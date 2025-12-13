@@ -1,8 +1,8 @@
 # Android Emulator Skill
 
-Android equivalent of the iOS Simulator Skill - production-ready automation for Android app testing and building.
+Android equivalent of the iOS Simulator Skill (https://github.com/conorluddy/ios-simulator-skill) - production-ready automation for Android app testing and building.
 
-## ✅ Current Status (v0.2.0)
+## ✅ Current Status (v0.1.0)
 
 **Core functionality complete!** This skill is now functional for basic Android automation with semantic element navigation.
 
@@ -21,7 +21,7 @@ Android equivalent of the iOS Simulator Skill - production-ready automation for 
 6. **emulator_boot.py** - Boot emulators with readiness verification
 7. **emulator_shutdown.py** - Graceful shutdown with verification
 
-#### Navigation & Interaction ✓ (NEW!)
+#### Navigation & Interaction ✓
 8. **screen_mapper.py** - Analyze current screen and list interactive elements
 9. **navigator.py** - Find and interact with elements semantically
 10. **gesture.py** - Swipes, scrolls, long press, drag and drop
@@ -98,18 +98,36 @@ python skill/scripts/gesture.py --swipe up
 ### Prerequisites
 ```bash
 # Android SDK
+# macOS/Linux
 export ANDROID_HOME=$HOME/Library/Android/sdk
 export PATH=$PATH:$ANDROID_HOME/platform-tools
 export PATH=$PATH:$ANDROID_HOME/emulator
+
+# Windows (PowerShell)
+$env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\sdk"
+$env:PATH += ";$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator"
 
 # Python 3.8+
 # Optional: pip3 install pillow
 ```
 
 ### As Claude Code Skill
+
 ```bash
-git clone <repository-url> ~/.claude/skills/android-emulator-skill
+# Personal installation
+git clone https://github.com/fluxxion82/android-emulator-skill.git /tmp/android-skill && \
+mkdir -p ~/.claude/skills && \
+cp -r /tmp/android-skill/skill ~/.claude/skills/android-emulator-skill && \
+rm -rf /tmp/android-skill
+
+# Project installation
+git clone https://github.com/fluxxion82/android-emulator-skill.git /tmp/android-skill && \
+mkdir -p .claude/skills && \
+cp -r /tmp/android-skill/skill .claude/skills/android-emulator-skill && \
+rm -rf /tmp/android-skill
 ```
+
+Restart Claude Code. The skill loads automatically.
 
 ## Project Structure
 
@@ -120,17 +138,16 @@ android-skill/
 └── skill/                       # Distributable skill
     ├── SKILL.md                # Script reference
     ├── README.md               # User guide
-    ├── CLAUDE.md               # Developer guide
     └── scripts/
         ├── common/             # 4 utility modules ✓
         ├── app_launcher.py     # ✓
         ├── emulator_boot.py    # ✓
         ├── emulator_shutdown.py # ✓
-        ├── screen_mapper.py    # ✓ NEW!
-        ├── navigator.py        # ✓ NEW!
-        ├── gesture.py          # ✓ NEW!
-        ├── keyboard.py         # ✓ NEW!
-        └── visual_diff.py      # ✓ NEW!
+        ├── screen_mapper.py    # ✓
+        ├── navigator.py        # ✓
+        ├── gesture.py          # ✓
+        ├── keyboard.py         # ✓
+        └── visual_diff.py      # ✓
 ```
 
 ## Differences from iOS
@@ -208,8 +225,7 @@ New scripts should:
 
 ## Version History
 
-- **v0.2.0** (Current) - Navigation scripts complete (screen_mapper, navigator, gesture, keyboard, visual_diff)
-- **v0.1.0** - Core utilities, app management, basic lifecycle
+- **v0.1.0** - Core utilities, app management, basic lifecycle, Navigation scripts complete (screen_mapper, navigator, gesture, keyboard, visual_diff)
 
 ## Next Development Session
 
