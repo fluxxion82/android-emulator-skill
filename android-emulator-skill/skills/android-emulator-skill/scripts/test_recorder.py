@@ -13,17 +13,23 @@ Usage:
 import argparse
 import json
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-from common.device_utils import get_ui_hierarchy
+from common.device_utils import get_ui_hierarchy, resolve_device_identifier
+from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
+
+# Tunable: max chars of a step description used when building artifact filenames.
+STEP_NAME_MAXLEN = env_int("ANDROID_EMU_STEP_NAME_MAXLEN", 30)
 
 
 class TestRecorder:
     """Records test execution with screenshots and UI snapshots."""
+
+    __test__ = False  # production class, not a pytest test case
 
     def __init__(
         self,
@@ -82,6 +88,7 @@ class TestRecorder:
         state: str | None = None,
         assertion: str | None = None,
         metadata: dict | None = None,
+        assertion_passed: bool = True,
     ):
         """
         Record a test step with automatic screenshot.
@@ -92,16 +99,19 @@ class TestRecorder:
             state: State description for semantic naming
             assertion: Optional assertion to verify
             metadata: Optional metadata for the step
+            assertion_passed: Result of the assertion when one is supplied
+                (default True, preserving the historical auto-pass behavior).
+                Ignored when ``assertion`` is None.
         """
         self.current_step += 1
         step_time = time.time() - self.start_time
 
+        slug = self._slugify(description)
+
         # Capture screenshot
         screenshot_path = None
         if not self.inline:
-            screenshot_name = (
-                f"{self.current_step:03d}-{description.lower().replace(' ', '-')[:30]}.png"
-            )
+            screenshot_name = f"{self.current_step:03d}-{slug}.png"
             screenshot_path = self.screenshots_dir / screenshot_name
 
         screenshot_result = capture_screenshot(
@@ -112,10 +122,7 @@ class TestRecorder:
         )
 
         # Capture UI hierarchy
-        ui_dump_path = (
-            self.ui_dumps_dir
-            / f"{self.current_step:03d}-{description.lower().replace(' ', '-')[:30]}.json"
-        )
+        ui_dump_path = self.ui_dumps_dir / f"{self.current_step:03d}-{slug}.json"
         element_count = self._capture_ui_hierarchy(ui_dump_path)
 
         # Store step data
@@ -148,15 +155,35 @@ class TestRecorder:
 
         if assertion:
             step_data["assertion"] = assertion
-            step_data["assertion_passed"] = True
+            step_data["assertion_passed"] = bool(assertion_passed)
 
         if metadata:
             step_data["metadata"] = metadata
 
         self.steps.append(step_data)
 
-        # Token-efficient output
-        print(f"  [{self.current_step}] {description} ({element_count} elements)")
+        # Token-efficient output. When the step carries an assertion, prefix a
+        # status symbol so pass/fail is visible at a glance; otherwise keep the
+        # original element-count line unchanged.
+        symbol = self._assertion_symbol(step_data)
+        prefix = f"{symbol} " if symbol else ""
+        print(f"  {prefix}[{self.current_step}] {description} ({element_count} elements)")
+
+    @staticmethod
+    def _slugify(description: str) -> str:
+        """Build a filesystem-safe, length-capped slug from a step description."""
+        return description.lower().replace(" ", "-")[:STEP_NAME_MAXLEN]
+
+    @staticmethod
+    def _assertion_symbol(step_data: dict) -> str:
+        """Return a per-step assertion status symbol, or '' if no assertion.
+
+        ✓ when the assertion passed, ✗ when it failed. Steps without an
+        assertion return an empty string so non-assertion output is unchanged.
+        """
+        if "assertion" not in step_data:
+            return ""
+        return "✓" if step_data.get("assertion_passed") else "✗"
 
     def _capture_ui_hierarchy(self, output_path: Path) -> int:
         """
@@ -197,15 +224,18 @@ class TestRecorder:
             count += self._count_elements(child)
         return count
 
-    def finish(self, passed: bool = True) -> str:
+    def generate_report(self, passed: bool = True) -> dict[str, str]:
         """
-        Finish recording and generate summary.
+        Write the test report artifacts (JSON + markdown).
 
         Args:
-            passed: Whether test passed
+            passed: Whether the test passed
 
         Returns:
-            Summary string
+            Dict of artifact paths with keys:
+            - "report_path": path to the JSON report
+            - "markdown_path": path to the markdown report
+            - "output_dir": path to the artifact directory
         """
         total_time = time.time() - self.start_time
 
@@ -220,7 +250,7 @@ class TestRecorder:
             "timestamp": datetime.now().isoformat(),
         }
 
-        # Save report
+        # Save JSON report
         report_path = self.output_dir / "test-report.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2)
@@ -229,12 +259,32 @@ class TestRecorder:
         markdown_path = self.output_dir / "test-report.md"
         self._generate_markdown(markdown_path, report)
 
+        return {
+            "report_path": str(report_path),
+            "markdown_path": str(markdown_path),
+            "output_dir": str(self.output_dir),
+        }
+
+    def finish(self, passed: bool = True) -> str:
+        """
+        Finish recording and generate summary.
+
+        Args:
+            passed: Whether test passed
+
+        Returns:
+            Path to the JSON report (string)
+        """
+        artifacts = self.generate_report(passed=passed)
+
+        total_time = time.time() - self.start_time
+
         # Token-efficient summary
         status = "✓ PASSED" if passed else "✗ FAILED"
         print(f"\n{status} in {total_time:.1f}s ({len(self.steps)} steps)")
-        print(f"Report: {report_path}")
+        print(f"Report: {artifacts['report_path']}")
 
-        return str(report_path)
+        return artifacts["report_path"]
 
     def _generate_markdown(self, output_path: Path, report: dict):
         """
@@ -319,11 +369,18 @@ Examples:
 
     args = parser.parse_args()
 
+    # Resolve device serial (auto-detects default device when --serial omitted)
+    try:
+        serial = resolve_device_identifier(args.device_serial)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     # Create recorder
     TestRecorder(
         test_name=args.test_name,
         output_dir=args.output,
-        serial=args.device_serial,
+        serial=serial,
         inline=args.inline,
         screenshot_size=args.size,
         app_name=args.app_name,

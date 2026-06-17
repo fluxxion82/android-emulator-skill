@@ -7,6 +7,7 @@ Performs swipes, scrolls, pinches, and complex touch gestures on Android devices
 Key Features:
 - Directional swipes (up/down/left/right)
 - Multi-swipe scrolling
+- Pull-to-refresh
 - Custom swipe paths
 - Long press
 - Multi-touch gestures
@@ -28,19 +29,28 @@ Usage Examples:
     # Custom swipe path
     python scripts/gesture.py --swipe-path 100,500,900,500 --duration 300
 
+    # Pull to refresh
+    python scripts/gesture.py --refresh
+
 Output Format:
     Swiped: up (540,1600) → (540,400) [300ms]
     Scrolled: down (3 swipes)
     Long pressed: (540, 960) for 2000ms
+    Pulled to refresh: (540,720) → (540,1920) [600ms]
 """
 
 import argparse
 import subprocess
 import sys
 import time
-from typing import Optional
 
 from common.device_utils import build_adb_command, get_device_screen_size, resolve_device_identifier
+from common.env_config import env_float, env_int
+
+# Tunable pull-to-refresh defaults (overridable via ANDROID_EMU_* env vars).
+REFRESH_START_PCT = env_float("ANDROID_EMU_REFRESH_START_PCT", 0.30)
+REFRESH_END_PCT = env_float("ANDROID_EMU_REFRESH_END_PCT", 0.80)
+REFRESH_DURATION_MS = env_int("ANDROID_EMU_REFRESH_DURATION_MS", 600)
 
 
 class GestureSimulator:
@@ -212,6 +222,38 @@ class GestureSimulator:
         except subprocess.CalledProcessError as e:
             return False, f"Long press failed: {e.stderr}"
 
+    def refresh(
+        self,
+        duration_ms: int = REFRESH_DURATION_MS,
+    ) -> tuple:
+        """
+        Perform a pull-to-refresh gesture.
+
+        Swipes downward from near the top of the screen to lower down,
+        mimicking the standard Android "pull down to refresh" interaction.
+        The start/end vertical positions and duration are tunable via the
+        ANDROID_EMU_REFRESH_* environment variables.
+
+        Args:
+            duration_ms: Swipe duration in milliseconds (slow enough to
+                register as a refresh, not a fling)
+
+        Returns:
+            (success, message) tuple
+        """
+        width, height = self.get_screen_size()
+        center_x = width // 2
+        start_y = int(height * REFRESH_START_PCT)
+        end_y = int(height * REFRESH_END_PCT)
+
+        success, _ = self.swipe_path(center_x, start_y, center_x, end_y, duration_ms)
+        if not success:
+            return False, "Pull-to-refresh failed"
+        return (
+            True,
+            f"Pulled to refresh: ({center_x},{start_y}) → ({center_x},{end_y}) [{duration_ms}ms]",
+        )
+
     def pinch(
         self,
         direction: str,
@@ -287,6 +329,9 @@ Examples:
 
   # Drag and drop
   python gesture.py --drag 100,500,900,500 --duration 1000
+
+  # Pull to refresh
+  python gesture.py --refresh
         """,
     )
 
@@ -301,7 +346,13 @@ Examples:
     parser.add_argument("--swipe-path", help="Custom swipe path (format: x1,y1,x2,y2)")
     parser.add_argument("--drag", help="Drag and drop (format: x1,y1,x2,y2)")
     parser.add_argument(
-        "--duration", type=int, default=300, help="Gesture duration in ms (default: 300)"
+        "--refresh", action="store_true", help="Pull-to-refresh gesture (swipe down from top)"
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=None,
+        help=f"Gesture duration in ms (default: 300; --refresh defaults to {REFRESH_DURATION_MS})",
     )
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -316,32 +367,39 @@ Examples:
 
     simulator = GestureSimulator(serial)
 
+    # Resolve durations: existing gestures keep their 300ms contract; --refresh
+    # falls back to its own (tunable) default when --duration is omitted.
+    duration = 300 if args.duration is None else args.duration
+    refresh_duration = REFRESH_DURATION_MS if args.duration is None else args.duration
+
     # Execute gesture
     success = False
     message = ""
 
     if args.swipe:
-        success, message = simulator.swipe(args.swipe, args.from_edge, args.duration)
+        success, message = simulator.swipe(args.swipe, args.from_edge, duration)
     elif args.scroll:
-        success, message = simulator.scroll(args.scroll, args.count, args.duration)
+        success, message = simulator.scroll(args.scroll, args.count, duration)
     elif args.long_press:
         try:
             x, y = map(int, args.long_press.split(","))
-            success, message = simulator.long_press(x, y, args.duration)
+            success, message = simulator.long_press(x, y, duration)
         except ValueError:
             message = "Error: --long-press requires format 'x,y'"
     elif args.swipe_path:
         try:
             x1, y1, x2, y2 = map(int, args.swipe_path.split(","))
-            success, message = simulator.swipe_path(x1, y1, x2, y2, args.duration)
+            success, message = simulator.swipe_path(x1, y1, x2, y2, duration)
         except ValueError:
             message = "Error: --swipe-path requires format 'x1,y1,x2,y2'"
     elif args.drag:
         try:
             x1, y1, x2, y2 = map(int, args.drag.split(","))
-            success, message = simulator.drag_and_drop(x1, y1, x2, y2, args.duration)
+            success, message = simulator.drag_and_drop(x1, y1, x2, y2, duration)
         except ValueError:
             message = "Error: --drag requires format 'x1,y1,x2,y2'"
+    elif args.refresh:
+        success, message = simulator.refresh(refresh_duration)
     else:
         parser.print_help()
         sys.exit(1)

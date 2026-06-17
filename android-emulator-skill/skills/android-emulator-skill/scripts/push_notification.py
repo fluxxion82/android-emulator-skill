@@ -20,9 +20,9 @@ import argparse
 import json
 import subprocess
 import sys
-from typing import Optional
 
 from common.device_utils import build_adb_command
+from common.env_config import env_int
 
 
 class PushNotificationSimulator:
@@ -43,6 +43,8 @@ class PushNotificationSimulator:
         title: str,
         message: str,
         data: dict | None = None,
+        badge: int | None = None,
+        sound: bool = True,
     ) -> tuple:
         """
         Send a notification to the app.
@@ -52,6 +54,8 @@ class PushNotificationSimulator:
             title: Notification title
             message: Notification message
             data: Optional data payload
+            badge: Optional badge count (emitted as an integer extra when > 0)
+            sound: Whether the notification should play a sound (boolean extra)
 
         Returns:
             (success, message) tuple
@@ -75,6 +79,14 @@ class PushNotificationSimulator:
             "message",
             f'"{message}"',
         )
+
+        # Badge count (Android-native equivalent of iOS aps.badge): integer extra.
+        # Only emitted when positive so the default contract is unchanged.
+        if badge is not None and badge > 0:
+            cmd.extend(["--ei", "badge", str(badge)])
+
+        # Sound toggle (Android-native equivalent of iOS aps.sound): boolean extra.
+        cmd.extend(["--ez", "sound", "true" if sound else "false"])
 
         # Add data if provided
         if data:
@@ -192,6 +204,10 @@ Examples:
   # Send with notification ID
   python scripts/push_notification.py --package com.myapp --title "Alert" --message "Important" --id 123
 
+  # Send with a badge count and no sound, tracking a named test scenario
+  python scripts/push_notification.py --package com.myapp --title "Alert" --message "Hi" \\
+      --badge 3 --no-sound --test-name push-cold-start --expected "deep link opens detail screen"
+
   # Check notification channels
   python scripts/push_notification.py --package com.myapp --list-channels
 
@@ -203,11 +219,27 @@ Note:
         """,
     )
 
+    # Default badge is tunable via ANDROID_EMU_PUSH_DEFAULT_BADGE (0 = no badge extra).
+    default_badge = env_int("ANDROID_EMU_PUSH_DEFAULT_BADGE", 0, min_value=0)
+
     parser.add_argument("--package", help="App package name")
     parser.add_argument("--title", help="Notification title")
     parser.add_argument("--message", help="Notification message")
     parser.add_argument("--id", type=int, default=1, help="Notification ID (default: 1)")
     parser.add_argument("--data", help="JSON data payload")
+    parser.add_argument(
+        "--badge",
+        type=int,
+        default=default_badge,
+        help="Badge count extra (broadcast method; 0 = no badge)",
+    )
+    parser.add_argument(
+        "--no-sound",
+        action="store_true",
+        help="Disable notification sound (sets the 'sound' boolean extra to false)",
+    )
+    parser.add_argument("--test-name", help="Test scenario name for tracking")
+    parser.add_argument("--expected", help="Expected behavior after the notification arrives")
     parser.add_argument("--list-channels", action="store_true", help="List notification channels")
     parser.add_argument(
         "--method",
@@ -264,16 +296,36 @@ Note:
 
     # Send notification
     if args.method == "broadcast":
-        success, message = simulator.send_notification(args.package, args.title, args.message, data)
+        success, message = simulator.send_notification(
+            args.package,
+            args.title,
+            args.message,
+            data,
+            badge=args.badge,
+            sound=not args.no_sound,
+        )
     else:  # intent
         success, message = simulator.send_notification_via_service(
             args.package, args.title, args.message, args.id
         )
 
     if args.json:
-        print(json.dumps({"success": success, "message": message}, indent=2))
+        result = {"success": success, "message": message}
+        if args.test_name:
+            result["test_name"] = args.test_name
+        if args.expected:
+            result["expected"] = args.expected
+        print(json.dumps(result, indent=2))
     elif args.verbose or not success:
         print(message)
+        if success and args.test_name:
+            print(f"Test: {args.test_name}")
+        if success and args.expected:
+            print(f"Expected: {args.expected}")
+        if success:
+            print(
+                "Verify handling: python scripts/log_monitor.py " f"--app {args.package} --follow"
+            )
     elif success:
         print("✓")
 

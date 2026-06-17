@@ -15,6 +15,13 @@ Usage Examples:
 
     # Save audit report
     python scripts/accessibility_audit.py --output audit-reports/
+
+Exit code:
+    Returns 1 when any critical issue is found (CI gate), else 0.
+
+Tunables (env, ANDROID_EMU_ prefix):
+    ANDROID_EMU_A11Y_MAX_NESTING  Depth above which nodes are flagged (default 5)
+    ANDROID_EMU_A11Y_TOP_ISSUES   Grouped issue types shown in console (default 10)
 """
 
 import argparse
@@ -25,6 +32,33 @@ from datetime import datetime
 from pathlib import Path
 
 from common.device_utils import get_ui_hierarchy
+from common.env_config import env_int
+
+# Tunable thresholds (overridable via env, ANDROID_EMU_ prefix).
+A11Y_MAX_NESTING = env_int("ANDROID_EMU_A11Y_MAX_NESTING", 5)
+A11Y_TOP_ISSUES = env_int("ANDROID_EMU_A11Y_TOP_ISSUES", 10)
+
+# Human-readable fix suggestions keyed by issue type.
+FIX_SUGGESTIONS = {
+    "missing_content_description": "Add android:contentDescription to the element",
+    "small_touch_target": "Increase touch target to at least 48x48dp",
+    "image_missing_description": (
+        "Add android:contentDescription, or set importantForAccessibility='no' if decorative"
+    ),
+    "edittext_missing_hint": "Add android:hint to describe the expected input",
+    "long_text_block": "Ensure adequate line spacing and consider breaking up the content",
+    "missing_resource_id": "Add android:id so the element can be reliably referenced and tested",
+    "deep_nesting": "Flatten the layout to reduce view-hierarchy depth",
+}
+
+
+def _fix_for(issue_type: str) -> str:
+    """Return the fix-suggestion string for an issue type."""
+    return FIX_SUGGESTIONS.get(issue_type, "Review accessibility")
+
+
+# Severity ordering used when ranking grouped issues for console output.
+_SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
 
 def _parse_bounds(bounds_str: str) -> dict:
@@ -50,14 +84,17 @@ class AccessibilityAuditor:
     # Minimum text size (sp)
     MIN_TEXT_SIZE = 12
 
-    def __init__(self, serial: str | None = None):
+    def __init__(self, serial: str | None = None, max_nesting: int | None = None):
         """
         Initialize accessibility auditor.
 
         Args:
             serial: Optional device serial
+            max_nesting: Depth above which a node is flagged as deeply nested.
+                Defaults to the ANDROID_EMU_A11Y_MAX_NESTING tunable.
         """
         self.serial = serial
+        self.max_nesting = A11Y_MAX_NESTING if max_nesting is None else max_nesting
         self.issues = []
 
     def audit(self) -> tuple:
@@ -130,6 +167,7 @@ class AccessibilityAuditor:
                         "type": "missing_content_description",
                         "severity": "critical",
                         "message": f"Interactive {class_name} missing content description",
+                        "fix": _fix_for("missing_content_description"),
                         "element": {
                             "class": class_name,
                             "resource_id": resource_id,
@@ -149,6 +187,7 @@ class AccessibilityAuditor:
                         "type": "small_touch_target",
                         "severity": "warning",
                         "message": f"Touch target too small: {width}x{height}dp (min: {self.MIN_TOUCH_TARGET_SIZE}dp)",
+                        "fix": _fix_for("small_touch_target"),
                         "element": {
                             "class": class_name,
                             "resource_id": resource_id,
@@ -165,6 +204,7 @@ class AccessibilityAuditor:
                     "type": "image_missing_description",
                     "severity": "info",
                     "message": "ImageView missing content description (okay if decorative)",
+                    "fix": _fix_for("image_missing_description"),
                     "element": {
                         "class": class_name,
                         "resource_id": resource_id,
@@ -181,6 +221,7 @@ class AccessibilityAuditor:
                         "type": "edittext_missing_hint",
                         "severity": "warning",
                         "message": "EditText missing hint text",
+                        "fix": _fix_for("edittext_missing_hint"),
                         "element": {
                             "class": class_name,
                             "resource_id": resource_id,
@@ -196,6 +237,7 @@ class AccessibilityAuditor:
                     "type": "long_text_block",
                     "severity": "info",
                     "message": f"Long text block ({len(text)} chars) - ensure adequate spacing",
+                    "fix": _fix_for("long_text_block"),
                     "element": {
                         "class": class_name,
                         "resource_id": resource_id,
@@ -204,9 +246,71 @@ class AccessibilityAuditor:
                 }
             )
 
+        # Check 6: Interactive elements should have a resource-id for testing
+        if clickable and enabled and not resource_id:
+            self.issues.append(
+                {
+                    "type": "missing_resource_id",
+                    "severity": "info",
+                    "message": f"Interactive {class_name or 'element'} missing resource-id",
+                    "fix": _fix_for("missing_resource_id"),
+                    "element": {
+                        "class": class_name,
+                        "bounds": bounds,
+                    },
+                }
+            )
+
+        # Check 7: Deeply nested elements complicate accessibility navigation
+        if depth > self.max_nesting:
+            self.issues.append(
+                {
+                    "type": "deep_nesting",
+                    "severity": "info",
+                    "message": f"Deeply nested element (depth {depth} > {self.max_nesting})",
+                    "fix": _fix_for("deep_nesting"),
+                    "element": {
+                        "class": class_name,
+                        "resource_id": resource_id,
+                        "depth": depth,
+                    },
+                }
+            )
+
         # Recurse to children
         for child in node.get("children", []):
             self._audit_node(child, depth + 1)
+
+    @staticmethod
+    def group_top_issues(issues: list, limit: int = A11Y_TOP_ISSUES) -> list:
+        """
+        Group issues by type and rank them by severity then count.
+
+        Args:
+            issues: List of issue dicts (as produced by :meth:`_audit_node`).
+            limit: Maximum number of grouped issue types to return.
+
+        Returns:
+            A list of grouped dicts (``type``/``severity``/``count``/``fix``),
+            sorted by severity (critical first) then descending count, truncated
+            to ``limit`` entries.
+        """
+        grouped: dict[str, dict] = {}
+        for issue in issues:
+            issue_type = issue["type"]
+            if issue_type not in grouped:
+                grouped[issue_type] = {
+                    "type": issue_type,
+                    "severity": issue["severity"],
+                    "count": 0,
+                    "fix": issue.get("fix", _fix_for(issue_type)),
+                }
+            grouped[issue_type]["count"] += 1
+
+        return sorted(
+            grouped.values(),
+            key=lambda g: (_SEVERITY_ORDER.get(g["severity"], 99), -g["count"]),
+        )[:limit]
 
     def save_report(self, output_dir: str, audit_data: dict) -> str:
         """
@@ -348,6 +452,7 @@ Examples:
                 )
                 print(f"\n{severity_symbol} {issue['type']} ({issue['severity']})")
                 print(f"  {issue['message']}")
+                print(f"  Fix: {issue.get('fix', _fix_for(issue['type']))}")
 
                 if "element" in issue:
                     elem = issue["element"]
@@ -355,6 +460,21 @@ Examples:
                         print(f"  Class: {elem['class']}")
                     if "resource_id" in elem:
                         print(f"  ID: {elem['resource_id']}")
+        elif audit_data["issues"]:
+            # Concise default: top issue types grouped by severity then count.
+            top_issues = AccessibilityAuditor.group_top_issues(audit_data["issues"])
+            print(f"\nTop issues (by severity, count) — showing {len(top_issues)}:")
+            for group in top_issues:
+                symbol = (
+                    "❌"
+                    if group["severity"] == "critical"
+                    else ("⚠️" if group["severity"] == "warning" else "ℹ️")
+                )
+                print(f"  {symbol} {group['type']} ({group['count']}x) - {group['fix']}")
+
+    # CI gate: non-zero exit when any critical issue is present.
+    if audit_data["critical"] > 0:
+        sys.exit(1)
 
     sys.exit(0)
 

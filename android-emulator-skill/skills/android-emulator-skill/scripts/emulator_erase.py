@@ -9,6 +9,12 @@ Usage Examples:
     # Erase single AVD (must be shutdown first)
     python scripts/emulator_erase.py --name MyTestDevice
 
+    # Erase and verify the wipe landed on disk
+    python scripts/emulator_erase.py --name MyTestDevice --verify
+
+    # Erase every AVD on this host
+    python scripts/emulator_erase.py --all
+
     # List AVDs
     python scripts/emulator_erase.py --list
 """
@@ -18,8 +24,26 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+
+from common.device_utils import build_adb_command
+from common.env_config import env_float, env_int
+
+# Tunable defaults (override via the ANDROID_EMU_ prefix).
+DEFAULT_ERASE_TIMEOUT = env_int("ANDROID_EMU_ERASE_TIMEOUT", 90)
+POLL_INTERVAL_SECONDS = env_float("ANDROID_EMU_POLL_INTERVAL", 0.5, min_value=0.05)
+
+# User-data artefacts removed during an erase. Deleting these returns the AVD
+# to factory state on next boot while preserving config.ini / hardware-qemu.ini.
+USERDATA_FILES = [
+    "userdata-qemu.img",
+    "userdata-qemu.img.qcow2",
+    "cache.img",
+    "cache.img.qcow2",
+    "sdcard.img",
+    "sdcard.img.qcow2",
+]
 
 
 class EmulatorEraser:
@@ -75,7 +99,7 @@ class EmulatorEraser:
         """
         try:
             result = subprocess.run(
-                ["adb", "devices"],
+                build_adb_command("devices"),
                 capture_output=True,
                 text=True,
                 check=True,
@@ -88,7 +112,7 @@ class EmulatorEraser:
                     serial = line.split()[0]
                     # Query AVD name
                     avd_result = subprocess.run(
-                        ["adb", "-s", serial, "emu", "avd", "name"],
+                        build_adb_command("emu", serial, "avd", "name"),
                         capture_output=True,
                         text=True,
                         check=True,
@@ -101,13 +125,21 @@ class EmulatorEraser:
         except subprocess.CalledProcessError:
             return False
 
-    def erase(self, name: str, force: bool = False) -> tuple:
+    def erase(
+        self,
+        name: str,
+        force: bool = False,
+        verify: bool = False,
+        timeout_seconds: int = DEFAULT_ERASE_TIMEOUT,
+    ) -> tuple:
         """
         Erase an AVD (wipe user data).
 
         Args:
             name: AVD name to erase
             force: Skip running check
+            verify: Poll the AVD on disk until the wipe is observed (or timeout)
+            timeout_seconds: Maximum seconds to poll when ``verify`` is set
 
         Returns:
             (success, message) tuple
@@ -129,17 +161,8 @@ class EmulatorEraser:
         avd_dir = avd_home / f"{name}.avd"
 
         # Delete userdata files
-        files_to_delete = [
-            "userdata-qemu.img",
-            "userdata-qemu.img.qcow2",
-            "cache.img",
-            "cache.img.qcow2",
-            "sdcard.img",
-            "sdcard.img.qcow2",
-        ]
-
         deleted_files = []
-        for filename in files_to_delete:
+        for filename in USERDATA_FILES:
             file_path = avd_dir / filename
             if file_path.exists():
                 try:
@@ -149,8 +172,92 @@ class EmulatorEraser:
                     return False, f"Failed to delete {filename}: {e}"
 
         if deleted_files:
-            return True, f"AVD erased: {name} (deleted {len(deleted_files)} files)"
-        return True, f"AVD already clean: {name}"
+            base_message = f"AVD erased: {name} (deleted {len(deleted_files)} files)"
+        else:
+            base_message = f"AVD already clean: {name}"
+
+        # Optionally verify the wipe actually landed on disk.
+        if verify:
+            ready, verify_message = self._verify_erase(avd_dir, timeout_seconds)
+            if ready:
+                return True, f"{base_message} [{verify_message}]"
+            return False, verify_message
+
+        return True, base_message
+
+    def _verify_erase(self, avd_dir: Path, timeout_seconds: int = DEFAULT_ERASE_TIMEOUT) -> tuple:
+        """
+        Verify an erase has landed on disk.
+
+        Polls the AVD directory until no user-data artefacts remain (the wipe is
+        flushed) while the AVD config is still present, confirming the AVD is
+        ready for a clean boot. This is the Android-native, device-free
+        equivalent of waiting for readiness after a reset.
+
+        Args:
+            avd_dir: Path to the ``<name>.avd`` directory
+            timeout_seconds: Maximum seconds to poll
+
+        Returns:
+            (success, message) tuple
+        """
+        start_time = time.time()
+        poll_interval = POLL_INTERVAL_SECONDS
+        checks = 0
+
+        while time.time() - start_time < timeout_seconds:
+            checks += 1
+            remaining = [f for f in USERDATA_FILES if (avd_dir / f).exists()]
+            config_present = (avd_dir / "config.ini").exists()
+            if not remaining and config_present:
+                elapsed = time.time() - start_time
+                return True, f"verified clean in {elapsed:.1f}s ({checks} checks)"
+
+            time.sleep(poll_interval)
+
+        elapsed = time.time() - start_time
+        still_present = [f for f in USERDATA_FILES if (avd_dir / f).exists()]
+        return False, (
+            f"Erase verification timeout after {elapsed:.1f}s ({checks} checks); "
+            f"user data still present: {', '.join(still_present) or 'none'}"
+        )
+
+    def erase_all(
+        self,
+        force: bool = False,
+        verify: bool = False,
+        timeout_seconds: int = DEFAULT_ERASE_TIMEOUT,
+    ) -> tuple[int, int, list[dict]]:
+        """
+        Erase every AVD defined on this host.
+
+        Args:
+            force: Skip the running check for each AVD
+            verify: Poll each AVD on disk until the wipe is observed
+            timeout_seconds: Maximum seconds to poll per AVD when ``verify`` is set
+
+        Returns:
+            (succeeded, failed, results) tuple where ``results`` is a list of
+            ``{"avd": name, "success": bool, "message": str}`` dicts.
+        """
+        succeeded = 0
+        failed = 0
+        results: list[dict] = []
+
+        for name in self.list_avds():
+            success, message = self.erase(
+                name,
+                force=force,
+                verify=verify,
+                timeout_seconds=timeout_seconds,
+            )
+            if success:
+                succeeded += 1
+            else:
+                failed += 1
+            results.append({"avd": name, "success": success, "message": message})
+
+        return succeeded, failed, results
 
 
 def main():
@@ -163,8 +270,14 @@ Examples:
   # Erase AVD (must be shutdown first)
   python scripts/emulator_erase.py --name MyTestDevice
 
+  # Erase and verify the wipe landed on disk
+  python scripts/emulator_erase.py --name MyTestDevice --verify
+
   # Force erase (even if running - may cause issues)
   python scripts/emulator_erase.py --name MyTestDevice --force
+
+  # Erase every AVD on this host
+  python scripts/emulator_erase.py --all
 
   # List all AVDs
   python scripts/emulator_erase.py --list
@@ -173,8 +286,23 @@ Examples:
 
     parser.add_argument("--name", help="AVD name to erase")
     parser.add_argument("--list", action="store_true", help="List all AVDs")
+    parser.add_argument("--all", action="store_true", help="Erase every AVD on this host")
     parser.add_argument(
         "--force", action="store_true", help="Force erase even if running (not recommended)"
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Poll the AVD on disk until the wipe is observed (or timeout)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_ERASE_TIMEOUT,
+        help=(
+            f"Timeout in seconds for --verify "
+            f"(default: {DEFAULT_ERASE_TIMEOUT}, override via ANDROID_EMU_ERASE_TIMEOUT)"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
@@ -196,6 +324,36 @@ Examples:
             print("No AVDs found")
         sys.exit(0)
 
+    # Erase-all operation
+    if args.all:
+        if args.verbose:
+            print("Erasing all AVDs")
+        succeeded, failed, results = eraser.erase_all(
+            force=args.force, verify=args.verify, timeout_seconds=args.timeout
+        )
+        total = succeeded + failed
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "action": "erase_all",
+                        "succeeded": succeeded,
+                        "failed": failed,
+                        "total": total,
+                        "results": results,
+                    },
+                    indent=2,
+                )
+            )
+        elif total == 0:
+            print("No AVDs found")
+        else:
+            print(f"Erase summary: {succeeded}/{total} succeeded, {failed} failed")
+            if args.verbose:
+                for result in results:
+                    print(f"  {result['message']}")
+        sys.exit(0 if failed == 0 else 1)
+
     # Erase operation
     if not args.name:
         print("Error: --name is required", file=sys.stderr)
@@ -205,7 +363,9 @@ Examples:
     if args.verbose:
         print(f"Erasing AVD: {args.name}")
 
-    success, message = eraser.erase(args.name, force=args.force)
+    success, message = eraser.erase(
+        args.name, force=args.force, verify=args.verify, timeout_seconds=args.timeout
+    )
 
     if args.json:
         print(json.dumps({"success": success, "message": message}, indent=2))

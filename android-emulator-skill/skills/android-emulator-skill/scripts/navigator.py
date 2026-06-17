@@ -59,11 +59,16 @@ import json as json_lib
 import re
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Optional
 
 from common.device_utils import build_adb_command, resolve_device_identifier
+from common.env_config import env_float, env_int
+
+# Tunable defaults (overridable via ANDROID_EMU_* env vars; see SKILL.md).
+MAX_ELEMENTS_LISTED = env_int("ANDROID_EMU_MAX_ELEMENTS", 25)
+TAP_SETTLE_SECONDS = env_float("ANDROID_EMU_TAP_SETTLE_MS", 500.0) / 1000.0
 
 
 @dataclass
@@ -294,6 +299,9 @@ class Navigator:
         try:
             cmd = build_adb_command("shell", self.serial, "input", "tap", str(x), str(y))
             subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Let the UI settle after the tap (animations, transitions, focus).
+            if TAP_SETTLE_SECONDS > 0:
+                time.sleep(TAP_SETTLE_SECONDS)
             return True, f"Tapped at ({x}, {y})"
         except subprocess.CalledProcessError as e:
             return False, f"Tap failed: {e.stderr}"
@@ -366,8 +374,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Find and tap button by text
+  # Find and tap button by text (fuzzy)
   python navigator.py --find-text "Login" --tap
+
+  # Find by exact text (non-fuzzy) and tap
+  python navigator.py --find-exact "Sign In" --tap
 
   # Find EditText and enter text
   python navigator.py --find-type EditText --enter-text "user@example.com"
@@ -383,17 +394,26 @@ Examples:
 
   # Tap at coordinates (fallback)
   python navigator.py --tap-at 200,400
+
+Environment overrides:
+  ANDROID_EMU_TAP_SETTLE_MS   Settle delay after each tap, ms (default: 500)
+  ANDROID_EMU_MAX_ELEMENTS    Max elements shown by --list (default: 25)
         """,
     )
 
     parser.add_argument("--serial", "-s", help="Device serial number (auto-detects if omitted)")
     parser.add_argument("--find-text", help="Find element by text (fuzzy match)")
+    parser.add_argument("--find-exact", help="Find element by exact text (non-fuzzy match)")
     parser.add_argument("--find-type", help="Find element by type (Button, EditText, etc.)")
     parser.add_argument("--find-id", help="Find element by resource ID")
     parser.add_argument(
         "--index", type=int, default=0, help="Index of matching element (default: 0)"
     )
-    parser.add_argument("--exact", action="store_true", help="Use exact text matching (not fuzzy)")
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Use exact text matching for --find-text (not fuzzy)",
+    )
     parser.add_argument("--tap", action="store_true", help="Tap the found element")
     parser.add_argument("--enter-text", help="Enter text into found element")
     parser.add_argument("--tap-at", help="Tap at coordinates (format: x,y)")
@@ -414,6 +434,9 @@ Examples:
     # List mode
     if args.list:
         elements = navigator.list_elements()
+        total = len(elements)
+        shown = elements[:MAX_ELEMENTS_LISTED]
+        truncated = total - len(shown)
         if args.json:
             elements_data = [
                 {
@@ -422,14 +445,30 @@ Examples:
                     "bounds": e.bounds,
                     "center": e.center,
                 }
-                for e in elements
+                for e in shown
             ]
-            print(json_lib.dumps({"elements": elements_data, "count": len(elements)}, indent=2))
+            print(
+                json_lib.dumps(
+                    {
+                        "elements": elements_data,
+                        "count": total,
+                        "shown": len(shown),
+                        "truncated": truncated,
+                    },
+                    indent=2,
+                )
+            )
         else:
-            print(f"Interactive elements ({len(elements)}):")
-            for i, elem in enumerate(elements):
+            print(f"Interactive elements ({total}):")
+            for i, elem in enumerate(shown):
                 x, y = elem.center
                 print(f"  {i}. {elem.description} at ({x}, {y})")
+            if truncated > 0:
+                print(
+                    f"  ... and {truncated} more "
+                    f"(showing first {MAX_ELEMENTS_LISTED}; "
+                    f"raise ANDROID_EMU_MAX_ELEMENTS to see more)"
+                )
         sys.exit(0)
 
     # Tap at coordinates mode
@@ -446,19 +485,28 @@ Examples:
             print("Error: --tap-at requires format 'x,y' (e.g., 200,400)", file=sys.stderr)
             sys.exit(1)
 
+    # Resolve search text: --find-exact forces exact matching; --find-text is
+    # fuzzy unless --exact is also passed. --find-exact takes precedence.
+    if args.find_exact is not None:
+        search_text = args.find_exact
+        fuzzy = False
+    else:
+        search_text = args.find_text
+        fuzzy = not args.exact
+
     # Find element mode
     element = navigator.find_element(
-        text=args.find_text,
+        text=search_text,
         element_type=args.find_type,
         resource_id=args.find_id,
         index=args.index,
-        fuzzy=not args.exact,
+        fuzzy=fuzzy,
     )
 
     if not element:
         criteria = []
-        if args.find_text:
-            criteria.append(f"text='{args.find_text}'")
+        if search_text:
+            criteria.append(f"text='{search_text}'")
         if args.find_type:
             criteria.append(f"type={args.find_type}")
         if args.find_id:

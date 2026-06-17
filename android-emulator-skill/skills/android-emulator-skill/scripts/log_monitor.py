@@ -23,6 +23,9 @@ Usage Examples:
     # Extract errors and warnings only
     python scripts/log_monitor.py --severity error,warning --duration 1m
 
+    # Inspect the last 5 minutes of history (dump-and-exit, no live follow)
+    python scripts/log_monitor.py --app com.myapp --last 5m
+
     # Save logs to file
     python scripts/log_monitor.py --app com.myapp --duration 1m --output logs/
 
@@ -39,9 +42,17 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from common.device_utils import build_adb_command
+from common.env_config import env_int
+
+# Output caps (env-configurable via ANDROID_EMU_LOG_*). Defaults preserve the
+# historical behavior of this script.
+LOG_LINE_MAX = env_int("ANDROID_EMU_LOG_LINE_MAX", 120)
+LOG_TAIL = env_int("ANDROID_EMU_LOG_TAIL", 50)
+LOG_TEXT_SUMMARY_CAP = env_int("ANDROID_EMU_LOG_TEXT_SUMMARY", 5)
+LOG_JSON_CAP = env_int("ANDROID_EMU_LOG_JSON_CAP", 20)
+LOG_INFO_CAP = env_int("ANDROID_EMU_LOG_INFO_CAP", 20)
 
 
 class LogMonitor:
@@ -244,82 +255,137 @@ class LogMonitor:
             self.warnings.append(f"[{parsed['tag']}] {parsed['message']}")
         elif severity == "info":
             self.info_count += 1
-            if len(self.info_messages) < 20:  # Keep only recent info
+            if len(self.info_messages) < LOG_INFO_CAP:  # Keep only recent info
                 self.info_messages.append(f"[{parsed['tag']}] {parsed['message']}")
         elif severity == "debug":
             self.debug_count += 1
         else:  # verbose
             self.verbose_count += 1
 
-    def stream_logs(
-        self,
-        follow: bool = False,
-        duration: float | None = None,
-        clear_first: bool = False,
-    ) -> bool:
+    def _severity_min_priority(self) -> str | None:
         """
-        Stream logs from device/emulator.
+        Resolve the active severity filter to a single minimum logcat priority.
 
-        Args:
-            follow: Follow mode (continuous streaming)
-            duration: Capture duration in seconds
-            clear_first: Clear logcat buffer before streaming
+        logcat's ``*:<priority>`` form shows that level and everything above it
+        (V < D < I < W < E < F), so we pick the lowest level the filter requests.
 
         Returns:
-            True if successful
+            A single priority letter (e.g. "W"), or None if no filter applies.
         """
-        # Clear logcat if requested
-        if clear_first:
-            clear_cmd = build_adb_command("logcat", self.device_serial, "-c")
-            # Ignore clear errors
-            with contextlib.suppress(subprocess.CalledProcessError):
-                subprocess.run(clear_cmd, check=True, capture_output=True)
+        if not self.severity_filter:
+            return None
 
-        # Build logcat command
+        priority_letters = []
+        for sev in self.severity_filter:
+            if sev == "error":
+                priority_letters.extend(["E", "F"])
+            elif sev == "warning":
+                priority_letters.append("W")
+            elif sev == "info":
+                priority_letters.append("I")
+            elif sev == "debug":
+                priority_letters.append("D")
+            elif sev == "verbose":
+                priority_letters.append("V")
+
+        if not priority_letters:
+            return None
+
+        priority_order = ["V", "D", "I", "W", "E", "F"]
+        return priority_order[min(priority_order.index(p) for p in priority_letters)]
+
+    def build_logcat_command(
+        self,
+        pid: str | None = None,
+        last_minutes: float | None = None,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """
+        Build the ``adb logcat`` command for streaming or a historical window.
+
+        This is a pure arg->command mapping (no device I/O), kept separate so the
+        PID-resolution and process plumbing in ``stream_logs`` stays testable.
+
+        Args:
+            pid: App PID to filter by (omitted if None/empty)
+            last_minutes: If set, dump a historical window with ``-d -t`` instead
+                of streaming live. The window starts at ``now - last_minutes``.
+            now: Reference time for the historical window (defaults to current
+                time; injectable for deterministic tests).
+
+        Returns:
+            Complete adb command list ready for subprocess.
+        """
         cmd = build_adb_command("logcat", self.device_serial)
+
+        # Historical window: dump-and-exit (-d) since a computed timestamp (-t).
+        # logcat's -t accepts a "MM-DD HH:MM:SS.mmm" timestamp and prints lines
+        # at or after it, then exits (no live follow).
+        if last_minutes is not None:
+            reference = now or datetime.now()
+            start_time = reference - timedelta(minutes=last_minutes)
+            cmd.append("-d")
+            cmd.append("-t")
+            cmd.append(start_time.strftime("%m-%d %H:%M:%S.000"))
 
         # Add format (time format with full timestamps)
         cmd.append("-v")
         cmd.append("time")
 
-        # Add app package filter if specified
-        if self.app_package:
-            # Get app PID
-            pid_cmd = build_adb_command("shell", self.device_serial, "pidof", self.app_package)
-            try:
-                result = subprocess.run(pid_cmd, capture_output=True, text=True, check=True)
-                pid = result.stdout.strip()
-                if pid:
-                    cmd.append(f"--pid={pid}")
-            except subprocess.CalledProcessError:
-                # App might not be running, continue without PID filter
-                pass
+        # Add app package filter if a PID was resolved
+        if pid:
+            cmd.append(f"--pid={pid}")
 
-        # Add severity filters
-        if self.severity_filter:
-            # Build priority filter string
-            # logcat uses single letters: V D I W E F
-            priority_letters = []
-            for sev in self.severity_filter:
-                if sev == "error":
-                    priority_letters.extend(["E", "F"])
-                elif sev == "warning":
-                    priority_letters.append("W")
-                elif sev == "info":
-                    priority_letters.append("I")
-                elif sev == "debug":
-                    priority_letters.append("D")
-                elif sev == "verbose":
-                    priority_letters.append("V")
+        # Add severity filter (single minimum priority, shows that level and up)
+        min_priority = self._severity_min_priority()
+        if min_priority:
+            cmd.append(f"*:{min_priority}")
 
-            # Use the minimum priority level (shows that level and above)
-            # V < D < I < W < E < F
-            priority_order = ["V", "D", "I", "W", "E", "F"]
-            if priority_letters:
-                min_priority = priority_order[
-                    min(priority_order.index(p) for p in priority_letters)
-                ]
-                cmd.append(f"*:{min_priority}")
+        return cmd
+
+    def _resolve_app_pid(self) -> str | None:
+        """Look up the running PID for ``self.app_package`` (None if not running)."""
+        if not self.app_package:
+            return None
+        pid_cmd = build_adb_command("shell", self.device_serial, "pidof", self.app_package)
+        try:
+            result = subprocess.run(pid_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError:
+            # App might not be running; continue without a PID filter.
+            return None
+        return result.stdout.strip() or None
+
+    def stream_logs(
+        self,
+        follow: bool = False,
+        duration: float | None = None,
+        clear_first: bool = False,
+        last_minutes: float | None = None,
+    ) -> bool:
+        """
+        Stream logs from device/emulator (or dump a historical window).
+
+        Args:
+            follow: Follow mode (continuous streaming)
+            duration: Capture duration in seconds
+            clear_first: Clear logcat buffer before streaming
+            last_minutes: Dump logs from the last N minutes (historical window via
+                ``logcat -d -t``) instead of streaming live
+
+        Returns:
+            True if successful
+        """
+        # Clear logcat if requested (ignored for historical windows, which read
+        # the existing buffer rather than streaming new lines).
+        if clear_first and last_minutes is None:
+            clear_cmd = build_adb_command("logcat", self.device_serial, "-c")
+            # Ignore clear errors
+            with contextlib.suppress(subprocess.CalledProcessError):
+                subprocess.run(clear_cmd, check=True, capture_output=True)
+
+        # Resolve app PID (device call) then build the command (pure mapping).
+        pid = self._resolve_app_pid()
+        cmd = self.build_logcat_command(pid=pid, last_minutes=last_minutes)
 
         # Setup signal handler for graceful interruption
         def signal_handler(sig, frame):
@@ -405,18 +471,18 @@ class LogMonitor:
         # Top issues
         if self.errors:
             lines.append(f"\nTop Errors ({len(self.errors)}):")
-            for error in self.errors[:5]:  # Show first 5
-                lines.append(f"  ❌ {error[:120]}")  # Truncate long lines
+            for error in self.errors[:LOG_TEXT_SUMMARY_CAP]:
+                lines.append(f"  ❌ {error[:LOG_LINE_MAX]}")  # Truncate long lines
 
         if self.warnings:
             lines.append(f"\nTop Warnings ({len(self.warnings)}):")
-            for warning in self.warnings[:5]:  # Show first 5
-                lines.append(f"  ⚠️  {warning[:120]}")
+            for warning in self.warnings[:LOG_TEXT_SUMMARY_CAP]:
+                lines.append(f"  ⚠️  {warning[:LOG_LINE_MAX]}")
 
         # Verbose output
         if verbose and self.log_lines:
             lines.append("\n=== Recent Log Lines ===")
-            for line in self.log_lines[-50:]:  # Last 50 lines
+            for line in self.log_lines[-LOG_TAIL:]:
                 lines.append(line)
 
         return "\n".join(lines)
@@ -434,9 +500,9 @@ class LogMonitor:
                 "debug": self.debug_count,
                 "verbose": self.verbose_count,
             },
-            "errors": self.errors[:20],  # Limit to 20
-            "warnings": self.warnings[:20],
-            "sample_logs": self.log_lines[-50:],  # Last 50 lines
+            "errors": self.errors[:LOG_JSON_CAP],
+            "warnings": self.warnings[:LOG_JSON_CAP],
+            "sample_logs": self.log_lines[-LOG_TAIL:],
         }
 
     def save_logs(self, output_dir: str) -> str:
@@ -486,6 +552,9 @@ Examples:
   # Show errors/warnings only
   python scripts/log_monitor.py --severity error,warning --duration 1m
 
+  # Inspect the last 5 minutes of history (logcat -d -t)
+  python scripts/log_monitor.py --app com.myapp --last 5m
+
   # Save logs to file
   python scripts/log_monitor.py --app com.myapp --duration 1m --output logs/
 
@@ -511,6 +580,11 @@ Examples:
         "--follow", action="store_true", help="Follow mode (continuous streaming)"
     )
     time_group.add_argument("--duration", help="Capture duration (e.g., 30s, 5m, 1h)")
+    time_group.add_argument(
+        "--last",
+        dest="last_window",
+        help="Dump a historical window from the last N (e.g., 5m, 1h) via 'logcat -d -t'",
+    )
 
     # Output options
     parser.add_argument("--output", help="Save logs to directory")
@@ -537,12 +611,25 @@ Examples:
     if args.duration:
         duration = monitor.parse_time_duration(args.duration)
 
+    # Parse historical window (--last); convert seconds -> minutes for logcat -t
+    last_minutes = None
+    if args.last_window:
+        last_minutes = monitor.parse_time_duration(args.last_window) / 60
+
     # Stream logs
-    print("Monitoring logs...", file=sys.stderr)
+    if last_minutes is not None:
+        print("Reading historical logs...", file=sys.stderr)
+    else:
+        print("Monitoring logs...", file=sys.stderr)
     if args.app_package:
         print(f"App: {args.app_package}", file=sys.stderr)
 
-    success = monitor.stream_logs(follow=args.follow, duration=duration, clear_first=args.clear)
+    success = monitor.stream_logs(
+        follow=args.follow,
+        duration=duration,
+        clear_first=args.clear,
+        last_minutes=last_minutes,
+    )
 
     if not success:
         sys.exit(1)

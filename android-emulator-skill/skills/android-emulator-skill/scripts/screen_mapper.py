@@ -35,7 +35,7 @@ Usage Examples:
 Output Format (default):
     Screen: MainActivity (45 elements, 7 interactive)
     Buttons: "Login", "Cancel", "Forgot Password"
-    EditTexts: 2 (0 filled)
+    EditTexts: 2 (0 filled) [1 secure]
     TextViews: "Sign In", "Welcome"
     Focusable: 7 elements
 
@@ -44,6 +44,11 @@ Technical Details:
 - Parses XML hierarchy with accessibility attributes
 - Identifies element types: Button, EditText, TextView, ImageView, etc.
 - Extracts labels from content-desc, text, and resource-id attributes
+- Reports secure/password inputs (password="true") separately
+
+Configuration (env overrides, ANDROID_EMU_ prefix):
+- ANDROID_EMU_SCREEN_BUTTONS_PREVIEW (default 15): button labels on summary line
+- ANDROID_EMU_SCREEN_SECTION_ITEMS (default 10): items per type in --verbose
 """
 
 import argparse
@@ -52,10 +57,15 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from pathlib import Path
-from typing import Optional
 
 from common.device_utils import build_adb_command, resolve_device_identifier
+from common.env_config import env_int
+
+# Preview limits (env-configurable; see SKILL.md -> Configuration).
+# BUTTONS_PREVIEW caps how many button labels render on the summary line.
+# SECTION_ITEMS_PREVIEW caps how many items render per type in --verbose mode.
+BUTTONS_PREVIEW = env_int("ANDROID_EMU_SCREEN_BUTTONS_PREVIEW", 15)
+SECTION_ITEMS_PREVIEW = env_int("ANDROID_EMU_SCREEN_SECTION_ITEMS", 10)
 
 
 class ScreenMapper:
@@ -160,6 +170,7 @@ class ScreenMapper:
             "text_views": [],
             "screen_name": None,
             "focusable": 0,
+            "secure_fields": 0,
         }
 
         self._analyze_recursive(root, analysis)
@@ -188,6 +199,8 @@ class ScreenMapper:
         clickable = node.get("clickable", "false") == "true"
         focusable = node.get("focusable", "false") == "true"
         enabled = node.get("enabled", "true") == "true"
+        # Android marks secure/password inputs with password="true".
+        is_secure = node.get("password", "false") == "true"
 
         # Extract simple class name (e.g., "android.widget.Button" -> "Button")
         simple_class = elem_class.split(".")[-1] if elem_class else "Unknown"
@@ -213,7 +226,11 @@ class ScreenMapper:
                 elif simple_class == "EditText":
                     is_filled = bool(text)
                     analysis["edit_texts"].append(
-                        {"label": content_desc or resource_id or "Unnamed", "filled": is_filled}
+                        {
+                            "label": content_desc or resource_id or "Unnamed",
+                            "filled": is_filled,
+                            "secure": is_secure,
+                        }
                     )
                 elif simple_class == "TextView" and label and clickable:
                     # Only track clickable TextViews (often used as buttons)
@@ -222,6 +239,10 @@ class ScreenMapper:
             # Count focusable
             if focusable and enabled:
                 analysis["focusable"] += 1
+
+            # Count secure/password fields separately (security-relevant inputs).
+            if is_secure:
+                analysis["secure_fields"] += 1
 
         # Recurse to children
         for child in node:
@@ -283,8 +304,8 @@ class ScreenMapper:
 
         # Buttons
         if analysis["buttons"]:
-            button_labels = '", "'.join(analysis["buttons"][:5])
-            if len(analysis["buttons"]) > 5:
+            button_labels = '", "'.join(analysis["buttons"][:BUTTONS_PREVIEW])
+            if len(analysis["buttons"]) > BUTTONS_PREVIEW:
                 lines.append(f'Buttons: "{button_labels}", ... ({len(analysis["buttons"])} total)')
             else:
                 lines.append(f'Buttons: "{button_labels}"')
@@ -292,7 +313,11 @@ class ScreenMapper:
         # EditTexts
         if analysis["edit_texts"]:
             filled_count = sum(1 for et in analysis["edit_texts"] if et["filled"])
-            lines.append(f"EditTexts: {len(analysis['edit_texts'])} ({filled_count} filled)")
+            edit_line = f"EditTexts: {len(analysis['edit_texts'])} ({filled_count} filled)"
+            secure_count = analysis.get("secure_fields", 0)
+            if secure_count:
+                edit_line += f" [{secure_count} secure]"
+            lines.append(edit_line)
 
         # Clickable TextViews
         if analysis["text_views"]:
@@ -313,10 +338,10 @@ class ScreenMapper:
             lines.append("\n--- Detailed Element Breakdown ---")
             for elem_type, elements in sorted(analysis["elements_by_type"].items()):
                 lines.append(f"\n{elem_type} ({len(elements)}):")
-                for i, elem in enumerate(elements[:10]):  # Limit to 10 per type
+                for i, elem in enumerate(elements[:SECTION_ITEMS_PREVIEW]):
                     lines.append(f"  {i+1}. {elem}")
-                if len(elements) > 10:
-                    lines.append(f"  ... and {len(elements) - 10} more")
+                if len(elements) > SECTION_ITEMS_PREVIEW:
+                    lines.append(f"  ... and {len(elements) - SECTION_ITEMS_PREVIEW} more")
 
         # Hints mode: Navigation suggestions
         if hints:

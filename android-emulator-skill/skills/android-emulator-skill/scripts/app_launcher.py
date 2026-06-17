@@ -17,6 +17,7 @@ import argparse
 import json as json_lib
 import subprocess
 import sys
+import time
 from typing import Optional
 
 from common.device_utils import (
@@ -26,6 +27,32 @@ from common.device_utils import (
     list_installed_packages,
     resolve_device_identifier,
 )
+from common.env_config import env_float
+
+# Delay between terminate and launch when restarting an app.
+RELAUNCH_DELAY_SECONDS = env_float("ANDROID_EMU_RELAUNCH_DELAY_MS", 1000.0) / 1000.0
+
+
+def parse_extras(pairs: list[str] | None) -> dict[str, str]:
+    """
+    Parse repeatable ``KEY=VALUE`` strings into a dict of intent string extras.
+
+    Args:
+        pairs: List of ``KEY=VALUE`` strings (from ``--args``), or None
+
+    Returns:
+        Mapping of extra keys to values
+
+    Raises:
+        ValueError: If a pair is malformed (missing ``=`` or empty key)
+    """
+    extras: dict[str, str] = {}
+    for pair in pairs or []:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise ValueError(f"invalid --args '{pair}', expected KEY=VALUE")
+        extras[key] = value
+    return extras
 
 
 class AppLauncher:
@@ -35,13 +62,20 @@ class AppLauncher:
         """Initialize with optional device serial."""
         self.serial = serial
 
-    def launch(self, package_name: str, activity: str | None = None) -> tuple:
+    def launch(
+        self,
+        package_name: str,
+        activity: str | None = None,
+        extras: dict[str, str] | None = None,
+    ) -> tuple:
         """
         Launch app by package name.
 
         Args:
             package_name: App package name (e.g., "com.example.app")
             activity: Optional activity name (auto-detects launcher activity if None)
+            extras: Optional intent string extras passed to "am start" as
+                "--es KEY VALUE" pairs
 
         Returns:
             (success, message) tuple
@@ -59,6 +93,11 @@ class AppLauncher:
             # Build activity component name
             component = f"{package_name}/{activity}" if "/" not in activity else activity
 
+            # Build intent string extras as "--es KEY VALUE" pairs
+            extra_args: list[str] = []
+            for key, value in (extras or {}).items():
+                extra_args.extend(["--es", key, value])
+
             # Launch activity
             cmd = build_adb_command(
                 "shell",
@@ -69,6 +108,7 @@ class AppLauncher:
                 component,
                 "-a",
                 "android.intent.action.MAIN",
+                *extra_args,
             )
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
@@ -100,6 +140,38 @@ class AppLauncher:
 
         except subprocess.CalledProcessError as e:
             return False, f"Terminate failed: {e.stderr}"
+
+    def restart(
+        self,
+        package_name: str,
+        activity: str | None = None,
+        extras: dict[str, str] | None = None,
+        delay: float = RELAUNCH_DELAY_SECONDS,
+    ) -> tuple:
+        """
+        Restart app: terminate then launch, sleeping between the two.
+
+        Args:
+            package_name: App package name
+            activity: Optional activity name (auto-detects launcher activity if None)
+            extras: Optional intent string extras forwarded to the relaunch
+            delay: Seconds to sleep between terminate and launch
+
+        Returns:
+            (success, message) tuple
+        """
+        term_success, term_message = self.terminate(package_name)
+        if not term_success:
+            return False, term_message
+
+        if delay > 0:
+            time.sleep(delay)
+
+        launch_success, launch_message = self.launch(package_name, activity, extras)
+        if not launch_success:
+            return False, launch_message
+
+        return True, f"Restarted: {package_name}"
 
     def install(self, apk_path: str, replace: bool = True) -> tuple:
         """
@@ -285,6 +357,12 @@ Examples:
   # Launch specific activity
   python app_launcher.py --launch com.example.app --activity .MainActivity
 
+  # Launch with intent string extras (repeatable)
+  python app_launcher.py --launch com.example.app --args mode=test --args env=ci
+
+  # Restart app (terminate then launch)
+  python app_launcher.py --restart com.example.app
+
   # Terminate app
   python app_launcher.py --terminate com.example.app
 
@@ -307,7 +385,14 @@ Examples:
 
     parser.add_argument("--serial", "-s", help="Device serial number (auto-detects if omitted)")
     parser.add_argument("--launch", help="Launch app by package name")
-    parser.add_argument("--activity", help="Activity name for launch (optional)")
+    parser.add_argument("--restart", help="Restart app by package name (terminate then launch)")
+    parser.add_argument("--activity", help="Activity name for launch/restart (optional)")
+    parser.add_argument(
+        "--args",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Intent string extra (repeatable); passed to 'am start' as '--es KEY VALUE'",
+    )
     parser.add_argument("--terminate", help="Terminate app by package name")
     parser.add_argument("--install", help="Install APK from path")
     parser.add_argument("--uninstall", help="Uninstall app by package name")
@@ -318,6 +403,13 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
     args = parser.parse_args()
+
+    # Parse --args KEY=VALUE intent extras, failing fast on malformed input.
+    try:
+        extras = parse_extras(args.args)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Resolve device
     try:
@@ -330,11 +422,23 @@ Examples:
 
     # Execute operation
     if args.launch:
-        success, message = launcher.launch(args.launch, args.activity)
+        success, message = launcher.launch(args.launch, args.activity, extras or None)
         if args.json:
             print(
                 json_lib.dumps(
                     {"success": success, "message": message, "action": "launch"}, indent=2
+                )
+            )
+        else:
+            print(message)
+        sys.exit(0 if success else 1)
+
+    elif args.restart:
+        success, message = launcher.restart(args.restart, args.activity, extras or None)
+        if args.json:
+            print(
+                json_lib.dumps(
+                    {"success": success, "message": message, "action": "restart"}, indent=2
                 )
             )
         else:

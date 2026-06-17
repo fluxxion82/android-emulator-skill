@@ -17,9 +17,13 @@ import argparse
 import subprocess
 import sys
 import time
-from typing import Optional
 
-from common.device_utils import get_connected_devices, list_devices
+from common.device_utils import build_adb_command, get_connected_devices
+from common.env_config import env_float, env_int
+
+# Tunable defaults (override via the ANDROID_EMU_ prefix).
+DEFAULT_BOOT_TIMEOUT = env_int("ANDROID_EMU_BOOT_TIMEOUT", 300)
+POLL_INTERVAL_SECONDS = env_float("ANDROID_EMU_POLL_INTERVAL", 0.5, min_value=0.05)
 
 
 class EmulatorBooter:
@@ -30,7 +34,10 @@ class EmulatorBooter:
         self.avd_name = avd_name
 
     def boot(
-        self, wait_ready: bool = False, timeout_seconds: int = 120, headless: bool = False
+        self,
+        wait_ready: bool = False,
+        timeout_seconds: int = DEFAULT_BOOT_TIMEOUT,
+        headless: bool = False,
     ) -> tuple:
         """
         Boot emulator and optionally wait for readiness.
@@ -110,7 +117,7 @@ class EmulatorBooter:
             "(use --wait-ready to wait for availability)"
         )
 
-    def _wait_for_ready(self, timeout_seconds: int = 120) -> tuple:
+    def _wait_for_ready(self, timeout_seconds: int = DEFAULT_BOOT_TIMEOUT) -> tuple:
         """
         Wait for emulator to reach ready state.
 
@@ -121,7 +128,7 @@ class EmulatorBooter:
             (success, message) tuple
         """
         start_time = time.time()
-        poll_interval = 2.0
+        poll_interval = POLL_INTERVAL_SECONDS
         checks = 0
 
         while True:
@@ -165,7 +172,7 @@ class EmulatorBooter:
             True if boot completed
         """
         try:
-            cmd = ["adb", "-s", serial, "shell", "getprop", "sys.boot_completed"]
+            cmd = build_adb_command("shell", serial, "getprop", "sys.boot_completed")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
             return result.stdout.strip() == "1"
         except Exception:
@@ -182,11 +189,43 @@ class EmulatorBooter:
             AVD name, or None if not found
         """
         try:
-            cmd = ["adb", "-s", serial, "emu", "avd", "name"]
+            cmd = build_adb_command("emu", serial, "avd", "name")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
             return result.stdout.strip()
         except Exception:
             return None
+
+    @staticmethod
+    def boot_all(headless: bool = False) -> tuple[int, int, list[dict]]:
+        """
+        Boot every AVD defined on this host.
+
+        Each AVD is launched in the background (no readiness wait), mirroring the
+        single-AVD non-blocking boot path so batch boots stay fast.
+
+        Args:
+            headless: Boot each AVD in headless mode (no GUI)
+
+        Returns:
+            (succeeded, failed, results) tuple where ``results`` is a list of
+            ``{"avd": name, "success": bool, "message": str}`` dicts.
+        """
+        avds = list_avds()
+        succeeded = 0
+        failed = 0
+        results: list[dict] = []
+
+        for avd in avds:
+            name = avd["name"]
+            booter = EmulatorBooter(name)
+            success, message = booter.boot(wait_ready=False, headless=headless)
+            if success:
+                succeeded += 1
+            else:
+                failed += 1
+            results.append({"avd": name, "success": success, "message": message})
+
+        return succeeded, failed, results
 
 
 def list_avds() -> list:
@@ -234,6 +273,9 @@ Examples:
   # Boot in headless mode
   python emulator_boot.py --avd Pixel_5_API_33 --headless
 
+  # Boot all defined AVDs
+  python emulator_boot.py --all
+
   # List available AVDs
   python emulator_boot.py --list-avds
         """,
@@ -241,13 +283,21 @@ Examples:
 
     parser.add_argument("--avd", help="AVD name to boot")
     parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Boot all defined AVDs (background boot, no readiness wait)",
+    )
+    parser.add_argument(
         "--wait-ready", action="store_true", help="Wait for emulator to be ready before returning"
     )
     parser.add_argument(
         "--timeout",
         type=int,
-        default=120,
-        help="Timeout in seconds for readiness check (default: 120)",
+        default=DEFAULT_BOOT_TIMEOUT,
+        help=(
+            f"Timeout in seconds for readiness check "
+            f"(default: {DEFAULT_BOOT_TIMEOUT}, override via ANDROID_EMU_BOOT_TIMEOUT)"
+        ),
     )
     parser.add_argument("--headless", action="store_true", help="Boot in headless mode (no GUI)")
     parser.add_argument("--list-avds", action="store_true", help="List available AVDs")
@@ -269,6 +319,31 @@ Examples:
         else:
             print("No AVDs found")
         sys.exit(0)
+
+    # Boot-all mode
+    if args.all:
+        succeeded, failed, results = EmulatorBooter.boot_all(headless=args.headless)
+        total = succeeded + failed
+        if args.json:
+            import json
+
+            print(
+                json.dumps(
+                    {
+                        "action": "boot_all",
+                        "succeeded": succeeded,
+                        "failed": failed,
+                        "total": total,
+                        "results": results,
+                    },
+                    indent=2,
+                )
+            )
+        elif total == 0:
+            print("No AVDs found")
+        else:
+            print(f"Boot summary: {succeeded}/{total} succeeded, {failed} failed")
+        sys.exit(0 if failed == 0 else 1)
 
     # Boot mode
     if not args.avd:

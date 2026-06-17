@@ -37,9 +37,16 @@ Output Format:
 import argparse
 import subprocess
 import sys
-from typing import Optional
+import time
 
 from common.device_utils import build_adb_command, resolve_device_identifier
+from common.env_config import env_float, env_int
+
+# Tunable defaults (override via ANDROID_EMU_* env vars).
+DEFAULT_TYPE_DELAY = env_float("ANDROID_EMU_KEYBOARD_TYPE_DELAY", 0.0)
+DEFAULT_KEY_COUNT = env_int("ANDROID_EMU_KEYBOARD_KEY_COUNT", 1)
+# Small pause between repeated keyevents so the IME/app can register each one.
+KEY_REPEAT_DELAY = env_float("ANDROID_EMU_KEYBOARD_KEY_REPEAT_DELAY", 0.05)
 
 
 class KeyboardSimulator:
@@ -74,40 +81,61 @@ class KeyboardSimulator:
         """Initialize keyboard simulator."""
         self.serial = serial
 
-    def type_text(self, text: str) -> tuple:
+    @staticmethod
+    def _escape_text(text: str) -> str:
+        """Escape text for `adb shell input text` (space -> %s, etc.)."""
+        return (
+            text.replace("\\", "\\\\")
+            .replace(" ", "%s")
+            .replace('"', '\\"')
+            .replace("'", "\\'")
+            .replace("$", "\\$")
+            .replace("`", "\\`")
+        )
+
+    def _input_text(self, text: str) -> tuple:
+        """Send a single `input text` chunk; returns (success, message)."""
+        try:
+            cmd = build_adb_command("shell", self.serial, "input", "text", self._escape_text(text))
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True, ""
+        except subprocess.CalledProcessError as e:
+            return False, f"Type failed: {e.stderr}"
+
+    def type_text(self, text: str, delay: float = 0.0) -> tuple:
         """
         Type text at current cursor position.
 
         Args:
             text: Text to type
+            delay: Seconds to pause between characters for slow typing. When 0
+                (default) the whole string is sent in a single `input text`.
 
         Returns:
             (success, message) tuple
         """
-        try:
-            # Escape special characters for shell
-            # Space must be %s, quotes and other special chars need escaping
-            escaped_text = (
-                text.replace("\\", "\\\\")
-                .replace(" ", "%s")
-                .replace('"', '\\"')
-                .replace("'", "\\'")
-                .replace("$", "\\$")
-                .replace("`", "\\`")
-            )
+        if delay > 0:
+            # Type character by character with a delay (useful for fields that
+            # debounce input or trigger per-keystroke animations).
+            for char in text:
+                success, message = self._input_text(char)
+                if not success:
+                    return False, message
+                time.sleep(delay)
+            return True, f'Typed: "{text}" (slowly, {delay}s/char)'
 
-            cmd = build_adb_command("shell", self.serial, "input", "text", escaped_text)
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True, f'Typed: "{text}"'
-        except subprocess.CalledProcessError as e:
-            return False, f"Type failed: {e.stderr}"
+        success, message = self._input_text(text)
+        if not success:
+            return False, message
+        return True, f'Typed: "{text}"'
 
-    def press_key(self, key: str) -> tuple:
+    def press_key(self, key: str, count: int = 1) -> tuple:
         """
         Press a special key.
 
         Args:
             key: Key name (enter, delete, tab, etc.)
+            count: Number of times to press the key (defaults to 1).
 
         Returns:
             (success, message) tuple
@@ -118,13 +146,20 @@ class KeyboardSimulator:
             return False, f"Unknown key: {key}. Available: {available}"
 
         keycode = self.KEY_CODES[key_lower]
+        repeats = max(count, 1)
 
         try:
             cmd = build_adb_command("shell", self.serial, "input", "keyevent", keycode)
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True, f"Pressed: {keycode}"
+            for i in range(repeats):
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                if i < repeats - 1 and KEY_REPEAT_DELAY > 0:
+                    time.sleep(KEY_REPEAT_DELAY)
         except subprocess.CalledProcessError as e:
             return False, f"Key press failed: {e.stderr}"
+
+        if repeats > 1:
+            return True, f"Pressed: {keycode} ({repeats}x)"
+        return True, f"Pressed: {keycode}"
 
     def press_button(self, button: str) -> tuple:
         """
@@ -193,6 +228,21 @@ class KeyboardSimulator:
         except subprocess.CalledProcessError as e:
             return False, f"Hide keyboard failed: {e.stderr}"
 
+    def dismiss_keyboard(self) -> tuple:
+        """
+        Dismiss the soft keyboard by pressing the BACK key.
+
+        On Android, BACK closes an open IME without leaving the current screen,
+        which is the native equivalent of dismissing the keyboard.
+
+        Returns:
+            (success, message) tuple
+        """
+        success, message = self.press_key("back")
+        if not success:
+            return False, f"Dismiss keyboard failed: {message}"
+        return True, "Dismissed keyboard"
+
     def key_combination(self, keys: list) -> tuple:
         """
         Press multiple keys in sequence.
@@ -220,10 +270,16 @@ Examples:
   # Type text
   python keyboard.py --type "Hello World"
 
+  # Type slowly (0.1s between characters)
+  python keyboard.py --type "slow typing" --delay 0.1
+
   # Press special key
   python keyboard.py --key enter
   python keyboard.py --key delete
   python keyboard.py --key tab
+
+  # Press delete 5 times
+  python keyboard.py --key delete --count 5
 
   # Press hardware button
   python keyboard.py --button back
@@ -232,8 +288,9 @@ Examples:
   # Clear text field
   python keyboard.py --clear 10
 
-  # Hide keyboard
+  # Hide / dismiss keyboard
   python keyboard.py --hide-keyboard
+  python keyboard.py --dismiss
 
   # Key combination
   python keyboard.py --keys enter,back
@@ -248,12 +305,27 @@ Available Keys:
 
     parser.add_argument("--serial", "-s", help="Device serial number (auto-detects if omitted)")
     parser.add_argument("--type", help="Type text")
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=DEFAULT_TYPE_DELAY,
+        metavar="SECONDS",
+        help="Seconds to pause between characters when typing (slow typing)",
+    )
     parser.add_argument("--key", help="Press special key")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=DEFAULT_KEY_COUNT,
+        metavar="N",
+        help="Repeat the --key keyevent N times (default 1)",
+    )
     parser.add_argument("--button", help="Press hardware button")
     parser.add_argument("--keys", help="Press multiple keys (comma-separated)")
     parser.add_argument("--clear", type=int, metavar="COUNT", help="Clear text (delete N times)")
     parser.add_argument("--show-keyboard", action="store_true", help="Show soft keyboard")
     parser.add_argument("--hide-keyboard", action="store_true", help="Hide soft keyboard")
+    parser.add_argument("--dismiss", action="store_true", help="Dismiss the keyboard (press BACK)")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
     args = parser.parse_args()
@@ -272,9 +344,9 @@ Available Keys:
     message = ""
 
     if args.type:
-        success, message = keyboard.type_text(args.type)
+        success, message = keyboard.type_text(args.type, args.delay)
     elif args.key:
-        success, message = keyboard.press_key(args.key)
+        success, message = keyboard.press_key(args.key, args.count)
     elif args.button:
         success, message = keyboard.press_button(args.button)
     elif args.keys:
@@ -286,6 +358,8 @@ Available Keys:
         success, message = keyboard.show_keyboard()
     elif args.hide_keyboard:
         success, message = keyboard.hide_keyboard()
+    elif args.dismiss:
+        success, message = keyboard.dismiss_keyboard()
     else:
         parser.print_help()
         sys.exit(1)

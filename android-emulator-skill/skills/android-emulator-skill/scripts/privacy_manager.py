@@ -12,11 +12,26 @@ Usage Examples:
     # Revoke location permission
     python scripts/privacy_manager.py --revoke location --package com.myapp
 
+    # Reset a permission (Android: alias for revoke; see note below)
+    python scripts/privacy_manager.py --reset camera --package com.myapp
+
     # List app permissions
     python scripts/privacy_manager.py --list --package com.myapp
 
     # Grant multiple permissions
     python scripts/privacy_manager.py --grant camera,location,storage --package com.myapp
+
+    # Record a test-trail scenario/step alongside the operation
+    python scripts/privacy_manager.py --revoke camera --package com.myapp \
+        --scenario onboarding --step 2
+
+Note on --reset:
+    Unlike iOS (xcrun simctl privacy reset), Android has no command that returns
+    a runtime permission to the original "ask on next use" prompt state. The
+    closest device-native operation is ``pm revoke``, which sets the permission
+    back to denied. ``--reset`` is therefore implemented as an explicit alias for
+    revoke so test trails can express intent symmetrically with iOS; the recorded
+    output marks the reset as revoke-based for transparency.
 """
 
 import argparse
@@ -24,9 +39,13 @@ import json
 import subprocess
 import sys
 from datetime import datetime
-from typing import Optional
 
 from common.device_utils import build_adb_command
+from common.env_config import env_int
+
+# Subprocess timeout (seconds) for adb calls. Permission ops are fast; dumpsys
+# package can take longer on a busy device, so allow an override.
+ADB_TIMEOUT_SECONDS = env_int("ANDROID_EMU_PRIVACY_ADB_TIMEOUT", 30, min_value=1)
 
 
 class PrivacyManager:
@@ -104,7 +123,9 @@ class PrivacyManager:
         cmd = build_adb_command("shell", self.serial, "pm", "grant", package, full_permission)
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            )
             return True, f"Granted {permission} to {package}"
 
         except subprocess.CalledProcessError as e:
@@ -137,12 +158,40 @@ class PrivacyManager:
         cmd = build_adb_command("shell", self.serial, "pm", "revoke", package, full_permission)
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            )
             return True, f"Revoked {permission} from {package}"
 
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to revoke permission: {error_msg}"
+
+    def reset_permission(self, package: str, permission: str) -> tuple:
+        """
+        Reset permission to its default state.
+
+        Android-native note: there is no adb/pm command that returns a runtime
+        permission to the original "ask on next use" prompt state (unlike iOS's
+        ``xcrun simctl privacy reset``). The closest native operation is
+        ``pm revoke``, which sets the permission back to denied. This method is
+        therefore an explicit alias for :meth:`revoke_permission`; the returned
+        message records that the reset was performed via revoke for transparency.
+
+        Args:
+            package: App package name
+            permission: Permission to reset (short or full name)
+
+        Returns:
+            (success, message) tuple
+        """
+        success, message = self.revoke_permission(package, permission)
+        if success:
+            return (
+                True,
+                f"Reset {permission} for {package} (via revoke; Android has no prompt reset)",
+            )
+        return success, message
 
     def list_app_permissions(self, package: str) -> tuple:
         """
@@ -157,7 +206,9 @@ class PrivacyManager:
         cmd = build_adb_command("shell", self.serial, "dumpsys", "package", package)
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            )
 
             # Parse dumpsys output for permissions
             granted_permissions = []
@@ -203,6 +254,33 @@ class PrivacyManager:
             return False, f"Failed to list permissions: {error_msg}", None
 
 
+def build_test_trail(scenario: str | None, step: int | None) -> dict | None:
+    """
+    Build optional test-trail metadata recorded alongside an operation.
+
+    Mirrors the iOS privacy manager's scenario/step audit fields so test trails
+    are symmetric across platforms. Returns ``None`` when no metadata was
+    supplied so the operation output stays unchanged for the common case.
+
+    Args:
+        scenario: Test scenario name (or None).
+        step: Step number within the scenario (or None).
+
+    Returns:
+        A dict with a timestamp plus any provided fields, or None if neither
+        ``scenario`` nor ``step`` was given.
+    """
+    if scenario is None and step is None:
+        return None
+
+    trail: dict = {"timestamp": datetime.now().isoformat()}
+    if scenario is not None:
+        trail["scenario"] = scenario
+    if step is not None:
+        trail["step"] = step
+    return trail
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -216,8 +294,15 @@ Examples:
   # Revoke location
   python scripts/privacy_manager.py --revoke location --package com.myapp
 
+  # Reset a permission (Android: alias for revoke; no prompt-state reset exists)
+  python scripts/privacy_manager.py --reset camera --package com.myapp
+
   # Grant multiple permissions
   python scripts/privacy_manager.py --grant camera,location,storage --package com.myapp
+
+  # Record a test-trail scenario/step with the operation
+  python scripts/privacy_manager.py --revoke camera --package com.myapp \\
+      --scenario onboarding --step 2
 
   # List app permissions
   python scripts/privacy_manager.py --list --package com.myapp
@@ -236,9 +321,22 @@ Examples:
     op_group = parser.add_mutually_exclusive_group()
     op_group.add_argument("--grant", help="Grant permission(s) (comma-separated)")
     op_group.add_argument("--revoke", help="Revoke permission(s) (comma-separated)")
+    op_group.add_argument(
+        "--reset",
+        help=(
+            "Reset permission(s) (comma-separated). Android has no prompt-state "
+            "reset, so this is an alias for revoke."
+        ),
+    )
     op_group.add_argument("--list", action="store_true", help="List app permissions")
     op_group.add_argument(
         "--list-permissions", action="store_true", help="List available permission names"
+    )
+
+    # Test-trail metadata (optional; recorded in operation output for parity)
+    parser.add_argument("--scenario", help="Test scenario name to record in operation output")
+    parser.add_argument(
+        "--step", type=int, help="Step number within the test scenario to record in output"
     )
 
     parser.add_argument("--json", action="store_true", help="Output as JSON")
@@ -288,39 +386,37 @@ Examples:
 
         sys.exit(0 if success else 1)
 
-    # Grant permissions
-    if args.grant:
-        permissions = [p.strip() for p in args.grant.split(",")]
+    # Grant / revoke / reset permissions (shared handling)
+    op_map = {
+        "grant": (args.grant, manager.grant_permission),
+        "revoke": (args.revoke, manager.revoke_permission),
+        "reset": (args.reset, manager.reset_permission),
+    }
+    for action, (raw, action_fn) in op_map.items():
+        if not raw:
+            continue
+
+        permissions = [p.strip() for p in raw.split(",")]
         results = []
 
         for permission in permissions:
-            success, message = manager.grant_permission(args.package, permission)
+            success, message = action_fn(args.package, permission)
             results.append({"permission": permission, "success": success, "message": message})
 
             if args.verbose or not success:
                 print(message)
 
-        if args.json:
-            print(json.dumps({"results": results}, indent=2))
-
-        # Exit with error if any failed
-        all_success = all(r["success"] for r in results)
-        sys.exit(0 if all_success else 1)
-
-    # Revoke permissions
-    if args.revoke:
-        permissions = [p.strip() for p in args.revoke.split(",")]
-        results = []
-
-        for permission in permissions:
-            success, message = manager.revoke_permission(args.package, permission)
-            results.append({"permission": permission, "success": success, "message": message})
-
-            if args.verbose or not success:
-                print(message)
+        test_trail = build_test_trail(args.scenario, args.step)
 
         if args.json:
-            print(json.dumps({"results": results}, indent=2))
+            output: dict = {"action": action, "results": results}
+            if test_trail is not None:
+                output["test_trail"] = test_trail
+            print(json.dumps(output, indent=2))
+        elif test_trail is not None and args.verbose:
+            location = f" (step {args.step})" if args.step is not None else ""
+            scenario_info = f" in {args.scenario}" if args.scenario is not None else ""
+            print(f"[Test trail] {test_trail['timestamp']}: {action}{scenario_info}{location}")
 
         # Exit with error if any failed
         all_success = all(r["success"] for r in results)
