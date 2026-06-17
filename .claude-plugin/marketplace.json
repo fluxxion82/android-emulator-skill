@@ -1,0 +1,14 @@
+{
+  "name": "fluxxion82",
+  "owner": {
+    "name": "fluxxion82"
+  },
+  "description": "Android emulator automation skills for Claude Code",
+  "plugins": [
+    {
+      "name": "android-emulator-skill",
+      "source": "./android-emulator-skill",
+      "description": "Production-ready scripts for Android app testing, building, and automation"
+    }
+  ]
+}

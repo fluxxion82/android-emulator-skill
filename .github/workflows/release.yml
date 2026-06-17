@@ -1,0 +1,57 @@
+name: Package and Release Skill
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package skill and upload to release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate skill structure
+        run: |
+          echo "Validating android-emulator-skill/ package structure..."
+          test -f android-emulator-skill/.claude-plugin/plugin.json || { echo "ERROR: plugin.json not found"; exit 1; }
+          test -f android-emulator-skill/skills/android-emulator-skill/SKILL.md || { echo "ERROR: SKILL.md not found"; exit 1; }
+          test -d android-emulator-skill/skills/android-emulator-skill/scripts || { echo "ERROR: scripts directory not found"; exit 1; }
+          echo "✅ Skill structure validated successfully"
+
+      - name: Create skill package
+        run: |
+          cd android-emulator-skill
+          zip -r ../android-emulator-skill-${{ github.ref_name }}.zip . \
+            -x "*.pyc" \
+            -x "__pycache__/*" \
+            -x "*.DS_Store"
+          cd ..
+          echo "📦 Created package: android-emulator-skill-${{ github.ref_name }}.zip"
+          ls -lh android-emulator-skill-${{ github.ref_name }}.zip
+
+      - name: Upload package to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: android-emulator-skill-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Release summary
+        run: |
+          echo "## 🎉 Release Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Package:** android-emulator-skill-${{ github.ref_name }}.zip" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Installation (Claude Code plugin)" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Add this repo as a marketplace, then install the plugin:" >> $GITHUB_STEP_SUMMARY
+          echo "claude plugin marketplace add ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "claude plugin install android-emulator-skill@fluxxion82" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,40 @@
+name: Run Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py'
+      - 'tests/**'
+
+jobs:
+  test:
+    name: Run pytest (mocked, no device required)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run pytest
+        run: |
+          echo "🧪 Running unit tests (adb/subprocess mocked)..."
+          pytest tests/

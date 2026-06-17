@@ -1,0 +1,52 @@
+name: Lint Python Code
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py'
+      - 'pyproject.toml'
+      - '.github/workflows/lint.yml'
+
+  push:
+    branches: [main]
+    paths:
+      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py'
+
+jobs:
+  lint:
+    name: Run Black and Ruff
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'black==26.5.1' 'ruff==0.15.14'
+
+      - name: Run Black (formatter check)
+        run: |
+          echo "🎨 Checking code formatting with Black..."
+          black --check --diff android-emulator-skill/skills/android-emulator-skill/scripts/
+
+      - name: Run Ruff (linter)
+        run: |
+          echo "🔍 Linting code with Ruff..."
+          ruff check android-emulator-skill/skills/android-emulator-skill/scripts/
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## ✅ All Linting Checks Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Black: Code formatting is correct" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Ruff: No linting issues found" >> $GITHUB_STEP_SUMMARY
