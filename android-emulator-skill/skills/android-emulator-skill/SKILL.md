@@ -31,7 +31,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.4.0)
 
-### Implemented (20 scripts)
+### Implemented (26 scripts)
 
 #### Core Utilities (3 modules)
 1. **common/device_utils.py** - ADB command building and device detection
@@ -173,6 +173,25 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - List notification channels
     - Multiple delivery methods
     - Options: `--package`, `--title`, `--message`, `--id`, `--data`, `--list-channels`, `--method`, `--serial`, `--json`
+
+#### Discovery & Device State (6 scripts) ⭐ NEW
+
+24. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
+
+25. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
+    - Options: `--get-details`, `--device-type`/`--name`, `--json`
+
+26. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
+    - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
+
+27. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
+    - Options: `--res DIR`, `--source DIR`, `--locale CODE`, `--strict`, `--json`, `--verbose`
+
+28. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
+    - Options: `--theme {light,dark}`, `--text-size {small,default,large,xl}`, `--font-scale`, `--locale`, `--reset`, `--serial`, `--json`
+
+29. **location.py** - Simulate GPS on an emulator via `adb emu geo fix` (fixed coords, city presets, GPX route replay). Emulator-only.
+    - Options: `--lat`/`--lng`, `--city`, `--gpx FILE`, `--interval`/`--speed`, `--clear`, `--list-cities`, `--serial`, `--json`
 
 ## Android vs iOS Mapping
 
@@ -362,12 +381,12 @@ this mirror. Treat the script list above as the **currently implemented baseline
 
 **Implemented today:** app lifecycle, emulator lifecycle (create/boot/shutdown/erase/delete), semantic
 navigation, gestures, keyboard, Gradle build/test, logcat monitoring, accessibility audit, visual diff, test
-recording, state capture, permissions, clipboard, status bar, push notifications.
+recording, state capture, permissions, clipboard, status bar, push notifications, environment health check,
+device/AVD discovery + selector, localization audit (`res/values` strings), appearance (dark mode / font
+scale), and location (`adb emu geo fix` + GPX route replay).
 
-**Planned (porting from iOS as Android-native tools):** environment health check, device/AVD discovery +
-selector, localization audit (`res/values` strings), appearance (dark mode / font scale), location
-(`adb emu geo fix` + GPX route replay), debuggable-app container inspector, a richer Gradle build subpackage
-(JUnit-XML test parsing), a Room/SQLite persistence inspector, and an ANR/jank watcher.
+**Planned (porting from iOS as Android-native tools):** a debuggable-app container inspector, a richer Gradle
+build subpackage (JUnit-XML test parsing), a Room/SQLite persistence inspector, and an ANR/jank watcher.
 
 ## Contributing
 
