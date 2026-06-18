@@ -31,7 +31,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.4.0)
 
-### Implemented (28 scripts)
+### Implemented (29 scripts)
 
 #### Core Utilities (3 modules)
 1. **common/device_utils.py** - ADB command building and device detection
@@ -198,7 +198,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 31. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
     - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
-> The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`.
+32. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
+    - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
+    - Legacy: `--watch [--duration N]`, `--since 5m`; plus `--budget-tokens`, `--terse`, `--json`
+
+> The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`. The ANR watcher's clustering/session machinery lives in `common/anr_pipeline.py` and `common/anr_sessions.py`.
 
 ## Android vs iOS Mapping
 
@@ -391,9 +395,12 @@ navigation, gestures, keyboard, Gradle build/test, logcat monitoring, accessibil
 recording, state capture, permissions, clipboard, status bar, push notifications, environment health check,
 device/AVD discovery + selector, localization audit (`res/values` strings), appearance (dark mode / font
 scale), location (`adb emu geo fix` + GPX route replay), a Gradle build subpackage with progressive disclosure,
-a debuggable-app container inspector, and a Room/SQLite persistence inspector.
+a debuggable-app container inspector, a Room/SQLite persistence inspector, and an ANR/jank watcher.
 
-**Planned (porting from iOS as Android-native tools):** an ANR/jank watcher.
+**Parity status:** the targeted iOS v1.5 feature set has been ported to Android-native equivalents. iOS-only
+mechanics (os_log hang predicates, HangBuster raw-capture/symbolication, xcresult specifics) are intentionally
+not mirrored; some controls are rescoped to Android realities (appearance locale is best-effort, container
+inspection is debuggable-apps-only, location is emulator-first).
 
 ## Contributing
 
