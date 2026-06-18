@@ -1,256 +1,270 @@
 #!/usr/bin/env python3
 """
-Build and Test Automation for Android Gradle Projects
+Build and Test Automation for Android Gradle Projects.
 
-Token-efficient build automation with progressive disclosure.
+Ultra token-efficient build automation with progressive disclosure. The default
+output is one summary line plus a result ID; drill into details on demand with
+``--get-errors`` / ``--get-warnings`` / ``--get-log <ID>``.
 
-Features:
-- Minimal default output (5-10 tokens)
-- Progressive disclosure for error/warning details
-- Build and test execution
-- Clean modular architecture
+Architecture mirrors the iOS ``xcode/`` subpackage but uses Gradle-native
+mechanics (gradlew tasks, JUnit XML, console parsing). See ``scripts/gradle/``.
 
 Usage Examples:
     # Build (minimal output)
     python scripts/build_and_test.py --project /path/to/project
-    # Output: Build: SUCCESS (0 errors, 3 warnings) [1:32]
+    # Output: Build: SUCCESS (0 errors, 3 warnings) [1:32] [build-20251028-143052]
 
-    # Run tests
-    python scripts/build_and_test.py --project /path/to/project --test
+    # Build a specific module + variant, clean first
+    python scripts/build_and_test.py --project . --module :app --variant release --clean
 
-    # Clean build
-    python scripts/build_and_test.py --project /path/to/project --clean
+    # Run unit tests (parses JUnit XML for pass/fail + failed names)
+    python scripts/build_and_test.py --project . --test
 
-    # Specific variant
-    python scripts/build_and_test.py --project /path/to/project --variant debug
+    # Filter tests
+    python scripts/build_and_test.py --project . --test --suite "com.example.MyTest"
 
-    # Verbose output
-    python scripts/build_and_test.py --project /path/to/project --verbose
+    # Drill into a previous build's details
+    python scripts/build_and_test.py --get-errors build-20251028-143052
+    python scripts/build_and_test.py --get-warnings build-20251028-143052
+    python scripts/build_and_test.py --get-log build-20251028-143052
+
+    # List recent builds
+    python scripts/build_and_test.py --list-builds
 """
 
 import argparse
 import json
-import re
-import subprocess
 import sys
-import time
-from pathlib import Path
-from typing import Optional
+
+from common.env_config import env_int
+from gradle import BuildResultCache, BuildRunner, OutputFormatter
+
+BUILD_JSON_CAP = env_int("ANDROID_EMU_BUILD_JSON_CAP", 50)
 
 
-class BuildRunner:
-    """Runs Android Gradle builds with token-efficient output."""
+def _print_get_errors(payload: dict, as_json: bool) -> int:
+    """Print cached errors for a build ID."""
+    errors = payload.get("errors", [])
+    if as_json:
+        print(json.dumps(errors[:BUILD_JSON_CAP], indent=2))
+    else:
+        print(OutputFormatter.format_errors(errors))
+    return 0
 
-    def __init__(self, project_dir: str):
-        """
-        Initialize build runner.
 
-        Args:
-            project_dir: Path to Android project directory
-        """
-        self.project_dir = Path(project_dir)
+def _print_get_warnings(payload: dict, as_json: bool) -> int:
+    """Print cached warnings for a build ID."""
+    warnings = payload.get("warnings", [])
+    if as_json:
+        print(json.dumps(warnings[:BUILD_JSON_CAP], indent=2))
+    else:
+        print(OutputFormatter.format_warnings(warnings))
+    return 0
 
-        if not self.project_dir.exists():
-            raise ValueError(f"Project directory not found: {project_dir}")
 
-        # Find gradlew
-        self.gradlew = self.project_dir / "gradlew"
-        if not self.gradlew.exists():
-            raise ValueError(f"gradlew not found in {project_dir}")
+def _print_get_log(cache: BuildResultCache, build_id: str, as_json: bool) -> int:
+    """Print the cached combined log for a build ID."""
+    log = cache.get_log(build_id)
+    if log is None:
+        print("No build log available", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps({"build_id": build_id, "log": log}, indent=2))
+    else:
+        print(OutputFormatter.format_log(log))
+    return 0
 
-        # Make gradlew executable
-        self.gradlew.chmod(0o755)
 
-    def build(
-        self,
-        variant: str = "debug",
-        clean: bool = False,
-        test: bool = False,
-    ) -> tuple:
-        """
-        Build the project.
+def _handle_disclosure(args: argparse.Namespace, cache: BuildResultCache) -> int | None:
+    """
+    Handle progressive-disclosure / list flags.
 
-        Args:
-            variant: Build variant (debug, release)
-            clean: Clean before building
-            test: Run tests after building
-
-        Returns:
-            (success, message, build_data) tuple
-        """
-        start_time = time.time()
-
-        # Build command
-        tasks = []
-        if clean:
-            tasks.append("clean")
-
-        if test:
-            tasks.append(f"test{variant.capitalize()}")
+    Returns an exit code if a disclosure flag was handled, else None.
+    """
+    if args.list_builds:
+        builds = cache.list()
+        if args.json:
+            print(json.dumps(builds, indent=2))
+        elif not builds:
+            print("No cached builds found")
         else:
-            tasks.append(f"assemble{variant.capitalize()}")
+            print(f"Recent builds ({len(builds)}):")
+            for entry in builds:
+                print(f"  {entry['id']}  ({entry['age_seconds']}s ago)")
+        return 0
 
-        cmd = [str(self.gradlew)] + tasks
+    build_id = args.get_errors or args.get_warnings or args.get_log
+    if not build_id:
+        return None
 
-        try:
-            # Run build
-            result = subprocess.run(
-                cmd,
-                cwd=self.project_dir,
-                capture_output=True,
-                text=True,
-                check=False,  # Don't raise on non-zero exit
+    if args.get_log:
+        return _print_get_log(cache, build_id, args.json)
+
+    payload = cache.get(build_id)
+    if payload is None:
+        print(f"Error: build result not found: {build_id}", file=sys.stderr)
+        print("Use --list-builds to see available builds", file=sys.stderr)
+        return 1
+
+    if args.get_errors:
+        return _print_get_errors(payload, args.json)
+    return _print_get_warnings(payload, args.json)
+
+
+def _emit_result(args: argparse.Namespace, result, build_id: str) -> None:
+    """Format and print a build/test result per the selected output mode."""
+    status = "SUCCESS" if result.success else "FAILED"
+    error_count = len(result.errors)
+    warning_count = len(result.warnings)
+
+    test_info = result.test_results
+    failed_tests = test_info.get("failed_tests") if test_info else None
+
+    if args.verbose:
+        print(
+            OutputFormatter.format_verbose(
+                status=status,
+                error_count=error_count,
+                warning_count=warning_count,
+                build_id=build_id,
+                duration=result.duration,
+                errors=result.errors or None,
+                warnings=result.warnings or None,
+                test_info=test_info,
+                failed_tests=failed_tests or None,
             )
-
-            duration = time.time() - start_time
-
-            # Parse output
-            errors, warnings = self._parse_build_output(result.stdout, result.stderr)
-
-            success = result.returncode == 0
-
-            # Build data
-            build_data = {
-                "success": success,
-                "duration": round(duration, 2),
-                "errors": errors,
-                "warnings": warnings,
-                "variant": variant,
-                "tasks": tasks,
-                "exit_code": result.returncode,
+        )
+    elif args.json:
+        data = {
+            "success": result.success,
+            "build_id": build_id,
+            "duration": result.duration,
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "variant": result.variant,
+            "module": result.module,
+            "tasks": result.tasks,
+        }
+        if test_info:
+            data["test_results"] = {
+                "total": test_info.get("total", 0),
+                "passed": test_info.get("passed", 0),
+                "failed": test_info.get("failed", 0),
+                "skipped": test_info.get("skipped", 0),
             }
-
-            # Generate message
-            if success:
-                message = f"Build: SUCCESS ({len(errors)} errors, {len(warnings)} warnings) [{self._format_duration(duration)}]"
-            else:
-                message = f"Build: FAILED ({len(errors)} errors, {len(warnings)} warnings) [{self._format_duration(duration)}]"
-
-            return success, message, build_data
-
-        except Exception as e:
-            return False, f"Build error: {e}", None
-
-    def _parse_build_output(self, stdout: str, stderr: str) -> tuple:
-        """
-        Parse build output for errors and warnings.
-
-        Args:
-            stdout: Standard output
-            stderr: Standard error
-
-        Returns:
-            (errors, warnings) tuple of lists
-        """
-        errors = []
-        warnings = []
-
-        combined_output = stdout + "\n" + stderr
-
-        for line in combined_output.split("\n"):
-            line_lower = line.lower()
-
-            # Detect errors
-            if any(
-                pattern in line_lower
-                for pattern in ["error:", "failed", "exception", "build failed"]
-            ):
-                errors.append(line.strip())
-
-            # Detect warnings
-            elif "warning:" in line_lower:
-                warnings.append(line.strip())
-
-        return errors, warnings
-
-    def _format_duration(self, seconds: float) -> str:
-        """
-        Format duration for display.
-
-        Args:
-            seconds: Duration in seconds
-
-        Returns:
-            Formatted string (e.g., "1:32", "0:05")
-        """
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}:{secs:02d}"
+        if not result.success:
+            if result.errors:
+                data["errors"] = result.errors[:BUILD_JSON_CAP]
+            if failed_tests:
+                data["failed_tests"] = failed_tests[:BUILD_JSON_CAP]
+        print(json.dumps(data, indent=2))
+    else:
+        print(
+            OutputFormatter.format_minimal(
+                status=status,
+                error_count=error_count,
+                warning_count=warning_count,
+                build_id=build_id,
+                duration=result.duration,
+                test_info=test_info,
+                errors=result.errors if not result.success else None,
+                failed_tests=failed_tests if failed_tests else None,
+            )
+        )
 
 
-def main():
+def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Build and test Android Gradle projects",
+        description="Build and test Android Gradle projects with progressive disclosure",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Build (minimal output)
   python scripts/build_and_test.py --project /path/to/project
 
-  # Clean build
-  python scripts/build_and_test.py --project /path/to/project --clean
+  # Build a module + variant, clean first
+  python scripts/build_and_test.py --project . --module :app --variant release --clean
 
-  # Build specific variant
-  python scripts/build_and_test.py --project /path/to/project --variant release
+  # Run tests (parses JUnit XML)
+  python scripts/build_and_test.py --project . --test --suite com.example.MyTest
 
-  # Run tests
-  python scripts/build_and_test.py --project /path/to/project --test
+  # Drill into a previous build
+  python scripts/build_and_test.py --get-errors build-20251028-143052
+  python scripts/build_and_test.py --get-log build-20251028-143052
 
-  # Verbose output (shows errors/warnings)
-  python scripts/build_and_test.py --project /path/to/project --verbose
+  # List recent builds
+  python scripts/build_and_test.py --list-builds
         """,
     )
 
-    parser.add_argument("--project", required=True, help="Path to Android project directory")
-    parser.add_argument(
-        "--variant",
-        default="debug",
-        choices=["debug", "release"],
-        help="Build variant (default: debug)",
+    build_group = parser.add_argument_group("Build/Test Options")
+    build_group.add_argument("--project", help="Path to the Android project directory")
+    build_group.add_argument(
+        "--module", "-p", help="Gradle module path to scope tasks (e.g., :app)"
     )
-    parser.add_argument("--clean", action="store_true", help="Clean before building")
-    parser.add_argument("--test", action="store_true", help="Run tests")
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument(
-        "--verbose", action="store_true", help="Verbose output (show errors/warnings)"
+    build_group.add_argument("--variant", default="debug", help="Build variant (default: debug)")
+    build_group.add_argument("--clean", action="store_true", help="Clean before building")
+    build_group.add_argument("--test", action="store_true", help="Run unit tests")
+    build_group.add_argument("--suite", help="Test filter passed to Gradle --tests")
+
+    disclosure_group = parser.add_argument_group("Progressive Disclosure Options")
+    disclosure_group.add_argument(
+        "--get-errors", metavar="BUILD_ID", help="Get error details from a cached build"
     )
+    disclosure_group.add_argument(
+        "--get-warnings", metavar="BUILD_ID", help="Get warning details from a cached build"
+    )
+    disclosure_group.add_argument(
+        "--get-log", metavar="BUILD_ID", help="Get the full log from a cached build"
+    )
+    disclosure_group.add_argument(
+        "--list-builds", action="store_true", help="List recent cached builds"
+    )
+
+    output_group = parser.add_argument_group("Output Options")
+    output_group.add_argument("--verbose", action="store_true", help="Show detailed output")
+    output_group.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()
 
+    cache = BuildResultCache()
+
+    disclosure_exit = _handle_disclosure(args, cache)
+    if disclosure_exit is not None:
+        return disclosure_exit
+
+    if not args.project:
+        parser.error("--project is required (or use --get-* / --list-builds)")
+
     try:
-        runner = BuildRunner(args.project)
+        runner = BuildRunner(args.project, module=args.module, variant=args.variant)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
-    # Run build
-    success, message, build_data = runner.build(
-        variant=args.variant,
-        clean=args.clean,
-        test=args.test,
+    if args.test:
+        result = runner.test(clean=args.clean, suite=args.suite)
+    else:
+        result = runner.build(clean=args.clean)
+
+    build_id = cache.save(
+        success=result.success,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        errors=result.errors,
+        warnings=result.warnings,
+        failed_tasks=result.failed_tasks,
+        test_results=result.test_results,
+        variant=result.variant,
+        module=result.module,
+        tasks=result.tasks,
+        duration=result.duration,
     )
 
-    # Output
-    if args.json:
-        print(json.dumps(build_data, indent=2))
-    else:
-        print(message)
-
-        # Show errors and warnings in verbose mode
-        if args.verbose and build_data:
-            if build_data["errors"]:
-                print(f"\nErrors ({len(build_data['errors'])}):")
-                for error in build_data["errors"][:10]:  # Show first 10
-                    print(f"  ❌ {error[:120]}")
-
-            if build_data["warnings"]:
-                print(f"\nWarnings ({len(build_data['warnings'])}):")
-                for warning in build_data["warnings"][:10]:  # Show first 10
-                    print(f"  ⚠️  {warning[:120]}")
-
-    sys.exit(0 if success else 1)
+    _emit_result(args, result, build_id)
+    return 0 if result.success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

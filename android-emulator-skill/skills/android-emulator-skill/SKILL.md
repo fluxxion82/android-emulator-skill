@@ -31,7 +31,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.4.0)
 
-### Implemented (26 scripts)
+### Implemented (27 scripts)
 
 #### Core Utilities (3 modules)
 1. **common/device_utils.py** - ADB command building and device detection
@@ -79,12 +79,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Options: `--name`, `--force`, `--list`, `--json`
 
 #### Build & Development (2 scripts) ✓ COMPLETE
-10. **build_and_test.py** ⭐ NEW - Gradle build automation
-    - Build with minimal token output
-    - Clean builds
-    - Run tests
-    - Parse errors and warnings
-    - Options: `--project`, `--variant`, `--clean`, `--test`, `--verbose`, `--json`
+10. **build_and_test.py** - Gradle build/test automation with progressive disclosure (backed by the `gradle/` subpackage)
+    - One-line summary + a result ID by default; drill in on demand
+    - Parses JUnit XML for pass/fail counts + failed test names; extracts Gradle/Kotlin/Java errors & warnings
+    - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring
     - Filter by app package
@@ -192,6 +190,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 29. **location.py** - Simulate GPS on an emulator via `adb emu geo fix` (fixed coords, city presets, GPX route replay). Emulator-only.
     - Options: `--lat`/`--lng`, `--city`, `--gpx FILE`, `--interval`/`--speed`, `--clear`, `--list-cities`, `--serial`, `--json`
+
+30. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
+    - List/read files, dump `shared_prefs` XML, list databases and dump SQLite schema (Room == SQLite), export a snapshot
+    - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
+
+> The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`.
 
 ## Android vs iOS Mapping
 
@@ -383,10 +387,10 @@ this mirror. Treat the script list above as the **currently implemented baseline
 navigation, gestures, keyboard, Gradle build/test, logcat monitoring, accessibility audit, visual diff, test
 recording, state capture, permissions, clipboard, status bar, push notifications, environment health check,
 device/AVD discovery + selector, localization audit (`res/values` strings), appearance (dark mode / font
-scale), and location (`adb emu geo fix` + GPX route replay).
+scale), location (`adb emu geo fix` + GPX route replay), a Gradle build subpackage with progressive disclosure,
+and a debuggable-app container inspector.
 
-**Planned (porting from iOS as Android-native tools):** a debuggable-app container inspector, a richer Gradle
-build subpackage (JUnit-XML test parsing), a Room/SQLite persistence inspector, and an ANR/jank watcher.
+**Planned (porting from iOS as Android-native tools):** a Room/SQLite persistence inspector and an ANR/jank watcher.
 
 ## Contributing
 
