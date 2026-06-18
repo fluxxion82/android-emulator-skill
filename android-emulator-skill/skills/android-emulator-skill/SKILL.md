@@ -31,7 +31,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.4.0)
 
-### Implemented (27 scripts)
+### Implemented (28 scripts)
 
 #### Core Utilities (3 modules)
 1. **common/device_utils.py** - ADB command building and device detection
@@ -194,6 +194,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 30. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
     - List/read files, dump `shared_prefs` XML, list databases and dump SQLite schema (Room == SQLite), export a snapshot
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
+
+31. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
+    - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
 > The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`.
 
@@ -388,9 +391,9 @@ navigation, gestures, keyboard, Gradle build/test, logcat monitoring, accessibil
 recording, state capture, permissions, clipboard, status bar, push notifications, environment health check,
 device/AVD discovery + selector, localization audit (`res/values` strings), appearance (dark mode / font
 scale), location (`adb emu geo fix` + GPX route replay), a Gradle build subpackage with progressive disclosure,
-and a debuggable-app container inspector.
+a debuggable-app container inspector, and a Room/SQLite persistence inspector.
 
-**Planned (porting from iOS as Android-native tools):** a Room/SQLite persistence inspector and an ANR/jank watcher.
+**Planned (porting from iOS as Android-native tools):** an ANR/jank watcher.
 
 ## Contributing
 
