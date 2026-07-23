@@ -29,6 +29,11 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # Enable Pages (source = GitHub Actions) if it isn't already, using the
+          # workflow's `pages: write` token. Without this the step 404s on repos
+          # where Pages has never been turned on in Settings.
+          enablement: true
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3

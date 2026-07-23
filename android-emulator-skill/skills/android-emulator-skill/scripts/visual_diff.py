@@ -8,6 +8,8 @@ Optimized for minimal token output.
 Usage: python scripts/visual_diff.py baseline.png current.png [options]
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
