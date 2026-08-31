@@ -1,0 +1,2 @@
+rootProject.name = 'flavored-scaffold'
+include ':app'

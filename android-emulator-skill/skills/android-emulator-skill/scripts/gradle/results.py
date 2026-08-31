@@ -192,6 +192,62 @@ _TASK_FAILED_RE = re.compile(r"^>\s*Task\s+(?P<task>\S+)\s+FAILED\s*$")
 # Gradle "What went wrong" / "FAILURE: Build failed" sections.
 _BUILD_FAILED_RE = re.compile(r"^(?:FAILURE:\s*)?Build failed", re.IGNORECASE)
 
+# Section headers inside a Gradle failure report: "* What went wrong:", "* Try:".
+_FAILURE_SECTION_RE = re.compile(r"^\*\s*(?P<heading>.+?):\s*$")
+
+# Boilerplate that follows every failure and carries no diagnostic value.
+_FAILURE_NOISE_PREFIXES = ("> Run ", "> Get more help", "> For more on ", "> Run with ")
+
+
+def extract_failure_reasons(text: str) -> list[str]:
+    """Pull the body of each ``* What went wrong:`` section from Gradle output.
+
+    Gradle reports configuration failures, dependency-resolution failures and
+    task-lookup failures through this block **only** — such builds emit no
+    ``> Task ... FAILED`` marker and no compiler ``e:`` lines. Without this,
+    those failures parse to zero errors and the CLI prints
+    ``Build: FAILED (0 errors, 0 warnings)`` with nothing actionable.
+
+    Args:
+        text: Combined Gradle stdout/stderr.
+
+    Returns:
+        One string per failure section, whitespace-collapsed. Empty if the
+        build did not fail.
+
+    Example:
+        >>> extract_failure_reasons("FAILURE: Build failed\\n\\n* What went wrong:\\nBoom\\n")
+        ['Boom']
+    """
+    reasons: list[str] = []
+    collecting = False
+    body: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        section = _FAILURE_SECTION_RE.match(line.strip())
+
+        if section:
+            # A new section ends whatever we were collecting.
+            if collecting and body:
+                reasons.append(" ".join(body).strip())
+            body = []
+            collecting = section.group("heading").strip().lower() == "what went wrong"
+            continue
+
+        if not collecting:
+            continue
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith(_FAILURE_NOISE_PREFIXES):
+            continue
+        body.append(stripped)
+
+    if collecting and body:
+        reasons.append(" ".join(body).strip())
+
+    return reasons
+
 
 def _split_kotlin_body(body: str) -> dict:
     """Split a Kotlin diagnostic body into location + message."""
@@ -325,5 +381,19 @@ def parse_build_output(stdout: str, stderr: str) -> dict:
                 }
             )
             continue
+
+    # Gradle's own failure report. Kept last so a compile error that already
+    # explains the failure stays first in the list, and deduplicated against it
+    # so a task-level failure is not reported twice.
+    for reason in extract_failure_reasons(combined):
+        if any(reason in existing["message"] for existing in errors):
+            continue
+        errors.append(
+            {
+                "message": reason,
+                "type": "gradle",
+                "location": {"file": None, "line": None, "column": None},
+            }
+        )
 
     return {"errors": errors, "warnings": warnings, "failed_tasks": failed_tasks}

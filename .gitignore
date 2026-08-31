@@ -33,6 +33,11 @@ build/
 .AppleDouble
 .LSOverride
 
+# Gradle scaffold build output (the scaffold sources are committed,
+# its build artifacts are not)
+tests/fixtures/scaffold/**/build/
+tests/fixtures/scaffold/**/.gradle/
+
 # Android (for testing)
 *.apk
 *.aab

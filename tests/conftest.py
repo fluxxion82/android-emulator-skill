@@ -38,8 +38,20 @@ RECORDED_DIR = RECORDED_ROOT / PRIMARY_PROFILE
 
 
 def _available_profiles() -> list[str]:
-    """Device profiles that have been recorded, primary first."""
-    names = sorted(p.name for p in RECORDED_ROOT.iterdir() if p.is_dir())
+    """Device profiles that have been recorded, primary first.
+
+    ``recorded/`` also holds non-device profiles (Gradle output, keyed by Gradle
+    version). Those are identified by their manifest — a device profile records
+    a ``device`` block — so a tool profile is not parameterised into tests that
+    only make sense for a device.
+    """
+    names = []
+    for path in sorted(RECORDED_ROOT.iterdir()):
+        manifest = path / "MANIFEST.json"
+        if not path.is_dir() or not manifest.exists():
+            continue
+        if "device" in json.loads(manifest.read_text(encoding="utf-8")):
+            names.append(path.name)
     return sorted(names, key=lambda n: (n != PRIMARY_PROFILE, n))
 
 

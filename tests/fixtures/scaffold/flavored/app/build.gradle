@@ -1,0 +1,6 @@
+// Task names mimic AGP's buildType x productFlavor camelCase output.
+// Real AGP is not needed: the failures these fixtures capture come from
+// Gradle's own task lookup, so plain Gradle reproduces them exactly.
+tasks.register('assembleProStagingDebug') { doLast { println 'assembled proStagingDebug' } }
+tasks.register('assembleProStagingRelease') { doLast { println 'assembled proStagingRelease' } }
+tasks.register('testProStagingDebugUnitTest') { doLast { println 'tested proStagingDebug' } }
