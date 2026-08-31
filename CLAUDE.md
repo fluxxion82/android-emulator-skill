@@ -62,7 +62,21 @@ Therefore:
    ```bash
    python tests/record_fixtures.py --list
    python tests/record_fixtures.py --only logcat_threadtime
+   python tests/record_fixtures.py --profile pixel4xl-api33 --serial <SERIAL>
    ```
+
+   Fixtures are namespaced per device under `tests/fixtures/recorded/<profile>/`,
+   so the same command captured on a different API level is a new file rather
+   than a silent overwrite — diffing two profiles is how you spot a format that
+   shifted between releases. Use the `any_profile` pytest fixture for invariants
+   that must hold everywhere ("this subcommand does not exist"), and `recorded`
+   for the complete primary profile.
+
+   **Never commit a fixture containing private data.** The recorder aliases
+   non-AOSP package names to `com.example.appN`, but that does not catch
+   free-text content. When recording from a personal device, capture only
+   structural output (`wm size`, `cmd ... help`) — not logcat, notification
+   lists, or screen dumps.
 
 2. **Before writing any code that parses a tool's output, run the tool and look
    at it.** Several commands in this codebase do not exist at all

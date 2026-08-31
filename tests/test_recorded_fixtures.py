@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-RECORDED_DIR = Path(__file__).resolve().parent / "fixtures" / "recorded"
+RECORDED_ROOT = Path(__file__).resolve().parent / "fixtures" / "recorded"
+RECORDED_DIR = RECORDED_ROOT / "emulator-api35"
 
 
 # ---------------------------------------------------------------------------
@@ -269,25 +270,29 @@ def test_touch_target_threshold_is_converted_to_pixels(recorded):
         "mobile-datatype",
     ],
 )
-def test_statusbar_subcommands_used_by_status_bar_do_not_exist(recorded, subcommand):
+def test_statusbar_subcommands_used_by_status_bar_do_not_exist(any_profile, subcommand):
     """S12: these are SystemUI demo-mode broadcast extras, not statusbar verbs.
 
     status_bar.py already contains the correct implementation
     (``_demo_broadcast``); only the CLI dispatch routes to the invented path.
     """
-    help_text = recorded.text("cmd_statusbar_help")
+    if not any_profile.has("cmd_statusbar_help"):
+        pytest.skip(f"{any_profile.name} did not record cmd_statusbar_help")
+    help_text = any_profile.text("cmd_statusbar_help")
     assert (
         subcommand not in help_text
-    ), f"'{subcommand}' now appears in `cmd statusbar` help — re-check S12"
+    ), f"'{subcommand}' appears in `cmd statusbar` help on {any_profile.name} — re-check S12"
 
 
-def test_cmd_notification_has_no_list_channels_subcommand(recorded):
+def test_cmd_notification_has_no_list_channels_subcommand(any_profile):
     """S14: `cmd notification list channels <pkg>` silently runs bare `list`.
 
     It does not error, which is worse than a hard failure: push_notification
     parses notification keys looking for channels and reports "none found".
     """
-    help_text = recorded.text("cmd_notification_help")
+    if not any_profile.has("cmd_notification_help"):
+        pytest.skip(f"{any_profile.name} did not record cmd_notification_help")
+    help_text = any_profile.text("cmd_notification_help")
     subcommands = re.findall(r"^\s{2}(\S+)", help_text, re.MULTILINE)
     assert "list" in subcommands, "fixture does not look like the expected help output"
     assert "channels" not in subcommands
@@ -298,7 +303,7 @@ def test_cmd_notification_has_no_list_channels_subcommand(recorded):
 # ---------------------------------------------------------------------------
 
 
-def test_am_broadcast_reports_success_for_a_nonexistent_receiver(recorded):
+def test_am_broadcast_reports_success_for_a_nonexistent_receiver(any_profile):
     """S4: this is why push_notification's success check can never fail.
 
     The recorded command targeted ``com.android.settings/.NoSuchReceiverExists``,
@@ -306,7 +311,9 @@ def test_am_broadcast_reports_success_for_a_nonexistent_receiver(recorded):
     with result=0. Any check of the form ``"result=" in stdout`` is therefore
     unconditionally true.
     """
-    output = recorded.text("am_broadcast_missing_receiver")
+    if not any_profile.has("am_broadcast_missing_receiver"):
+        pytest.skip(f"{any_profile.name} did not record am_broadcast_missing_receiver")
+    output = any_profile.text("am_broadcast_missing_receiver")
     assert "NoSuchReceiverExists" in output, "fixture did not target the bogus receiver"
     assert "Broadcast completed: result=0" in output
     assert "result=" in output.lower(), (
@@ -393,4 +400,40 @@ def test_omitting_serial_is_ambiguous_when_two_devices_are_attached(recorded):
         "with no serial the command carries no device target; against "
         f"{len(serials)} attached devices adb exits 1 with "
         "'more than one device/emulator'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# S7, quantified on real hardware. The emulator understates this badly.
+# ---------------------------------------------------------------------------
+
+
+def test_touch_target_bug_severity_scales_with_density(any_profile):
+    """Show how much of the dp range the pixel-comparison wrongly accepts.
+
+    ``accessibility_audit`` compares pixel bounds against the literal 48. Any
+    element between 48px and 48dp-in-pixels is undersized but passes. That
+    window widens with density, so a fixture set recorded only on a low-density
+    emulator makes the bug look far milder than it is on real hardware:
+
+        420dpi (emulator):  48px .. 126px  -> misses down to ~18dp
+        560dpi (Pixel 4XL): 48px .. 168px  -> misses down to ~14dp
+    """
+    if not any_profile.has("wm_density_physical"):
+        pytest.skip(f"{any_profile.name} did not record wm_density_physical")
+
+    density_text = any_profile.text("wm_density_physical")
+    density = int(re.search(r"Physical density: (\d+)", density_text).group(1))
+    scale = density / 160
+
+    correct_threshold_px = 48 * scale
+    smallest_dp_wrongly_accepted = 48 / scale
+
+    assert correct_threshold_px > 48, (
+        f"{any_profile.name}: density {density} gives no px/dp gap; "
+        f"this profile cannot demonstrate S7"
+    )
+    assert smallest_dp_wrongly_accepted < 48, (
+        f"{any_profile.name}: a {smallest_dp_wrongly_accepted:.0f}dp target "
+        f"passes a check documented as requiring 48dp"
     )

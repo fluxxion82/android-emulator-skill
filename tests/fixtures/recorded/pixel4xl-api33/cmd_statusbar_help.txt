@@ -1,0 +1,58 @@
+Status bar commands:
+  help
+    Print this help text.
+
+  expand-notifications
+    Open the notifications panel.
+
+  expand-settings
+    Open the notifications panel and expand quick settings if present.
+
+  collapse
+    Collapse the notifications and settings panel.
+
+  add-tile COMPONENT
+    Add a TileService of the specified component
+
+  remove-tile COMPONENT
+    Remove a TileService of the specified component
+
+  click-tile COMPONENT
+    Click on a TileService of the specified component
+
+  check-support
+    Check if this device supports QS + APIs
+
+  get-status-icons
+    Print the list of status bar icons and the order they appear in
+
+  disable-for-setup DISABLE
+    If true, disable status bar components unsuitable for device setup
+
+  send-disable-flag FLAG...
+    Send zero or more disable flags (parsed individually) to StatusBarManager
+    Valid options:
+        <blank>             - equivalent to "none"
+        none                - re-enables all components
+        search              - disable search
+        home                - disable naviagation home
+        recents             - disable recents/overview
+        notification-peek   - disable notification peeking
+        statusbar-expansion - disable status bar expansion
+        system-icons        - disable system icons appearing in status bar
+        clock               - disable clock appearing in status bar
+        notification-icons  - disable notification icons from status bar
+
+  tracing (start | stop)
+    Start or stop SystemUI tracing
+
+  NOTE: any command not listed here will be passed through to IStatusBar
+
+  Commands implemented in SystemUI:
+  Usage: adb shell cmd statusbar <command>
+    known commands:
+     media-mute-await
+     charging-ripple
+     auth-ripple
+     tile-service-add
+     prefs

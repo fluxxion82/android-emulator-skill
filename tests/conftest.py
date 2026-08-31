@@ -27,7 +27,20 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "scripts"
-RECORDED_DIR = Path(__file__).resolve().parent / "fixtures" / "recorded"
+RECORDED_ROOT = Path(__file__).resolve().parent / "fixtures" / "recorded"
+
+# The profile carrying the complete fixture set. Other profiles hold whatever
+# subset was safe or practical to capture on that device — a personal phone, for
+# instance, should never have its logcat or screen contents committed.
+PRIMARY_PROFILE = "emulator-api35"
+
+RECORDED_DIR = RECORDED_ROOT / PRIMARY_PROFILE
+
+
+def _available_profiles() -> list[str]:
+    """Device profiles that have been recorded, primary first."""
+    names = sorted(p.name for p in RECORDED_ROOT.iterdir() if p.is_dir())
+    return sorted(names, key=lambda n: (n != PRIMARY_PROFILE, n))
 
 
 @pytest.fixture
@@ -76,6 +89,21 @@ class RecordedFixtures:
         """Return a recorded fixture split into lines, trailing blank removed."""
         return self.text(name).splitlines()
 
+    def has(self, name: str) -> bool:
+        """Whether this profile recorded that fixture.
+
+        Profiles legitimately differ: a personal phone should not have its
+        logcat or screen contents committed, so those exist only for the
+        emulator profile.
+        """
+        stem = name.split(".", maxsplit=1)[0]
+        return any((self._root / f"{stem}{ext}").exists() for ext in (".txt", ".xml"))
+
+    @property
+    def name(self) -> str:
+        """Profile directory name, e.g. ``pixel4xl-api33``."""
+        return self._root.name
+
     @property
     def manifest(self) -> dict:
         """Provenance for the recorded set: device, API level, per-fixture command."""
@@ -90,7 +118,7 @@ class RecordedFixtures:
 
 @pytest.fixture(scope="session")
 def recorded() -> RecordedFixtures:
-    """Verbatim tool output recorded from a real device.
+    """Verbatim tool output from the primary (complete) device profile.
 
     Example:
         def test_parser_handles_real_logcat(recorded):
@@ -98,6 +126,21 @@ def recorded() -> RecordedFixtures:
             assert any(p for p in parsed), "parser matched nothing against real output"
     """
     return RecordedFixtures(RECORDED_DIR)
+
+
+@pytest.fixture(params=_available_profiles())
+def any_profile(request) -> RecordedFixtures:
+    """Each recorded device profile in turn.
+
+    For invariants that must hold on *every* Android version we have evidence
+    for — chiefly "this command does not exist". A subcommand absent on one API
+    level but present on another is exactly the kind of drift that a
+    single-device fixture set hides.
+
+    Profiles hold different subsets, so use ``has()`` to skip cleanly rather
+    than failing on a fixture that device never recorded.
+    """
+    return RecordedFixtures(RECORDED_ROOT / request.param)
 
 
 @pytest.fixture(scope="session")

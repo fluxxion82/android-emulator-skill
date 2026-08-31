@@ -39,7 +39,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-RECORDED_DIR = Path(__file__).resolve().parent / "fixtures" / "recorded"
+RECORDED_ROOT = Path(__file__).resolve().parent / "fixtures" / "recorded"
+
+# Fixtures live under recorded/<profile>/ so the same command recorded on a
+# different API level is a new file, not a silent overwrite. Diffing two
+# profiles is how you find a format that shifted between releases.
+DEFAULT_PROFILE = "emulator-api35"
 
 # Every adb call is bounded. An unbounded `adb shell dumpsys window` will wedge
 # the adb connection, which is the same defect class this repo ships (R1).
@@ -384,9 +389,10 @@ def _device_metadata(serial: str | None) -> dict[str, str]:
     return meta
 
 
-def record(serial: str | None, only: set[str] | None) -> int:
+def record(serial: str | None, only: set[str] | None, profile: str) -> int:
     """Record fixtures, write MANIFEST.json, and report what was written."""
-    RECORDED_DIR.mkdir(parents=True, exist_ok=True)
+    recorded_dir = RECORDED_ROOT / profile
+    recorded_dir.mkdir(parents=True, exist_ok=True)
 
     selected = [f for f in FIXTURES if only is None or f.name in only]
     if only:
@@ -409,7 +415,7 @@ def record(serial: str | None, only: set[str] | None) -> int:
 
     def _record_one(name: str, command: str, description: str, catches: list[str], text: str):
         ext = "xml" if name.startswith("uiautomator") else "txt"
-        path = RECORDED_DIR / f"{name}.{ext}"
+        path = recorded_dir / f"{name}.{ext}"
         path.write_text(text, encoding="utf-8")
         size = len(text.encode("utf-8"))
         entries.append(
@@ -466,6 +472,7 @@ def record(serial: str | None, only: set[str] | None) -> int:
             )
 
     manifest = {
+        "profile": profile,
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "recorded_on": platform.platform(),
         "device": device,
@@ -477,7 +484,7 @@ def record(serial: str | None, only: set[str] | None) -> int:
         ),
         "fixtures": entries,
     }
-    manifest_path = RECORDED_DIR / "MANIFEST.json"
+    manifest_path = recorded_dir / "MANIFEST.json"
     # Merge with any previous run so a partial re-record keeps earlier provenance.
     if manifest_path.exists() and only is not None:
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -488,7 +495,7 @@ def record(serial: str | None, only: set[str] | None) -> int:
         manifest["fixtures"] = sorted(entries, key=lambda e: e["name"])
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
-    print(f"\n{len(entries)} fixture(s) -> {RECORDED_DIR}")
+    print(f"\n{len(entries)} fixture(s) -> {recorded_dir}")
     print(f"Device: {device.get('model')} API {device.get('api_level')} ({device.get('abi')})")
     if failures:
         print(f"\n{len(failures)} fixture(s) NOT recorded:", file=sys.stderr)
@@ -509,6 +516,15 @@ def main() -> None:
     parser.add_argument("--serial", "-s", help="Device serial (auto-detects if omitted)")
     parser.add_argument("--only", nargs="+", metavar="NAME", help="Record only these fixtures")
     parser.add_argument("--list", action="store_true", help="List fixtures and exit")
+    parser.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE,
+        help=(
+            "Device profile directory under fixtures/recorded/ "
+            f"(default: {DEFAULT_PROFILE}). Name it after the device and API "
+            "level, e.g. pixel4xl-api33."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -521,7 +537,7 @@ def main() -> None:
         )
         return
 
-    sys.exit(record(args.serial, set(args.only) if args.only else None))
+    sys.exit(record(args.serial, set(args.only) if args.only else None, args.profile))
 
 
 if __name__ == "__main__":
