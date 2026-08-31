@@ -17,7 +17,6 @@ import importlib
 import subprocess
 
 import emulator_create
-import pytest
 
 DEVICES = [
     {"id": "pixel_7", "name": "Pixel 7"},

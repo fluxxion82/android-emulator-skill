@@ -1,0 +1,20 @@
+usage: cmd notification SUBCMD [args]
+
+SUBCMDs:
+  allow_listener COMPONENT [user_id (current user if not specified)]
+  disallow_listener COMPONENT [user_id (current user if not specified)]
+  allow_assistant COMPONENT [user_id (current user if not specified)]
+  remove_assistant COMPONENT [user_id (current user if not specified)]
+  set_dnd [on|none (same as on)|priority|alarms|all|off (same as all)]
+  allow_dnd PACKAGE [user_id (current user if not specified)]
+  disallow_dnd PACKAGE [user_id (current user if not specified)]
+  reset_assistant_user_set [user_id (current user if not specified)]
+  get_approved_assistant [user_id (current user if not specified)]
+  post [--help | flags] TAG TEXT
+  set_bubbles PACKAGE PREFERENCE (0=none 1=all 2=selected) [user_id (current user if not specified)]
+  set_bubbles_channel PACKAGE CHANNEL_ID ALLOW [user_id (current user if not specified)]
+  list
+  get <notification-key>
+  snooze --for <msec> <notification-key>
+  unsnooze <notification-key>
+

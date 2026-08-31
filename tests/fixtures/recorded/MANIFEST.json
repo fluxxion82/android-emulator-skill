@@ -1,0 +1,164 @@
+{
+  "recorded_at": "2026-08-31T21:17:25Z",
+  "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
+  "device": {
+    "model": "sdk_gphone16k_arm64",
+    "api_level": "35",
+    "android_release": "15",
+    "abi": "arm64-v8a",
+    "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
+  },
+  "redacted_package_count": 8,
+  "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
+  "fixtures": [
+    {
+      "name": "adb_devices_multiple",
+      "file": "adb_devices_multiple.txt",
+      "command": "adb devices -l",
+      "description": "`adb devices -l` with two devices attached. resolve_device_identifier(None) returns None, so build_adb_command omits -s entirely and adb fails with a raw 'more than one device/emulator'. Record by starting a second emulator instance: emulator -avd NAME -read-only.",
+      "catches": [
+        "R5"
+      ],
+      "bytes": 258
+    },
+    {
+      "name": "adb_devices_single",
+      "file": "adb_devices_single.txt",
+      "command": "adb devices -l",
+      "description": "`adb devices -l` with exactly one device attached.",
+      "catches": [],
+      "bytes": 142
+    },
+    {
+      "name": "am_broadcast_missing_receiver",
+      "file": "am_broadcast_missing_receiver.txt",
+      "command": "adb shell am broadcast -n com.android.settings/.NoSuchReceiverExists -a android.intent.action.VIEW",
+      "description": "`am broadcast` targeting a receiver class that does not exist still prints 'Broadcast completed: result=0' and exits 0. This is why push_notification's success check ('result=' in stdout) can never report failure.",
+      "catches": [
+        "S4"
+      ],
+      "bytes": 146
+    },
+    {
+      "name": "cmd_notification_help",
+      "file": "cmd_notification_help.txt",
+      "command": "adb shell cmd notification",
+      "description": "Authoritative `cmd notification` subcommand list. There is no 'list channels' subcommand \u2014 `cmd notification list channels <pkg>` silently ignores the extra args and runs bare `list`, exiting 0, which is why push_notification always reports 'no channels found'.",
+      "catches": [
+        "S14"
+      ],
+      "bytes": 991
+    },
+    {
+      "name": "cmd_notification_list",
+      "file": "cmd_notification_list.txt",
+      "command": "adb shell cmd notification list",
+      "description": "Posted-notification keys: 'userId|package|id|tag|uid'. The primitive for asserting what the app under test actually posted.",
+      "catches": [],
+      "bytes": 101
+    },
+    {
+      "name": "cmd_statusbar_help",
+      "file": "cmd_statusbar_help.txt",
+      "command": "adb shell cmd statusbar",
+      "description": "Authoritative `cmd statusbar` subcommand list. Contains no battery-level / battery-charging / wifi-enabled / wifi-level / mobile-enabled / mobile-level / mobile-datatype \u2014 the seven subcommands status_bar.py invents. Those are SystemUI demo-mode broadcast extras, not statusbar subcommands.",
+      "catches": [
+        "S12"
+      ],
+      "bytes": 1992
+    },
+    {
+      "name": "dumpsys_gfxinfo",
+      "file": "dumpsys_gfxinfo.txt",
+      "command": "adb shell dumpsys gfxinfo com.android.settings",
+      "description": "Frame statistics: 'Total frames rendered', 'Janky frames', and the percentile block. Real jank accounting, versus anr_watcher's inference from Choreographer's 'Skipped N frames' log line.",
+      "catches": [],
+      "bytes": 3812
+    },
+    {
+      "name": "dumpsys_meminfo",
+      "file": "dumpsys_meminfo.txt",
+      "command": "adb shell dumpsys meminfo com.android.settings",
+      "description": "Memory breakdown including the Objects block (Views, ViewRootImpl, Activities, AppContexts). The Activities count is the Activity-leak test: navigate in and out N times and see whether it grew by N.",
+      "catches": [],
+      "bytes": 3309
+    },
+    {
+      "name": "logcat_threadtime",
+      "file": "logcat_threadtime.txt",
+      "command": "adb logcat -d -v threadtime -t 200",
+      "description": "`logcat -v threadtime` output: 'MM-DD HH:MM:SS.mmm PID TID P Tag: msg'. This is the layout log_monitor's regex actually expects, and what anr_watcher correctly requests.",
+      "catches": [
+        "A1"
+      ],
+      "bytes": 24519
+    },
+    {
+      "name": "logcat_time",
+      "file": "logcat_time.txt",
+      "command": "adb logcat -d -v time -t 200",
+      "description": "`logcat -v time` output: 'MM-DD HH:MM:SS.mmm P/Tag( PID): msg'. log_monitor requests this format but its regex expects threadtime, so every line falls into the unparsed branch.",
+      "catches": [
+        "A1"
+      ],
+      "bytes": 23514
+    },
+    {
+      "name": "resolve_activity_launcher",
+      "file": "resolve_activity_launcher.txt",
+      "command": "adb shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.android.settings",
+      "description": "Correct launcher-activity resolution. app_launcher instead greps `pm dump` for the first line containing 'Activity' and the package, which readily returns an ActivityRecord or a provider.",
+      "catches": [
+        "S10"
+      ],
+      "bytes": 106
+    },
+    {
+      "name": "uiautomator_current_screen",
+      "file": "uiautomator_current_screen.xml",
+      "command": "adb shell uiautomator dump /dev/tty",
+      "description": "A real uiautomator hierarchy. Note bounds are in physical PIXELS, which is what makes accessibility_audit's comparison against a 48 'dp' constant wrong.",
+      "catches": [
+        "S7"
+      ],
+      "bytes": 23465
+    },
+    {
+      "name": "wm_density_override",
+      "file": "wm_density_override.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` with an override active \u2014 emits BOTH 'Physical density:' and 'Override density:'. Needed for a correct px->dp conversion.",
+      "catches": [
+        "S7",
+        "S9"
+      ],
+      "bytes": 44
+    },
+    {
+      "name": "wm_density_physical",
+      "file": "wm_density_physical.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` with no override set \u2014 only a 'Physical density:' line.",
+      "catches": [],
+      "bytes": 22
+    },
+    {
+      "name": "wm_size_override",
+      "file": "wm_size_override.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` with an override active \u2014 emits BOTH 'Physical size:' and 'Override size:'. device_utils matches only Physical, so every tap coordinate is wrong by the ratio while an override is set.",
+      "catches": [
+        "S9"
+      ],
+      "bytes": 50
+    },
+    {
+      "name": "wm_size_physical",
+      "file": "wm_size_physical.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` with no override set \u2014 only a 'Physical size:' line.",
+      "catches": [],
+      "bytes": 25
+    }
+  ]
+}

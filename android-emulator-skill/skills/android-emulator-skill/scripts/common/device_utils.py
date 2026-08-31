@@ -17,10 +17,8 @@ Used by:
 - test_recorder.py, app_state_capture.py - Auto-device detection
 """
 
-import json
 import re
 import subprocess
-from typing import Any, Optional
 
 
 def build_adb_command(

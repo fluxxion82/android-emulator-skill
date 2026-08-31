@@ -85,9 +85,7 @@ def test_device_info_builds_expected_adb_commands(monkeypatch):
 
     # Verify the adb command shapes (serial targeting + getprop/wm density).
     joined = [" ".join(c) for c in calls]
-    assert any(
-        c == "adb -s emulator-5554 shell getprop ro.product.model" for c in joined
-    ), joined
+    assert any(c == "adb -s emulator-5554 shell getprop ro.product.model" for c in joined), joined
     assert any(
         c == "adb -s emulator-5554 shell getprop ro.build.version.sdk" for c in joined
     ), joined

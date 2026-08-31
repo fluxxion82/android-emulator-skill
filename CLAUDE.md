@@ -46,6 +46,40 @@ android-emulator-skill/                      # repo root
   `base64_data` key** (not `base64`).
 - **cache_utils.py** — progressive disclosure cache for large outputs.
 
+## Testing: recorded fixtures are mandatory
+
+**The defining bug class in this repo is code and tests both written against
+*imagined* tool output.** When the imagination is wrong they are wrong in the
+same direction, so the suite stays green while the script does nothing. Three
+advertised capabilities shipped inert this way, past 470 passing tests.
+
+Therefore:
+
+1. **Parser tests read `tests/fixtures/recorded/`; they never inline tool output
+   as a string literal.** Use the `recorded` pytest fixture. If ground truth is
+   missing, record it — do not hand-write a plausible substitute.
+
+   ```bash
+   python tests/record_fixtures.py --list
+   python tests/record_fixtures.py --only logcat_threadtime
+   ```
+
+2. **Before writing any code that parses a tool's output, run the tool and look
+   at it.** Several commands in this codebase do not exist at all
+   (`cmd statusbar battery-level`, `dumpsys activity anr`,
+   `cmd notification list channels`). Some fail silently and exit 0.
+
+3. **Known defects are pinned with `@pytest.mark.xfail(strict=True)`** and a
+   defect ID, in `tests/test_recorded_fixtures.py`. `strict=True` means fixing
+   the defect turns the test red until the marker is removed — delete the marker
+   in the same commit as the fix.
+
+4. **Tests needing a device are marked `@pytest.mark.emulator`** and deselected
+   by default. Run them with `pytest -m emulator`. They assert *semantic floors*
+   ("did the agent get a usable answer"), not command shapes.
+
+Run the suite with `uvx --python 3.12 --with pytest --with pillow pytest tests/`.
+
 ## Quality standards
 
 1. Python 3.12+ with modern type hints (`str | None`, `StrEnum`).

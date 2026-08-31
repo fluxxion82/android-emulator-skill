@@ -16,12 +16,9 @@ Used by:
 """
 
 import base64
-import os
 import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
 # Try to import PIL for resizing, but make it optional
 try:

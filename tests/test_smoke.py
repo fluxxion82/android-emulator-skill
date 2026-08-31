@@ -26,7 +26,10 @@ def test_help_runs(script: Path) -> None:
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     combined = (result.stdout + result.stderr).lower()
-    assert result.returncode == 0, f"{script.name} --help exited {result.returncode}: {result.stderr}"
+    assert (
+        result.returncode == 0
+    ), f"{script.name} --help exited {result.returncode}: {result.stderr}"
     assert "usage" in combined, f"{script.name} --help produced no usage text"

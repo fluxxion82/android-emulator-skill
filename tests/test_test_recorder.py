@@ -17,7 +17,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 import test_recorder
 from test_recorder import TestRecorder
 

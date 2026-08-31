@@ -24,7 +24,10 @@ extend-exclude = '''
 line-length = 100
 target-version = "py312"
 # Only check skill code, not root-level dev scripts
-include = ["android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py"]
+include = [
+    "android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py",
+    "tests/**/*.py",
+]
 
 [tool.ruff.lint]
 # Enable ALL recommended rules (strict mode)
@@ -63,9 +66,14 @@ ignore = [
     "ARG001",   # Unused function arguments - required by signal handlers
     "SIM102",   # Nested if statements - more readable in some cases
     "PLW2901",  # Redefined loop variable - acceptable in some contexts
-    "F401",     # Unused import - may be used in __init__.py exports
     "N806",     # Non-lowercase variable - acceptable for constants
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py re-exports for the public surface; F401 is expected there.
+"**/__init__.py" = ["F401"]
+# Test doubles mirror real signatures; unused params are inherent to the pattern.
+"tests/**" = ["ARG001", "ARG002", "ARG005", "PLW0108"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["common", "gradle"]
@@ -73,4 +81,7 @@ known-first-party = ["common", "gradle"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "android-emulator-skill/skills/android-emulator-skill/scripts"]
-addopts = "-ra"
+addopts = "-ra -m 'not emulator'"
+markers = [
+    "emulator: requires a booted emulator or device; opt in with `-m emulator`",
+]

@@ -63,7 +63,7 @@ def test_parse_garbage_returns_none():
 def test_read_text_decodes_clipboard(monkeypatch):
     dump = _make_parcel_dump("Hello World")
 
-    def fake_run(cmd, *args, **kwargs):  # noqa: ARG001
+    def fake_run(cmd, *args, **kwargs):
         assert "service" in cmd and "call" in cmd and "clipboard" in cmd
         return subprocess.CompletedProcess(cmd, 0, stdout=dump, stderr="")
 
@@ -78,7 +78,7 @@ def test_copy_then_expected_match(monkeypatch):
     captured: list[list[str]] = []
     dump = _make_parcel_dump("secret")
 
-    def fake_run(cmd, *args, **kwargs):  # noqa: ARG001
+    def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
         # First call is the copy (service code "1"); second is the read ("4").
         out = dump if "4" in cmd else ""
@@ -101,7 +101,7 @@ def test_copy_then_expected_match(monkeypatch):
 def test_copy_then_expected_mismatch(monkeypatch):
     dump = _make_parcel_dump("actual-value")
 
-    def fake_run(cmd, *args, **kwargs):  # noqa: ARG001
+    def fake_run(cmd, *args, **kwargs):
         out = dump if "4" in cmd else ""
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 

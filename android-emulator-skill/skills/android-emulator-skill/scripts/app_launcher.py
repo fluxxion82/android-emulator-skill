@@ -18,12 +18,10 @@ import json as json_lib
 import subprocess
 import sys
 import time
-from typing import Optional
 
 from common.device_utils import (
     build_adb_command,
     get_current_activity,
-    get_default_device,
     list_installed_packages,
     resolve_device_identifier,
 )

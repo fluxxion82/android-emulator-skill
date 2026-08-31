@@ -1,0 +1,203 @@
+--------- beginning of system
+08-31 14:17:02.496   811   852 V WindowManagerShell: RemoteTransition directly requested for (#16) android.os.BinderProxy@7fd32c3: RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@2183740, appThread = null, debugName = null }
+08-31 14:17:02.497   551  1050 W UserManagerService: Requested status bar icon for non-badged user 0
+--------- beginning of main
+08-31 14:17:02.497  1270  1334 D SearchTargetUtil: queryLength=0 size=1
+08-31 14:17:02.497  1270  1334 D SearchTargetUtil: layoutType=icon_row resultType=4096 packageName= extras=Bundle{aiai_settings_enabled=true,icon_container_enabled=true,zero_state_query_ready=true,zero_state_all_apps_web_suggest_count=3,rank=1.0,toast_settings_toggle_values=16777476,key_ipc_start=366113,hide_subtitle=true,enable_launch_animations=true,zero_state_qsb_web_suggest_count=10,}ParentID: null targetID: SESSION_INFO:0::zero_state_flags
+08-31 14:17:02.498   811   852 D WindowManagerShell: setLauncherKeepClearAreaHeight: visible=true, height=527
+08-31 14:17:02.499   551   551 D AppHibernationService: App hibernation changed to enabled=true
+08-31 14:17:02.499   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.499   551   551 D ExplicitHealthCheckController: Getting health check supported packages
+08-31 14:17:02.499  1270  1270 D OverviewActionsView: updateActionButtonsVisibility() called: showSingleTaskActions = [true], showGroupActions = [false]
+08-31 14:17:02.500   551  1050 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.500   551  1050 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.500   551  1050 D ExplicitHealthCheckController: Getting health check requested packages
+08-31 14:17:02.500   551  1050 I ExplicitHealthCheckController: Explicit health check requested packages []
+08-31 14:17:02.500   551  1050 I ExplicitHealthCheckController: No more health check requests, unbinding...
+08-31 14:17:02.501   551  1050 I ExplicitHealthCheckController: Explicit health check service is unbound
+08-31 14:17:02.502  1270  1270 D TISBindHelper: TIS service connected
+08-31 14:17:02.502  1270  1270 D b/254119092: Set mActivity=com.google.android.apps.nexuslauncher.NexusLauncherActivity@8ec7730
+08-31 14:17:02.502  1270  1270 D b/254119092: mActivity and mContext agree taskbarIsPresent=false
+08-31 14:17:02.502  1270  1270 D b/254119092: registering activity lifecycle callbacks from setActivity().
+08-31 14:17:02.503   551   574 I ActivityTaskManager: Activity reported stop, but no longer stopping: ActivityRecord{d0957fa u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t615} STOPPED
+08-31 14:17:02.503   402   402 I BpBinder: onLastStrongRef automatically unlinking death recipients: 
+08-31 14:17:02.514   551   574 V WindowManager: Queueing transition: TransitionRecord{76bfa0d id=-1 type=CLOSE flags=0x0}
+08-31 14:17:02.516   811  1582 V WindowManagerShell: onTransitionReady(transaction=2366526980720)
+08-31 14:17:02.516   811   852 V WindowManagerShell: onTransitionReady (#16) android.os.BinderProxy@7fd32c3: {id=16 t=CHANGE f=0x0 trk=1 r=[] c=[]}
+08-31 14:17:02.516   811   852 V WindowManagerShell: No transition roots in (#16) android.os.BinderProxy@7fd32c3@1 so abort
+08-31 14:17:02.516   551   601 V WindowManager: Sent Transition (#16) createdAt=08-31 14:17:02.479 via request=TransitionRequestInfo { type = CHANGE, triggerTask = null, pipTask = null, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@2379dc2, appThread = null, debugName = null }, displayChange = null, flags = 0, debugId = 16 }
+08-31 14:17:02.516   551   601 V WindowManager:     startWCT=WindowContainerTransaction { changes = {} hops = [] errorCallbackToken=null taskFragmentOrganizer=null }
+08-31 14:17:02.516   551   601 V WindowManager:     info={id=16 t=CHANGE f=0x0 trk=1 r=[] c=[]}
+08-31 14:17:02.516   811   852 V WindowManagerShell: Transition animation finished (aborted=true), notifying core (#16) android.os.BinderProxy@7fd32c3@1
+08-31 14:17:02.516   811   852 V WindowManagerShell: Track 1 became idle
+08-31 14:17:02.516   811   852 V WindowManagerShell: All active transition animations finished
+08-31 14:17:02.516   811   852 V WindowManagerShell: Transition requested (#17): android.os.BinderProxy@a53679 TransitionRequestInfo { type = CLOSE, triggerTask = null, pipTask = null, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@7873fbe, appThread = null, debugName = null }, displayChange = null, flags = 0, debugId = 17 }
+08-31 14:17:02.516   811   852 V WindowManagerShell: RemoteTransition directly requested for (#17) android.os.BinderProxy@a53679: RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@7873fbe, appThread = null, debugName = null }
+08-31 14:17:02.516   551   601 V WindowManager: Finish Transition (#16): created at 08-31 14:17:02.479 collect-started=7.386ms request-sent=11.667ms started=17.266ms ready=35.813ms sent=35.924ms finished=36.665ms
+08-31 14:17:02.517   551   601 V WindowManager: Sent Transition (#17) createdAt=08-31 14:17:02.514 via request=TransitionRequestInfo { type = CLOSE, triggerTask = null, pipTask = null, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@9cb77d3, appThread = null, debugName = null }, displayChange = null, flags = 0, debugId = 17 }
+08-31 14:17:02.517   551   601 V WindowManager:     startWCT=WindowContainerTransaction { changes = {} hops = [] errorCallbackToken=null taskFragmentOrganizer=null }
+08-31 14:17:02.517   551   601 V WindowManager:     info={id=17 t=CLOSE f=0x0 trk=2 r=[] c=[]}
+08-31 14:17:02.517   811  1471 V WindowManagerShell: onTransitionReady(transaction=2366526980726)
+08-31 14:17:02.517   551  1704 W UserManagerService: Requested status bar icon for non-badged user 0
+08-31 14:17:02.517   811   852 V WindowManagerShell: onTransitionReady (#17) android.os.BinderProxy@a53679: {id=17 t=CLOSE f=0x0 trk=2 r=[] c=[]}
+08-31 14:17:02.517   811   852 V WindowManagerShell: No transition roots in (#17) android.os.BinderProxy@a53679@2 so abort
+08-31 14:17:02.518   811   852 V WindowManagerShell: Transition animation finished (aborted=true), notifying core (#17) android.os.BinderProxy@a53679@2
+08-31 14:17:02.519   551   601 V WindowManager: Finish Transition (#17): created at 08-31 14:17:02.514 collect-started=1.481ms request-sent=1.922ms started=2.76ms ready=2.756ms sent=3.002ms finished=4.395ms
+08-31 14:17:02.519   811   852 V WindowManagerShell: Track 2 became idle
+08-31 14:17:02.519   811   852 V WindowManagerShell: All active transition animations finished
+08-31 14:17:02.519   551  1704 W UserManagerService: Requested status bar icon for non-badged user 0
+08-31 14:17:02.532   551   668 I RescueParty: Starting to observe: [android, com.android.settings, com.android.systemui], updated namespace: window_manager
+08-31 14:17:02.532   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.532   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.android.settings, com.android.systemui]
+08-31 14:17:02.532   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.532   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.532   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.536   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.536   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.536   551   551 I ExplicitHealthCheckController: Explicit health check service is bound
+08-31 14:17:02.537   551   551 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+08-31 14:17:02.538   551   551 I ExplicitHealthCheckController: Service initialized, syncing requests
+08-31 14:17:02.538   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.538   551   551 D ExplicitHealthCheckController: Getting health check supported packages
+08-31 14:17:02.544   551  1050 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.544   551  1050 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.544   551  1050 D ExplicitHealthCheckController: Getting health check requested packages
+08-31 14:17:02.546   551  1704 I ExplicitHealthCheckController: Explicit health check requested packages []
+08-31 14:17:02.546   551  1704 I ExplicitHealthCheckController: No more health check requests, unbinding...
+08-31 14:17:02.546   551   668 I RescueParty: Starting to observe: [com.google.android.bluetooth], updated namespace: bluetooth
+08-31 14:17:02.546   551  1704 I ExplicitHealthCheckController: Explicit health check service is unbound
+08-31 14:17:02.547   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.547   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [com.google.android.bluetooth]
+08-31 14:17:02.547   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.547   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.547   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.551   551   668 I RescueParty: Starting to observe: [android, com.android.systemui], updated namespace: latency_tracker
+08-31 14:17:02.552   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.552   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.android.systemui]
+08-31 14:17:02.552   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.552   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.552   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.554   551   668 I RescueParty: Starting to observe: [android], updated namespace: battery_saver
+08-31 14:17:02.555   551   668 I RescueParty: Starting to observe: [android], updated namespace: constrain_display_apis
+08-31 14:17:02.556   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.556   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+08-31 14:17:02.556   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.556   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.556   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.556   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.556   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+08-31 14:17:02.556   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.556   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.556   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.559   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.559   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.559   551   551 I ExplicitHealthCheckController: Explicit health check service is bound
+08-31 14:17:02.559   551   551 E DeviceConfig: Parsing int failed for location_mode
+08-31 14:17:02.560   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.560   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.560   551   551 I ExplicitHealthCheckController: Not binding to service, service already connecting
+08-31 14:17:02.560   551   551 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+08-31 14:17:02.560   551   551 I ExplicitHealthCheckController: Service initialized, syncing requests
+08-31 14:17:02.560   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.560   551   551 D ExplicitHealthCheckController: Getting health check supported packages
+08-31 14:17:02.561   551  1704 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.561   551  1704 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.561   551  1704 D ExplicitHealthCheckController: Getting health check requested packages
+08-31 14:17:02.561   551  1704 I ExplicitHealthCheckController: Explicit health check requested packages []
+08-31 14:17:02.561   551  1704 I ExplicitHealthCheckController: No more health check requests, unbinding...
+08-31 14:17:02.561   551   668 I RescueParty: Starting to observe: [android], updated namespace: backup_and_restore
+08-31 14:17:02.561   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.561   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+08-31 14:17:02.561   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.561   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.561   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.561   551  1704 I ExplicitHealthCheckController: Explicit health check service is unbound
+08-31 14:17:02.561   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.562   551   551 I ExplicitHealthCheckController: Explicit health check service is bound
+08-31 14:17:02.564   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.564   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.564   551   551 I ExplicitHealthCheckController: Not binding to service, service already connecting
+08-31 14:17:02.564   551   551 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+08-31 14:17:02.564   551   551 I ExplicitHealthCheckController: Service initialized, syncing requests
+08-31 14:17:02.564   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.564   551   551 D ExplicitHealthCheckController: Getting health check supported packages
+08-31 14:17:02.564   551  1704 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.564   551  1704 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.564   551  1704 D ExplicitHealthCheckController: Getting health check requested packages
+08-31 14:17:02.564   551  1704 I ExplicitHealthCheckController: Explicit health check requested packages []
+08-31 14:17:02.564   551  1704 I ExplicitHealthCheckController: No more health check requests, unbinding...
+08-31 14:17:02.565   551  1704 I ExplicitHealthCheckController: Explicit health check service is unbound
+08-31 14:17:02.567   551   668 I RescueParty: Starting to observe: [android, com.google.android.networkstack], updated namespace: tethering
+08-31 14:17:02.567   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.567   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.google.android.networkstack]
+08-31 14:17:02.567   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.567   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.567   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.569   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.569   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.570   551   551 I ExplicitHealthCheckController: Explicit health check service is bound
+08-31 14:17:02.571   551   551 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+08-31 14:17:02.571   551   551 I ExplicitHealthCheckController: Service initialized, syncing requests
+08-31 14:17:02.571   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.571   551   551 D ExplicitHealthCheckController: Getting health check supported packages
+08-31 14:17:02.571   551   574 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.571   551   574 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.571   551   574 D ExplicitHealthCheckController: Getting health check requested packages
+08-31 14:17:02.572   551  1690 I ExplicitHealthCheckController: Explicit health check requested packages []
+08-31 14:17:02.572   551  1690 I ExplicitHealthCheckController: No more health check requests, unbinding...
+08-31 14:17:02.572   551  1690 I ExplicitHealthCheckController: Explicit health check service is unbound
+08-31 14:17:02.574   551   668 I RescueParty: Starting to observe: [android], updated namespace: location
+08-31 14:17:02.574   551   610 I PackageWatchdog: Syncing state, reason: observing new packages
+08-31 14:17:02.574   551   610 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+08-31 14:17:02.574   551   610 I PackageWatchdog: Syncing state, reason: updated observers
+08-31 14:17:02.574   551   610 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+08-31 14:17:02.574   551   610 I PackageWatchdog: Saving observer state to file
+08-31 14:17:02.577   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.577   551   551 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+08-31 14:17:02.577   551   551 I ExplicitHealthCheckController: Explicit health check service is bound
+08-31 14:17:02.578   551   551 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+08-31 14:17:02.578   551   551 I ExplicitHealthCheckController: Service initialized, syncing requests
+08-31 14:17:02.578   551   551 I PackageWatchdog: Syncing health check requests for packages: {}
+08-31 14:17:02.578   551   551 D ExplicitHealthCheckController: Getting health check supported packages
+08-31 14:17:02.579   551  1704 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.579   551  1704 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+08-31 14:17:02.579   551  1704 D ExplicitHealthCheckController: Getting health check requested packages
+08-31 14:17:02.579   551  1704 I ExplicitHealthCheckController: Explicit health check requested packages []
+08-31 14:17:02.579   551  1704 I ExplicitHealthCheckController: No more health check requests, unbinding...
+08-31 14:17:02.579   551  1704 I ExplicitHealthCheckController: Explicit health check service is unbound
+08-31 14:17:02.772  1446  1446 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.mobstore.service.START dat=chimera-action:/... cmp=com.google.android.gms/.chimera.GmsApiService }
+08-31 14:17:02.773  1446  1446 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.mdd.service.START dat=chimera-action:/... cmp=com.google.android.gms/.chimera.GmsApiService }
+08-31 14:17:02.774  1446  1446 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.auth.service.START pkg=com.google.android.gms }
+08-31 14:17:02.940  1026  1026 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.libs.gmscorelogger.service.START dat=chimera-action:/... cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
+08-31 14:17:04.886   551   667 D ActivityManager: freezing 4410 com.google.android.gms.ui
+08-31 14:17:06.372   551   667 D ActivityManager: freezing 6121 com.android.imsserviceentitlement
+08-31 14:17:06.375   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+08-31 14:17:06.376   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+08-31 14:17:06.376   551   724 D InetDiagMessage: Destroyed live tcp sockets for uids={10134} in 1ms
+08-31 14:17:06.551   551   610 W IPCThreadState: Sending oneway calls to frozen process.
+08-31 14:17:07.018   551   667 D ActivityManager: freezing 4786 com.android.vending
+08-31 14:17:07.021   551   667 D ActivityManager: freezing 4797 com.android.vending:background
+08-31 14:17:07.103   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+08-31 14:17:07.103   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+08-31 14:17:07.103   551   724 D InetDiagMessage: Destroyed live tcp sockets for uids={10141} in 1ms
+08-31 14:17:07.216   551  1698 D OomAdjuster: Not killing cached processes
+08-31 14:17:07.780   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+08-31 14:17:07.781   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+08-31 14:17:07.781   551   724 D InetDiagMessage: Destroyed live tcp sockets for uids={10201} in 2ms
+08-31 14:17:07.781   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+08-31 14:17:07.781   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+08-31 14:17:07.781   551   724 D InetDiagMessage: Destroyed live tcp sockets for uids={20201} in 1ms
+08-31 14:17:08.299   799   799 I wpa_supplicant: wlan0: CTRL-EVENT-BEACON-LOSS 
+08-31 14:17:12.390   551   610 W IPCThreadState: Sending oneway calls to frozen process.
+08-31 14:17:12.394   551   610 W IPCThreadState: Sending oneway calls to frozen process.
+08-31 14:17:12.714   551  1698 I WindowManager: Using new display size: 1080x2424
+08-31 14:17:12.797   551   667 D ActivityManager: freezing 1446 com.google.android.gms
+08-31 14:17:12.798   551   667 D ActivityManager: freezing 1530 com.google.android.adservices.api
+08-31 14:17:12.842   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+08-31 14:17:12.843   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+08-31 14:17:12.843   551   724 D InetDiagMessage: Destroyed live tcp sockets for uids={10201} in 0ms
+08-31 14:17:15.961   551   667 D ActivityManager: freezing 1167 com.google.android.permissioncontroller
+08-31 14:17:15.966   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+08-31 14:17:15.967   551   724 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+08-31 14:17:15.967   551   724 D InetDiagMessage: Destroyed live tcp sockets for uids={10184} in 1ms
+08-31 14:17:16.236   799   799 I wpa_supplicant: wlan0: CTRL-EVENT-BEACON-LOSS 

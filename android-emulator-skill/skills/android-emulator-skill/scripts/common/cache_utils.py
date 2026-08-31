@@ -16,10 +16,8 @@ Used by:
 """
 
 import json
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
 
 
 class ProgressiveCache:

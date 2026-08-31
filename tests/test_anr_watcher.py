@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 import anr_watcher
+
 from common.anr_pipeline import build_normalised_event, event_to_jsonl, parse_logcat_anr
 from common.anr_sessions import SessionStore
 

@@ -1,0 +1,57 @@
+Applications Memory Usage (in Kilobytes):
+Uptime: 386770 Realtime: 386770
+
+** MEMINFO in pid 3563 [com.android.settings] **
+                   Pss  Private  Private  SwapPss      Rss     Heap     Heap     Heap
+                 Total    Dirty    Clean    Dirty    Total     Size    Alloc     Free
+                ------   ------   ------   ------   ------   ------   ------   ------
+  Native Heap    22231    22176       32      535    23008    36368    27549     4182
+  Dalvik Heap    11663    11536       80      527    12272    21220    10610    10610
+ Dalvik Other     4567     3824        0        0     5776                           
+        Stack     1056     1056        0      208     1056                           
+       Ashmem       19        0        0        0     1088                           
+    Other dev       94       48       32        0      560                           
+     .so mmap     5825      480     2352      149    33088                           
+    .jar mmap     2792        0      288        0    35936                           
+    .apk mmap    18721        0    16576        0    23568                           
+    .ttf mmap      251        0       48        0      640                           
+    .dex mmap      521        0      512       16     1440                           
+    .oat mmap      694        0        0        0    11936                           
+    .art mmap     3041     2288       64      683    22528                           
+   Other mmap      814       16      320        0     2160                           
+      Unknown     1887     1632      240      113     2368                           
+        TOTAL    76407    43056    20544     2231   177424    57588    38159    14792
+ 
+ App Summary
+                       Pss(KB)                        Rss(KB)
+                        ------                         ------
+           Java Heap:    13888                          34800
+         Native Heap:    22176                          23008
+                Code:    20272                         108112
+               Stack:     1056                           1056
+            Graphics:        0                              0
+       Private Other:     6208
+              System:    12807
+             Unknown:                                   10448
+ 
+           TOTAL PSS:    76407            TOTAL RSS:   177424       TOTAL SWAP PSS:     2231
+ 
+ Objects
+               Views:      486         ViewRootImpl:        3
+         AppContexts:       11           Activities:        3
+              Assets:       25        AssetManagers:        0
+       Local Binders:       92        Proxy Binders:      117
+       Parcel memory:      116         Parcel count:      107
+    Death Recipients:        9             WebViews:        0
+ 
+ SQL
+         MEMORY_USED:      107
+  PAGECACHE_OVERFLOW:       42          MALLOC_SIZE:       46
+ 
+ DATABASES
+      pgsz     dbsz   Lookaside(b) cache hits cache misses cache size  Dbname
+PER CONNECTION STATS
+         4       76             43    65    18     4  /data/user_de/0/com.android.settings/databases/slices_index.db
+POOL STATS
+     cache hits  cache misses    cache size  Dbname
+             65            19            84  /data/user_de/0/com.android.settings/databases/slices_index.db
