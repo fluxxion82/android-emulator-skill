@@ -63,7 +63,11 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common.device_utils import (
+    build_adb_command,
+    quote_for_device_shell,
+    resolve_device_identifier,
+)
 from common.env_config import env_float, env_int
 
 # Tunable defaults (overridable via ANDROID_EMU_* env vars; see SKILL.md).
@@ -339,8 +343,9 @@ class Navigator:
             (success, message) tuple
         """
         try:
-            # Escape spaces and special characters
-            escaped_text = text.replace(" ", "%s").replace("'", "\\'")
+            # `input text` maps %s to a space; the argument then crosses the
+            # device shell, which re-parses it, so it must be quoted too.
+            escaped_text = quote_for_device_shell(text.replace(" ", "%s"))
 
             cmd = build_adb_command("shell", self.serial, "input", "text", escaped_text)
             subprocess.run(cmd, capture_output=True, text=True, check=True)

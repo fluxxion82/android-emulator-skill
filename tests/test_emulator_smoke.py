@@ -129,3 +129,29 @@ def test_omitting_serial_fails_loudly_when_multiple_devices_attached(adb: str):
     )
     assert result.returncode != 0, "adb silently picked a device instead of refusing"
     assert "more than one device" in (result.stderr + result.stdout).lower()
+
+
+# ---------------------------------------------------------------------------
+# Device-shell quoting, verified against the shell that actually parses it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["a&b", "x;id", "back`tick`", "dollar$HOME", "pipe|cat", "paren(s)", "star*", "quote'single"],
+)
+def test_quoted_argument_survives_the_device_shell(adb: str, live_device: str, payload: str):
+    """The construction tests pin the quoting; this proves it against real sh.
+
+    `adb shell echo <quoted>` shows exactly what the device's shell parsed, so
+    a mismatch here means the argument was re-interpreted rather than passed
+    through -- which is the injection.
+    """
+    from common.device_utils import quote_for_device_shell
+
+    result = _adb(adb, live_device, "shell", "echo", quote_for_device_shell(payload))
+    got = result.stdout.replace("\r\n", "\n").rstrip("\n")
+    assert got == payload, (
+        f"device shell received {got!r} instead of {payload!r}; "
+        f"the argument was re-parsed rather than passed through"
+    )

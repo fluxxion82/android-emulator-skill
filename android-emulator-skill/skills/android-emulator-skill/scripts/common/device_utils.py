@@ -18,7 +18,32 @@ Used by:
 """
 
 import re
+import shlex
 import subprocess
+
+
+def quote_for_device_shell(value: str) -> str:
+    """Quote a single argument for the shell running **on the device**.
+
+    ``build_adb_command`` keeps the host safe by never using ``shell=True``, but
+    that is only half the story: ``adb shell a b c`` concatenates the arguments
+    and the device's own ``sh -c`` re-parses the result. An argument carrying
+    ``;``, ``&``, backticks or ``$(...)`` therefore executes on the device --
+    for ``run-as`` calls, as the target app's uid.
+
+    Args:
+        value: Raw text destined for a device-side command.
+
+    Returns:
+        The value quoted so the device shell treats it as one literal argument.
+
+    Example:
+        >>> quote_for_device_shell("x;id")
+        "'x;id'"
+        >>> quote_for_device_shell("com.example.app")
+        'com.example.app'
+    """
+    return shlex.quote(value)
 
 
 def build_adb_command(

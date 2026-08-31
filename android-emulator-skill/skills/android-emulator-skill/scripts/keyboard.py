@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via ANDROID_EMU_* env vars).
@@ -83,15 +83,18 @@ class KeyboardSimulator:
 
     @staticmethod
     def _escape_text(text: str) -> str:
-        """Escape text for `adb shell input text` (space -> %s, etc.)."""
-        return (
-            text.replace("\\", "\\\\")
-            .replace(" ", "%s")
-            .replace('"', '\\"')
-            .replace("'", "\\'")
-            .replace("$", "\\$")
-            .replace("`", "\\`")
-        )
+        """Prepare text for ``adb shell input text``.
+
+        Two separate concerns, previously conflated into one hand-rolled escape
+        that missed ``& ; | < > ( ) *`` and newline:
+
+        1. ``input text`` treats ``%s`` as a space, so spaces are encoded that
+           way rather than relying on argv splitting.
+        2. The argument still crosses the *device* shell, which re-parses it --
+           so the result is quoted. Without this, ``x;id`` ran ``id`` on the
+           device.
+        """
+        return quote_for_device_shell(text.replace(" ", "%s"))
 
     def _input_text(self, text: str) -> tuple:
         """Send a single `input text` chunk; returns (success, message)."""

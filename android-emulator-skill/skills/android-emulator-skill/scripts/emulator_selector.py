@@ -76,6 +76,9 @@ COMMON_MODELS = [
 
 CONFIG_FILENAME = "config.json"
 FALLBACK_CONFIG_DIR = Path.home() / ".android-emulator-skill"
+# Pre-0.5 installs kept history next to the script, inside the distributed
+# package. Still read if present so nobody loses their history; never created.
+LEGACY_CONFIG_PATH = Path(__file__).resolve().parent / CONFIG_FILENAME
 
 
 def _normalize(value: str) -> str:
@@ -215,11 +218,19 @@ class EmulatorSelector:
 
     @staticmethod
     def _default_config_path() -> Path:
-        """Resolve the config path, preferring a writable script-local file."""
-        script_local = Path(__file__).resolve().parent / CONFIG_FILENAME
-        parent = script_local.parent
-        if script_local.exists() or _is_writable_dir(parent):
-            return script_local
+        """Resolve where recent-AVD history lives.
+
+        User state goes under the user's config directory, never into the
+        installed package. This previously preferred a file next to the script
+        whenever that directory was writable -- which it normally is -- so the
+        history was written into the distributed plugin: shared across every
+        project and checkout, and lost on reinstall.
+
+        An existing legacy file is still read so nobody silently loses history,
+        but a new one is never created there.
+        """
+        if LEGACY_CONFIG_PATH.exists():
+            return LEGACY_CONFIG_PATH
         return FALLBACK_CONFIG_DIR / CONFIG_FILENAME
 
     def list_avds(self) -> list[dict]:
@@ -317,9 +328,21 @@ class EmulatorSelector:
         """
         recent = [name, *(n for n in self.load_recent() if n != name)]
         recent = recent[:RECENT_HISTORY_MAX]
+
+        # Merge rather than replace: this file is shared config, and a
+        # whole-file rewrite silently discarded every key except "recent".
+        payload: dict = {}
+        try:
+            payload = json.loads(self.config_path.read_text())
+            if not isinstance(payload, dict):
+                payload = {}
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+
+        payload["recent"] = recent
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            self.config_path.write_text(json.dumps({"recent": recent}, indent=2))
+            self.config_path.write_text(json.dumps(payload, indent=2))
         except OSError:
             pass
 
