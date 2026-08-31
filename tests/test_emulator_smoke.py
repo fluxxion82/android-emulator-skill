@@ -75,14 +75,6 @@ def test_screen_mapper_returns_a_usable_answer(adb: str, live_device: str, scrip
     assert payload, "screen_mapper returned an empty analysis"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A1: log_monitor requests `-v time` but parses threadtime, so it "
-        "extracts nothing from real device output. Verified live: 0 of 240 "
-        "lines parsed. Drop this marker when the format is fixed."
-    ),
-)
 def test_logcat_produces_lines_the_monitor_can_parse(adb: str, live_device: str):
     """A1 floor: the diagnostics path must actually yield parsed records.
 

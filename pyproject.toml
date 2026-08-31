@@ -73,7 +73,7 @@ ignore = [
 # __init__.py re-exports for the public surface; F401 is expected there.
 "**/__init__.py" = ["F401"]
 # Test doubles mirror real signatures; unused params are inherent to the pattern.
-"tests/**" = ["ARG001", "ARG002", "ARG005", "PLW0108"]
+"tests/**" = ["ARG001", "ARG002", "ARG003", "ARG005", "PLW0108"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["common", "gradle"]

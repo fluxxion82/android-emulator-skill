@@ -40,10 +40,11 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from common.device_utils import build_adb_command
+from common.device_utils import build_adb_command, get_connected_devices
 from common.env_config import env_int
 
 # Output caps (env-configurable via ANDROID_EMU_LOG_*). Defaults preserve the
@@ -53,6 +54,9 @@ LOG_TAIL = env_int("ANDROID_EMU_LOG_TAIL", 50)
 LOG_TEXT_SUMMARY_CAP = env_int("ANDROID_EMU_LOG_TEXT_SUMMARY", 5)
 LOG_JSON_CAP = env_int("ANDROID_EMU_LOG_JSON_CAP", 20)
 LOG_INFO_CAP = env_int("ANDROID_EMU_LOG_INFO_CAP", 20)
+# Grace period for a terminated logcat to exit before it is killed. Bounded
+# so shutdown can never become the hang it is meant to prevent.
+STREAM_SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_LOG_SHUTDOWN_TIMEOUT", 5)
 
 
 class LogMonitor:
@@ -106,6 +110,7 @@ class LogMonitor:
         # Process control
         self.log_process = None
         self.interrupted = False
+        self._stderr_lines: list[str] = []
 
     def parse_time_duration(self, duration_str: str) -> float:
         """
@@ -328,9 +333,13 @@ class LogMonitor:
             cmd.append("-t")
             cmd.append(start_time.strftime("%m-%d %H:%M:%S.000"))
 
-        # Add format (time format with full timestamps)
+        # `threadtime` is mandatory, not cosmetic: parse_logcat_line expects
+        # "MM-DD HH:MM:SS.mmm PID TID P Tag: msg". The `time` format omits the
+        # PID/TID columns and writes "P/Tag( PID):" instead, which that regex
+        # cannot match -- so every line landed in the unparsed branch, severity
+        # counts stayed at zero and --follow printed nothing at all.
         cmd.append("-v")
-        cmd.append("time")
+        cmd.append("threadtime")
 
         # Add app package filter if a PID was resolved
         if pid:
@@ -375,6 +384,9 @@ class LogMonitor:
         Returns:
             True if successful
         """
+        if not self._verify_device_available():
+            return False
+
         # Clear logcat if requested (ignored for historical windows, which read
         # the existing buffer rather than streaming new lines).
         if clear_first and last_minutes is None:
@@ -395,8 +407,15 @@ class LogMonitor:
 
         signal.signal(signal.SIGINT, signal_handler)
 
+        stopped_by_us = False
+        deadline_timer: threading.Timer | None = None
+
         try:
-            # Start log streaming process
+            # stderr gets its own pipe *and* a reader. Leaving it unread
+            # deadlocks the child once the buffer fills (~64KB); merging it into
+            # stdout instead would feed adb's own error text through the log
+            # parser and count it as device output. Draining it on a thread
+            # avoids both, and keeps the text for diagnosis on failure.
             self.log_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -404,19 +423,33 @@ class LogMonitor:
                 text=True,
                 bufsize=1,  # Line buffered
             )
+            self._stderr_lines = []
+            self._start_stderr_drain()
 
-            # Track start time for duration
+            def _stop_at_deadline() -> None:
+                nonlocal stopped_by_us
+                stopped_by_us = True
+                self.interrupted = True
+                if self.log_process:
+                    self.log_process.terminate()
+
+            # A live `adb logcat` never closes its pipe, so readline() blocks
+            # indefinitely on a quiet device. Checking the clock inside the loop
+            # only helps while lines keep arriving; the timer is what guarantees
+            # --duration actually returns.
+            if duration:
+                deadline_timer = threading.Timer(float(duration), _stop_at_deadline)
+                deadline_timer.daemon = True
+                deadline_timer.start()
+
             start_time = datetime.now()
 
-            # Process log lines
             for line in iter(self.log_process.stdout.readline, ""):
                 if not line:
                     break
 
-                # Process the line
                 self.process_log_line(line.rstrip())
 
-                # Print in follow mode
                 if follow:
                     parsed = self.parse_logcat_line(line.rstrip())
                     if parsed:
@@ -424,25 +457,128 @@ class LogMonitor:
                         if severity in self.severity_filter:
                             print(line.rstrip())
 
-                # Check duration
                 if duration and (datetime.now() - start_time).total_seconds() >= duration:
+                    stopped_by_us = True
                     break
 
-                # Check if interrupted
                 if self.interrupted:
+                    stopped_by_us = True
                     break
 
-            # Wait for process to finish
-            self.log_process.wait()
-            return True
+            return self._finish_stream(stopped_by_us)
 
         except Exception as e:
             print(f"Error streaming logs: {e}", file=sys.stderr)
             return False
 
         finally:
-            if self.log_process:
+            if deadline_timer:
+                deadline_timer.cancel()
+            if self.log_process and self.log_process.poll() is None:
                 self.log_process.terminate()
+
+    def _verify_device_available(self) -> bool:
+        """Check an explicitly requested serial is actually attached.
+
+        ``adb -s <serial> logcat`` does not fail when the serial is unknown --
+        it blocks waiting for that device to appear. With ``--duration`` set,
+        that looks exactly like a device which simply logged nothing: the
+        capture ends on schedule and reports success with zero lines. Exit
+        status cannot distinguish the two, so the check has to happen up front.
+
+        Returns:
+            True if no specific serial was requested, or it is attached.
+        """
+        if not self.device_serial:
+            return True
+
+        try:
+            attached = [
+                device["serial"]
+                for device in get_connected_devices()
+                if device.get("state") == "device"
+            ]
+        except (RuntimeError, subprocess.SubprocessError) as exc:
+            print(f"Could not list devices: {exc}", file=sys.stderr)
+            return False
+
+        if self.device_serial in attached:
+            return True
+
+        available = ", ".join(attached) if attached else "none"
+        print(
+            f"Device '{self.device_serial}' is not attached. Available: {available}.",
+            file=sys.stderr,
+        )
+        return False
+
+    def _start_stderr_drain(self) -> None:
+        """Continuously read the child's stderr on a daemon thread.
+
+        An unread ``stderr=PIPE`` blocks the child as soon as the OS pipe buffer
+        fills, which on a long capture looks like a hang with no explanation.
+        The text is retained so a failure can say what adb actually reported.
+        """
+        stream = self.log_process.stderr if self.log_process else None
+        if stream is None:
+            return
+
+        def _drain() -> None:
+            with contextlib.suppress(ValueError, OSError):
+                for line in iter(stream.readline, ""):
+                    if not line:
+                        break
+                    self._stderr_lines.append(line.rstrip())
+
+        thread = threading.Thread(target=_drain, daemon=True)
+        thread.start()
+
+    def _finish_stream(self, stopped_by_us: bool) -> bool:
+        """Reap the logcat process and decide whether the capture succeeded.
+
+        Args:
+            stopped_by_us: True if the duration elapsed or the user interrupted,
+                in which case a terminated process is the expected outcome.
+
+        Returns:
+            True if the capture completed as intended.
+
+        Never waits without a timeout: a streaming `adb logcat` does not exit on
+        its own, so an unbounded ``wait()`` here is an unconditional hang.
+        """
+        process = self.log_process
+        if process is None:
+            return False
+
+        if stopped_by_us and process.poll() is None:
+            process.terminate()
+
+        try:
+            returncode = process.wait(timeout=STREAM_SHUTDOWN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=STREAM_SHUTDOWN_TIMEOUT)
+            returncode = process.poll()
+
+        # We terminated it deliberately, so its exit status says nothing about
+        # whether the capture worked.
+        if stopped_by_us:
+            return True
+
+        if returncode:
+            detail = " ".join(self._stderr_lines).strip()
+            message = f"adb logcat exited with status {returncode}."
+            if detail:
+                message += f" {detail}"
+            else:
+                message += (
+                    " Check the device is connected and, with more than one "
+                    "attached, pass --serial."
+                )
+            print(message, file=sys.stderr)
+            return False
+        return True
 
     def get_summary(self, verbose: bool = False) -> str:
         """

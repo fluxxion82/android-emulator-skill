@@ -101,35 +101,6 @@ def test_parser_matches_the_threadtime_format_it_was_written_for(recorded):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A1: build_logcat_command requests `-v time`, whose layout is "
-        "'MM-DD HH:MM:SS.mmm P/Tag( PID): msg'. parse_logcat_line's regex "
-        "expects threadtime's 'MM-DD HH:MM:SS.mmm PID TID P Tag: msg'. Every "
-        "line falls into the unparsed branch, so severity counts are always 0 "
-        "and --follow prints nothing. Fix by requesting -v threadtime."
-    ),
-)
-def test_parser_matches_the_format_the_tool_actually_requests(recorded):
-    """The parser must handle whatever format build_logcat_command asks for."""
-    monitor = _log_monitor()
-    lines = _content_lines(recorded.text("logcat_time"))
-    assert lines, "time-format fixture is empty"
-
-    parsed = [monitor.parse_logcat_line(line) for line in lines]
-    matched = [p for p in parsed if p is not None]
-    assert matched, f"parsed 0 of {len(lines)} lines in the format the tool requests"
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A1: the requested format (-v time) and the parsed format "
-        "(threadtime) disagree. This is the invariant that, held from the "
-        "start, would have made A1 impossible whichever side was chosen."
-    ),
-)
 def test_requested_format_and_parsed_format_agree(recorded):
     """The command's `-v` argument must name the format the parser understands.
 
