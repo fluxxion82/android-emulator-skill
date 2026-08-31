@@ -44,6 +44,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -354,15 +355,31 @@ class AnrBuster:
             total_lines=line_counters.get("total", 0),
             dropped_below_threshold=line_counters.get("dropped", 0),
         )
-        effective_top_n = top_n or env_int("ANDROID_EMU_ANR_DEFAULT_TOP_N", 3)
-        summary.clusters = summary.clusters[:effective_top_n]
+        # Persist the complete summary BEFORE any capping. Top-N is a display
+        # concern; truncating first destroyed every cluster past N on disk, so
+        # `--get-details --cluster 4` could never resolve and `--diff` compared
+        # two truncated sets, reporting clusters as new or resolved purely
+        # because they fell outside the cap.
         self.store.stop(session_id, summary)
+
+        # `top_n or default` treated both None (no flag) and 0 (--all, "no cap")
+        # as "unset", so --all returned exactly the default it was meant to lift.
+        effective_top_n = env_int("ANDROID_EMU_ANR_DEFAULT_TOP_N", 3) if top_n is None else top_n
+
+        view = summary
+        if effective_top_n > 0:
+            view = replace(summary, clusters=summary.clusters[:effective_top_n])
+
         if json_mode:
-            return json.dumps(summary_to_json(summary), indent=2)
+            return json.dumps(summary_to_json(view), indent=2)
         if terse:
-            return format_l0(summary)
+            return format_l0(view)
         budget = budget_tokens or env_int("ANDROID_EMU_ANR_BUDGET_TOKENS", 0) or None
-        return compress_to_budget(summary, max_tokens=budget, default_top_n=effective_top_n)
+        return compress_to_budget(
+            view,
+            max_tokens=budget,
+            default_top_n=effective_top_n if effective_top_n > 0 else len(view.clusters),
+        )
 
     def get_details(
         self,
@@ -829,7 +846,8 @@ def main():
 
     if args.stop:
         buster = AnrBuster()
-        top_n = None if args.all_clusters else args.top_n
+        # 0 means no cap, matching the repo's '0 = disabled' convention.
+        top_n = 0 if args.all_clusters else args.top_n
         out = buster.stop(
             args.stop,
             budget_tokens=args.budget_tokens,
