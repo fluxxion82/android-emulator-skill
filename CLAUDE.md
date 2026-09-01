@@ -99,7 +99,14 @@ Therefore:
    the defect turns the test red until the marker is removed — delete the marker
    in the same commit as the fix.
 
-5. **Tests needing a device are marked `@pytest.mark.emulator`** and deselected
+5. **A live test must never drive someone's phone.** `adb devices` lists a
+   handset before `emulator-5554`, so taking the first serial pointed the whole
+   lane at whatever was plugged in. `live_device` prefers an emulator; anything
+   with side effects that must not reach a real device (SMS, snapshots, taps,
+   key presses) takes `emulator_only_device`, which skips rather than falling
+   back.
+
+6. **Tests needing a device are marked `@pytest.mark.emulator`** and deselected
    by default. Run them with `pytest -m emulator`. They assert *semantic floors*
    ("did the agent get a usable answer"), not command shapes.
 
