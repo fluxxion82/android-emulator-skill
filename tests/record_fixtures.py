@@ -398,6 +398,18 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="emu_help_sms",
+        args=["emu", "help", "sms"],
+        description=(
+            "The console's authoritative `sms` sub-command list: `send` and "
+            "`pdu`, and nothing else. Both simulate an INBOUND message, so there "
+            "is no console path for testing an app's outgoing-SMS code, and no "
+            "MMS sub-command. Recorded so a claim about `adb emu sms` can be "
+            "checked against the console rather than assumed -- several scripts "
+            "in this skill previously invented sub-commands outright."
+        ),
+    ),
+    Fixture(
         name="emu_sms_send",
         args=["emu", "sms", "send", "+15551234567", "Your code is 428193"],
         description=(
@@ -419,6 +431,80 @@ FIXTURES: list[Fixture] = [
             "proves `adb emu sms send` actually delivered. Row shape is "
             "'Row: <n> address=..., body=..., date=...' -- comma-space separated "
             "pairs, so a body containing ', ' cannot be split naively."
+        ),
+    ),
+    Fixture(
+        name="content_query_sms_inbox_multi",
+        args=[
+            "shell",
+            "content query --uri content://sms/inbox --projection address:body:date",
+        ],
+        setup=[
+            ["emu", "sms", "send", "+15550002222", "Order 42, shipped today"],
+            ["emu", "sms", "send", "+15550003333", "Verify 7781 now"],
+            # `adb emu sms send` returns before the message reaches the inbox:
+            # measured on API 35, absent immediately and present after ~2.1s.
+            # Anything reading the inbox straight after a send must poll.
+            ["shell", "sleep", "5"],
+        ],
+        description=(
+            "The same query with several messages present, including one whose "
+            "body contains ', ' -- 'Order 42, shipped today'. That row is the "
+            "point of the fixture: the pair separator is also ', ', so splitting "
+            "on it yields 'address=+1555...', 'body=Order 42', 'shipped today' "
+            "and 'date=...'. A parser must bound each value by the NEXT KNOWN KEY "
+            "instead. Note also that rows arrive newest first (the provider's own "
+            "ORDER BY is date DESC, visible in the SQL echoed by "
+            "content_query_sms_error), that dates are epoch milliseconds, and "
+            "that two identical bodies can coexist -- which is why verifying a "
+            "send means finding a message the inbox did not already contain. "
+            "Re-recording appends: the setup sends again, so the file grows. "
+            "That is harmless, since what it pins is row shape."
+        ),
+    ),
+    Fixture(
+        name="content_query_empty_result",
+        args=[
+            "shell",
+            "content query --uri content://sms/sent --projection address:body:date",
+        ],
+        description=(
+            "What `content query` prints for an empty cursor: 'No result found.' "
+            "on stdout, exit 0, nothing on stderr. Recorded against sms/sent, "
+            "which is empty unless something has sent from the device. This is "
+            "the string that distinguishes an EMPTY inbox from an UNREADABLE one "
+            "(content_query_sms_error) -- 'the message did not arrive' and "
+            "'the inbox could not be read' are different answers and must not be "
+            "reported as the same one."
+        ),
+    ),
+    Fixture(
+        name="content_query_sms_error",
+        args=[
+            "shell",
+            "content query --uri content://sms/inbox --projection address:body:date "
+            "--where address=nosuchcolumn",
+        ],
+        description=(
+            "`content query` FAILING. It writes 'Error while accessing provider:"
+            "<authority>' plus a Java stack trace to STDERR, prints nothing on "
+            "stdout, and EXITS 0 -- the same shape of trap as `adb emu` and "
+            "`am broadcast`. A caller checking only the exit status, or only "
+            "stdout, reads this as an empty inbox. (The unquoted --where value "
+            "reaches SQLite as an identifier, which is how the failure is "
+            "provoked; the compiled SQL it echoes also documents the provider's "
+            "default 'ORDER BY date DESC'.)"
+        ),
+    ),
+    Fixture(
+        name="emu_sms_send_missing_arg",
+        args=["emu", "sms", "send", "+15551234567"],
+        description=(
+            "`adb emu sms send` with the body omitted. The console answers "
+            "\"KO: missing argument, try 'sms send <phonenumber> <text "
+            "message>'\" and adb still EXITS 0, so anything reading the exit "
+            "status sees a successful send. Failure is visible only in the reply "
+            "text; common/emu_console.run_emu is what turns it into an error."
         ),
     ),
     Fixture(

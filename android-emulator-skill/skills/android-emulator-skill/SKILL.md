@@ -44,12 +44,18 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.5.0)
 
-### Implemented (29 scripts)
+### Implemented (30 scripts)
 
-#### Core Utilities (6 modules)
+#### Core Utilities (9 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
+
+   Also in `common/`: **adb_exec.py** (the one bounded entry point for every adb
+   call, with typed errors that name a remedy), **hierarchy.py** (the one way to
+   capture the UI hierarchy — no temp files, so concurrent runs cannot read each
+   other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
+   fails), **env_config.py**, **anr_pipeline.py**, **anr_sessions.py**.
 
 #### App Management (1 script)
 4. **app_launcher.py** - App lifecycle management
@@ -217,6 +223,20 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
     - Legacy: `--watch [--duration N]`, `--since 5m`; plus `--budget-tokens`, `--terse`, `--json`
 
+33. **sms.py** ⭐ NEW - Deliver an inbound SMS to an emulator and **prove it arrived**. Emulator-only.
+    - `--send` reads the inbox back and reports `accepted` and `delivered` separately: the console's `OK` means the command was taken, not that a message exists. Delivery is asynchronous (~2s measured), so it polls.
+    - `--otp` extracts a one-time code from the newest message and prints the message it came from, so the heuristic can be checked.
+    - Options: `--send --to NUM --body TEXT [--no-verify]`, `--list [--limit N]`, `--otp`, `--serial`, `--json`, `--verbose`
+
+34. **snapshot.py** ⭐ NEW - Save/load/delete emulator snapshots (`adb emu avd snapshot`). A ~2s state reset in place of a 60s reboot. Emulator-only.
+    - A failed load is reported as a failure, which is the whole point: `adb emu` exits 0 even when it answers `KO`, so a restore that did not happen would otherwise be reported as success and the next test would run against unknown state.
+    - Options: `--list`, `--save NAME`, `--load NAME`, `--delete NAME`, `--no-verify`, `--timeout`, `--serial`, `--json`, `--verbose`
+
+35. **crash_triage.py** ⭐ NEW - Parse the dedicated crash buffer (`logcat -b crash`) into structured crashes, grouped by fault.
+    - Groups repeats by package + exception + signature frame (a crash loop otherwise floods the output), and names the frame most useful for triage, **labelled with the basis for the choice** — including "no app frame; every frame is framework code" when that is the honest answer.
+    - Exit status answers "did triage run", not "did anything crash" — branch on `crash_count` in `--json`, or pass `--fail-on-crash`.
+    - Options: `--package PKG`, `--clear`, `--fail-on-crash`, `--serial`, `--json`, `--verbose`
+
 > The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`. The ANR watcher's clustering/session machinery lives in `common/anr_pipeline.py` and `common/anr_sessions.py`.
 
 ## Android vs iOS Mapping
@@ -255,6 +275,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 - **push_notification.py** - Test notification handling
 - **status_bar.py** - Fine-grained control
 - **emulator_create/delete/erase.py** - CI/CD provisioning
+- **sms.py** - Inbound SMS, and OTP login flows end to end (emulator-only)
+- **snapshot.py** - ~2s state reset between tests (emulator-only)
+- **crash_triage.py** - Structured crashes from the dedicated crash buffer
 
 ## Typical Workflows
 

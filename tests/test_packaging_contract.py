@@ -72,6 +72,41 @@ def test_skill_md_shows_how_to_root_the_path():
 # ---------------------------------------------------------------------------
 
 
+def test_skill_md_lists_every_script_and_counts_them_correctly():
+    """The script inventory must match the filesystem, not a stale memory of it.
+
+    Both numbers in SKILL.md had already drifted: it announced "29 scripts"
+    while 27 existed, and "Core Utilities (6 modules)" while `common/` held 9.
+    A reader trusting either count reaches for a script that is not there, or
+    misses one that is -- and the count is the first thing an agent reads to
+    decide what this skill can do.
+
+    Counted from disk rather than from the heading, so adding a script without
+    documenting it fails here.
+    """
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    scripts = sorted(p.name for p in (SKILL_ROOT / "scripts").glob("*.py"))
+    common = sorted(
+        p.name for p in (SKILL_ROOT / "scripts" / "common").glob("*.py") if p.name != "__init__.py"
+    )
+
+    undocumented = [name for name in scripts if f"**{name}**" not in text]
+    assert not undocumented, f"scripts missing from SKILL.md: {undocumented}"
+
+    claimed = re.search(r"### Implemented \((\d+) scripts\)", text)
+    assert claimed, "SKILL.md no longer announces a script count"
+    assert int(claimed.group(1)) == len(
+        scripts
+    ), f"SKILL.md claims {claimed.group(1)} scripts; {len(scripts)} exist on disk"
+
+    claimed_common = re.search(r"#### Core Utilities \((\d+) modules", text)
+    assert claimed_common, "SKILL.md no longer announces a common-module count"
+    assert int(claimed_common.group(1)) == len(
+        common
+    ), f"SKILL.md claims {claimed_common.group(1)} common modules; {len(common)} exist"
+
+
 def test_skill_md_does_not_link_nonexistent_docs():
     """STATUS.md and TESTING.md have never existed in this repo."""
     text = SKILL_MD.read_text(encoding="utf-8")

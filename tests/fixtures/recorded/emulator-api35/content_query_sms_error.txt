@@ -1,0 +1,10 @@
+Error while accessing provider:sms
+android.database.sqlite.SQLiteException: no such column: nosuchcolumn (code 1 SQLITE_ERROR): , while compiling: SELECT address, body, date FROM sms_restricted WHERE (type=1) AND ((address=nosuchcolumn) AND (sub_id IN ('1','-1') OR address IN ('911','112'))) ORDER BY date DESC
+	at android.database.DatabaseUtils.readExceptionFromParcel(DatabaseUtils.java:199)
+	at android.database.DatabaseUtils.readExceptionFromParcel(DatabaseUtils.java:155)
+	at android.content.ContentProviderProxy.query(ContentProviderNative.java:495)
+	at com.android.commands.content.Content$QueryCommand.onExecute(Content.java:661)
+	at com.android.commands.content.Content$Command.execute(Content.java:522)
+	at com.android.commands.content.Content.main(Content.java:735)
+	at com.android.internal.os.RuntimeInit.nativeFinishInit(Native Method)
+	at com.android.internal.os.RuntimeInit.main(RuntimeInit.java:369)
