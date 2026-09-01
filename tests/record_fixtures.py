@@ -188,27 +188,33 @@ def _redact_private_packages(text: str, mapping: dict[str, str]) -> str:
 COMPOSE_PACKAGE = "com.example.composefixture"
 
 
-def _hierarchy_of(package: str) -> Callable[[str], str]:
+def _trim_hierarchy(raw: str) -> str:
     """Trim an ``exec-out uiautomator dump`` stream to just its XML document.
 
     uiautomator writes its status line ("UI hierchary dumped to: /dev/tty" --
     Android's typo, not ours) onto the same stream, so the raw bytes are not a
     parseable document.
+    """
+    start = raw.find("<?xml")
+    if start == -1:
+        raise CaptureError(f"no XML in uiautomator output: {raw.strip()[:120]!r}")
+    end = raw.rfind("</hierarchy>")
+    if end == -1:
+        raise CaptureError("uiautomator output truncated: no closing </hierarchy>")
+    return raw[start : end + len("</hierarchy>")] + "\n"
 
-    The returned callable also asserts the dump is of ``package``. A dump always
-    succeeds: if the activity never launched, uiautomator happily describes the
-    launcher instead, and the result would be a file that looks like a Compose
-    hierarchy and is not -- the exact failure this recorder exists to prevent.
+
+def _hierarchy_of(package: str) -> Callable[[str], str]:
+    """Trim the dump and assert it is of ``package``.
+
+    A dump always succeeds: if the activity never launched, uiautomator happily
+    describes the launcher instead, and the result would be a file that looks
+    like a Compose hierarchy and is not -- the exact failure this recorder
+    exists to prevent.
     """
 
     def trim(raw: str) -> str:
-        start = raw.find("<?xml")
-        if start == -1:
-            raise CaptureError(f"no XML in uiautomator output: {raw.strip()[:120]!r}")
-        end = raw.rfind("</hierarchy>")
-        if end == -1:
-            raise CaptureError("uiautomator output truncated: no closing </hierarchy>")
-        xml = raw[start : end + len("</hierarchy>")] + "\n"
+        xml = _trim_hierarchy(raw)
         if f'package="{package}"' not in xml:
             raise CaptureError(
                 f"dump contains no {package!r} node: the activity did not launch. "
@@ -217,6 +223,84 @@ def _hierarchy_of(package: str) -> Callable[[str], str]:
         return xml
 
     return trim
+
+
+def _screen_of(
+    package: str,
+    *,
+    require: tuple[str, ...] = (),
+    forbid: tuple[str, ...] = (),
+    scrollable: bool | None = None,
+) -> Callable[[str], str]:
+    """Trim the dump and refuse it unless it is the screen that was asked for.
+
+    A scroll fixture is only worth having if the scroll actually happened, and
+    a dump gives no sign either way: swipe the wrong distance, or catch the
+    list mid-fling, and you get a perfectly valid hierarchy of the wrong
+    screen. A test written against that pair would prove nothing while looking
+    like ground truth. So each capture states the fact it is meant to carry --
+    the target text is present, or absent, or the screen has no scrollable
+    container -- and a capture that does not carry it is dropped rather than
+    written.
+
+    Args:
+        package: Package that must own nodes in the dump.
+        require: Substrings that must appear (raw XML text, so escape as
+            uiautomator does: ``&amp;`` for an ampersand).
+        forbid: Substrings that must not appear.
+        scrollable: When set, whether the screen must have at least one
+            ``scrollable="true"`` node.
+
+    Returns:
+        A post-processor for :class:`Fixture`.
+    """
+
+    def check(raw: str) -> str:
+        xml = _trim_hierarchy(raw)
+        if f'package="{package}"' not in xml:
+            raise CaptureError(f"dump contains no {package!r} node: the screen did not open")
+        for needle in require:
+            if needle not in xml:
+                raise CaptureError(
+                    f"captured screen does not contain {needle!r}: it is not the "
+                    f"screen this fixture is supposed to record"
+                )
+        for needle in forbid:
+            if needle in xml:
+                raise CaptureError(
+                    f"captured screen still contains {needle!r}: the scroll did "
+                    f"not move the list as far as this fixture requires"
+                )
+        if scrollable is not None:
+            found = xml.count('scrollable="true"')
+            if bool(found) is not scrollable:
+                raise CaptureError(
+                    f"captured screen has {found} scrollable node(s); this "
+                    f"fixture requires scrollable={scrollable}"
+                )
+        return xml
+
+    return check
+
+
+# --- scroll-into-view corpus ------------------------------------------------
+# navigator's --scroll-to-find needs successive states of one real list: the
+# target below the fold, the same list after a scroll, and the list at its end.
+# The Settings home screen is the case that motivated the feature.
+SETTINGS_PACKAGE = "com.android.settings"
+DIALER_PACKAGE = "com.google.android.dialer"
+
+# What GestureSimulator.scroll("down") issues: the finger travels from 80% to
+# 20% of the screen height at the horizontal centre, over 300ms. These are
+# those pixels for this profile's 1080x2424 screen (see wm_size_physical) and
+# must be recomputed before recording a differently sized device.
+_SCROLL_DOWN = ["shell", "input", "swipe", "540", "1939", "540", "484", "300"]
+_SETTLE = ["shell", "sleep", "1"]
+_OPEN_SETTINGS = [
+    ["shell", "am", "force-stop", SETTINGS_PACKAGE],
+    ["shell", "am", "start", "-a", "android.settings.SETTINGS"],
+    ["shell", "sleep", "2"],
+]
 
 
 FIXTURES: list[Fixture] = [
@@ -688,6 +772,107 @@ FIXTURES: list[Fixture] = [
         ],
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
         post=_hierarchy_of(COMPOSE_PACKAGE),
+    ),
+    # --- below the fold: successive states of one scrolling list ------------
+    Fixture(
+        name="uiautomator_settings_top",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "Settings home as it opens. 'Notifications' is on it; 'About "
+            "emulated device' is NOT -- it exists, one scroll below the fold. "
+            'That pair is the whole navigator defect: `--find-text "About '
+            "phone\"` answered 'Not found' and exited 1, which an agent reads "
+            "as 'the item does not exist' and gives up. Two nodes carry "
+            'scrollable="true" here (nested ScrollViews: '
+            "settings_homepage_container and main_content_scrollable_container), "
+            "so a screen is not limited to one scrolling region."
+        ),
+        setup=_OPEN_SETTINGS,
+        post=_screen_of(
+            SETTINGS_PACKAGE,
+            require=("Notifications",),
+            forbid=("About emulated device",),
+            scrollable=True,
+        ),
+    ),
+    Fixture(
+        name="uiautomator_settings_scrolled",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "The same list after ONE scroll-down swipe. 'About emulated device' "
+            "is now present and 'Notifications' has gone off the top, so the "
+            "pair with uiautomator_settings_top is real evidence that one "
+            "scroll changes what a text search can reach -- not a hand-edited "
+            "variant of a single dump."
+        ),
+        setup=_OPEN_SETTINGS + [_SCROLL_DOWN, _SETTLE],
+        post=_screen_of(
+            SETTINGS_PACKAGE,
+            require=("About emulated device",),
+            forbid=("Notifications",),
+            scrollable=True,
+        ),
+    ),
+    Fixture(
+        name="uiautomator_settings_half",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "The state BETWEEN settings_top and settings_scrolled, reached with "
+            "a half-height swipe (80% -> 50% of the screen). It exists because "
+            "this list is short: at the skill's own 80% -> 20% swipe it reaches "
+            "its end in a single scroll, so the corpus had no three-state "
+            "sequence to prove a search loop actually iterates. The traversal is "
+            "real and was checked on the device -- a full scroll from this state "
+            "produces bytes identical to settings_scrolled. Note what changed: "
+            "'Network & internet' has gone off the top and 'Accessibility' has "
+            "come in, while the target 'About emulated device' is still not "
+            "there. So a scroll can move the list a long way without the search "
+            "hitting, which is why 'no match' must not end the search and why "
+            "bounds belong in the changed-screen comparison."
+        ),
+        setup=_OPEN_SETTINGS
+        + [["shell", "input", "swipe", "540", "1939", "540", "1212", "300"], _SETTLE],
+        post=_screen_of(
+            SETTINGS_PACKAGE,
+            require=("Notifications", "Accessibility"),
+            forbid=("About emulated device", "Network"),
+            scrollable=True,
+        ),
+    ),
+    Fixture(
+        name="uiautomator_settings_scrolled_again",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "A SECOND scroll-down swipe on a list already at its end, dumped "
+            "again. Byte-identical to uiautomator_settings_scrolled -- measured: "
+            "dumps taken after the 2nd through 6th swipe all hashed the same. "
+            "This is the ground truth for navigator's early exit: at the end of "
+            "a list the swipe still succeeds and still exits 0, so 'the screen "
+            "did not change' is the only signal that scrolling further is "
+            "pointless. A search without it reports having searched ten screens "
+            "after searching one screen ten times."
+        ),
+        setup=_OPEN_SETTINGS + [_SCROLL_DOWN, _SETTLE, _SCROLL_DOWN, _SETTLE],
+        post=_screen_of(SETTINGS_PACKAGE, require=("About emulated device",), scrollable=True),
+    ),
+    Fixture(
+        name="uiautomator_dialer_keypad",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "A screen with NO scrollable node: the dialer keypad, opened on a "
+            "dialled number. Recorded because every Settings page probed "
+            "(home, date, wifi, input methods) and the launcher home screen all "
+            "report at least one scrollable container, so 'the screen does not "
+            "scroll' needed evidence rather than assumption. navigator must "
+            "report that instead of swiping hopefully at a screen that cannot "
+            "move."
+        ),
+        setup=[
+            ["shell", "am", "start", "-a", "android.intent.action.DIAL", "-d", "tel:5551234"],
+            ["shell", "sleep", "3"],
+        ],
+        teardown=[["shell", "am", "force-stop", DIALER_PACKAGE]],
+        post=_screen_of(DIALER_PACKAGE, require=("555-1234",), scrollable=False),
     ),
 ]
 

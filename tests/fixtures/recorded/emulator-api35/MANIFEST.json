@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T17:02:31Z",
+  "recorded_at": "2026-09-01T18:36:15Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -269,12 +269,52 @@
       "bytes": 23465
     },
     {
+      "name": "uiautomator_dialer_keypad",
+      "file": "uiautomator_dialer_keypad.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "A screen with NO scrollable node: the dialer keypad, opened on a dialled number. Recorded because every Settings page probed (home, date, wifi, input methods) and the launcher home screen all report at least one scrollable container, so 'the screen does not scroll' needed evidence rather than assumption. navigator must report that instead of swiping hopefully at a screen that cannot move.",
+      "catches": [],
+      "bytes": 41034
+    },
+    {
       "name": "uiautomator_dump_raw",
       "file": "uiautomator_dump_raw.xml",
       "command": "adb exec-out uiautomator dump /dev/tty",
       "description": "The dump exactly as `exec-out` delivers it, status line included. The existing uiautomator_* fixtures hold only the XML, so the framing was never recorded and tests asserted it as an inline literal -- guessing tool output, the exact mistake this corpus exists to prevent. The measured shape: uiautomator appends 'UI hierchary dumped to: /dev/tty' (Android's typo, not ours) directly onto the XML with NO separating newline, on stdout. A test that writes it with a '\\n' is testing something the device never produces.",
       "catches": [],
       "bytes": 10927
+    },
+    {
+      "name": "uiautomator_settings_half",
+      "file": "uiautomator_settings_half.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "The state BETWEEN settings_top and settings_scrolled, reached with a half-height swipe (80% -> 50% of the screen). It exists because this list is short: at the skill's own 80% -> 20% swipe it reaches its end in a single scroll, so the corpus had no three-state sequence to prove a search loop actually iterates. The traversal is real and was checked on the device -- a full scroll from this state produces bytes identical to settings_scrolled. Note what changed: 'Network & internet' has gone off the top and 'Accessibility' has come in, while the target 'About emulated device' is still not there. So a scroll can move the list a long way without the search hitting, which is why 'no match' must not end the search and why bounds belong in the changed-screen comparison.",
+      "catches": [],
+      "bytes": 31241
+    },
+    {
+      "name": "uiautomator_settings_scrolled",
+      "file": "uiautomator_settings_scrolled.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "The same list after ONE scroll-down swipe. 'About emulated device' is now present and 'Notifications' has gone off the top, so the pair with uiautomator_settings_top is real evidence that one scroll changes what a text search can reach -- not a hand-edited variant of a single dump.",
+      "catches": [],
+      "bytes": 29581
+    },
+    {
+      "name": "uiautomator_settings_scrolled_again",
+      "file": "uiautomator_settings_scrolled_again.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "A SECOND scroll-down swipe on a list already at its end, dumped again. Byte-identical to uiautomator_settings_scrolled -- measured: dumps taken after the 2nd through 6th swipe all hashed the same. This is the ground truth for navigator's early exit: at the end of a list the swipe still succeeds and still exits 0, so 'the screen did not change' is the only signal that scrolling further is pointless. A search without it reports having searched ten screens after searching one screen ten times.",
+      "catches": [],
+      "bytes": 29581
+    },
+    {
+      "name": "uiautomator_settings_top",
+      "file": "uiautomator_settings_top.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "Settings home as it opens. 'Notifications' is on it; 'About emulated device' is NOT -- it exists, one scroll below the fold. That pair is the whole navigator defect: `--find-text \"About phone\"` answered 'Not found' and exited 1, which an agent reads as 'the item does not exist' and gives up. Two nodes carry scrollable=\"true\" here (nested ScrollViews: settings_homepage_container and main_content_scrollable_container), so a screen is not limited to one scrolling region.",
+      "catches": [],
+      "bytes": 23466
     },
     {
       "name": "wm_density_override",
