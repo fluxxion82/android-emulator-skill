@@ -16,6 +16,11 @@ Used by:
 """
 
 import base64
+import contextlib
+import os
+import struct
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -181,6 +186,32 @@ def resize_screenshot(
     return (output_path, new_w, new_h)
 
 
+def png_dimensions(path: str | Path) -> tuple[int, int]:
+    """Read (width, height) out of a PNG header.
+
+    Used when Pillow is not installed. The previous fallback was
+    ``width, height = 1080, 1920``, which reported a plausible lie: a caller
+    comparing those against element bounds gets nonsense on any other device,
+    and nothing says the numbers were invented. A PNG stores its dimensions as
+    two big-endian uint32 at offsets 16 and 20, so the real answer is free.
+
+    Args:
+        path: Path to a PNG file.
+
+    Returns:
+        (width, height) in pixels.
+
+    Raises:
+        ValueError: The file is not a PNG.
+    """
+    with open(path, "rb") as handle:
+        header = handle.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"{path} is not a PNG file")
+    width, height = struct.unpack(">II", header[16:24])
+    return width, height
+
+
 def capture_screenshot(
     serial: str | None = None,
     output_path: str | None = None,
@@ -237,11 +268,16 @@ def capture_screenshot(
         print(f"Screenshot: {result['width']}x{result['height']}")
         print(f"Base64: {result['base64_data'][:50]}...")
     """
-    try:
-        # Capture screenshot to device temp location
-        device_path = "/sdcard/screenshot.png"
-        temp_path = "/tmp/android_screenshot.png"
+    # Unique on BOTH sides. These were `/sdcard/screenshot.png` and
+    # `/tmp/android_screenshot.png` -- fixed, so two concurrent captures, or
+    # one run against two devices, overwrote each other and an agent could act
+    # on another screen. That is defect R4, which `common.hierarchy` removed
+    # for UI dumps; screenshots carried the same collision until now.
+    device_path = f"/sdcard/android_emu_screenshot_{uuid.uuid4().hex}.png"
+    handle, temp_path = tempfile.mkstemp(prefix="android_emu_screenshot_", suffix=".png")
+    os.close(handle)
 
+    try:
         # Capture on device, then pull. Both bounded: a screencap on a busy
         # device is slow but finite, and an unbounded call wedges the adb
         # connection for whatever runs next.
@@ -268,7 +304,7 @@ def capture_screenshot(
                     img = Image.open(resized_path)
                     width, height = img.size
                 else:
-                    width, height = 1080, 1920  # Fallback to common device size
+                    width, height = png_dimensions(resized_path)
 
             # Read and encode as base64
             with open(resized_path, "rb") as f:
@@ -307,7 +343,7 @@ def capture_screenshot(
                 img = Image.open(final_path)
                 width, height = img.size
             else:
-                width, height = 1080, 1920  # Fallback
+                width, height = png_dimensions(final_path)
 
         # Get file size
         size_bytes = Path(final_path).stat().st_size
@@ -325,6 +361,18 @@ def capture_screenshot(
         raise RuntimeError(f"Failed to capture screenshot: {e.stderr}") from e
     except Exception as e:
         raise RuntimeError(f"Screenshot capture error: {e!s}") from e
+    finally:
+        # The device copy was never deleted before, so every capture leaked a
+        # file onto /sdcard for the life of the device. Failures included --
+        # a screencap that succeeded and a pull that did not still leaves one.
+        #
+        # Cleanup must never raise: this runs while an exception may be in
+        # flight, and a failure here would replace "screenshot failed, here is
+        # why" with a confusing error about deleting a temp file.
+        with contextlib.suppress(Exception):
+            run_adb("shell", serial, "rm", "-f", device_path, timeout=SCREENCAP_TIMEOUT)
+        with contextlib.suppress(Exception):
+            Path(temp_path).unlink(missing_ok=True)
 
 
 def format_screenshot_result(result: dict) -> str:
