@@ -1,334 +1,590 @@
 #!/usr/bin/env python3
 """
-Android Push Notification Simulator
+Notification testing from adb: post to the shade, verify what the app posted,
+and toggle POST_NOTIFICATIONS.
 
-Simulate push notifications for testing notification handling.
-Uses adb to send notification intents to the app.
+What this tool does NOT do, and why
+-----------------------------------
+It cannot deliver a payload into the app's own notification code. The previous
+version claimed to "simulate push notifications for testing notification
+handling"; no adb path reaches that, and the implementation invented the pieces
+it needed:
 
-Note: This simulates local notifications. For testing FCM (Firebase Cloud Messaging),
-you'll need to use Firebase tools or API calls.
+  S4   It broadcast to ``{package}/.NotificationReceiver`` -- a class this skill
+       made up, which no real app implements -- and then called the attempt a
+       success if stdout contained ``result=``. ``am broadcast`` ALWAYS prints
+       "Broadcast completed: result=0" and exits 0, even for a receiver class
+       that does not exist (recorded:
+       ``tests/fixtures/recorded/*/am_broadcast_missing_receiver.txt``), so the
+       failure branch was unreachable. A second method hardcoded
+       ``{package}/.MainActivity``.
+
+  S14  ``--list-channels`` ran ``cmd notification list channels <pkg>``. There is
+       no ``list channels`` subcommand; ``cmd notification`` silently ignores the
+       extra arguments, runs bare ``list`` and exits 0, so the answer was always
+       "no channels found" (recorded: ``cmd_notification_help.txt``).
+
+FCM is out of reach on purpose: the ``com.google.android.c2dm.intent.RECEIVE``
+receiver is protected by ``com.google.android.c2dm.permission.SEND``, which Google
+Play services holds and the shell user (uid 2000) does not. To exercise a real
+FirebaseMessagingService, send through FCM itself.
+
+Reading an app's notification *channel* configuration is deferred:
+``dumpsys notification --noredact`` carries app-internal channel ids and
+human-readable channel names, so it is deliberately not in the fixture set.
+
+What it does do
+---------------
+1. ``--post``  Posts a notification into the shade via ``cmd notification post``.
+   The notification belongs to **com.android.shell** on channel **shell_cmd** --
+   NOT to the app under test. It therefore exercises a NotificationListenerService,
+   the shade UI, or an agent reacting to a notification; it does NOT exercise the
+   app's own channels, its receiver, or its rendering.
+2. ``--list`` / ``--expect-package``  Reads back what is actually posted, from
+   ``cmd notification list``. Keys are ``userId|package|id|tag|uid``. This is the
+   check to run after driving the app: did package X actually post something?
+   ``--expect-package`` exits non-zero when it did not, so an agent can branch.
+3. ``--grant-permission`` / ``--revoke-permission``  Flips
+   ``android.permission.POST_NOTIFICATIONS`` (API 33+) with ``pm grant`` /
+   ``pm revoke``, for testing an app's blocked-notifications path.
+
+Success is never inferred from a substring of stdout. It comes from the process
+exit status and, for ``--post``, from the notification actually appearing in
+``cmd notification list``.
 
 Usage Examples:
-    # Send simple notification
-    python scripts/push_notification.py --package com.myapp --title "Hello" --message "Test"
+    # Post into the shade (as com.android.shell) and verify it landed
+    python push_notification.py --post --tag order-42 --text "Your order shipped"
 
-    # Send with custom data
-    python scripts/push_notification.py --package com.myapp --title "Alert" --data '{"key":"value"}'
+    # Did the app under test post anything? Exit code answers it
+    python push_notification.py --list --expect-package com.example.app
+
+    # Exercise the notifications-blocked path
+    python push_notification.py --revoke-permission --package com.example.app
 """
 
 import argparse
 import json
 import subprocess
 import sys
+import time
+from dataclasses import asdict, dataclass
 
-from common.device_utils import build_adb_command
+from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
 
+# `cmd notification post` posts on behalf of the shell, not the target app.
+# Verified on API 33 and 35: the notification is owned by com.android.shell and
+# lands on the shell's own channel.
+SHELL_PACKAGE = "com.android.shell"
+SHELL_CHANNEL = "shell_cmd"
 
-class PushNotificationSimulator:
-    """Simulates push notifications on Android."""
+# Real, grantable, and only defined from API 33 (Android 13) onward. On older
+# devices `pm grant` fails with "Unknown permission", which surfaces as a normal
+# non-zero exit rather than a silent success.
+POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS"
+
+# Every adb call is bounded; an unbounded one wedges the connection for whatever
+# runs next.
+ADB_TIMEOUT = env_int("ANDROID_EMU_NOTIFICATION_TIMEOUT", 20, min_value=5)
+# `cmd notification post` returns before NotificationManagerService registers
+# the notification, so the read-back polls rather than reading once. Measured
+# on API 35: absent immediately, present within ~2s.
+VERIFY_TIMEOUT_SECONDS = env_int("ANDROID_EMU_NOTIFICATION_VERIFY_TIMEOUT", 10, min_value=1)
+VERIFY_POLL_SECONDS = 0.25
+
+# Repeated verbatim in every user-facing surface. The whole point of the rewrite
+# is that nobody reads "notification posted" and believes their app posted it.
+SHELL_POST_CAVEAT = (
+    f"Posted as {SHELL_PACKAGE} on channel {SHELL_CHANNEL} - NOT as the target app. "
+    "The app's own channels, receiver and rendering are not exercised."
+)
+
+# Exit codes used when adb never produced one of its own.
+_EXIT_TIMEOUT = 124
+_EXIT_ADB_MISSING = 127
+
+# Fields in a notification key: userId|package|id|tag|uid
+_KEY_FIELDS = 5
+
+
+@dataclass(frozen=True)
+class PostedNotification:
+    """One line of ``cmd notification list`` -- a posted notification's key.
+
+    Attributes:
+        user_id: Android user id (``-1`` for a notification posted for all users).
+        package: Owning package.
+        notification_id: The app-chosen notification id.
+        tag: The app-chosen tag, or None when the key carries the literal ``null``.
+        uid: Owning uid.
+        key: The verbatim line, for reuse with ``cmd notification get/snooze``.
+    """
+
+    user_id: int
+    package: str
+    notification_id: int
+    tag: str | None
+    uid: int
+    key: str
+
+
+def _is_int(value: str) -> bool:
+    """Whether a key field is a (possibly signed) integer."""
+    if not value:
+        return False
+    body = value[1:] if value[0] in "+-" else value
+    return body.isdigit()
+
+
+def parse_notification_keys(output: str) -> list[PostedNotification]:
+    """Parse ``cmd notification list`` output into posted-notification records.
+
+    The command emits one notification *key* per line, pipe-delimited as
+    ``userId|package|id|tag|uid``. A tag is free text chosen by the app, so it may
+    itself contain a pipe; the three leading fields and the trailing uid are fixed,
+    and everything between them is the tag. Lines whose fixed fields are not
+    integers are not keys and are skipped rather than guessed at.
+
+    Args:
+        output: Raw stdout of ``adb shell cmd notification list``.
+
+    Returns:
+        One record per parsed key, in the order emitted.
+    """
+    notifications: list[PostedNotification] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        parts = line.split("|")
+        if len(parts) < _KEY_FIELDS:
+            continue
+        user_id, package, notification_id, uid = parts[0], parts[1], parts[2], parts[-1]
+        if not (_is_int(user_id) and _is_int(notification_id) and _is_int(uid)):
+            continue
+        tag = "|".join(parts[3:-1])
+        notifications.append(
+            PostedNotification(
+                user_id=int(user_id),
+                package=package,
+                notification_id=int(notification_id),
+                tag=None if tag == "null" else tag,
+                uid=int(uid),
+                key=line,
+            )
+        )
+    return notifications
+
+
+class NotificationTester:
+    """Post shell notifications, read back what is posted, and set POST_NOTIFICATIONS."""
 
     def __init__(self, serial: str | None = None):
-        """
-        Initialize push notification simulator.
+        """Initialize the tester.
 
         Args:
-            serial: Optional device serial
+            serial: Device serial (uses the default device when None).
         """
         self.serial = serial
 
-    def send_notification(
-        self,
-        package: str,
-        title: str,
-        message: str,
-        data: dict | None = None,
-        badge: int | None = None,
-        sound: bool = True,
-    ) -> tuple:
-        """
-        Send a notification to the app.
+    # === PUBLIC API ===
+
+    def post(self, tag: str, text: str, verify: bool = True) -> tuple[bool, dict]:
+        """Post a notification into the shade **as com.android.shell**.
+
+        Wraps ``cmd notification post TAG TEXT`` -- the two positional arguments
+        the platform documents (``post [--help | flags] TAG TEXT``). The tag is
+        what the shade shows as the title and is also carried in the notification
+        key, which is what makes the read-back check below possible.
 
         Args:
-            package: App package name
-            title: Notification title
-            message: Notification message
-            data: Optional data payload
-            badge: Optional badge count (emitted as an integer extra when > 0)
-            sound: Whether the notification should play a sound (boolean extra)
+            tag: Notification tag; appears in the shade and in the key.
+            text: Body text.
+            verify: Read ``cmd notification list`` back and require the
+                notification to be present before reporting success.
 
         Returns:
-            (success, message) tuple
+            (success, result_dict).
         """
-        # Method 1: Use am broadcast to send intent
-        # This requires the app to have a BroadcastReceiver set up
-
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
-            "am",
-            "broadcast",
-            "-a",
-            f"{package}.NOTIFICATION",
-            "-n",
-            f"{package}/.NotificationReceiver",
-            "--es",
-            "title",
-            f'"{title}"',
-            "--es",
-            "message",
-            f'"{message}"',
-        )
-
-        # Badge count (Android-native equivalent of iOS aps.badge): integer extra.
-        # Only emitted when positive so the default contract is unchanged.
-        if badge is not None and badge > 0:
-            cmd.extend(["--ei", "badge", str(badge)])
-
-        # Sound toggle (Android-native equivalent of iOS aps.sound): boolean extra.
-        cmd.extend(["--ez", "sound", "true" if sound else "false"])
-
-        # Add data if provided
-        if data:
-            for key, value in data.items():
-                cmd.extend(["--es", key, f'"{value}"'])
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            # Check if broadcast was successful
-            if "result=" in result.stdout.lower() or "broadcast" in result.stdout.lower():
-                return True, f"Notification sent: {title}"
-            return False, "Failed to send notification (receiver not found)"
-
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to send notification: {error_msg}"
-
-    def send_notification_via_service(
-        self,
-        package: str,
-        title: str,
-        message: str,
-        notification_id: int = 1,
-    ) -> tuple:
-        """
-        Send notification via NotificationManager service.
-
-        Args:
-            package: App package name
-            title: Notification title
-            message: Notification message
-            notification_id: Notification ID
-
-        Returns:
-            (success, message) tuple
-        """
-        # Alternative: Use service call to NotificationManager
-        # This is more complex and requires parsing service IDs
-
-        # For now, we'll use a simpler approach: start the app with intent extras
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
-            "am",
-            "start",
-            "-n",
-            f"{package}/.MainActivity",
-            "--es",
-            "notification_title",
-            f'"{title}"',
-            "--es",
-            "notification_message",
-            f'"{message}"',
-            "--ei",
-            "notification_id",
-            str(notification_id),
-        )
-
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True, f"Notification sent via intent: {title}"
-
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to send notification: {error_msg}"
-
-    def test_notification_channel(self, package: str) -> tuple:
-        """
-        Test if app has notification channels (Android 8.0+).
-
-        Args:
-            package: App package name
-
-        Returns:
-            (success, message, channels) tuple
-        """
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
+        code, stdout, stderr = self._shell(
             "cmd",
             "notification",
-            "list",
-            "channels",
-            package,
+            "post",
+            quote_for_device_shell(tag),
+            quote_for_device_shell(text),
         )
+        result = {
+            "action": "post",
+            "posted_as": SHELL_PACKAGE,
+            "channel": SHELL_CHANNEL,
+            "tag": tag,
+            "text": text,
+            "caveat": SHELL_POST_CAVEAT,
+            "exit_code": code,
+            "verified": False,
+        }
 
+        if code != 0:
+            result["error"] = (stderr or stdout).strip() or f"cmd notification post exited {code}"
+            return False, result
+
+        if not verify:
+            # Exit status is the only signal left, so also reject the case where
+            # the shell printed its own usage instead of posting.
+            if "usage: cmd notification" in f"{stdout}\n{stderr}".lower():
+                result["error"] = (
+                    "cmd notification printed its usage instead of posting; "
+                    "the arguments were rejected"
+                )
+                return False, result
+            result["note"] = "Not verified (--no-verify): exit status only."
+            return True, result
+
+        # `cmd notification post` returns before NotificationManagerService has
+        # registered the notification: measured on API 35, an immediate
+        # `cmd notification list` does not show it, and it appears within about
+        # two seconds. Polling rather than sleeping keeps the fast path fast and
+        # still gives a slow device room.
+        matches: list[dict] = []
+        listing: dict = {}
+        deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS
+        while True:
+            listed, listing = self.list_posted()
+            if listed:
+                matches = [
+                    item
+                    for item in listing["notifications"]
+                    if item["package"] == SHELL_PACKAGE and item["tag"] == tag
+                ]
+                if matches:
+                    break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(VERIFY_POLL_SECONDS)
+
+        if not listed:
+            result["error"] = (
+                "posted, but the read-back failed so it cannot be confirmed: "
+                f"{listing.get('error', 'unknown error')}"
+            )
+            return False, result
+
+        result["matches"] = matches
+        if not matches:
+            result["error"] = (
+                f"cmd notification post exited 0 but no {SHELL_PACKAGE} notification "
+                f"tagged {tag!r} appeared in `cmd notification list` within "
+                f"{VERIFY_TIMEOUT_SECONDS}s. Exit 0 alone does not mean a "
+                "notification exists."
+            )
+            return False, result
+
+        result["verified"] = True
+        result["key"] = matches[0]["key"]
+        return True, result
+
+    def list_posted(self) -> tuple[bool, dict]:
+        """List every notification currently posted, from ``cmd notification list``.
+
+        Returns:
+            (success, result_dict) with parsed ``notifications`` on success.
+        """
+        code, stdout, stderr = self._shell("cmd", "notification", "list")
+        if code != 0:
+            return False, {
+                "action": "list",
+                "exit_code": code,
+                "error": (stderr or stdout).strip() or f"cmd notification list exited {code}",
+            }
+
+        notifications = [asdict(item) for item in parse_notification_keys(stdout)]
+        return True, {
+            "action": "list",
+            "exit_code": 0,
+            "count": len(notifications),
+            "packages": sorted({item["package"] for item in notifications}),
+            "notifications": notifications,
+        }
+
+    def expect_package(self, package: str) -> tuple[bool, dict]:
+        """Assert that ``package`` currently has at least one posted notification.
+
+        The check an agent runs after driving the app: it answers "did the app
+        actually post anything" from the platform's own record, and reports
+        failure (non-zero exit from the CLI) when it did not.
+
+        Args:
+            package: Package expected to have posted a notification.
+
+        Returns:
+            (found, result_dict).
+        """
+        listed, listing = self.list_posted()
+        if not listed:
+            return False, listing
+
+        matches = [item for item in listing["notifications"] if item["package"] == package]
+        result = {
+            "action": "expect-package",
+            "exit_code": 0,
+            "expect_package": package,
+            "found": bool(matches),
+            "count": len(matches),
+            "notifications": matches,
+            "packages_present": listing["packages"],
+        }
+        if not matches:
+            present = ", ".join(listing["packages"]) or "none"
+            result["error"] = (
+                f"no notification posted by {package} (packages currently posting: {present})"
+            )
+        return bool(matches), result
+
+    def set_post_permission(self, package: str, granted: bool) -> tuple[bool, dict]:
+        """Grant or revoke ``android.permission.POST_NOTIFICATIONS`` for a package.
+
+        Args:
+            package: Target package.
+            granted: True to ``pm grant``, False to ``pm revoke``.
+
+        Returns:
+            (success, result_dict).
+        """
+        verb = "grant" if granted else "revoke"
+        code, stdout, stderr = self._shell(
+            "pm", verb, quote_for_device_shell(package), POST_NOTIFICATIONS
+        )
+        result = {
+            "action": f"{verb}-permission",
+            "package": package,
+            "permission": POST_NOTIFICATIONS,
+            "granted": granted,
+            "exit_code": code,
+        }
+
+        # `pm grant`/`pm revoke` print nothing when they work. Anything on either
+        # stream is the platform explaining a refusal ("Operation not allowed",
+        # "Unknown permission" below API 33), which on some builds still exits 0.
+        complaint = (stderr or stdout).strip()
+        if code != 0 or complaint:
+            result["error"] = complaint or f"pm {verb} exited {code}"
+            return False, result
+        return True, result
+
+    # === INTERNAL ===
+
+    def _shell(self, *args: str) -> tuple[int, str, str]:
+        """Run one ``adb shell`` command, bounded, without a host shell.
+
+        Args:
+            *args: Device-side command and arguments, already quoted for the
+                device shell where they carry untrusted text.
+
+        Returns:
+            (exit_code, stdout, stderr). adb missing or hung is reported as a
+            non-zero code, never as a success.
+        """
+        cmd = build_adb_command("shell", self.serial, *args)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            channels = []
-            for line in result.stdout.split("\n"):
-                if "channelId" in line:
-                    channels.append(line.strip())
-
-            if channels:
-                return True, f"Found {len(channels)} notification channel(s)", channels
-            return True, "No notification channels found (app may not have created any)", []
-
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to check channels: {error_msg}", None
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=ADB_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return _EXIT_TIMEOUT, "", f"adb timed out after {ADB_TIMEOUT}s: {' '.join(cmd)}"
+        except FileNotFoundError:
+            return _EXIT_ADB_MISSING, "", "adb not found on PATH"
+        return completed.returncode, completed.stdout, completed.stderr
 
 
-def main():
-    """Main entry point."""
+def _print_post(success: bool, result: dict, verbose: bool) -> None:
+    """Print the concise ``--post`` report."""
+    if not success:
+        print(f"x Post failed: {result.get('error', 'unknown error')}", file=sys.stderr)
+        return
+    print(f"+ Posted tag {result['tag']!r} as {SHELL_PACKAGE} (channel {SHELL_CHANNEL})")
+    print(f"  {SHELL_POST_CAVEAT}")
+    if result["verified"]:
+        print(f"  Verified in `cmd notification list`: {result['key']}")
+    else:
+        print(f"  {result.get('note', 'Not verified.')}")
+    if verbose:
+        print(f"  Body: {result['text']}")
+        print("  Read back later with: --list --expect-package " + SHELL_PACKAGE)
+
+
+def _print_list(success: bool, result: dict, verbose: bool) -> None:
+    """Print the concise ``--list`` report."""
+    if not success:
+        print(f"x {result.get('error', 'unknown error')}", file=sys.stderr)
+        return
+    packages = ", ".join(result["packages"]) or "none"
+    print(f"{result['count']} notification(s) posted by: {packages}")
+    if verbose:
+        for item in result["notifications"]:
+            print(f"  {item['key']}")
+    elif result["notifications"]:
+        print("  (--verbose for keys)")
+
+
+def _print_expect(success: bool, result: dict, verbose: bool) -> None:
+    """Print the concise ``--expect-package`` report."""
+    package = result.get("expect_package", "?")
+    if not success:
+        print(f"x {result.get('error', 'unknown error')}", file=sys.stderr)
+        return
+    print(f"+ {package} has {result['count']} posted notification(s)")
+    if verbose:
+        for item in result["notifications"]:
+            print(f"  {item['key']}")
+
+
+def _print_permission(success: bool, result: dict, verbose: bool) -> None:
+    """Print the concise permission report."""
+    granted = bool(result.get("granted"))
+    if not success:
+        attempt = "grant" if granted else "revoke"
+        print(
+            f"x Failed to {attempt} {POST_NOTIFICATIONS}: {result.get('error', 'unknown error')}",
+            file=sys.stderr,
+        )
+        return
+    print(f"+ {'Granted' if granted else 'Revoked'} {POST_NOTIFICATIONS} for {result['package']}")
+    if verbose:
+        print("  Only meaningful on API 33+; the app must also declare the permission.")
+
+
+_PRINTERS = {
+    "post": _print_post,
+    "list": _print_list,
+    "expect-package": _print_expect,
+    "grant-permission": _print_permission,
+    "revoke-permission": _print_permission,
+}
+
+
+def _emit(success: bool, result: dict, args: argparse.Namespace) -> None:
+    """Render a result as JSON or as the concise human report."""
+    if args.json:
+        print(json.dumps({"success": success, **result}, indent=2))
+        return
+    printer = _PRINTERS.get(str(result.get("action")), _print_list)
+    printer(success, result, args.verbose)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI parser."""
     parser = argparse.ArgumentParser(
-        description="Simulate push notifications on Android",
+        description=(
+            "Post a notification into the shade as the system shell, verify what an "
+            "app actually posted, and toggle POST_NOTIFICATIONS."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+What --post really does:
+  `cmd notification post` posts as {SHELL_PACKAGE} on channel {SHELL_CHANNEL}.
+  The notification does NOT belong to the app under test, so the app's own
+  channels, its receiver and its rendering are NOT exercised. It is still useful
+  for driving a NotificationListenerService, the shade UI, or an agent that
+  reacts to a notification.
+
+  Delivering a payload into an app's own FirebaseMessagingService is not
+  possible from adb: the c2dm RECEIVE receiver is protected by a permission held
+  by Google Play services, not by the shell user. Send through FCM instead.
+
 Examples:
-  # Send simple notification
-  python scripts/push_notification.py --package com.myapp --title "Hello" --message "Test"
+  python push_notification.py --post --tag order-42 --text "Your order shipped"
+  python push_notification.py --post --tag t1 --text hi --no-verify --json
+  python push_notification.py --list --verbose
+  python push_notification.py --list --expect-package com.example.app
+  python push_notification.py --grant-permission --package com.example.app
+  python push_notification.py --revoke-permission --package com.example.app --json
 
-  # Send with notification ID
-  python scripts/push_notification.py --package com.myapp --title "Alert" --message "Important" --id 123
-
-  # Send with a badge count and no sound, tracking a named test scenario
-  python scripts/push_notification.py --package com.myapp --title "Alert" --message "Hi" \\
-      --badge 3 --no-sound --test-name push-cold-start --expected "deep link opens detail screen"
-
-  # Check notification channels
-  python scripts/push_notification.py --package com.myapp --list-channels
-
-Note:
-  This script simulates notifications by sending intents to your app.
-  Your app needs to handle these intents to display notifications.
-
-  For testing FCM (Firebase Cloud Messaging), use Firebase tools or API calls instead.
+Exit status:
+  0  the action succeeded (for --post: the notification was found in
+     `cmd notification list`; for --expect-package: the package has one)
+  1  it did not
         """,
     )
 
-    # Default badge is tunable via ANDROID_EMU_PUSH_DEFAULT_BADGE (0 = no badge extra).
-    default_badge = env_int("ANDROID_EMU_PUSH_DEFAULT_BADGE", 0, min_value=0)
-
-    parser.add_argument("--package", help="App package name")
-    parser.add_argument("--title", help="Notification title")
-    parser.add_argument("--message", help="Notification message")
-    parser.add_argument("--id", type=int, default=1, help="Notification ID (default: 1)")
-    parser.add_argument("--data", help="JSON data payload")
-    parser.add_argument(
-        "--badge",
-        type=int,
-        default=default_badge,
-        help="Badge count extra (broadcast method; 0 = no badge)",
-    )
-    parser.add_argument(
-        "--no-sound",
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument(
+        "--post",
         action="store_true",
-        help="Disable notification sound (sets the 'sound' boolean extra to false)",
+        help=f"Post a notification into the shade as {SHELL_PACKAGE} (not as the app)",
     )
-    parser.add_argument("--test-name", help="Test scenario name for tracking")
-    parser.add_argument("--expected", help="Expected behavior after the notification arrives")
-    parser.add_argument("--list-channels", action="store_true", help="List notification channels")
-    parser.add_argument(
-        "--method",
-        default="broadcast",
-        choices=["broadcast", "intent"],
-        help="Method to use (default: broadcast)",
+    action.add_argument(
+        "--list",
+        dest="list_posted",
+        action="store_true",
+        help="List the notifications currently posted (any package)",
     )
-    parser.add_argument(
-        "--serial", dest="device_serial", help="Device serial (uses default if not specified)"
+    action.add_argument(
+        "--grant-permission",
+        action="store_true",
+        help=f"pm grant {POST_NOTIFICATIONS} to --package (API 33+)",
     )
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    action.add_argument(
+        "--revoke-permission",
+        action="store_true",
+        help=f"pm revoke {POST_NOTIFICATIONS} from --package (API 33+)",
+    )
 
+    parser.add_argument("--tag", help="With --post: tag, shown as the title and kept in the key")
+    parser.add_argument("--text", help="With --post: notification body text")
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="With --post: skip the read-back check and trust the exit status alone",
+    )
+    parser.add_argument(
+        "--expect-package",
+        metavar="PACKAGE",
+        help="With --list: exit non-zero unless PACKAGE has a posted notification",
+    )
+    parser.add_argument(
+        "--package",
+        help="Target package for --grant-permission / --revoke-permission",
+    )
+    parser.add_argument("--serial", help="Device serial (auto-detects if omitted)")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--verbose", action="store_true", help="Show extended detail")
+    return parser
+
+
+def main() -> None:
+    """Parse arguments, dispatch one action, and exit with its real status."""
+    parser = _build_parser()
     args = parser.parse_args()
 
-    if not args.package:
-        print("Error: --package is required", file=sys.stderr)
-        parser.print_help()
+    if args.post and not (args.tag and args.text):
+        parser.error("--post requires --tag and --text")
+    if (args.grant_permission or args.revoke_permission) and not args.package:
+        parser.error("--grant-permission/--revoke-permission require --package")
+    if args.expect_package and not args.list_posted:
+        parser.error("--expect-package is used with --list")
+
+    try:
+        serial = resolve_device_identifier(args.serial)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    simulator = PushNotificationSimulator(serial=args.device_serial)
+    tester = NotificationTester(serial=serial)
 
-    # List channels
-    if args.list_channels:
-        success, message, channels = simulator.test_notification_channel(args.package)
-
-        if args.json:
-            print(
-                json.dumps({"success": success, "message": message, "channels": channels}, indent=2)
-            )
+    if args.post:
+        success, result = tester.post(args.tag, args.text, verify=not args.no_verify)
+    elif args.list_posted:
+        if args.expect_package:
+            success, result = tester.expect_package(args.expect_package)
         else:
-            print(message)
-            if channels:
-                print("\nChannels:")
-                for channel in channels:
-                    print(f"  {channel}")
+            success, result = tester.list_posted()
+    else:
+        success, result = tester.set_post_permission(args.package, granted=args.grant_permission)
 
-        sys.exit(0 if success else 1)
-
-    # Send notification
-    if not args.title or not args.message:
-        print("Error: --title and --message are required", file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
-
-    # Parse data if provided
-    data = None
-    if args.data:
-        try:
-            data = json.loads(args.data)
-        except json.JSONDecodeError:
-            print(f"Error: Invalid JSON data: {args.data}", file=sys.stderr)
-            sys.exit(1)
-
-    # Send notification
-    if args.method == "broadcast":
-        success, message = simulator.send_notification(
-            args.package,
-            args.title,
-            args.message,
-            data,
-            badge=args.badge,
-            sound=not args.no_sound,
-        )
-    else:  # intent
-        success, message = simulator.send_notification_via_service(
-            args.package, args.title, args.message, args.id
-        )
-
-    if args.json:
-        result = {"success": success, "message": message}
-        if args.test_name:
-            result["test_name"] = args.test_name
-        if args.expected:
-            result["expected"] = args.expected
-        print(json.dumps(result, indent=2))
-    elif args.verbose or not success:
-        print(message)
-        if success and args.test_name:
-            print(f"Test: {args.test_name}")
-        if success and args.expected:
-            print(f"Expected: {args.expected}")
-        if success:
-            print(
-                "Verify handling: python scripts/log_monitor.py " f"--app {args.package} --follow"
-            )
-    elif success:
-        print("✓")
-
+    _emit(success, result, args)
     sys.exit(0 if success else 1)
 
 
