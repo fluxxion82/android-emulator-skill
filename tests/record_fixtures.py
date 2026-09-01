@@ -323,6 +323,35 @@ FIXTURES: list[Fixture] = [
         ),
         catches=("S10",),
     ),
+    # --- emulator console + focused activity ------------------------------
+    Fixture(
+        name="emu_avd_name",
+        args=["emu", "avd", "name"],
+        description=(
+            "`adb emu avd name` reply. The emulator console appends 'OK' to every "
+            "response, so the raw bytes are 'Pixel_9\\r\\nOK\\r\\n'. "
+            "emulator_boot compared .strip() of this against the AVD name, which "
+            "yields 'Pixel_9\\nOK' and therefore never matches -- the "
+            "already-booted short-circuit was dead and a second emulator was "
+            "spawned for a running AVD."
+        ),
+        catches=("S5",),
+    ),
+    Fixture(
+        name="dumpsys_window_focus",
+        args=[
+            "shell",
+            "dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp'",
+        ],
+        description=(
+            "The focused-window lines from `dumpsys window`. get_current_activity "
+            "tried to build this pipeline as an argv list and run it with "
+            "shell=True, which on POSIX executes only argv[0] -- bare `adb` -- so "
+            "it always returned None. Recorded here as the text the parser must "
+            "handle; the fix filters in Python rather than shelling out."
+        ),
+        catches=("S1",),
+    ),
     # --- performance counters ---------------------------------------------
     Fixture(
         name="dumpsys_gfxinfo",

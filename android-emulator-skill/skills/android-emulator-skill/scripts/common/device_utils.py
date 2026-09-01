@@ -439,6 +439,43 @@ def list_installed_packages(serial: str | None = None) -> list:
         raise RuntimeError(f"Failed to list packages: {e.stderr}") from e
 
 
+# Focused-window lines from `dumpsys window`, e.g.
+#   mCurrentFocus=Window{c63b9b5 u0 com.pkg/com.pkg.MainActivity}
+#   mFocusedApp=ActivityRecord{ba1d946 u0 com.pkg/.MainActivity t615}
+_FOCUS_LINE_RE = re.compile(r"^\s*(?:mCurrentFocus|mFocusedApp)=(?P<body>.*)$", re.MULTILINE)
+_COMPONENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_.]*/[A-Za-z0-9_.]+)")
+
+# `dumpsys window` is a large dump on a busy device; bound it like every other
+# adb call so a wedged service cannot hang the caller indefinitely.
+CURRENT_ACTIVITY_TIMEOUT = 15
+
+
+def parse_focused_activity(dumpsys_output: str) -> str | None:
+    """Extract the focused ``package/activity`` component from `dumpsys window`.
+
+    Pure function so it can be tested against recorded device output; the adb
+    call lives in :func:`get_current_activity`.
+
+    Args:
+        dumpsys_output: Text from ``adb shell dumpsys window``.
+
+    Returns:
+        The component, or None when nothing is focused.
+
+    Example:
+        >>> parse_focused_activity("  mCurrentFocus=Window{a u0 com.x/com.x.Main}")
+        'com.x/com.x.Main'
+    """
+    for match in _FOCUS_LINE_RE.finditer(dumpsys_output):
+        body = match.group("body")
+        if "null" in body:
+            continue
+        component = _COMPONENT_RE.search(body)
+        if component:
+            return component.group(1)
+    return None
+
+
 def get_current_activity(serial: str | None = None) -> str | None:
     """
     Get currently focused activity.
@@ -455,28 +492,22 @@ def get_current_activity(serial: str | None = None) -> str | None:
             print(f"Current activity: {activity}")
     """
     try:
-        cmd = build_adb_command(
-            "shell",
-            serial,
-            "dumpsys",
-            "window",
-            "windows",
-            "|",
-            "grep",
-            "-E",
-            "'mCurrentFocus|mFocusedApp'",
+        # Filtering happens in Python, not via a device-side pipeline. The
+        # previous version built an argv list containing a literal "|" and
+        # "grep" and ran it with shell=True -- which on POSIX executes only
+        # argv[0] (bare `adb`) and passes the rest as $0, $1, ... So stdout was
+        # always empty and this always returned None.
+        cmd = build_adb_command("shell", serial, "dumpsys", "window")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CURRENT_ACTIVITY_TIMEOUT,
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True, check=False)
+        return parse_focused_activity(result.stdout)
 
-        # Parse output
-        # Format: mCurrentFocus=Window{abc123 u0 com.example.app/com.example.app.MainActivity}
-        match = re.search(r"([a-zA-Z0-9_.]+/[a-zA-Z0-9_.]+)\}", result.stdout)
-        if match:
-            return match.group(1)
-
-        return None
-
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return None
 
 

@@ -1,5 +1,6 @@
 {
-  "recorded_at": "2026-08-31T21:17:25Z",
+  "profile": "emulator-api35",
+  "recorded_at": "2026-09-01T01:08:35Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -8,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 8,
+  "redacted_package_count": 0,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -82,6 +83,26 @@
       "description": "Memory breakdown including the Objects block (Views, ViewRootImpl, Activities, AppContexts). The Activities count is the Activity-leak test: navigate in and out N times and see whether it grew by N.",
       "catches": [],
       "bytes": 3309
+    },
+    {
+      "name": "dumpsys_window_focus",
+      "file": "dumpsys_window_focus.txt",
+      "command": "adb shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp'",
+      "description": "The focused-window lines from `dumpsys window`. get_current_activity tried to build this pipeline as an argv list and run it with shell=True, which on POSIX executes only argv[0] -- bare `adb` -- so it always returned None. Recorded here as the text the parser must handle; the fix filters in Python rather than shelling out.",
+      "catches": [
+        "S1"
+      ],
+      "bytes": 240
+    },
+    {
+      "name": "emu_avd_name",
+      "file": "emu_avd_name.txt",
+      "command": "adb emu avd name",
+      "description": "`adb emu avd name` reply. The emulator console appends 'OK' to every response, so the raw bytes are 'Pixel_9\\r\\nOK\\r\\n'. emulator_boot compared .strip() of this against the AVD name, which yields 'Pixel_9\\nOK' and therefore never matches -- the already-booted short-circuit was dead and a second emulator was spawned for a running AVD.",
+      "catches": [
+        "S5"
+      ],
+      "bytes": 11
     },
     {
       "name": "logcat_threadtime",

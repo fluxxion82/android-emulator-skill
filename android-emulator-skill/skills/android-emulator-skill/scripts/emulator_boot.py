@@ -191,7 +191,14 @@ class EmulatorBooter:
         try:
             cmd = build_adb_command("emu", serial, "avd", "name")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-            return result.stdout.strip()
+            # The emulator console terminates every reply with its own "OK"
+            # line, so the raw response is "Pixel_9\r\nOK\r\n". Stripping alone
+            # leaves "Pixel_9\nOK", which never equalled the AVD name -- so the
+            # already-booted short-circuit was dead and a second emulator got
+            # spawned for an AVD that was already running.
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            payload = [line for line in lines if line not in ("OK", "KO")]
+            return payload[0] if payload else None
         except Exception:
             return None
 

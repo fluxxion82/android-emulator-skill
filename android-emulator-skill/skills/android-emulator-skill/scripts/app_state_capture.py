@@ -21,7 +21,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from common.device_utils import build_adb_command, get_ui_hierarchy
@@ -136,7 +136,11 @@ class AppStateCapture:
                 output_path=str(screenshot_path),
                 size=screenshot_size,
             )
-            if screenshot_result.get("success"):
+            # capture_screenshot() raises on failure and otherwise returns a
+            # descriptor dict -- there is no "success" key, so the previous
+            # check was always falsy and the PNG was written to disk but never
+            # listed in the manifest.
+            if screenshot_result.get("file_path"):
                 artifacts.append("screenshot.png")
 
             # 2. Capture UI hierarchy
@@ -321,8 +325,14 @@ class AppStateCapture:
         if unit == "m":
             value *= 60
 
-        # Build logcat command
-        cmd = build_adb_command("logcat", self.serial, "-d", "-t", f"{value}")
+        # `logcat -t N` means the last N LINES; a bare duration passed here
+        # silently became a line count, so "--logs 1m" returned 60 lines. The
+        # time-window form takes a "MM-DD HH:MM:SS.mmm" timestamp, which is what
+        # log_monitor already does.
+        start_time = datetime.now() - timedelta(seconds=value)
+        cmd = build_adb_command(
+            "logcat", self.serial, "-d", "-t", start_time.strftime("%m-%d %H:%M:%S.000")
+        )
 
         # Add package filter if PID available
         pid_cmd = build_adb_command("shell", self.serial, "pidof", self.package)

@@ -321,12 +321,17 @@ def test_every_claimed_defect_id_is_referenced_by_a_test():
     """A fixture claiming to catch a defect must have a test that uses it."""
     manifest = json.loads((RECORDED_DIR / "MANIFEST.json").read_text(encoding="utf-8"))
     claimed = {d for entry in manifest["fixtures"] for d in entry.get("catches", [])}
-    this_file = Path(__file__).read_text(encoding="utf-8")
 
-    unreferenced = {d for d in claimed if d not in this_file}
+    # Scan the whole suite: a fixture's tests legitimately live wherever the
+    # defect does, not necessarily in this file.
+    corpus = "\n".join(
+        path.read_text(encoding="utf-8") for path in Path(__file__).parent.glob("test_*.py")
+    )
+
+    unreferenced = {d for d in claimed if d not in corpus}
     assert not unreferenced, (
-        f"fixtures claim to catch {sorted(unreferenced)} but no test here "
-        f"references those IDs — either write the test or drop the claim"
+        f"fixtures claim to catch {sorted(unreferenced)} but no test references "
+        f"those IDs — either write the test or drop the claim"
     )
 
 
