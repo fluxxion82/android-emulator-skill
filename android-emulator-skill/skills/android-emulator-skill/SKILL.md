@@ -44,7 +44,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.5.0)
 
-### Implemented (31 scripts)
+### Implemented (32 scripts)
 
 #### Core Utilities (10 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
@@ -253,6 +253,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 36. **logs.py** ⭐ NEW - One entry point for reading logs; routes on the question being asked.
     - `logs.py tail` (main buffers) → `log_monitor.py`; `logs.py crashes` (`-b crash`) → `crash_triage.py`; `logs.py anr` (ANR/jank, incl. session mode) → `anr_watcher.py`.
     - Arguments are passed through verbatim, so each verb takes the full flag set of the script it delegates to, and those scripts remain callable unchanged.
+    - Options: `<verb> [verb options]`, `--json` (routing table), `--help`
+
+37. **avd.py** ⭐ NEW - One entry point for the emulator/AVD lifecycle; routes on the question being asked.
+    - `avd.py list` → `device_list.py`; `pick` → `emulator_selector.py`; `create` → `emulator_create.py`; `start` → `emulator_boot.py`; `stop` → `emulator_shutdown.py`; `reset` (wipe data, keep the AVD) → `emulator_erase.py`; `delete` (remove the AVD) → `emulator_delete.py`.
+    - `reset` and `delete` are separate verbs because they destroy different things, and a near-miss between them is asked about rather than guessed.
+    - Arguments are passed through verbatim, so each verb takes the full flag set of the script it delegates to — including its own confirmation flag (`delete --yes`, `reset --force`) — and those scripts remain callable unchanged.
     - Options: `<verb> [verb options]`, `--json` (routing table), `--help`
 
 > The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`. The ANR watcher's clustering/session machinery lives in `common/anr_pipeline.py` and `common/anr_sessions.py`.
