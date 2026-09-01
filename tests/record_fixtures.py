@@ -11,9 +11,16 @@ script does nothing. Recording real output is the only way out of that.
 The rule this tool enforces: **parser tests consume files under
 ``tests/fixtures/recorded/``; they never inline tool output as string literals.**
 
-Fixtures are written byte-for-byte, with no header or annotation, so a parser
-under test sees exactly what it would see from the real tool. Provenance lives
-alongside in ``MANIFEST.json``.
+Fixtures are written with no header or annotation, so a parser under test sees
+what it would see from the real tool. Provenance lives alongside in
+``MANIFEST.json``.
+
+Two documented departures from verbatim, both visible in the code below:
+CRLF is normalised to LF (``_strip_cr``), and non-AOSP package names are
+redacted. The CRLF one has a cost worth knowing: the emulator console really
+does answer ``Pixel_9\r\nOK\r\n``, and that CR is what caused defect S5, so
+no fixture can reproduce S5. ``tests/test_emu_console.py`` covers the CRLF
+framing with constructed input and records the measured bytes in its docstring.
 
 Usage
 -----
@@ -374,6 +381,76 @@ FIXTURES: list[Fixture] = [
             "which readily returns an ActivityRecord or a provider."
         ),
         catches=("S10",),
+    ),
+    # --- increment 3: SMS/OTP, snapshots, crash triage --------------------
+    Fixture(
+        name="logcat_crash_java",
+        args=["logcat", "-b", "crash", "-d", "-t", "200"],
+        description=(
+            "The dedicated crash buffer after a Java crash. This is the whole "
+            "point of `-b crash`: the trace arrives already isolated, so triage "
+            "does not mean grepping the main buffer for 'FATAL EXCEPTION' and "
+            "hoping the surrounding lines belong to it. Note the shape a parser "
+            "must handle -- a '--------- beginning of crash' separator, then one "
+            "'FATAL EXCEPTION: <thread>' line, a 'Process: <pkg>, PID: <n>' line, "
+            "the exception class and message, and an indented 'at ...' frame list "
+            "that is the only multi-line part."
+        ),
+    ),
+    Fixture(
+        name="emu_sms_send",
+        args=["emu", "sms", "send", "+15551234567", "Your code is 428193"],
+        description=(
+            "`adb emu sms send` reply: bare 'OK'. It says the console accepted "
+            "the command, NOT that a message was delivered -- the same trap as "
+            "`am broadcast` always printing 'result=0' (see "
+            "am_broadcast_missing_receiver). Delivery is only provable by reading "
+            "the inbox back; see content_query_sms_inbox."
+        ),
+    ),
+    Fixture(
+        name="content_query_sms_inbox",
+        args=[
+            "shell",
+            "content query --uri content://sms/inbox --projection address:body:date",
+        ],
+        description=(
+            "The SMS inbox read back through the content provider, which is what "
+            "proves `adb emu sms send` actually delivered. Row shape is "
+            "'Row: <n> address=..., body=..., date=...' -- comma-space separated "
+            "pairs, so a body containing ', ' cannot be split naively."
+        ),
+    ),
+    Fixture(
+        name="emu_avd_snapshot_list",
+        args=["emu", "avd", "snapshot", "list"],
+        description=(
+            "`adb emu avd snapshot list`. A fixed-width table under two header "
+            "lines, terminated by the console's 'OK'. The ID column is '--' for "
+            "the boot snapshot, so a parser keying on ID must tolerate it."
+        ),
+    ),
+    Fixture(
+        name="emu_avd_snapshot_load_missing",
+        args=["emu", "avd", "snapshot", "load", "no_such_snapshot_xyz"],
+        description=(
+            "A failed snapshot load. The console answers 'KO: <reason>' -- and "
+            "`adb emu` still EXITS 0. Failure is only visible in the reply text, "
+            "so anything checking returncode reports a successful load of a "
+            "snapshot that does not exist, and the test that follows runs "
+            "against whatever state the emulator happened to be in. Same class "
+            "of trap as `am broadcast` always printing 'result=0'."
+        ),
+    ),
+    Fixture(
+        name="emu_help",
+        args=["emu", "help"],
+        description=(
+            "The emulator console's own command list, recorded so a claim that "
+            "some `adb emu` subcommand exists can be checked against the console "
+            "rather than assumed. Several scripts in this skill previously "
+            "invented subcommands that do not exist."
+        ),
     ),
     # --- emulator console + focused activity ------------------------------
     Fixture(

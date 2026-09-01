@@ -1,0 +1,2 @@
+KO: Device 'encrypt' does not have the requested snapshot 'no_such_snapshot_xyz'
+KO: Snapshot load failure: snapshot doesn't exist

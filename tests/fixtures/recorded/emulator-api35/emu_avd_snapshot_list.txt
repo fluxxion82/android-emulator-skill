@@ -1,0 +1,4 @@
+List of snapshots present on all disks:
+ID        TAG                 VM SIZE                DATE       VM CLOCK
+--        default_boot           138M 2026-08-22 14:25:48   04:33:18.874
+OK

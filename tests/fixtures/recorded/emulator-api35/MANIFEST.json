@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T04:47:53Z",
+  "recorded_at": "2026-09-01T16:18:49Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -69,6 +69,14 @@
       "bytes": 1992
     },
     {
+      "name": "content_query_sms_inbox",
+      "file": "content_query_sms_inbox.txt",
+      "command": "adb shell content query --uri content://sms/inbox --projection address:body:date",
+      "description": "The SMS inbox read back through the content provider, which is what proves `adb emu sms send` actually delivered. Row shape is 'Row: <n> address=..., body=..., date=...' -- comma-space separated pairs, so a body containing ', ' cannot be split naively.",
+      "catches": [],
+      "bytes": 74
+    },
+    {
       "name": "dumpsys_gfxinfo",
       "file": "dumpsys_gfxinfo.txt",
       "command": "adb shell dumpsys gfxinfo com.android.settings",
@@ -103,6 +111,46 @@
         "S5"
       ],
       "bytes": 11
+    },
+    {
+      "name": "emu_avd_snapshot_list",
+      "file": "emu_avd_snapshot_list.txt",
+      "command": "adb emu avd snapshot list",
+      "description": "`adb emu avd snapshot list`. A fixed-width table under two header lines, terminated by the console's 'OK'. The ID column is '--' for the boot snapshot, so a parser keying on ID must tolerate it.",
+      "catches": [],
+      "bytes": 189
+    },
+    {
+      "name": "emu_avd_snapshot_load_missing",
+      "file": "emu_avd_snapshot_load_missing.txt",
+      "command": "adb emu avd snapshot load no_such_snapshot_xyz",
+      "description": "A failed snapshot load. The console answers 'KO: <reason>' -- and `adb emu` still EXITS 0. Failure is only visible in the reply text, so anything checking returncode reports a successful load of a snapshot that does not exist, and the test that follows runs against whatever state the emulator happened to be in. Same class of trap as `am broadcast` always printing 'result=0'.",
+      "catches": [],
+      "bytes": 131
+    },
+    {
+      "name": "emu_help",
+      "file": "emu_help.txt",
+      "command": "adb emu help",
+      "description": "The emulator console's own command list, recorded so a claim that some `adb emu` subcommand exists can be checked against the console rather than assumed. Several scripts in this skill previously invented subcommands that do not exist.",
+      "catches": [],
+      "bytes": 546
+    },
+    {
+      "name": "emu_sms_send",
+      "file": "emu_sms_send.txt",
+      "command": "adb emu sms send +15551234567 Your code is 428193",
+      "description": "`adb emu sms send` reply: bare 'OK'. It says the console accepted the command, NOT that a message was delivered -- the same trap as `am broadcast` always printing 'result=0' (see am_broadcast_missing_receiver). Delivery is only provable by reading the inbox back; see content_query_sms_inbox.",
+      "catches": [],
+      "bytes": 3
+    },
+    {
+      "name": "logcat_crash_java",
+      "file": "logcat_crash_java.txt",
+      "command": "adb logcat -b crash -d -t 200",
+      "description": "The dedicated crash buffer after a Java crash. This is the whole point of `-b crash`: the trace arrives already isolated, so triage does not mean grepping the main buffer for 'FATAL EXCEPTION' and hoping the surrounding lines belong to it. Note the shape a parser must handle -- a '--------- beginning of crash' separator, then one 'FATAL EXCEPTION: <thread>' line, a 'Process: <pkg>, PID: <n>' line, the exception class and message, and an indented 'at ...' frame list that is the only multi-line part.",
+      "catches": [],
+      "bytes": 1470
     },
     {
       "name": "logcat_threadtime",
