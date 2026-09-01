@@ -64,6 +64,7 @@ from dataclasses import dataclass
 
 from common import adb_exec
 from common.device_utils import (
+    UI_DUMP_TIMEOUT,
     quote_for_device_shell,
     resolve_device_identifier,
 )
@@ -135,6 +136,7 @@ class Navigator:
                 "dump",
                 "/sdcard/window_dump.xml",
                 check=True,
+                timeout=UI_DUMP_TIMEOUT,
             )
 
             if "ERROR" in result.stdout or "error" in result.stderr.lower():
@@ -142,7 +144,14 @@ class Navigator:
 
             # Pull XML file to local temp
             temp_file = "/tmp/android_navigator_dump.xml"
-            adb_exec.run_adb("pull", self.serial, "/sdcard/window_dump.xml", temp_file, check=True)
+            adb_exec.run_adb(
+                "pull",
+                self.serial,
+                "/sdcard/window_dump.xml",
+                temp_file,
+                check=True,
+                timeout=UI_DUMP_TIMEOUT,
+            )
 
             # Parse XML
             tree = ET.parse(temp_file)

@@ -309,12 +309,16 @@ def get_device_screen_size(serial: str | None = None) -> tuple:
             height = int(match.group(2))
             return (width, height)
 
-        # Fallback to common resolution
-        return (1080, 1920)
+        raise RuntimeError(
+            f"Could not parse a screen size from `wm size`: {result.stdout.strip()!r}"
+        )
 
-    except Exception:
-        # Graceful fallback
-        return (1080, 1920)
+    except AdbError:
+        # Deliberately NOT a fallback. Callers derive tap and swipe coordinates
+        # from this, so a guessed 1080x1920 on a tablet aims every gesture at
+        # the wrong place and reports success -- a confident wrong answer, which
+        # is worse than a failure the caller can see.
+        raise
 
 
 def get_ui_hierarchy(serial: str | None = None) -> dict:

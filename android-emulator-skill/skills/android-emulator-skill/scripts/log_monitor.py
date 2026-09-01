@@ -44,7 +44,7 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from common.adb_exec import AdbCommandError, run_adb
+from common.adb_exec import AdbCommandError, AdbError, run_adb
 from common.device_utils import build_adb_command, get_connected_devices, quote_for_device_shell
 from common.env_config import env_int
 
@@ -767,12 +767,18 @@ Examples:
     if args.app_package:
         print(f"App: {args.app_package}", file=sys.stderr)
 
-    success = monitor.stream_logs(
-        follow=args.follow,
-        duration=duration,
-        clear_first=args.clear,
-        last_minutes=last_minutes,
-    )
+    try:
+        success = monitor.stream_logs(
+            follow=args.follow,
+            duration=duration,
+            clear_first=args.clear,
+            last_minutes=last_minutes,
+        )
+    except AdbError as error:
+        # Device-level failures (ambiguous serial, offline, adb missing) carry a
+        # remedy; a traceback does not.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     if not success:
         sys.exit(1)

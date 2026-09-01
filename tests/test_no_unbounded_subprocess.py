@@ -92,20 +92,38 @@ def test_no_unbounded_subprocess_calls(path: Path):
 
 
 @pytest.mark.parametrize("module", STREAMING)
-def test_streaming_modules_enforce_their_own_deadline(module: str):
+def test_streaming_modules_arm_a_watchdog_timer(module: str):
     """A streaming exemption is only honest if a deadline is actually enforced.
 
-    `subprocess`'s own timeout cannot bound a stream that is read incrementally,
-    so these modules terminate the child themselves. Without that, the exemption
-    would just be a licence to hang -- which is the bug it exists to prevent.
+    `subprocess`'s own timeout cannot bound a stream read incrementally, so
+    these modules must stop the child themselves.
+
+    The first version of this test substring-matched ``terminate()`` and
+    ``kill()``. Both appear in unrelated cleanup code, so it passed for
+    `anr_watcher` while ``AnrWatcher.watch(duration_seconds=...)`` still blocked
+    forever on a silent device -- a guard against vacuous guards that was itself
+    vacuous, and it blessed a real hang.
+
+    The mechanism that actually works is a watchdog *timer*: an in-loop clock
+    check cannot fire while ``readline()`` is blocked, because the loop body
+    never runs. That is what is asserted here; the behavioural proof that
+    ``watch()`` returns on a device emitting nothing lives in
+    tests/test_review_findings.py.
     """
-    source = (SCRIPTS / module).read_text(encoding="utf-8")
-    assert (
-        "terminate()" in source
-    ), f"{module} claims a streaming exemption but never terminates its child"
-    assert (
-        "kill()" in source
-    ), f"{module} never escalates to kill(); a child ignoring SIGTERM would hang"
+    tree = ast.parse((SCRIPTS / module).read_text(encoding="utf-8"), filename=module)
+
+    arms_timer = any(
+        isinstance(node, ast.Call)
+        and (
+            getattr(node.func, "attr", None) == "Timer" or getattr(node.func, "id", None) == "Timer"
+        )
+        for node in ast.walk(tree)
+    )
+    assert arms_timer, (
+        f"{module} claims a streaming exemption but arms no watchdog timer. An "
+        f"in-loop duration check cannot fire while readline() is blocked, so "
+        f"without a timer the stream hangs on a device that logs nothing."
+    )
 
 
 def test_adb_goes_through_the_shared_runner():

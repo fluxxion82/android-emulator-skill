@@ -49,7 +49,39 @@ SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_ADB_SHUTDOWN_TIMEOUT", 5, min_value=1)
 
 
 class AdbError(RuntimeError):
-    """Base for every adb failure, so callers can catch the family at once."""
+    """Base for every adb failure, so callers can catch the family at once.
+
+    Subclassing ``RuntimeError`` is deliberate API, not an accident. Several CLI
+    boundaries pre-date this module and already catch ``RuntimeError`` from
+    ``resolve_device_identifier``; inheriting from it means an adb failure
+    reaches those handlers already carrying its remedy, and ``screen_mapper``
+    relies on exactly that to route the remedy into its normal output. Pinned by
+    ``test_adb_error_is_a_runtime_error``.
+
+    Attributes:
+        command: The argv that failed, so a caller can say what was run.
+        result: The :class:`AdbResult` when adb produced one, else None.
+    """
+
+    def __init__(self, message: str, command: list[str] | None = None, result=None):
+        super().__init__(message)
+        self.command = command or []
+        self.result = result
+
+    @property
+    def stdout(self) -> str:
+        """Captured stdout, or empty when adb produced no result."""
+        return self.result.stdout if self.result else ""
+
+    @property
+    def stderr(self) -> str:
+        """Captured stderr, or empty when adb produced no result."""
+        return self.result.stderr if self.result else ""
+
+    @property
+    def returncode(self) -> int | None:
+        """Exit status, or None when the command never produced one."""
+        return self.result.returncode if self.result else None
 
 
 class AdbNotInstalledError(AdbError):
@@ -123,6 +155,13 @@ def build_command(operation: str, serial: str | None = None, *args: object) -> l
     Returns:
         Complete argv, ready for subprocess. Never a shell string.
     """
+    if serial and serial.startswith("-"):
+        raise ValueError(
+            f"serial={serial!r} looks like a flag. `serial` is the second "
+            f"positional argument, so run_adb('devices', '-l') would become "
+            f"`adb -s -l devices`. Pass None for the serial, or use serial=."
+        )
+
     cmd = ["adb"]
     if serial:
         cmd.extend(["-s", serial])
@@ -163,15 +202,21 @@ def _remedy_for_multiple_devices() -> str:
     return "Pass --serial to choose a device (see `adb devices`)."
 
 
-def _classify(stderr: str, stdout: str, serial: str | None) -> AdbError | None:
+def _classify(stderr: str, serial: str | None) -> AdbError | None:
     """Map adb's own error text to a typed error that names a remedy.
 
-    adb reports device-level problems on stderr with a mix of ``adb:`` and
-    ``error:`` prefixes, so matching is on the message body rather than the
-    prefix. Returns None when the text is not a recognised device error, which
-    means the command reached a device and its status is the command's own.
+    Only adb's own stderr is examined. A command running *on the device* can
+    legitimately print "device not found" -- a log line, a grep hit, an app's own
+    message -- and classifying stdout let device-generated text forge a
+    host-level failure. For an agent that treats these messages as retry
+    prompts, that is a false remedy.
+
+    adb reports device problems with a mix of ``adb:`` and ``error:`` prefixes,
+    so matching is on the message body rather than the prefix. Returns None when
+    the text is not a recognised device error, meaning the command reached a
+    device and its status is the command's own.
     """
-    text = f"{stderr}\n{stdout}".lower()
+    text = stderr.lower()
 
     if "more than one device" in text:
         return MultipleDevicesError(
@@ -259,7 +304,8 @@ def run_adb(
     except subprocess.TimeoutExpired as exc:
         raise AdbTimeoutError(
             f"`{' '.join(cmd)}` did not finish within {budget}s. The device may be "
-            f"busy or the adb connection wedged; try `adb kill-server` and retry."
+            f"busy or the adb connection wedged; try `adb kill-server` and retry.",
+            command=cmd,
         ) from exc
 
     result = AdbResult(
@@ -270,11 +316,17 @@ def run_adb(
     )
 
     if not result.ok:
-        device_error = _classify(result.stderr, result.stdout, serial)
+        device_error = _classify(result.stderr, serial)
         if device_error is not None:
+            device_error.command = cmd
+            device_error.result = result
             raise device_error
         if check:
             detail = result.stderr.strip() or result.stdout.strip() or "no output"
-            raise AdbCommandError(f"`{' '.join(cmd)}` exited {result.returncode}: {detail}")
+            raise AdbCommandError(
+                f"`{' '.join(cmd)}` exited {result.returncode}: {detail}",
+                command=cmd,
+                result=result,
+            )
 
     return result

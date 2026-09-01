@@ -228,3 +228,88 @@ def test_shell_exit_status_is_passed_through(fake_run):
     result = adb_exec.run_adb("shell", "emulator-5554", "exit", "7")
     assert result.returncode == 7
     assert not result.ok
+
+
+# ---------------------------------------------------------------------------
+# Exceptions must carry structure, not just a formatted string.
+# ---------------------------------------------------------------------------
+
+
+def test_command_failure_carries_the_result(fake_run):
+    """A caller that needs stderr should not have to re-parse the message.
+
+    screenshot_utils wrote `except AdbCommandError as e: ... {e.stderr}` against
+    an attribute that did not exist -- an AttributeError waiting on the failure
+    path, which the sibling `except Exception` could not catch because it was
+    raised from inside the handler.
+    """
+    fake_run(returncode=2, stdout="out", stderr="boom")
+    with pytest.raises(adb_exec.AdbCommandError) as excinfo:
+        adb_exec.run_adb("shell", None, "false", check=True)
+
+    error = excinfo.value
+    assert error.stderr == "boom"
+    assert error.stdout == "out"
+    assert error.returncode == 2
+    assert error.result.command[0] == "adb"
+
+
+def test_every_error_carries_the_command(fake_run):
+    """Diagnosing a failure starts with knowing what was run."""
+    fake_run(raises=subprocess.TimeoutExpired(cmd="adb", timeout=1))
+    with pytest.raises(adb_exec.AdbTimeoutError) as excinfo:
+        adb_exec.run_adb("shell", None, "sleep", "9", timeout=1)
+    assert excinfo.value.command[:1] == ["adb"]
+
+
+# ---------------------------------------------------------------------------
+# The RuntimeError base is deliberate API, and load-bearing.
+# ---------------------------------------------------------------------------
+
+
+def test_adb_error_is_a_runtime_error():
+    """`screen_mapper` relies on this to route remedies into its normal output.
+
+    Several CLI boundaries pre-date adb_exec and catch RuntimeError from
+    `resolve_device_identifier`; inheriting from it means an adb failure reaches
+    those handlers already carrying its remedy. That is intentional, so it is
+    pinned here -- otherwise a well-meaning refactor to `Exception` would
+    silently stop those messages reaching the user.
+    """
+    assert issubclass(adb_exec.AdbError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# Classification must not be fooled by device-side output.
+# ---------------------------------------------------------------------------
+
+
+def test_device_output_cannot_forge_a_device_error(fake_run):
+    """Only adb's own stderr may be classified, never the command's stdout.
+
+    A shell command can legitimately print "device not found" -- a log line, a
+    grep hit, an app's own error. Classifying stdout let device-generated text
+    forge a host-level failure, which for an agent means a false remedy.
+    """
+    fake_run(returncode=1, stdout="E/Sensors: device not found\n", stderr="")
+    result = adb_exec.run_adb("shell", "emulator-5554", "logcat", "-d")
+    assert result.returncode == 1, "device output was misclassified as an adb device error"
+
+
+def test_real_adb_device_error_is_still_classified(fake_run, recorded_anywhere):
+    """Guard against over-correcting: adb's own stderr must still be read."""
+    fake_run(returncode=1, stdout="", stderr=recorded_anywhere("adb_device_not_found"))
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        adb_exec.run_adb("get-state", "no-such-serial-xyz")
+
+
+# ---------------------------------------------------------------------------
+# The positional-serial footgun.
+# ---------------------------------------------------------------------------
+
+
+def test_a_flag_passed_as_the_serial_is_rejected(fake_run):
+    """`run_adb("devices", "-l")` would silently become `adb -s -l devices`."""
+    fake_run()
+    with pytest.raises(ValueError, match="serial"):
+        adb_exec.run_adb("devices", "-l")

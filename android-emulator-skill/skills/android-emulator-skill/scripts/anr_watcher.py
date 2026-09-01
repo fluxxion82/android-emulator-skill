@@ -43,6 +43,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -176,18 +177,38 @@ class AnrWatcher:
                 text=True,
                 bufsize=1,
             )
+            # A quiet device blocks in readline(), so the in-loop clock check
+            # below never runs -- the same defect fixed in log_monitor (A2). The
+            # timer is what actually guarantees --duration returns; the in-loop
+            # check just stops sooner when lines are flowing.
+            deadline_timer: threading.Timer | None = None
+            if duration_seconds:
+
+                def _stop_at_deadline() -> None:
+                    self.interrupted = True
+                    if self._process and self._process.poll() is None:
+                        self._process.terminate()
+
+                deadline_timer = threading.Timer(float(duration_seconds), _stop_at_deadline)
+                deadline_timer.daemon = True
+                deadline_timer.start()
+
             start_time = datetime.now()
-            for raw_line in iter(self._process.stdout.readline, ""):
-                if not raw_line:
-                    break
-                self._handle_line(raw_line.rstrip(), package, json_mode)
-                if (
-                    duration_seconds
-                    and (datetime.now() - start_time).total_seconds() >= duration_seconds
-                ):
-                    break
-                if self.interrupted:
-                    break
+            try:
+                for raw_line in iter(self._process.stdout.readline, ""):
+                    if not raw_line:
+                        break
+                    self._handle_line(raw_line.rstrip(), package, json_mode)
+                    if (
+                        duration_seconds
+                        and (datetime.now() - start_time).total_seconds() >= duration_seconds
+                    ):
+                        break
+                    if self.interrupted:
+                        break
+            finally:
+                if deadline_timer:
+                    deadline_timer.cancel()
             if self._process and self._process.poll() is None:
                 self._process.terminate()
                 with contextlib.suppress(subprocess.TimeoutExpired):
@@ -278,12 +299,23 @@ class AnrWatcher:
         )
 
     def _register_signal_handler(self) -> None:
+        """Stop the stream on Ctrl-C, when we are in a position to ask for it.
+
+        ``signal.signal`` raises ValueError outside the main thread, so calling
+        ``watch()`` from any worker thread previously died here before the
+        stream even started. Ctrl-C handling is a convenience for interactive
+        use, not a correctness requirement -- the duration watchdog stops the
+        stream either way -- so a thread that cannot register simply goes
+        without it.
+        """
+
         def handle_sigint(_sig, _frame):
             self.interrupted = True
             if self._process:
                 self._process.terminate()
 
-        signal.signal(signal.SIGINT, handle_sigint)
+        with contextlib.suppress(ValueError):
+            signal.signal(signal.SIGINT, handle_sigint)
 
 
 # === ANRBUSTER (session mode) ===

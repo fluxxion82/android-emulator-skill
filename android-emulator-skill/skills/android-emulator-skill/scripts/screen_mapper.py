@@ -58,7 +58,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 from common import adb_exec
-from common.device_utils import resolve_device_identifier
+from common.device_utils import UI_DUMP_TIMEOUT, resolve_device_identifier
 from common.env_config import env_int
 
 # Preview limits (env-configurable; see SKILL.md -> Configuration).
@@ -136,6 +136,7 @@ class ScreenMapper:
                 "dump",
                 "/sdcard/window_dump.xml",
                 check=True,
+                timeout=UI_DUMP_TIMEOUT,
             )
 
             if "ERROR" in result.stdout or "error" in result.stderr.lower():
@@ -143,7 +144,14 @@ class ScreenMapper:
 
             # Pull XML file to local temp
             temp_file = "/tmp/android_window_dump.xml"
-            adb_exec.run_adb("pull", self.serial, "/sdcard/window_dump.xml", temp_file, check=True)
+            adb_exec.run_adb(
+                "pull",
+                self.serial,
+                "/sdcard/window_dump.xml",
+                temp_file,
+                check=True,
+                timeout=UI_DUMP_TIMEOUT,
+            )
 
             # Parse XML
             tree = ET.parse(temp_file)
