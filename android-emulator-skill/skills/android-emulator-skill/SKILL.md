@@ -30,7 +30,7 @@ python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app
 # 2. Map screen to see elements
 python3 "$SKILL_DIR/scripts/screen_mapper.py"
 
-# 3. Tap button
+# 3. Tap button (add --scroll-to-find if it may be below the fold)
 python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Login" --tap
 
 # 4. Enter text
@@ -122,9 +122,20 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Find by text, type, resource ID
     - Tap, enter text, get bounds
     - Fuzzy matching support
-    - Options: `--find-text`, `--find-type`, `--find-id`, `--tap`, `--enter-text`, `--list`, `--serial`, `--json`
+    - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible
+      screen, and `Not found` is indistinguishable from "the item is two rows down". The default
+      path now says which it was: `(searched 1 screen; this screen scrolls -- retry with
+      --scroll-to-find)`. Scrolling is opt-in on purpose -- a swipe is not a read, so a lookup
+      that scrolled silently would let `--find-text "Save is visible"` pass for a button three
+      screens away.
+    - Options: `--find-text`, `--find-type`, `--find-id`, `--tap`, `--enter-text`, `--list`,
+      `--scroll-to-find`, `--scroll-direction {down,up}`, `--max-scrolls N`, `--serial`,
+      `--json`, `--verbose`
 
 14. **gesture.py** - Perform swipes, scrolls, long press
+    - `--scroll {up,down}` names the direction the **content** moves; `--swipe` names what the
+      **finger** does. They are opposites. (Conflating them was a real defect: `--scroll down`
+      dragged lists back toward the top and reported success.)
     - Directional swipes
     - Custom swipe coordinates
     - Scroll and long press
