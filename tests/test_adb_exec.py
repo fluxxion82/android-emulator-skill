@@ -67,7 +67,7 @@ def test_explicit_timeout_is_honoured(fake_run):
 def test_timeout_raises_a_typed_error_naming_the_command(fake_run):
     """A timeout must say what timed out, or it is unactionable."""
     fake_run(raises=subprocess.TimeoutExpired(cmd="adb", timeout=5))
-    with pytest.raises(adb_exec.AdbTimeout) as excinfo:
+    with pytest.raises(adb_exec.AdbTimeoutError) as excinfo:
         adb_exec.run_adb("shell", None, "dumpsys", "window", timeout=5)
 
     message = str(excinfo.value)
@@ -122,7 +122,7 @@ def test_nonzero_exit_is_not_an_exception_by_default(fake_run):
 
 def test_check_raises_on_nonzero(fake_run):
     fake_run(returncode=1, stderr="boom")
-    with pytest.raises(adb_exec.AdbCommandFailed):
+    with pytest.raises(adb_exec.AdbCommandError):
         adb_exec.run_adb("shell", None, "false", check=True)
 
 
@@ -134,7 +134,7 @@ def test_check_raises_on_nonzero(fake_run):
 def test_multiple_devices_is_typed_and_names_the_remedy(fake_run):
     """The most common agent-facing adb failure."""
     fake_run(returncode=1, stderr="adb: more than one device/emulator\n")
-    with pytest.raises(adb_exec.MultipleDevices) as excinfo:
+    with pytest.raises(adb_exec.MultipleDevicesError) as excinfo:
         adb_exec.run_adb("shell", None, "echo", "hi", check=True)
     assert "--serial" in str(excinfo.value), "the error does not say what to do next"
 
@@ -149,7 +149,7 @@ def test_device_not_found_is_typed_and_names_the_remedy(fake_run, recorded_anywh
     assert "not found" in fixture
 
     fake_run(returncode=1, stderr=fixture)
-    with pytest.raises(adb_exec.DeviceNotFound) as excinfo:
+    with pytest.raises(adb_exec.DeviceNotFoundError) as excinfo:
         adb_exec.run_adb("shell", "no-such-serial-xyz", "echo", "hi", check=True)
 
     message = str(excinfo.value)
@@ -159,28 +159,28 @@ def test_device_not_found_is_typed_and_names_the_remedy(fake_run, recorded_anywh
 
 def test_no_devices_at_all_is_typed(fake_run):
     fake_run(returncode=1, stderr="adb: no devices/emulators found\n")
-    with pytest.raises(adb_exec.DeviceNotFound) as excinfo:
+    with pytest.raises(adb_exec.DeviceNotFoundError) as excinfo:
         adb_exec.run_adb("shell", None, "echo", "hi", check=True)
     assert "emulator" in str(excinfo.value).lower()
 
 
 def test_offline_device_is_typed_and_names_the_remedy(fake_run):
     fake_run(returncode=1, stderr="error: device offline\n")
-    with pytest.raises(adb_exec.DeviceOffline) as excinfo:
+    with pytest.raises(adb_exec.DeviceOfflineError) as excinfo:
         adb_exec.run_adb("shell", "emulator-5554", "echo", "hi", check=True)
     assert "reconnect" in str(excinfo.value).lower() or "adb kill-server" in str(excinfo.value)
 
 
 def test_unauthorized_device_is_typed_and_names_the_remedy(fake_run):
     fake_run(returncode=1, stderr="error: device unauthorized.\n")
-    with pytest.raises(adb_exec.DeviceUnauthorized) as excinfo:
+    with pytest.raises(adb_exec.DeviceUnauthorizedError) as excinfo:
         adb_exec.run_adb("shell", "ABC123", "echo", "hi", check=True)
     assert "authorize" in str(excinfo.value).lower() or "prompt" in str(excinfo.value).lower()
 
 
 def test_missing_adb_is_typed_and_names_the_remedy(fake_run):
     fake_run(raises=FileNotFoundError("adb"))
-    with pytest.raises(adb_exec.AdbNotInstalled) as excinfo:
+    with pytest.raises(adb_exec.AdbNotInstalledError) as excinfo:
         adb_exec.run_adb("devices", None)
     assert "platform-tools" in str(excinfo.value)
 
@@ -193,20 +193,20 @@ def test_device_errors_are_detected_even_without_check(fake_run):
     to noticing that.
     """
     fake_run(returncode=1, stderr="adb: more than one device/emulator\n")
-    with pytest.raises(adb_exec.MultipleDevices):
+    with pytest.raises(adb_exec.MultipleDevicesError):
         adb_exec.run_adb("shell", None, "echo", "hi")
 
 
 @pytest.mark.parametrize(
     "error_class",
     [
-        adb_exec.AdbTimeout,
-        adb_exec.MultipleDevices,
-        adb_exec.DeviceNotFound,
-        adb_exec.DeviceOffline,
-        adb_exec.DeviceUnauthorized,
-        adb_exec.AdbNotInstalled,
-        adb_exec.AdbCommandFailed,
+        adb_exec.AdbTimeoutError,
+        adb_exec.MultipleDevicesError,
+        adb_exec.DeviceNotFoundError,
+        adb_exec.DeviceOfflineError,
+        adb_exec.DeviceUnauthorizedError,
+        adb_exec.AdbNotInstalledError,
+        adb_exec.AdbCommandError,
     ],
 )
 def test_every_error_type_derives_from_one_base(error_class):

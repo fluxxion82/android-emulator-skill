@@ -52,15 +52,15 @@ class AdbError(RuntimeError):
     """Base for every adb failure, so callers can catch the family at once."""
 
 
-class AdbNotInstalled(AdbError):
+class AdbNotInstalledError(AdbError):
     """The adb binary is not on PATH."""
 
 
-class AdbTimeout(AdbError):
+class AdbTimeoutError(AdbError):
     """A single adb call exceeded its time budget."""
 
 
-class AdbCommandFailed(AdbError):
+class AdbCommandError(AdbError):
     """adb ran the command and it returned a non-zero status."""
 
 
@@ -68,19 +68,19 @@ class DeviceError(AdbError):
     """The command never reached a device."""
 
 
-class MultipleDevices(DeviceError):
+class MultipleDevicesError(DeviceError):
     """More than one device is attached and no serial was given."""
 
 
-class DeviceNotFound(DeviceError):
+class DeviceNotFoundError(DeviceError):
     """The requested device is not attached, or nothing is attached."""
 
 
-class DeviceOffline(DeviceError):
+class DeviceOfflineError(DeviceError):
     """The device is attached but not responding to adb."""
 
 
-class DeviceUnauthorized(DeviceError):
+class DeviceUnauthorizedError(DeviceError):
     """The device has not accepted this host's USB debugging key."""
 
 
@@ -174,7 +174,7 @@ def _classify(stderr: str, stdout: str, serial: str | None) -> AdbError | None:
     text = f"{stderr}\n{stdout}".lower()
 
     if "more than one device" in text:
-        return MultipleDevices(
+        return MultipleDevicesError(
             f"More than one device is attached, so adb could not choose one. "
             f"{_remedy_for_multiple_devices()}"
         )
@@ -182,25 +182,25 @@ def _classify(stderr: str, stdout: str, serial: str | None) -> AdbError | None:
     if "not found" in text and "device" in text:
         attached = _attached_serials()
         listed = ", ".join(attached) if attached else "none"
-        return DeviceNotFound(
+        return DeviceNotFoundError(
             f"Device {serial!r} is not attached. Attached: {listed}. "
             f"Run `adb devices` to see what is available."
         )
 
     if "no devices" in text or "no emulators" in text:
-        return DeviceNotFound(
+        return DeviceNotFoundError(
             "No devices or emulators are attached. Start one with "
             "`emulator -avd <name>`, or connect a device and enable USB debugging."
         )
 
     if "device offline" in text:
-        return DeviceOffline(
+        return DeviceOfflineError(
             f"Device {serial or ''} is attached but offline. Reconnect it, or "
             f"restart the adb server with `adb kill-server && adb start-server`."
         )
 
     if "unauthorized" in text:
-        return DeviceUnauthorized(
+        return DeviceUnauthorizedError(
             f"Device {serial or ''} has not authorized this computer. Unlock it "
             f"and accept the 'Allow USB debugging?' prompt, then retry."
         )
@@ -222,7 +222,7 @@ def run_adb(
         serial: Device serial; ``-s`` is omitted when None.
         *args: Remaining arguments.
         timeout: Seconds to allow. Defaults to ``ANDROID_EMU_ADB_TIMEOUT`` (30).
-        check: Raise :class:`AdbCommandFailed` on a non-zero exit status.
+        check: Raise :class:`AdbCommandError` on a non-zero exit status.
 
     Returns:
         The :class:`AdbResult`.
@@ -230,7 +230,8 @@ def run_adb(
     Raises:
         AdbNotInstalled: adb is not on PATH.
         AdbTimeout: the call exceeded ``timeout``.
-        MultipleDevices, DeviceNotFound, DeviceOffline, DeviceUnauthorized:
+        MultipleDevicesError, DeviceNotFoundError, DeviceOfflineError,
+        DeviceUnauthorizedError:
             the command never reached a device. These raise regardless of
             ``check``, because the command did not run at all.
         AdbCommandFailed: only when ``check`` is set and the status is non-zero.
@@ -251,12 +252,12 @@ def run_adb(
             check=False,
         )
     except FileNotFoundError as exc:
-        raise AdbNotInstalled(
+        raise AdbNotInstalledError(
             "adb is not on PATH. Install the Android SDK platform-tools and add "
             'them to PATH, e.g. export PATH="$ANDROID_HOME/platform-tools:$PATH".'
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise AdbTimeout(
+        raise AdbTimeoutError(
             f"`{' '.join(cmd)}` did not finish within {budget}s. The device may be "
             f"busy or the adb connection wedged; try `adb kill-server` and retry."
         ) from exc
@@ -274,6 +275,6 @@ def run_adb(
             raise device_error
         if check:
             detail = result.stderr.strip() or result.stdout.strip() or "no output"
-            raise AdbCommandFailed(f"`{' '.join(cmd)}` exited {result.returncode}: {detail}")
+            raise AdbCommandError(f"`{' '.join(cmd)}` exited {result.returncode}: {detail}")
 
     return result
