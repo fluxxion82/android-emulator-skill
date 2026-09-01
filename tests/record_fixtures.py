@@ -163,6 +163,32 @@ def _sdk_tool(name: str) -> str:
     return str(tool)
 
 
+def _emulator_tool() -> str:
+    """Absolute path to the `emulator` binary.
+
+    Not `_sdk_tool`: emulator lives at ``<sdk>/emulator/emulator``, not under
+    ``cmdline-tools/latest/bin``. Resolution is delegated to the skill's own
+    ``common.sdk_tools`` so the recorder and the scripts cannot disagree about
+    which binary "emulator" means -- the disagreement that produced the
+    PermissionError this fixture exists to make testable.
+    """
+    scripts = (
+        Path(__file__).resolve().parents[1]
+        / "android-emulator-skill"
+        / "skills"
+        / "android-emulator-skill"
+        / "scripts"
+    )
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
+
+    resolved = get_emulator_path()
+    if not resolved:
+        raise CaptureError(EMULATOR_NOT_FOUND_MESSAGE)
+    return resolved
+
+
 def _scrub_home_paths(text: str) -> str:
     """Replace the recording machine's home directory with a placeholder.
 
@@ -1148,6 +1174,36 @@ FIXTURES: list[Fixture] = [
             "statements including a UNIQUE one."
         ),
     ),
+    # --- emulator -list-avds: three scripts parse it, none had a fixture ----
+    Fixture(
+        name="emulator_list_avds",
+        args=[],
+        host_argv=["{emulator}", "-list-avds"],
+        description=(
+            "`emulator -list-avds`. Three scripts (device_list, emulator_boot, "
+            "emulator_selector) parse this and none had a fixture, while two "
+            "more scripts answer 'which AVDs exist?' from entirely different "
+            "sources -- emulator_delete asks `avdmanager list avd -c`, "
+            "emulator_erase scans $ANDROID_AVD_HOME for `*.avd` directories. "
+            "Recording all three is what makes that divergence testable. The "
+            "shape is deliberately boring: one bare AVD name per line, no "
+            "header, no decoration -- but note it must be captured through the "
+            "RESOLVED binary, because with the SDK root on PATH the bare name "
+            "`emulator` is the <sdk>/emulator DIRECTORY and execve raises "
+            "PermissionError, which is the defect this fixture pins."
+        ),
+    ),
+    Fixture(
+        name="avdmanager_list_avd_compact",
+        args=[],
+        host_argv=["{avdmanager}", "list", "avd", "-c"],
+        description=(
+            "`avdmanager list avd -c`. The compact form emulator_delete parses, "
+            "as opposed to the block form in avdmanager_list_avd: one name per "
+            "line, identical in shape to `emulator -list-avds`. Recorded as the "
+            "second leg of the AVD-source agreement test."
+        ),
+    ),
     # --- avdmanager: seven scripts parse this and none had a fixture --------
     Fixture(
         name="avdmanager_list_avd",
@@ -1533,9 +1589,13 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                 raw = _run_host(
                     [
                         (
-                            _sdk_tool(a.strip("{}"))
-                            if a in ("{avdmanager}", "{sdkmanager}")
-                            else a.format(tmp=scratch)
+                            _emulator_tool()
+                            if a == "{emulator}"
+                            else (
+                                _sdk_tool(a.strip("{}"))
+                                if a in ("{avdmanager}", "{sdkmanager}")
+                                else a.format(tmp=scratch)
+                            )
                         )
                         for a in fixture.host_argv
                     ]

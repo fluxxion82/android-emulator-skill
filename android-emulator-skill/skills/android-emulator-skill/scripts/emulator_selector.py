@@ -46,6 +46,7 @@ from pathlib import Path
 from common import adb_exec
 from common.device_utils import get_connected_devices
 from common.env_config import env_int
+from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_SUGGEST_COUNT = env_int("ANDROID_EMU_SELECTOR_COUNT", 4, min_value=1)
@@ -225,6 +226,8 @@ class EmulatorSelector:
                 falling back to ``~/.android-emulator-skill/config.json``.
         """
         self.config_path = config_path or self._default_config_path()
+        # One "emulator not found" line per run, not one per AVD lookup.
+        self._emulator_warned = False
 
     @staticmethod
     def _default_config_path() -> Path:
@@ -264,21 +267,29 @@ class EmulatorSelector:
         }
 
     def _list_avd_names(self) -> list[str]:
-        """Return AVD names via ``emulator -list-avds`` (empty on any failure)."""
+        """
+        Return AVD names via ``emulator -list-avds`` (empty on any failure).
+
+        The binary is resolved explicitly (see :mod:`common.sdk_tools`); exec'ing
+        the bare name raises ``PermissionError`` when PATH holds the SDK root.
+        """
+        emulator = get_emulator_path()
+        if not emulator:
+            if not self._emulator_warned:
+                print(EMULATOR_NOT_FOUND_MESSAGE, file=sys.stderr)
+                self._emulator_warned = True
+            return []
+
         try:
             result = subprocess.run(
-                ["emulator", "-list-avds"],
+                [emulator, "-list-avds"],
                 capture_output=True,
                 text=True,
                 timeout=EMULATOR_TOOL_TIMEOUT,
                 check=True,
             )
-        except FileNotFoundError:
-            print(
-                "Error: 'emulator' command not found. "
-                "Ensure the Android SDK emulator is on PATH.",
-                file=sys.stderr,
-            )
+        except OSError as e:
+            print(f"Error: could not run {emulator!r}: {e}", file=sys.stderr)
             return []
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
@@ -410,7 +421,11 @@ class EmulatorSelector:
     @staticmethod
     def _boot_via_cli(name: str, headless: bool) -> tuple[bool, str]:
         """Fallback boot using ``emulator -avd <name>`` directly."""
-        cmd = ["emulator", "-avd", name]
+        emulator = get_emulator_path()
+        if not emulator:
+            return False, EMULATOR_NOT_FOUND_MESSAGE
+
+        cmd = [emulator, "-avd", name]
         if headless:
             cmd.append("-no-window")
         try:
@@ -423,8 +438,8 @@ class EmulatorSelector:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        except FileNotFoundError:
-            return False, "Error: 'emulator' command not found. Ensure the Android SDK is on PATH."
+        except OSError as e:
+            return False, f"{EMULATOR_NOT_FOUND_MESSAGE}\n  (exec of {emulator!r} failed: {e})"
         except Exception as e:
             return False, f"Boot error: {e}"
         return True, f"Emulator booting: {name} (use emulator_boot.py --wait-ready to wait)"

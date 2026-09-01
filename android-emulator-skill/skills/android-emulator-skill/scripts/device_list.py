@@ -47,6 +47,7 @@ import subprocess
 import sys
 
 from common.env_config import env_int
+from common.sdk_tools import get_emulator_path
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 # How many online devices to echo inline under the concise summary.
@@ -282,9 +283,11 @@ class DeviceLister:
         """
         Run a discovery command, returning stdout or None if unavailable.
 
-        Missing tools (adb/emulator/avdmanager not on PATH) and nonzero exits
-        are treated as "nothing to report" rather than hard failures, so the
-        listing degrades gracefully (e.g. AVDs still show if adb is absent).
+        Unusable tools and nonzero exits are treated as "nothing to report"
+        rather than hard failures, so the listing degrades gracefully (e.g. AVDs
+        still show if adb is absent). The catch is ``OSError``, not just
+        ``FileNotFoundError``: when PATH holds the Android SDK root, a bare tool
+        name can resolve to a *directory* and execve raises ``PermissionError``.
         """
         try:
             result = subprocess.run(
@@ -294,7 +297,7 @@ class DeviceLister:
                 timeout=LIST_COMMAND_TIMEOUT,
                 check=False,
             )
-        except (FileNotFoundError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError):
             return None
         if result.returncode != 0:
             return None
@@ -309,8 +312,15 @@ class DeviceLister:
         return devices
 
     def get_avds(self) -> list[dict]:
-        """Get defined AVDs via ``emulator -list-avds`` + avdmanager (filtered)."""
-        names_output = self._run(["emulator", "-list-avds"])
+        """
+        Get defined AVDs via ``emulator -list-avds`` + avdmanager (filtered).
+
+        The emulator binary is resolved explicitly rather than exec'd by bare
+        name, which is unsafe when PATH holds the SDK root (see
+        :mod:`common.sdk_tools`). An unresolvable emulator yields no names.
+        """
+        emulator = get_emulator_path()
+        names_output = self._run([emulator, "-list-avds"]) if emulator else None
         names = parse_emulator_avds(names_output) if names_output else []
 
         meta_output = self._run(["avdmanager", "list", "avd"])

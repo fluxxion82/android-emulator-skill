@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T22:50:55Z",
+  "recorded_at": "2026-09-02T00:04:28Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -63,6 +63,14 @@
       "description": "`avdmanager list avd`. Recorded only now, because until the SDK command-line tools were installed avdmanager could not run on the dev machine at all -- the legacy tools/bin copies use JAXB, removed in Java 11 -- so every script parsing AVD listings was written against imagined output. Note the shape: a header line, then indented `Key: value` pairs with INCONSISTENT leading whitespace (`    Name:` has four spaces, `  Device:` two), a `Based on:` continuation line belonging to `Target:`, and Tag/ABI riding on that same continuation rather than having its own key.",
       "catches": [],
       "bytes": 271
+    },
+    {
+      "name": "avdmanager_list_avd_compact",
+      "file": "avdmanager_list_avd_compact.txt",
+      "command": "{avdmanager} list avd -c",
+      "description": "`avdmanager list avd -c`. The compact form emulator_delete parses, as opposed to the block form in avdmanager_list_avd: one name per line, identical in shape to `emulator -list-avds`. Recorded as the second leg of the AVD-source agreement test.",
+      "catches": [],
+      "bytes": 8
     },
     {
       "name": "avdmanager_list_device",
@@ -247,6 +255,14 @@
       "description": "`adb emu sms send` with the body omitted. The console answers \"KO: missing argument, try 'sms send <phonenumber> <text message>'\" and adb still EXITS 0, so anything reading the exit status sees a successful send. Failure is visible only in the reply text; common/emu_console.run_emu is what turns it into an error.",
       "catches": [],
       "bytes": 66
+    },
+    {
+      "name": "emulator_list_avds",
+      "file": "emulator_list_avds.txt",
+      "command": "{emulator} -list-avds",
+      "description": "`emulator -list-avds`. Three scripts (device_list, emulator_boot, emulator_selector) parse this and none had a fixture, while two more scripts answer 'which AVDs exist?' from entirely different sources -- emulator_delete asks `avdmanager list avd -c`, emulator_erase scans $ANDROID_AVD_HOME for `*.avd` directories. Recording all three is what makes that divergence testable. The shape is deliberately boring: one bare AVD name per line, no header, no decoration -- but note it must be captured through the RESOLVED binary, because with the SDK root on PATH the bare name `emulator` is the <sdk>/emulator DIRECTORY and execve raises PermissionError, which is the defect this fixture pins.",
+      "catches": [],
+      "bytes": 8
     },
     {
       "name": "logcat_anr_broadcast",

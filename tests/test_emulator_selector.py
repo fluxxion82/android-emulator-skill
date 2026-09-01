@@ -228,8 +228,14 @@ def test_a_device_error_is_not_ranked_as_not_running(monkeypatch, tmp_path, reco
         selector.running_avd_names()
 
 
+def _fake_emulator_on_path(monkeypatch):
+    """Pin emulator resolution to the bare name so argv assertions stay stable."""
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: "emulator")
+
+
 def test_avd_listing_is_bounded(monkeypatch, tmp_path):
     """`emulator -list-avds` is an SDK tool, not adb -- but still not unbounded."""
+    _fake_emulator_on_path(monkeypatch)
     calls = _fake_adb(monkeypatch, {("emulator",): (0, "Pixel_9_Pro\n", "")})
 
     selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
@@ -240,6 +246,7 @@ def test_avd_listing_is_bounded(monkeypatch, tmp_path):
 
 def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, capsys):
     """At the CLI boundary the agent gets the remedy, not a stack trace."""
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
     _fake_adb(
@@ -283,3 +290,92 @@ def test_tunables_env_override(monkeypatch):
         monkeypatch.delenv("ANDROID_EMU_SELECTOR_COUNT", raising=False)
         monkeypatch.delenv("ANDROID_EMU_SELECTOR_RUNNING_PTS", raising=False)
         importlib.reload(emulator_selector)
+
+
+# ---------------------------------------------------------------------------
+# Emulator resolution (SDK-root-on-PATH regression)
+# ---------------------------------------------------------------------------
+def test_list_avd_names_survives_permission_error_from_a_directory_argv0(monkeypatch, tmp_path):
+    """`emulator` resolving to a directory raises PermissionError, not ENOENT."""
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: "/sdk/emulator/emulator")
+
+    def boom(_cmd, **_kwargs):
+        raise PermissionError(13, "Permission denied", "emulator")
+
+    monkeypatch.setattr(emulator_selector.subprocess, "run", boom)
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    assert selector._list_avd_names() == []
+
+
+def test_list_avd_names_reports_actionable_hint_when_unresolvable(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
+
+    def unexpected(_cmd, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("must not exec an unresolved emulator")
+
+    monkeypatch.setattr(emulator_selector.subprocess, "run", unexpected)
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    assert selector._list_avd_names() == []
+    assert "$ANDROID_HOME/emulator" in capsys.readouterr().err
+
+
+def test_list_avd_names_parses_recorded_emulator_output(monkeypatch, tmp_path, recorded):
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: "/sdk/emulator/emulator")
+
+    seen: list[list[str]] = []
+
+    class _Result:
+        stdout = recorded.text("emulator_list_avds")
+
+    def fake_run(cmd, **_kwargs):
+        seen.append(cmd)
+        return _Result()
+
+    monkeypatch.setattr(emulator_selector.subprocess, "run", fake_run)
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+
+    expected = [ln.strip() for ln in recorded.lines("emulator_list_avds") if ln.strip()]
+    assert selector._list_avd_names() == expected
+    assert seen == [["/sdk/emulator/emulator", "-list-avds"]]
+
+
+def test_boot_via_cli_uses_the_resolved_emulator_path(monkeypatch):
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: "/sdk/emulator/emulator")
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        emulator_selector.subprocess, "Popen", lambda cmd, **_kw: launched.append(cmd)
+    )
+
+    success, _message = emulator_selector.EmulatorSelector._boot_via_cli("Pixel_9", headless=False)
+
+    assert success is True
+    assert launched == [["/sdk/emulator/emulator", "-avd", "Pixel_9"]]
+
+
+def test_boot_via_cli_reports_actionable_hint_when_unresolvable(monkeypatch):
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
+
+    def unexpected(_cmd, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("must not exec an unresolved emulator")
+
+    monkeypatch.setattr(emulator_selector.subprocess, "Popen", unexpected)
+
+    success, message = emulator_selector.EmulatorSelector._boot_via_cli("Pixel_9", headless=False)
+
+    assert success is False
+    assert "$ANDROID_HOME/emulator" in message
+
+
+def test_missing_emulator_is_reported_once_per_selector(monkeypatch, tmp_path, capsys):
+    """`--list` calls _list_avd_names twice; the hint should not double up."""
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+
+    selector._list_avd_names()
+    selector._list_avd_names()
+
+    assert capsys.readouterr().err.count("emulator' binary not found") == 1

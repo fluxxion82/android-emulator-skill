@@ -46,7 +46,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### Implemented (32 scripts)
 
-#### Core Utilities (10 modules in `common/`)
+#### Core Utilities (11 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
@@ -56,7 +56,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    capture the UI hierarchy — no temp files, so concurrent runs cannot read each
    other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
    fails), **logcat.py** (the one place that builds an `adb logcat` argv and
-   parses a duration, shared by all four log readers), **env_config.py**,
+   parses a duration, shared by all four log readers), **sdk_tools.py** (resolves
+   SDK binaries; `emulator` by bare name hits the `<sdk>/emulator` *directory* on an
+   SDK-root PATH and raises `PermissionError`), **env_config.py**,
    **anr_pipeline.py**, **anr_sessions.py**.
 
 #### App Management (1 script)
@@ -262,6 +264,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `<verb> [verb options]`, `--json` (routing table), `--help`
 
 > The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`. The ANR watcher's clustering/session machinery lives in `common/anr_pipeline.py` and `common/anr_sessions.py`.
+>
+> SDK binary resolution lives in `common/sdk_tools.py` (`get_emulator_path()`). Never exec
+> `emulator` by bare name: the SDK root contains a *directory* named `emulator`, so a PATH
+> holding `$ANDROID_HOME` instead of `$ANDROID_HOME/emulator` makes execve raise
+> `PermissionError` — not the `FileNotFoundError` callers usually guard against.
 
 ## Android vs iOS Mapping
 
