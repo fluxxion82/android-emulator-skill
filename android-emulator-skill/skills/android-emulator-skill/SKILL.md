@@ -482,13 +482,14 @@ screens; touch targets are measured in dp against the device's real density;
 display overrides (`wm size` / `wm density`) are honoured, so coordinates are
 right while one is active; every script reads the screen through one
 implementation that writes no temp files, so concurrent runs and multi-device
-runs can no longer read each other's screen.
+runs can no longer read each other's screen; `test_recorder` records again
+(screenshots, UI dumps and a Markdown report per step); `push_notification` is
+rescoped to what adb can actually do — post to the shade, and read back what a
+package really posted — instead of broadcasting to a receiver class this skill
+invented.
 
 **Known-broken, being worked:**
 
-- `push_notification.py` — cannot deliver into an app's own FCM handler; being
-  rescoped to posting a system notification and *verifying* what the app posted.
-- `test_recorder.py` — the CLI currently records nothing; being rebuilt.
 - `accessibility_audit.py` — no contrast check, despite the script's own
   description mentioning one. Contrast needs pixel sampling from a screenshot,
   which is not implemented.
