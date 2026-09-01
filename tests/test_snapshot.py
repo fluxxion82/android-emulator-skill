@@ -597,3 +597,20 @@ def test_live_load_of_a_missing_snapshot_fails(emulator_only_device):
     )
     assert success is False, "the real console's KO was read as a successful load"
     assert "error" in result
+
+
+def test_an_emulator_with_no_snapshots_is_empty_not_unreadable(recorded):
+    """A fresh emulator answers with a sentence, not a table.
+
+    CI found this on the emulator lane's first successful run: a runner's AVD
+    has no snapshots, while the dev machine's had `default_boot`, so the empty
+    case never occurred locally. `There is no snapshot available.` was reported
+    as a line the parser could not read -- which reads as "the format changed",
+    the loudest possible way to say "there is nothing here".
+    """
+    text = recorded.text("emu_avd_snapshot_list_empty")
+
+    assert snapshot.parse_snapshot_table(text) == []
+    assert (
+        snapshot.unrecognised_lines(text) == []
+    ), "the no-snapshots sentence is being reported as unparsed output"

@@ -139,12 +139,24 @@ def validate_snapshot_name(name: str) -> str | None:
     return None
 
 
+# What the console says instead of a table when there are no snapshots.
+# Measured, not guessed: CI's first successful emulator run failed here,
+# because a fresh runner AVD has none while the dev machine's had `default_boot`
+# -- so locally the empty case never occurred. Recorded as
+# emu_avd_snapshot_list_empty.
+_EMPTY_LISTING = "There is no snapshot available."
+
+
 def _is_framing(line: str) -> bool:
     """Whether a line is table framing rather than a candidate row."""
     stripped = line.strip()
     if not stripped or stripped == "OK" or stripped.startswith("KO"):
         return True
     if stripped.startswith(_TITLE_PREFIX):
+        return True
+    # "no snapshots" is an answer, not an unreadable line. Reporting it as
+    # unparsed makes an empty emulator look like a broken parser.
+    if stripped == _EMPTY_LISTING:
         return True
     return stripped.split()[: len(_HEADER_TOKENS)] == _HEADER_TOKENS
 

@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T20:31:10Z",
+  "recorded_at": "2026-09-01T22:09:56Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -39,6 +39,22 @@
         "S4"
       ],
       "bytes": 146
+    },
+    {
+      "name": "avdmanager_list_avd",
+      "file": "avdmanager_list_avd.txt",
+      "command": "{avdmanager} list avd",
+      "description": "`avdmanager list avd`. Recorded only now, because until the SDK command-line tools were installed avdmanager could not run on the dev machine at all -- the legacy tools/bin copies use JAXB, removed in Java 11 -- so every script parsing AVD listings was written against imagined output. Note the shape: a header line, then indented `Key: value` pairs with INCONSISTENT leading whitespace (`    Name:` has four spaces, `  Device:` two), a `Based on:` continuation line belonging to `Target:`, and Tag/ABI riding on that same continuation rather than having its own key.",
+      "catches": [],
+      "bytes": 271
+    },
+    {
+      "name": "avdmanager_list_device",
+      "file": "avdmanager_list_device.txt",
+      "command": "{avdmanager} list device",
+      "description": "`avdmanager list device` -- the device definitions emulator_create offers. Entries are numbered `id: N or \"name\"`, which is two identifiers for one device, and the human name is on a separate `Name:` line.",
+      "catches": [],
+      "bytes": 8184
     },
     {
       "name": "cmd_notification_help",
@@ -151,6 +167,14 @@
       "description": "`adb emu avd snapshot list`. A fixed-width table under two header lines, terminated by the console's 'OK'. The ID column is '--' for the boot snapshot, so a parser keying on ID must tolerate it.",
       "catches": [],
       "bytes": 189
+    },
+    {
+      "name": "emu_avd_snapshot_list_empty",
+      "file": "emu_avd_snapshot_list_empty.txt",
+      "command": "adb emu avd snapshot list",
+      "description": "`avd snapshot list` on an emulator with NO snapshots: a plain sentence, 'There is no snapshot available.', where the populated case is a table with two header lines. Found by CI on its first successful emulator run -- a fresh runner AVD has no snapshots, and the dev machine's did, so locally the empty case never occurred. The parser reported the sentence as an unreadable line rather than as an empty list.",
+      "catches": [],
+      "bytes": 35
     },
     {
       "name": "emu_avd_snapshot_load_missing",
@@ -269,6 +293,14 @@
       "description": "run-as refused for a package that is not installed: 'run-as: unknown package: <pkg>'. This one the marker list does match, which is why the actionable hint appears here and not for run_as_not_an_application -- the contrast is the point.",
       "catches": [],
       "bytes": 42
+    },
+    {
+      "name": "sdkmanager_list_installed",
+      "file": "sdkmanager_list_installed.txt",
+      "command": "{sdkmanager} --list_installed",
+      "description": "`sdkmanager --list_installed`, and the reason AVD creation could never work. emulator_create looked for lines starting `system-images;` and split them on `|`. sdkmanager prints `  system-images/android-34/google_apis/arm64-v8a` -- SLASHES, and whitespace-padded columns with no pipe anywhere. So the installed list was always empty, every image reported as 'not installed', and `--api` inference had nothing to infer from. Note also that the *install* id uses semicolons, so the slashes have to be converted back to build the `sdkmanager` argument the error message tells the user to run.",
+      "catches": [],
+      "bytes": 3868
     },
     {
       "name": "shared_prefs_settings_xml",

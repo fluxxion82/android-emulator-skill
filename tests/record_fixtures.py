@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import re
 import subprocess
@@ -139,6 +140,37 @@ def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) ->
     if "DUMP TIMEOUT" in text:
         raise CaptureError("device-side dumpsys timeout (device is loaded or unhealthy)")
     return text
+
+
+def _sdk_tool(name: str) -> str:
+    """Absolute path to an Android cmdline-tool.
+
+    They are not on PATH by default -- and until `cmdline-tools` was installed
+    they could not run at all here, which is why `avdmanager` output has no
+    fixture despite seven scripts parsing it. The legacy `tools/bin` copies are
+    not a fallback: they use JAXB, removed in Java 11.
+    """
+    home = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if not home:
+        home = str(Path.home() / "Library" / "Android" / "sdk")
+    tool = Path(home) / "cmdline-tools" / "latest" / "bin" / name
+    if not tool.exists():
+        raise CaptureError(
+            f"{name} not found at {tool}. Install the SDK command-line tools "
+            f"(Android Studio > SDK Manager > SDK Tools > Android SDK "
+            f"Command-line Tools), or set ANDROID_HOME."
+        )
+    return str(tool)
+
+
+def _scrub_home_paths(text: str) -> str:
+    """Replace the recording machine's home directory with a placeholder.
+
+    `avdmanager list avd` prints `Path: /Users/<someone>/.android/avd/...`.
+    Fixtures are committed to a public repository, so the account name of
+    whoever recorded them must not travel with the file.
+    """
+    return text.replace(str(Path.home()), "/Users/<user>")
 
 
 def _pull_app_database(scratch: Path, serial: str | None) -> None:
@@ -692,6 +724,19 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="emu_avd_snapshot_list_empty",
+        args=["emu", "avd", "snapshot", "list"],
+        description=(
+            "`avd snapshot list` on an emulator with NO snapshots: a plain "
+            "sentence, 'There is no snapshot available.', where the populated "
+            "case is a table with two header lines. Found by CI on its first "
+            "successful emulator run -- a fresh runner AVD has no snapshots, "
+            "and the dev machine's did, so locally the empty case never "
+            "occurred. The parser reported the sentence as an unreadable line "
+            "rather than as an empty list."
+        ),
+    ),
+    Fixture(
         name="emu_avd_snapshot_load_missing",
         args=["emu", "avd", "snapshot", "load", "no_such_snapshot_xyz"],
         description=(
@@ -793,6 +838,54 @@ FIXTURES: list[Fixture] = [
             "android_metadata and sqlite_sequence, AUTOINCREMENT, a composite "
             "FOREIGN KEY ... ON DELETE CASCADE, and separate CREATE INDEX "
             "statements including a UNIQUE one."
+        ),
+    ),
+    # --- avdmanager: seven scripts parse this and none had a fixture --------
+    Fixture(
+        name="avdmanager_list_avd",
+        args=[],
+        host_argv=["{avdmanager}", "list", "avd"],
+        post=_scrub_home_paths,
+        description=(
+            "`avdmanager list avd`. Recorded only now, because until the SDK "
+            "command-line tools were installed avdmanager could not run on the "
+            "dev machine at all -- the legacy tools/bin copies use JAXB, removed "
+            "in Java 11 -- so every script parsing AVD listings was written "
+            "against imagined output. Note the shape: a header line, then "
+            "indented `Key: value` pairs with INCONSISTENT leading whitespace "
+            "(`    Name:` has four spaces, `  Device:` two), a `Based on:` "
+            "continuation line belonging to `Target:`, and Tag/ABI riding on "
+            "that same continuation rather than having its own key."
+        ),
+    ),
+    Fixture(
+        name="avdmanager_list_device",
+        args=[],
+        host_argv=["{avdmanager}", "list", "device"],
+        post=_scrub_home_paths,
+        description=(
+            "`avdmanager list device` -- the device definitions emulator_create "
+            'offers. Entries are numbered `id: N or "name"`, which is two '
+            "identifiers for one device, and the human name is on a separate "
+            "`Name:` line."
+        ),
+    ),
+    Fixture(
+        name="sdkmanager_list_installed",
+        args=[],
+        host_argv=["{sdkmanager}", "--list_installed"],
+        post=_scrub_home_paths,
+        description=(
+            "`sdkmanager --list_installed`, and the reason AVD creation could "
+            "never work. emulator_create looked for lines starting "
+            "`system-images;` and split them on `|`. sdkmanager prints "
+            "`  system-images/android-34/google_apis/arm64-v8a` -- SLASHES, and "
+            "whitespace-padded columns with no pipe anywhere. So the installed "
+            "list was always empty, every image reported as 'not installed', "
+            "and `--api` inference had nothing to infer from. Note also that "
+            "the *install* id uses semicolons, so the slashes have to be "
+            "converted back to build the `sdkmanager` argument the error "
+            "message tells the user to run."
         ),
     ),
     Fixture(
@@ -1129,7 +1222,16 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             fixture.prepare(scratch, serial)
         try:
             if fixture.host_argv is not None:
-                raw = _run_host([a.format(tmp=scratch) for a in fixture.host_argv])
+                raw = _run_host(
+                    [
+                        (
+                            _sdk_tool(a.strip("{}"))
+                            if a in ("{avdmanager}", "{sdkmanager}")
+                            else a.format(tmp=scratch)
+                        )
+                        for a in fixture.host_argv
+                    ]
+                )
             else:
                 raw = _run(fixture.args, serial, fixture.timeout)
             text = _redact_private_packages(_strip_cr(raw), redactions)

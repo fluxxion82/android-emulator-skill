@@ -268,7 +268,19 @@ class EmulatorCreator:
                 if line.startswith("id:"):
                     if current_device:
                         devices.append(current_device)
-                    current_device = {"id": line.split(":", 1)[1].strip()}
+                    # `id: 53 or "pixel_9"` is TWO identifiers for one device,
+                    # not one. This used to keep the whole tail as the id and
+                    # pass it to `avdmanager --device`, which answered
+                    # `No device found matching --device 53 or "pixel_9"` --
+                    # echoing back the string it had been handed. Recorded as
+                    # avdmanager_list_device.
+                    raw = line.split(":", 1)[1].strip()
+                    numeric, _, quoted = raw.partition(" or ")
+                    current_device = {
+                        "id": quoted.strip().strip('"') or numeric.strip(),
+                        "index": numeric.strip(),
+                        "raw_id": raw,
+                    }
                 elif line.startswith("Name:"):
                     current_device["name"] = line.split(":", 1)[1].strip()
                 elif line.startswith("OEM"):
@@ -364,9 +376,21 @@ class EmulatorCreator:
         images = []
         for line in result.stdout.split("\n"):
             stripped = line.strip()
-            if not stripped.startswith("system-images;"):
+            # `--list_installed` prints PATHS, not package ids, in
+            # whitespace-padded columns:
+            #
+            #   system-images/android-34/google_apis/arm64-v8a   14.0.0   Google APIs...
+            #
+            # This used to look for `system-images;` and split on `|`, matching
+            # nothing -- so the installed list was always empty, every image
+            # reported as "not installed", and creating an AVD was impossible.
+            # Recorded as sdkmanager_list_installed.
+            if not stripped.startswith("system-images/"):
                 continue
-            image_id = stripped.split("|", 1)[0].strip()
+            path = stripped.split()[0]
+            # The *install* id uses semicolons, so convert back: the error we
+            # show tells the user to run `sdkmanager 'system-images;...'`.
+            image_id = path.replace("/", ";")
             match = re.match(r"system-images;android-(\d+);([^;]+);([^;\s]+)", image_id)
             if match:
                 api_level, variant, abi = match.groups()
@@ -444,27 +468,24 @@ class EmulatorCreator:
         # Build system image path
         system_image = f"system-images;android-{api_level};{variant};{abi}"
 
-        # Check if system image is installed
-        sdkmanager = self.get_sdkmanager_path()
-        if sdkmanager:
-            try:
-                result = subprocess.run(
-                    [sdkmanager, "--list"],
-                    capture_output=True,
-                    text=True,
-                    timeout=SDK_LIST_TIMEOUT,
-                    check=True,
-                )
-
-                if system_image not in result.stdout:
-                    return (
-                        False,
-                        f"System image not installed: {system_image}\n"
-                        f"Install with: sdkmanager '{system_image}'",
-                        None,
-                    )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                pass  # Continue anyway
+        # Check the image is installed, against the LOCAL package list.
+        #
+        # This used to run `sdkmanager --list` and ask whether the semicolon
+        # form appeared anywhere in its stdout. It never does: --list prints
+        # paths with slashes. So every image looked missing and no AVD could
+        # ever be created -- with an error telling the user to install
+        # something they already had. `--list` also reaches the network, so the
+        # check was slow and failed offline for the wrong reason.
+        installed = self.list_installed_system_images()
+        if installed and system_image not in {image["id"] for image in installed}:
+            available = sorted(image["id"] for image in installed)
+            return (
+                False,
+                f"System image not installed: {system_image}\n"
+                f"Install with: sdkmanager '{system_image}'\n"
+                f"Or use one you already have: {', '.join(available)}",
+                None,
+            )
 
         # Create AVD
         cmd = [
@@ -481,7 +502,7 @@ class EmulatorCreator:
 
         try:
             # Use 'no' to decline custom hardware profile
-            result = subprocess.run(
+            subprocess.run(
                 cmd,
                 input="no\n",
                 capture_output=True,
