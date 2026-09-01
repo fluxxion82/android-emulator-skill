@@ -1,5 +1,6 @@
 {
   "name": "android-emulator-skill",
+  "version": "0.5.0",
   "description": "Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output.",
   "author": {
     "name": "fluxxion82"
@@ -7,5 +8,13 @@
   "license": "MIT",
   "homepage": "https://github.com/fluxxion82/android-emulator-skill",
   "repository": "https://github.com/fluxxion82/android-emulator-skill",
-  "keywords": ["android", "emulator", "adb", "gradle", "testing", "accessibility", "automation"]
+  "keywords": [
+    "android",
+    "emulator",
+    "adb",
+    "gradle",
+    "testing",
+    "accessibility",
+    "automation"
+  ]
 }

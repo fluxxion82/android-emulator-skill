@@ -6,7 +6,12 @@ These exercise the pure arg->command mapping by monkeypatching the module's
 * presets map to coherent override field groups,
 * ``override`` enters demo mode once then emits the expected demo broadcasts
   atomically (clock / battery / network), and
-* existing individual setters (``set_battery``) are untouched.
+* the individual setters (``set_battery`` etc.) go through demo mode too.
+
+This file previously declared the individual setters out of scope and
+asserted they used ``cmd statusbar battery-level``. That subcommand does
+not exist -- see tests/test_invented_commands_removed.py -- so the test was
+pinning a broken path as intended behaviour.
 """
 
 from __future__ import annotations
@@ -181,14 +186,22 @@ def test_serial_threaded_into_commands(captured_cmds):
         assert cmd[1:3] == ["-s", "emulator-5554"]
 
 
-def test_set_battery_unchanged_uses_statusbar_cmd(captured_cmds):
-    # Existing individual flag path is preserved (cmd statusbar, not demo mode).
+def test_set_battery_uses_demo_mode(captured_cmds):
+    """The individual setter now takes the same path as override().
+
+    It previously issued `cmd statusbar battery-level`, which is not a real
+    subcommand; "battery-level" is a demo-mode broadcast extra.
+    """
     ok, msg = StatusBarController().set_battery(42)
     assert ok is True
     assert "42%" in msg
-    assert any("statusbar" in c and "battery-level" in c for c in captured_cmds)
-    # set_battery must not enter demo mode.
-    assert not any(c[-2:] == ["command", "enter"] for c in captured_cmds)
+
+    assert not any(
+        "statusbar" in c for c in captured_cmds
+    ), "still issuing a `cmd statusbar` subcommand"
+    assert any("com.android.systemui.demo" in c for c in captured_cmds)
+    # Demo mode must be entered, or the broadcast is ignored.
+    assert any(c[-2:] == ["command", "enter"] for c in captured_cmds)
 
 
 def test_override_failure_returns_message(monkeypatch):

@@ -75,6 +75,10 @@ class KeyboardSimulator:
         "volume_down": "KEYCODE_VOLUME_DOWN",
         "power": "KEYCODE_POWER",
         "camera": "KEYCODE_CAMERA",
+        # Documented in press_button() but previously unmapped, so the call
+        # always returned "Unknown key".
+        "recent_apps": "KEYCODE_APP_SWITCH",
+        "app_switch": "KEYCODE_APP_SWITCH",
     }
 
     def __init__(self, serial: str | None = None):
@@ -194,28 +198,6 @@ class KeyboardSimulator:
 
         return True, f"Cleared: {count} characters"
 
-    def show_keyboard(self) -> tuple:
-        """
-        Show soft keyboard.
-
-        Returns:
-            (success, message) tuple
-        """
-        try:
-            # Toggle IME visibility - show
-            cmd = build_adb_command(
-                "shell",
-                self.serial,
-                "am",
-                "broadcast",
-                "-a",
-                "android.intent.action.INPUT_METHOD_CHANGED",
-            )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True, "Keyboard shown"
-        except subprocess.CalledProcessError as e:
-            return False, f"Show keyboard failed: {e.stderr}"
-
     def hide_keyboard(self) -> tuple:
         """
         Hide soft keyboard.
@@ -326,8 +308,6 @@ Available Keys:
     parser.add_argument("--button", help="Press hardware button")
     parser.add_argument("--keys", help="Press multiple keys (comma-separated)")
     parser.add_argument("--clear", type=int, metavar="COUNT", help="Clear text (delete N times)")
-    parser.add_argument("--show-keyboard", action="store_true", help="Show soft keyboard")
-    parser.add_argument("--hide-keyboard", action="store_true", help="Hide soft keyboard")
     parser.add_argument("--dismiss", action="store_true", help="Dismiss the keyboard (press BACK)")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -357,8 +337,6 @@ Available Keys:
         success, message = keyboard.key_combination(keys)
     elif args.clear is not None:
         success, message = keyboard.clear_text(args.clear)
-    elif args.show_keyboard:
-        success, message = keyboard.show_keyboard()
     elif args.hide_keyboard:
         success, message = keyboard.hide_keyboard()
     elif args.dismiss:

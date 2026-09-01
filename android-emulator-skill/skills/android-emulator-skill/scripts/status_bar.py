@@ -128,118 +128,110 @@ class StatusBarController:
 
     def set_battery(self, level: int, charging: bool = False) -> tuple:
         """
-        Set battery level display.
+        Set the battery indicator via SystemUI demo mode.
 
         Args:
             level: Battery level (0-100)
-            charging: Show charging indicator
+            charging: Show the charging indicator
 
         Returns:
             (success, message) tuple
+
+        This previously issued ``cmd statusbar battery-level``, which does not
+        exist -- recorded `cmd statusbar` help on API 33 and 35 lists only
+        expand-notifications / collapse / add-tile / set-tiles / click-tile and
+        friends. "battery-level" is a demo-mode broadcast extra.
         """
         if not 0 <= level <= 100:
             return False, "Battery level must be between 0 and 100"
 
-        # Disable real battery status
-        cmd1 = build_adb_command(
-            "shell", self.serial, "cmd", "statusbar", "battery-level", str(level)
-        )
-
         try:
-            subprocess.run(cmd1, capture_output=True, text=True, check=True)
-
-            # Set charging status
-            if charging:
-                cmd2 = build_adb_command(
-                    "shell", self.serial, "cmd", "statusbar", "battery-charging", "true"
-                )
-                subprocess.run(cmd2, capture_output=True, text=True, check=True)
-
+            self._enter_demo_mode()
+            cmd = self._demo_broadcast(
+                "-e",
+                "command",
+                "battery",
+                "-e",
+                "level",
+                str(level),
+                "-e",
+                "plugged",
+                "true" if charging else "false",
+            )
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
             return True, f"Battery set to {level}%{' (charging)' if charging else ''}"
-
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to set battery: {error_msg}"
 
     def set_wifi(self, enabled: bool = True, level: int = 4) -> tuple:
         """
-        Set WiFi indicator.
+        Set the wifi indicator via SystemUI demo mode.
 
         Args:
-            enabled: Show WiFi enabled
-            level: Signal level (0-4)
+            enabled: Show the wifi icon
+            level: Signal bars (0-4)
 
         Returns:
             (success, message) tuple
         """
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
-            "cmd",
-            "statusbar",
-            "wifi-enabled",
-            "true" if enabled else "false",
-        )
+        if not 0 <= level <= 4:
+            return False, "WiFi level must be between 0 and 4"
 
         try:
+            self._enter_demo_mode()
+            cmd = self._demo_broadcast(
+                "-e",
+                "command",
+                "network",
+                "-e",
+                "wifi",
+                "show" if enabled else "hide",
+                "-e",
+                "level",
+                str(level),
+            )
             subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            if enabled and 0 <= level <= 4:
-                cmd2 = build_adb_command(
-                    "shell", self.serial, "cmd", "statusbar", "wifi-level", str(level)
-                )
-                subprocess.run(cmd2, capture_output=True, text=True, check=True)
-
-            return True, f"WiFi {'enabled' if enabled else 'disabled'} (level: {level})"
-
+            state = f"shown at level {level}" if enabled else "hidden"
+            return True, f"WiFi {state}"
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to set WiFi: {error_msg}"
+            return False, f"Failed to set wifi: {error_msg}"
 
-    def set_mobile_data(
-        self, enabled: bool = True, level: int = 4, data_type: str = "lte"
-    ) -> tuple:
+    def set_mobile_data(self, enabled: bool = True, level: int = 4, datatype: str = "lte") -> tuple:
         """
-        Set mobile data indicator.
+        Set the mobile-data indicator via SystemUI demo mode.
 
         Args:
-            enabled: Show mobile data enabled
-            level: Signal level (0-4)
-            data_type: Data type (lte, 3g, 4g, 5g)
+            enabled: Show the mobile icon
+            level: Signal bars (0-4)
+            datatype: Network type shown (lte, 4g, 3g, e, g, hspa, ...)
 
         Returns:
             (success, message) tuple
         """
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
-            "cmd",
-            "statusbar",
-            "mobile-enabled",
-            "true" if enabled else "false",
-        )
+        if not 0 <= level <= 4:
+            return False, "Mobile level must be between 0 and 4"
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            if enabled:
-                # Set signal level
-                cmd2 = build_adb_command(
-                    "shell", self.serial, "cmd", "statusbar", "mobile-level", str(level)
-                )
-                subprocess.run(cmd2, capture_output=True, text=True, check=True)
-
-                # Set data type
-                cmd3 = build_adb_command(
-                    "shell", self.serial, "cmd", "statusbar", "mobile-datatype", data_type
-                )
-                subprocess.run(cmd3, capture_output=True, text=True, check=True)
-
-            return (
-                True,
-                f"Mobile data {'enabled' if enabled else 'disabled'} ({data_type}, level: {level})",
+            self._enter_demo_mode()
+            cmd = self._demo_broadcast(
+                "-e",
+                "command",
+                "network",
+                "-e",
+                "mobile",
+                "show" if enabled else "hide",
+                "-e",
+                "level",
+                str(level),
+                "-e",
+                "datatype",
+                datatype,
             )
-
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            state = f"shown at level {level} ({datatype})" if enabled else "hidden"
+            return True, f"Mobile data {state}"
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to set mobile data: {error_msg}"

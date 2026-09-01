@@ -1,6 +1,6 @@
 ---
 name: android-emulator-skill
-version: 0.4.0
+version: 0.5.0
 description: Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output. Android equivalent of ios-simulator-skill.
 ---
 
@@ -8,32 +8,45 @@ description: Production-ready scripts for Android app testing, building, and aut
 
 Build, test, and automate Android applications using accessibility-driven navigation and structured data instead of pixel coordinates.
 
+## Invoking these scripts
+
+Scripts live in `scripts/`, beside this file. **Use a path rooted at the skill
+directory, not a bare relative path** — when the skill is installed as a plugin
+and you are working in a project, `python scripts/foo.py` is a file-not-found.
+
+```bash
+SKILL_DIR=/path/to/skills/android-emulator-skill
+python3 "$SKILL_DIR/scripts/screen_mapper.py" --json
+```
+
+The examples below are written with `$SKILL_DIR` set that way.
+
 ## Quick Start
 
 ```bash
 # 1. Launch app
-python scripts/app_launcher.py --launch com.example.app
+python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app
 
 # 2. Map screen to see elements
-python scripts/screen_mapper.py
+python3 "$SKILL_DIR/scripts/screen_mapper.py"
 
 # 3. Tap button
-python scripts/navigator.py --find-text "Login" --tap
+python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Login" --tap
 
 # 4. Enter text
-python scripts/navigator.py --find-type EditText --enter-text "user@example.com"
+python3 "$SKILL_DIR/scripts/navigator.py" --find-type EditText --enter-text "user@example.com"
 
 # 5. Run accessibility audit
-python scripts/accessibility_audit.py
+python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 ```
 
 All scripts support `--help` for detailed options and `--json` for machine-readable output.
 
-## Scripts (v0.4.0)
+## Scripts (v0.5.0)
 
 ### Implemented (29 scripts)
 
-#### Core Utilities (3 modules)
+#### Core Utilities (6 modules)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
@@ -131,7 +144,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Pixel-perfect comparison
     - Highlight differences
     - Generate diff images
-    - Options: `--image1`, `--image2`, `--output`, `--threshold`, `--json`
+    - Usage: `visual_diff.py BASELINE CURRENT [--output DIR] [--threshold N] [--details]`
+    - Note: the two images are **positional**; there is no `--json` (use `--details`)
 
 18. **test_recorder.py** ⭐ NEW - Automatically document test execution
     - Record test steps with screenshots
@@ -164,13 +178,19 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Set WiFi/mobile signal strength
     - Set time display (for consistent screenshots)
     - Demo mode support
-    - Options: `--battery`, `--charging`, `--wifi`, `--mobile`, `--time`, `--reset`, `--serial`, `--json`
+    - Options: `--preset`, `--battery`, `--charging`, `--wifi`, `--mobile`, `--time`, `--reset`, `--serial`, `--json`
+    - All of these drive SystemUI **demo mode**, which changes what the status
+      bar *draws*. It does not change what the app reads from the system
+      (`BatteryManager` still reports the real level).
 
 23. **push_notification.py** ⭐ NEW - Push notification simulation
     - Send test notifications
     - List notification channels
     - Multiple delivery methods
-    - Options: `--package`, `--title`, `--message`, `--id`, `--data`, `--list-channels`, `--method`, `--serial`, `--json`
+    - Options: `--package`, `--title`, `--message`, `--id`, `--data`, `--method`, `--serial`, `--json`
+    - ⚠️ Being reworked. It cannot deliver into an app's own FCM handler --
+      no adb path reaches that -- and `--list-channels` never worked, because
+      `cmd notification` has no `list channels` subcommand.
 
 #### Discovery & Device State (6 scripts) ⭐ NEW
 
@@ -246,18 +266,18 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 ### Manual Testing Flow
 ```bash
 # 1. Launch app
-python scripts/app_launcher.py --launch com.example.app
+python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app
 
 # 2. See what's on screen
-python scripts/screen_mapper.py
+python3 "$SKILL_DIR/scripts/screen_mapper.py"
 
 # 3. Interact
-python scripts/navigator.py --find-text "Login" --tap
-python scripts/navigator.py --find-type EditText --index 0 --enter-text "user@test.com"
-python scripts/keyboard.py --button enter
+python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Login" --tap
+python3 "$SKILL_DIR/scripts/navigator.py" --find-type EditText --index 0 --enter-text "user@test.com"
+python3 "$SKILL_DIR/scripts/keyboard.py" --button enter
 
 # 4. Verify
-python scripts/screen_mapper.py
+python3 "$SKILL_DIR/scripts/screen_mapper.py"
 ```
 
 ### Automated Testing Flow
@@ -277,39 +297,39 @@ recorder.finish(passed=True)
 ### CI/CD Flow
 ```bash
 # 1. Create fresh emulator
-python scripts/emulator_create.py --device pixel_7 --api 34 --name test-device
+python3 "$SKILL_DIR/scripts/emulator_create.py" --device pixel_7 --api 34 --name test-device
 
 # 2. Boot emulator
-python scripts/emulator_boot.py --avd test-device --wait-ready
+python3 "$SKILL_DIR/scripts/emulator_boot.py" --avd test-device --wait-ready
 
 # 3. Build and test
-python scripts/build_and_test.py --project . --test
+python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --test
 
 # 4. Run UI tests
 # ... your test scripts ...
 
 # 5. Cleanup
-python scripts/emulator_shutdown.py --serial emulator-5554
-python scripts/emulator_delete.py --name test-device
+python3 "$SKILL_DIR/scripts/emulator_shutdown.py" --serial emulator-5554
+python3 "$SKILL_DIR/scripts/emulator_delete.py" --name test-device
 ```
 
 ### Debugging Flow
 ```bash
 # 1. Capture complete state
-python scripts/app_state_capture.py --package com.myapp --output debug-snapshots/
+python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --output debug-snapshots/
 
 # 2. Monitor logs in real-time
-python scripts/log_monitor.py --app com.myapp --severity error,warning --follow
+python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --severity error,warning --follow
 
 # 3. Check accessibility issues
-python scripts/accessibility_audit.py --output audit-reports/ --verbose
+python3 "$SKILL_DIR/scripts/accessibility_audit.py" --output audit-reports/ --verbose
 ```
 
 ## Requirements
 
 - macOS, Linux, or Windows
 - Android SDK with platform-tools and emulator
-- Python 3.8+
+- Python 3.12+
 - ADB (Android Debug Bridge)
 - Optional: Gradle for building
 - Optional: Pillow for screenshot resizing
@@ -344,19 +364,24 @@ git clone <repository-url> .claude/skills/android-emulator-skill
 
 ## Documentation
 
-- **SKILL.md** (this file) - Script reference and quick start
-- **README.md** - Installation and examples
-- **CLAUDE.md** - Architecture and implementation details
-- **STATUS.md** - Project status and roadmap
-- **TESTING.md** - Testing guide
-- **references/** - Deep documentation on specific topics
-- **examples/** - Complete automation workflows
+- **SKILL.md** (this file) - the script reference; the accurate inventory
+- **README.md** - short orientation for humans
+- **examples/** - complete automation workflows (ships with the package)
+
+In the source repository only:
+
+- **CLAUDE.md** - architecture, conventions, and the recorded-fixture policy
+- **references/** - deep dives on adb, test patterns, accessibility
+  (not included in the released package)
 
 ## Key Design Principles
 
 **Semantic Navigation**: Find elements by meaning (text, type, ID) not pixel coordinates. Survives UI changes.
 
-**Token Efficiency**: Concise default output (3-5 lines) with optional verbose and JSON modes for detailed results. 96% reduction vs raw tools.
+**Token Efficiency**: Concise default output (3-5 lines), with `--verbose` for
+human detail and `--json` for machine-readable output. The reduction versus
+piping raw tool output is large but has not been measured; a budget table is
+planned rather than an invented percentage.
 
 **Accessibility-First**: Built on standard accessibility APIs for reliability and compatibility.
 
@@ -386,21 +411,40 @@ git clone <repository-url> .claude/skills/android-emulator-skill
 
 ## Status & Roadmap
 
-This skill is **actively being modernized** to track the upstream
-[`ios-simulator-skill`](https://github.com/conorluddy/ios-simulator-skill), which has since grown well beyond
-this mirror. Treat the script list above as the **currently implemented baseline**, not a finished product.
+**Under active repair, not feature work.** An audit found that several scripts
+were written against *assumed* tool output — and their tests were written
+against the same assumption, so the suite stayed green while the script did
+nothing. Some called Android commands that do not exist.
 
-**Implemented today:** app lifecycle, emulator lifecycle (create/boot/shutdown/erase/delete), semantic
-navigation, gestures, keyboard, Gradle build/test, logcat monitoring, accessibility audit, visual diff, test
-recording, state capture, permissions, clipboard, status bar, push notifications, environment health check,
-device/AVD discovery + selector, localization audit (`res/values` strings), appearance (dark mode / font
-scale), location (`adb emu geo fix` + GPX route replay), a Gradle build subpackage with progressive disclosure,
-a debuggable-app container inspector, a Room/SQLite persistence inspector, and an ANR/jank watcher.
+The correction is fixture-driven: `tests/fixtures/recorded/` holds verbatim
+output captured from real devices, parser tests consume it, and known defects
+are pinned with `xfail(strict=True)` so fixing one forces the marker's removal.
+See `CLAUDE.md` in the source repository.
 
-**Parity status:** the targeted iOS v1.5 feature set has been ported to Android-native equivalents. iOS-only
-mechanics (os_log hang predicates, HangBuster raw-capture/symbolication, xcresult specifics) are intentionally
-not mirrored; some controls are rescoped to Android realities (appearance locale is best-effort, container
-inspection is debuggable-apps-only, location is emulator-first).
+**Fixed so far:** Gradle failures now report a diagnostic instead of
+"0 errors"; errored tests no longer count as a pass; `log_monitor` parses
+device output at all and `--duration` terminates; `anr_watcher --all` no longer
+returns 3 clusters and delete the rest from disk; the focused-activity lookup
+works; cache ids can no longer address files outside the cache directory;
+selector history no longer writes into the installed package; arguments
+crossing into the device shell are quoted.
+
+**Known-broken, being worked:**
+
+- `push_notification.py` — cannot deliver into an app's own FCM handler; being
+  rescoped to posting a system notification and *verifying* what the app posted.
+- `test_recorder.py` — the CLI currently records nothing; being rebuilt.
+- `clipboard.py` — the surviving code path is blocked on Android 10+; needs
+  `cmd clipboard`.
+- `accessibility_audit.py` — touch-target sizes are compared in pixels against a
+  dp constant, so the check under-reports; the advertised contrast check is not
+  implemented.
+- Display overrides (`wm size` / `wm density`) are ignored, so coordinates are
+  wrong while an override is active.
+- `screen_mapper` enumerates by class name and so reports almost nothing on a
+  Jetpack Compose screen. `navigator --find-text` still works there.
+- AVD management needs `cmdline-tools`; the legacy `tools/bin` copies cannot run
+  on Java 11+.
 
 ## Contributing
 

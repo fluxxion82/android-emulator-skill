@@ -1,0 +1,158 @@
+"""What the released package actually contains, and what the docs claim.
+
+`release.yml` zips only `android-emulator-skill/`, so anything outside that
+directory — the repo README, CLAUDE.md, `references/` — does not reach a
+consumer. Docs that point at those from inside the package are broken links for
+everyone who installs it.
+
+The invocation problem was worse: every SKILL.md example read
+`python scripts/foo.py`, which is a file-not-found unless the current directory
+happens to be the skill root. An agent working in a user's project got an error
+on the first command. Verified by extracting the release zip and running from a
+separate directory.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_ROOT = REPO_ROOT / "android-emulator-skill"
+SKILL_ROOT = PACKAGE_ROOT / "skills" / "android-emulator-skill"
+SKILL_MD = SKILL_ROOT / "SKILL.md"
+
+
+# ---------------------------------------------------------------------------
+# Invocation.
+# ---------------------------------------------------------------------------
+
+
+def _code_block_lines(markdown: str) -> list[str]:
+    """Lines inside fenced code blocks — the parts a reader will actually run.
+
+    Prose that *describes* the wrong invocation (including the sentence
+    explaining this very rule) is not a defect, and a whole-file scan cannot
+    tell the two apart.
+    """
+    lines, inside = [], False
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            lines.append(line)
+    return lines
+
+
+def test_no_bare_relative_script_invocations_in_skill_md():
+    """`python scripts/foo.py` only works if cwd is the skill root."""
+    offenders = [
+        line.strip()
+        for line in _code_block_lines(SKILL_MD.read_text(encoding="utf-8"))
+        if re.search(r"python3?\s+scripts/", line)
+    ]
+    assert not offenders, (
+        "SKILL.md documents bare relative invocations, which fail for an "
+        f"installed plugin: {offenders[:5]}"
+    )
+
+
+def test_skill_md_shows_how_to_root_the_path():
+    """An agent needs to be told what the path is relative to."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    assert "SKILL_DIR" in text, "no guidance on rooting script paths"
+
+
+# ---------------------------------------------------------------------------
+# Docs must only point at things the consumer receives.
+# ---------------------------------------------------------------------------
+
+
+def test_skill_md_does_not_link_nonexistent_docs():
+    """STATUS.md and TESTING.md have never existed in this repo."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    for missing in ("STATUS.md", "TESTING.md"):
+        assert missing not in text, f"SKILL.md still references {missing}, which does not exist"
+
+
+def test_package_contains_what_the_docs_promise():
+    """`examples/` is promised and ships; `references/` does not ship."""
+    assert (SKILL_ROOT / "examples").is_dir(), "examples/ is documented but missing"
+    assert not (
+        SKILL_ROOT / "references"
+    ).exists(), "references/ now ships; SKILL.md says it is repo-only and should be updated"
+
+
+def test_shipped_readme_is_not_stale():
+    """The inner README is the consumer's first impression.
+
+    It sat at "Initial Development (v0.1.0)" with a Planned Scripts list of
+    twelve scripts that all existed.
+    """
+    text = (SKILL_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "v0.1.0" not in text
+    assert "Planned Scripts" not in text
+    assert "Python 3.8" not in text
+
+
+# ---------------------------------------------------------------------------
+# Version, in one place per manifest and all agreeing.
+# ---------------------------------------------------------------------------
+
+
+def _skill_md_version() -> str:
+    match = re.search(r"^version:\s*(\S+)", SKILL_MD.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match, "SKILL.md frontmatter has no version"
+    return match.group(1)
+
+
+def _pyproject_version() -> str:
+    match = re.search(
+        r'^version\s*=\s*"([^"]+)"',
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match, "pyproject.toml has no version"
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    ("label", "getter"),
+    [
+        (
+            "plugin.json",
+            lambda: json.loads(
+                (PACKAGE_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+            ).get("version"),
+        ),
+        (
+            "marketplace.json",
+            lambda: json.loads(
+                (REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+            )["plugins"][0].get("version"),
+        ),
+        ("SKILL.md", _skill_md_version),
+    ],
+)
+def test_every_manifest_declares_the_same_version_as_pyproject(label, getter):
+    """Both plugin manifests previously had no version at all, so CI could not
+    detect drift -- it only checked pyproject.toml and *warned* on SKILL.md."""
+    declared = getter()
+    assert declared, f"{label} declares no version"
+    assert (
+        declared == _pyproject_version()
+    ), f"{label} says {declared}, pyproject.toml says {_pyproject_version()}"
+
+
+def test_release_validation_fails_rather_than_warns():
+    """A check that only warns cannot keep versions in step."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "validate-version.yml").read_text(
+        encoding="utf-8"
+    )
+    for manifest in ("plugin.json", "marketplace.json", "SKILL.md"):
+        assert manifest in workflow, f"release validation does not check {manifest}"
+    assert workflow.count("exit 1") >= 4, "version drift should fail the release, not warn"
