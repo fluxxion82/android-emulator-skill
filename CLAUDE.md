@@ -92,7 +92,16 @@ Therefore:
    by default. Run them with `pytest -m emulator`. They assert *semantic floors*
    ("did the agent get a usable answer"), not command shapes.
 
-Run the suite with `uvx --python 3.12 --with pytest --with pillow pytest tests/`.
+Run the suite with:
+
+```bash
+uvx --python 3.12 --with pytest --with pillow --with pyyaml pytest tests/
+```
+
+`pyyaml` is required, not optional: the guards in `tests/test_packaging_contract.py`
+parse `.github/workflows/` to assert a release cannot be cut without running the
+tests. They deliberately do not `importorskip`, because a guard that skips when a
+dependency is missing protects nothing.
 
 ## Quality standards
 

@@ -107,6 +107,82 @@ def test_skill_md_lists_every_script_and_counts_them_correctly():
     ), f"SKILL.md claims {claimed_common.group(1)} common modules; {len(common)} exist"
 
 
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+
+
+def _yaml(name: str):
+    """Parse a workflow.
+
+    Deliberately NOT `pytest.importorskip("yaml")`: these guards protect the
+    release gate, and a guard that skips when a dependency is missing is worth
+    nothing. CI installs pyyaml precisely so these run.
+    """
+    import yaml
+
+    return yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+
+
+def test_a_release_cannot_be_cut_without_running_the_tests():
+    """The release used to run zero tests.
+
+    It checked that three files existed, zipped, and uploaded. So the checks
+    that decide whether this skill works were not on the path that ships --
+    the same process shape that once let three advertised capabilities ship
+    completely inert behind 470 passing tests. Guarding it here because the
+    gate is one `needs:` line away from being deleted by someone in a hurry.
+    """
+    release = _yaml("release.yml")
+
+    package = release["jobs"]["package"]
+    needs = package.get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
+
+    assert "verify" in needs, "packaging no longer requires lint and unit tests"
+    assert "emulator" in needs, "packaging no longer requires the device-backed lane"
+
+
+def test_the_release_gate_actually_runs_the_suites_it_claims_to():
+    """`needs:` on a job that tests nothing would satisfy the test above."""
+    release = _yaml("release.yml")
+
+    steps = release["jobs"]["verify"]["steps"]
+    commands = " ".join(step.get("run", "") for step in steps)
+    assert "pytest" in commands, "the verify job does not run pytest"
+    assert "ruff" in commands and "black" in commands, "the verify job does not lint"
+
+    assert release["jobs"]["emulator"]["uses"].endswith(
+        "emulator.yml"
+    ), "the emulator gate no longer calls the emulator workflow"
+
+
+def test_the_emulator_workflow_is_callable_as_a_gate():
+    """Without `workflow_call` the release cannot require it."""
+    emulator = _yaml("emulator.yml")
+
+    # PyYAML parses a bare `on:` key as the boolean True.
+    triggers = emulator.get("on", emulator.get(True))
+    assert triggers is not None, "emulator.yml has no triggers"
+    assert "workflow_call" in triggers, "emulator.yml cannot be required by release.yml"
+
+
+def test_the_emulator_lane_fails_when_every_test_skips():
+    """A lane where everything skipped is not a lane that passed.
+
+    Every emulator test skips politely when no device or fixture app is
+    present -- correct on a laptop, useless as a gate. The script must notice.
+    """
+    script = (REPO_ROOT / ".github" / "scripts" / "run-emulator-lane.sh").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "passed" in script and "exit 1" in script
+    ), "the lane script no longer fails when no test actually ran"
+    assert "pm list packages" in script, (
+        "the lane no longer asserts the fixture app installed; the end-to-end "
+        "agent test would skip and the gate would pass having tested nothing"
+    )
+
+
 def test_skill_md_does_not_link_nonexistent_docs():
     """STATUS.md and TESTING.md have never existed in this repo."""
     text = SKILL_MD.read_text(encoding="utf-8")

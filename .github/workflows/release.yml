@@ -8,9 +8,50 @@ permissions:
   contents: write
 
 jobs:
+  # A release used to run ZERO tests: it checked that three files existed,
+  # zipped, and uploaded. The checks that decide whether this skill works were
+  # not on the path that ships -- which is the same process shape that once let
+  # three advertised capabilities ship completely inert behind 470 passing
+  # tests. Both jobs below are required before anything is packaged.
+  verify:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pillow pyyaml 'black==26.5.1' 'ruff==0.15.14'
+
+      - name: Ruff
+        run: ruff check android-emulator-skill/skills/android-emulator-skill/scripts/ tests/
+
+      - name: Black
+        run: black --check --diff android-emulator-skill/skills/android-emulator-skill/scripts/ tests/
+
+      - name: Unit tests
+        run: pytest tests/ -q
+
+  # The device-backed lane. A fixture freezes one moment of output; it cannot
+  # catch asynchrony, blocking, concurrency, or a gesture whose direction is
+  # backwards. Those have to be run against a real device or they are not
+  # tested at all.
+  emulator:
+    name: Emulator lane
+    uses: ./.github/workflows/emulator.yml
+
   package:
     name: Package skill and upload to release
     runs-on: ubuntu-latest
+    needs: [verify, emulator]
 
     steps:
       - name: Checkout repository

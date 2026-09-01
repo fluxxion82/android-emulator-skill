@@ -1,0 +1,100 @@
+name: Emulator Lane
+
+# The tests that need a real device.
+#
+# Why this exists: `test.yml` runs the mocked suite, which cannot catch
+# asynchrony, blocking, concurrency, device-state dependence, or a gesture whose
+# direction is backwards. Every one of those has shipped from this repo with a
+# green suite. Two defects in a single review round -- a scroll that moved the
+# list the wrong way, and screenshots colliding on a fixed path -- were found by
+# *running the tool*, not by the suite.
+#
+# Until this workflow existed, `pytest -m emulator` ran only on one developer's
+# laptop, when they remembered, against whatever device happened to be booted.
+# That is the same process shape that once let three advertised capabilities
+# ship completely inert behind 470 passing tests: the checks that matter were
+# not on the path that ships.
+#
+# `workflow_call` is what makes it a gate -- `release.yml` requires this job, so
+# a release cannot be cut without it passing.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    # Nightly. A fixture corpus does not decay visibly: it stays green while the
+    # platform moves underneath it, so something has to actually talk to a
+    # device on a schedule rather than only when someone is watching.
+    - cron: '0 6 * * *'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**'
+      - 'tests/**'
+      - '.github/workflows/emulator.yml'
+
+jobs:
+  emulator:
+    name: pytest -m emulator (real AVD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pillow pyyaml
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle
+        # The Compose fixture app has no Gradle wrapper (only its sources are
+        # committed), so Gradle is provisioned here rather than assumed present.
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Enable KVM
+        # Without this the emulator falls back to software rendering and the
+        # lane takes long enough to hit the job timeout.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run the emulator lane
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: .github/scripts/run-emulator-lane.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Emulator lane"
+            echo ""
+            echo "Ran \`pytest -m emulator\` against a real API 35 AVD."
+            echo ""
+            echo "These are the tests that a mocked suite structurally cannot replace:"
+            echo "they assert an agent got a usable answer from a device, not that a"
+            echo "command was shaped a certain way."
+          } >> "$GITHUB_STEP_SUMMARY"
