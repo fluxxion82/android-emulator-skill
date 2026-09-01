@@ -176,10 +176,20 @@ class GestureSimulator:
         duration_ms: int = 300,
     ) -> tuple:
         """
-        Perform multiple swipes for scrolling.
+        Scroll the content, by swiping in the opposite direction.
+
+        ``swipe`` names what the *finger* does; ``scroll`` names what the
+        *content* does. They are opposites, and this method used to pass its
+        direction straight through -- so ``scroll("down")`` swiped down, which
+        drags a list back toward its top. Measured on a real Settings screen:
+        ``--scroll down`` did not move it at all, and still reported
+        ``Scrolled: down (1 swipes)`` and exited 0. An agent then got
+        ``Not found`` from ``navigator --find-text``, which reads as "the item
+        does not exist" rather than "it is below the fold".
 
         Args:
-            direction: 'up' or 'down'
+            direction: 'up' or 'down' -- the direction the *content* moves.
+                'down' reveals what is further down the list.
             count: Number of swipes
             duration_ms: Duration per swipe
 
@@ -189,8 +199,12 @@ class GestureSimulator:
         if direction not in ["up", "down"]:
             return False, "Scroll direction must be 'up' or 'down'"
 
+        # Scrolling down reveals content below, which means dragging the
+        # content upward: the finger travels up.
+        finger = "up" if direction == "down" else "down"
+
         for i in range(count):
-            success, message = self.swipe(direction, duration_ms=duration_ms)
+            success, message = self.swipe(finger, duration_ms=duration_ms)
             if not success:
                 return False, f"Scroll failed on swipe {i+1}: {message}"
             # Small delay between swipes

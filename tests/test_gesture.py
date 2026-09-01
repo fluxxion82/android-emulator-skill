@@ -156,3 +156,85 @@ def test_main_reports_multiple_devices_without_a_traceback(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert err.startswith("Error: ")
     assert "--serial" in err, "the error does not say what to do next"
+
+
+# ---------------------------------------------------------------------------
+# `--scroll` moved the list the wrong way.
+# ---------------------------------------------------------------------------
+
+
+def _swipe_ys(calls: list[list[str]]) -> tuple[int, int]:
+    """(start_y, end_y) of the last `input swipe` command."""
+    swipe = next(c for c in reversed(calls) if "swipe" in c)
+    coords = swipe[swipe.index("swipe") + 1 :]
+    return int(coords[1]), int(coords[3])
+
+
+def test_scroll_down_reveals_content_below(monkeypatch):
+    """Measured on a real Settings screen: `--scroll down` did not move it.
+
+    `scroll()` passed its direction straight to `swipe()`, but the two use
+    opposite conventions -- `swipe("down")` means "the finger travels down",
+    which drags the list *up* toward its start. So `--scroll down` scrolled
+    the list up, and on a screen already at the top it did nothing at all
+    while reporting `Scrolled: down (1 swipes)` and exiting 0.
+
+    That is the inert-capability shape this whole effort exists to remove: an
+    agent asked to scroll down to find an item gets success, no movement, and
+    then a "Not found" from `navigator --find-text` -- which reads as "the item
+    does not exist" rather than "it is below the fold".
+
+    Scrolling down means revealing what is below, so the finger must travel
+    up: start_y > end_y.
+    """
+    sim, calls = _make_simulator(monkeypatch, 1080, 2400)
+
+    success, _ = sim.scroll("down")
+
+    assert success
+    start_y, end_y = _swipe_ys(calls)
+    assert start_y > end_y, (
+        f"scroll('down') swiped from y={start_y} to y={end_y}, which drags the "
+        f"list back toward its top; it must reveal content below"
+    )
+
+
+def test_scroll_up_reveals_content_above(monkeypatch):
+    """The mirror image, so the fix cannot be an inversion of the same bug."""
+    sim, calls = _make_simulator(monkeypatch, 1080, 2400)
+
+    sim.scroll("up")
+
+    start_y, end_y = _swipe_ys(calls)
+    assert start_y < end_y, (
+        f"scroll('up') swiped from y={start_y} to y={end_y}; it must reveal " f"content above"
+    )
+
+
+def test_scroll_and_swipe_stay_opposite(monkeypatch):
+    """Pins the convention rather than the numbers.
+
+    `swipe` names what the finger does; `scroll` names what the content does.
+    They are opposites, and collapsing them is what caused the defect.
+    """
+    sim, scroll_calls = _make_simulator(monkeypatch, 1080, 2400)
+    sim.scroll("down")
+    scroll_start, scroll_end = _swipe_ys(scroll_calls)
+
+    sim2, swipe_calls = _make_simulator(monkeypatch, 1080, 2400)
+    sim2.swipe("down")
+    swipe_start, swipe_end = _swipe_ys(swipe_calls)
+
+    assert (scroll_start > scroll_end) is not (swipe_start > swipe_end), (
+        "scroll('down') and swipe('down') moved the finger the same way; "
+        "one names the content's direction, the other the finger's"
+    )
+
+
+def test_every_scroll_swipe_is_issued(monkeypatch):
+    """`--count 3` must produce three swipes, not one and a cheerful message."""
+    sim, calls = _make_simulator(monkeypatch, 1080, 2400)
+
+    sim.scroll("down", count=3)
+
+    assert sum(1 for c in calls if "swipe" in c) == 3
