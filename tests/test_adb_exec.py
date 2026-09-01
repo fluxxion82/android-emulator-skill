@@ -12,9 +12,18 @@ Two problems this replaces, measured with AST across the skill:
    "pass --serial emulator-5554" does. Every error raised here must name a
    remedy, and that is asserted below rather than left to good intentions.
 
-Error strings are matched against recorded adb output where a fixture exists —
-`adb_device_not_found.txt` proves the prefix is `error:` and not `adb:`, which
-is the kind of detail that gets hardcoded wrong.
+Error strings are matched against recorded adb output where a fixture exists,
+and the two profiles disagree about the prefix: `adb_shell_device_not_found`
+(emulator-api35) is `adb: device '...' not found`, while
+`adb_device_not_found` (pixel4xl-api33) is `error: ...`. The matcher is
+therefore prefix-AGNOSTIC, and anchoring it on either would silently stop
+classifying the other profile's failure.
+
+This docstring used to claim the fixture "proves the prefix is `error:` and not
+`adb:`". It proves no such thing — the other profile shows the opposite. Which
+is the point: prose asserting a precision the code does not have is the same
+failure this suite exists to catch, just moved from the assertion into the
+comment above it.
 """
 
 from __future__ import annotations
@@ -140,7 +149,12 @@ def test_multiple_devices_is_typed_and_names_the_remedy(fake_run):
 
 
 def test_device_not_found_is_typed_and_names_the_remedy(fake_run, recorded_anywhere):
-    """Matched against real adb output: the prefix is 'error:', not 'adb:'.
+    """Matched against real adb output, without depending on the prefix.
+
+    This fixture happens to carry `error:`; the emulator profile's
+    `adb_shell_device_not_found` carries `adb:` for the same condition. The
+    assertion below does not care, and must not: see
+    `test_the_not_found_match_is_prefix_agnostic`, which runs both.
 
     This is host adb-client output, identical whatever device is attached,
     so it is looked up in whichever profile happens to hold it.
