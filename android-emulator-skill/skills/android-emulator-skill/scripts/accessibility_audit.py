@@ -3,8 +3,13 @@
 Android Accessibility Audit
 
 Audit app screens for accessibility issues and compliance.
-Checks for common accessibility problems like missing content descriptions,
-low contrast, small touch targets, etc.
+Checks missing content descriptions, unlabelled fields, disabled-but-clickable
+controls, and touch targets below 48dp (measured against the device's real
+density, not in raw pixels).
+
+Contrast is deliberately not claimed: it needs pixel sampling from a
+screenshot, which this script does not do. It was listed here before it was
+written, which is worse than not offering it.
 
 Usage Examples:
     # Audit current screen

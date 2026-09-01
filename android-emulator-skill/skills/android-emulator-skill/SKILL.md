@@ -394,6 +394,36 @@ That needs a gRPC client and the emulator's auth token, and is not wired up here
 called `service call clipboard 1` with the pre-Android-10 signature and always
 failed.
 
+**Jetpack Compose screens look different in the dump.** Everything below was
+measured from recorded dumps of a real Compose app, not assumed — three
+plausible-sounding assumptions about Compose turned out to be wrong.
+
+- **The host class is `androidx.compose.ui.platform.ComposeView`.**
+  `AndroidComposeView` does not appear in the dump at all, so a detector
+  looking for it matches nothing.
+- **There are no resource-ids.** A default Compose screen exposes only
+  `android:id/content`, which belongs to the AOSP FrameLayout. `--find-id` has
+  nothing to work with; use `--find-text` or `screen_mapper`.
+- **Interactive nodes carry no label of their own.** Every clickable and
+  checkable node has `text=""` and `content-desc=""`. uiautomator dumps the
+  *unmerged* semantics tree, so a clickable `Card` keeps its Texts as separate
+  children rather than merging them into one label — there is no concatenation
+  anywhere. `screen_mapper` recovers labels from a control's descendants
+  (Button, Card, list row) and from row-adjacent siblings (Checkbox, Switch,
+  icon), which is why it can name a control that the dump leaves anonymous.
+
+**To make your own Compose app addressable**, opt into test tags as resource-ids
+on the root of the tree:
+
+```kotlin
+Modifier.semantics { testTagsAsResourceId = true }   // once, at the root
+Modifier.testTag("submit_button")                    // on each control
+```
+
+The tag then surfaces as a **bare** `resource-id` — `submit_button`, *not*
+`com.example.app:id/submit_button`. Anything that splits a resource-id on
+`":id/"` to recover a name drops every Compose tag on the screen.
+
 ## Key Design Principles
 
 **Semantic Navigation**: Find elements by meaning (text, type, ID) not pixel coordinates. Survives UI changes.
@@ -447,24 +477,27 @@ device output at all and `--duration` terminates; `anr_watcher --all` no longer
 returns 3 clusters and delete the rest from disk; the focused-activity lookup
 works; cache ids can no longer address files outside the cache directory;
 selector history no longer writes into the installed package; arguments
-crossing into the device shell are quoted.
+crossing into the device shell are quoted; `screen_mapper` sees Jetpack Compose
+screens; touch targets are measured in dp against the device's real density;
+display overrides (`wm size` / `wm density`) are honoured, so coordinates are
+right while one is active; every script reads the screen through one
+implementation that writes no temp files, so concurrent runs and multi-device
+runs can no longer read each other's screen.
 
 **Known-broken, being worked:**
 
 - `push_notification.py` — cannot deliver into an app's own FCM handler; being
   rescoped to posting a system notification and *verifying* what the app posted.
 - `test_recorder.py` — the CLI currently records nothing; being rebuilt.
-- `clipboard.py` — the surviving code path is blocked on Android 10+; needs
-  `cmd clipboard`.
-- `accessibility_audit.py` — touch-target sizes are compared in pixels against a
-  dp constant, so the check under-reports; the advertised contrast check is not
-  implemented.
-- Display overrides (`wm size` / `wm density`) are ignored, so coordinates are
-  wrong while an override is active.
-- `screen_mapper` enumerates by class name and so reports almost nothing on a
-  Jetpack Compose screen. `navigator --find-text` still works there.
+- `accessibility_audit.py` — no contrast check, despite the script's own
+  description mentioning one. Contrast needs pixel sampling from a screenshot,
+  which is not implemented.
 - AVD management needs `cmdline-tools`; the legacy `tools/bin` copies cannot run
-  on Java 11+.
+  on Java 11+ (they use JAXB, removed in Java 11).
+
+Removed rather than repaired: `clipboard.py` — see "Platform limitations"
+above; writing the clipboard is not reachable from adb on any modern Android,
+so the script could not be made to do what it advertised.
 
 ## Contributing
 
