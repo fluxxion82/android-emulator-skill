@@ -1,0 +1,6 @@
+total 52
+drwx------   5 u0_a205 u0_a205        4096 2026-08-31 21:44 .
+drwxrwx--x 249 system  system        16384 2026-08-31 21:43 ..
+drwxrws--x   2 u0_a205 u0_a205_cache  4096 2026-08-31 21:43 cache
+drwxrws--x   2 u0_a205 u0_a205_cache  4096 2026-08-31 21:43 code_cache
+drwxrwx--x   2 u0_a205 u0_a205        4096 2026-09-01 09:17 files

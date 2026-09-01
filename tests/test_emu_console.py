@@ -164,14 +164,18 @@ def test_a_table_reply_keeps_every_row(console, recorded):
 
 
 def test_a_physical_device_gets_an_answer_that_names_the_reason(console):
-    """adb's own wording does not say 'this device has no console'.
+    """adb says NOTHING on a phone, so the wording cannot be matched.
 
-    NOTE: the trigger string here is NOT measured -- no physical device was
-    attached when this was written. The mapping matches both plausible adb
-    strings; until a fixture is recorded from a real phone, this test proves
-    only that the mapping works when it fires, not that it fires.
+    Measured on a Pixel 4 XL (API 35) after this branch first shipped guessing
+    at two plausible error strings, both wrong -- the remedy was dead code:
+
+        $ adb -s <phone> emu avd name  ->  exit 1, stdout empty, stderr empty
+
+    So the discriminator is the shape of the reply. This is deliberately not a
+    recorded fixture: the entire signal is an exit code plus two empty streams,
+    and a fixture stores only output.
     """
-    console("error: no emulator detected\n")
+    console("", returncode=1)
 
     with pytest.raises(EmuConsoleError) as excinfo:
         run_emu("avd", "name", serial="1A2B3C4D")
@@ -181,8 +185,24 @@ def test_a_physical_device_gets_an_answer_that_names_the_reason(console):
     assert "1A2B3C4D" in message
 
 
+def test_an_emulator_answering_zero_with_output_is_never_mistaken_for_a_phone(console):
+    """The other half of the discriminator, measured on emulator-5554.
+
+    An emulator answers 0 with output for EVERY command, including an unknown
+    subcommand. If it did not, a `KO` would be misreported as "this is a
+    physical device" and the user would be sent looking for the wrong problem.
+    """
+    console("KO: unknown command\n", returncode=0)
+
+    with pytest.raises(EmuConsoleError) as excinfo:
+        run_emu("bogus-subcommand", serial="emulator-5554")
+
+    assert "physical device" not in str(excinfo.value)
+    assert "KO: unknown command" in str(excinfo.value)
+
+
 def test_console_available_is_false_rather_than_raising(console):
-    console("error: no emulator detected\n")
+    console("", returncode=1)
     assert console_available(serial="1A2B3C4D") is False
 
 

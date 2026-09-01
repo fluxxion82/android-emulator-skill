@@ -197,21 +197,32 @@ def _completed(cmd, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
-def test_list_dir_builds_run_as_ls(monkeypatch):
+def test_list_dir_builds_run_as_ls(monkeypatch, recorded):
+    """Parses a real `run-as ls -la`, not a tidy one-liner.
+
+    The hand-written sample this replaced was
+    `-rw------- 1 u0_a1 u0_a1 10 2024-01-02 03:04 f.txt` -- single-spaced, no
+    header, owner equal to group. Real output has a `total 52` line, `.` and
+    `..` entries, variable-width padding, and a group that differs from the
+    owner on cache dirs (u0_a205 vs u0_a205_cache). Every one of those is a
+    chance for the parser to be wrong in a way the tidy sample could not show.
+    """
     captured: list[list[str]] = []
+    listing = recorded.text("run_as_ls_data_dir")
 
     def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
-        return _completed(
-            cmd,
-            stdout="-rw------- 1 u0_a1 u0_a1 10 2024-01-02 03:04 f.txt\n",
-        )
+        return _completed(cmd, stdout=listing)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
     ok, result = ContainerInspector(serial="emulator-5554").list_dir("com.example.app")
     assert ok is True
-    assert result["total_entries"] == 1
+
+    # `.`, `..` and the `total` header must not be counted as entries.
+    assert result["total_entries"] == 3, f"miscounted real ls output: {result}"
+    names = {entry["name"] for entry in result["entries"]}
+    assert names == {"cache", "code_cache", "files"}, names
 
     cmd = captured[0]
     # Targets the right device, uses run-as for the right package, lists the data dir.
@@ -241,25 +252,37 @@ def test_list_dir_rejects_path_escape():
     assert "escapes" in result["error"]
 
 
-def test_run_as_denied_release_build(monkeypatch):
+def test_run_as_denied_for_a_non_debuggable_package(monkeypatch, recorded):
+    """The denial that was NOT being detected, in the platform's own words.
+
+    This test used to assert against `run-as: package not debuggable: <pkg>`,
+    a string the platform never prints. The real one is `run-as: package not
+    an application: <pkg>`, and container.py's marker list read "is not an
+    application" -- with an "is" that is not there -- so this denial fell
+    through to a generic "Command failed" and the user never saw the hint
+    telling them the app has to be debuggable.
+
+    Both the invented assertion and the invented marker were wrong in the same
+    direction, which is exactly why the suite stayed green.
+    """
+    denial = recorded.text("run_as_not_an_application")
+
     def fake_run(cmd, *args, **kwargs):
-        return _completed(
-            cmd,
-            returncode=1,
-            stderr="run-as: package not debuggable: com.example.app",
-        )
+        return _completed(cmd, returncode=1, stderr=denial)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
-    ok, result = ContainerInspector().list_dir("com.example.app")
+    ok, result = ContainerInspector().list_dir("com.android.settings")
     assert ok is False
-    assert result["run_as_denied"] is True
+    assert result["run_as_denied"] is True, (
+        f"a real run-as denial was reported as a generic failure: {result}"
+    )
     assert "debuggable" in result["hint"].lower()
 
 
-def test_run_as_denied_unknown_package(monkeypatch):
+def test_run_as_denied_unknown_package(monkeypatch, recorded):
     def fake_run(cmd, *args, **kwargs):
-        return _completed(cmd, returncode=1, stderr="run-as: unknown package: com.nope")
+        return _completed(cmd, returncode=1, stderr=recorded.text("run_as_unknown_package"))
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 

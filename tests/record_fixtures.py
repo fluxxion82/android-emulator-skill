@@ -660,6 +660,41 @@ FIXTURES: list[Fixture] = [
             "never produces."
         ),
     ),
+    # --- run-as: the container/model-inspector ground truth -----------------
+    Fixture(
+        name="run_as_not_an_application",
+        args=["shell", "run-as com.android.settings ls 2>&1"],
+        description=(
+            "run-as refused for a system package. The real wording is "
+            "'run-as: package not an application: <pkg>'. container.py's denial "
+            "markers listed 'is not an application' -- with an 'is' that the "
+            "platform does not print -- so this denial fell through to a "
+            "generic 'Command failed' instead of the hint telling the user the "
+            "app must be debuggable. Written from imagination, wrong in exactly "
+            "the way this corpus exists to catch."
+        ),
+    ),
+    Fixture(
+        name="run_as_unknown_package",
+        args=["shell", "run-as com.nonexistent.app ls 2>&1"],
+        description=(
+            "run-as refused for a package that is not installed: "
+            "'run-as: unknown package: <pkg>'. This one the marker list does "
+            "match, which is why the actionable hint appears here and not for "
+            "run_as_not_an_application -- the contrast is the point."
+        ),
+    ),
+    Fixture(
+        name="run_as_ls_data_dir",
+        args=["shell", "run-as com.example.composefixture ls -la"],
+        description=(
+            "A real `run-as ls -la` of an app's data dir, from the Compose "
+            "fixture app. Note what a hand-written sample gets wrong: a "
+            "'total N' header line, '.' and '..' entries, variable-width column "
+            "padding, and a group that differs from the owner "
+            "(u0_a205 vs u0_a205_cache on cache dirs)."
+        ),
+    ),
     Fixture(
         name="emu_help",
         args=["emu", "help"],

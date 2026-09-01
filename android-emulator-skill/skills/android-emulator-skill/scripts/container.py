@@ -57,7 +57,12 @@ _RUN_AS_DENIED_MARKERS = (
     "unknown package",
     "run-as: package not found",
     "package not found",
-    "is not an application",
+    # Measured, not guessed: the device prints "run-as: package not an
+    # application: <pkg>". This entry used to read "is not an application",
+    # with an "is" the platform never emits, so a system or release package
+    # fell through to a generic "Command failed" instead of the hint below.
+    # Recorded as run_as_not_an_application.
+    "not an application",
     "user is not debuggable",
     "permission denied",
 )

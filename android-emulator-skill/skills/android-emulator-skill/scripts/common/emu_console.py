@@ -132,20 +132,27 @@ def run_emu(
     result = run_adb("emu", serial, *args, timeout=timeout or CONSOLE_TIMEOUT)
     raw = _normalise(result.stdout)
 
-    # UNVERIFIED: unlike everything else in this module, the exact wording adb
-    # uses here has NOT been measured -- no physical device was attached when
-    # this was written, and guessing tool output is the mistake this whole
-    # effort exists to correct. Both plausible strings are matched so the
-    # remedy is not silently dead, but until a fixture is recorded from a real
-    # phone, treat this branch as unproven. Record one with:
-    #     python tests/record_fixtures.py --serial <phone> --only emu_on_physical
-    combined = f"{raw}\n{_normalise(result.stderr)}"
-    lowered = combined.lower()
-    if "not an emulator" in lowered or "no emulator detected" in lowered:
+    # A physical device has no console. Measured on a Pixel 4 XL against API 35,
+    # after this branch shipped guessing at two plausible error strings -- both
+    # of which were wrong, so the remedy was dead code until it was measured:
+    #
+    #     $ adb -s <phone> emu avd name   ->  exit 1, stdout empty, stderr empty
+    #     $ adb -s <emulator> emu <anything>  ->  exit 0, stdout non-empty
+    #
+    # adb says nothing at all. The discriminator is therefore the *shape* of the
+    # reply, not its wording: an emulator answers 0 with output for every
+    # command including an unknown subcommand ("KO: unknown command"), while a
+    # phone answers non-zero with both streams empty.
+    #
+    # This cannot be a recorded fixture: the whole signal is an exit code and
+    # two empty streams, and a fixture stores only output. It is pinned
+    # behaviourally in tests/test_emu_console.py instead.
+    if result.returncode != 0 and not raw.strip() and not result.stderr.strip():
         raise EmuConsoleError(
-            f"{serial or 'the target device'} is a physical device, which has no "
-            f"emulator console. `adb emu` commands (sms, snapshot, gsm, geo) work "
-            f"only on emulators; use a booted emulator instead."
+            f"{serial or 'the target device'} has no emulator console, which "
+            f"means it is a physical device (adb exits {result.returncode} here "
+            f"and prints nothing at all). `adb emu` commands -- sms, snapshot, "
+            f"gsm, geo -- work only on emulators; use a booted emulator instead."
         )
 
     failures = _failures(raw)

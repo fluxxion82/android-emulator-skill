@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T18:36:15Z",
+  "recorded_at": "2026-09-01T20:25:26Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 0,
+  "redacted_package_count": 1,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -237,6 +237,30 @@
         "S10"
       ],
       "bytes": 106
+    },
+    {
+      "name": "run_as_ls_data_dir",
+      "file": "run_as_ls_data_dir.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la",
+      "description": "A real `run-as ls -la` of an app's data dir, from the Compose fixture app. Note what a hand-written sample gets wrong: a 'total N' header line, '.' and '..' entries, variable-width column padding, and a group that differs from the owner (u0_a205 vs u0_a205_cache on cache dirs).",
+      "catches": [],
+      "bytes": 337
+    },
+    {
+      "name": "run_as_not_an_application",
+      "file": "run_as_not_an_application.txt",
+      "command": "adb shell run-as com.android.settings ls 2>&1",
+      "description": "run-as refused for a system package. The real wording is 'run-as: package not an application: <pkg>'. container.py's denial markers listed 'is not an application' -- with an 'is' that the platform does not print -- so this denial fell through to a generic 'Command failed' instead of the hint telling the user the app must be debuggable. Written from imagination, wrong in exactly the way this corpus exists to catch.",
+      "catches": [],
+      "bytes": 57
+    },
+    {
+      "name": "run_as_unknown_package",
+      "file": "run_as_unknown_package.txt",
+      "command": "adb shell run-as com.nonexistent.app ls 2>&1",
+      "description": "run-as refused for a package that is not installed: 'run-as: unknown package: <pkg>'. This one the marker list does match, which is why the actionable hint appears here and not for run_as_not_an_application -- the contrast is the point.",
+      "catches": [],
+      "bytes": 42
     },
     {
       "name": "uiautomator_compose_default",
