@@ -59,8 +59,9 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 from common import adb_exec
-from common.device_utils import UI_DUMP_TIMEOUT, resolve_device_identifier
+from common.device_utils import resolve_device_identifier
 from common.env_config import env_int
+from common.hierarchy import capture_hierarchy
 
 # Preview limits (env-configurable; see SKILL.md -> Configuration).
 # BUTTONS_PREVIEW caps how many button labels render on the summary line.
@@ -132,48 +133,20 @@ class ScreenMapper:
 
     def get_ui_hierarchy(self) -> ET.Element:
         """
-        Fetch UI hierarchy from Android device via uiautomator dump.
+        Fetch the current UI hierarchy.
+
+        Delegates to :func:`common.hierarchy.capture_hierarchy`, which captures
+        via ``adb exec-out`` and so writes no file on either the device or the
+        host -- this used to pull to a fixed ``/tmp`` path shared with navigator
+        and device_utils, where concurrent runs read each other's screen.
 
         Returns:
-            XML root element
+            XML root element.
 
         Raises:
-            RuntimeError: If UI dump fails
+            RuntimeError: If the hierarchy could not be captured.
         """
-        try:
-            # Dump UI hierarchy to device
-            result = adb_exec.run_adb(
-                "shell",
-                self.serial,
-                "uiautomator",
-                "dump",
-                "/sdcard/window_dump.xml",
-                check=True,
-                timeout=UI_DUMP_TIMEOUT,
-            )
-
-            if "ERROR" in result.stdout or "error" in result.stderr.lower():
-                raise RuntimeError(f"UI dump failed: {result.stdout or result.stderr}")
-
-            # Pull XML file to local temp
-            temp_file = "/tmp/android_window_dump.xml"
-            adb_exec.run_adb(
-                "pull",
-                self.serial,
-                "/sdcard/window_dump.xml",
-                temp_file,
-                check=True,
-                timeout=UI_DUMP_TIMEOUT,
-            )
-
-            # Parse XML
-            tree = ET.parse(temp_file)
-            return tree.getroot()
-
-        except adb_exec.AdbCommandError as e:
-            raise RuntimeError(f"Failed to get UI hierarchy: {e}") from e
-        except ET.ParseError as e:
-            raise RuntimeError(f"Failed to parse UI hierarchy XML: {e}") from e
+        return capture_hierarchy(self.serial)
 
     def analyze_tree(self, root: ET.Element) -> dict:
         """

@@ -10,8 +10,11 @@ Covers the two curated deltas:
 All logic here is pure (XML -> analysis dict -> formatted string), so no adb or
 emulator is required. The one place subprocess would be touched
 (``get_ui_hierarchy``) is exercised by monkeypatching the subprocess call under
-``common.adb_exec`` and ``ET.parse`` to prove command construction never shells
-out to a device.
+``common.adb_exec`` to prove command construction never shells out to a device.
+
+The dump now comes back on stdout (``adb exec-out uiautomator dump /dev/tty``),
+so the fake supplies the XML as the command's output. It used to arrive via a
+pulled file, which is why these tests once patched ``ET.parse``.
 
 screen_mapper reaches adb only through ``adb_exec.run_adb`` now, so the fake
 goes there; patching ``screen_mapper.subprocess`` would stop intercepting and
@@ -187,22 +190,26 @@ def _patch_adb(monkeypatch, result_for=None):
     return calls, budgets
 
 
+def _dump_result(_cmd):
+    """Serve the hierarchy on stdout, the way `exec-out` delivers it."""
+    return _fake_result(stdout=HIERARCHY_WITH_SECURE)
+
+
 def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch):
-    calls, budgets = _patch_adb(monkeypatch)
-    monkeypatch.setattr(
-        ET, "parse", lambda _f: ET.ElementTree(ET.fromstring(HIERARCHY_WITH_SECURE))
-    )
+    calls, budgets = _patch_adb(monkeypatch, result_for=_dump_result)
 
     root = ScreenMapper(serial="emulator-5554").get_ui_hierarchy()
     analysis = ScreenMapper().analyze_tree(root)
     assert analysis["secure_fields"] == 1
 
-    # First call dumps the hierarchy via adb shell uiautomator dump.
     dump_cmd = calls[0]
     assert "adb" in dump_cmd[0]
     assert "uiautomator" in dump_cmd
     assert "dump" in dump_cmd
     assert "emulator-5554" in dump_cmd
+    # exec-out, not shell: over `adb shell` the device allocates a pty and only
+    # uiautomator's status line comes back, so the XML never reaches the host.
+    assert "exec-out" in dump_cmd, f"a pty would swallow the dump: {dump_cmd}"
     # An unbounded call would wedge adb for whatever runs next.
     assert all(b for b in budgets), f"unbounded adb call: {budgets}"
 
@@ -250,10 +257,7 @@ def test_main_json_error_payload_is_preserved_and_exits_non_zero(monkeypatch, ca
 
 
 def test_main_exits_zero_when_the_screen_is_read(monkeypatch, capsys):
-    _patch_adb(monkeypatch)
-    monkeypatch.setattr(
-        ET, "parse", lambda _f: ET.ElementTree(ET.fromstring(HIERARCHY_WITH_SECURE))
-    )
+    _patch_adb(monkeypatch, result_for=_dump_result)
     monkeypatch.setattr(screen_mapper, "resolve_device_identifier", lambda arg: arg)
     monkeypatch.setattr(
         screen_mapper.sys, "argv", ["screen_mapper.py", "--serial", "emulator-5554"]

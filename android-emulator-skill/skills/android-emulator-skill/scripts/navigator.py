@@ -64,11 +64,11 @@ from dataclasses import dataclass
 
 from common import adb_exec
 from common.device_utils import (
-    UI_DUMP_TIMEOUT,
     quote_for_device_shell,
     resolve_device_identifier,
 )
 from common.env_config import env_float, env_int
+from common.hierarchy import capture_hierarchy
 
 # Tunable defaults (overridable via ANDROID_EMU_* env vars; see SKILL.md).
 MAX_ELEMENTS_LISTED = env_int("ANDROID_EMU_MAX_ELEMENTS", 25)
@@ -116,52 +116,27 @@ class Navigator:
 
     def get_ui_hierarchy(self, force_refresh: bool = False) -> ET.Element:
         """
-        Get UI hierarchy (cached for efficiency).
+        Get the UI hierarchy, cached for the lifetime of this navigator.
+
+        Delegates to :func:`common.hierarchy.capture_hierarchy`, which captures
+        via ``adb exec-out`` and writes no file on either side -- this used to
+        pull to a fixed ``/tmp`` path shared with screen_mapper and
+        device_utils, where concurrent runs read each other's screen.
 
         Args:
-            force_refresh: Force refresh even if cached
+            force_refresh: Re-capture even if a tree is already cached.
 
         Returns:
-            XML root element
+            XML root element.
+
+        Raises:
+            RuntimeError: If the hierarchy could not be captured.
         """
         if self._tree_cache is not None and not force_refresh:
             return self._tree_cache
 
-        try:
-            # Dump UI hierarchy to device
-            result = adb_exec.run_adb(
-                "shell",
-                self.serial,
-                "uiautomator",
-                "dump",
-                "/sdcard/window_dump.xml",
-                check=True,
-                timeout=UI_DUMP_TIMEOUT,
-            )
-
-            if "ERROR" in result.stdout or "error" in result.stderr.lower():
-                raise RuntimeError(f"UI dump failed: {result.stdout or result.stderr}")
-
-            # Pull XML file to local temp
-            temp_file = "/tmp/android_navigator_dump.xml"
-            adb_exec.run_adb(
-                "pull",
-                self.serial,
-                "/sdcard/window_dump.xml",
-                temp_file,
-                check=True,
-                timeout=UI_DUMP_TIMEOUT,
-            )
-
-            # Parse XML
-            tree = ET.parse(temp_file)
-            self._tree_cache = tree.getroot()
-            return self._tree_cache
-
-        except adb_exec.AdbCommandError as e:
-            raise RuntimeError(f"Failed to get UI hierarchy: {e}") from e
-        except ET.ParseError as e:
-            raise RuntimeError(f"Failed to parse UI hierarchy XML: {e}") from e
+        self._tree_cache = capture_hierarchy(self.serial)
+        return self._tree_cache
 
     def _parse_bounds(self, bounds_str: str) -> tuple:
         """

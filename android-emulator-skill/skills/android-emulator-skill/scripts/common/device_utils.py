@@ -21,6 +21,7 @@ import re
 import shlex
 
 from .adb_exec import AdbCommandError, AdbError, run_adb
+from .hierarchy import capture_hierarchy_dict
 
 # Every adb call is bounded. An unbounded one wedges the adb connection for
 # whatever runs next, which is a hang with no diagnosis rather than an error.
@@ -382,53 +383,25 @@ def get_device_screen_size(serial: str | None = None) -> tuple:
 
 def get_ui_hierarchy(serial: str | None = None) -> dict:
     """
-    Get UI hierarchy dump from device.
+    Get the UI hierarchy as nested dicts.
 
-    Uses uiautomator dump to get XML UI hierarchy and converts to dict.
+    Thin wrapper over :func:`common.hierarchy.capture_hierarchy_dict`, kept
+    because several scripts import this name. The capture itself now writes no
+    temp file on either the device or the host; this used to dump to
+    ``/sdcard/window_dump.xml`` and pull to ``/tmp/window_dump.xml``, a path
+    shared with two other implementations (R4).
 
     Args:
-        serial: Device serial (uses default if None)
+        serial: Device serial (uses the default device if None).
 
     Returns:
-        Dict representation of UI hierarchy
+        ``{"tag": str, "attributes": {...}, "children": [...]}``, with every
+        attribute value left as the string uiautomator emitted.
 
-    Example:
-        hierarchy = get_ui_hierarchy("emulator-5554")
-        print(f"Found {len(hierarchy)} nodes")
+    Raises:
+        HierarchyError: If the hierarchy could not be captured or parsed.
     """
-    try:
-        # Dump UI hierarchy to device
-        run_adb(
-            "shell",
-            serial,
-            "uiautomator",
-            "dump",
-            "/sdcard/window_dump.xml",
-            timeout=UI_DUMP_TIMEOUT,
-            check=True,
-        )
-
-        # Pull XML file
-        run_adb(
-            "pull",
-            serial,
-            "/sdcard/window_dump.xml",
-            "/tmp/window_dump.xml",
-            timeout=UI_DUMP_TIMEOUT,
-            check=True,
-        )
-
-        # Read and parse XML
-        import xml.etree.ElementTree as ET
-
-        tree = ET.parse("/tmp/window_dump.xml")
-        root = tree.getroot()
-
-        # Convert XML to dict structure
-        return _xml_to_dict(root)
-
-    except Exception as e:
-        raise RuntimeError(f"Failed to get UI hierarchy: {e}") from e
+    return capture_hierarchy_dict(serial)
 
 
 def _xml_to_dict(element) -> dict:
