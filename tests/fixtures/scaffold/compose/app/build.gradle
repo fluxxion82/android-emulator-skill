@@ -1,0 +1,56 @@
+// Build + install (ANDROID_HOME is not exported on the recording machine, so
+// pass it explicitly; there is no Gradle wrapper here on purpose -- `gradle` on
+// PATH is used, exactly like the flavored/ scaffold next door):
+//
+//   ANDROID_HOME=~/Library/Android/sdk \
+//   JAVA_HOME=$(/usr/libexec/java_home -v 17) \
+//   gradle -p tests/fixtures/scaffold/compose :app:assembleDebug
+//   adb -s emulator-5554 install -r \
+//     tests/fixtures/scaffold/compose/app/build/outputs/apk/debug/app-debug.apk
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'com.example.composefixture'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.example.composefixture'
+        minSdk 24
+        targetSdk 36
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildFeatures {
+        compose true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // Deterministic output path for the install step above.
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity-compose:1.10.1'
+    implementation 'androidx.compose.ui:ui:1.11.4'
+    implementation 'androidx.compose.foundation:foundation:1.11.4'
+    implementation 'androidx.compose.material3:material3:1.4.0'
+}

@@ -1,0 +1,19 @@
+// Minimal Compose scaffold used to record the uiautomator_compose_* fixtures.
+// Not part of the pytest suite: it is built by hand on a machine with the
+// Android SDK, installed on an emulator, and the resulting hierarchy dump is
+// what the suite consumes. See app/build.gradle for the exact build command.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = 'compose-scaffold'
+include ':app'

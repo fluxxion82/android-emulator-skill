@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T01:08:35Z",
+  "recorded_at": "2026-09-01T04:47:53Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -133,6 +133,26 @@
         "S10"
       ],
       "bytes": 106
+    },
+    {
+      "name": "uiautomator_compose_default",
+      "file": "uiautomator_compose_default.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "A Jetpack Compose screen with NO testTagsAsResourceId -- what a new Android app looks like out of the box. Three things a class-name whitelist gets wrong here. (1) Every resource-id is EMPTY: Compose emits none, so any lookup keyed on resource-id finds nothing. (2) The nodes that actually carry clickable/checkable/scrollable are android.view.View -- the clickable Card, the Switch, the IconButton and the LazyColumn all report that class -- while the whitelisted widget names that DO appear (android.widget.Button, .TextView) sit on nodes that are not clickable. (3) uiautomator dumps the UNMERGED semantics tree, so mergeDescendants does not collapse anything: the clickable Card's own text is empty and its three Text children remain separate TextView nodes. A label has to be recovered from descendants, never read off the interactive node itself.",
+      "catches": [
+        "R11"
+      ],
+      "bytes": 10895
+    },
+    {
+      "name": "uiautomator_compose_testtags",
+      "file": "uiautomator_compose_testtags.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "The same Compose screen from an activity whose root adds Modifier.semantics { testTagsAsResourceId = true }, so Modifier.testTag surfaces as resource-id. This is the remediation the skill documents, and diffing it against uiautomator_compose_default shows exactly what it buys: one extra semantics wrapper node, and the resource-id column. Note the ids are the BARE testTag string ('submit_button'), not the 'package:id/name' form every AOSP view uses -- code that splits on ':id/' drops them. Only the nodes given a testTag get an id; the TextViews inside the Card and the list still have none.",
+      "catches": [
+        "R11"
+      ],
+      "bytes": 11340
     },
     {
       "name": "uiautomator_current_screen",

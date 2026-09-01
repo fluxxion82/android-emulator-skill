@@ -66,6 +66,9 @@ class Fixture:
         catches: Defect IDs this fixture would have caught. Empty for context.
         setup: Optional adb argument lists run before capture.
         teardown: Optional adb argument lists run after capture, always.
+        timeout: Per-fixture bound on the adb call.
+        post: Optional transform applied to the captured text before it is
+            written. It may raise CaptureError to reject a bad capture.
     """
 
     name: str
@@ -170,6 +173,43 @@ def _redact_private_packages(text: str, mapping: dict[str, str]) -> str:
         return mapping[token]
 
     return _PACKAGE_RE.sub(alias, text)
+
+
+# The Compose scaffold under tests/fixtures/scaffold/compose. Two exported
+# activities render the same screen; only the root Modifier differs. See that
+# directory's AndroidManifest.xml for the build-and-install commands.
+COMPOSE_PACKAGE = "com.example.composefixture"
+
+
+def _hierarchy_of(package: str) -> Callable[[str], str]:
+    """Trim an ``exec-out uiautomator dump`` stream to just its XML document.
+
+    uiautomator writes its status line ("UI hierchary dumped to: /dev/tty" --
+    Android's typo, not ours) onto the same stream, so the raw bytes are not a
+    parseable document.
+
+    The returned callable also asserts the dump is of ``package``. A dump always
+    succeeds: if the activity never launched, uiautomator happily describes the
+    launcher instead, and the result would be a file that looks like a Compose
+    hierarchy and is not -- the exact failure this recorder exists to prevent.
+    """
+
+    def trim(raw: str) -> str:
+        start = raw.find("<?xml")
+        if start == -1:
+            raise CaptureError(f"no XML in uiautomator output: {raw.strip()[:120]!r}")
+        end = raw.rfind("</hierarchy>")
+        if end == -1:
+            raise CaptureError("uiautomator output truncated: no closing </hierarchy>")
+        xml = raw[start : end + len("</hierarchy>")] + "\n"
+        if f'package="{package}"' not in xml:
+            raise CaptureError(
+                f"dump contains no {package!r} node: the activity did not launch. "
+                f"Build and install tests/fixtures/scaffold/compose first."
+            )
+        return xml
+
+    return trim
 
 
 FIXTURES: list[Fixture] = [
@@ -385,6 +425,59 @@ FIXTURES: list[Fixture] = [
             "test: navigate in and out N times and see whether it grew by N."
         ),
     ),
+    # --- R11: a Jetpack Compose screen, which no system app renders ---------
+    # Recorded from tests/fixtures/scaffold/compose. Build and install it
+    # first; the post-processor refuses the capture if the app is not on top.
+    Fixture(
+        name="uiautomator_compose_default",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "A Jetpack Compose screen with NO testTagsAsResourceId -- what a new "
+            "Android app looks like out of the box. Three things a class-name "
+            "whitelist gets wrong here. (1) Every resource-id is EMPTY: Compose "
+            "emits none, so any lookup keyed on resource-id finds nothing. (2) The "
+            "nodes that actually carry clickable/checkable/scrollable are "
+            "android.view.View -- the clickable Card, the Switch, the IconButton "
+            "and the LazyColumn all report that class -- while the whitelisted "
+            "widget names that DO appear (android.widget.Button, .TextView) sit on "
+            "nodes that are not clickable. (3) uiautomator dumps the UNMERGED "
+            "semantics tree, so mergeDescendants does not collapse anything: the "
+            "clickable Card's own text is empty and its three Text children remain "
+            "separate TextView nodes. A label has to be recovered from "
+            "descendants, never read off the interactive node itself."
+        ),
+        catches=("R11",),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "1"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_hierarchy_of(COMPOSE_PACKAGE),
+    ),
+    Fixture(
+        name="uiautomator_compose_testtags",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        description=(
+            "The same Compose screen from an activity whose root adds "
+            "Modifier.semantics { testTagsAsResourceId = true }, so Modifier.testTag "
+            "surfaces as resource-id. This is the remediation the skill documents, "
+            "and diffing it against uiautomator_compose_default shows exactly what "
+            "it buys: one extra semantics wrapper node, and the resource-id column. "
+            "Note the ids are the BARE testTag string ('submit_button'), not the "
+            "'package:id/name' form every AOSP view uses -- code that splits on "
+            "':id/' drops them. Only the nodes given a testTag get an id; the "
+            "TextViews inside the Card and the list still have none."
+        ),
+        catches=("R11",),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.TestTagsActivity"],
+            ["shell", "sleep", "1"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_hierarchy_of(COMPOSE_PACKAGE),
+    ),
 ]
 
 
@@ -503,6 +596,8 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             text = _redact_private_packages(
                 _strip_cr(_run(fixture.args, serial, fixture.timeout)), redactions
             )
+            if fixture.post is not None:
+                text = fixture.post(text)
         except CaptureError as exc:
             failures.append((fixture.name, str(exc)))
             print(f"  FAIL  {fixture.name}: {exc}", file=sys.stderr)

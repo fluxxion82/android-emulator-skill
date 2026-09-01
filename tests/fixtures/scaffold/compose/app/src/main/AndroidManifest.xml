@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Two exported activities render the SAME composable. They differ only in the
+  Modifier handed to the root, which is what makes the two recorded fixtures
+  differ in exactly one column (resource-id):
+
+    .DefaultActivity   no testTagsAsResourceId  -> resource-id is "" everywhere
+    .TestTagsActivity  testTagsAsResourceId=true -> Modifier.testTag surfaces
+                                                    as resource-id
+
+  Launch them by explicit component; neither reads any intent extra:
+    adb shell am start -n com.example.composefixture/.DefaultActivity
+    adb shell am start -n com.example.composefixture/.TestTagsActivity
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="ComposeFixture"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".DefaultActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".TestTagsActivity"
+            android:exported="true" />
+    </application>
+
+</manifest>

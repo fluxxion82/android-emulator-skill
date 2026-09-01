@@ -53,6 +53,7 @@ Configuration (env overrides, ANDROID_EMU_ prefix):
 
 import argparse
 import json as json_lib
+import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -86,23 +87,35 @@ class ScreenMapper:
         - Navigation-focused: Highlight elements relevant for automation
     """
 
-    # Element types we care about for navigation
-    # These are Android View class names that indicate user interaction points
-    INTERACTIVE_TYPES = {
+    # Interactivity is decided by an element's PROPERTIES, not its class name.
+    #
+    # The previous version gated on a whitelist of View class names (Button,
+    # EditText, TextView, ...). Jetpack Compose -- the default Android UI
+    # toolkit since 2022 -- renders its semantics nodes as plain
+    # `android.view.View`, so on a Compose screen the whitelist matched almost
+    # nothing and this reported ~0 interactive elements (defect R11).
+    #
+    # Measured on a recorded Compose dump: of seven controls, five report class
+    # `android.view.View`; a Switch produces no `android.widget.Switch` at all.
+    # Only Checkbox, TextField and Image map to widget classes.
+    INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollable")
+
+    # Class names still used for *labelling* an element, never for eligibility.
+    KNOWN_WIDGET_CLASSES = {
         "Button",
         "ImageButton",
         "EditText",
-        "TextView",  # Often clickable in Android
         "CheckBox",
         "RadioButton",
         "Switch",
         "ToggleButton",
         "SeekBar",
         "Spinner",
-        "TabWidget",
-        "ListView",
-        "RecyclerView",
     }
+
+    # Cap on text gathered from a control's subtree, so a long list does not
+    # turn one entry into a wall of text.
+    MAX_RECOVERED_LABEL_PARTS = 3
 
     def __init__(self, serial: str | None = None):
         """
@@ -184,7 +197,7 @@ class ScreenMapper:
             "secure_fields": 0,
         }
 
-        self._analyze_recursive(root, analysis)
+        self._analyze_recursive(root, analysis, parent=None)
 
         # Post-process for clean output
         analysis["elements_by_type"] = dict(analysis["elements_by_type"])
@@ -194,20 +207,24 @@ class ScreenMapper:
 
         return analysis
 
-    def _analyze_recursive(self, node: ET.Element, analysis: dict):
+    def _analyze_recursive(
+        self, node: ET.Element, analysis: dict, parent: ET.Element | None = None
+    ):
         """
         Recursively analyze XML nodes.
 
         Args:
             node: Current XML element
             analysis: Analysis dict to populate
+            parent: The node's parent, needed to recover a label from a
+                row-adjacent sibling (a Compose Checkbox or Switch carries no
+                text of its own; its caption is the next sibling).
         """
         # Get element attributes
         elem_class = node.get("class", "")
         text = node.get("text", "")
         content_desc = node.get("content-desc", "")
         resource_id = node.get("resource-id", "")
-        clickable = node.get("clickable", "false") == "true"
         focusable = node.get("focusable", "false") == "true"
         enabled = node.get("enabled", "true") == "true"
         # Android marks secure/password inputs with password="true".
@@ -223,29 +240,44 @@ class ScreenMapper:
             # Determine label for this element
             label = text or content_desc or resource_id or None
 
-            # Track interactive elements
-            if simple_class in self.INTERACTIVE_TYPES and enabled:
-                if clickable or focusable:
-                    analysis["interactive_elements"] += 1
+            # Track interactive elements.
+            #
+            # Eligibility is by property, not class name. Bounds must be
+            # non-zero: uiautomator emits no visibility attribute, so a
+            # zero-area rect is the only signal that an element cannot be
+            # touched. `focusable` is deliberately NOT sufficient on its own --
+            # focusable containers are everywhere and would flood the output.
+            interactive = (
+                enabled
+                and self._has_area(node)
+                and any(node.get(attr, "false") == "true" for attr in self.INTERACTIVE_ATTRIBUTES)
+            )
 
-                if label:
-                    analysis["elements_by_type"][simple_class].append(label)
+            if interactive:
+                analysis["interactive_elements"] += 1
 
-                # Special handling for common types
-                if simple_class == "Button" and label:
-                    analysis["buttons"].append(label)
+                # Compose controls carry no text of their own; recover it.
+                recovered = label or self._recover_label(node, parent)
+                bucket = simple_class if simple_class in self.KNOWN_WIDGET_CLASSES else "Control"
+                if recovered:
+                    analysis["elements_by_type"][bucket].append(recovered)
+
+                if simple_class in ("Button", "ImageButton") and recovered:
+                    analysis["buttons"].append(recovered)
                 elif simple_class == "EditText":
-                    is_filled = bool(text)
                     analysis["edit_texts"].append(
                         {
-                            "label": content_desc or resource_id or "Unnamed",
-                            "filled": is_filled,
+                            "label": recovered or content_desc or resource_id or "Unnamed",
+                            "filled": bool(text),
                             "secure": is_secure,
                         }
                     )
-                elif simple_class == "TextView" and label and clickable:
-                    # Only track clickable TextViews (often used as buttons)
-                    analysis["text_views"].append(label)
+                elif simple_class == "TextView" and recovered:
+                    analysis["text_views"].append(recovered)
+
+            elif label and simple_class == "TextView":
+                # Passive labels still describe the screen, so keep listing them.
+                analysis["elements_by_type"]["TextView"].append(label)
 
             # Count focusable
             if focusable and enabled:
@@ -257,7 +289,78 @@ class ScreenMapper:
 
         # Recurse to children
         for child in node:
-            self._analyze_recursive(child, analysis)
+            self._analyze_recursive(child, analysis, parent=node)
+
+    @staticmethod
+    def _bounds(node: ET.Element) -> tuple[int, int, int, int] | None:
+        """Parse ``bounds="[l,t][r,b]"``, or None when absent/malformed."""
+        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))
+        return tuple(int(g) for g in match.groups()) if match else None
+
+    def _has_area(self, node: ET.Element) -> bool:
+        """Whether the element occupies a non-zero rectangle.
+
+        uiautomator reports no visibility attribute, so this is the only
+        available proxy: a zero-area element cannot be tapped whatever its
+        flags claim.
+        """
+        box = self._bounds(node)
+        if box is None:
+            return True  # No bounds reported: do not exclude on a missing signal.
+        left, top, right, bottom = box
+        return right > left and bottom > top
+
+    @staticmethod
+    def _own_label(node: ET.Element) -> str:
+        return (node.get("text") or "").strip() or (node.get("content-desc") or "").strip()
+
+    def _recover_label(self, node: ET.Element, parent: ET.Element | None) -> str | None:
+        """Find text describing a control that carries none of its own.
+
+        Compose controls are unlabelled: measured on a real dump, all seven
+        interactive nodes had empty ``text`` and ``content-desc``. Their captions
+        sit in two different places, so both are searched:
+
+        - **Descendants** -- a Button's "Submit Order", a Card's item lines, a
+          list's rows. uiautomator dumps the *unmerged* semantics tree, so
+          ``mergeDescendants`` does not fold these into the parent and there is
+          no concatenated label to read.
+        - **A row-adjacent sibling** -- a Checkbox's "Remember me" and a Switch's
+          "Dark theme" are siblings, not children. Only an immediate sibling
+          whose bounds overlap vertically is used; scanning all siblings would
+          pull in the whole screen, since these controls share one flat parent.
+        """
+        parts = [self._own_label(child) for child in node.iter() if child is not node]
+        parts = [p for p in parts if p]
+        if parts:
+            return " ".join(parts[: self.MAX_RECOVERED_LABEL_PARTS])
+
+        if parent is None:
+            return None
+
+        siblings = list(parent)
+        try:
+            position = siblings.index(node)
+        except ValueError:
+            return None
+
+        own = self._bounds(node)
+        for offset in (1, -1):
+            index = position + offset
+            if not 0 <= index < len(siblings):
+                continue
+            sibling = siblings[index]
+            if own is not None:
+                box = self._bounds(sibling)
+                # Same row: vertical spans must overlap.
+                if box is not None and not (box[1] < own[3] and own[1] < box[3]):
+                    continue
+            candidate = self._own_label(sibling) or next(
+                (self._own_label(c) for c in sibling.iter() if self._own_label(c)), ""
+            )
+            if candidate:
+                return candidate
+        return None
 
     def _detect_screen_name(self, analysis: dict):
         """
