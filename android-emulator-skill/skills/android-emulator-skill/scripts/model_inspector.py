@@ -59,7 +59,12 @@ _RUN_AS_DENIED_MARKERS = (
     "unknown package",
     "run-as: package not found",
     "package not found",
-    "is not an application",
+    # Measured: the device prints "run-as: package not an application: <pkg>".
+    # This read "is not an application", with an "is" Android never emits, so a
+    # real denial fell through and the failure was reported as
+    # "app.db is not a valid SQLite database" -- blaming the database for a
+    # permissions problem. Recorded as run_as_not_an_application.
+    "not an application",
     "user is not debuggable",
     "permission denied",
 )

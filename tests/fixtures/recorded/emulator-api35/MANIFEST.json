@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T20:25:26Z",
+  "recorded_at": "2026-09-01T20:31:10Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 1,
+  "redacted_package_count": 0,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -247,6 +247,14 @@
       "bytes": 337
     },
     {
+      "name": "run_as_ls_databases",
+      "file": "run_as_ls_databases.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la databases",
+      "description": "The databases directory. Carries the -journal file alongside the database, which anything listing databases has to not offer as a database.",
+      "catches": [],
+      "bytes": 252
+    },
+    {
       "name": "run_as_not_an_application",
       "file": "run_as_not_an_application.txt",
       "command": "adb shell run-as com.android.settings ls 2>&1",
@@ -261,6 +269,22 @@
       "description": "run-as refused for a package that is not installed: 'run-as: unknown package: <pkg>'. This one the marker list does match, which is why the actionable hint appears here and not for run_as_not_an_application -- the contrast is the point.",
       "catches": [],
       "bytes": 42
+    },
+    {
+      "name": "shared_prefs_settings_xml",
+      "file": "shared_prefs_settings_xml.txt",
+      "command": "adb shell run-as com.example.composefixture cat shared_prefs/fixture_settings.xml",
+      "description": "Real SharedPreferences XML from the Compose fixture app, covering every type Android encodes differently: string, int, long, float, boolean and a string set. A parser that only ever saw <string> is a parser that has not been tested -- and the hand-written sample this replaces had exactly that shape. Note the set is nested <string> children rather than an attribute, and the entries are not in insertion order.",
+      "catches": [],
+      "bytes": 433
+    },
+    {
+      "name": "sqlite_schema_host",
+      "file": "sqlite_schema_host.txt",
+      "command": "sqlite3 {tmp}/fx.db .schema",
+      "description": "`sqlite3 .schema` of a real Android app database. Recorded on the HOST because sqlite3 is absent from Android user builds -- verified missing on API 35 -- so model_inspector's working path is pull-then-host-sqlite3, and the adb call would capture the pull rather than the schema. Contains what a hand-written schema omits: android_metadata and sqlite_sequence, AUTOINCREMENT, a composite FOREIGN KEY ... ON DELETE CASCADE, and separate CREATE INDEX statements including a UNIQUE one.",
+      "catches": [],
+      "bytes": 622
     },
     {
       "name": "uiautomator_compose_default",

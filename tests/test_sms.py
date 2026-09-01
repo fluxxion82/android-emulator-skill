@@ -588,11 +588,11 @@ def test_no_shell_true_and_no_direct_subprocess():
 
 
 @pytest.mark.emulator
-def test_send_is_proven_by_the_inbox_on_a_real_emulator(live_device, monkeypatch):
+def test_send_is_proven_by_the_inbox_on_a_real_emulator(emulator_only_device, monkeypatch):
     """Send a message and require the tool to find it, end to end."""
     monkeypatch.setattr(sms, "VERIFY_TIMEOUT_SECONDS", 30)
     monkeypatch.setattr(sms, "VERIFY_POLL_SECONDS", 0.25)
-    tester = sms.SmsTester(serial=live_device)
+    tester = sms.SmsTester(serial=emulator_only_device)
     body = f"Recorded test, code 246813 at {id(tester)}"
 
     success, result = tester.send("+15551230000", body)

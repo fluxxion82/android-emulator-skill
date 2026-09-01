@@ -410,13 +410,22 @@ def test_live_falls_back_to_host_sqlite3(monkeypatch, tmp_path):
     assert "widgets" in names
 
 
-def test_live_run_as_denied_release_build(monkeypatch):
+def test_live_run_as_denied_release_build(monkeypatch, recorded):
+    """`run-as: package not debuggable: <pkg>` is a string Android never prints.
+
+    The real refusal for a non-debuggable package is
+    `run-as: package not an application: <pkg>` (recorded). Asserting against
+    the invented one meant this test could not tell whether the detection
+    worked on a real denial -- and in container.py, the matching marker was
+    invented in the same direction, so it did not.
+    """
+    denial = recorded.text("run_as_not_an_application")
+
     def fake_run(cmd, *args, **kwargs):
-        return _completed(
-            cmd,
-            returncode=1,
-            stderr="run-as: package not debuggable: com.example.app",
-        )
+        # bytes, not str: this path runs adb without text mode and decodes the
+        # stream itself, so a str double would exercise code the real call never
+        # reaches.
+        return _completed(cmd, returncode=1, stderr=denial.encode("utf-8"))
 
     monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
 
@@ -435,3 +444,51 @@ def test_live_run_as_denied_listing(monkeypatch):
     ok, result = LiveInspector().execute("com.nope")
     assert ok is False
     assert result.get("run_as_denied") is True
+
+
+# ---------------------------------------------------------------------------
+# A real Android database, via the path that actually runs.
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_schema_parses_a_real_android_database(recorded):
+    """Schema from a real app database, recorded via host sqlite3.
+
+    Host, not device: `sqlite3` is absent from Android user builds (verified
+    missing on API 35), so `LiveInspector`'s working path is pull-then-host,
+    and a device-sqlite3 capture would have recorded a failure.
+
+    What the recording contains that a hand-written schema omits: the
+    `android_metadata` and `sqlite_sequence` tables SQLite and Android create
+    themselves, and `CREATE TABLE sqlite_sequence(name,seq)` with no space
+    before the parenthesis and no newlines inside it.
+    """
+    tables = parse_sqlite_schema(recorded.text("sqlite_schema_host"))
+    by_name = {table["name"]: table for table in tables}
+
+    assert {"orders", "order_items"} <= set(by_name), f"missed real tables: {list(by_name)}"
+
+    assert [c["name"] for c in by_name["orders"]["columns"]] == [
+        "id",
+        "reference",
+        "total_cents",
+        "placed_at",
+    ]
+
+    # The platform's own tables are present in every Android database; a
+    # consumer that cannot see them will be surprised by them.
+    assert "android_metadata" in by_name
+    assert [c["name"] for c in by_name["sqlite_sequence"]["columns"]] == ["name", "seq"]
+
+
+def test_a_foreign_key_clause_is_not_mistaken_for_a_column(recorded):
+    """`FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE`.
+
+    It sits in the column list and is not a column. A parser splitting on
+    commas invents one called "FOREIGN KEY(order_id) REFERENCES orders(id)".
+    """
+    tables = {t["name"]: t for t in parse_sqlite_schema(recorded.text("sqlite_schema_host"))}
+    columns = [c["name"] for c in tables["order_items"]["columns"]]
+
+    assert columns == ["id", "order_id", "label", "quantity"], columns
+    assert not any("FOREIGN" in name.upper() for name in columns)

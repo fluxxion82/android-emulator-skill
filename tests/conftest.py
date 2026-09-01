@@ -209,4 +209,34 @@ def live_device(adb: str) -> str:
     ]
     if not serials:
         pytest.skip("no booted device; start one and re-run with -m emulator")
+
+    # Prefer an emulator, always. These tests tap, swipe, press keys, take
+    # screenshots and send SMS, and `adb devices` lists a physical phone before
+    # `emulator-5554`, so taking serials[0] pointed the whole lane at whatever
+    # handset a developer happened to have plugged in. That has already
+    # happened once in this project.
+    #
+    # A physical device is used only when it is the ONLY thing attached, which
+    # is a deliberate choice by whoever attached it.
+    emulators = [serial for serial in serials if serial.startswith("emulator-")]
+    if emulators:
+        return emulators[0]
+
     return serials[0]
+
+
+@pytest.fixture(scope="session")
+def emulator_only_device(live_device: str) -> str:
+    """A booted EMULATOR, skipping rather than falling back to a phone.
+
+    For tests whose side effects must never reach a real handset -- sending an
+    SMS into someone's inbox, loading a snapshot, wiping state -- and for
+    anything going through the emulator console, which a physical device does
+    not have at all (`adb emu` there exits 1 and prints nothing).
+    """
+    if not live_device.startswith("emulator-"):
+        pytest.skip(
+            f"only a physical device ({live_device}) is attached. This test has "
+            f"side effects that must not reach a real handset; boot an emulator."
+        )
+    return live_device

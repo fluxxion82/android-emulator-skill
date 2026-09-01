@@ -274,9 +274,9 @@ def test_run_as_denied_for_a_non_debuggable_package(monkeypatch, recorded):
 
     ok, result = ContainerInspector().list_dir("com.android.settings")
     assert ok is False
-    assert result["run_as_denied"] is True, (
-        f"a real run-as denial was reported as a generic failure: {result}"
-    )
+    assert (
+        result["run_as_denied"] is True
+    ), f"a real run-as denial was reported as a generic failure: {result}"
     assert "debuggable" in result["hint"].lower()
 
 
@@ -408,9 +408,11 @@ def test_export_writes_snapshot(monkeypatch, tmp_path):
     assert (dest / "shared_prefs" / "settings.xml").exists()
 
 
-def test_export_refuses_existing_destination(monkeypatch, tmp_path):
+def test_export_refuses_existing_destination(monkeypatch, tmp_path, recorded):
+    listing = recorded.text("run_as_ls_data_dir")
+
     def fake_run(cmd, *args, **kwargs):
-        return _completed(cmd, stdout="-rw------- 1 u0_a1 u0_a1 1 2024-01-02 03:04 a\n")
+        return _completed(cmd, stdout=listing)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
@@ -418,3 +420,49 @@ def test_export_refuses_existing_destination(monkeypatch, tmp_path):
     ok, result = ContainerInspector().export("com.example.app", str(tmp_path))
     assert ok is False
     assert "already exists" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Real SharedPreferences, from the fixture app's own data dir.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_prefs_parses_every_type_android_writes(recorded):
+    """The six types Android encodes differently, from a real prefs file.
+
+    A parser that only ever saw ``<string>`` has not been tested, and the
+    hand-written sample this complements was written by someone imagining the
+    format. The fixture app now writes one of each so the corpus contains
+    ground truth: note that ``<set>`` is nested ``<string>`` children rather
+    than an attribute, and that the entries are not in insertion order.
+    """
+    parsed = parse_shared_prefs_xml(recorded.text("shared_prefs_settings_xml"))
+
+    assert parsed["display_name"] == "Fixture User"
+    assert parsed["launch_count"] == 7
+    assert parsed["last_sync_epoch_ms"] == 1788280000000
+    assert parsed["playback_speed"] == 1.25
+    assert parsed["dark_theme"] is True
+    assert sorted(parsed["enabled_flags"]) == ["compose", "telemetry"]
+
+
+def test_shared_prefs_types_are_converted_not_left_as_strings(recorded):
+    """`value="7"` must become 7, or every caller has to re-parse it."""
+    parsed = parse_shared_prefs_xml(recorded.text("shared_prefs_settings_xml"))
+
+    assert isinstance(parsed["launch_count"], int)
+    assert isinstance(parsed["playback_speed"], float)
+    assert isinstance(parsed["dark_theme"], bool)
+    assert isinstance(parsed["enabled_flags"], list)
+    assert not isinstance(parsed["dark_theme"], str), "boolean left as the literal 'true'"
+
+
+def test_databases_listing_does_not_offer_the_journal_as_a_database(recorded):
+    """`fixture.db-journal` sits beside `fixture.db` and is not a database."""
+    listing = recorded.text("run_as_ls_databases")
+    assert "fixture.db-journal" in listing, "fixture no longer exercises the journal case"
+
+    entries = parse_ls_output(listing)
+    names = {entry["name"] for entry in entries}
+    assert "fixture.db" in names
+    assert "." not in names and ".." not in names

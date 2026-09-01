@@ -53,21 +53,21 @@ OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
 # them is to record the real thing with `python tests/record_fixtures.py` and
 # read it through the `recorded` fixture.
 #
-# The two that matter most, because they are the original sin recurring:
-#   test_container.py       -- hand-written `run-as ls -la` output
-#   test_model_inspector.py -- hand-written `sqlite3 .schema` output
-# Neither `run-as`, `sqlite3` nor `shared_prefs` output exists in the corpus at
-# all, so there is currently nothing to compare against.
+# PAID OFF: test_container.py and test_model_inspector.py were the two that
+# mattered most -- the original sin recurring in scripts written after the
+# register named it. Both now read recorded `run-as` output, and recording it
+# immediately found two real defects: a denial marker written as "is not an
+# application" where the device says "package not an application", in BOTH
+# files, so a non-debuggable app got a generic failure from one and
+# "app.db is not a valid SQLite database" from the other.
 KNOWN_VIOLATIONS = frozenset(
     {
         "test_anr_pipeline.py::parse_logcat_anr",
         "test_anr_watcher.py::parse_logcat_anr",
-        "test_container.py::_completed",
         "test_emulator_create.py::CompletedProcess",
         "test_emulator_shutdown.py::_FakeResult",
         "test_gradle.py::parse_build_output",
         "test_location.py::parse_gpx",
-        "test_model_inspector.py::_completed",
         "test_push_notification.py::when",
         "test_status_bar.py::failing_adb",
     }

@@ -574,9 +574,9 @@ def test_help_warns_that_adb_emu_exits_zero_on_failure(scripts_dir):
 
 
 @pytest.mark.emulator
-def test_live_listing_is_usable(live_device):
+def test_live_listing_is_usable(emulator_only_device):
     """Semantic floor: did the agent get an answer it can act on?"""
-    success, result = snapshot.SnapshotManager(serial=live_device).list_snapshots()
+    success, result = snapshot.SnapshotManager(serial=emulator_only_device).list_snapshots()
     assert success, result.get("error")
     assert result.get("unrecognised", []) == [], "the live table has lines the parser cannot read"
     if not result["snapshots"]:
@@ -589,10 +589,10 @@ def test_live_listing_is_usable(live_device):
 
 
 @pytest.mark.emulator
-def test_live_load_of_a_missing_snapshot_fails(live_device):
+def test_live_load_of_a_missing_snapshot_fails(emulator_only_device):
     """The defect, against the real console. Loading a name that cannot exist
     changes nothing on the device."""
-    success, result = snapshot.SnapshotManager(serial=live_device).load(
+    success, result = snapshot.SnapshotManager(serial=emulator_only_device).load(
         "no_such_snapshot_xyz_from_tests"
     )
     assert success is False, "the real console's KO was read as a successful load"

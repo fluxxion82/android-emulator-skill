@@ -546,10 +546,10 @@ def _navigator_cli(adb_path: str, serial: str, args: list[str]) -> subprocess.Co
 
 
 @pytest.mark.emulator
-def test_live_scroll_search_reaches_an_item_below_the_fold(adb, live_device):
+def test_live_scroll_search_reaches_an_item_below_the_fold(adb, emulator_only_device):
     """'About …' is the last row of Settings on every Android build we have seen."""
     result = _navigator_cli(
-        adb, live_device, ["--find-text", "About", "--scroll-to-find", "--json"]
+        adb, emulator_only_device, ["--find-text", "About", "--scroll-to-find", "--json"]
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -560,10 +560,10 @@ def test_live_scroll_search_reaches_an_item_below_the_fold(adb, live_device):
 
 
 @pytest.mark.emulator
-def test_live_absent_text_reports_the_search_rather_than_a_bare_miss(adb, live_device):
+def test_live_absent_text_reports_the_search_rather_than_a_bare_miss(adb, emulator_only_device):
     result = _navigator_cli(
         adb,
-        live_device,
+        emulator_only_device,
         ["--find-text", "Wormhole Calibration", "--scroll-to-find", "--json"],
     )
 

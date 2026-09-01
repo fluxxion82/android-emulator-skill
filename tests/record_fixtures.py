@@ -41,6 +41,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -76,6 +77,17 @@ class Fixture:
         timeout: Per-fixture bound on the adb call.
         post: Optional transform applied to the captured text before it is
             written. It may raise CaptureError to reject a bad capture.
+        prepare: Optional callable run before capture, given (scratch_dir,
+            serial). For binary payloads: adb's text mode would corrupt them,
+            and a device-side ``>`` redirect runs as the wrong uid under
+            ``run-as`` (measured: it yields a 0-byte file).
+        host_argv: Optional HOST command to capture instead of an adb call, as
+            a format string list interpolated with ``{tmp}`` (a scratch
+            directory). Needed for the one case where the text a parser
+            consumes is produced on the host rather than the device: `sqlite3`
+            was removed from user builds, so `model_inspector`'s real path
+            pulls the database and runs the host's sqlite3 against it. Use
+            ``setup`` to pull the file first.
     """
 
     name: str
@@ -87,6 +99,8 @@ class Fixture:
     teardown: list[list[str]] = field(default_factory=list)
     timeout: int = DEFAULT_TIMEOUT
     post: Callable[[str], str] | None = None
+    prepare: Callable[[Path, str | None], None] | None = None
+    host_argv: list[str] | None = None
 
 
 class CaptureError(RuntimeError):
@@ -124,6 +138,51 @@ def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) ->
     # dumpsys reports its own internal timeout in-band and still exits 0.
     if "DUMP TIMEOUT" in text:
         raise CaptureError("device-side dumpsys timeout (device is loaded or unhealthy)")
+    return text
+
+
+def _pull_app_database(scratch: Path, serial: str | None) -> None:
+    """Copy the fixture app's database to the host, byte for byte.
+
+    `adb exec-out` rather than a device-side redirect: `run-as ... cat > /sdcard/x`
+    runs the redirect as the shell uid while `cat` runs as the app uid, and the
+    measured result is a 0-byte file. exec-out streams the bytes straight to the
+    host with no pty and no intermediate file.
+    """
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += ["exec-out", "run-as", "com.example.composefixture", "cat", "databases/fixture.db"]
+
+    result = subprocess.run(cmd, capture_output=True, timeout=DEFAULT_TIMEOUT, check=False)
+    if result.returncode != 0 or not result.stdout:
+        raise CaptureError(
+            "could not read the fixture app's database. Install it first:\n"
+            "  cd tests/fixtures/scaffold/compose && gradle :app:installDebug\n"
+            "then launch it once so DefaultActivity seeds the data dir."
+        )
+    (scratch / "fx.db").write_bytes(result.stdout)
+
+
+def _run_host(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Run a command on the HOST and return its output.
+
+    For the one case where the text a parser consumes is not produced by adb:
+    `sqlite3` is absent from Android user builds (verified missing on API 35),
+    so `model_inspector`'s working path pulls the database and runs the host's
+    sqlite3 against it. Recording the adb call instead would capture the pull,
+    not the schema the parser actually reads.
+    """
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError as exc:
+        raise CaptureError(f"{argv[0]} is not installed on this host") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CaptureError(f"timed out after {timeout}s") from exc
+
+    text = result.stdout if result.stdout.strip() else result.stderr
+    if not text.strip():
+        raise CaptureError(f"{' '.join(argv)} produced no output")
     return text
 
 
@@ -696,6 +755,47 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="shared_prefs_settings_xml",
+        args=[
+            "shell",
+            "run-as com.example.composefixture cat shared_prefs/fixture_settings.xml",
+        ],
+        description=(
+            "Real SharedPreferences XML from the Compose fixture app, covering "
+            "every type Android encodes differently: string, int, long, float, "
+            "boolean and a string set. A parser that only ever saw <string> is "
+            "a parser that has not been tested -- and the hand-written sample "
+            "this replaces had exactly that shape. Note the set is nested "
+            "<string> children rather than an attribute, and the entries are "
+            "not in insertion order."
+        ),
+    ),
+    Fixture(
+        name="run_as_ls_databases",
+        args=["shell", "run-as com.example.composefixture ls -la databases"],
+        description=(
+            "The databases directory. Carries the -journal file alongside the "
+            "database, which anything listing databases has to not offer as a "
+            "database."
+        ),
+    ),
+    Fixture(
+        name="sqlite_schema_host",
+        args=[],
+        prepare=_pull_app_database,
+        host_argv=["sqlite3", "{tmp}/fx.db", ".schema"],
+        description=(
+            "`sqlite3 .schema` of a real Android app database. Recorded on the "
+            "HOST because sqlite3 is absent from Android user builds -- "
+            "verified missing on API 35 -- so model_inspector's working path is "
+            "pull-then-host-sqlite3, and the adb call would capture the pull "
+            "rather than the schema. Contains what a hand-written schema omits: "
+            "android_metadata and sqlite_sequence, AUTOINCREMENT, a composite "
+            "FOREIGN KEY ... ON DELETE CASCADE, and separate CREATE INDEX "
+            "statements including a UNIQUE one."
+        ),
+    ),
+    Fixture(
         name="emu_help",
         args=["emu", "help"],
         description=(
@@ -1020,13 +1120,19 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         )
         print(f"  ok    {path.name} ({size} bytes)")
 
+    scratch = Path(tempfile.mkdtemp(prefix="android_emu_record_"))
+
     for fixture in selected:
         for cmd in fixture.setup:
-            _run(cmd, serial)
+            _run([a.format(tmp=scratch) for a in cmd], serial)
+        if fixture.prepare is not None:
+            fixture.prepare(scratch, serial)
         try:
-            text = _redact_private_packages(
-                _strip_cr(_run(fixture.args, serial, fixture.timeout)), redactions
-            )
+            if fixture.host_argv is not None:
+                raw = _run_host([a.format(tmp=scratch) for a in fixture.host_argv])
+            else:
+                raw = _run(fixture.args, serial, fixture.timeout)
+            text = _redact_private_packages(_strip_cr(raw), redactions)
             if fixture.post is not None:
                 text = fixture.post(text)
         except CaptureError as exc:
@@ -1038,7 +1144,11 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                 _run(cmd, serial)
         _record_one(
             fixture.name,
-            "adb " + " ".join(fixture.args),
+            (
+                " ".join(fixture.host_argv)
+                if fixture.host_argv is not None
+                else "adb " + " ".join(fixture.args)
+            ),
             fixture.description,
             list(fixture.catches),
             text,

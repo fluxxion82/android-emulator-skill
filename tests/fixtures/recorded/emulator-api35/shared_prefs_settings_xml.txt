@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <int name="launch_count" value="7" />
+    <float name="playback_speed" value="1.25" />
+    <set name="enabled_flags">
+        <string>compose</string>
+        <string>telemetry</string>
+    </set>
+    <string name="display_name">Fixture User</string>
+    <long name="last_sync_epoch_ms" value="1788280000000" />
+    <boolean name="dark_theme" value="true" />
+</map>

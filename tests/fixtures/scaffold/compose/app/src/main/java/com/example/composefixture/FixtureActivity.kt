@@ -1,5 +1,8 @@
 package com.example.composefixture
 
+import android.content.ContentValues
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -47,6 +50,7 @@ import androidx.compose.ui.unit.dp
 class DefaultActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        seedContainerFixtures(this)
         setContent {
             MaterialTheme {
                 FixtureScreen(rootModifier = Modifier)
@@ -205,4 +209,73 @@ private fun FixtureScreen(rootModifier: Modifier) {
 @Composable
 private fun Box24(color: Color) {
     Column(modifier = Modifier.size(24.dp).background(color)) {}
+}
+
+
+/**
+ * Give the app a data dir worth inspecting: SharedPreferences and a database.
+ *
+ * `container.py` and `model_inspector.py` read an app's sandbox over
+ * `run-as` -- the XML under `shared_prefs/` and `sqlite3 .schema`. Neither had any
+ * recorded fixture, so both were tested against hand-written samples: the
+ * repo's defining bug, in scripts written after the defect register named it.
+ * A fixture app with an empty data dir cannot produce ground truth, so this
+ * seeds one.
+ *
+ * Everything written here is synthetic. The fixtures are committed to a public
+ * repository, so nothing may come from the device or the user.
+ *
+ * The preferences deliberately cover every type Android encodes differently in
+ * the XML -- string, int, long, float, boolean and a string set -- because a
+ * parser that only ever saw `<string>` is a parser that has not been tested.
+ */
+fun seedContainerFixtures(context: Context) {
+    context.getSharedPreferences("fixture_settings", Context.MODE_PRIVATE)
+        .edit()
+        .putString("display_name", "Fixture User")
+        .putInt("launch_count", 7)
+        .putLong("last_sync_epoch_ms", 1788280000000L)
+        .putFloat("playback_speed", 1.25f)
+        .putBoolean("dark_theme", true)
+        .putStringSet("enabled_flags", setOf("compose", "telemetry"))
+        .commit()
+
+    val database: SQLiteDatabase =
+        context.openOrCreateDatabase("fixture.db", Context.MODE_PRIVATE, null)
+    database.use { db ->
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reference TEXT NOT NULL,
+                total_cents INTEGER NOT NULL DEFAULT 0,
+                placed_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_order_items_order_id ON order_items(order_id)")
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_orders_reference ON orders(reference)")
+
+        db.delete("orders", null, null)
+        db.insert(
+            "orders",
+            null,
+            ContentValues().apply {
+                put("reference", "ORD-4821")
+                put("total_cents", 2599)
+                put("placed_at", 1788279000000L)
+            },
+        )
+    }
 }
