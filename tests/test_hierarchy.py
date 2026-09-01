@@ -143,10 +143,24 @@ def test_capture_returns_the_parsed_root(fake_dump):
 
 
 def test_capture_tolerates_the_status_line_around_the_xml(fake_dump):
-    """uiautomator prints its own line; the XML must be extracted from it."""
-    payload = _recorded("uiautomator_compose_default") + "\nUI hierchary dumped to: /dev/tty"
-    fake_dump(payload)
+    """uiautomator prints its own line; the XML must be extracted from it.
+
+    Reads the raw dump rather than appending the status line by hand. Written
+    by hand it was `xml + "\\nUI hierchary dumped to: /dev/tty"` -- and the
+    device emits **no newline** there, appending the status line straight onto
+    `</hierarchy>`. Small, but it is guessed tool output in the one repo whose
+    defining bug is guessed tool output.
+    """
+    fake_dump(_recorded("uiautomator_dump_raw"))
     assert hierarchy.capture_hierarchy("emulator-5554").tag == "hierarchy"
+
+
+def test_the_recorded_dump_really_has_no_newline_before_its_status_line():
+    """Pins the premise of the test above, so it cannot silently stop holding."""
+    raw = _recorded("uiautomator_dump_raw")
+    assert (
+        "</hierarchy>UI hierchary dumped to:" in raw
+    ), "the status line is no longer glued to the XML; re-check the extraction"
 
 
 def test_a_dump_with_no_xml_is_an_error_not_an_empty_tree(fake_dump):

@@ -410,6 +410,22 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="logcat_crash_loop",
+        args=["logcat", "-b", "crash", "-d", "-t", "200"],
+        description=(
+            "A real crash LOOP: the same app crashed three times. Recorded "
+            "because the multi-block behaviour was previously exercised by "
+            "cloning the single-crash fixture, which cannot prove how the "
+            "device actually frames repeats. Measured here: three "
+            "'FATAL EXCEPTION' blocks, exactly ONE "
+            "'--------- beginning of crash' separator (the reader prints it "
+            "once per dump, not once per crash), and a distinct PID per "
+            "repeat. So blocks are delimited by 'FATAL EXCEPTION' and never by "
+            "the separator, and PID/timestamp must stay out of any dedup key "
+            "or one crash loop becomes N separate faults."
+        ),
+    ),
+    Fixture(
         name="emu_sms_send",
         args=["emu", "sms", "send", "+15551234567", "Your code is 428193"],
         description=(
@@ -508,6 +524,22 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="content_query_sms_date_in_body",
+        args=[
+            "shell",
+            "content query --uri content://sms/inbox --projection address:body:date",
+        ],
+        description=(
+            "An inbox whose newest body contains a literal 'date=' -- the one "
+            "case sms.py's parser claimed to survive with no ground truth "
+            "behind the claim. Values are ', '-separated key=value pairs, so a "
+            "body reading 'Meeting moved, date=2026-09-15, code 5521' can "
+            "swallow the real trailing date= field if the parser splits "
+            "greedily on the first match rather than bounding each value by "
+            "the next projection key."
+        ),
+    ),
+    Fixture(
         name="emu_avd_snapshot_list",
         args=["emu", "avd", "snapshot", "list"],
         description=(
@@ -526,6 +558,22 @@ FIXTURES: list[Fixture] = [
             "snapshot that does not exist, and the test that follows runs "
             "against whatever state the emulator happened to be in. Same class "
             "of trap as `am broadcast` always printing 'result=0'."
+        ),
+    ),
+    Fixture(
+        name="uiautomator_dump_raw",
+        args=["exec-out", "uiautomator", "dump", "/dev/tty"],
+        ext="txt",
+        description=(
+            "The dump exactly as `exec-out` delivers it, status line included. "
+            "The existing uiautomator_* fixtures hold only the XML, so the "
+            "framing was never recorded and tests asserted it as an inline "
+            "literal -- guessing tool output, the exact mistake this corpus "
+            "exists to prevent. The measured shape: uiautomator appends "
+            "'UI hierchary dumped to: /dev/tty' (Android's typo, not ours) "
+            "directly onto the XML with NO separating newline, on stdout. A "
+            "test that writes it with a '\\n' is testing something the device "
+            "never produces."
         ),
     ),
     Fixture(

@@ -201,6 +201,35 @@ def test_repeated_crash_is_one_group_with_a_count(recorded):
     assert [crash.pid for crash in groups[0].occurrences] == [5731, 9042]
 
 
+def test_a_real_crash_loop_is_one_group(recorded):
+    """The same assertion as above, against output the device actually produced.
+
+    The test above builds its second block by cloning the first. That proves
+    the parser splits what it is given; it cannot prove the device frames
+    repeats that way. `logcat_crash_loop` is a recorded dump of one app
+    crashing three times, and it settles two things a clone cannot:
+
+    - three `FATAL EXCEPTION` blocks arrive under exactly ONE
+      `--------- beginning of crash` separator, so the separator is printed
+      once per dump and must never be used as the block delimiter;
+    - every repeat carries a different PID, so a dedup key including PID would
+      report one crash loop as three unrelated faults.
+    """
+    text = recorded.text("logcat_crash_loop")
+
+    assert (
+        text.count("--------- beginning of crash") == 1
+    ), "the recorded loop no longer has a single separator; re-check splitting"
+
+    crashes = parse_crash_buffer(text)
+    assert len(crashes) == 3, f"expected 3 crashes from the recorded loop, got {len(crashes)}"
+    assert len({crash.pid for crash in crashes}) == 3, "repeats should each have their own PID"
+
+    groups = group_crashes(crashes)
+    assert len(groups) == 1, f"one app crashing three times became {len(groups)} groups"
+    assert groups[0].count == 3
+
+
 def test_a_restarted_process_does_not_split_the_group(recorded):
     """PID and timestamp change on every repeat, so neither may be in the key."""
     text = recorded.text(FIXTURE)

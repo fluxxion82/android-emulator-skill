@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-01T16:26:53Z",
+  "recorded_at": "2026-09-01T17:02:31Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -75,6 +75,14 @@
       "description": "What `content query` prints for an empty cursor: 'No result found.' on stdout, exit 0, nothing on stderr. Recorded against sms/sent, which is empty unless something has sent from the device. This is the string that distinguishes an EMPTY inbox from an UNREADABLE one (content_query_sms_error) -- 'the message did not arrive' and 'the inbox could not be read' are different answers and must not be reported as the same one.",
       "catches": [],
       "bytes": 17
+    },
+    {
+      "name": "content_query_sms_date_in_body",
+      "file": "content_query_sms_date_in_body.txt",
+      "command": "adb shell content query --uri content://sms/inbox --projection address:body:date",
+      "description": "An inbox whose newest body contains a literal 'date=' -- the one case sms.py's parser claimed to survive with no ground truth behind the claim. Values are ', '-separated key=value pairs, so a body reading 'Meeting moved, date=2026-09-15, code 5521' can swallow the real trailing date= field if the parser splits greedily on the first match rather than bounding each value by the next projection key.",
+      "catches": [],
+      "bytes": 1687
     },
     {
       "name": "content_query_sms_error",
@@ -193,6 +201,14 @@
       "bytes": 1470
     },
     {
+      "name": "logcat_crash_loop",
+      "file": "logcat_crash_loop.txt",
+      "command": "adb logcat -b crash -d -t 200",
+      "description": "A real crash LOOP: the same app crashed three times. Recorded because the multi-block behaviour was previously exercised by cloning the single-crash fixture, which cannot prove how the device actually frames repeats. Measured here: three 'FATAL EXCEPTION' blocks, exactly ONE '--------- beginning of crash' separator (the reader prints it once per dump, not once per crash), and a distinct PID per repeat. So blocks are delimited by 'FATAL EXCEPTION' and never by the separator, and PID/timestamp must stay out of any dedup key or one crash loop becomes N separate faults.",
+      "catches": [],
+      "bytes": 4355
+    },
+    {
       "name": "logcat_threadtime",
       "file": "logcat_threadtime.txt",
       "command": "adb logcat -d -v threadtime -t 200",
@@ -251,6 +267,14 @@
         "S7"
       ],
       "bytes": 23465
+    },
+    {
+      "name": "uiautomator_dump_raw",
+      "file": "uiautomator_dump_raw.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "The dump exactly as `exec-out` delivers it, status line included. The existing uiautomator_* fixtures hold only the XML, so the framing was never recorded and tests asserted it as an inline literal -- guessing tool output, the exact mistake this corpus exists to prevent. The measured shape: uiautomator appends 'UI hierchary dumped to: /dev/tty' (Android's typo, not ours) directly onto the XML with NO separating newline, on stdout. A test that writes it with a '\\n' is testing something the device never produces.",
+      "catches": [],
+      "bytes": 10927
     },
     {
       "name": "wm_density_override",

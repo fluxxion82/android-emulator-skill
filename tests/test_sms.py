@@ -185,6 +185,40 @@ def test_every_parsed_field_reassembles_into_the_recorded_line(recorded):
         ), f"parsed fields do not reassemble into the recorded line: {segment!r}"
 
 
+DATE_IN_BODY = "content_query_sms_date_in_body"
+
+
+def test_a_body_containing_date_equals_does_not_eat_the_real_date(recorded):
+    """The worst case the format allows, recorded rather than imagined.
+
+    `sms.py` claimed to survive a body containing a literal `date=`, but no
+    fixture held one -- the claim rested on constructed stress input, which is
+    the shape of assumption this corpus exists to replace. So a message was
+    actually sent through the emulator console and the inbox re-read:
+
+        Row: 0 address=+15550007777, body=Meeting moved, date=2026-09-15,
+        code 5521, date=1788282145694
+
+    A parser that stops the body at the first `date=` truncates it and then
+    reads `2026-09-15` as the timestamp; one that runs greedily to the last
+    `, ` swallows the real date into the body.
+    """
+    messages = sms.parse_inbox(recorded.text(DATE_IN_BODY))
+    assert messages, "the recorded inbox parsed to nothing"
+
+    embedded = [m for m in messages if "date=" in m.body]
+    assert embedded, (
+        f"{DATE_IN_BODY} no longer contains a body with 'date=' in it, so this "
+        f"test proves nothing. Re-record it: "
+        f"python tests/record_fixtures.py --only {DATE_IN_BODY}"
+    )
+
+    message = embedded[0]
+    assert message.body == "Meeting moved, date=2026-09-15, code 5521"
+    assert message.date == 1788282145694, f"the real trailing date= was lost; got {message.date}"
+    assert message.address == "+15550007777"
+
+
 def test_body_containing_the_pair_separator_survives_parsing(recorded):
     """The comma case, from the recorded inbox rather than a constructed one."""
     messages = sms.parse_inbox(recorded.text(INBOX_MANY))
