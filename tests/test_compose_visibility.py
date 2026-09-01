@@ -196,3 +196,47 @@ def test_bounds_are_required_so_zero_size_nodes_are_not_offered():
     )
     analysis = ScreenMapper().analyze_tree(zero)
     assert analysis["interactive_elements"] == 0
+
+
+# ---------------------------------------------------------------------------
+# S8 — the unlabelled-field check must use information that actually exists.
+# ---------------------------------------------------------------------------
+
+
+def test_a_field_described_by_a_child_label_is_not_flagged():
+    """`hint` is not an attribute uiautomator emits, so it was always absent.
+
+    The check read `attrs.get("hint", "")`, which is empty on every node in
+    every recorded dump, so the condition collapsed to "this field is empty" --
+    flagging every correctly-hinted empty field. The Compose TextField here IS
+    labelled: 'Email address' sits in its subtree. It must not be reported.
+    """
+    from accessibility_audit import AccessibilityAuditor
+
+    from common.device_utils import _xml_to_dict
+
+    auditor = AccessibilityAuditor()
+    auditor.density = 420
+    auditor.audit_tree(_xml_to_dict(_root("uiautomator_compose_default")))
+
+    flagged = [i for i in auditor.issues if i["type"] == "edittext_missing_hint"]
+    assert (
+        not flagged
+    ), f"a field labelled 'Email address' by its child was flagged as unlabelled: {flagged}"
+
+
+def test_a_genuinely_unlabelled_field_is_still_flagged():
+    """Guard against deleting the check rather than fixing it."""
+    from accessibility_audit import AccessibilityAuditor
+
+    from common.device_utils import _xml_to_dict
+
+    bare = ET.fromstring(
+        '<hierarchy><node class="android.widget.EditText" clickable="true" enabled="true" '
+        'text="" content-desc="" resource-id="" bounds="[0,0][400,120]" /></hierarchy>'
+    )
+    auditor = AccessibilityAuditor()
+    auditor.density = 420
+    auditor.audit_tree(_xml_to_dict(bare))
+
+    assert any(i["type"] == "edittext_missing_hint" for i in auditor.issues)

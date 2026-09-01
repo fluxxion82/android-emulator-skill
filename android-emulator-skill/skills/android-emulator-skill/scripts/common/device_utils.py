@@ -282,6 +282,75 @@ def list_devices(device_type: str | None = None, state: str | None = None) -> li
     return devices
 
 
+# `wm size` / `wm density` report a Physical line always, and an Override line
+# only when one is set. The override is the EFFECTIVE value: uiautomator reports
+# element bounds in it, so a parser that reads only Physical scales every tap by
+# the wrong ratio (S9).
+_PHYSICAL_SIZE_RE = re.compile(r"Physical size:\s*(\d+)x(\d+)")
+_OVERRIDE_SIZE_RE = re.compile(r"Override size:\s*(\d+)x(\d+)")
+_PHYSICAL_DENSITY_RE = re.compile(r"Physical density:\s*(\d+)")
+_OVERRIDE_DENSITY_RE = re.compile(r"Override density:\s*(\d+)")
+
+
+def parse_display_size(output: str) -> tuple[int, int]:
+    """Return the effective (width, height) from ``wm size`` output.
+
+    Prefers ``Override size:`` when present, because that is the resolution the
+    device is actually rendering -- and therefore the one uiautomator reports
+    bounds in.
+
+    Args:
+        output: Raw stdout of ``adb shell wm size``.
+
+    Returns:
+        (width, height) in pixels.
+
+    Raises:
+        RuntimeError: If neither line is present.
+
+    Example:
+        >>> parse_display_size("Physical size: 1080x2424\nOverride size: 1080x2400")
+        (1080, 2400)
+    """
+    match = _OVERRIDE_SIZE_RE.search(output) or _PHYSICAL_SIZE_RE.search(output)
+    if not match:
+        raise RuntimeError(f"Could not parse a screen size from `wm size`: {output.strip()!r}")
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def parse_display_density(output: str) -> int:
+    """Return the effective dpi from ``wm density`` output.
+
+    Prefers ``Override density:`` for the same reason as :func:`parse_display_size`.
+
+    Args:
+        output: Raw stdout of ``adb shell wm density``.
+
+    Returns:
+        Dots per inch.
+
+    Raises:
+        RuntimeError: If neither line is present.
+    """
+    match = _OVERRIDE_DENSITY_RE.search(output) or _PHYSICAL_DENSITY_RE.search(output)
+    if not match:
+        raise RuntimeError(f"Could not parse a density from `wm density`: {output.strip()!r}")
+    return int(match.group(1))
+
+
+def get_device_density(serial: str | None = None) -> int:
+    """Query the device's effective screen density in dpi.
+
+    Args:
+        serial: Device serial (uses the default device if None).
+
+    Returns:
+        Dots per inch, honouring an active override.
+    """
+    result = run_adb("shell", serial, "wm", "density", check=True)
+    return parse_display_density(result.stdout)
+
+
 def get_device_screen_size(serial: str | None = None) -> tuple:
     """
     Get actual screen dimensions for device.
@@ -301,17 +370,7 @@ def get_device_screen_size(serial: str | None = None) -> tuple:
     try:
         result = run_adb("shell", serial, "wm", "size", check=True)
 
-        # Parse output
-        # Format: Physical size: 1080x1920
-        match = re.search(r"Physical size: (\d+)x(\d+)", result.stdout)
-        if match:
-            width = int(match.group(1))
-            height = int(match.group(2))
-            return (width, height)
-
-        raise RuntimeError(
-            f"Could not parse a screen size from `wm size`: {result.stdout.strip()!r}"
-        )
+        return parse_display_size(result.stdout)
 
     except AdbError:
         # Deliberately NOT a fallback. Callers derive tap and swipe coordinates

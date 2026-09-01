@@ -144,28 +144,38 @@ def test_physical_fixture_has_no_override(recorded):
     ), "physical fixture is polluted by a leftover override — re-record it"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "S9: device_utils matches only 'Physical size:'. When an override is "
-        "active, uiautomator reports bounds in the OVERRIDE resolution while "
-        "taps are computed against the physical one, so every coordinate is "
-        "wrong by the ratio. The parser must prefer Override when present."
-    ),
-)
 def test_effective_screen_size_prefers_override(recorded):
-    """The size a tap is computed against must be the effective one."""
-    text = recorded.text("wm_size_override")
-    physical = _PHYSICAL_SIZE_RE.search(text)
-    override = _OVERRIDE_SIZE_RE.search(text)
-    assert physical.groups() != override.groups(), "fixture needs distinct values"
+    """The size a tap is computed against must be the effective one.
 
-    # This mirrors what device_utils does today: first Physical match wins.
-    parsed = _PHYSICAL_SIZE_RE.search(text).groups()
-    assert parsed == override.groups(), (
-        f"parsed physical {parsed} but the effective resolution is "
-        f"{override.groups()}; coordinates will be scaled wrongly"
-    )
+    With an override active, uiautomator reports element bounds in the OVERRIDE
+    resolution while a parser reading only "Physical size:" scales taps against
+    the physical one, so every coordinate is wrong by the ratio.
+    """
+    from common.device_utils import parse_display_size
+
+    text = recorded.text("wm_size_override")
+    physical = tuple(int(g) for g in _PHYSICAL_SIZE_RE.search(text).groups())
+    override = tuple(int(g) for g in _OVERRIDE_SIZE_RE.search(text).groups())
+    assert physical != override, "fixture needs distinct values to prove anything"
+
+    assert parse_display_size(text) == override
+
+
+def test_physical_size_is_used_when_no_override_is_set(recorded):
+    """Guard against always preferring a line that is usually absent."""
+    from common.device_utils import parse_display_size
+
+    text = recorded.text("wm_size_physical")
+    expected = tuple(int(g) for g in _PHYSICAL_SIZE_RE.search(text).groups())
+    assert parse_display_size(text) == expected
+
+
+def test_effective_density_prefers_override(recorded):
+    """Same defect, same shape, for the density the dp conversion needs."""
+    from common.device_utils import parse_display_density
+
+    assert parse_display_density(recorded.text("wm_density_override")) == 560
+    assert parse_display_density(recorded.text("wm_density_physical")) == 420
 
 
 # ---------------------------------------------------------------------------
@@ -198,30 +208,40 @@ def test_recorded_hierarchy_bounds_are_pixels_not_dp(recorded):
     assert max(bounds) <= width_px, f"bound {max(bounds)} exceeds physical width {width_px}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "S7: accessibility_audit compares uiautomator bounds (PIXELS) against "
-        "MIN_TOUCH_TARGET_SIZE = 48 (dp) and labels the result 'dp'. At 420dpi "
-        "48dp is 126px, so a real 40dp button (105px) passes. The check only "
-        "fires on targets ~2.6x too small. Convert px->dp using wm density, "
-        "honouring Override density when set."
-    ),
-)
 def test_touch_target_threshold_is_converted_to_pixels(recorded):
-    """48dp must become a pixel threshold before being compared to bounds."""
+    """48dp must become a pixel threshold before being compared to bounds.
+
+    uiautomator reports bounds in physical PIXELS. Comparing them against the
+    literal 48 meant the check only fired on elements ~2.6x too small at 420dpi,
+    and its message called the pixel figures "dp".
+    """
     from accessibility_audit import AccessibilityAuditor
 
     density = int(
         re.search(r"Physical density: (\d+)", recorded.text("wm_density_physical")).group(1)
     )
-    expected_px = 48 * (density / 160)
+    auditor = AccessibilityAuditor()
+    auditor.density = density
 
-    threshold = AccessibilityAuditor.MIN_TOUCH_TARGET_SIZE
-    assert threshold == pytest.approx(expected_px, rel=0.01), (
-        f"threshold is {threshold} (a raw dp number) but bounds are in pixels; "
-        f"at density {density} it should be {expected_px:.0f}px"
+    assert auditor.min_touch_target_px() == pytest.approx(48 * (density / 160), rel=0.01)
+
+
+def test_a_genuinely_small_target_is_reported(recorded):
+    """The check has to actually fire; before, it almost never did.
+
+    At 420dpi a 100x100px control is ~38dp -- clearly under the 48dp minimum --
+    yet 100 > 48 so the old comparison passed it.
+    """
+    from accessibility_audit import AccessibilityAuditor
+
+    density = int(
+        re.search(r"Physical density: (\d+)", recorded.text("wm_density_physical")).group(1)
     )
+    auditor = AccessibilityAuditor()
+    auditor.density = density
+    assert (
+        auditor.min_touch_target_px() > 100
+    ), "a 100px control at 420dpi is ~38dp and must be flagged"
 
 
 # ---------------------------------------------------------------------------
