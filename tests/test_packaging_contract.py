@@ -267,3 +267,47 @@ def test_release_validation_fails_rather_than_warns():
     for manifest in ("plugin.json", "marketplace.json", "SKILL.md"):
         assert manifest in workflow, f"release validation does not check {manifest}"
     assert workflow.count("exit 1") >= 4, "version drift should fail the release, not warn"
+
+
+def test_commit_trailers_are_rejected_by_a_hook_not_just_a_style_note():
+    """The no-trailers rule must stay enforced, not merely documented.
+
+    Adding `Co-Authored-By` is a default in several tools, so the rule gets
+    re-broken by things that are not paying attention -- it has already come
+    back once mid-session after being agreed. A note in CLAUDE.md cannot stop
+    that; a commit-msg hook can. Guarded here because the hook is a few lines
+    of YAML away from being deleted.
+    """
+    import yaml
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    hooks = [hook for repo in config["repos"] for hook in repo.get("hooks", [])]
+    trailer_hook = next((h for h in hooks if h.get("id") == "no-commit-trailers"), None)
+
+    assert trailer_hook is not None, "the commit-msg trailer hook is gone"
+    assert "commit-msg" in trailer_hook.get(
+        "stages", []
+    ), "the trailer hook no longer runs at the commit-msg stage, so it never fires"
+    assert (REPO_ROOT / ".github" / "scripts" / "check-commit-trailers.py").exists()
+
+
+def test_the_trailer_check_actually_rejects_a_trailer(tmp_path):
+    """A hook that accepts everything would satisfy the test above."""
+    import subprocess
+    import sys
+
+    script = REPO_ROOT / ".github" / "scripts" / "check-commit-trailers.py"
+
+    bad = tmp_path / "bad"
+    bad.write_text("feat: x\n\nBody.\n\nCo-Authored-By: A <a@b.c>\n", encoding="utf-8")
+    rejected = subprocess.run(
+        [sys.executable, str(script), str(bad)], capture_output=True, text=True, check=False
+    )
+    assert rejected.returncode != 0, "a Co-Authored-By trailer was accepted"
+
+    good = tmp_path / "good"
+    good.write_text("feat: x\n\nBody.\n", encoding="utf-8")
+    accepted = subprocess.run(
+        [sys.executable, str(script), str(good)], capture_output=True, text=True, check=False
+    )
+    assert accepted.returncode == 0, f"a clean message was rejected: {accepted.stderr}"

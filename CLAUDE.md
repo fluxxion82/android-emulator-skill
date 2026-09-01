@@ -129,6 +129,27 @@ dependency is missing protects nothing.
 4. Never `shell=True`; pass explicit `check=` to `subprocess.run`.
 5. `--help` and `--json` on every script; update `SKILL.md` when adding scripts.
 
+## Commit messages: no trailers
+
+Commit messages end at their last content line. **No `Co-Authored-By:`, no
+`Signed-off-by:`, no generated-with footer.** The same goes for PR bodies.
+
+This is enforced by a `commit-msg` hook rather than left as a note, because
+adding `Co-Authored-By` is a *default* in several tools and assistants — it
+comes back on its own, and something that reapplies itself needs a check that
+reapplies itself too. Install it (the `commit-msg` stage is **not** covered by
+a plain `pre-commit install`):
+
+```bash
+pre-commit install && pre-commit install --hook-type commit-msg
+```
+
+To strip a trailer from a commit that already has one:
+
+```bash
+git log -1 --pretty=%B | grep -vE '^(Co-Authored-By|Signed-off-by):' | git commit --amend -F -
+```
+
 ## Token efficiency
 
 Default output is intentionally minimal (a few lines). Use `--verbose` for human detail and
