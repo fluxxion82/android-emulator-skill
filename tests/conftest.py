@@ -140,6 +140,29 @@ def recorded() -> RecordedFixtures:
     return RecordedFixtures(RECORDED_DIR)
 
 
+@pytest.fixture(scope="session")
+def recorded_anywhere():
+    """Look a fixture up in whichever profile recorded it.
+
+    For output produced by the *host* adb client rather than by a device --
+    "error: device 'x' not found", for instance -- which is identical whatever
+    is attached and so has no natural device profile. Still fails loudly when
+    the fixture exists nowhere, rather than skipping.
+    """
+
+    def _find(name: str) -> str:
+        for profile in _available_profiles():
+            accessor = RecordedFixtures(RECORDED_ROOT / profile)
+            if accessor.has(name):
+                return accessor.text(name)
+        pytest.fail(
+            f"Recorded fixture '{name}' is missing from every profile.\n"
+            f"Record it with: python tests/record_fixtures.py --only {name}"
+        )
+
+    return _find
+
+
 @pytest.fixture(params=_available_profiles())
 def any_profile(request) -> RecordedFixtures:
     """Each recorded device profile in turn.
