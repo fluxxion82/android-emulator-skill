@@ -2,39 +2,33 @@
 """
 Android crash triage from the dedicated crash log buffer.
 
-Why a separate buffer matters
------------------------------
-``adb logcat -b crash -d`` reads Android's dedicated *crash* buffer. That is the
-whole point of this script: the trace arrives already isolated, so triage does
-not mean grepping the main buffer for ``FATAL EXCEPTION`` and hoping the
-surrounding lines belong to the same crash. Everything in that buffer is a
-crash report, in order, with nothing interleaved.
+``adb logcat -b crash -d`` reads Android's dedicated *crash* buffer, so a trace
+arrives already isolated: triage does not mean grepping the main buffer for
+``FATAL EXCEPTION`` and hoping the surrounding lines belong to the same crash.
 
-What was measured (emulator-5554, API 35), not assumed
-------------------------------------------------------
+Measured on emulator-5554 / API 35, not assumed:
+
 - The buffer prints one ``--------- beginning of crash`` separator at the top of
-  a dump, and *only one*, no matter how many crashes follow.
-- A Java crash block is: ``FATAL EXCEPTION: <thread>``, ``Process: <pkg>, PID:
-  <n>``, the exception class (with an optional ``: message``), then the indented
-  ``at ...`` frame list — the only multi-line part.
-- Repeated crashes append further blocks back to back, with no blank line
-  between them. A crash loop restarts the process, so each repeat carries a new
-  PID and timestamp while the exception, package and frames stay identical.
-  This is why PID and timestamp are deliberately *not* part of the dedup key.
+  a dump and *only one*, however many crashes follow -- so blocks are delimited
+  by ``FATAL EXCEPTION`` lines, never by the separator.
+- A Java crash block is ``FATAL EXCEPTION: <thread>``, ``Process: <pkg>, PID:
+  <n>``, the exception class (optionally ``: message``), then the indented
+  ``at ...`` frames -- the only multi-line part.
+- Repeated crashes append further blocks back to back with no blank line. A
+  crash loop restarts the process, so each repeat carries a new PID and
+  timestamp while exception, package and frames stay identical: PID and
+  timestamp are therefore deliberately *not* part of the dedup key.
 - On a device that has not crashed the dump is zero lines and exits 0. Empty is
-  a healthy answer, reported as "no crashes" — never as an error.
+  a healthy answer, reported as "no crashes" -- never as an error.
 - ``adb logcat -b crash -c`` clears the buffer, prints nothing, exits 0.
-- ``-v threadtime`` is passed explicitly. It was verified to produce byte-identical
-  output to the device default here; passing it pins the format this parser
-  expects rather than inheriting whatever a device's log settings produce.
+- ``-v threadtime`` is passed explicitly. It was verified to produce
+  byte-identical output to the device default here; passing it pins the format
+  this parser expects rather than inheriting a device's log settings.
 
-Scope, stated honestly
-----------------------
-Only ``AndroidRuntime`` lines are parsed into crashes, because that is the shape
-there is recorded evidence for. The crash buffer also carries native crash
-output (``DEBUG`` tombstones, ``libc`` fatal-signal lines) on a native crash;
-this script does not parse those, so it counts them by tag and says so in its
-output rather than silently dropping them.
+Scope: only ``AndroidRuntime`` lines are parsed into crashes, because that is
+the shape there is recorded evidence for. The buffer also carries native crash
+output (``DEBUG`` tombstones, ``libc`` fatal-signal lines); those are counted by
+tag and reported rather than silently dropped.
 
 Usage:
     python scripts/crash_triage.py
@@ -62,8 +56,7 @@ CRASH_TAG = "AndroidRuntime"
 # Text-mode caps (env-configurable via the repo's ANDROID_EMU_ prefix).
 MAX_GROUPS_SHOWN = env_int("ANDROID_EMU_CRASH_MAX_GROUPS", 5, min_value=1)
 MAX_FRAMES_SHOWN = env_int("ANDROID_EMU_CRASH_MAX_FRAMES", 12, min_value=1)
-# A crash dump is small; the default 30s adb budget is ample. Kept configurable
-# because a wedged adb is the failure this repo bounds everywhere else.
+# A crash dump is small; the default 30s adb budget is ample.
 ADB_TIMEOUT = env_int("ANDROID_EMU_CRASH_TIMEOUT", 30, min_value=1)
 
 # Exit statuses. See the --help epilog for why "crashes found" is opt-in.
@@ -71,9 +64,8 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_CRASHES_FOUND = 2
 
-# Package prefixes treated as framework / platform / stdlib rather than app
-# code. Used only as the *fallback* tier of the app-frame heuristic, and named
-# in the output when it fires, so a wrong guess is visible rather than implied.
+# Framework / platform / stdlib prefixes. Only the *fallback* tier of the
+# app-frame heuristic, and named in the output when it fires.
 FRAMEWORK_PREFIXES = (
     "android.",
     "androidx.",
@@ -145,10 +137,9 @@ class FrameChoice:
     """The frame picked for triage, plus *how* it was picked.
 
     ``basis`` is reported to the user so the heuristic is never mistaken for a
-    fact: ``package`` (frame is in the crashing package), ``vendor`` (frame
-    shares the package's first two components — a sibling module), ``non-framework``
-    (nothing matched the app, so the topmost frame outside the platform was
-    taken) or ``none`` (every frame is framework code).
+    fact: ``package`` (in the crashing package), ``vendor`` (shares the package's
+    first two components — a sibling module), ``non-framework`` (nothing matched
+    the app, so the topmost non-platform frame was taken) or ``none``.
     """
 
     frame: Frame | None
@@ -168,9 +159,8 @@ class Crash:
     message: str | None = None
     frames: list[Frame] = field(default_factory=list)
     # AndroidRuntime lines inside the block that are neither header nor frame —
-    # "Caused by:", "... 3 more", suppressed-exception lines. Kept verbatim
-    # rather than parsed into invented fields: none appear in the recorded
-    # fixture, so there is no ground truth to parse them against.
+    # "Caused by:", "... 3 more", suppressed-exception lines. Kept verbatim: none
+    # appear in the recorded fixture, so there is no ground truth to parse them.
     extra_lines: list[str] = field(default_factory=list)
 
     @property
@@ -199,8 +189,8 @@ class BufferScan:
         total_lines: Non-blank lines in the dump.
         other_tags: Counts of log lines carrying a tag this parser does not
             understand — native crash output, chiefly. Surfaced rather than
-            dropped, so "0 crashes" over a buffer full of tombstone lines cannot
-            read as "nothing happened".
+            dropped, so "0 crashes" over a buffer of tombstone lines cannot read
+            as "nothing happened".
         orphan_lines: AndroidRuntime lines seen before any ``FATAL EXCEPTION``,
             i.e. the tail of a trace whose header has rotated out of the buffer.
         unparsed_lines: Lines matching no known shape at all.
@@ -247,10 +237,8 @@ class CrashGroup:
 def scan_crash_buffer(text: str) -> BufferScan:
     """Parse a ``adb logcat -b crash -d`` dump into crashes plus accounting.
 
-    Blocks are delimited by ``FATAL EXCEPTION`` lines, not by the
-    ``--------- beginning of crash`` separator: the separator is printed once per
-    dump by the *reader*, so using it as a boundary would merge every crash in
-    the buffer into one. Verified on API 35 by forcing three crashes and dumping.
+    Blocks are delimited by ``FATAL EXCEPTION`` lines, not by the separator (see
+    the module docstring).
 
     Args:
         text: Raw dump. An empty string is normal (nothing has crashed).
@@ -341,27 +329,23 @@ def select_app_frame(frames: list[Frame], package: str | None) -> FrameChoice:
 
     The heuristic, and what it cannot know:
 
-    1. **Package match** — the topmost frame whose symbol starts with the
-       crashing process's package. This is the only tier that is close to
-       evidence; even it is not certain, because the process name carries a
-       ``:suffix`` for secondary processes (stripped here) and a build's
-       ``applicationIdSuffix`` (``.debug``, ``.staging``) makes the runtime
-       package a *longer* string than the source package, so app frames can fail
-       to match a prefix test.
-    2. **Vendor match** — the topmost frame sharing the package's first two
-       components (``com.example``). Catches library modules of the same app,
-       and will also catch an unrelated artifact published under the same vendor
-       prefix.
-    3. **Non-framework** — no app frame was found, so the topmost frame outside
-       the platform/stdlib prefixes is returned instead. Often a third-party
-       library rather than app code: still the best available lead, but it is
-       *not* the app.
+    1. **Package match** — topmost frame whose symbol starts with the crashing
+       process's package. The only tier close to evidence, and still not certain:
+       the process name carries a ``:suffix`` for secondary processes (stripped
+       here), and an ``applicationIdSuffix`` (``.debug``, ``.staging``) makes the
+       runtime package *longer* than the source package, so app frames can fail a
+       prefix test.
+    2. **Vendor match** — topmost frame sharing the package's first two
+       components (``com.example``). Catches sibling modules of the same app, and
+       also an unrelated artifact under the same vendor prefix.
+    3. **Non-framework** — no app frame found, so the topmost frame outside the
+       platform/stdlib prefixes is returned. Often a third-party library: the
+       best available lead, but *not* the app.
 
-    None of these tiers survive R8/ProGuard obfuscation, where frames carry
-    minified names that may not contain the package at all; nor do they
-    recognise inlined or synthetic frames (``-$$Nest$m…``, ``Unknown Source:0``).
-    The chosen ``basis`` is returned so callers report which tier fired rather
-    than presenting a guess as the answer.
+    No tier survives R8/ProGuard obfuscation, where minified frames may not
+    contain the package at all, and none recognise inlined or synthetic frames
+    (``-$$Nest$m…``, ``Unknown Source:0``). The chosen ``basis`` is returned so
+    callers report which tier fired rather than presenting a guess as the answer.
 
     Args:
         frames: Frames of one crash, topmost first.
@@ -397,15 +381,14 @@ def select_app_frame(frames: list[Frame], package: str | None) -> FrameChoice:
 def crash_signature(crash: Crash) -> tuple[str, str, str]:
     """Dedup key: package, exception class, and the frame that identifies the site.
 
-    Package and exception class are the required identity. The signature frame
-    (the app frame when there is one, else the topmost frame) is included so two
-    genuinely different faults that happen to raise the same exception class in
-    the same app stay separate groups.
+    The signature frame (the app frame when there is one, else the topmost) is
+    included so two different faults raising the same exception class in the same
+    app stay separate groups.
 
-    Deliberately excluded: PID and timestamp, because a crash loop restarts the
-    process and so changes both on every repeat (measured); and the exception
-    *message*, because it commonly carries per-occurrence values (an index, an
-    id, a URL) that would split one fault into N groups of one.
+    Deliberately excluded: PID and timestamp, which a crash loop changes on every
+    repeat (measured); and the exception *message*, which commonly carries
+    per-occurrence values (an index, an id, a URL) that would split one fault
+    into N groups of one.
     """
     choice = select_app_frame(crash.frames, crash.package)
     frame = choice.frame or crash.top_frame
@@ -442,8 +425,7 @@ def matches_package(crash: Crash, package: str) -> bool:
 
     Matches the process name exactly, or a secondary process of it
     (``com.example.app:remote``). Applied post-parse: the crash buffer cannot be
-    filtered by package at the adb level, because the crashing PID is only known
-    after the fact.
+    filtered by package at the adb level.
     """
     if not crash.package:
         return False
@@ -520,9 +502,9 @@ def format_report(report: dict, *, verbose: bool = False) -> str:
 
     if report["crash_count"] == 0:
         lines.append(_format_empty(report, device))
-        # Accounting is printed even here — especially here. "0 crashes" over a
+        # Accounting is printed even here — especially here: "0 crashes" over a
         # buffer full of tombstone lines would otherwise read as "nothing
-        # happened", which is the silent-failure mode this repo exists to stop.
+        # happened".
         lines.extend(_format_accounting(report))
         if verbose:
             lines.append("The crash buffer is not consumed by reading; use --clear to reset it.")

@@ -2,17 +2,11 @@
 """One way to capture the device's UI hierarchy.
 
 Three implementations used to exist -- in ``device_utils``, ``screen_mapper``
-and ``navigator`` -- each dumping to a fixed device path and pulling to a fixed
-host path::
-
-    /sdcard/window_dump.xml -> /tmp/window_dump.xml
-    /sdcard/window_dump.xml -> /tmp/android_window_dump.xml
-    /sdcard/window_dump.xml -> /tmp/android_navigator_dump.xml
-
-Two concurrent invocations, or one run against two devices, silently read each
-other's screen (defect R4). With parallel agents that is the normal case rather
-than an edge one. They also returned two different shapes, so callers could not
-move between them.
+and ``navigator`` -- each dumping to ``/sdcard/window_dump.xml`` and pulling to
+its own fixed host path under ``/tmp``. Two concurrent invocations, or one run
+against two devices, silently read each other's screen (defect R4); with
+parallel agents that is the normal case. They also returned two different
+shapes, so callers could not move between them.
 
 Two things make this module the single implementation:
 
@@ -37,8 +31,8 @@ import xml.etree.ElementTree as ET
 from .adb_exec import AdbError, run_adb
 from .env_config import env_int
 
-# uiautomator waits for the UI to go idle before dumping, which on a busy or
-# animating screen takes considerably longer than an ordinary adb command.
+# uiautomator waits for the UI to go idle before dumping, which on a busy screen
+# takes considerably longer than an ordinary adb command.
 CAPTURE_TIMEOUT = env_int("ANDROID_EMU_UI_DUMP_TIMEOUT", 60, min_value=5)
 
 # Attempts, not retries: 1 means try once and do not retry.
@@ -54,16 +48,12 @@ class HierarchyError(RuntimeError):
     """The UI hierarchy could not be captured or parsed.
 
     Subclasses RuntimeError so the CLI boundaries that already catch it keep
-    working, consistent with :class:`common.adb_exec.AdbError`.
+    working, as :class:`common.adb_exec.AdbError` does.
     """
 
 
 def _extract_xml(payload: str) -> str | None:
-    """Pull the XML document out of uiautomator's stdout.
-
-    uiautomator prints its own status line alongside the document, and with
-    ``exec-out`` both arrive together.
-    """
+    """Pull the XML document out of uiautomator's stdout (the status line comes too)."""
     start = payload.find("<?xml")
     if start == -1:
         start = payload.find("<hierarchy")
@@ -150,9 +140,8 @@ def element_to_dict(element: ET.Element) -> dict:
 
     The contract, per CLAUDE.md: ``{"tag": str, "attributes": {...}, "children":
     [...]}``, with every attribute value left as the string uiautomator emitted.
-    Consumers parse their own types -- ``bounds`` is ``"[l,t][r,b]"`` and
-    booleans are ``"true"``/``"false"`` -- because silently coercing them is how
-    a caller ends up reading a field that is not there.
+    Consumers parse their own types -- ``bounds`` is ``"[l,t][r,b]"``, booleans
+    are ``"true"``/``"false"``.
 
     Args:
         element: A parsed hierarchy element.

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """One entry point for the emulator console (``adb emu``).
 
-Why this exists
----------------
 **`adb emu` exits 0 when the command fails.** Measured on API 35::
 
     $ adb emu avd snapshot load no_such_snapshot_xyz
@@ -11,24 +9,21 @@ Why this exists
     $ echo $?
     0
 
-Failure is visible only in the reply text. Anything that checks the exit status
-reports a successful load of a snapshot that does not exist, and whatever test
-runs next runs against unknown emulator state while reporting a pass. This is
-the same trap as ``am broadcast`` always printing ``result=0``, which is how
-this skill once shipped a push-notification path that could not fail (see
-``push_notification.py``). Centralising the check means a new ``adb emu`` caller
-cannot reintroduce it by forgetting.
+Failure is visible only in the reply text, so anything checking the exit status
+reports a successful load of a snapshot that does not exist and runs on against
+unknown emulator state while reporting a pass. (Same trap as ``am broadcast``
+always printing ``result=0``; see ``push_notification.py``.) Centralising the
+check here means a new ``adb emu`` caller cannot reintroduce it by forgetting.
 
-**The reply is framed, not bare.** Every console reply ends with an ``OK`` line,
-and the transport uses CRLF, so ``adb emu avd name`` returns
-``b"Pixel_9\\r\\nOK\\r\\n"``. A previous version compared ``.strip()`` of that
-against an AVD name -- which yields ``"Pixel_9\\nOK"`` and never matches -- so an
-already-booted emulator was never recognised and a second one was spawned for
+**The reply is framed, not bare.** Every reply ends with an ``OK`` line and the
+transport is CRLF, so ``adb emu avd name`` returns ``b"Pixel_9\\r\\nOK\\r\\n"``.
+``.strip()`` of that yields ``"Pixel_9\\nOK"``, which matches no AVD name -- an
+already-booted emulator therefore went unrecognised and a second was spawned for
 the same AVD (defect S5). :func:`run_emu` returns the payload with the framing
 removed, so callers never see the ``OK``.
 
-**The console is emulator-only.** A physical device has no console; the error
-adb gives for one does not say so in as many words, so it is mapped here.
+**The console is emulator-only.** A physical device has no console, and the
+error adb gives for one does not say so in as many words, so it is mapped here.
 """
 
 from __future__ import annotations
@@ -38,9 +33,8 @@ from dataclasses import dataclass
 from .adb_exec import AdbError, run_adb
 from .env_config import env_int
 
-# Snapshot save/load moves hundreds of MB of guest RAM, so the console can take
-# noticeably longer than an ordinary adb call. Measured at ~3s for a save on an
-# idle API 35 emulator; the ceiling allows for a loaded machine.
+# Snapshot save/load moves hundreds of MB of guest RAM: measured at ~3s for a
+# save on an idle API 35 emulator, and the ceiling allows for a loaded machine.
 CONSOLE_TIMEOUT = env_int("ANDROID_EMU_CONSOLE_TIMEOUT", 120, min_value=5)
 
 # The console's own framing.
@@ -51,9 +45,9 @@ _FAILURE_PREFIX = "KO"
 class EmuConsoleError(AdbError):
     """An `adb emu` command was rejected by the emulator console.
 
-    Subclasses :class:`common.adb_exec.AdbError` so callers that already catch
-    the adb family -- and the CLI boundaries that catch ``RuntimeError`` --
-    handle a console rejection without a separate branch.
+    Subclasses :class:`common.adb_exec.AdbError` so callers that catch the adb
+    family -- and the CLI boundaries that catch ``RuntimeError`` -- handle a
+    console rejection without a separate branch.
     """
 
 
@@ -138,10 +132,6 @@ def run_emu(
     result = run_adb("emu", serial, *args, timeout=timeout or CONSOLE_TIMEOUT)
     raw = _normalise(result.stdout)
 
-    # A physical device has no console. adb's own wording does not say that in
-    # as many words, so an agent reading it would go looking for a broken
-    # emulator.
-    #
     # UNVERIFIED: unlike everything else in this module, the exact wording adb
     # uses here has NOT been measured -- no physical device was attached when
     # this was written, and guessing tool output is the mistake this whole
