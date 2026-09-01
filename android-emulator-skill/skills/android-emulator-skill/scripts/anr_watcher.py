@@ -391,6 +391,8 @@ class AnrBuster:
         """Drill into a stored session. ``cluster`` is 1-indexed for human use."""
         try:
             self.store.load_meta(session_id)
+        except ValueError as error:
+            return f"{error}"
         except FileNotFoundError:
             return f"Unknown session: {session_id}"
         summary = self.store.load_summary(session_id)
@@ -848,13 +850,20 @@ def main():
         buster = AnrBuster()
         # 0 means no cap, matching the repo's '0 = disabled' convention.
         top_n = 0 if args.all_clusters else args.top_n
-        out = buster.stop(
-            args.stop,
-            budget_tokens=args.budget_tokens,
-            top_n=top_n,
-            terse=args.terse,
-            json_mode=args.json,
-        )
+        try:
+            out = buster.stop(
+                args.stop,
+                budget_tokens=args.budget_tokens,
+                top_n=top_n,
+                terse=args.terse,
+                json_mode=args.json,
+            )
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError:
+            print(f"Error: unknown session {args.stop}", file=sys.stderr)
+            sys.exit(1)
         print(out)
         sys.exit(0)
 

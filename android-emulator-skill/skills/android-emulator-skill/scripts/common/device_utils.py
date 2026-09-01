@@ -21,6 +21,11 @@ import re
 import shlex
 import subprocess
 
+# Every adb call is bounded. An unbounded one wedges the adb connection for
+# whatever runs next, which is a hang with no diagnosis rather than an error.
+CURRENT_ACTIVITY_TIMEOUT = 15
+PACKAGE_INFO_TIMEOUT = 20
+
 
 def quote_for_device_shell(value: str) -> str:
     """Quote a single argument for the shell running **on the device**.
@@ -386,8 +391,13 @@ def get_package_info(package_name: str, serial: str | None = None) -> dict:
         print(f"Package: {info['package']}")
     """
     try:
-        cmd = build_adb_command("shell", serial, "pm", "dump", package_name)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # The package name is re-parsed by the device shell, so it is quoted
+        # like every other argument crossing that boundary. Bounded, too: an
+        # unbounded adb call wedges the connection for whatever runs next.
+        cmd = build_adb_command("shell", serial, "pm", "dump", quote_for_device_shell(package_name))
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=PACKAGE_INFO_TIMEOUT
+        )
 
         # Parse relevant info from pm dump output
         info = {"package": package_name, "installed": True}
@@ -444,10 +454,6 @@ def list_installed_packages(serial: str | None = None) -> list:
 #   mFocusedApp=ActivityRecord{ba1d946 u0 com.pkg/.MainActivity t615}
 _FOCUS_LINE_RE = re.compile(r"^\s*(?:mCurrentFocus|mFocusedApp)=(?P<body>.*)$", re.MULTILINE)
 _COMPONENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_.]*/[A-Za-z0-9_.]+)")
-
-# `dumpsys window` is a large dump on a busy device; bound it like every other
-# adb call so a wedged service cannot hang the caller indefinitely.
-CURRENT_ACTIVITY_TIMEOUT = 15
 
 
 def parse_focused_activity(dumpsys_output: str) -> str | None:
