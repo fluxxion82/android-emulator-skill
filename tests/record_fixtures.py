@@ -295,6 +295,52 @@ def _trim_hierarchy(raw: str) -> str:
     return raw[start : end + len("</hierarchy>")] + "\n"
 
 
+def _requires(*needles: str) -> Callable[[str], str]:
+    """Refuse a capture that does not carry the fact it exists to record.
+
+    A grep that matched nothing, a device with only one serial attached, a
+    command whose failure mode changed -- all of them produce a short, valid,
+    completely useless file. Writing it would put something that looks like
+    ground truth on disk, which is the failure this recorder exists to prevent.
+    """
+
+    def check(text: str) -> str:
+        for needle in needles:
+            if needle not in text:
+                raise CaptureError(
+                    f"capture does not contain {needle!r}, so it is not the "
+                    f"output this fixture is meant to record"
+                )
+        return text
+
+    return check
+
+
+def _anr_for(package: str) -> Callable[[str], str]:
+    """Refuse an ANR capture that is not an ANR of ``package``.
+
+    An ANR is provoked, not requested, and every way of provoking one can
+    quietly fail to: the app may not have been foreground, the broadcast may
+    have gone to a process that was not running, the wait may have been too
+    short. Each of those yields an empty grep, and an empty ANR fixture would
+    assert nothing while looking like evidence.
+    """
+
+    def check(text: str) -> str:
+        if "ANR in " not in text:
+            raise CaptureError(
+                "no 'ANR in' line was captured: the app did not ANR. Install "
+                "the fixture app first (cd tests/fixtures/scaffold/compose && "
+                "gradle :app:installDebug) -- its AnrReceiver is what earns the "
+                "ANR."
+            )
+        if package not in text:
+            raise CaptureError(f"the captured ANR is not {package}'s; refusing to record it")
+        return text
+
+    return check
+
+
 def _hierarchy_of(package: str) -> Callable[[str], str]:
     """Trim the dump and assert it is of ``package``.
 
@@ -747,6 +793,268 @@ FIXTURES: list[Fixture] = [
             "against whatever state the emulator happened to be in. Same class "
             "of trap as `am broadcast` always printing 'result=0'."
         ),
+    ),
+    # --- ANR / jank: the lines anr_pipeline claims to parse --------------
+    #
+    # Android will not produce an ANR on request, so these come from an app
+    # built to earn one: tests/fixtures/scaffold/compose's AnrReceiver blocks
+    # its main thread for 40s, and a FOREGROUND broadcast has a 10s dispatch
+    # timeout. No touch input is involved, deliberately -- a recorder must
+    # never be the thing that taps a screen.
+    Fixture(
+        name="logcat_anr_broadcast",
+        args=["shell", "logcat -d -v threadtime | grep -A 3 'ActivityManager: ANR in '"],
+        description=(
+            "A real hard ANR as ActivityManager frames it, and the shape every "
+            "hand-typed sample in this repo got wrong. The line is "
+            "'ANR in com.example.composefixture' -- the package ALONE, with no "
+            "parenthesised component. The invented samples all wrote "
+            "'ANR in com.example.app (com.example.app/.MainActivity)', so the "
+            "component group in _ANR_IN_RE was only ever exercised against "
+            "output Android does not produce here. Note also what the following "
+            "lines carry, each a separate logcat line under the same tag: "
+            "'PID: <n>' is the ANRing app's pid, which is NOT the pid in the "
+            "logcat column (that is system_server's), and 'Reason: Broadcast of "
+            "Intent { ... }' holds the only statement of what actually timed "
+            "out. parse_logcat_anr classifies lines one at a time, so it keeps "
+            "the package and drops the pid and the reason."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+            ["logcat", "-c"],
+            [
+                "shell",
+                "am",
+                "broadcast",
+                "-f",
+                "0x10000000",
+                "-n",
+                f"{COMPOSE_PACKAGE}/.AnrReceiver",
+                "-a",
+                f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
+            ],
+            # The foreground dispatch timeout is 10s; the input-dispatch ANR
+            # follows ~5s later. Measured: both present by +16s.
+            ["shell", "sleep", "20"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_anr_for(COMPOSE_PACKAGE),
+    ),
+    Fixture(
+        name="logcat_anr_input_dispatch",
+        args=["shell", "logcat -d -v threadtime | grep 'WindowManager: ANR in '"],
+        description=(
+            "The SAME stalled app, reported a second time by a different "
+            "subsystem and in a completely different shape: WindowManager "
+            "writes one line reading 'ANR in Window{<hash> u0 <pkg>/<Activity>}."
+            " Reason:Input dispatching timed out (... Waited 5006ms for "
+            "FocusEvent(hasFocus=false)).' Three things a guess gets wrong. "
+            "The token after 'ANR in' is the literal word 'Window', not a "
+            "package -- _ANR_IN_RE's '([\\w.]+)' happily reports a fault in a "
+            "package called 'Window'. The component is inside the braces rather "
+            "than in parentheses. And 'Reason:' has no space after the colon, "
+            "unlike ActivityManager's. One stall therefore reaches a logcat "
+            "reader as two events under two tags."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+            ["logcat", "-c"],
+            [
+                "shell",
+                "am",
+                "broadcast",
+                "-f",
+                "0x10000000",
+                "-n",
+                f"{COMPOSE_PACKAGE}/.AnrReceiver",
+                "-a",
+                f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
+            ],
+            ["shell", "sleep", "20"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_anr_for(COMPOSE_PACKAGE),
+    ),
+    Fixture(
+        name="logcat_choreographer_jank",
+        args=["shell", "logcat -d -v threadtime | grep Choreographer"],
+        description=(
+            "Real Choreographer jank: "
+            "'I Choreographer: Skipped N frames!  The application may be doing "
+            "too much work on its main thread.' TWO spaces after the "
+            "exclamation mark, and the tag carries the janking app's own pid in "
+            "the logcat columns -- unlike the ActivityManager ANR lines, whose "
+            "pid is system_server's. Recorded because every skipped-frame test "
+            "in this repo built its input from an f-string, which proves only "
+            "that the parser matches the f-string. Provoked by AnrReceiver's "
+            "40s block: the recorded line says 'Skipped 2401 frames', and "
+            "2401 * 16.7ms is 40.1 seconds -- the first independent check this "
+            "repo has that the FRAME_MS heuristic tracks wall-clock, on a stall "
+            "whose real length is known. A cold start alone also janks, but "
+            "only when the host happens to be busy, so how MANY lines land here "
+            "is not fixed; the severity-boundary tests vary the frame count off "
+            "this line rather than typing new ones."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["logcat", "-c"],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            # Two sources of jank, so the fixture carries both a small drop and
+            # a catastrophic one. The cold start drops ~30 frames; the blocked
+            # receiver then drops ~2400. Choreographer reports the second only
+            # once the main thread runs again, so the wait must outlast
+            # AnrReceiver's 40s sleep -- split in two because a single
+            # `adb shell sleep 50` would exceed this recorder's own timeout.
+            [
+                "shell",
+                "am",
+                "broadcast",
+                "-f",
+                "0x10000000",
+                "-n",
+                f"{COMPOSE_PACKAGE}/.AnrReceiver",
+                "-a",
+                f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
+            ],
+            ["shell", "sleep", "25"],
+            ["shell", "sleep", "25"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_requires("Skipped"),
+    ),
+    Fixture(
+        name="logcat_strictmode_violation",
+        # Anchored on the tag column: a bare `grep StrictMode` also matches
+        # every WindowManagerShell transition line naming StrictModeActivity,
+        # which is ~40KB of unrelated dump.
+        args=["shell", "logcat -d -v threadtime | grep -E '[VDIWEF] StrictMode: '"],
+        description=(
+            "What StrictMode actually logs, against what anr_pipeline was "
+            "written for. The real header is "
+            "'D StrictMode: StrictMode policy violation; ~duration=27 ms: "
+            "android.os.strictmode.DiskReadViolation'; the invented sample was "
+            "'D StrictMode: Slow operation detected on main thread', which "
+            "StrictMode prints in no form at all (it borrows the wording of "
+            "ActivityManager's own 'Slow operation:' bookkeeping, a different "
+            "subsystem entirely). Two consequences visible in this file. The "
+            "violation states its OWN duration, which _classify_anr discards in "
+            "favour of a hard-coded WARN_FRAMES * FRAME_MS. And every frame of "
+            "the stack trace that follows is logged under the same StrictMode "
+            "tag, so a tag-only match turns one violation into one event per "
+            "stack frame -- about thirty. Provoked by "
+            "StrictModeActivity, which enables the policy and then reads and "
+            "writes a file on the main thread."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["logcat", "-c"],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.StrictModeActivity"],
+            ["shell", "sleep", "3"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_requires("StrictMode policy violation"),
+    ),
+    # --- host-side adb failures: the retry prompts an agent reads ---------
+    Fixture(
+        name="adb_shell_device_not_found",
+        args=["-s", "no-such-serial-xyz", "shell", "getprop", "ro.build.version.sdk"],
+        description=(
+            "`adb -s <unknown> shell` -- the call shape the skill's scripts "
+            "actually make. The prefix here is 'adb:', where the same failure "
+            "from `get-state` (adb_device_not_found) says 'error:'. adb mixes "
+            "the two, which is why adb_exec._classify matches the message body "
+            "rather than the prefix; recorded so that stays a measured fact "
+            "rather than a comment."
+        ),
+    ),
+    Fixture(
+        name="adb_more_than_one_device",
+        args=[],
+        host_argv=["adb", "shell", "getprop", "ro.build.version.sdk"],
+        description=(
+            "What adb says when two devices are attached and no -s was given: "
+            "'adb: more than one device/emulator', exit 1, on stderr, and the "
+            "command never reaches a device at all. Recorded as a HOST command "
+            "precisely because it must run WITHOUT -s, which every other "
+            "fixture here has. Requires two devices attached; with one, the "
+            "capture is refused rather than written."
+        ),
+        post=_requires("more than one device"),
+    ),
+    Fixture(
+        name="pm_grant_not_changeable",
+        args=[
+            "shell",
+            f"pm grant {COMPOSE_PACKAGE} android.permission.INTERNET",
+        ],
+        description=(
+            '`pm grant` REFUSING. It writes "Exception occurred while '
+            "executing 'grant':\" and a java.lang.SecurityException with a "
+            "full stack trace to stderr, and exits 255. The invented sample "
+            "said 'Operation not allowed: java.lang.SecurityException: not "
+            "requested' at exit 0 -- neither the wording nor the exit status "
+            "Android uses. INTERNET is used because it is an install-time "
+            "permission and so is never grantable at runtime, which makes the "
+            "refusal reproducible on any device."
+        ),
+        post=_requires("Exception occurred while executing"),
+    ),
+    Fixture(
+        name="pm_grant_not_requested",
+        args=[
+            "shell",
+            f"pm grant {COMPOSE_PACKAGE} android.permission.POST_NOTIFICATIONS "
+            f"2>&1; echo exit=$?",
+        ],
+        description=(
+            "`pm grant` doing NOTHING and saying so with silence. The fixture "
+            "app does not request POST_NOTIFICATIONS, so the permission is not "
+            "granted -- and pm prints nothing at all and exits 0. (The echo is "
+            "part of the recorded command because an empty file cannot show an "
+            "exit status; everything before 'exit=' is pm's own output, and "
+            "there is none.) This is the failure push_notification cannot "
+            "detect: its check is 'exit 0 and no output means granted', which "
+            "is exactly what a no-op looks like."
+        ),
+        post=_requires("exit=0"),
+    ),
+    Fixture(
+        name="cmd_notification_post_rejected",
+        args=[
+            "shell",
+            "cmd notification post -i nonsense://x fixturetag hello 2>&1; echo exit=$?",
+        ],
+        description=(
+            "`cmd notification post` REJECTING its arguments, and still exiting "
+            "0. Probed every way it can fail -- unknown option, missing "
+            "argument, bad icon, bad style, bad picture spec, no arguments at "
+            "all -- and the exit status was 0 every time. So a non-zero exit "
+            "from this command is not a case that exists, which is what "
+            "push_notification's tests used to assert against. The real trap is "
+            "this one: an error on the output stream at a successful exit "
+            "status. (The trailing echo is part of the recorded command because "
+            "a file cannot show an exit status; everything before 'exit=' is "
+            "the command's own output.)"
+        ),
+        post=_requires("exit=0"),
+    ),
+    Fixture(
+        name="cmd_notification_post_usage",
+        args=["shell", "cmd notification post"],
+        description=(
+            "`cmd notification post` with its arguments omitted prints its "
+            "usage block and EXITS 0 -- the same trap as `am broadcast` always "
+            "printing 'result=0'. Anything deciding a post succeeded from the "
+            "exit status cannot tell a posted notification from a rejected "
+            "command line. The usage block is also the authoritative flag list: "
+            "there is no --channel flag, so the channel a post lands on is not "
+            "selectable here."
+        ),
+        post=_requires("usage: cmd notification post"),
     ),
     Fixture(
         name="uiautomator_dump_raw",

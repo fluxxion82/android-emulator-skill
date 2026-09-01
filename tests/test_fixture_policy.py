@@ -60,16 +60,47 @@ OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
 # application" where the device says "package not an application", in BOTH
 # files, so a non-debuggable app got a generic failure from one and
 # "app.db is not a valid SQLite database" from the other.
+#
+# PAID OFF SINCE, and every one of them cost the production code a fix:
+#
+#   test_anr_pipeline.py, test_anr_watcher.py — a real ANR now exists to read,
+#     provoked by tests/fixtures/scaffold/compose's AnrReceiver. Android writes
+#     "ANR in com.example.app" with NO parenthesised component, reports the same
+#     stall a SECOND time as "ANR in Window{...}" (whose package the parser read
+#     as the literal word "Window"), and logs a StrictMode violation as a header
+#     plus a stack trace all under one tag (one violation had been arriving as
+#     thirty events, at a constant duration, while the real one was stated in
+#     the line).
+#   test_gradle.py — Kotlin K2 prints `e: file:///abs/path.kt:5:13 Message.`,
+#     not Kotlin 1.x's `e: file: /path.kt: (5, 13): message`, so every Kotlin
+#     diagnostic since Kotlin 2.0 had parsed to no file, line or column at all;
+#     and Gradle's indented reprint of the compiler output inside
+#     "* What went wrong:" was being counted as more javac errors.
+#   test_push_notification.py — `cmd notification post` was driven into every
+#     failure it has and exited 0 every time, so the non-zero-exit case the test
+#     asserted does not exist; the real rejection is text at a successful exit,
+#     and only the usage wording was being checked for.
+#   test_status_bar.py — `adb -s <unknown> shell` prefixes its message `adb:`,
+#     not the `error:` the literal claimed (that is `adb get-state`'s prefix).
+#
+# STILL OUTSTANDING:
+#
+#   test_emulator_create.py, test_emulator_shutdown.py — not yet recorded.
+#
+#   test_location.py::parse_gpx — a documented EXCEPTION, in the same class as
+#     test_emu_console.py, and not expected to be paid off. GPX is not tool
+#     output: it is a document the USER hands to `location.py --gpx`, produced
+#     by a GPS device or a mapping service, so there is no tool for a recorder
+#     to run and look at. Nothing in the Android SDK emits GPX, and a real track
+#     is somebody's movements, which must not be committed to a public
+#     repository. The specific flagged line is a deliberately MALFORMED document
+#     (`lat="north"`), which by definition nothing produces. See the module
+#     docstring of test_location.py.
 KNOWN_VIOLATIONS = frozenset(
     {
-        "test_anr_pipeline.py::parse_logcat_anr",
-        "test_anr_watcher.py::parse_logcat_anr",
         "test_emulator_create.py::CompletedProcess",
         "test_emulator_shutdown.py::_FakeResult",
-        "test_gradle.py::parse_build_output",
         "test_location.py::parse_gpx",
-        "test_push_notification.py::when",
-        "test_status_bar.py::failing_adb",
     }
 )
 

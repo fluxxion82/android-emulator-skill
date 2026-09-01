@@ -1,0 +1,17 @@
+// Four JVM subprojects whose only job is to emit one compiler diagnostic each,
+// so the lines `gradle/results.py` claims to parse can be RECORDED instead of
+// imagined. See tests/record_gradle_fixtures.py.
+//
+// Why one subproject per diagnostic: a compiler that has errored stops
+// reporting warnings. Measured — a module holding both a warning file and an
+// error file prints only the error, so "an error and a warning in one build
+// log" is a shape neither compiler actually produces from one module.
+//
+// Why not Android: AGP runs these same two compilers, so the diagnostic text is
+// identical, and plain Gradle keeps the scaffold buildable with no SDK, no
+// emulator and no AGP download.
+rootProject.name = 'compile-scaffold'
+include ':kotlin-error'
+include ':kotlin-warning'
+include ':java-error'
+include ':java-warning'

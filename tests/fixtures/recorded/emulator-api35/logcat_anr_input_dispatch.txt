@@ -1,0 +1,1 @@
+09-01 15:37:12.904   597   730 I WindowManager: ANR in Window{67a8d77 u0 com.example.composefixture/com.example.composefixture.DefaultActivity}. Reason:Input dispatching timed out (67a8d77 com.example.composefixture/com.example.composefixture.DefaultActivity (server) is not responding. Waited 5005ms for FocusEvent(hasFocus=false)).

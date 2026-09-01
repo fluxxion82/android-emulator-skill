@@ -1,0 +1,2 @@
+error: invalid icon: nonsense://x
+exit=0

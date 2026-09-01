@@ -30,6 +30,27 @@
         <activity
             android:name=".TestTagsActivity"
             android:exported="true" />
+
+        <!--
+          Commits a StrictMode violation and finishes. Recorded as
+          `logcat_strictmode_violation`; see StrictModeActivity.kt.
+        -->
+        <activity
+            android:name=".StrictModeActivity"
+            android:exported="true" />
+
+        <!--
+          Blocks its own main thread for 40s so ActivityManager reports a real
+          ANR. Recorded as `logcat_anr_broadcast`; see AnrReceiver.kt for why a
+          hand-typed "ANR in ..." line was not good enough.
+        -->
+        <receiver
+            android:name=".AnrReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.composefixture.PROVOKE_ANR" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

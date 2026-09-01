@@ -1,0 +1,33 @@
+
+> Configure project :kotlin-error
+w: ⚠️ Deprecated Gradle Version
+The used Gradle version (Gradle 8.13) is deprecated and will not be supported in future Kotlin Gradle Plugin releases.
+The minimum supported Gradle version will become Gradle 8.14.4 in Kotlin 2.5.0.
+
+This warning can be suppressed in 'gradle.properties':
+    kotlin.suppressGradlePluginWarnings=DeprecatedGradleVersionWarning
+Solution: Please update the Gradle version to at least Gradle 8.14.4.
+
+
+> Task :kotlin-error:checkKotlinGradlePluginConfigurationErrors SKIPPED
+
+> Task :kotlin-error:compileKotlin FAILED
+
+[Incubating] Problems report is available at: file:///scaffold/build/reports/problems/problems-report.html
+1 actionable task: 1 executed
+e: file:///scaffold/kotlin-error/src/main/kotlin/com/example/Broken.kt:5:13 Unresolved reference 'missingSymbol'.
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':kotlin-error:compileKotlin'.
+> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.btapi.BuildToolsApiCompilationWork
+   > Compilation error. See log for more details
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 0s

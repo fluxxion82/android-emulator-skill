@@ -228,12 +228,21 @@ class NotificationTester:
             return False, result
 
         if not verify:
-            # Exit status is the only signal left, so also reject the case where
-            # the shell printed its own usage instead of posting.
-            if "usage: cmd notification" in f"{stdout}\n{stderr}".lower():
+            # Exit status is the only signal left -- and it carries almost
+            # nothing. Every way `cmd notification post` was made to fail on
+            # API 35 (no arguments, an unknown option, a missing argument, a
+            # bad icon, a bad style, a bad picture spec) exited 0, so a
+            # rejection is visible ONLY in the text. Two wordings were
+            # recorded: the usage block (cmd_notification_post_usage) and
+            # "error: <reason>" / "Error occurred. Check logcat for details."
+            # (cmd_notification_post_rejected). Checking only for the usage
+            # block let a rejected icon through as a successful post.
+            printed = f"{stdout}\n{stderr}".lower()
+            refusals = ("usage: cmd notification", "error occurred.", "error:")
+            if any(marker in printed for marker in refusals):
                 result["error"] = (
-                    "cmd notification printed its usage instead of posting; "
-                    "the arguments were rejected"
+                    "cmd notification post exited 0 but printed a refusal, so "
+                    f"nothing was posted: {(stdout or stderr).strip()}"
                 )
                 return False, result
             result["note"] = "Not verified (--no-verify): exit status only."

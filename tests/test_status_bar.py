@@ -300,24 +300,41 @@ def test_module_makes_no_direct_subprocess_calls():
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_serial_raises_rather_than_reporting_a_command_failure(failing_adb):
-    """A missing device means nothing ran; a (False, msg) tuple would hide that."""
-    failing_adb(returncode=1, stderr="error: device 'no-such-serial' not found\n")
+def test_unknown_serial_raises_rather_than_reporting_a_command_failure(recorded, failing_adb):
+    """A missing device means nothing ran; a (False, msg) tuple would hide that.
+
+    The stderr is the RECORDED text of `adb -s <unknown> shell ...` -- which is
+    the call shape status_bar makes, and which prefixes the message `adb:`. The
+    literal this replaced said `error:`, the prefix `adb get-state` uses. adb
+    mixes the two, so classification cannot key on either; recording both forms
+    is what makes that a measurement rather than a hope.
+    """
+    failing_adb(returncode=1, stderr=recorded.text("adb_shell_device_not_found"))
     with pytest.raises(adb_exec.DeviceNotFoundError):
-        StatusBarController(serial="no-such-serial").set_battery(50)
+        StatusBarController(serial="no-such-serial-xyz").set_battery(50)
 
 
-def test_multiple_devices_raises_from_a_setter(failing_adb):
-    failing_adb(returncode=1, stderr="adb: more than one device/emulator\n")
+def test_the_recorded_shell_failure_uses_the_other_prefix(recorded, recorded_anywhere):
+    """Guard the point above: the two recordings really do disagree.
+
+    If a future adb unified them, the test above stops carrying its meaning and
+    should be reconsidered rather than left looking thorough.
+    """
+    assert recorded.text("adb_shell_device_not_found").startswith("adb:")
+    assert recorded_anywhere("adb_device_not_found").startswith("error:")
+
+
+def test_multiple_devices_raises_from_a_setter(recorded, failing_adb):
+    failing_adb(returncode=1, stderr=recorded.text("adb_more_than_one_device"))
     with pytest.raises(adb_exec.MultipleDevicesError):
         StatusBarController().override(time="9:41")
 
 
-def test_cli_reports_an_unknown_serial_and_exits_one(failing_adb, monkeypatch, capsys):
+def test_cli_reports_an_unknown_serial_and_exits_one(recorded, failing_adb, monkeypatch, capsys):
     """No traceback: an actionable message on stderr and exit status 1."""
-    failing_adb(returncode=1, stderr="error: device 'no-such-serial' not found\n")
+    failing_adb(returncode=1, stderr=recorded.text("adb_shell_device_not_found"))
     monkeypatch.setattr(
-        "sys.argv", ["status_bar.py", "--serial", "no-such-serial", "--battery", "50"]
+        "sys.argv", ["status_bar.py", "--serial", "no-such-serial-xyz", "--battery", "50"]
     )
 
     with pytest.raises(SystemExit) as excinfo:
@@ -326,7 +343,7 @@ def test_cli_reports_an_unknown_serial_and_exits_one(failing_adb, monkeypatch, c
     assert excinfo.value.code == 1
     captured = capsys.readouterr()
     assert captured.err.startswith("Error: ")
-    assert "no-such-serial" in captured.err
+    assert "no-such-serial-xyz" in captured.err
     assert "adb devices" in captured.err, "the error must say how to see what is attached"
     assert "Traceback" not in captured.err
 

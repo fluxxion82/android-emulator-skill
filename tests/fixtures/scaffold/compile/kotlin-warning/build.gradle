@@ -1,0 +1,9 @@
+// The Kotlin version is PINNED, because the diagnostic format belongs to the
+// compiler rather than to Gradle. K2 (2.x) prints
+// `e: file:///abs/path.kt:LINE:COL Message.`; Kotlin 1.x printed
+// `e: /abs/path.kt: (LINE, COL): message`. A floating version would silently
+// change the recorded shape under whoever re-records next.
+plugins {
+    id 'org.jetbrains.kotlin.jvm' version '2.4.10'
+}
+repositories { mavenCentral() }

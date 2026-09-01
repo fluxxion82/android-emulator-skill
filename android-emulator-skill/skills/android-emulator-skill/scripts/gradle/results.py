@@ -175,11 +175,18 @@ _KOTLIN_ERROR_RE = re.compile(r"^e:\s*(?P<body>.+)$")
 _KOTLIN_WARNING_RE = re.compile(r"^w:\s*(?P<body>.+)$")
 
 # Java/Kotlin/clang style: "/path/File.java:12: error: message".
+#
+# The file group must start with a NON-space character. Gradle reprints the
+# whole compiler output, indented by two spaces, inside its "* What went wrong:"
+# section — visible in gradle_javac_compile_error — and `[^:]+` matched that
+# indent quite happily, so every javac diagnostic was counted twice over. (The
+# recording shows javac itself also reporting one missing type twice, once per
+# caret position; that duplication is real output and is left alone.)
 _JAVAC_ERROR_RE = re.compile(
-    r"^(?P<file>[^:]+\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*error:\s*(?P<message>.+)$"
+    r"^(?P<file>[^\s:][^:]*\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*error:\s*(?P<message>.+)$"
 )
 _JAVAC_WARNING_RE = re.compile(
-    r"^(?P<file>[^:]+\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*warning:\s*(?P<message>.+)$"
+    r"^(?P<file>[^\s:][^:]*\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*warning:\s*(?P<message>.+)$"
 )
 
 # Bare "error:" / "warning:" diagnostics without a leading file path.
@@ -250,8 +257,35 @@ def extract_failure_reasons(text: str) -> list[str]:
 
 
 def _split_kotlin_body(body: str) -> dict:
-    """Split a Kotlin diagnostic body into location + message."""
+    """Split a Kotlin diagnostic body into location + message.
+
+    Three shapes, because the Kotlin compiler changed its diagnostic format at
+    K2 and this parser only knew the old one:
+
+    * ``file:///abs/path.kt:12:5 Message.`` — Kotlin 2.x, recorded as
+      ``gradle_kotlin_compile_error``. A ``file://`` URI, colon-separated
+      line and column, no parentheses and no colon before the message.
+    * ``file: /path/File.kt: (12, 5): message`` — Kotlin 1.x.
+    * ``/path/File.kt:12:5: message`` — the plain colon form.
+
+    The K2 branch is checked first: its body starts ``file://``, which the
+    1.x pattern's optional ``file:`` prefix would otherwise eat, leaving
+    ``//abs/path.kt:12:5 …`` to fall through to no location at all. That was
+    the live behaviour — every Kotlin error since 2.0 was reported with file,
+    line and column all None.
+    """
     location = {"file": None, "line": None, "column": None}
+
+    k2_uri = re.match(
+        r"^file://(?P<file>.+?):(?P<line>\d+):(?P<col>\d+)\s+(?P<message>.+)$",
+        body,
+    )
+    if k2_uri:
+        location["file"] = k2_uri.group("file").strip()
+        location["line"] = int(k2_uri.group("line"))
+        location["column"] = int(k2_uri.group("col"))
+        return {"message": k2_uri.group("message").strip(), "location": location}
+
     # Format: "file: /path/File.kt: (12, 5): message" OR "/path:12:5: message".
     file_paren = re.match(
         r"^(?:file:\s*)?(?P<file>.+?):\s*\((?P<line>\d+),\s*(?P<col>\d+)\):\s*(?P<message>.+)$",

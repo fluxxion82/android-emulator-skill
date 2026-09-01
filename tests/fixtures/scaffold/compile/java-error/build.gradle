@@ -1,0 +1,5 @@
+plugins { id 'java' }
+// javac says nothing about deprecated use without this.
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs << '-Xlint:deprecation'
+}

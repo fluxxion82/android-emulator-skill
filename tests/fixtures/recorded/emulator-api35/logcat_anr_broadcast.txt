@@ -1,0 +1,4 @@
+09-01 15:36:34.255   597  4642 E ActivityManager: ANR in com.example.composefixture
+09-01 15:36:34.255   597  4642 E ActivityManager: PID: 4597
+09-01 15:36:34.255   597  4642 E ActivityManager: Reason: Broadcast of Intent { act=com.example.composefixture.PROVOKE_ANR flg=0x10400010 cmp=com.example.composefixture/.AnrReceiver }
+09-01 15:36:34.255   597  4642 E ActivityManager: ErrorId: ee516afe-ca5a-40a6-8cd2-3c9852bb5487

@@ -340,18 +340,61 @@ def test_cli_exits_non_zero_when_the_post_cannot_be_verified(recorded, fake_adb,
 
 
 def test_non_zero_exit_is_a_failure_whatever_stdout_says(recorded, fake_adb):
-    """Exit status outranks output."""
+    """Exit status outranks output.
+
+    No invented stderr: the double is given a non-zero status and nothing else,
+    so what is asserted is the code's own fallback message. The stderr literal
+    this replaced -- "Exception occurred while executing 'post'" -- described a
+    case that does not exist. `cmd notification post` was driven into every
+    failure it has (no arguments, unknown option, missing argument, bad icon,
+    bad style, bad picture spec) and exited 0 every single time; see
+    cmd_notification_post_rejected.
+    """
     fake_adb.when(
         "cmd",
         "notification",
         "post",
         returncode=1,
         stdout=recorded.text("am_broadcast_missing_receiver"),
-        stderr="Exception occurred while executing 'post'",
     )
     success, result = push_notification.NotificationTester().post("t", "hi")
+
+    assert success is False, "a reassuring stdout outranked a non-zero exit"
+    assert result["exit_code"] == 1
+    assert "result=0" in result["error"], "the failure must carry what adb printed"
+
+
+def test_a_refusal_at_exit_zero_is_a_failure(recorded, fake_adb):
+    """The failure mode this command actually has.
+
+    `cmd notification post -i nonsense://x tag hello` answers
+    "error: invalid icon: nonsense://x" and exits 0. With --no-verify the exit
+    status is the only other signal, and it says success. Checking for the
+    usage block alone -- which this rejection does not print -- let it through.
+    """
+    rejection = recorded.text("cmd_notification_post_rejected")
+    assert "exit=0" in rejection, "the fixture no longer records a zero exit"
+
+    fake_adb.when("cmd", "notification", "post", returncode=0, stdout=rejection)
+    success, result = push_notification.NotificationTester().post("t", "hi", verify=False)
+
     assert success is False
-    assert "Exception" in result["error"]
+    assert "invalid icon" in result["error"]
+
+
+def test_the_usage_block_at_exit_zero_is_also_a_failure(recorded, fake_adb):
+    """The other recorded rejection wording: bare `post` prints its usage."""
+    fake_adb.when(
+        "cmd",
+        "notification",
+        "post",
+        returncode=0,
+        stdout=recorded.text("cmd_notification_post_usage"),
+    )
+    success, result = push_notification.NotificationTester().post("t", "hi", verify=False)
+
+    assert success is False
+    assert "nothing was posted" in result["error"]
 
 
 def test_post_succeeds_only_once_the_notification_is_actually_there(recorded, fake_adb):
@@ -487,19 +530,46 @@ def test_revoke_uses_pm_revoke(fake_adb):
     assert fake_adb.commands_matching("pm", "revoke"), f"no pm revoke issued: {fake_adb.calls}"
 
 
-def test_a_refusal_on_stderr_is_a_failure_even_at_exit_zero(fake_adb):
-    """`pm grant` says nothing when it works; anything it prints is a refusal."""
-    fake_adb.when(
-        "pm",
-        "grant",
-        returncode=0,
-        stderr="Operation not allowed: java.lang.SecurityException: not requested",
-    )
+def test_a_refused_grant_is_a_failure(recorded, fake_adb):
+    """`pm grant` refusing, in the wording and at the exit status it really uses.
+
+    Recorded: granting an install-time permission answers "Exception occurred
+    while executing 'grant':" plus a java.lang.SecurityException and a full
+    stack trace, on stderr, and exits 255. The literal this replaced said
+    "Operation not allowed: java.lang.SecurityException: not requested" at exit
+    0 -- neither the wording nor the status Android uses.
+    """
+    refusal = recorded.text("pm_grant_not_changeable")
+    fake_adb.when("pm", "grant", returncode=255, stderr=refusal)
+
     success, result = push_notification.NotificationTester().set_post_permission(
         "com.example.app", granted=True
     )
     assert success is False
     assert "SecurityException" in result["error"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "pm grant of a permission the app never requested is a silent no-op: "
+        "recorded as pm_grant_not_requested -- no output, exit 0, and the "
+        "permission is still not held. set_post_permission's success test is "
+        "'exit 0 and nothing printed', which is exactly what the no-op looks "
+        "like, so it reports a grant that did not happen. Proving a grant "
+        "needs a read-back, the way post() proves a post. Delete this marker "
+        "in the commit that adds one."
+    ),
+)
+def test_a_grant_that_did_nothing_is_not_a_success(recorded, fake_adb):
+    silent = recorded.text("pm_grant_not_requested")
+    assert silent.strip() == "exit=0", "the fixture no longer records a silent success"
+
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    success, _ = push_notification.NotificationTester().set_post_permission(
+        "com.example.app", granted=True
+    )
+    assert success is False
 
 
 def test_permission_cli_exit_codes(fake_adb, monkeypatch):

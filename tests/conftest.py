@@ -163,6 +163,32 @@ def recorded_anywhere():
     return _find
 
 
+@pytest.fixture(scope="session")
+def recorded_gradle():
+    """Verbatim Gradle output, by fixture name.
+
+    The Gradle corpus is keyed by Gradle version rather than by device, so it
+    is not a device profile and ``recorded`` does not reach it. Same rule
+    though: a parser test consumes these files and never a literal. Recorded by
+    ``tests/record_gradle_fixtures.py`` from the checked-in scaffolds under
+    ``tests/fixtures/scaffold/``.
+    """
+    root = RECORDED_ROOT / "gradle-8.13"
+
+    def _load(name: str) -> str:
+        path = root / f"{name}.txt"
+        if not path.exists():
+            pytest.fail(
+                f"Gradle fixture '{name}' is missing.\n"
+                f"Run: python tests/record_gradle_fixtures.py\n"
+                f"Do not substitute a hand-written literal — that is the bug "
+                f"class this directory exists to prevent."
+            )
+        return path.read_text(encoding="utf-8")
+
+    return _load
+
+
 @pytest.fixture(params=_available_profiles())
 def any_profile(request) -> RecordedFixtures:
     """Each recorded device profile in turn.
