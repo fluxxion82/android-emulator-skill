@@ -44,9 +44,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ## Scripts (v0.5.0)
 
-### Implemented (30 scripts)
+### Implemented (31 scripts)
 
-#### Core Utilities (9 modules in `common/`)
+#### Core Utilities (10 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
@@ -55,7 +55,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    call, with typed errors that name a remedy), **hierarchy.py** (the one way to
    capture the UI hierarchy — no temp files, so concurrent runs cannot read each
    other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
-   fails), **env_config.py**, **anr_pipeline.py**, **anr_sessions.py**.
+   fails), **logcat.py** (the one place that builds an `adb logcat` argv and
+   parses a duration, shared by all four log readers), **env_config.py**,
+   **anr_pipeline.py**, **anr_sessions.py**.
 
 #### App Management (1 script)
 4. **app_launcher.py** - App lifecycle management
@@ -247,6 +249,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Groups repeats by package + exception + signature frame (a crash loop otherwise floods the output), and names the frame most useful for triage, **labelled with the basis for the choice** — including "no app frame; every frame is framework code" when that is the honest answer.
     - Exit status answers "did triage run", not "did anything crash" — branch on `crash_count` in `--json`, or pass `--fail-on-crash`.
     - Options: `--package PKG`, `--clear`, `--fail-on-crash`, `--serial`, `--json`, `--verbose`
+
+36. **logs.py** ⭐ NEW - One entry point for reading logs; routes on the question being asked.
+    - `logs.py tail` (main buffers) → `log_monitor.py`; `logs.py crashes` (`-b crash`) → `crash_triage.py`; `logs.py anr` (ANR/jank, incl. session mode) → `anr_watcher.py`.
+    - Arguments are passed through verbatim, so each verb takes the full flag set of the script it delegates to, and those scripts remain callable unchanged.
+    - Options: `<verb> [verb options]`, `--json` (routing table), `--help`
 
 > The build system lives in the `gradle/` subpackage (`builder`, `results`, `cache`, `config`, `reporter`), used by `build_and_test.py`. The ANR watcher's clustering/session machinery lives in `common/anr_pipeline.py` and `common/anr_sessions.py`.
 

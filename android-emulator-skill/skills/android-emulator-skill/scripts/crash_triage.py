@@ -46,6 +46,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 
+from common import logcat
 from common.adb_exec import AdbError, run_adb
 from common.device_utils import resolve_device_identifier
 from common.env_config import env_int
@@ -602,15 +603,16 @@ class CrashTriage:
         self.serial = resolve_device_identifier(serial)
 
     def read_buffer(self) -> str:
-        """Dump the crash buffer. Empty output means nothing has crashed."""
+        """Dump the crash buffer. Empty output means nothing has crashed.
+
+        The ``-b crash`` buffer is why this is not a mode of the main log
+        reader: it is a different buffer with a different parser, not a filter
+        over the one ``log_monitor`` reads.
+        """
         result = run_adb(
             "logcat",
             self.serial,
-            "-b",
-            "crash",
-            "-d",
-            "-v",
-            "threadtime",
+            *logcat.logcat_args(buffer_name="crash", dump=True),
             timeout=ADB_TIMEOUT,
             check=True,
         )
@@ -618,7 +620,13 @@ class CrashTriage:
 
     def clear_buffer(self) -> None:
         """Clear the crash buffer (``adb logcat -b crash -c``)."""
-        run_adb("logcat", self.serial, "-b", "crash", "-c", timeout=ADB_TIMEOUT, check=True)
+        run_adb(
+            "logcat",
+            self.serial,
+            *logcat.logcat_args(buffer_name="crash", clear=True),
+            timeout=ADB_TIMEOUT,
+            check=True,
+        )
 
     def triage(self, package: str | None = None) -> dict:
         """Read the buffer and return the structured report."""
@@ -634,6 +642,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Also reachable as `python scripts/logs.py crashes ...` — the unified log entry
+point, which routes here unchanged. Both invocations are supported.
+
 Examples:
   python scripts/crash_triage.py
   python scripts/crash_triage.py --package com.myapp

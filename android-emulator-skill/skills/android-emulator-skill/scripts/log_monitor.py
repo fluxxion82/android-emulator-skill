@@ -41,11 +41,12 @@ import signal
 import subprocess
 import sys
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
+from common import logcat
 from common.adb_exec import AdbCommandError, AdbError, run_adb
-from common.device_utils import build_adb_command, get_connected_devices, quote_for_device_shell
+from common.device_utils import get_connected_devices, quote_for_device_shell
 from common.env_config import env_int
 
 # Output caps (env-configurable via ANDROID_EMU_LOG_*). Defaults preserve the
@@ -117,29 +118,19 @@ class LogMonitor:
         """
         Parse duration string to seconds.
 
+        Delegates to ``common.logcat.parse_duration`` so ``--duration 1h`` means
+        the same thing in every script in this skill.
+
         Args:
             duration_str: Duration like "30s", "5m", "1h"
 
         Returns:
             Duration in seconds
+
+        Raises:
+            ValueError: If the format is unrecognised.
         """
-        match = re.match(r"(\d+)([smh])", duration_str.lower())
-        if not match:
-            raise ValueError(
-                f"Invalid duration format: {duration_str}. Use format like '30s', '5m', '1h'"
-            )
-
-        value, unit = match.groups()
-        value = int(value)
-
-        if unit == "s":
-            return value
-        if unit == "m":
-            return value * 60
-        if unit == "h":
-            return value * 3600
-
-        return 0
+        return logcat.parse_duration(duration_str)
 
     def parse_logcat_line(self, line: str) -> dict | None:
         """
@@ -278,27 +269,7 @@ class LogMonitor:
         Returns:
             A single priority letter (e.g. "W"), or None if no filter applies.
         """
-        if not self.severity_filter:
-            return None
-
-        priority_letters = []
-        for sev in self.severity_filter:
-            if sev == "error":
-                priority_letters.extend(["E", "F"])
-            elif sev == "warning":
-                priority_letters.append("W")
-            elif sev == "info":
-                priority_letters.append("I")
-            elif sev == "debug":
-                priority_letters.append("D")
-            elif sev == "verbose":
-                priority_letters.append("V")
-
-        if not priority_letters:
-            return None
-
-        priority_order = ["V", "D", "I", "W", "E", "F"]
-        return priority_order[min(priority_order.index(p) for p in priority_letters)]
+        return logcat.min_priority_for(self.severity_filter)
 
     def build_logcat_command(
         self,
@@ -311,6 +282,15 @@ class LogMonitor:
 
         This is a pure arg->command mapping (no device I/O), kept separate so the
         PID-resolution and process plumbing in ``stream_logs`` stays testable.
+        The argv shape itself comes from ``common.logcat``, which every logcat
+        reader in this skill shares.
+
+        ``-v threadtime`` (the shared default) is mandatory, not cosmetic:
+        ``parse_logcat_line`` expects "MM-DD HH:MM:SS.mmm PID TID P Tag: msg".
+        The ``time`` format omits the PID/TID columns and writes "P/Tag( PID):"
+        instead, which that regex cannot match -- so every line landed in the
+        unparsed branch, severity counts stayed at zero and ``--follow`` printed
+        nothing at all.
 
         Args:
             pid: App PID to filter by (omitted if None/empty)
@@ -322,36 +302,16 @@ class LogMonitor:
         Returns:
             Complete adb command list ready for subprocess.
         """
-        cmd = build_adb_command("logcat", self.device_serial)
-
-        # Historical window: dump-and-exit (-d) since a computed timestamp (-t).
-        # logcat's -t accepts a "MM-DD HH:MM:SS.mmm" timestamp and prints lines
-        # at or after it, then exits (no live follow).
+        since = None
         if last_minutes is not None:
-            reference = now or datetime.now()
-            start_time = reference - timedelta(minutes=last_minutes)
-            cmd.append("-d")
-            cmd.append("-t")
-            cmd.append(start_time.strftime("%m-%d %H:%M:%S.000"))
+            since = logcat.window_start(last_minutes * 60, now=now)
 
-        # `threadtime` is mandatory, not cosmetic: parse_logcat_line expects
-        # "MM-DD HH:MM:SS.mmm PID TID P Tag: msg". The `time` format omits the
-        # PID/TID columns and writes "P/Tag( PID):" instead, which that regex
-        # cannot match -- so every line landed in the unparsed branch, severity
-        # counts stayed at zero and --follow printed nothing at all.
-        cmd.append("-v")
-        cmd.append("threadtime")
-
-        # Add app package filter if a PID was resolved
-        if pid:
-            cmd.append(f"--pid={pid}")
-
-        # Add severity filter (single minimum priority, shows that level and up)
-        min_priority = self._severity_min_priority()
-        if min_priority:
-            cmd.append(f"*:{min_priority}")
-
-        return cmd
+        return logcat.build_logcat_command(
+            self.device_serial,
+            since=since,
+            pid=pid,
+            min_priority=self._severity_min_priority(),
+        )
 
     def _resolve_app_pid(self) -> str | None:
         """Look up the running PID for ``self.app_package`` (None if not running)."""
@@ -400,7 +360,7 @@ class LogMonitor:
             # Ignore clear errors: an unclearable buffer is not worth failing
             # the capture over. Device-level errors still propagate.
             with contextlib.suppress(AdbCommandError):
-                run_adb("logcat", self.device_serial, "-c", check=True)
+                run_adb("logcat", self.device_serial, *logcat.logcat_args(clear=True), check=True)
 
         # Resolve app PID (device call) then build the command (pure mapping).
         pid = self._resolve_app_pid()
@@ -685,6 +645,9 @@ def main():
         description="Monitor and analyze Android device/emulator logs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Also reachable as `python scripts/logs.py tail ...` — the unified log entry
+point, which routes here unchanged. Both invocations are supported.
+
 Examples:
   # Monitor app in real-time
   python scripts/log_monitor.py --app com.myapp --follow

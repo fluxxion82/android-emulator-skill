@@ -38,7 +38,6 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import select
 import signal
 import subprocess
@@ -46,7 +45,7 @@ import sys
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # Resolve imports whether run from repo root or scripts/ directory.
@@ -54,6 +53,7 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+from common import logcat  # noqa: E402
 from common.anr_pipeline import (  # noqa: E402
     build_normalised_event,
     compress_to_budget,
@@ -87,20 +87,13 @@ def _compute_start_timestamp(duration_str: str) -> str:
     """Parse a duration string and return a ``logcat -t`` start timestamp.
 
     logcat's ``-t`` accepts ``MM-DD HH:MM:SS.mmm`` and prints lines at or after
-    it, then exits (no live follow).
+    it, then exits (no live follow). Grammar and formatting are shared with
+    every other logcat reader in the skill via ``common.logcat``.
 
     Raises:
         ValueError: If the format is unrecognised.
     """
-    match = re.match(r"(\d+)([smh])", duration_str.lower())
-    if not match:
-        raise ValueError(
-            f"Invalid duration format: {duration_str!r}. Use format like '30s', '5m', '1h'."
-        )
-    value, unit = match.groups()
-    seconds = int(value) * {"s": 1, "m": 60, "h": 3600}[unit]
-    start = datetime.now() - timedelta(seconds=seconds)
-    return start.strftime("%m-%d %H:%M:%S.000")
+    return logcat.window_start_for(duration_str)
 
 
 def matches_package(event: dict, package: str) -> bool:
@@ -149,11 +142,7 @@ class AnrWatcher:
         Returns:
             Complete adb command list ready for subprocess.
         """
-        cmd = build_adb_command("logcat", self.serial)
-        if since is not None:
-            cmd.extend(["-d", "-t", since])
-        cmd.extend(["-v", "threadtime"])
-        return cmd
+        return logcat.build_logcat_command(self.serial, since=since)
 
     def watch(
         self,
@@ -779,6 +768,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Also reachable as `python scripts/logs.py anr ...` — the unified log entry
+point, which routes here unchanged. Both invocations are supported.
+
 Examples:
   # ANRBuster session mode (agent-friendly):
   SID=$(python scripts/anr_watcher.py --start --package com.myapp)

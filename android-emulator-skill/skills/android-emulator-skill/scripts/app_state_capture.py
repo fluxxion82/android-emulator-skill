@@ -20,10 +20,10 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from common import adb_exec
+from common import adb_exec, logcat
 from common.device_utils import get_ui_hierarchy
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
@@ -317,38 +317,29 @@ class AppStateCapture:
             Dict with ``captured`` plus ``lines``/``errors``/``warnings`` on
             success, or a ``reason``/``error`` on failure.
         """
-        # Parse duration
-        match = re.match(r"(\d+)([sm])", duration)
-        if not match:
-            with open(output_path, "w") as f:
-                f.write(f"Invalid log duration: {duration!r}\n")
-            return {"captured": False, "reason": f"Invalid log duration: {duration!r}"}
-
-        value, unit = match.groups()
-        value = int(value)
-
-        if unit == "m":
-            value *= 60
-
         # `logcat -t N` means the last N LINES; a bare duration passed here
         # silently became a line count, so "--logs 1m" returned 60 lines. The
         # time-window form takes a "MM-DD HH:MM:SS.mmm" timestamp, which is what
-        # log_monitor already does.
-        start_time = datetime.now() - timedelta(seconds=value)
-        logcat_args = ["-d", "-t", start_time.strftime("%m-%d %H:%M:%S.000")]
+        # common.logcat builds -- the same grammar and the same argv order every
+        # other logcat reader in the skill uses. Routing through it is also what
+        # made `--logs 1h` work here: this parser accepted only `[sm]`.
+        try:
+            since = logcat.window_start_for(duration)
+        except ValueError:
+            with open(output_path, "w") as f:
+                f.write(f"Invalid log duration: {duration!r}\n")
+            return {"captured": False, "reason": f"Invalid log duration: {duration!r}"}
 
         # Add package filter if PID available. `pidof` exits non-zero when the
         # app is not running; the snapshot then keeps the unfiltered window.
         pid_result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
         pid = pid_result.stdout.strip() if pid_result.ok else ""
-        if pid:
-            logcat_args.append(f"--pid={pid}")
 
         try:
             result = adb_exec.run_adb(
                 "logcat",
                 self.serial,
-                *logcat_args,
+                *logcat.logcat_args(since=since, fmt=None, pid=pid),
                 timeout=LOGCAT_TIMEOUT_SECONDS,
                 check=True,
             )
@@ -451,7 +442,9 @@ Examples:
     parser.add_argument(
         "--serial", dest="device_serial", help="Device serial (uses default if not specified)"
     )
-    parser.add_argument("--logs", default="30s", help="Duration of logs to capture (e.g., 30s, 1m)")
+    parser.add_argument(
+        "--logs", default="30s", help="Duration of logs to capture (e.g., 30s, 5m, 1h)"
+    )
     parser.add_argument("--no-logs", action="store_true", help="Don't capture logs")
     parser.add_argument(
         "--log-lines",
