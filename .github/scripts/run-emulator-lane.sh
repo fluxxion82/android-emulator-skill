@@ -29,8 +29,13 @@ adb shell getprop ro.product.model
 echo "::endgroup::"
 
 echo "::group::Build and install the Compose fixture app"
+# Through the wrapper, deliberately. CI first ran this with whatever Gradle
+# `setup-gradle` provisioned -- 9.7.1 -- which removed an internal API that AGP
+# 8.x still uses, so the build failed with "use Gradle 9.5" while the same
+# sources built fine locally on 8.13. A wrapper is the only way CI and a laptop
+# agree on the toolchain.
 # Sources are committed; build output is gitignored, so this always builds.
-gradle --project-dir "${COMPOSE_APP}" --no-daemon :app:installDebug
+(cd "${COMPOSE_APP}" && ./gradlew --no-daemon :app:installDebug)
 echo "::endgroup::"
 
 # Assert rather than hope: if this is missing, test_agent_task_e2e skips and the

@@ -61,8 +61,10 @@ jobs:
           java-version: '21'
 
       - name: Set up Gradle
-        # The Compose fixture app has no Gradle wrapper (only its sources are
-        # committed), so Gradle is provisioned here rather than assumed present.
+        # Caching only. The version comes from the fixture app's wrapper
+        # (8.13), NOT from this action: left to provision the latest, it
+        # installed Gradle 9.7.1, which removed an internal API that AGP 8.x
+        # still depends on, and the build failed in CI while succeeding locally.
         uses: gradle/actions/setup-gradle@v4
 
       - name: Enable KVM
