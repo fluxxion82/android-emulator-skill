@@ -3,64 +3,48 @@
 SMS on an emulator: deliver an inbound message, read the inbox back, and pull a
 one-time code out of the newest message.
 
-Two tool behaviours drive the design. Both are the ``am broadcast result=0``
-trap (defect S4, ``push_notification.py``) in a new place:
+Two tool behaviours drive the design; both are the ``am broadcast result=0``
+trap (defect S4, ``push_notification.py``) in a new place.
 
-**``adb emu sms send`` answers a bare ``OK``, which means the console accepted
-the command -- not that a message was delivered.** With the body omitted the
-console answers ``KO: missing argument`` and adb still **exits 0** (recorded:
-``emu_sms_send.txt``, ``emu_sms_send_missing_arg.txt``); failure lives in the
-reply text only. So every console call here goes through
-``common.emu_console.run_emu``, which turns a ``KO`` into an exception, and
-nothing shells out to ``adb emu`` directly. The console does not validate the
-sender either -- ``sms send abc "hello there"`` answers ``OK`` and delivers
-``abc`` verbatim. ``--send`` therefore proves delivery the only way it can be
-proved: by reading ``content://sms/inbox`` back and finding a message the inbox
-did not already hold. *accepted* and *delivered* are reported separately and are
-never conflated.
+**``adb emu sms send`` answers a bare ``OK``, meaning the console accepted the
+command -- not that a message was delivered.** With the body omitted it answers
+``KO: missing argument`` and adb still **exits 0** (recorded: ``emu_sms_send``,
+``emu_sms_send_missing_arg``), so failure lives in the reply text alone: every
+console call goes through ``common.emu_console.run_emu``, which raises on a
+``KO``, and none shells out to ``adb emu``. The sender is not validated either
+-- ``sms send abc "hi"`` answers ``OK`` and delivers ``abc`` verbatim. So
+``--send`` proves delivery by reading ``content://sms/inbox`` back for a message
+the inbox did not already hold; *accepted* and *delivered* are reported
+separately and never conflated.
 
-**``adb shell content query`` also exits 0 when it fails.** It writes
+**``adb shell content query`` also exits 0 when it fails**, writing
 ``Error while accessing provider:<authority>`` and a Java stack trace to
-**stderr**, printing nothing on stdout (recorded:
-``content_query_sms_error.txt``); an empty result set is instead the literal
-``No result found.`` on stdout (``content_query_empty_result.txt``). A caller
-that checks only the exit status, or only stdout, reads a failed query as an
-empty inbox -- reporting "your message never arrived" when the truth is "the
-inbox could not be read". This script keeps them apart.
+**stderr** and nothing to stdout (recorded: ``content_query_sms_error``); an
+empty result set is instead ``No result found.`` on stdout
+(``content_query_empty_result``). Checking only the exit status, or only stdout,
+turns "the inbox could not be read" into "your message never arrived".
 
 Row shape, and why it cannot be split naively::
 
     Row: 1 address=+15550002222, body=Order 42, shipped today, date=1788280004066
 
-Pairs are separated by ``", "`` and a body may contain ``", "`` itself, as that
-recorded row does. :func:`parse_content_rows` bounds each value by the next
-*known key* instead (recorded: ``content_query_sms_inbox_multi.txt``). ``date``
-is epoch milliseconds. Rows arrive newest first, but this script sorts by
-``date`` itself rather than trusting that.
+A body may contain the ``", "`` pair separator, as that recorded row does, so
+:func:`parse_content_rows` bounds each value by the next *known key* (recorded:
+``content_query_sms_inbox_multi``). ``date`` is epoch milliseconds; rows arrive
+newest first, but this script sorts rather than trust that.
 
-Limitations:
-
-* **``--send`` is emulator-only.** A physical device has no emulator console.
-  ``--list`` and ``--otp`` are plain content queries and work anywhere the shell
-  can read the provider.
-* **No outgoing SMS, and no MMS.** ``adb emu help sms`` lists exactly ``send``
-  and ``pdu``, and both simulate an *inbound* message (recorded:
-  ``emu_help_sms.txt``). There is no console path to the app's send code.
-* **No delivery to a particular app** -- the message goes to the platform,
-  which routes it as it would any inbound SMS.
-* **No writes to the SMS provider** (no delete, no mark-as-read). Whether the
-  shell uid may do either is UNVERIFIED, and unverified capabilities are not
-  shipped.
-* **``--otp`` is a heuristic, not a parser.** See :func:`extract_otp`.
+Limitations: ``--send`` is **emulator-only** (a physical device has no console;
+``--list``/``--otp`` are plain content queries and work anywhere); there is **no
+outgoing SMS and no MMS** -- ``adb emu help sms`` lists only ``send`` and
+``pdu``, both simulating an *inbound* message (``emu_help_sms``); a message
+cannot be aimed at **a particular app**, only at the platform; **nothing is
+written to the provider** (no delete, no mark-as-read -- whether the shell uid
+may is UNVERIFIED, and unverified capabilities are not shipped); and ``--otp``
+is a **heuristic, not a parser** (see :func:`extract_otp`).
 
 Usage Examples:
-    # Deliver a message and prove it landed in the inbox
     python sms.py --send --to +15551234567 --body "Your code is 428193"
-
-    # Newest messages first
     python sms.py --list --limit 5
-
-    # Pull the code out of the newest message (exit 1 if there is none)
     python sms.py --otp --json
 """
 
@@ -111,12 +95,11 @@ class SmsMessage:
     """One row of the SMS inbox.
 
     Attributes:
-        address: Sender. Usually a phone number, but the console delivers an
-            alphanumeric sender verbatim, so this is not guaranteed numeric.
+        address: Sender. Not guaranteed numeric: an alphanumeric sender is
+            delivered verbatim.
         body: Message text, which may itself contain ``", "``.
         date: Receipt time in epoch **milliseconds**, as the provider stores it.
-        row: The ``Row: <n>`` index the query printed, kept for traceability
-            back to the raw output.
+        row: The ``Row: <n>`` index the query printed, for traceability.
     """
 
     address: str
@@ -131,28 +114,21 @@ class SmsMessage:
 
     @property
     def identity(self) -> tuple[str, str, int]:
-        """Value identity used to tell an existing message from a new one.
-
-        ``date`` is part of it because the inbox legitimately holds two messages
-        with the same sender and body (the recorded fixture has that pair).
-        """
+        """Identity used to tell an existing message from a new one; ``date`` is
+        part of it because the inbox legitimately holds two messages with the
+        same sender and body (the recorded fixture has that pair)."""
         return (self.address, self.body, self.date)
 
 
 def parse_content_rows(output: str, projection: tuple[str, ...] = PROJECTION) -> list[dict]:
     """Parse ``adb shell content query`` rows into ``{key: value}`` dicts.
 
-    The CLI prints ``Row: <n> k1=v1, k2=v2, ...`` with ``", "`` between pairs
-    and no quoting, so a body containing ``", "`` looks exactly like a pair
-    boundary. Each value is therefore bounded by the *next key in the
-    projection*: ``body=Order 42, shipped today, date=...`` parses because the
-    boundary is ``", date="``, not any ``", "``. The final value is bounded by
-    end-of-line and the one before it matched greedily, so a body containing
-    ``date=`` still parses. A body ending in ``", date=<digits>"`` remains
-    genuinely ambiguous and cannot be resolved from this output at all.
-
-    Lines that are not rows (``No result found.``, a stack trace) do not match
-    and are skipped; the caller distinguishes those cases before calling here.
+    The CLI prints ``Row: <n> k1=v1, k2=v2, ...`` unquoted, so a body containing
+    ``", "`` looks exactly like a pair boundary; each value is therefore bounded
+    by the *next key in the projection*. A body ending in ``", date=<digits>"``
+    stays ambiguous and cannot be resolved from this output at all. Non-row
+    lines (``No result found.``, a stack trace) are skipped here; the caller
+    distinguishes those cases before calling.
 
     Args:
         output: Raw stdout of the ``content query``.
@@ -195,16 +171,14 @@ def _row_pattern(projection: tuple[str, ...]) -> re.Pattern[str]:
 def parse_inbox(output: str) -> list[SmsMessage]:
     """Parse inbox rows into messages, newest first.
 
-    Rows whose ``date`` is not an integer are dropped rather than guessed at:
-    it is an integer column, so a non-integer means the line was not the row it
-    appeared to be.
+    Rows whose ``date`` is not an integer are dropped rather than guessed at.
 
     Args:
         output: Raw stdout of the inbox query.
 
     Returns:
-        Messages sorted by ``date`` descending. The provider already sorts that
-        way; sorting here makes the order this function's guarantee.
+        Messages sorted by ``date`` descending -- the provider sorts that way
+        too, but sorting here makes the order this function's guarantee.
     """
     messages = []
     for row in parse_content_rows(output):
@@ -227,10 +201,9 @@ def extract_otp(body: str) -> str | None:
 
     **This is a heuristic and it does not know what a code is.** It returns the
     first run of 4 to 8 digits with neither a digit nor a letter against either
-    end, which excludes a longer number and a digit run inside a word, and
-    nothing else: it cannot tell a verification code from an order number, an
-    amount or a year. Callers must show the message the code came from so a
-    human can check it, which is what the CLI does.
+    end -- excluding a longer number and a digit run inside a word, nothing more
+    -- so it cannot tell a code from an order number, an amount or a year.
+    Callers must show the message it came from, which is what the CLI does.
 
     Args:
         body: Message text.
@@ -246,11 +219,7 @@ class SmsTester:
     """Deliver inbound SMS to an emulator and read the inbox back."""
 
     def __init__(self, serial: str | None = None):
-        """Initialize the tester.
-
-        Args:
-            serial: Device serial (uses the default device when None).
-        """
+        """Initialize the tester (``serial`` None uses the default device)."""
         self.serial = serial
 
     # === PUBLIC API ===
@@ -259,9 +228,9 @@ class SmsTester:
         """Read ``content://sms/inbox``, newest first.
 
         Returns:
-            (success, result_dict). Success means the query *ran*; an empty
-            inbox is a successful read with ``count`` 0. A provider failure is
-            not, and carries the provider's own error text.
+            (success, result_dict). Success means the query *ran*: an empty
+            inbox is a successful read with ``count`` 0, a provider failure is
+            not and carries the provider's own error text.
         """
         try:
             result = run_adb(
@@ -278,8 +247,8 @@ class SmsTester:
         except AdbError as exc:
             return False, {"action": "list", "error": str(exc)}
 
-        # `content query` exits 0 whatever happens, so the exit status is not
-        # consulted at all: the answer is in which stream said what.
+        # `content query` exits 0 whatever happens: the answer is in which
+        # stream said what, so the exit status is not consulted at all.
         if PROVIDER_ERROR in result.stderr:
             return False, {
                 "action": "list",
@@ -321,8 +290,7 @@ class SmsTester:
         """Deliver an inbound SMS through the emulator console.
 
         Args:
-            to: Sender to attribute the message to. The console does not
-                validate it; an alphanumeric sender is delivered verbatim.
+            to: Sender to attribute the message to; unvalidated by the console.
             body: Message text.
             verify: Read the inbox back and require the message to appear before
                 reporting success. With False, the only claim made is that the
@@ -419,9 +387,9 @@ class SmsTester:
     def newest_otp(self) -> tuple[bool, dict]:
         """Extract a one-time code from the **newest** inbox message.
 
-        Only the newest message is examined: searching backwards would happily
-        return a stale code. Extraction is the heuristic documented on
-        :func:`extract_otp`, so the message it came from is reported with it.
+        Only the newest message is examined; searching backwards would return a
+        stale code. Extraction is the :func:`extract_otp` heuristic, so the
+        message it came from is always reported with it.
 
         Returns:
             (found, result_dict).
@@ -466,8 +434,8 @@ def _addresses_match(sent: str, seen: str) -> bool:
 
     Measured on API 35, the console stores the address exactly as given (even
     ``abc`` comes back verbatim), so the exact comparison is the one that
-    matters. The digits-only comparison is tolerance for a platform that might
-    normalise punctuation, not a claim that one does.
+    matters; the digits-only fallback tolerates a platform that might normalise
+    punctuation, rather than claiming one does.
     """
     if sent == seen:
         return True
@@ -481,8 +449,7 @@ def _find_new_message(messages: list[dict], to: str, body: str, known: set[tuple
 
     Args:
         messages: Inbox messages, newest first.
-        to: Sender the message was sent from.
-        body: Body that was sent.
+        to, body: What was sent.
         known: Identities present before the send.
 
     Returns:

@@ -83,12 +83,23 @@ Therefore:
    (`cmd statusbar battery-level`, `dumpsys activity anr`,
    `cmd notification list channels`). Some fail silently and exit 0.
 
-3. **Known defects are pinned with `@pytest.mark.xfail(strict=True)`** and a
+3. **The rule is enforced, not just written here.** `tests/test_fixture_policy.py`
+   is a ratchet: it fails any *new* test that feeds a long string literal into a
+   parser, either directly or through a mocked `subprocess`'s `stdout=`. The
+   violations that exist today are frozen in `KNOWN_VIOLATIONS` as debt, and a
+   stale entry fails too, so paying one off cannot silently re-open the door.
+
+   The two worth paying off first are `test_container.py` and
+   `test_model_inspector.py`, which test parsers against hand-written `run-as
+   ls -la` and `sqlite3 .schema` output. Neither command has any recorded
+   fixture, so there is currently nothing to compare against.
+
+4. **Known defects are pinned with `@pytest.mark.xfail(strict=True)`** and a
    defect ID, in `tests/test_recorded_fixtures.py`. `strict=True` means fixing
    the defect turns the test red until the marker is removed — delete the marker
    in the same commit as the fix.
 
-4. **Tests needing a device are marked `@pytest.mark.emulator`** and deselected
+5. **Tests needing a device are marked `@pytest.mark.emulator`** and deselected
    by default. Run them with `pytest -m emulator`. They assert *semantic floors*
    ("did the agent get a usable answer"), not command shapes.
 
