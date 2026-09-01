@@ -22,7 +22,7 @@ script list and the roadmap of features still being ported.
 - **Emulators and real devices** — `--serial` with auto-detection.
 - **Lifecycle management** — create / boot / shutdown / erase / delete AVDs.
 - **Gradle build & test, logcat monitoring, accessibility audit, visual diff, test recording,
-  state capture, permissions, clipboard, status bar, push notifications.**
+  state capture, permissions, status bar, notifications.**
 
 ## Quick start
 

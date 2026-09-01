@@ -168,11 +168,6 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Batch operations
     - Options: `--grant`, `--revoke`, `--list`, `--package`, `--serial`, `--list-permissions`, `--json`
 
-21. **clipboard.py** ⭐ NEW - Clipboard management
-    - Copy text to device clipboard
-    - Test paste functionality
-    - Options: `--copy`, `--paste`, `--serial`, `--json`
-
 22. **status_bar.py** ⭐ NEW - Status bar control
     - Set battery level and charging state
     - Set WiFi/mobile signal strength
@@ -258,7 +253,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 ### ⚙️ Advanced
 - **privacy_manager.py** - Test permission flows
 - **push_notification.py** - Test notification handling
-- **clipboard.py** / **status_bar.py** - Fine-grained control
+- **status_bar.py** - Fine-grained control
 - **emulator_create/delete/erase.py** - CI/CD provisioning
 
 ## Typical Workflows
@@ -373,6 +368,31 @@ In the source repository only:
 - **CLAUDE.md** - architecture, conventions, and the recorded-fixture policy
 - **references/** - deep dives on adb, test patterns, accessibility
   (not included in the released package)
+
+## Platform limitations worth knowing
+
+**The clipboard is not reachable from adb.** There is no way to *set* clipboard
+text from the shell on any modern Android:
+
+- `cmd clipboard` reports "No shell command implementation" on API 33 and 35 —
+  the clipboard service exposes no shell command interface at all.
+- `service call clipboard <setPrimaryClip>` cannot work either: the call takes a
+  `ClipData` Parcelable, whose text is marshalled with `writeString8()` plus
+  version-dependent fields, and `service` can only write `i32`/`s16`/binders.
+- The emulator console (`adb emu`) has no clipboard command.
+
+Reading and clearing *are* reachable — `service call clipboard 3/4/9` with the
+right signature is accepted for the shell uid, which holds
+`READ_CLIPBOARD_IN_BACKGROUND` — but writing is not, so a paste-flow test needs
+an app-side hook or a helper IME.
+
+On an emulator only, the gRPC control API does expose `setClipboard` /
+`getClipboard` (see `$ANDROID_HOME/emulator/lib/emulator_controller.proto`).
+That needs a gRPC client and the emulator's auth token, and is not wired up here.
+
+`clipboard.py` was removed in v0.5.0 for this reason: its surviving code path
+called `service call clipboard 1` with the pre-Android-10 signature and always
+failed.
 
 ## Key Design Principles
 
