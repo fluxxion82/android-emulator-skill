@@ -47,6 +47,13 @@ from common.env_config import env_int
 DEVICE_MATCH_CUTOFF = env_int("ANDROID_EMU_DEVICE_MATCH_CUTOFF", 60, min_value=0)
 DEVICE_MATCH_SUGGEST = env_int("ANDROID_EMU_DEVICE_MATCH_SUGGEST", 5, min_value=1)
 
+# avdmanager and sdkmanager are Android SDK tools, not adb, so they do not go
+# through common.adb_exec. They still need a ceiling: an unbounded call wedges
+# the caller with no diagnosis. `sdkmanager --list` fetches the remote package
+# index, so it gets the longer budget; every other call here is local.
+SDK_TOOL_TIMEOUT = 120
+SDK_LIST_TIMEOUT = 300
+
 
 def _normalize_device_token(value: str) -> str:
     """Lowercase and strip non-alphanumerics so 'Pixel 7' ~= 'pixel_7' ~= 'pixel7'."""
@@ -249,6 +256,7 @@ class EmulatorCreator:
                 [avdmanager, "list", "device"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
 
@@ -271,7 +279,7 @@ class EmulatorCreator:
 
             return devices
 
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
     def list_system_images(self) -> list:
@@ -290,6 +298,7 @@ class EmulatorCreator:
                 [sdkmanager, "--list"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_LIST_TIMEOUT,
                 check=True,
             )
 
@@ -323,7 +332,7 @@ class EmulatorCreator:
 
             return images
 
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
     def list_installed_system_images(self) -> list:
@@ -346,9 +355,10 @@ class EmulatorCreator:
                 [sdkmanager, "--list_installed"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
         images = []
@@ -442,6 +452,7 @@ class EmulatorCreator:
                     [sdkmanager, "--list"],
                     capture_output=True,
                     text=True,
+                    timeout=SDK_LIST_TIMEOUT,
                     check=True,
                 )
 
@@ -452,7 +463,7 @@ class EmulatorCreator:
                         f"Install with: sdkmanager '{system_image}'",
                         None,
                     )
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 pass  # Continue anyway
 
         # Create AVD
@@ -475,6 +486,7 @@ class EmulatorCreator:
                 input="no\n",
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
 
@@ -483,6 +495,14 @@ class EmulatorCreator:
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to create AVD: {error_msg}", None
+
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                f"avdmanager did not finish creating {name} within {SDK_TOOL_TIMEOUT}s. "
+                f"Check for a stale avdmanager process and retry.",
+                None,
+            )
 
     def delete(self, name: str) -> tuple:
         """
@@ -504,12 +524,21 @@ class EmulatorCreator:
         cmd = [avdmanager, "delete", "avd", "--name", name]
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cmd, capture_output=True, text=True, timeout=SDK_TOOL_TIMEOUT, check=True
+            )
             return True, f"AVD deleted: {name}"
 
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to delete AVD: {error_msg}"
+
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                f"avdmanager did not finish deleting {name} within {SDK_TOOL_TIMEOUT}s. "
+                f"Check for a stale avdmanager process and retry.",
+            )
 
 
 def main():

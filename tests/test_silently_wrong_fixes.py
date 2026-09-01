@@ -79,7 +79,7 @@ def test_focused_activity_returns_none_when_absent():
 
 def test_get_current_activity_does_not_use_a_shell_pipeline(monkeypatch):
     """The command must be a real argv list, with no shell metacharacters."""
-    from common import device_utils
+    from common import adb_exec, device_utils
 
     captured = {}
 
@@ -93,7 +93,7 @@ def test_get_current_activity_does_not_use_a_shell_pipeline(monkeypatch):
         captured["kwargs"] = kwargs
         return _Result()
 
-    monkeypatch.setattr(device_utils.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     device_utils.get_current_activity("emulator-5554")
 
     assert captured["kwargs"].get("shell") is not True
@@ -103,14 +103,14 @@ def test_get_current_activity_does_not_use_a_shell_pipeline(monkeypatch):
 
 def test_get_current_activity_returns_the_component(monkeypatch, recorded):
     """End to end against recorded device output."""
-    from common import device_utils
+    from common import adb_exec, device_utils
 
     class _Result:
         stdout = recorded.text("dumpsys_window_focus")
         stderr = ""
         returncode = 0
 
-    monkeypatch.setattr(device_utils.subprocess, "run", lambda *_a, **_k: _Result())
+    monkeypatch.setattr(adb_exec.subprocess, "run", lambda *_a, **_k: _Result())
     assert device_utils.get_current_activity("emulator-5554") is not None
 
 
@@ -126,7 +126,7 @@ def test_capture_screenshot_has_no_success_key(tmp_path, monkeypatch):
 
     from PIL import Image as _Image
 
-    from common import screenshot_utils
+    from common import adb_exec, screenshot_utils
 
     buffer = _io.BytesIO()
     _Image.new("RGB", (4, 4)).save(buffer, format="PNG")
@@ -138,7 +138,7 @@ def test_capture_screenshot_has_no_success_key(tmp_path, monkeypatch):
             pathlib.Path(cmd[-1]).write_bytes(png)
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr(screenshot_utils.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     target = tmp_path / "shot.png"
 
     result = screenshot_utils.capture_screenshot(None, output_path=str(target), size="full")
@@ -159,7 +159,7 @@ def test_snapshot_lists_the_screenshot_it_captured(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
     monkeypatch.setattr(
-        app_state_capture.subprocess,
+        app_state_capture.adb_exec.subprocess,
         "run",
         lambda *_a, **_k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
     )
@@ -235,7 +235,7 @@ def test_log_window_uses_a_timestamp_not_a_line_count(monkeypatch, tmp_path):
         captured.append(cmd)
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr(app_state_capture.subprocess, "run", _run)
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", _run)
 
     capturer = app_state_capture.AppStateCapture(package="com.example.app")
     capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
@@ -259,7 +259,7 @@ def test_log_window_timestamp_reflects_the_requested_duration(monkeypatch, tmp_p
 
     captured = []
     monkeypatch.setattr(
-        app_state_capture.subprocess,
+        app_state_capture.adb_exec.subprocess,
         "run",
         lambda cmd, **_k: (
             captured.append(cmd),

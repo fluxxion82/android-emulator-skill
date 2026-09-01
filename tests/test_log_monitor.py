@@ -139,20 +139,30 @@ def test_stream_logs_last_window_runs_dump_command(monkeypatch):
 
 
 def test_resolve_app_pid_returns_pid(monkeypatch):
-    class _Result:
-        stdout = "  4242 \n"
+    # adb now goes through common.adb_exec, so that is where the fake belongs.
+    import subprocess as real_subprocess
 
-    monkeypatch.setattr(log_monitor.subprocess, "run", lambda *_a, **_k: _Result())
+    from common import adb_exec
+
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: real_subprocess.CompletedProcess(cmd, 0, "  4242 \n", ""),
+    )
     assert _monitor(app_package="com.myapp")._resolve_app_pid() == "4242"
 
 
 def test_resolve_app_pid_handles_not_running(monkeypatch):
+    """`pidof` exits non-zero when the app is not running: an answer, not a failure."""
     import subprocess as real_subprocess
 
-    def _raise(*_a, **_k):
-        raise real_subprocess.CalledProcessError(1, "pidof")
+    from common import adb_exec
 
-    monkeypatch.setattr(log_monitor.subprocess, "run", _raise)
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: real_subprocess.CompletedProcess(cmd, 1, "", ""),
+    )
     assert _monitor(app_package="com.myapp")._resolve_app_pid() is None
 
 

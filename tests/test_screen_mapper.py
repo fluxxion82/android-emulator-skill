@@ -9,18 +9,39 @@ Covers the two curated deltas:
 
 All logic here is pure (XML -> analysis dict -> formatted string), so no adb or
 emulator is required. The one place subprocess would be touched
-(``get_ui_hierarchy``) is exercised by monkeypatching ``subprocess.run`` and
-``ET.parse`` to prove command construction never shells out to a device.
+(``get_ui_hierarchy``) is exercised by monkeypatching the subprocess call under
+``common.adb_exec`` and ``ET.parse`` to prove command construction never shells
+out to a device.
+
+screen_mapper reaches adb only through ``adb_exec.run_adb`` now, so the fake
+goes there; patching ``screen_mapper.subprocess`` would stop intercepting and
+let these tests dump a real device's screen.
 """
 
 from __future__ import annotations
 
-import subprocess
+import json as json_lib
 import xml.etree.ElementTree as ET
 
 import pytest
 import screen_mapper
 from screen_mapper import ScreenMapper
+
+from common import adb_exec
+
+
+def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
+    """Stand-in for subprocess.CompletedProcess."""
+
+    class _Result:
+        pass
+
+    result = _Result()
+    result.returncode = returncode
+    result.stdout = stdout
+    result.stderr = stderr
+    return result
+
 
 # A hierarchy with one plain EditText and one password EditText so the secure
 # count is independently observable from the total EditText count.
@@ -149,22 +170,25 @@ def test_env_int_overrides_at_import(monkeypatch):
 # --- Command construction never shells out to a real device ----------------
 
 
-def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch):
+def _patch_adb(monkeypatch, result_for=None):
+    """Intercept every adb call; return (commands, timeouts)."""
     calls: list[list[str]] = []
-
-    class _FakeResult:
-        stdout = ""
-        stderr = ""
+    budgets: list[object] = []
 
     def fake_run(cmd, *args, **kwargs):
-        calls.append(cmd)
-        # Must be an arg list (never shell=True), and check= passed explicitly.
+        calls.append(list(cmd))
+        budgets.append(kwargs.get("timeout"))
+        # Must be an arg list (never shell=True).
         assert isinstance(cmd, list)
         assert kwargs.get("shell", False) is False
-        return _FakeResult()
+        return _fake_result() if result_for is None else result_for(cmd)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(screen_mapper.subprocess, "run", fake_run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    return calls, budgets
+
+
+def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch):
+    calls, budgets = _patch_adb(monkeypatch)
     monkeypatch.setattr(
         ET, "parse", lambda _f: ET.ElementTree(ET.fromstring(HIERARCHY_WITH_SECURE))
     )
@@ -179,6 +203,67 @@ def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch):
     assert "uiautomator" in dump_cmd
     assert "dump" in dump_cmd
     assert "emulator-5554" in dump_cmd
+    # An unbounded call would wedge adb for whatever runs next.
+    assert all(b for b in budgets), f"unbounded adb call: {budgets}"
+
+
+# --- R2: the exit code must carry the outcome ------------------------------
+
+
+def test_main_exits_non_zero_when_the_screen_cannot_be_read(monkeypatch, capsys):
+    """R2: exiting 0 while serialising an error made the status useless."""
+    _patch_adb(
+        monkeypatch,
+        result_for=lambda _cmd: _fake_result(
+            returncode=1, stderr="adb: more than one device/emulator\n"
+        ),
+    )
+    monkeypatch.setattr(screen_mapper, "resolve_device_identifier", lambda arg: arg)
+    monkeypatch.setattr(screen_mapper.sys, "argv", ["screen_mapper.py"])
+
+    with pytest.raises(SystemExit) as exc:
+        screen_mapper.main()
+
+    assert exc.value.code != 0, "a failed screen read still reported success"
+    out = capsys.readouterr().out
+    # Output format is unchanged: still one "Error: ..." line on stdout.
+    assert out.startswith("Error: ")
+    assert "--serial" in out, "the error does not say what to do next"
+
+
+def test_main_json_error_payload_is_preserved_and_exits_non_zero(monkeypatch, capsys):
+    _patch_adb(
+        monkeypatch,
+        result_for=lambda _cmd: _fake_result(
+            returncode=1, stderr="adb: more than one device/emulator\n"
+        ),
+    )
+    monkeypatch.setattr(screen_mapper, "resolve_device_identifier", lambda arg: arg)
+    monkeypatch.setattr(screen_mapper.sys, "argv", ["screen_mapper.py", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        screen_mapper.main()
+
+    assert exc.value.code != 0
+    payload = json_lib.loads(capsys.readouterr().out)
+    assert "error" in payload, "the JSON error contract changed"
+
+
+def test_main_exits_zero_when_the_screen_is_read(monkeypatch, capsys):
+    _patch_adb(monkeypatch)
+    monkeypatch.setattr(
+        ET, "parse", lambda _f: ET.ElementTree(ET.fromstring(HIERARCHY_WITH_SECURE))
+    )
+    monkeypatch.setattr(screen_mapper, "resolve_device_identifier", lambda arg: arg)
+    monkeypatch.setattr(
+        screen_mapper.sys, "argv", ["screen_mapper.py", "--serial", "emulator-5554"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        screen_mapper.main()
+
+    assert exc.value.code == 0
+    assert "Screen:" in capsys.readouterr().out
 
 
 if __name__ == "__main__":

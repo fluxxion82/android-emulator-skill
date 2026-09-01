@@ -37,9 +37,9 @@ Locale caveat:
 
 import argparse
 import json
-import subprocess
 import sys
 
+from common import adb_exec
 from common.device_utils import build_adb_command, resolve_device_identifier
 from common.env_config import env_float
 
@@ -142,6 +142,25 @@ class AppearanceController:
 
     # === DEVICE OPERATIONS ===
 
+    def _run_built(self, cmd: list) -> None:
+        """Run an argv produced by one of the ``build_*_command`` helpers.
+
+        Those helpers are the tested source of truth for these commands, so
+        rather than restating their arguments here we hand the device-side tail
+        (everything after ``shell``) to :func:`run_adb`, which re-adds the
+        bounded ``adb [-s SERIAL] shell`` prefix. Every call is therefore
+        bounded, and a device-level failure raises rather than being reported
+        as "the setting did not apply".
+
+        Args:
+            cmd: Complete adb argv from a ``build_*_command`` helper.
+
+        Raises:
+            adb_exec.AdbCommandError: the command ran and returned non-zero.
+            adb_exec.AdbError: adb never reached a device (surfaces at main()).
+        """
+        adb_exec.run_adb("shell", self.serial, *cmd[cmd.index("shell") + 1 :], check=True)
+
     def set_theme(self, theme: str) -> tuple:
         """
         Switch device between light and dark UI night mode.
@@ -154,11 +173,10 @@ class AppearanceController:
         """
         cmd = self.build_theme_command(theme)
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self._run_built(cmd)
             return True, f"Theme set: {theme}"
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.strip() if e.stderr else str(e)
-            return False, f"Failed to set theme: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to set theme: {e}"
 
     def set_font_scale(self, scale: float) -> tuple:
         """
@@ -175,11 +193,10 @@ class AppearanceController:
 
         cmd = self.build_font_scale_command(scale)
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self._run_built(cmd)
             return True, f"Font scale set: {scale}"
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.strip() if e.stderr else str(e)
-            return False, f"Failed to set font scale: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to set font scale: {e}"
 
     def set_text_size(self, alias: str) -> tuple:
         """
@@ -219,15 +236,14 @@ class AppearanceController:
         """
         cmd = self.build_locale_command(locale)
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self._run_built(cmd)
             return True, (
                 f"Locale write attempted: {locale} (best-effort — a reboot may be "
                 "required, and unprivileged devices may ignore this)"
             )
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.strip() if e.stderr else str(e)
+        except adb_exec.AdbCommandError as e:
             return False, (
-                f"Locale not changed: {error_msg}. Changing the global locale "
+                f"Locale not changed: {e}. Changing the global locale "
                 "reliably needs root/privileged access or a reboot."
             )
 
@@ -347,25 +363,32 @@ the property write succeeded; it does not guarantee apps re-localize.
     controller = AppearanceController(serial=serial)
     results: list[dict] = []
 
-    if args.reset:
-        success, message = controller.reset()
-        results.append({"operation": "reset", "success": success, "message": message})
-    else:
-        if args.theme:
-            success, message = controller.set_theme(args.theme)
-            results.append({"operation": "theme", "success": success, "message": message})
+    # CLI boundary: a device-level adb failure (ambiguous target, wrong serial,
+    # offline, unauthorized) means the command never ran. Report the remedy the
+    # error already carries rather than letting a traceback reach the user.
+    try:
+        if args.reset:
+            success, message = controller.reset()
+            results.append({"operation": "reset", "success": success, "message": message})
+        else:
+            if args.theme:
+                success, message = controller.set_theme(args.theme)
+                results.append({"operation": "theme", "success": success, "message": message})
 
-        if args.text_size:
-            success, message = controller.set_text_size(args.text_size)
-            results.append({"operation": "text_size", "success": success, "message": message})
+            if args.text_size:
+                success, message = controller.set_text_size(args.text_size)
+                results.append({"operation": "text_size", "success": success, "message": message})
 
-        if args.font_scale is not None:
-            success, message = controller.set_font_scale(args.font_scale)
-            results.append({"operation": "font_scale", "success": success, "message": message})
+            if args.font_scale is not None:
+                success, message = controller.set_font_scale(args.font_scale)
+                results.append({"operation": "font_scale", "success": success, "message": message})
 
-        if args.locale:
-            success, message = controller.set_locale(args.locale)
-            results.append({"operation": "locale", "success": success, "message": message})
+            if args.locale:
+                success, message = controller.set_locale(args.locale)
+                results.append({"operation": "locale", "success": success, "message": message})
+    except adb_exec.AdbError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     if args.json:
         print(json.dumps({"results": results}, indent=2))

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 
+from common import adb_exec
 from common.device_utils import quote_for_device_shell
 
 # Metacharacters the device shell acts on. Each of these was previously passed
@@ -76,7 +77,8 @@ def test_keyboard_text_is_quoted_before_reaching_the_device(monkeypatch):
         captured["cmd"] = cmd
         return _Result()
 
-    monkeypatch.setattr(keyboard.subprocess, "run", _run)
+    # keyboard reaches adb through adb_exec.run_adb, so the fake goes there.
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     keyboard.KeyboardSimulator()._input_text("x;id")
 
     payload = captured["cmd"][-1]
@@ -98,7 +100,7 @@ def test_navigator_text_is_quoted_before_reaching_the_device(monkeypatch):
         captured["cmd"] = cmd
         return _Result()
 
-    monkeypatch.setattr(navigator.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     monkeypatch.setattr(navigator.time, "sleep", lambda _s: None)
     element = navigator.Element(
         type="EditText",
@@ -160,7 +162,7 @@ def test_space_handling_is_preserved(monkeypatch):
         returncode = 0
 
     monkeypatch.setattr(
-        keyboard.subprocess, "run", lambda cmd, **_k: (captured.update(cmd=cmd), _Result())[1]
+        adb_exec.subprocess, "run", lambda cmd, **_k: (captured.update(cmd=cmd), _Result())[1]
     )
     keyboard.KeyboardSimulator()._input_text("hello world")
 

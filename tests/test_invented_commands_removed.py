@@ -24,6 +24,8 @@ import keyboard
 import pytest
 import status_bar
 
+from common import adb_exec
+
 
 def _demo_extras(cmd: list[str]) -> dict[str, str]:
     """Pull the ``-e key value`` pairs out of an am broadcast command."""
@@ -36,7 +38,12 @@ def _demo_extras(cmd: list[str]) -> dict[str, str]:
 
 @pytest.fixture
 def capture_adb(monkeypatch):
-    """Record every adb command status_bar issues."""
+    """Record every adb command status_bar issues.
+
+    status_bar reaches adb only through ``common.adb_exec.run_adb`` now, so the
+    fake goes in there; patching ``status_bar.subprocess`` would silently stop
+    intercepting and let these tests hit a real device.
+    """
     commands: list[list[str]] = []
 
     class _Result:
@@ -45,10 +52,10 @@ def capture_adb(monkeypatch):
         returncode = 0
 
     def _run(cmd, **_kwargs):
-        commands.append(cmd)
+        commands.append(list(cmd))
         return _Result()
 
-    monkeypatch.setattr(status_bar.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     return commands
 
 
@@ -68,18 +75,19 @@ INVENTED = [
 
 
 def _statusbar_call_args(source: str) -> list[list[str]]:
-    """Constant string args of every build_adb_command call naming `statusbar`.
+    """Constant string args of every call naming `statusbar`.
 
     Parsed, not grepped: the module docstrings now explain *why* these
     subcommands were wrong, and a substring search cannot tell an explanation
     apart from a call.
+
+    Every call is inspected rather than only ``build_adb_command``: adb calls
+    now go through ``run_adb``, and keying the check on one helper's name would
+    let the invented subcommands come back through the other.
     """
     calls = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
-            continue
-        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-        if name != "build_adb_command":
             continue
         args = [a.value for a in node.args if isinstance(a, ast.Constant)]
         if "statusbar" in args:
@@ -171,8 +179,21 @@ def test_show_keyboard_flag_is_gone():
 # ---------------------------------------------------------------------------
 
 
-def test_every_documented_button_is_mapped():
-    """`recent_apps` was in the docstring but absent from the key map."""
+def test_every_documented_button_is_mapped(monkeypatch):
+    """`recent_apps` was in the docstring but absent from the key map.
+
+    The adb call is faked: unmocked, this pressed APP_SWITCH on whatever device
+    happened to be attached, and with no device it now raises rather than
+    returning a message to assert on.
+    """
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", lambda cmd, **_kwargs: _Result())
+
     simulator = keyboard.KeyboardSimulator()
     _ok, message = simulator.press_button("recent_apps")
     assert "Unknown" not in message, f"documented button not mapped: {message}"

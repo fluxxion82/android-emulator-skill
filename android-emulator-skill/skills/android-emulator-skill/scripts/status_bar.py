@@ -5,6 +5,12 @@ Android Status Bar Controller
 Control status bar appearance for consistent screenshots and testing.
 Modify battery level, signal strength, time, and other status indicators.
 
+Every adb call goes through :func:`common.adb_exec.run_adb`, so each one is
+bounded and each device-level failure ("more than one device", "device
+offline", ...) arrives as a typed error whose message names a remedy. An
+unbounded adb call does not merely hang this script: it wedges the adb
+connection for whatever runs next.
+
 Usage Examples:
     # Set battery to 50%
     python scripts/status_bar.py --battery 50
@@ -24,10 +30,9 @@ Usage Examples:
 
 import argparse
 import json
-import subprocess
 import sys
 
-from common.device_utils import build_adb_command
+from common import adb_exec
 from common.env_config import env_int
 
 # Tunable battery levels for presets (overridable via ANDROID_EMU_* env vars).
@@ -95,18 +100,25 @@ class StatusBarController:
             serial: Optional device serial (auto-detects if None)
         """
         self.serial = serial
+        # Whether this controller has already opened the demo-mode gate on the
+        # device. See _enter_demo_mode().
+        self._demo_mode_entered = False
 
-    def _demo_broadcast(self, *extras: str) -> list:
+    def _demo_broadcast(self, *extras: str) -> adb_exec.AdbResult:
         """
-        Build a SystemUI demo-mode broadcast command.
+        Send a SystemUI demo-mode broadcast.
 
         Args:
             *extras: Additional ``-e key value`` arguments for the broadcast
 
         Returns:
-            Complete adb command list ready for subprocess.run()
+            The :class:`~common.adb_exec.AdbResult` for the broadcast
+
+        Raises:
+            adb_exec.AdbCommandError: the broadcast exited non-zero
+            adb_exec.DeviceError: the command never reached a device
         """
-        return build_adb_command(
+        return adb_exec.run_adb(
             "shell",
             self.serial,
             "am",
@@ -114,17 +126,38 @@ class StatusBarController:
             "-a",
             "com.android.systemui.demo",
             *extras,
+            check=True,
         )
 
     def _enter_demo_mode(self) -> None:
-        """Allow and enter SystemUI demo mode (idempotent)."""
-        allow = build_adb_command(
-            "shell", self.serial, "settings", "put", "global", "sysui_demo_allowed", "1"
-        )
-        subprocess.run(allow, capture_output=True, text=True, check=True)
+        """Allow and enter SystemUI demo mode (idempotent).
 
-        enter = self._demo_broadcast("-e", "command", "enter")
-        subprocess.run(enter, capture_output=True, text=True, check=True)
+        Demo broadcasts are silently ignored unless ``sysui_demo_allowed`` is
+        set *and* the ``enter`` command has been sent, so this precedes every
+        one of them.
+
+        The two calls are made at most once per controller: a single CLI
+        invocation can apply several settings, and re-entering an already
+        entered demo mode costs two adb round trips per setter without changing
+        the device state. The flag is per-process and short-lived, and the one
+        thing that closes the gate again -- :meth:`reset` -- clears it, so a
+        later setter re-enters rather than broadcasting into a closed gate.
+        """
+        if self._demo_mode_entered:
+            return
+
+        adb_exec.run_adb(
+            "shell",
+            self.serial,
+            "settings",
+            "put",
+            "global",
+            "sysui_demo_allowed",
+            "1",
+            check=True,
+        )
+        self._demo_broadcast("-e", "command", "enter")
+        self._demo_mode_entered = True
 
     def set_battery(self, level: int, charging: bool = False) -> tuple:
         """
@@ -147,7 +180,7 @@ class StatusBarController:
 
         try:
             self._enter_demo_mode()
-            cmd = self._demo_broadcast(
+            self._demo_broadcast(
                 "-e",
                 "command",
                 "battery",
@@ -158,11 +191,9 @@ class StatusBarController:
                 "plugged",
                 "true" if charging else "false",
             )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
             return True, f"Battery set to {level}%{' (charging)' if charging else ''}"
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to set battery: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to set battery: {e}"
 
     def set_wifi(self, enabled: bool = True, level: int = 4) -> tuple:
         """
@@ -180,7 +211,7 @@ class StatusBarController:
 
         try:
             self._enter_demo_mode()
-            cmd = self._demo_broadcast(
+            self._demo_broadcast(
                 "-e",
                 "command",
                 "network",
@@ -191,12 +222,10 @@ class StatusBarController:
                 "level",
                 str(level),
             )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
             state = f"shown at level {level}" if enabled else "hidden"
             return True, f"WiFi {state}"
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to set wifi: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to set wifi: {e}"
 
     def set_mobile_data(self, enabled: bool = True, level: int = 4, datatype: str = "lte") -> tuple:
         """
@@ -215,7 +244,7 @@ class StatusBarController:
 
         try:
             self._enter_demo_mode()
-            cmd = self._demo_broadcast(
+            self._demo_broadcast(
                 "-e",
                 "command",
                 "network",
@@ -229,12 +258,10 @@ class StatusBarController:
                 "datatype",
                 datatype,
             )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
             state = f"shown at level {level} ({datatype})" if enabled else "hidden"
             return True, f"Mobile data {state}"
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to set mobile data: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to set mobile data: {e}"
 
     def set_time(self, time_str: str) -> tuple:
         """
@@ -254,7 +281,7 @@ class StatusBarController:
             self._enter_demo_mode()
 
             # Set time
-            cmd3 = self._demo_broadcast(
+            self._demo_broadcast(
                 "-e",
                 "command",
                 "clock",
@@ -262,13 +289,11 @@ class StatusBarController:
                 "hhmm",
                 time_str.replace(":", ""),
             )
-            subprocess.run(cmd3, capture_output=True, text=True, check=True)
 
             return True, f"Time set to {time_str} (demo mode)"
 
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to set time: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to set time: {e}"
 
     def override(
         self,
@@ -314,14 +339,11 @@ class StatusBarController:
             applied = []
 
             if time:
-                clock = self._demo_broadcast(
-                    "-e", "command", "clock", "-e", "hhmm", time.replace(":", "")
-                )
-                subprocess.run(clock, capture_output=True, text=True, check=True)
+                self._demo_broadcast("-e", "command", "clock", "-e", "hhmm", time.replace(":", ""))
                 applied.append(f"time={time}")
 
             if battery is not None:
-                batt = self._demo_broadcast(
+                self._demo_broadcast(
                     "-e",
                     "command",
                     "battery",
@@ -332,19 +354,17 @@ class StatusBarController:
                     "plugged",
                     "true" if charging else "false",
                 )
-                subprocess.run(batt, capture_output=True, text=True, check=True)
                 applied.append(f"battery={battery}%{' charging' if charging else ''}")
 
             # Airplane mode is mutually exclusive with live radios; apply it
             # before the per-radio toggles so the final icon state is coherent.
             if airplane:
-                air = self._demo_broadcast("-e", "command", "network", "-e", "airplane", "show")
-                subprocess.run(air, capture_output=True, text=True, check=True)
+                self._demo_broadcast("-e", "command", "network", "-e", "airplane", "show")
                 applied.append("airplane=on")
 
             if wifi is not None:
                 if wifi:
-                    wifi_cmd = self._demo_broadcast(
+                    self._demo_broadcast(
                         "-e",
                         "command",
                         "network",
@@ -356,15 +376,12 @@ class StatusBarController:
                         str(wifi_level),
                     )
                 else:
-                    wifi_cmd = self._demo_broadcast(
-                        "-e", "command", "network", "-e", "wifi", "hide"
-                    )
-                subprocess.run(wifi_cmd, capture_output=True, text=True, check=True)
+                    self._demo_broadcast("-e", "command", "network", "-e", "wifi", "hide")
                 applied.append(f"wifi={'on' if wifi else 'off'}")
 
             if mobile is not None:
                 if mobile:
-                    mobile_cmd = self._demo_broadcast(
+                    self._demo_broadcast(
                         "-e",
                         "command",
                         "network",
@@ -379,7 +396,7 @@ class StatusBarController:
                         mobile_type,
                     )
                 else:
-                    mobile_cmd = self._demo_broadcast(
+                    self._demo_broadcast(
                         "-e",
                         "command",
                         "network",
@@ -390,15 +407,13 @@ class StatusBarController:
                         "datatype",
                         "none",
                     )
-                subprocess.run(mobile_cmd, capture_output=True, text=True, check=True)
                 applied.append(f"mobile={'on' if mobile else 'off'}")
 
             summary = ", ".join(applied) if applied else "no changes"
             return True, f"Status bar override applied ({summary})"
 
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to apply override: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to apply override: {e}"
 
     def apply_preset(self, name: str) -> tuple:
         """
@@ -426,23 +441,30 @@ class StatusBarController:
         Returns:
             (success, message) tuple
         """
-        # Exit demo mode
-        cmd = self._demo_broadcast("-e", "command", "exit")
+        # The gate is about to be closed, so any later setter on this controller
+        # must open it again rather than broadcast into a closed one.
+        self._demo_mode_entered = False
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Exit demo mode.
+            self._demo_broadcast("-e", "command", "exit")
 
-            # Reset statusbar settings
-            cmd2 = build_adb_command(
-                "shell", self.serial, "settings", "put", "global", "sysui_demo_allowed", "0"
+            # Reset statusbar settings.
+            adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "settings",
+                "put",
+                "global",
+                "sysui_demo_allowed",
+                "0",
+                check=True,
             )
-            subprocess.run(cmd2, capture_output=True, text=True, check=True)
 
             return True, "Status bar reset to actual values"
 
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
-            return False, f"Failed to reset: {error_msg}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Failed to reset: {e}"
 
 
 def main():
@@ -499,37 +521,49 @@ Examples:
     controller = StatusBarController(serial=args.device_serial)
     results = []
 
-    # Reset operation
-    if args.reset:
-        success, message = controller.reset()
-        results.append({"operation": "reset", "success": success, "message": message})
+    # A device-level failure (no device, several devices, offline, unauthorized)
+    # means the command never ran at all, so it is raised rather than returned.
+    # Its message already names the remedy; a traceback would bury it.
+    try:
+        # Reset operation
+        if args.reset:
+            success, message = controller.reset()
+            results.append({"operation": "reset", "success": success, "message": message})
 
-    # Preset operation (atomic, coherent group via demo mode)
-    if args.preset:
-        success, message = controller.apply_preset(args.preset)
-        results.append(
-            {"operation": "preset", "preset": args.preset, "success": success, "message": message}
-        )
+        # Preset operation (atomic, coherent group via demo mode)
+        if args.preset:
+            success, message = controller.apply_preset(args.preset)
+            results.append(
+                {
+                    "operation": "preset",
+                    "preset": args.preset,
+                    "success": success,
+                    "message": message,
+                }
+            )
 
-    # Battery operation
-    if args.battery is not None:
-        success, message = controller.set_battery(args.battery, args.charging)
-        results.append({"operation": "battery", "success": success, "message": message})
+        # Battery operation
+        if args.battery is not None:
+            success, message = controller.set_battery(args.battery, args.charging)
+            results.append({"operation": "battery", "success": success, "message": message})
 
-    # WiFi operation
-    if args.wifi:
-        success, message = controller.set_wifi(True, args.wifi_level)
-        results.append({"operation": "wifi", "success": success, "message": message})
+        # WiFi operation
+        if args.wifi:
+            success, message = controller.set_wifi(True, args.wifi_level)
+            results.append({"operation": "wifi", "success": success, "message": message})
 
-    # Mobile data operation
-    if args.mobile:
-        success, message = controller.set_mobile_data(True, args.mobile_level, args.mobile_type)
-        results.append({"operation": "mobile", "success": success, "message": message})
+        # Mobile data operation
+        if args.mobile:
+            success, message = controller.set_mobile_data(True, args.mobile_level, args.mobile_type)
+            results.append({"operation": "mobile", "success": success, "message": message})
 
-    # Time operation
-    if args.time:
-        success, message = controller.set_time(args.time)
-        results.append({"operation": "time", "success": success, "message": message})
+        # Time operation
+        if args.time:
+            success, message = controller.set_time(args.time)
+            results.append({"operation": "time", "success": success, "message": message})
+    except adb_exec.AdbError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     # Output results
     if not results:

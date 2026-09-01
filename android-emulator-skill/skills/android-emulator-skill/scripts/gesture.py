@@ -40,17 +40,27 @@ Output Format:
 """
 
 import argparse
-import subprocess
 import sys
 import time
 
-from common.device_utils import build_adb_command, get_device_screen_size, resolve_device_identifier
+from common import adb_exec
+from common.device_utils import get_device_screen_size, resolve_device_identifier
 from common.env_config import env_float, env_int
 
 # Tunable pull-to-refresh defaults (overridable via ANDROID_EMU_* env vars).
 REFRESH_START_PCT = env_float("ANDROID_EMU_REFRESH_START_PCT", 0.30)
 REFRESH_END_PCT = env_float("ANDROID_EMU_REFRESH_END_PCT", 0.80)
 REFRESH_DURATION_MS = env_int("ANDROID_EMU_REFRESH_DURATION_MS", 600)
+
+
+def _gesture_timeout(duration_ms: int) -> int:
+    """Time budget for an ``input swipe`` that itself lasts ``duration_ms``.
+
+    ``input swipe`` blocks for the whole gesture, so a long drag would trip the
+    default adb budget while working perfectly. Allow the gesture's own runtime
+    on top of it.
+    """
+    return adb_exec.DEFAULT_TIMEOUT + max(duration_ms, 0) // 1000
 
 
 class GestureSimulator:
@@ -142,7 +152,7 @@ class GestureSimulator:
             (success, message) tuple
         """
         try:
-            cmd = build_adb_command(
+            adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "input",
@@ -152,11 +162,12 @@ class GestureSimulator:
                 str(x2),
                 str(y2),
                 str(duration_ms),
+                timeout=_gesture_timeout(duration_ms),
+                check=True,
             )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
             return True, f"Swiped: ({x1},{y1}) → ({x2},{y2}) [{duration_ms}ms]"
-        except subprocess.CalledProcessError as e:
-            return False, f"Swipe failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Swipe failed: {e}"
 
     def scroll(
         self,
@@ -206,7 +217,7 @@ class GestureSimulator:
         """
         # Long press is a swipe from point to same point with duration
         try:
-            cmd = build_adb_command(
+            adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "input",
@@ -216,11 +227,12 @@ class GestureSimulator:
                 str(x),
                 str(y),
                 str(duration_ms),
+                timeout=_gesture_timeout(duration_ms),
+                check=True,
             )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
             return True, f"Long pressed: ({x}, {y}) for {duration_ms}ms"
-        except subprocess.CalledProcessError as e:
-            return False, f"Long press failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Long press failed: {e}"
 
     def refresh(
         self,
@@ -376,32 +388,38 @@ Examples:
     success = False
     message = ""
 
-    if args.swipe:
-        success, message = simulator.swipe(args.swipe, args.from_edge, duration)
-    elif args.scroll:
-        success, message = simulator.scroll(args.scroll, args.count, duration)
-    elif args.long_press:
-        try:
-            x, y = map(int, args.long_press.split(","))
-            success, message = simulator.long_press(x, y, duration)
-        except ValueError:
-            message = "Error: --long-press requires format 'x,y'"
-    elif args.swipe_path:
-        try:
-            x1, y1, x2, y2 = map(int, args.swipe_path.split(","))
-            success, message = simulator.swipe_path(x1, y1, x2, y2, duration)
-        except ValueError:
-            message = "Error: --swipe-path requires format 'x1,y1,x2,y2'"
-    elif args.drag:
-        try:
-            x1, y1, x2, y2 = map(int, args.drag.split(","))
-            success, message = simulator.drag_and_drop(x1, y1, x2, y2, duration)
-        except ValueError:
-            message = "Error: --drag requires format 'x1,y1,x2,y2'"
-    elif args.refresh:
-        success, message = simulator.refresh(refresh_duration)
-    else:
-        parser.print_help()
+    try:
+        if args.swipe:
+            success, message = simulator.swipe(args.swipe, args.from_edge, duration)
+        elif args.scroll:
+            success, message = simulator.scroll(args.scroll, args.count, duration)
+        elif args.long_press:
+            try:
+                x, y = map(int, args.long_press.split(","))
+                success, message = simulator.long_press(x, y, duration)
+            except ValueError:
+                message = "Error: --long-press requires format 'x,y'"
+        elif args.swipe_path:
+            try:
+                x1, y1, x2, y2 = map(int, args.swipe_path.split(","))
+                success, message = simulator.swipe_path(x1, y1, x2, y2, duration)
+            except ValueError:
+                message = "Error: --swipe-path requires format 'x1,y1,x2,y2'"
+        elif args.drag:
+            try:
+                x1, y1, x2, y2 = map(int, args.drag.split(","))
+                success, message = simulator.drag_and_drop(x1, y1, x2, y2, duration)
+            except ValueError:
+                message = "Error: --drag requires format 'x1,y1,x2,y2'"
+        elif args.refresh:
+            success, message = simulator.refresh(refresh_duration)
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except adb_exec.AdbError as error:
+        # The gesture never reached a device. The error names the remedy, so
+        # print it rather than letting a traceback bury it.
+        print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
 
     if args.json:

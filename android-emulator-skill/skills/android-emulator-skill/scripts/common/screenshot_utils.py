@@ -16,9 +16,14 @@ Used by:
 """
 
 import base64
-import subprocess
 from datetime import datetime
 from pathlib import Path
+
+from .adb_exec import AdbCommandError, run_adb
+
+# A screencap on a loaded device takes noticeably longer than an ordinary
+# command, and the pull moves a multi-megabyte PNG.
+SCREENCAP_TIMEOUT = 60
 
 # Try to import PIL for resizing, but make it optional
 try:
@@ -237,22 +242,19 @@ def capture_screenshot(
         device_path = "/sdcard/screenshot.png"
         temp_path = "/tmp/android_screenshot.png"
 
-        # Build adb command
-        cmd = ["adb"]
-        if serial:
-            cmd.extend(["-s", serial])
-        cmd.extend(["shell", "screencap", "-p", device_path])
-
-        # Capture screenshot on device
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-
-        # Pull screenshot from device
-        pull_cmd = ["adb"]
-        if serial:
-            pull_cmd.extend(["-s", serial])
-        pull_cmd.extend(["pull", device_path, temp_path])
-
-        subprocess.run(pull_cmd, check=True, capture_output=True, text=True)
+        # Capture on device, then pull. Both bounded: a screencap on a busy
+        # device is slow but finite, and an unbounded call wedges the adb
+        # connection for whatever runs next.
+        run_adb(
+            "shell",
+            serial,
+            "screencap",
+            "-p",
+            device_path,
+            timeout=SCREENCAP_TIMEOUT,
+            check=True,
+        )
+        run_adb("pull", serial, device_path, temp_path, timeout=SCREENCAP_TIMEOUT, check=True)
 
         if inline:
             # Inline mode: resize and convert to base64
@@ -319,7 +321,7 @@ def capture_screenshot(
             "size_preset": size,
         }
 
-    except subprocess.CalledProcessError as e:
+    except AdbCommandError as e:
         raise RuntimeError(f"Failed to capture screenshot: {e.stderr}") from e
     except Exception as e:
         raise RuntimeError(f"Screenshot capture error: {e!s}") from e

@@ -243,3 +243,69 @@ def test_tunables_env_override(monkeypatch):
 def test_default_tunables():
     assert emulator_create.DEVICE_MATCH_CUTOFF == 60
     assert emulator_create.DEVICE_MATCH_SUGGEST == 5
+
+
+# --- every SDK-tool call is bounded ----------------------------------------
+# avdmanager/sdkmanager are Android SDK tools, not adb, so they do not route
+# through common.adb_exec. That makes it easy for one to go out unbounded again,
+# so every call site in the module is exercised below.
+
+
+def test_every_sdk_tool_call_is_bounded(monkeypatch):
+    """Six of the AST sweep's unbounded subprocess calls lived in this file."""
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        # create()'s pre-check looks for the image id in `sdkmanager --list`.
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="system-images;android-34;google_apis;x86_64\n", stderr=""
+        )
+
+    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+
+    creator.list_device_definitions()
+    creator.list_system_images()
+    creator.list_installed_system_images()
+    creator.create(device_id="pixel_7", api_level=34, name="MyAVD")
+    creator.delete("MyAVD")
+
+    assert len(calls) == 6, "a call site was missed; update this test with it"
+    unbounded = [c["cmd"] for c in calls if not c["kwargs"].get("timeout")]
+    assert not unbounded, f"unbounded SDK-tool calls: {unbounded}"
+
+
+def test_a_listing_timeout_degrades_to_an_empty_list(monkeypatch):
+    """A bounded call raises TimeoutExpired; that must not reach the user raw."""
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+
+    def fake_run(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=emulator_create.SDK_TOOL_TIMEOUT)
+
+    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+
+    assert creator.list_device_definitions() == []
+
+
+def test_create_reports_its_own_timeout(monkeypatch):
+    """avdmanager waiting on stdin used to hang forever; now it is a message."""
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: None)
+
+    def fake_run(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=emulator_create.SDK_TOOL_TIMEOUT)
+
+    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+
+    success, message, avd_name = creator.create(device_id="pixel_7", api_level=34, name="MyAVD")
+
+    assert success is False
+    assert avd_name is None
+    assert str(emulator_create.SDK_TOOL_TIMEOUT) in message
+    assert "MyAVD" in message

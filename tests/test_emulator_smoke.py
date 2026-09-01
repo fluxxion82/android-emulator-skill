@@ -58,9 +58,9 @@ def test_hierarchy_dump_returns_parseable_xml(adb: str, live_device: str):
 def test_screen_mapper_returns_a_usable_answer(adb: str, live_device: str, scripts_dir):
     """R11 floor: an agent that sees zero elements cannot act.
 
-    Note this deliberately does **not** check the exit code: R2 means
-    screen_mapper exits 0 even when it serialises an error, so the return code
-    carries no information. Assert on the payload instead.
+    Asserts on the payload rather than only the exit code. R2 (screen_mapper
+    exiting 0 even when it serialised an error) was fixed during the adb_exec
+    migration, but the payload is still the more specific check.
     """
     result = subprocess.run(
         ["python3", str(scripts_dir / "screen_mapper.py"), "--serial", live_device, "--json"],

@@ -57,14 +57,13 @@ Technical Details:
 import argparse
 import json as json_lib
 import re
-import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
+from common import adb_exec
 from common.device_utils import (
-    build_adb_command,
     quote_for_device_shell,
     resolve_device_identifier,
 )
@@ -129,26 +128,29 @@ class Navigator:
 
         try:
             # Dump UI hierarchy to device
-            dump_cmd = build_adb_command(
-                "shell", self.serial, "uiautomator", "dump", "/sdcard/window_dump.xml"
+            result = adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "uiautomator",
+                "dump",
+                "/sdcard/window_dump.xml",
+                check=True,
             )
-            result = subprocess.run(dump_cmd, capture_output=True, text=True, check=True)
 
             if "ERROR" in result.stdout or "error" in result.stderr.lower():
                 raise RuntimeError(f"UI dump failed: {result.stdout or result.stderr}")
 
             # Pull XML file to local temp
             temp_file = "/tmp/android_navigator_dump.xml"
-            pull_cmd = build_adb_command("pull", self.serial, "/sdcard/window_dump.xml", temp_file)
-            subprocess.run(pull_cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb("pull", self.serial, "/sdcard/window_dump.xml", temp_file, check=True)
 
             # Parse XML
             tree = ET.parse(temp_file)
             self._tree_cache = tree.getroot()
             return self._tree_cache
 
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to get UI hierarchy: {e.stderr}") from e
+        except adb_exec.AdbCommandError as e:
+            raise RuntimeError(f"Failed to get UI hierarchy: {e}") from e
         except ET.ParseError as e:
             raise RuntimeError(f"Failed to parse UI hierarchy XML: {e}") from e
 
@@ -301,14 +303,13 @@ class Navigator:
             (success, message) tuple
         """
         try:
-            cmd = build_adb_command("shell", self.serial, "input", "tap", str(x), str(y))
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb("shell", self.serial, "input", "tap", str(x), str(y), check=True)
             # Let the UI settle after the tap (animations, transitions, focus).
             if TAP_SETTLE_SECONDS > 0:
                 time.sleep(TAP_SETTLE_SECONDS)
             return True, f"Tapped at ({x}, {y})"
-        except subprocess.CalledProcessError as e:
-            return False, f"Tap failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Tap failed: {e}"
 
     def enter_text(self, element: Element, text: str) -> tuple:
         """
@@ -347,11 +348,10 @@ class Navigator:
             # device shell, which re-parses it, so it must be quoted too.
             escaped_text = quote_for_device_shell(text.replace(" ", "%s"))
 
-            cmd = build_adb_command("shell", self.serial, "input", "text", escaped_text)
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb("shell", self.serial, "input", "text", escaped_text, check=True)
             return True, f"Typed: {text}"
-        except subprocess.CalledProcessError as e:
-            return False, f"Type failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Type failed: {e}"
 
     def list_elements(self, interactive_only: bool = True) -> list:
         """
@@ -436,6 +436,21 @@ Environment overrides:
 
     navigator = Navigator(serial)
 
+    try:
+        _run_action(navigator, args)
+    except adb_exec.AdbError as error:
+        # The command never reached a device. The error names the remedy, so
+        # print it rather than letting a traceback bury it.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
+    """Perform the requested action, exiting with its status.
+
+    Split out of ``main()`` only so that every adb failure raised anywhere in
+    here lands in the single ``except adb_exec.AdbError`` above.
+    """
     # List mode
     if args.list:
         elements = navigator.list_elements()

@@ -34,6 +34,11 @@ from common.env_config import env_int
 # Default number of newest AVDs to keep when --old is given without a value.
 DEFAULT_KEEP_COUNT = env_int("ANDROID_EMU_DELETE_KEEP", 3)
 
+# avdmanager is an Android SDK tool, not adb, so it does not go through
+# common.adb_exec. It still needs a ceiling: an unbounded call wedges the
+# caller with no diagnosis. Both operations here are local to the SDK.
+SDK_TOOL_TIMEOUT = 120
+
 
 class EmulatorDeleter:
     """Delete Android AVDs."""
@@ -96,12 +101,13 @@ class EmulatorDeleter:
                 [avdmanager, "list", "avd", "-c"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
 
             return [line.strip() for line in result.stdout.split("\n") if line.strip()]
 
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
     def list_avds_by_recency(self) -> list:
@@ -157,11 +163,19 @@ class EmulatorDeleter:
         """
         cmd = [avdmanager, "delete", "avd", "--name", name]
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cmd, capture_output=True, text=True, timeout=SDK_TOOL_TIMEOUT, check=True
+            )
             return True, f"AVD deleted: {name}"
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to delete AVD: {error_msg}"
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                f"avdmanager did not finish deleting {name} within {SDK_TOOL_TIMEOUT}s. "
+                f"Check for a stale avdmanager process and retry.",
+            )
 
     def delete(self, name: str, confirm: bool = False) -> tuple[bool, str]:
         """

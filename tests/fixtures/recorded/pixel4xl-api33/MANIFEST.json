@@ -56,7 +56,7 @@
       "name": "resolve_activity_launcher",
       "file": "resolve_activity_launcher.txt",
       "command": "adb shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.android.settings",
-      "description": "Correct launcher-activity resolution. app_launcher instead greps `pm dump` for the first line containing 'Activity' and the package, which readily returns an ActivityRecord or a provider.",
+      "description": "Correct launcher-activity resolution. app_launcher now uses this; it previously grepped `pm dump` for the first line containing both 'Activity' and the package name, which readily matched an ActivityRecord or a provider (S10, fixed during the adb_exec migration).",
       "catches": [
         "S10"
       ],

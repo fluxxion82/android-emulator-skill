@@ -228,13 +228,13 @@ def run_adb(
         The :class:`AdbResult`.
 
     Raises:
-        AdbNotInstalled: adb is not on PATH.
-        AdbTimeout: the call exceeded ``timeout``.
+        AdbNotInstalledError: adb is not on PATH.
+        AdbTimeoutError: the call exceeded ``timeout``.
         MultipleDevicesError, DeviceNotFoundError, DeviceOfflineError,
         DeviceUnauthorizedError:
             the command never reached a device. These raise regardless of
             ``check``, because the command did not run at all.
-        AdbCommandFailed: only when ``check`` is set and the status is non-zero.
+        AdbCommandError: only when ``check`` is set and the status is non-zero.
 
     Example:
         >>> run_adb("shell", "emulator-5554", "getprop", "ro.build.version.sdk").stdout

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from common import anr_sessions, device_utils
+from common import adb_exec, anr_sessions, device_utils
 
 TRAVERSING_IDS = [
     "../escape",
@@ -135,7 +135,7 @@ def test_get_package_info_quotes_the_package(monkeypatch):
         captured["cmd"] = cmd
         return _Result()
 
-    monkeypatch.setattr(device_utils.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     device_utils.get_package_info("com.example.app;id", serial="emulator-5554")
 
     joined = " ".join(captured["cmd"])
@@ -157,7 +157,7 @@ def test_get_package_info_is_bounded(monkeypatch):
         captured["kwargs"] = kwargs
         return _Result()
 
-    monkeypatch.setattr(device_utils.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     device_utils.get_package_info("com.example.app")
 
     assert captured["kwargs"].get("timeout"), "pm dump can hang without a timeout"

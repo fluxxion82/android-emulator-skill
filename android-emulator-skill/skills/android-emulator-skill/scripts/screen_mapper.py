@@ -53,12 +53,12 @@ Configuration (env overrides, ANDROID_EMU_ prefix):
 
 import argparse
 import json as json_lib
-import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common import adb_exec
+from common.device_utils import resolve_device_identifier
 from common.env_config import env_int
 
 # Preview limits (env-configurable; see SKILL.md -> Configuration).
@@ -129,25 +129,28 @@ class ScreenMapper:
         """
         try:
             # Dump UI hierarchy to device
-            dump_cmd = build_adb_command(
-                "shell", self.serial, "uiautomator", "dump", "/sdcard/window_dump.xml"
+            result = adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "uiautomator",
+                "dump",
+                "/sdcard/window_dump.xml",
+                check=True,
             )
-            result = subprocess.run(dump_cmd, capture_output=True, text=True, check=True)
 
             if "ERROR" in result.stdout or "error" in result.stderr.lower():
                 raise RuntimeError(f"UI dump failed: {result.stdout or result.stderr}")
 
             # Pull XML file to local temp
             temp_file = "/tmp/android_window_dump.xml"
-            pull_cmd = build_adb_command("pull", self.serial, "/sdcard/window_dump.xml", temp_file)
-            subprocess.run(pull_cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb("pull", self.serial, "/sdcard/window_dump.xml", temp_file, check=True)
 
             # Parse XML
             tree = ET.parse(temp_file)
             return tree.getroot()
 
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to get UI hierarchy: {e.stderr}") from e
+        except adb_exec.AdbCommandError as e:
+            raise RuntimeError(f"Failed to get UI hierarchy: {e}") from e
         except ET.ParseError as e:
             raise RuntimeError(f"Failed to parse UI hierarchy XML: {e}") from e
 
@@ -259,15 +262,13 @@ class ScreenMapper:
         """
         # Try to get current activity name from device
         try:
-            cmd = build_adb_command(
+            result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "dumpsys",
                 "window",
                 "windows",
-            )
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=5, shell=False, check=False
+                timeout=5,
             )
 
             # Look for current focus
@@ -359,7 +360,7 @@ class ScreenMapper:
 
     def map_screen(
         self, verbose: bool = False, hints: bool = False, json_output: bool = False
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
         Main entry point: Map current screen and return formatted output.
 
@@ -369,20 +370,24 @@ class ScreenMapper:
             json_output: Return JSON instead of formatted text
 
         Returns:
-            Formatted summary or JSON string
+            ``(output, ok)``. The output format is unchanged; ``ok`` is False
+            when the screen could not be read, so ``main()`` can exit non-zero
+            instead of reporting success while serialising an error (R2).
         """
         try:
             root = self.get_ui_hierarchy()
             analysis = self.analyze_tree(root)
 
             if json_output:
-                return json_lib.dumps(analysis, indent=2)
-            return self.format_summary(analysis, verbose, hints)
+                return json_lib.dumps(analysis, indent=2), True
+            return self.format_summary(analysis, verbose, hints), True
 
         except RuntimeError as e:
+            # adb_exec's device errors subclass RuntimeError, so "more than one
+            # device" arrives here already carrying its remedy.
             if json_output:
-                return json_lib.dumps({"error": str(e)}, indent=2)
-            return f"Error: {e}"
+                return json_lib.dumps({"error": str(e)}, indent=2), False
+            return f"Error: {e}", False
 
 
 def main():
@@ -426,10 +431,20 @@ Examples:
 
     # Map screen
     mapper = ScreenMapper(serial)
-    output = mapper.map_screen(verbose=args.verbose, hints=args.hints, json_output=args.json)
+    try:
+        output, ok = mapper.map_screen(
+            verbose=args.verbose, hints=args.hints, json_output=args.json
+        )
+    except adb_exec.AdbError as error:
+        # Anything that escaped map_screen's own handling; the message names a
+        # remedy, so print it rather than letting a traceback bury it.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     print(output)
-    sys.exit(0)
+    # R2: exiting 0 after serialising an error made the status code useless to
+    # a caller that only checks it.
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

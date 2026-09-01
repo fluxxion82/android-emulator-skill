@@ -44,7 +44,8 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from common.device_utils import build_adb_command, get_connected_devices
+from common.adb_exec import AdbCommandError, run_adb
+from common.device_utils import build_adb_command, get_connected_devices, quote_for_device_shell
 from common.env_config import env_int
 
 # Output caps (env-configurable via ANDROID_EMU_LOG_*). Defaults preserve the
@@ -356,11 +357,17 @@ class LogMonitor:
         """Look up the running PID for ``self.app_package`` (None if not running)."""
         if not self.app_package:
             return None
-        pid_cmd = build_adb_command("shell", self.device_serial, "pidof", self.app_package)
         try:
-            result = subprocess.run(pid_cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError:
-            # App might not be running; continue without a PID filter.
+            result = run_adb(
+                "shell",
+                self.device_serial,
+                "pidof",
+                quote_for_device_shell(self.app_package),
+                check=True,
+            )
+        except AdbCommandError:
+            # `pidof` exits non-zero when the app is not running, which is an
+            # answer rather than a failure: continue without a PID filter.
             return None
         return result.stdout.strip() or None
 
@@ -390,10 +397,10 @@ class LogMonitor:
         # Clear logcat if requested (ignored for historical windows, which read
         # the existing buffer rather than streaming new lines).
         if clear_first and last_minutes is None:
-            clear_cmd = build_adb_command("logcat", self.device_serial, "-c")
-            # Ignore clear errors
-            with contextlib.suppress(subprocess.CalledProcessError):
-                subprocess.run(clear_cmd, check=True, capture_output=True)
+            # Ignore clear errors: an unclearable buffer is not worth failing
+            # the capture over. Device-level errors still propagate.
+            with contextlib.suppress(AdbCommandError):
+                run_adb("logcat", self.device_serial, "-c", check=True)
 
         # Resolve app PID (device call) then build the command (pure mapping).
         pid = self._resolve_app_pid()

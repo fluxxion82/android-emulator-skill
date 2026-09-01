@@ -18,12 +18,21 @@ import subprocess
 import sys
 import time
 
-from common.device_utils import build_adb_command, get_connected_devices
+from common import adb_exec
+from common.device_utils import get_connected_devices
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_BOOT_TIMEOUT = env_int("ANDROID_EMU_BOOT_TIMEOUT", 300)
 POLL_INTERVAL_SECONDS = env_float("ANDROID_EMU_POLL_INTERVAL", 0.5, min_value=0.05)
+
+# Ceiling for a single probe inside the poll loop. Deliberately short: a probe
+# that stalls should be retried on the next poll rather than eat the boot budget.
+PROBE_TIMEOUT_SECONDS = 5
+
+# `emulator` is an Android SDK tool, not adb, so it does not go through
+# common.adb_exec -- but it still needs a ceiling.
+EMULATOR_TOOL_TIMEOUT = 30
 
 
 class EmulatorBooter:
@@ -76,7 +85,9 @@ class EmulatorBooter:
 
         # Execute boot command in background
         try:
-            # Start emulator in background
+            # Start emulator in background. Exempt from run_adb/timeout: this is
+            # not an adb call, and the emulator process is meant to outlive this
+            # script -- bounding it would kill the emulator we just launched.
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -172,11 +183,16 @@ class EmulatorBooter:
             True if boot completed
         """
         try:
-            cmd = build_adb_command("shell", serial, "getprop", "sys.boot_completed")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-            return result.stdout.strip() == "1"
-        except Exception:
+            result = adb_exec.run_adb(
+                "shell", serial, "getprop", "sys.boot_completed", timeout=PROBE_TIMEOUT_SECONDS
+            )
+        except adb_exec.AdbError:
+            # A device that is still booting is legitimately offline, or briefly
+            # absent from `adb devices`. That is exactly the state this poll
+            # exists to wait out, so a failed probe means "not ready yet" rather
+            # than a failure to report.
             return False
+        return result.stdout.strip() == "1"
 
     def _get_avd_name_for_serial(self, serial: str) -> str | None:
         """
@@ -189,8 +205,7 @@ class EmulatorBooter:
             AVD name, or None if not found
         """
         try:
-            cmd = build_adb_command("emu", serial, "avd", "name")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+            result = adb_exec.run_adb("emu", serial, "avd", "name", timeout=PROBE_TIMEOUT_SECONDS)
             # The emulator console terminates every reply with its own "OK"
             # line, so the raw response is "Pixel_9\r\nOK\r\n". Stripping alone
             # leaves "Pixel_9\nOK", which never equalled the AVD name -- so the
@@ -199,7 +214,9 @@ class EmulatorBooter:
             lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             payload = [line for line in lines if line not in ("OK", "KO")]
             return payload[0] if payload else None
-        except Exception:
+        except adb_exec.AdbError:
+            # Same reasoning as _is_boot_completed: an emulator that has not
+            # finished booting cannot answer its console yet.
             return None
 
     @staticmethod
@@ -244,7 +261,9 @@ def list_avds() -> list:
     """
     try:
         cmd = ["emulator", "-list-avds"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=EMULATOR_TOOL_TIMEOUT, check=True
+        )
 
         avds = []
         for line in result.stdout.split("\n"):
@@ -261,11 +280,22 @@ def list_avds() -> list:
             file=sys.stderr,
         )
         return []
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return []
 
 
 def main():
+    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    try:
+        _run()
+    except adb_exec.AdbError as error:
+        # run_adb raises errors whose message already names a remedy ("pass
+        # --serial ...", "start an emulator ..."). That message is the point.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run():
     parser = argparse.ArgumentParser(
         description="Boot Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,

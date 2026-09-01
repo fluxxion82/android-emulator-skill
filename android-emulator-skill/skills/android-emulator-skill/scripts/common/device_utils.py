@@ -19,12 +19,16 @@ Used by:
 
 import re
 import shlex
-import subprocess
+
+from .adb_exec import AdbCommandError, AdbError, run_adb
 
 # Every adb call is bounded. An unbounded one wedges the adb connection for
 # whatever runs next, which is a hang with no diagnosis rather than an error.
 CURRENT_ACTIVITY_TIMEOUT = 15
 PACKAGE_INFO_TIMEOUT = 20
+# uiautomator has to wait for the UI to go idle before it can dump, which on
+# an animating screen takes longer than an ordinary command.
+UI_DUMP_TIMEOUT = 60
 
 
 def quote_for_device_shell(value: str) -> str:
@@ -120,8 +124,7 @@ def get_connected_devices() -> list:
         # ABC123DEF456 (device) - device
     """
     try:
-        cmd = ["adb", "devices", "-l"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = run_adb("devices", None, "-l", check=True)
 
         devices = []
         # Parse output
@@ -147,8 +150,8 @@ def get_connected_devices() -> list:
 
         return devices
 
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to list devices: {e.stderr}") from e
+    except AdbCommandError as e:
+        raise RuntimeError(f"Failed to list devices: {e}") from e
 
 
 def get_default_device() -> str | None:
@@ -296,8 +299,7 @@ def get_device_screen_size(serial: str | None = None) -> tuple:
         print(f"Device screen: {width}x{height}")
     """
     try:
-        cmd = build_adb_command("shell", serial, "wm", "size")
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = run_adb("shell", serial, "wm", "size", check=True)
 
         # Parse output
         # Format: Physical size: 1080x1920
@@ -333,16 +335,25 @@ def get_ui_hierarchy(serial: str | None = None) -> dict:
     """
     try:
         # Dump UI hierarchy to device
-        dump_cmd = build_adb_command(
-            "shell", serial, "uiautomator", "dump", "/sdcard/window_dump.xml"
+        run_adb(
+            "shell",
+            serial,
+            "uiautomator",
+            "dump",
+            "/sdcard/window_dump.xml",
+            timeout=UI_DUMP_TIMEOUT,
+            check=True,
         )
-        subprocess.run(dump_cmd, capture_output=True, text=True, check=True)
 
         # Pull XML file
-        pull_cmd = build_adb_command(
-            "pull", serial, "/sdcard/window_dump.xml", "/tmp/window_dump.xml"
+        run_adb(
+            "pull",
+            serial,
+            "/sdcard/window_dump.xml",
+            "/tmp/window_dump.xml",
+            timeout=UI_DUMP_TIMEOUT,
+            check=True,
         )
-        subprocess.run(pull_cmd, capture_output=True, text=True, check=True)
 
         # Read and parse XML
         import xml.etree.ElementTree as ET
@@ -394,9 +405,14 @@ def get_package_info(package_name: str, serial: str | None = None) -> dict:
         # The package name is re-parsed by the device shell, so it is quoted
         # like every other argument crossing that boundary. Bounded, too: an
         # unbounded adb call wedges the connection for whatever runs next.
-        cmd = build_adb_command("shell", serial, "pm", "dump", quote_for_device_shell(package_name))
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=PACKAGE_INFO_TIMEOUT
+        result = run_adb(
+            "shell",
+            serial,
+            "pm",
+            "dump",
+            quote_for_device_shell(package_name),
+            timeout=PACKAGE_INFO_TIMEOUT,
+            check=True,
         )
 
         # Parse relevant info from pm dump output
@@ -414,7 +430,9 @@ def get_package_info(package_name: str, serial: str | None = None) -> dict:
 
         return info
 
-    except subprocess.CalledProcessError:
+    except AdbCommandError:
+        # `pm dump` exits non-zero for a package that is not installed, which is
+        # an answer rather than a failure.
         return {"package": package_name, "installed": False}
 
 
@@ -433,8 +451,7 @@ def list_installed_packages(serial: str | None = None) -> list:
         print(f"Found {len(packages)} packages")
     """
     try:
-        cmd = build_adb_command("shell", serial, "pm", "list", "packages")
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = run_adb("shell", serial, "pm", "list", "packages", check=True)
 
         # Parse output
         # Format: package:com.android.settings
@@ -445,8 +462,8 @@ def list_installed_packages(serial: str | None = None) -> list:
 
         return packages
 
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to list packages: {e.stderr}") from e
+    except AdbCommandError as e:
+        raise RuntimeError(f"Failed to list packages: {e}") from e
 
 
 # Focused-window lines from `dumpsys window`, e.g.
@@ -503,17 +520,10 @@ def get_current_activity(serial: str | None = None) -> str | None:
         # "grep" and ran it with shell=True -- which on POSIX executes only
         # argv[0] (bare `adb`) and passes the rest as $0, $1, ... So stdout was
         # always empty and this always returned None.
-        cmd = build_adb_command("shell", serial, "dumpsys", "window")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=CURRENT_ACTIVITY_TIMEOUT,
-        )
+        result = run_adb("shell", serial, "dumpsys", "window", timeout=CURRENT_ACTIVITY_TIMEOUT)
         return parse_focused_activity(result.stdout)
 
-    except (subprocess.SubprocessError, OSError):
+    except (AdbError, OSError):
         return None
 
 

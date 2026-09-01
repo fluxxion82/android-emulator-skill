@@ -301,9 +301,10 @@ def test_am_broadcast_reports_success_for_a_nonexistent_receiver(any_profile):
 def test_resolve_activity_returns_a_single_component(recorded):
     """S10: `cmd package resolve-activity --brief` gives one unambiguous answer.
 
-    app_launcher instead greps `pm dump` for the first line containing both
-    'Activity' and the package name, which readily matches an ActivityRecord or
-    a provider.
+    app_launcher used to grep `pm dump` for the first line containing both
+    'Activity' and the package name, which readily matched an ActivityRecord or
+    a provider. It now uses this command (S10, fixed during the adb_exec
+    migration); this fixture is what it parses.
     """
     lines = [ln for ln in recorded.lines("resolve_activity_launcher") if ln.strip()]
     component = lines[-1]

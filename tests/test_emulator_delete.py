@@ -9,6 +9,7 @@ recency ordering, plus the ANDROID_EMU_DELETE_KEEP tunable.
 from __future__ import annotations
 
 import importlib
+import subprocess
 
 import emulator_delete
 import pytest
@@ -180,3 +181,50 @@ def test_keep_count_env_override(monkeypatch):
     finally:
         monkeypatch.delenv("ANDROID_EMU_DELETE_KEEP", raising=False)
         importlib.reload(emulator_delete)
+
+
+# --- every avdmanager call is bounded --------------------------------------
+# avdmanager is an Android SDK tool, not adb, so it does not route through
+# common.adb_exec -- but an unbounded call here still wedges the caller.
+
+
+def test_every_avdmanager_call_is_bounded(monkeypatch, deleter):
+    """Both of the AST sweep's unbounded calls in this file, pinned."""
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        return subprocess.CompletedProcess(cmd, 0, stdout="MyTestDevice\n", stderr="")
+
+    monkeypatch.setattr(emulator_delete.subprocess, "run", fake_run)
+
+    deleter.list_avds()
+    deleter.delete("MyTestDevice", confirm=True)
+
+    assert len(calls) == 3  # list, then delete()'s existence check + the delete
+    unbounded = [c["cmd"] for c in calls if not c["kwargs"].get("timeout")]
+    assert not unbounded, f"unbounded avdmanager calls: {unbounded}"
+
+
+def test_listing_timeout_degrades_to_an_empty_list(monkeypatch, deleter):
+    def fake_run(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=emulator_delete.SDK_TOOL_TIMEOUT)
+
+    monkeypatch.setattr(emulator_delete.subprocess, "run", fake_run)
+    assert deleter.list_avds() == []
+
+
+def test_delete_reports_its_own_timeout(monkeypatch, deleter):
+    """A bounded call raises TimeoutExpired; the user gets a message, not a trace."""
+    monkeypatch.setattr(deleter, "list_avds", lambda: ["MyTestDevice"])
+
+    def fake_run(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=emulator_delete.SDK_TOOL_TIMEOUT)
+
+    monkeypatch.setattr(emulator_delete.subprocess, "run", fake_run)
+
+    success, message = deleter.delete("MyTestDevice", confirm=True)
+
+    assert success is False
+    assert str(emulator_delete.SDK_TOOL_TIMEOUT) in message
+    assert "MyTestDevice" in message

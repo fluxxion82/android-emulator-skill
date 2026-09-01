@@ -1,16 +1,22 @@
 """Device-free tests for emulator_boot.
 
 These mock the module's ``subprocess`` so no emulator/adb is needed. They assert
-the pure arg->command mapping for ``--all`` (batch boot) and the env-configurable
-boot timeout / poll interval tunables.
+the pure arg->command mapping for ``--all`` (batch boot), the env-configurable
+boot timeout / poll interval tunables, and the error contract of the adb_exec
+migration: the readiness probes swallow adb failures on purpose (a booting
+device is legitimately unreachable), while anything that escapes reaches the
+user as a remedy rather than a traceback.
 """
 
 from __future__ import annotations
 
 import importlib
+import subprocess
 
 import emulator_boot
 import pytest
+
+from common import adb_exec
 
 
 class _FakeProcess:
@@ -139,3 +145,114 @@ def test_single_boot_command_mapping(monkeypatch, headless):
     if headless:
         expected.append("-no-window")
     assert launched == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Readiness probes go through common.adb_exec: bounded, and deliberately
+# tolerant of a device that has not finished booting.
+# ---------------------------------------------------------------------------
+def _fake_adb(monkeypatch, responses):
+    """Answer adb / emulator calls at the subprocess boundary under adb_exec.
+
+    ``responses`` maps a command prefix tuple to (returncode, stdout, stderr),
+    or to an exception instance to raise.
+    """
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        for prefix, response in responses.items():
+            if tuple(cmd[: len(prefix)]) == prefix:
+                if isinstance(response, BaseException):
+                    raise response
+                returncode, stdout, stderr = response
+                return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    return calls
+
+
+def test_boot_completed_probe_is_bounded(monkeypatch):
+    calls = _fake_adb(monkeypatch, {("adb",): (0, "1\n", "")})
+    booter = emulator_boot.EmulatorBooter("Pixel_9")
+
+    assert booter._is_boot_completed("emulator-5554") is True
+    assert calls[0]["cmd"] == [
+        "adb",
+        "-s",
+        "emulator-5554",
+        "shell",
+        "getprop",
+        "sys.boot_completed",
+    ]
+    assert calls[0]["kwargs"].get("timeout"), "the readiness probe went out unbounded"
+
+
+def test_boot_completed_probe_treats_an_unreachable_device_as_not_ready(monkeypatch):
+    """The one place a device error must NOT escalate.
+
+    An emulator mid-boot restarts adbd, so `adb shell` answers "device offline"
+    or "not found" for a window. That is precisely the state --wait-ready exists
+    to wait out; raising would abort the wait at the moment it is working.
+    """
+    _fake_adb(monkeypatch, {("adb",): (1, "", "error: device offline\n")})
+    booter = emulator_boot.EmulatorBooter("Pixel_9")
+
+    assert booter._is_boot_completed("emulator-5554") is False
+
+
+def test_avd_name_probe_treats_an_unreachable_device_as_unknown(monkeypatch):
+    """Same reasoning: an emulator that cannot answer its console yet is not fatal."""
+    _fake_adb(monkeypatch, {("adb",): (1, "", "error: device offline\n")})
+    booter = emulator_boot.EmulatorBooter("Pixel_9")
+
+    assert booter._get_avd_name_for_serial("emulator-5554") is None
+
+
+def test_avd_name_probe_is_bounded(monkeypatch, recorded):
+    calls = _fake_adb(monkeypatch, {("adb",): (0, recorded.text("emu_avd_name"), "")})
+    booter = emulator_boot.EmulatorBooter("Pixel_9")
+
+    assert booter._get_avd_name_for_serial("emulator-5554") == "Pixel_9"
+    assert calls[0]["kwargs"].get("timeout"), "the AVD-name probe went out unbounded"
+
+
+def test_avd_listing_is_bounded(monkeypatch):
+    """`emulator -list-avds` is an SDK tool, not adb -- but still not unbounded."""
+    calls = _fake_adb(monkeypatch, {("emulator",): (0, "Pixel_9\nPixel_5_API_33\n", "")})
+
+    assert emulator_boot.list_avds() == [{"name": "Pixel_9"}, {"name": "Pixel_5_API_33"}]
+    assert calls[0]["cmd"] == ["emulator", "-list-avds"]
+    assert calls[0]["kwargs"].get("timeout"), "`emulator -list-avds` went out unbounded"
+
+
+def test_avd_listing_survives_its_own_timeout(monkeypatch):
+    """A bounded call raises TimeoutExpired, which must not become a traceback."""
+    _fake_adb(
+        monkeypatch,
+        {("emulator",): subprocess.TimeoutExpired(cmd="emulator", timeout=30)},
+    )
+    assert emulator_boot.list_avds() == []
+
+
+def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
+    """At the CLI boundary the agent gets the remedy, not a stack trace."""
+
+    def _raise():
+        raise adb_exec.MultipleDevicesError(
+            "More than one device is attached, so adb could not choose one. "
+            "Pass --serial with one of: emulator-5554, emulator-5556."
+        )
+
+    monkeypatch.setattr(emulator_boot, "get_connected_devices", _raise)
+    monkeypatch.setattr(emulator_boot.sys, "argv", ["emulator_boot.py", "--avd", "Pixel_9"])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_boot.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: ")
+    assert "Traceback" not in captured.err
+    assert "--serial" in captured.err, "no remedy named"
