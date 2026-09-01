@@ -89,6 +89,12 @@ from dataclasses import dataclass
 # imported by the tests.
 from gesture import GestureSimulator
 
+# Sibling script, imported the same way. `screen_mapper` already knows how to
+# recover a Compose control's caption from its subtree or its row; duplicating
+# that here is how the two files would drift into disagreeing about what is on
+# the screen.
+from screen_mapper import ScreenMapper
+
 from common import adb_exec
 from common.device_utils import (
     quote_for_device_shell,
@@ -124,6 +130,18 @@ class Element:
     bounds: tuple  # (x1, y1, x2, y2)
     clickable: bool
     enabled: bool
+    # Compose drives Checkbox, Switch and list rows through these rather than
+    # through `clickable` alone, so reading only `clickable` misses controls
+    # that are plainly operable. Defaulted so existing constructions still work.
+    checkable: bool = False
+    long_clickable: bool = False
+    scrollable: bool = False
+    # A caption borrowed from the subtree or a row-adjacent sibling, for a
+    # control that carries none of its own (every interactive Compose node).
+    # Deliberately NOT folded into `content_desc`: a container row would then
+    # match a --find-text for the text of its own child and be returned instead
+    # of it, moving the tap from the label to the whole row.
+    recovered_label: str | None = None
 
     @property
     def center(self) -> tuple:
@@ -134,9 +152,23 @@ class Element:
         return (x, y)
 
     @property
+    def interactive(self) -> bool:
+        """Whether this element can be operated at all.
+
+        Any of the four interaction attributes, matching
+        `screen_mapper.INTERACTIVE_ATTRIBUTES`. Both files decide the same
+        question and must not answer it differently.
+        """
+        return self.enabled and (
+            self.clickable or self.checkable or self.long_clickable or self.scrollable
+        )
+
+    @property
     def label(self) -> str:
         """Get best label for this element."""
-        return self.text or self.content_desc or self.resource_id or "Unnamed"
+        return (
+            self.text or self.content_desc or self.recovered_label or self.resource_id or "Unnamed"
+        )
 
     @property
     def description(self) -> str:
@@ -208,6 +240,10 @@ class ScrollSearch:
 class Navigator:
     """Navigates Android apps using UI hierarchy data."""
 
+    # One shared labeller; `_recover_label` is pure tree-walking and holds no
+    # per-device state.
+    _labeller = ScreenMapper()
+
     def __init__(self, serial: str | None = None):
         """Initialize navigator with optional device serial."""
         self.serial = serial
@@ -267,7 +303,12 @@ class Navigator:
             return tuple(int(x) for x in match.groups())
         return (0, 0, 0, 0)
 
-    def _flatten_tree(self, node: ET.Element, elements: list | None = None) -> list:
+    def _flatten_tree(
+        self,
+        node: ET.Element,
+        elements: list | None = None,
+        parent: ET.Element | None = None,
+    ) -> list:
         """
         Flatten UI hierarchy into list of elements.
 
@@ -289,12 +330,23 @@ class Navigator:
         bounds_str = node.get("bounds", "[0,0][0,0]")
         clickable = node.get("clickable", "false") == "true"
         enabled = node.get("enabled", "true") == "true"
+        checkable = node.get("checkable", "false") == "true"
+        long_clickable = node.get("long-clickable", "false") == "true"
+        scrollable = node.get("scrollable", "false") == "true"
 
         # Extract simple class name
         simple_class = elem_class.split(".")[-1] if elem_class else "Unknown"
 
         # Parse bounds
         bounds = self._parse_bounds(bounds_str)
+
+        # Compose controls carry no text of their own, so borrow the caption
+        # that describes them -- from the subtree for a Button or Card, from a
+        # row-adjacent sibling for a Checkbox or Switch. Without this, `--list`
+        # answers "Unnamed" for every control and an agent has nothing to pick.
+        recovered_label = None
+        if not (text or content_desc):
+            recovered_label = self._labeller._recover_label(node, parent) or None
 
         # Create element
         element = Element(
@@ -307,12 +359,16 @@ class Navigator:
             bounds=bounds,
             clickable=clickable,
             enabled=enabled,
+            checkable=checkable,
+            long_clickable=long_clickable,
+            scrollable=scrollable,
+            recovered_label=recovered_label,
         )
         elements.append(element)
 
         # Recurse to children
         for child in node:
-            self._flatten_tree(child, elements)
+            self._flatten_tree(child, elements, parent=node)
 
         return elements
 
@@ -645,8 +701,14 @@ class Navigator:
         elements = self._flatten_tree(root)
 
         if interactive_only:
-            # Filter to clickable and enabled elements
-            return [e for e in elements if e.clickable and e.enabled and e.label != "Unnamed"]
+            # `e.label != "Unnamed"` used to be part of this filter, and it made
+            # `--list` return ZERO on any Compose screen: every interactive
+            # Compose node has empty text and content-desc, which is measured
+            # and pinned in tests/test_compose_visibility.py. An unlabelled
+            # control is still tappable -- dropping it hides the only thing an
+            # agent could act on. This is defect R11 surviving in navigator
+            # after it was fixed in screen_mapper.
+            return [e for e in elements if e.interactive]
 
         return elements
 

@@ -240,3 +240,52 @@ def test_a_genuinely_unlabelled_field_is_still_flagged():
     auditor.audit_tree(_xml_to_dict(bare))
 
     assert any(i["type"] == "edittext_missing_hint" for i in auditor.issues)
+
+
+# ---------------------------------------------------------------------------
+# R11 survived in navigator after it was fixed in screen_mapper.
+# ---------------------------------------------------------------------------
+
+
+def test_navigator_lists_compose_controls(monkeypatch):
+    """`navigator --list` returned ZERO on a Compose screen.
+
+    Its filter was `e.clickable and e.enabled and e.label != "Unnamed"`. Every
+    interactive Compose node has empty text and content-desc -- asserted above
+    in `test_every_interactive_compose_node_is_unlabelled` -- so the label
+    clause excluded all of them, and an agent listing what it could tap was
+    told there was nothing.
+
+    The same defect had already been found and fixed in `screen_mapper`. Fixing
+    a defect class in one file is not fixing it.
+    """
+    import navigator
+
+    root = _root("uiautomator_compose_default")
+    nav = navigator.Navigator()
+    monkeypatch.setattr(nav, "get_ui_hierarchy", lambda force_refresh=False: root)
+
+    elements = nav.list_elements(interactive_only=True)
+    assert len(elements) >= 6, f"only {len(elements)} interactive elements listed"
+
+
+def test_navigator_recovers_labels_so_the_list_is_actionable(monkeypatch):
+    """Seven controls all called "Unnamed" is not something an agent can act on.
+
+    The captions live in the subtree (Button, Card) or in a row-adjacent
+    sibling (Checkbox, Switch), and `screen_mapper` already knows how to find
+    them -- so navigator borrows that rather than growing a second, divergent
+    copy.
+    """
+    import navigator
+
+    root = _root("uiautomator_compose_default")
+    nav = navigator.Navigator()
+    monkeypatch.setattr(nav, "get_ui_hierarchy", lambda force_refresh=False: root)
+
+    labels = [element.label for element in nav.list_elements(interactive_only=True)]
+    assert any("Submit Order" in label for label in labels), labels
+    assert any("Remember me" in label for label in labels), labels
+    assert (
+        sum(1 for label in labels if label == "Unnamed") <= 1
+    ), f"controls are still anonymous: {labels}"
