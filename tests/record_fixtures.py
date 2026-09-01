@@ -190,6 +190,18 @@ FIXTURES: list[Fixture] = [
         ),
         catches=("R5",),
     ),
+    Fixture(
+        name="adb_device_not_found",
+        args=["-s", "no-such-serial-xyz", "get-state"],
+        description=(
+            "What adb prints for an unknown serial, using a non-blocking command. "
+            "Note the prefix is 'error:', not 'adb:'. `adb -s <unknown> shell` "
+            "does NOT print this -- it blocks waiting for the device to appear, "
+            "which is why log_monitor validates the serial up front instead of "
+            "inferring from exit status."
+        ),
+        catches=("R5",),
+    ),
     # --- logcat: the format mismatch that makes log_monitor inert ---------
     Fixture(
         name="logcat_time",
@@ -437,6 +449,31 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
     if not device.get("api_level"):
         print("No device responding. Boot an emulator first.", file=sys.stderr)
         return 1
+
+    # Recording into an existing profile with a different device attached
+    # rewrites that profile's provenance to describe the wrong hardware --
+    # silently invalidating every fixture already in it.
+    manifest_path = recorded_dir / "MANIFEST.json"
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8")).get("device", {})
+        drift = [
+            f"{key}: profile has {existing[key]!r}, device reports {device.get(key)!r}"
+            for key in ("model", "api_level")
+            if existing.get(key) and existing[key] != device.get(key)
+        ]
+        if drift:
+            print(
+                f"Refusing to record into profile {profile!r}: the attached "
+                f"device is not the one it was recorded from.",
+                file=sys.stderr,
+            )
+            for line in drift:
+                print(f"  {line}", file=sys.stderr)
+            print(
+                "Pass --profile naming this device, or attach the original one.",
+                file=sys.stderr,
+            )
+            return 2
 
     entries: list[dict] = []
     failures: list[tuple[str, str]] = []

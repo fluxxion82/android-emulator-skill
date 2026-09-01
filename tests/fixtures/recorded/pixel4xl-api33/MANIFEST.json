@@ -1,6 +1,6 @@
 {
   "profile": "pixel4xl-api33",
-  "recorded_at": "2026-08-31T21:55:40Z",
+  "recorded_at": "2026-09-01T02:13:11Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "Pixel 4 XL",
@@ -13,40 +13,14 @@
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
-      "name": "wm_size_physical",
-      "file": "wm_size_physical.txt",
-      "command": "adb shell wm size",
-      "description": "`wm size` with no override set \u2014 only a 'Physical size:' line.",
-      "catches": [],
-      "bytes": 25
-    },
-    {
-      "name": "wm_density_physical",
-      "file": "wm_density_physical.txt",
-      "command": "adb shell wm density",
-      "description": "`wm density` with no override set \u2014 only a 'Physical density:' line.",
-      "catches": [],
-      "bytes": 22
-    },
-    {
-      "name": "cmd_statusbar_help",
-      "file": "cmd_statusbar_help.txt",
-      "command": "adb shell cmd statusbar",
-      "description": "Authoritative `cmd statusbar` subcommand list. Contains no battery-level / battery-charging / wifi-enabled / wifi-level / mobile-enabled / mobile-level / mobile-datatype \u2014 the seven subcommands status_bar.py invents. Those are SystemUI demo-mode broadcast extras, not statusbar subcommands.",
+      "name": "adb_device_not_found",
+      "file": "adb_device_not_found.txt",
+      "command": "adb -s no-such-serial-xyz get-state",
+      "description": "What adb prints for an unknown serial, using a non-blocking command. Note the prefix is 'error:', not 'adb:'. `adb -s <unknown> shell` does NOT print this -- it blocks waiting for the device to appear, which is why log_monitor validates the serial up front instead of inferring from exit status.",
       "catches": [
-        "S12"
+        "R5"
       ],
-      "bytes": 1790
-    },
-    {
-      "name": "cmd_notification_help",
-      "file": "cmd_notification_help.txt",
-      "command": "adb shell cmd notification",
-      "description": "Authoritative `cmd notification` subcommand list. There is no 'list channels' subcommand \u2014 `cmd notification list channels <pkg>` silently ignores the extra args and runs bare `list`, exiting 0, which is why push_notification always reports 'no channels found'.",
-      "catches": [
-        "S14"
-      ],
-      "bytes": 990
+      "bytes": 45
     },
     {
       "name": "am_broadcast_missing_receiver",
@@ -59,6 +33,26 @@
       "bytes": 146
     },
     {
+      "name": "cmd_notification_help",
+      "file": "cmd_notification_help.txt",
+      "command": "adb shell cmd notification",
+      "description": "Authoritative `cmd notification` subcommand list. There is no 'list channels' subcommand \u2014 `cmd notification list channels <pkg>` silently ignores the extra args and runs bare `list`, exiting 0, which is why push_notification always reports 'no channels found'.",
+      "catches": [
+        "S14"
+      ],
+      "bytes": 990
+    },
+    {
+      "name": "cmd_statusbar_help",
+      "file": "cmd_statusbar_help.txt",
+      "command": "adb shell cmd statusbar",
+      "description": "Authoritative `cmd statusbar` subcommand list. Contains no battery-level / battery-charging / wifi-enabled / wifi-level / mobile-enabled / mobile-level / mobile-datatype \u2014 the seven subcommands status_bar.py invents. Those are SystemUI demo-mode broadcast extras, not statusbar subcommands.",
+      "catches": [
+        "S12"
+      ],
+      "bytes": 1790
+    },
+    {
       "name": "resolve_activity_launcher",
       "file": "resolve_activity_launcher.txt",
       "command": "adb shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.android.settings",
@@ -67,6 +61,22 @@
         "S10"
       ],
       "bytes": 106
+    },
+    {
+      "name": "wm_density_physical",
+      "file": "wm_density_physical.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` with no override set \u2014 only a 'Physical density:' line.",
+      "catches": [],
+      "bytes": 22
+    },
+    {
+      "name": "wm_size_physical",
+      "file": "wm_size_physical.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` with no override set \u2014 only a 'Physical size:' line.",
+      "catches": [],
+      "bytes": 25
     }
   ]
 }
