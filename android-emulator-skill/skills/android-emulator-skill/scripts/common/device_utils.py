@@ -17,10 +17,43 @@ Used by:
 - test_recorder.py, app_state_capture.py - Auto-device detection
 """
 
-import json
 import re
-import subprocess
-from typing import Any, Optional
+import shlex
+
+from .adb_exec import AdbCommandError, AdbError, run_adb
+from .hierarchy import capture_hierarchy_dict
+
+# Every adb call is bounded. An unbounded one wedges the adb connection for
+# whatever runs next, which is a hang with no diagnosis rather than an error.
+CURRENT_ACTIVITY_TIMEOUT = 15
+PACKAGE_INFO_TIMEOUT = 20
+# uiautomator has to wait for the UI to go idle before it can dump, which on
+# an animating screen takes longer than an ordinary command.
+UI_DUMP_TIMEOUT = 60
+
+
+def quote_for_device_shell(value: str) -> str:
+    """Quote a single argument for the shell running **on the device**.
+
+    ``build_adb_command`` keeps the host safe by never using ``shell=True``, but
+    that is only half the story: ``adb shell a b c`` concatenates the arguments
+    and the device's own ``sh -c`` re-parses the result. An argument carrying
+    ``;``, ``&``, backticks or ``$(...)`` therefore executes on the device --
+    for ``run-as`` calls, as the target app's uid.
+
+    Args:
+        value: Raw text destined for a device-side command.
+
+    Returns:
+        The value quoted so the device shell treats it as one literal argument.
+
+    Example:
+        >>> quote_for_device_shell("x;id")
+        "'x;id'"
+        >>> quote_for_device_shell("com.example.app")
+        'com.example.app'
+    """
+    return shlex.quote(value)
 
 
 def build_adb_command(
@@ -92,8 +125,7 @@ def get_connected_devices() -> list:
         # ABC123DEF456 (device) - device
     """
     try:
-        cmd = ["adb", "devices", "-l"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = run_adb("devices", None, "-l", check=True)
 
         devices = []
         # Parse output
@@ -119,8 +151,8 @@ def get_connected_devices() -> list:
 
         return devices
 
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to list devices: {e.stderr}") from e
+    except AdbCommandError as e:
+        raise RuntimeError(f"Failed to list devices: {e}") from e
 
 
 def get_default_device() -> str | None:
@@ -251,6 +283,75 @@ def list_devices(device_type: str | None = None, state: str | None = None) -> li
     return devices
 
 
+# `wm size` / `wm density` report a Physical line always, and an Override line
+# only when one is set. The override is the EFFECTIVE value: uiautomator reports
+# element bounds in it, so a parser that reads only Physical scales every tap by
+# the wrong ratio (S9).
+_PHYSICAL_SIZE_RE = re.compile(r"Physical size:\s*(\d+)x(\d+)")
+_OVERRIDE_SIZE_RE = re.compile(r"Override size:\s*(\d+)x(\d+)")
+_PHYSICAL_DENSITY_RE = re.compile(r"Physical density:\s*(\d+)")
+_OVERRIDE_DENSITY_RE = re.compile(r"Override density:\s*(\d+)")
+
+
+def parse_display_size(output: str) -> tuple[int, int]:
+    """Return the effective (width, height) from ``wm size`` output.
+
+    Prefers ``Override size:`` when present, because that is the resolution the
+    device is actually rendering -- and therefore the one uiautomator reports
+    bounds in.
+
+    Args:
+        output: Raw stdout of ``adb shell wm size``.
+
+    Returns:
+        (width, height) in pixels.
+
+    Raises:
+        RuntimeError: If neither line is present.
+
+    Example:
+        >>> parse_display_size("Physical size: 1080x2424\nOverride size: 1080x2400")
+        (1080, 2400)
+    """
+    match = _OVERRIDE_SIZE_RE.search(output) or _PHYSICAL_SIZE_RE.search(output)
+    if not match:
+        raise RuntimeError(f"Could not parse a screen size from `wm size`: {output.strip()!r}")
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def parse_display_density(output: str) -> int:
+    """Return the effective dpi from ``wm density`` output.
+
+    Prefers ``Override density:`` for the same reason as :func:`parse_display_size`.
+
+    Args:
+        output: Raw stdout of ``adb shell wm density``.
+
+    Returns:
+        Dots per inch.
+
+    Raises:
+        RuntimeError: If neither line is present.
+    """
+    match = _OVERRIDE_DENSITY_RE.search(output) or _PHYSICAL_DENSITY_RE.search(output)
+    if not match:
+        raise RuntimeError(f"Could not parse a density from `wm density`: {output.strip()!r}")
+    return int(match.group(1))
+
+
+def get_device_density(serial: str | None = None) -> int:
+    """Query the device's effective screen density in dpi.
+
+    Args:
+        serial: Device serial (uses the default device if None).
+
+    Returns:
+        Dots per inch, honouring an active override.
+    """
+    result = run_adb("shell", serial, "wm", "density", check=True)
+    return parse_display_density(result.stdout)
+
+
 def get_device_screen_size(serial: str | None = None) -> tuple:
     """
     Get actual screen dimensions for device.
@@ -268,65 +369,39 @@ def get_device_screen_size(serial: str | None = None) -> tuple:
         print(f"Device screen: {width}x{height}")
     """
     try:
-        cmd = build_adb_command("shell", serial, "wm", "size")
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = run_adb("shell", serial, "wm", "size", check=True)
 
-        # Parse output
-        # Format: Physical size: 1080x1920
-        match = re.search(r"Physical size: (\d+)x(\d+)", result.stdout)
-        if match:
-            width = int(match.group(1))
-            height = int(match.group(2))
-            return (width, height)
+        return parse_display_size(result.stdout)
 
-        # Fallback to common resolution
-        return (1080, 1920)
-
-    except Exception:
-        # Graceful fallback
-        return (1080, 1920)
+    except AdbError:
+        # Deliberately NOT a fallback. Callers derive tap and swipe coordinates
+        # from this, so a guessed 1080x1920 on a tablet aims every gesture at
+        # the wrong place and reports success -- a confident wrong answer, which
+        # is worse than a failure the caller can see.
+        raise
 
 
 def get_ui_hierarchy(serial: str | None = None) -> dict:
     """
-    Get UI hierarchy dump from device.
+    Get the UI hierarchy as nested dicts.
 
-    Uses uiautomator dump to get XML UI hierarchy and converts to dict.
+    Thin wrapper over :func:`common.hierarchy.capture_hierarchy_dict`, kept
+    because several scripts import this name. The capture itself now writes no
+    temp file on either the device or the host; this used to dump to
+    ``/sdcard/window_dump.xml`` and pull to ``/tmp/window_dump.xml``, a path
+    shared with two other implementations (R4).
 
     Args:
-        serial: Device serial (uses default if None)
+        serial: Device serial (uses the default device if None).
 
     Returns:
-        Dict representation of UI hierarchy
+        ``{"tag": str, "attributes": {...}, "children": [...]}``, with every
+        attribute value left as the string uiautomator emitted.
 
-    Example:
-        hierarchy = get_ui_hierarchy("emulator-5554")
-        print(f"Found {len(hierarchy)} nodes")
+    Raises:
+        HierarchyError: If the hierarchy could not be captured or parsed.
     """
-    try:
-        # Dump UI hierarchy to device
-        dump_cmd = build_adb_command(
-            "shell", serial, "uiautomator", "dump", "/sdcard/window_dump.xml"
-        )
-        subprocess.run(dump_cmd, capture_output=True, text=True, check=True)
-
-        # Pull XML file
-        pull_cmd = build_adb_command(
-            "pull", serial, "/sdcard/window_dump.xml", "/tmp/window_dump.xml"
-        )
-        subprocess.run(pull_cmd, capture_output=True, text=True, check=True)
-
-        # Read and parse XML
-        import xml.etree.ElementTree as ET
-
-        tree = ET.parse("/tmp/window_dump.xml")
-        root = tree.getroot()
-
-        # Convert XML to dict structure
-        return _xml_to_dict(root)
-
-    except Exception as e:
-        raise RuntimeError(f"Failed to get UI hierarchy: {e}") from e
+    return capture_hierarchy_dict(serial)
 
 
 def _xml_to_dict(element) -> dict:
@@ -363,8 +438,18 @@ def get_package_info(package_name: str, serial: str | None = None) -> dict:
         print(f"Package: {info['package']}")
     """
     try:
-        cmd = build_adb_command("shell", serial, "pm", "dump", package_name)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # The package name is re-parsed by the device shell, so it is quoted
+        # like every other argument crossing that boundary. Bounded, too: an
+        # unbounded adb call wedges the connection for whatever runs next.
+        result = run_adb(
+            "shell",
+            serial,
+            "pm",
+            "dump",
+            quote_for_device_shell(package_name),
+            timeout=PACKAGE_INFO_TIMEOUT,
+            check=True,
+        )
 
         # Parse relevant info from pm dump output
         info = {"package": package_name, "installed": True}
@@ -381,7 +466,9 @@ def get_package_info(package_name: str, serial: str | None = None) -> dict:
 
         return info
 
-    except subprocess.CalledProcessError:
+    except AdbCommandError:
+        # `pm dump` exits non-zero for a package that is not installed, which is
+        # an answer rather than a failure.
         return {"package": package_name, "installed": False}
 
 
@@ -400,8 +487,7 @@ def list_installed_packages(serial: str | None = None) -> list:
         print(f"Found {len(packages)} packages")
     """
     try:
-        cmd = build_adb_command("shell", serial, "pm", "list", "packages")
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = run_adb("shell", serial, "pm", "list", "packages", check=True)
 
         # Parse output
         # Format: package:com.android.settings
@@ -412,8 +498,41 @@ def list_installed_packages(serial: str | None = None) -> list:
 
         return packages
 
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to list packages: {e.stderr}") from e
+    except AdbCommandError as e:
+        raise RuntimeError(f"Failed to list packages: {e}") from e
+
+
+# Focused-window lines from `dumpsys window`, e.g.
+#   mCurrentFocus=Window{c63b9b5 u0 com.pkg/com.pkg.MainActivity}
+#   mFocusedApp=ActivityRecord{ba1d946 u0 com.pkg/.MainActivity t615}
+_FOCUS_LINE_RE = re.compile(r"^\s*(?:mCurrentFocus|mFocusedApp)=(?P<body>.*)$", re.MULTILINE)
+_COMPONENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_.]*/[A-Za-z0-9_.]+)")
+
+
+def parse_focused_activity(dumpsys_output: str) -> str | None:
+    """Extract the focused ``package/activity`` component from `dumpsys window`.
+
+    Pure function so it can be tested against recorded device output; the adb
+    call lives in :func:`get_current_activity`.
+
+    Args:
+        dumpsys_output: Text from ``adb shell dumpsys window``.
+
+    Returns:
+        The component, or None when nothing is focused.
+
+    Example:
+        >>> parse_focused_activity("  mCurrentFocus=Window{a u0 com.x/com.x.Main}")
+        'com.x/com.x.Main'
+    """
+    for match in _FOCUS_LINE_RE.finditer(dumpsys_output):
+        body = match.group("body")
+        if "null" in body:
+            continue
+        component = _COMPONENT_RE.search(body)
+        if component:
+            return component.group(1)
+    return None
 
 
 def get_current_activity(serial: str | None = None) -> str | None:
@@ -432,28 +551,15 @@ def get_current_activity(serial: str | None = None) -> str | None:
             print(f"Current activity: {activity}")
     """
     try:
-        cmd = build_adb_command(
-            "shell",
-            serial,
-            "dumpsys",
-            "window",
-            "windows",
-            "|",
-            "grep",
-            "-E",
-            "'mCurrentFocus|mFocusedApp'",
-        )
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True, check=False)
+        # Filtering happens in Python, not via a device-side pipeline. The
+        # previous version built an argv list containing a literal "|" and
+        # "grep" and ran it with shell=True -- which on POSIX executes only
+        # argv[0] (bare `adb`) and passes the rest as $0, $1, ... So stdout was
+        # always empty and this always returned None.
+        result = run_adb("shell", serial, "dumpsys", "window", timeout=CURRENT_ACTIVITY_TIMEOUT)
+        return parse_focused_activity(result.stdout)
 
-        # Parse output
-        # Format: mCurrentFocus=Window{abc123 u0 com.example.app/com.example.app.MainActivity}
-        match = re.search(r"([a-zA-Z0-9_.]+/[a-zA-Z0-9_.]+)\}", result.stdout)
-        if match:
-            return match.group(1)
-
-        return None
-
-    except Exception:
+    except (AdbError, OSError):
         return None
 
 

@@ -70,8 +70,27 @@ _LOG_LINE_PATTERN = re.compile(
 
 # "Skipped 47 frames!  The application may be doing too much work..."
 _SKIPPED_FRAMES_RE = re.compile(r"Skipped\s+(\d+)\s+frames", re.IGNORECASE)
-# "ANR in com.example.app (com.example.app/.MainActivity)"
+
+# One stalled app is reported by TWO subsystems in two different shapes. Both
+# are recorded: logcat_anr_broadcast and logcat_anr_input_dispatch.
+#
+# WindowManager writes the input-dispatch form FIRST in the line, and its
+# package sits inside the braces:
+#   "ANR in Window{67a8d77 u0 com.pkg/com.pkg.MainActivity}. Reason:Input ..."
+# Matched before the generic form, which would otherwise read the literal word
+# "Window" as the package name and report a fault in an app called Window.
+_ANR_IN_WINDOW_RE = re.compile(
+    r"ANR in Window\{\S+\s+\S+\s+(?P<package>[\w.]+)/(?P<component>[\w.$]+)\}",
+    re.IGNORECASE,
+)
+
+# ActivityManager's form is the bare package: "ANR in com.example.app". The
+# parenthesised component is optional because -- contrary to every hand-typed
+# sample this repo used to test against -- a broadcast ANR does not carry one.
 _ANR_IN_RE = re.compile(r"ANR in ([\w.]+)(?:\s+\(([^)]+)\))?", re.IGNORECASE)
+
+# "StrictMode policy violation; ~duration=27 ms: android.os.strictmode.DiskReadViolation"
+_STRICTMODE_DURATION_RE = re.compile(r"~duration=(\d+)\s*ms", re.IGNORECASE)
 
 
 # === TYPES ===
@@ -207,7 +226,21 @@ def _classify_anr(tag: str, message: str) -> dict | None:
                 "anr_package": None,
             }
 
-    # 2. ActivityManager hard ANR.
+    # 2a. WindowManager's input-dispatch ANR, whose package is inside the
+    # braces. Checked before the generic form: "ANR in Window{...}" matches
+    # that too, and reports a fault in a package called "Window".
+    window_match = _ANR_IN_WINDOW_RE.search(message)
+    if window_match:
+        package = window_match.group("package")
+        return {
+            "kind": "anr",
+            "frames": None,
+            "duration_ms": 5000.0,
+            "component": f"{package}/{window_match.group('component')}",
+            "anr_package": package,
+        }
+
+    # 2b. ActivityManager hard ANR.
     anr_match = _ANR_IN_RE.search(message)
     if anr_match:
         pkg = anr_match.group(1)
@@ -233,11 +266,26 @@ def _classify_anr(tag: str, message: str) -> dict | None:
         }
 
     # 3. StrictMode / slow operation hints (minor jank).
+    #
+    # StrictMode logs a violation as a HEADER line followed by its whole stack
+    # trace, every frame under the same tag -- see logcat_strictmode_violation,
+    # where two file operations produce ten headers and roughly three hundred
+    # tagged lines. Matching on the tag alone made each of those frames a
+    # separate event, so one violation arrived as thirty stalls.
     if "strictmode" in tag.lower() or "slow operation" in lower:
+        if message.lstrip().startswith(("at ", "... ")):
+            return None
+        # The violation states its own cost ("~duration=27 ms"). The old
+        # constant below is a placeholder for when it does not; using it while
+        # the real number was right there in the line was simply throwing the
+        # measurement away.
+        duration = _STRICTMODE_DURATION_RE.search(message)
         return {
             "kind": "strictmode",
             "frames": None,
-            "duration_ms": float(WARN_FRAMES * FRAME_MS),
+            "duration_ms": (
+                float(duration.group(1)) if duration else float(WARN_FRAMES * FRAME_MS)
+            ),
             "component": None,
             "anr_package": None,
         }

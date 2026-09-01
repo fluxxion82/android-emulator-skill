@@ -1,7 +1,10 @@
 """Device-free tests for navigator feature deltas.
 
-Covers the three curated deltas, with adb/subprocess and ``time.sleep`` mocked
-so nothing touches a real device:
+Covers the three curated deltas, with adb and ``time.sleep`` mocked so nothing
+touches a real device. navigator reaches adb only through
+``adb_exec.run_adb``, so the fake goes under that; patching
+``navigator.subprocess`` would stop intercepting and let these tests drive a
+real device:
 
 1. ``--find-exact`` performs exact (non-fuzzy) text matching.
 2. Each tap is followed by an ``ANDROID_EMU_TAP_SETTLE_MS`` settle delay.
@@ -16,6 +19,21 @@ import xml.etree.ElementTree as ET
 import navigator
 import pytest
 from navigator import Element, Navigator
+
+from common import adb_exec
+
+
+def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
+    """Stand-in for subprocess.CompletedProcess."""
+
+    class _Result:
+        pass
+
+    result = _Result()
+    result.returncode = returncode
+    result.stdout = stdout
+    result.stderr = stderr
+    return result
 
 
 def _root(xml: str) -> ET.Element:
@@ -101,10 +119,10 @@ def test_tap_at_sleeps_for_settle(monkeypatch):
         slept.append(seconds)
 
     def _run(cmd, **kwargs):
-        return None
+        return _fake_result()
 
     monkeypatch.setattr(navigator.time, "sleep", _sleep)
-    monkeypatch.setattr(navigator.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
 
     nav = Navigator(serial="emulator-5554")
     success, _ = nav.tap_at(10, 20)
@@ -121,10 +139,10 @@ def test_tap_at_no_sleep_when_settle_zero(monkeypatch):
         slept.append(seconds)
 
     def _run(cmd, **kwargs):
-        return None
+        return _fake_result()
 
     monkeypatch.setattr(navigator.time, "sleep", _sleep)
-    monkeypatch.setattr(navigator.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
 
     nav = Navigator(serial="emulator-5554")
     success, _ = nav.tap_at(10, 20)
@@ -136,12 +154,16 @@ def test_tap_at_no_sleep_when_settle_zero(monkeypatch):
 def test_tap_passes_serial_to_adb(monkeypatch):
     monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
     captured: list[list[str]] = []
+    budgets: list[object] = []
 
     def _run(cmd, **kwargs):
-        captured.append(cmd)
-        assert kwargs.get("check") is True
+        captured.append(list(cmd))
+        # run_adb enforces the non-zero check itself, so the child is run with
+        # check=False; what must survive the move is the time budget.
+        budgets.append(kwargs.get("timeout"))
+        return _fake_result()
 
-    monkeypatch.setattr(navigator.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
 
     nav = Navigator(serial="emulator-5554")
     nav.tap_at(10, 20)
@@ -151,6 +173,7 @@ def test_tap_passes_serial_to_adb(monkeypatch):
     assert cmd[0] == "adb"
     assert "-s" in cmd and "emulator-5554" in cmd
     assert cmd[-3:] == ["tap", "10", "20"]
+    assert all(b for b in budgets), f"unbounded adb call: {budgets}"
 
 
 # --- Delta 3: element cap + overflow hint ----------------------------------
@@ -220,3 +243,80 @@ def test_list_json_reports_total_and_truncation(monkeypatch, capsys):
     assert payload["shown"] == 3
     assert payload["truncated"] == 7
     assert len(payload["elements"]) == 3
+
+
+# --- Device errors reach the agent with a remedy, not a traceback ----------
+
+
+def test_unknown_serial_raises_rather_than_reporting_a_tap(monkeypatch, recorded_anywhere):
+    """The tap never reached a device, so it must not look like success."""
+    monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
+
+    def _run(cmd, **kwargs):
+        return _fake_result(returncode=1, stderr=recorded_anywhere("adb_device_not_found"))
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+
+    nav = Navigator(serial="no-such-serial-xyz")
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        nav.tap_at(10, 20)
+
+
+def test_main_reports_an_unknown_serial_without_a_traceback(monkeypatch, capsys, recorded_anywhere):
+    """Exit 1 with the remedy on stderr; a traceback would bury it."""
+    monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
+
+    def _run(cmd, **kwargs):
+        return _fake_result(returncode=1, stderr=recorded_anywhere("adb_device_not_found"))
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    _stub_resolve(monkeypatch, serial="no-such-serial-xyz")
+    monkeypatch.setattr(
+        navigator.sys,
+        "argv",
+        ["navigator.py", "--serial", "no-such-serial-xyz", "--tap-at", "10,20"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        navigator.main()
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: ")
+    assert "no-such-serial-xyz" in err
+    assert "adb devices" in err, "the error does not say how to see what is attached"
+
+
+def test_main_reports_multiple_devices_when_listing(monkeypatch, capsys):
+    """--list dumps the hierarchy, so it hits the same ambiguity."""
+
+    def _run(cmd, **kwargs):
+        return _fake_result(returncode=1, stderr="adb: more than one device/emulator\n")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    _stub_resolve(monkeypatch, serial=None)
+    monkeypatch.setattr(navigator.sys, "argv", ["navigator.py", "--list"])
+
+    with pytest.raises(SystemExit) as exc:
+        navigator.main()
+
+    assert exc.value.code == 1
+    assert "--serial" in capsys.readouterr().err
+
+
+def test_typed_text_is_still_quoted_and_space_encoded(monkeypatch):
+    """R7/R8: quoting for the device shell survives the move to run_adb."""
+    captured: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _fake_result()
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+
+    nav = Navigator(serial="emulator-5554")
+    nav.type_text("x;id now")
+
+    payload = captured[0][-1]
+    assert not payload.startswith("x;"), f"unquoted payload reached the device: {payload!r}"
+    assert "%s" in payload, f"space no longer encoded for `input text`: {payload!r}"

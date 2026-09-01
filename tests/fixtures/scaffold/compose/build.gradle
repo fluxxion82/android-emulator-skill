@@ -1,0 +1,10 @@
+// Versions are pinned to what the recording machine already had in its Gradle
+// cache, so a re-record downloads as little as possible. Any AGP >= 8.7 with a
+// matching Kotlin/Compose compiler pair produces an equivalent hierarchy: the
+// defect these fixtures pin down (R11) is a property of Compose's semantics ->
+// AccessibilityNodeInfo mapping, not of the build tooling.
+plugins {
+    id 'com.android.application' version '8.13.2' apply false
+    id 'org.jetbrains.kotlin.android' version '2.4.0' apply false
+    id 'org.jetbrains.kotlin.plugin.compose' version '2.4.0' apply false
+}

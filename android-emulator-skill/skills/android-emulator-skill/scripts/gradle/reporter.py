@@ -65,11 +65,17 @@ class OutputFormatter:
             passed = test_info.get("passed", 0)
             failed = test_info.get("failed", 0)
             skipped = test_info.get("skipped", 0)
-            test_status = "PASS" if failed == 0 and status != "FAILED" else "FAIL"
-            lines.append(
-                f"Tests: {test_status} ({passed}/{total} passed, "
-                f"{failed} failed, {skipped} skipped) [{build_id}]"
-            )
+            # `errors` counts <error> testcases -- anything that threw, including
+            # a crash in @Before/setUp. Omitting them from the verdict reported a
+            # suite of 10 with 5 errors as "PASS (5/10 passed, 0 failed,
+            # 0 skipped)": a pass claim, with numbers that do not sum.
+            errored = test_info.get("errors", 0)
+            not_passing = failed + errored
+            test_status = "PASS" if not_passing == 0 and status != "FAILED" else "FAIL"
+            counts = f"{passed}/{total} passed, {failed} failed"
+            if errored:
+                counts += f", {errored} errors"
+            lines.append(f"Tests: {test_status} ({counts}, {skipped} skipped) [{build_id}]")
         else:
             lines.append(
                 f"Build: {status} ({error_count} errors, {warning_count} warnings) "

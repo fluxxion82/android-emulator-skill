@@ -110,7 +110,13 @@ class BuildRunner:
 
         e.g. base="assembleDebug", module=":app" -> ":app:assembleDebug".
         """
-        capitalized = f"{base}{self.variant.capitalize()}"
+        # Only the first letter changes case. str.capitalize() lowercases the
+        # remainder, turning AGP's "proStagingDebug" into "Prostagingdebug".
+        # Gradle's name-abbreviation matching is case-insensitive and resolves
+        # that anyway, so it does not break the build -- but the task name is
+        # wrong in logs, and the fallback stops working as soon as the
+        # abbreviation is ambiguous.
+        capitalized = f"{base}{self.variant[:1].upper()}{self.variant[1:]}"
         if self.module:
             module = self.module if self.module.startswith(":") else f":{self.module}"
             return f"{module}:{capitalized}"

@@ -1,0 +1,90 @@
+{
+  "profile": "gradle-8.13",
+  "recorded_at": "2026-09-01T22:32:33Z",
+  "gradle_version": "8.13",
+  "scaffolds": [
+    "tests/fixtures/scaffold/flavored",
+    "tests/fixtures/scaffold/compile"
+  ],
+  "note": "Durations and absolute paths are normalised so a re-record diffs only on real format changes.",
+  "fixtures": [
+    {
+      "name": "gradle_task_not_found",
+      "file": "gradle_task_not_found.txt",
+      "command": "gradle --console=plain :app:assembleNoSuchVariantAtAll",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "description": "A task that genuinely does not exist. Produces Gradle's 'FAILURE: Build failed with an exception.' / '* What went wrong:' block. Nothing in gradle/results.py parses this, so the skill reports 'Build: FAILED (0 errors, 0 warnings)' with no diagnostic.",
+      "catches": [
+        "A6"
+      ],
+      "bytes": 745
+    },
+    {
+      "name": "gradle_task_ambiguous",
+      "file": "gradle_task_ambiguous.txt",
+      "command": "gradle --console=plain :app:assembleProstaging",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "description": "An abbreviated task name matching more than one task. Gradle lists the candidates in the '* What went wrong:' block \u2014 exactly the detail an agent needs and currently never sees.",
+      "catches": [
+        "A6"
+      ],
+      "bytes": 804
+    },
+    {
+      "name": "gradle_miscased_variant_resolves",
+      "file": "gradle_miscased_variant_resolves.txt",
+      "command": "gradle --console=plain :app:assembleProstagingdebug",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "description": "Evidence that S2 is NOT build-breaking. str.capitalize() turns 'proStagingDebug' into 'Prostagingdebug', but Gradle's name abbreviation matching is case-insensitive and resolves it to assembleProStagingDebug. BUILD SUCCESSFUL, no deprecation warning. The generated name is still wrong and should be fixed, but it does not fail the build.",
+      "catches": [
+        "S2"
+      ],
+      "bytes": 117
+    },
+    {
+      "name": "gradle_build_successful",
+      "file": "gradle_build_successful.txt",
+      "command": "gradle --console=plain :app:assembleProStagingDebug",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "description": "Baseline success output, for asserting the parser does not cry wolf.",
+      "catches": [],
+      "bytes": 117
+    },
+    {
+      "name": "gradle_kotlin_compile_error",
+      "file": "gradle_kotlin_compile_error.txt",
+      "command": "gradle --console=plain --rerun-tasks :kotlin-error:compileKotlin",
+      "scaffold": "tests/fixtures/scaffold/compile",
+      "description": "A real Kotlin compile error, and the reason this fixture had to exist. K2 prints `e: file:///abs/path/Broken.kt:5:13 Unresolved reference 'x'.` \u2014 a file:// URI, colon-separated line:column, no parentheses, no colon before the message, and a trailing full stop. results.py's _split_kotlin_body matches Kotlin 1.x's `e: /path.kt: (5, 13): unresolved reference: x` instead, so on any Kotlin 2.x build the error is reported with file, line and column all None. Note too that the `> Task ... FAILED` marker and the `e:` line both appear, so one mistake yields two errors.",
+      "catches": [],
+      "bytes": 1339
+    },
+    {
+      "name": "gradle_kotlin_compile_warning",
+      "file": "gradle_kotlin_compile_warning.txt",
+      "command": "gradle --console=plain --rerun-tasks :kotlin-warning:compileKotlin",
+      "scaffold": "tests/fixtures/scaffold/compile",
+      "description": "A real Kotlin warning, in the same K2 shape as the error: `w: file:///abs/path.kt:7:21 'fun retired(): Int' is deprecated. \u2026`. Recorded separately from the error because a compiler that has errored stops reporting warnings \u2014 measured: a module holding both prints only the error \u2014 so 'errors and warnings in one log' is not a shape either compiler produces from one module. This capture also carries the Kotlin Gradle plugin's own multi-line `w:` block, whose body is prose rather than a location and whose continuation lines carry no `w:` prefix at all.",
+      "catches": [],
+      "bytes": 880
+    },
+    {
+      "name": "gradle_javac_compile_error",
+      "file": "gradle_javac_compile_error.txt",
+      "command": "gradle --console=plain --rerun-tasks :java-error:compileJava",
+      "scaffold": "tests/fixtures/scaffold/compile",
+      "description": "A real javac error. The `path.java:LINE: error: message` shape is the one thing the hand-written sample got right, but it omits everything around it: the source line and caret, the indented `symbol:`/`location:` continuation lines, a trailing `N errors` count, one mistake reported TWICE by javac itself, and then the whole block repeated a third and fourth time \u2014 indented by two spaces \u2014 inside Gradle's `* What went wrong:` section. _JAVAC_ERROR_RE's `[^:]+` file group matches leading spaces, so it re-matches the indented copies and one missing type is counted four times.",
+      "catches": [],
+      "bytes": 1836
+    },
+    {
+      "name": "gradle_javac_compile_warning",
+      "file": "gradle_javac_compile_warning.txt",
+      "command": "gradle --console=plain --rerun-tasks :java-warning:compileJava",
+      "scaffold": "tests/fixtures/scaffold/compile",
+      "description": "A real javac warning: `path.java:6: warning: [deprecation] retired() in Retired has been deprecated`, followed by the source line, a caret and `1 warning`. The `[deprecation]` lint-category tag rides inside the message, which no hand-written sample had. Requires `-Xlint:deprecation` and a caller in a different class \u2014 javac says nothing when a class deprecates and calls its own method.",
+      "catches": [],
+      "bytes": 858
+    }
+  ]
+}

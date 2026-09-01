@@ -49,15 +49,38 @@ jobs:
           fi
           echo "✅ pyproject.toml version matches"
 
-      - name: Check SKILL.md for version reference
+      - name: Check SKILL.md frontmatter version
         run: |
           SKILL_MD=android-emulator-skill/skills/android-emulator-skill/SKILL.md
-          if ! grep -q "${{ steps.version.outputs.number }}" "$SKILL_MD"; then
-            echo "⚠️  WARNING: Version ${{ steps.version.outputs.number }} not mentioned in SKILL.md"
-            echo "Consider adding version info to the SKILL.md frontmatter or description"
-          else
-            echo "✅ SKILL.md mentions version ${{ steps.version.outputs.number }}"
+          SKILL_VERSION=$(grep -E '^version: ' "$SKILL_MD" | head -1 | sed 's/version: //')
+          echo "SKILL.md version: $SKILL_VERSION"
+          if [ "$SKILL_VERSION" != "${{ steps.version.outputs.number }}" ]; then
+            echo "::error::SKILL.md says $SKILL_VERSION, release is ${{ steps.version.outputs.number }}"
+            exit 1
           fi
+          echo "SKILL.md version matches"
+
+      - name: Check plugin.json version
+        run: |
+          PLUGIN_JSON=android-emulator-skill/.claude-plugin/plugin.json
+          PLUGIN_VERSION=$(python3 -c "import json;print(json.load(open('$PLUGIN_JSON')).get('version',''))")
+          echo "plugin.json version: $PLUGIN_VERSION"
+          if [ "$PLUGIN_VERSION" != "${{ steps.version.outputs.number }}" ]; then
+            echo "::error::plugin.json says '$PLUGIN_VERSION', release is ${{ steps.version.outputs.number }}"
+            exit 1
+          fi
+          echo "plugin.json version matches"
+
+      - name: Check marketplace.json version
+        run: |
+          MARKET_JSON=.claude-plugin/marketplace.json
+          MARKET_VERSION=$(python3 -c "import json;print(json.load(open('$MARKET_JSON'))['plugins'][0].get('version',''))")
+          echo "marketplace.json version: $MARKET_VERSION"
+          if [ "$MARKET_VERSION" != "${{ steps.version.outputs.number }}" ]; then
+            echo "::error::marketplace.json says '$MARKET_VERSION', release is ${{ steps.version.outputs.number }}"
+            exit 1
+          fi
+          echo "marketplace.json version matches"
 
       - name: Validation summary
         if: success()
@@ -67,5 +90,8 @@ jobs:
           echo "**Release Version:** ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "All version references are consistent:" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ pyproject.toml: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Git tag: ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- pyproject.toml: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- SKILL.md: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- plugin.json: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- marketplace.json: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Git tag: ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY

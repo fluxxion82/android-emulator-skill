@@ -1,0 +1,20 @@
+
+> Configure project :kotlin-error
+w: ⚠️ Deprecated Gradle Version
+The used Gradle version (Gradle 8.13) is deprecated and will not be supported in future Kotlin Gradle Plugin releases.
+The minimum supported Gradle version will become Gradle 8.14.4 in Kotlin 2.5.0.
+
+This warning can be suppressed in 'gradle.properties':
+    kotlin.suppressGradlePluginWarnings=DeprecatedGradleVersionWarning
+Solution: Please update the Gradle version to at least Gradle 8.14.4.
+
+
+> Task :kotlin-warning:checkKotlinGradlePluginConfigurationErrors SKIPPED
+
+> Task :kotlin-warning:compileKotlin
+w: file:///scaffold/kotlin-warning/src/main/kotlin/com/example/Warned.kt:7:21 'fun retired(): Int' is deprecated. Use current() instead.
+
+[Incubating] Problems report is available at: file:///scaffold/build/reports/problems/problems-report.html
+
+BUILD SUCCESSFUL in 0s
+1 actionable task: 1 executed

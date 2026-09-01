@@ -175,11 +175,18 @@ _KOTLIN_ERROR_RE = re.compile(r"^e:\s*(?P<body>.+)$")
 _KOTLIN_WARNING_RE = re.compile(r"^w:\s*(?P<body>.+)$")
 
 # Java/Kotlin/clang style: "/path/File.java:12: error: message".
+#
+# The file group must start with a NON-space character. Gradle reprints the
+# whole compiler output, indented by two spaces, inside its "* What went wrong:"
+# section — visible in gradle_javac_compile_error — and `[^:]+` matched that
+# indent quite happily, so every javac diagnostic was counted twice over. (The
+# recording shows javac itself also reporting one missing type twice, once per
+# caret position; that duplication is real output and is left alone.)
 _JAVAC_ERROR_RE = re.compile(
-    r"^(?P<file>[^:]+\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*error:\s*(?P<message>.+)$"
+    r"^(?P<file>[^\s:][^:]*\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*error:\s*(?P<message>.+)$"
 )
 _JAVAC_WARNING_RE = re.compile(
-    r"^(?P<file>[^:]+\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*warning:\s*(?P<message>.+)$"
+    r"^(?P<file>[^\s:][^:]*\.\w+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*warning:\s*(?P<message>.+)$"
 )
 
 # Bare "error:" / "warning:" diagnostics without a leading file path.
@@ -192,10 +199,93 @@ _TASK_FAILED_RE = re.compile(r"^>\s*Task\s+(?P<task>\S+)\s+FAILED\s*$")
 # Gradle "What went wrong" / "FAILURE: Build failed" sections.
 _BUILD_FAILED_RE = re.compile(r"^(?:FAILURE:\s*)?Build failed", re.IGNORECASE)
 
+# Section headers inside a Gradle failure report: "* What went wrong:", "* Try:".
+_FAILURE_SECTION_RE = re.compile(r"^\*\s*(?P<heading>.+?):\s*$")
+
+# Boilerplate that follows every failure and carries no diagnostic value.
+_FAILURE_NOISE_PREFIXES = ("> Run ", "> Get more help", "> For more on ", "> Run with ")
+
+
+def extract_failure_reasons(text: str) -> list[str]:
+    """Pull the body of each ``* What went wrong:`` section from Gradle output.
+
+    Gradle reports configuration failures, dependency-resolution failures and
+    task-lookup failures through this block **only** — such builds emit no
+    ``> Task ... FAILED`` marker and no compiler ``e:`` lines. Without this,
+    those failures parse to zero errors and the CLI prints
+    ``Build: FAILED (0 errors, 0 warnings)`` with nothing actionable.
+
+    Args:
+        text: Combined Gradle stdout/stderr.
+
+    Returns:
+        One string per failure section, whitespace-collapsed. Empty if the
+        build did not fail.
+
+    Example:
+        >>> extract_failure_reasons("FAILURE: Build failed\\n\\n* What went wrong:\\nBoom\\n")
+        ['Boom']
+    """
+    reasons: list[str] = []
+    collecting = False
+    body: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        section = _FAILURE_SECTION_RE.match(line.strip())
+
+        if section:
+            # A new section ends whatever we were collecting.
+            if collecting and body:
+                reasons.append(" ".join(body).strip())
+            body = []
+            collecting = section.group("heading").strip().lower() == "what went wrong"
+            continue
+
+        if not collecting:
+            continue
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith(_FAILURE_NOISE_PREFIXES):
+            continue
+        body.append(stripped)
+
+    if collecting and body:
+        reasons.append(" ".join(body).strip())
+
+    return reasons
+
 
 def _split_kotlin_body(body: str) -> dict:
-    """Split a Kotlin diagnostic body into location + message."""
+    """Split a Kotlin diagnostic body into location + message.
+
+    Three shapes, because the Kotlin compiler changed its diagnostic format at
+    K2 and this parser only knew the old one:
+
+    * ``file:///abs/path.kt:12:5 Message.`` — Kotlin 2.x, recorded as
+      ``gradle_kotlin_compile_error``. A ``file://`` URI, colon-separated
+      line and column, no parentheses and no colon before the message.
+    * ``file: /path/File.kt: (12, 5): message`` — Kotlin 1.x.
+    * ``/path/File.kt:12:5: message`` — the plain colon form.
+
+    The K2 branch is checked first: its body starts ``file://``, which the
+    1.x pattern's optional ``file:`` prefix would otherwise eat, leaving
+    ``//abs/path.kt:12:5 …`` to fall through to no location at all. That was
+    the live behaviour — every Kotlin error since 2.0 was reported with file,
+    line and column all None.
+    """
     location = {"file": None, "line": None, "column": None}
+
+    k2_uri = re.match(
+        r"^file://(?P<file>.+?):(?P<line>\d+):(?P<col>\d+)\s+(?P<message>.+)$",
+        body,
+    )
+    if k2_uri:
+        location["file"] = k2_uri.group("file").strip()
+        location["line"] = int(k2_uri.group("line"))
+        location["column"] = int(k2_uri.group("col"))
+        return {"message": k2_uri.group("message").strip(), "location": location}
+
     # Format: "file: /path/File.kt: (12, 5): message" OR "/path:12:5: message".
     file_paren = re.match(
         r"^(?:file:\s*)?(?P<file>.+?):\s*\((?P<line>\d+),\s*(?P<col>\d+)\):\s*(?P<message>.+)$",
@@ -325,5 +415,19 @@ def parse_build_output(stdout: str, stderr: str) -> dict:
                 }
             )
             continue
+
+    # Gradle's own failure report. Kept last so a compile error that already
+    # explains the failure stays first in the list, and deduplicated against it
+    # so a task-level failure is not reported twice.
+    for reason in extract_failure_reasons(combined):
+        if any(reason in existing["message"] for existing in errors):
+            continue
+        errors.append(
+            {
+                "message": reason,
+                "type": "gradle",
+                "location": {"file": None, "line": None, "column": None},
+            }
+        )
 
     return {"errors": errors, "warnings": warnings, "failed_tasks": failed_tasks}

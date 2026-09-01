@@ -10,10 +10,34 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 
+import pytest
 from accessibility_audit import AccessibilityAuditor, _attr_bool, _parse_bounds
 from fixtures import SAMPLE_UI_HIERARCHY
 
 from common.device_utils import _xml_to_dict
+
+# The density every unpinned test in this file runs at. 160dpi is Android's
+# baseline, where 1px == 1dp, so px-shaped fixtures keep their intended sizes.
+BASELINE_DPI = 160
+
+
+@pytest.fixture(autouse=True)
+def pinned_density(monkeypatch):
+    """Keep the audit off any attached device.
+
+    `_resolve_density` asks adb for the real density, so without this every
+    test here silently reads whichever phone or emulator happens to be plugged
+    in -- and the touch-target findings change with it. That is what made
+    `test_audit_parses_touch_target_bounds` fail: a device reported 420dpi, and
+    the sample's 100px row became 38dp, correctly under the 48dp minimum. The
+    result depended on the hardware, which is not a test.
+
+    Density is pinned rather than the adb call blocked, so a test that wants a
+    specific density just assigns `auditor.density`.
+    """
+    monkeypatch.setattr(
+        AccessibilityAuditor, "_resolve_density", lambda self: self.density or BASELINE_DPI
+    )
 
 
 def _sample_hierarchy() -> dict:
@@ -53,12 +77,35 @@ def test_audit_detects_issues_from_nested_attributes():
 
 def test_audit_parses_touch_target_bounds():
     # Ensures bounds parse to ints (not an unparsed string), so touch-target
-    # math runs rather than being silently skipped. The sample's targets are
-    # all large, so there must be no false small-target finding.
+    # math runs rather than being silently skipped. At 160dpi the sample's
+    # targets are all >= 48dp, so there must be no false small-target finding.
     auditor = AccessibilityAuditor()
     auditor._audit_node(_sample_hierarchy())
     small = [i for i in auditor.issues if i["type"] == "small_touch_target"]
     assert small == []
+
+
+def test_touch_targets_are_measured_in_dp_not_pixels():
+    """48 *pixels* is not the threshold; 48dp is, and they differ per device.
+
+    The sample's 1000x100px row passes at 160dpi and fails at 420dpi -- the
+    same layout, the same pixels, a different verdict. A px-based check calls
+    it fine on every device, which is how an undersized target ships.
+    """
+    auditor = AccessibilityAuditor()
+    auditor.density = 420
+    auditor._audit_node(_sample_hierarchy())
+
+    small = [i for i in auditor.issues if i["type"] == "small_touch_target"]
+    assert small, "a 100px-tall row is 38dp at 420dpi and must be flagged"
+    assert "38dp" in small[0]["message"], f"message reports px, not dp: {small[0]['message']}"
+
+
+def test_px_to_dp_converts_against_the_device_density():
+    auditor = AccessibilityAuditor()
+    auditor.density = 320
+    assert auditor.px_to_dp(96) == pytest.approx(48.0)
+    assert auditor.min_touch_target_px() == pytest.approx(96.0)
 
 
 def test_audit_detects_critical_issue():

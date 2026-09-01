@@ -29,8 +29,10 @@ def test_build_command_base_streaming():
     assert cmd[0] == "adb"
     assert "-d" not in cmd
     assert "-t" not in cmd
-    # Always uses the time format.
-    assert cmd[cmd.index("-v") + 1] == "time"
+    # threadtime, not time: parse_logcat_line needs the PID/TID columns.
+    # This previously asserted "time", locking in a parser that matched
+    # nothing (A1).
+    assert cmd[cmd.index("-v") + 1] == "threadtime"
     assert cmd.index("logcat") == 1
 
 
@@ -111,11 +113,20 @@ def test_stream_logs_last_window_runs_dump_command(monkeypatch):
             captured["cmd"] = cmd
             # Empty stream: readline() returns "" immediately (EOF).
             self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
 
-        def wait(self):
+        def wait(self, timeout=None):
+            # Accepts a timeout because stream_logs must never wait unbounded
+            # on a process that may not exit (A2).
+            return 0
+
+        def poll(self):
             return 0
 
         def terminate(self):
+            return None
+
+        def kill(self):
             return None
 
     # No app package -> _resolve_app_pid returns None without calling adb.
@@ -128,20 +139,30 @@ def test_stream_logs_last_window_runs_dump_command(monkeypatch):
 
 
 def test_resolve_app_pid_returns_pid(monkeypatch):
-    class _Result:
-        stdout = "  4242 \n"
+    # adb now goes through common.adb_exec, so that is where the fake belongs.
+    import subprocess as real_subprocess
 
-    monkeypatch.setattr(log_monitor.subprocess, "run", lambda *_a, **_k: _Result())
+    from common import adb_exec
+
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: real_subprocess.CompletedProcess(cmd, 0, "  4242 \n", ""),
+    )
     assert _monitor(app_package="com.myapp")._resolve_app_pid() == "4242"
 
 
 def test_resolve_app_pid_handles_not_running(monkeypatch):
+    """`pidof` exits non-zero when the app is not running: an answer, not a failure."""
     import subprocess as real_subprocess
 
-    def _raise(*_a, **_k):
-        raise real_subprocess.CalledProcessError(1, "pidof")
+    from common import adb_exec
 
-    monkeypatch.setattr(log_monitor.subprocess, "run", _raise)
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: real_subprocess.CompletedProcess(cmd, 1, "", ""),
+    )
     assert _monitor(app_package="com.myapp")._resolve_app_pid() is None
 
 

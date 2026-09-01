@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import subprocess
 
 import emulator_selector
 import pytest
+
+from common import adb_exec
 
 
 # ---------------------------------------------------------------------------
@@ -162,14 +165,33 @@ def test_load_recent_missing_file_returns_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# adb serial -> AVD name resolution (subprocess mocked)
+# adb serial -> AVD name resolution (the subprocess boundary under adb_exec)
 # ---------------------------------------------------------------------------
-class _FakeResult:
-    def __init__(self, stdout: str):
-        self.stdout = stdout
+def _fake_adb(monkeypatch, responses):
+    """Answer adb / emulator calls at the subprocess boundary under adb_exec.
+
+    ``responses`` maps a command prefix tuple to (returncode, stdout, stderr).
+    Patching ``adb_exec.subprocess`` patches the one module every one of these
+    callers shares, so `emulator -list-avds` is served here too.
+    """
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        for prefix, (returncode, stdout, stderr) in responses.items():
+            if tuple(cmd[: len(prefix)]) == prefix:
+                return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    return calls
 
 
-def test_running_avd_names_resolves_serials(monkeypatch, tmp_path):
+def test_running_avd_names_resolves_serials(monkeypatch, tmp_path, recorded):
+    calls = _fake_adb(
+        monkeypatch,
+        {("adb", "-s"): (0, recorded.text("emu_avd_name"), "")},
+    )
     monkeypatch.setattr(
         emulator_selector,
         "get_connected_devices",
@@ -180,17 +202,64 @@ def test_running_avd_names_resolves_serials(monkeypatch, tmp_path):
         ],
     )
 
-    def fake_run(cmd, **_kwargs):
-        # `adb -s emulator-5554 emu avd name` -> name then OK line.
-        assert "emu" in cmd
-        return _FakeResult("Pixel_9_Pro\nOK\n")
-
-    monkeypatch.setattr(emulator_selector.subprocess, "run", fake_run)
-
     selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
     running = selector.running_avd_names()
     # Only the ready emulator is resolved; offline + real device are skipped.
-    assert running == {"Pixel_9_Pro"}
+    assert running == {"Pixel_9"}
+    assert calls[0]["cmd"] == ["adb", "-s", "emulator-5554", "emu", "avd", "name"]
+    assert calls[0]["kwargs"].get("timeout"), "the AVD-name probe went out unbounded"
+
+
+def test_a_device_error_is_not_ranked_as_not_running(monkeypatch, tmp_path, recorded_anywhere):
+    """An unanswered running-check must not quietly read as "idle".
+
+    Ranking a live AVD as not-running is how a second copy of it gets booted, so
+    the typed error propagates to the CLI boundary instead of being swallowed.
+    """
+    _fake_adb(monkeypatch, {("adb", "-s"): (1, "", recorded_anywhere("adb_device_not_found"))})
+    monkeypatch.setattr(
+        emulator_selector,
+        "get_connected_devices",
+        lambda: [{"serial": "emulator-5554", "state": "device", "type": "emulator"}],
+    )
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        selector.running_avd_names()
+
+
+def test_avd_listing_is_bounded(monkeypatch, tmp_path):
+    """`emulator -list-avds` is an SDK tool, not adb -- but still not unbounded."""
+    calls = _fake_adb(monkeypatch, {("emulator",): (0, "Pixel_9_Pro\n", "")})
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    assert [c["name"] for c in selector.list_avds()] == ["Pixel_9_Pro"]
+    assert calls[0]["cmd"] == ["emulator", "-list-avds"]
+    assert calls[0]["kwargs"].get("timeout"), "`emulator -list-avds` went out unbounded"
+
+
+def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, capsys):
+    """At the CLI boundary the agent gets the remedy, not a stack trace."""
+    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    _fake_adb(
+        monkeypatch,
+        {
+            ("emulator",): (0, "Pixel_9_Pro\n", ""),
+            ("adb", "devices"): (0, "List of devices attached\nemulator-5554\tdevice\n", ""),
+            ("adb", "-s"): (1, "", "error: device unauthorized.\n"),
+        },
+    )
+    monkeypatch.setattr(emulator_selector.sys, "argv", ["emulator_selector.py", "--suggest"])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_selector.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: ")
+    assert "Traceback" not in captured.err
+    assert "usb debugging" in captured.err.lower(), "no remedy named"
 
 
 # ---------------------------------------------------------------------------

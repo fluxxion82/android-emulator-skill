@@ -1,5 +1,7 @@
 # Pre-commit hooks for android-emulator-skill
-# Install: pre-commit install
+# Install: pre-commit install && pre-commit install --hook-type commit-msg
+#   (the second is required for the trailer check; commit-msg is not installed
+#    by `pre-commit install` alone)
 # Run manually: pre-commit run --all-files
 
 repos:
@@ -37,3 +39,16 @@ repos:
       - id: mixed-line-ending
         name: Fix mixed line endings
         args: ['--fix=lf']
+
+  # Commit messages end at their last content line: no Co-Authored-By, no
+  # Signed-off-by, no generated-with footer. A hook rather than a note in the
+  # style guide because adding Co-Authored-By is a *default* in several tools,
+  # so it comes back on its own -- and something that reapplies itself needs a
+  # check that reapplies itself too.
+  - repo: local
+    hooks:
+      - id: no-commit-trailers
+        name: Reject commit-message trailers
+        entry: python3 .github/scripts/check-commit-trailers.py
+        language: system
+        stages: [commit-msg]

@@ -197,21 +197,32 @@ def _completed(cmd, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
-def test_list_dir_builds_run_as_ls(monkeypatch):
+def test_list_dir_builds_run_as_ls(monkeypatch, recorded):
+    """Parses a real `run-as ls -la`, not a tidy one-liner.
+
+    The hand-written sample this replaced was
+    `-rw------- 1 u0_a1 u0_a1 10 2024-01-02 03:04 f.txt` -- single-spaced, no
+    header, owner equal to group. Real output has a `total 52` line, `.` and
+    `..` entries, variable-width padding, and a group that differs from the
+    owner on cache dirs (u0_a205 vs u0_a205_cache). Every one of those is a
+    chance for the parser to be wrong in a way the tidy sample could not show.
+    """
     captured: list[list[str]] = []
+    listing = recorded.text("run_as_ls_data_dir")
 
     def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
-        return _completed(
-            cmd,
-            stdout="-rw------- 1 u0_a1 u0_a1 10 2024-01-02 03:04 f.txt\n",
-        )
+        return _completed(cmd, stdout=listing)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
     ok, result = ContainerInspector(serial="emulator-5554").list_dir("com.example.app")
     assert ok is True
-    assert result["total_entries"] == 1
+
+    # `.`, `..` and the `total` header must not be counted as entries.
+    assert result["total_entries"] == 3, f"miscounted real ls output: {result}"
+    names = {entry["name"] for entry in result["entries"]}
+    assert names == {"cache", "code_cache", "files"}, names
 
     cmd = captured[0]
     # Targets the right device, uses run-as for the right package, lists the data dir.
@@ -241,25 +252,37 @@ def test_list_dir_rejects_path_escape():
     assert "escapes" in result["error"]
 
 
-def test_run_as_denied_release_build(monkeypatch):
+def test_run_as_denied_for_a_non_debuggable_package(monkeypatch, recorded):
+    """The denial that was NOT being detected, in the platform's own words.
+
+    This test used to assert against `run-as: package not debuggable: <pkg>`,
+    a string the platform never prints. The real one is `run-as: package not
+    an application: <pkg>`, and container.py's marker list read "is not an
+    application" -- with an "is" that is not there -- so this denial fell
+    through to a generic "Command failed" and the user never saw the hint
+    telling them the app has to be debuggable.
+
+    Both the invented assertion and the invented marker were wrong in the same
+    direction, which is exactly why the suite stayed green.
+    """
+    denial = recorded.text("run_as_not_an_application")
+
     def fake_run(cmd, *args, **kwargs):
-        return _completed(
-            cmd,
-            returncode=1,
-            stderr="run-as: package not debuggable: com.example.app",
-        )
+        return _completed(cmd, returncode=1, stderr=denial)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
-    ok, result = ContainerInspector().list_dir("com.example.app")
+    ok, result = ContainerInspector().list_dir("com.android.settings")
     assert ok is False
-    assert result["run_as_denied"] is True
+    assert (
+        result["run_as_denied"] is True
+    ), f"a real run-as denial was reported as a generic failure: {result}"
     assert "debuggable" in result["hint"].lower()
 
 
-def test_run_as_denied_unknown_package(monkeypatch):
+def test_run_as_denied_unknown_package(monkeypatch, recorded):
     def fake_run(cmd, *args, **kwargs):
-        return _completed(cmd, returncode=1, stderr="run-as: unknown package: com.nope")
+        return _completed(cmd, returncode=1, stderr=recorded.text("run_as_unknown_package"))
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
@@ -385,9 +408,11 @@ def test_export_writes_snapshot(monkeypatch, tmp_path):
     assert (dest / "shared_prefs" / "settings.xml").exists()
 
 
-def test_export_refuses_existing_destination(monkeypatch, tmp_path):
+def test_export_refuses_existing_destination(monkeypatch, tmp_path, recorded):
+    listing = recorded.text("run_as_ls_data_dir")
+
     def fake_run(cmd, *args, **kwargs):
-        return _completed(cmd, stdout="-rw------- 1 u0_a1 u0_a1 1 2024-01-02 03:04 a\n")
+        return _completed(cmd, stdout=listing)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
@@ -395,3 +420,49 @@ def test_export_refuses_existing_destination(monkeypatch, tmp_path):
     ok, result = ContainerInspector().export("com.example.app", str(tmp_path))
     assert ok is False
     assert "already exists" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Real SharedPreferences, from the fixture app's own data dir.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_prefs_parses_every_type_android_writes(recorded):
+    """The six types Android encodes differently, from a real prefs file.
+
+    A parser that only ever saw ``<string>`` has not been tested, and the
+    hand-written sample this complements was written by someone imagining the
+    format. The fixture app now writes one of each so the corpus contains
+    ground truth: note that ``<set>`` is nested ``<string>`` children rather
+    than an attribute, and that the entries are not in insertion order.
+    """
+    parsed = parse_shared_prefs_xml(recorded.text("shared_prefs_settings_xml"))
+
+    assert parsed["display_name"] == "Fixture User"
+    assert parsed["launch_count"] == 7
+    assert parsed["last_sync_epoch_ms"] == 1788280000000
+    assert parsed["playback_speed"] == 1.25
+    assert parsed["dark_theme"] is True
+    assert sorted(parsed["enabled_flags"]) == ["compose", "telemetry"]
+
+
+def test_shared_prefs_types_are_converted_not_left_as_strings(recorded):
+    """`value="7"` must become 7, or every caller has to re-parse it."""
+    parsed = parse_shared_prefs_xml(recorded.text("shared_prefs_settings_xml"))
+
+    assert isinstance(parsed["launch_count"], int)
+    assert isinstance(parsed["playback_speed"], float)
+    assert isinstance(parsed["dark_theme"], bool)
+    assert isinstance(parsed["enabled_flags"], list)
+    assert not isinstance(parsed["dark_theme"], str), "boolean left as the literal 'true'"
+
+
+def test_databases_listing_does_not_offer_the_journal_as_a_database(recorded):
+    """`fixture.db-journal` sits beside `fixture.db` and is not a database."""
+    listing = recorded.text("run_as_ls_databases")
+    assert "fixture.db-journal" in listing, "fixture no longer exercises the journal case"
+
+    entries = parse_ls_output(listing)
+    names = {entry["name"] for entry in entries}
+    assert "fixture.db" in names
+    assert "." not in names and ".." not in names

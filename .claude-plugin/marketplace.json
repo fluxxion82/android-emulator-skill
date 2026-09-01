@@ -8,7 +8,8 @@
     {
       "name": "android-emulator-skill",
       "source": "./android-emulator-skill",
-      "description": "Production-ready scripts for Android app testing, building, and automation"
+      "description": "Production-ready scripts for Android app testing, building, and automation",
+      "version": "0.5.0"
     }
   ]
 }

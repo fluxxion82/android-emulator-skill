@@ -19,17 +19,26 @@ Usage Examples:
 import argparse
 import json
 import re
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from common.device_utils import build_adb_command, get_ui_hierarchy
+from common import adb_exec, logcat
+from common.device_utils import get_ui_hierarchy
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
 
 # Tunable defaults (override via ANDROID_EMU_* env vars).
 DEFAULT_LOG_LINES = env_int("ANDROID_EMU_STATE_LOG_LINES", 200)
+
+# A snapshot is several dumps back to back, and it is taken of a device that is
+# by definition in a state worth debugging. `dumpsys package` and `dumpsys
+# activity activities` walk live system state and can run past the 30s
+# adb_exec default on a loaded emulator, and `logcat -d` over a wide window
+# drains the whole ring buffer. Both get their own budget here rather than
+# raising the module-wide default for every adb call in the skill.
+DUMPSYS_TIMEOUT_SECONDS = 60
+LOGCAT_TIMEOUT_SECONDS = 60
 
 
 def count_ui_elements(node: dict | None) -> int:
@@ -136,7 +145,11 @@ class AppStateCapture:
                 output_path=str(screenshot_path),
                 size=screenshot_size,
             )
-            if screenshot_result.get("success"):
+            # capture_screenshot() raises on failure and otherwise returns a
+            # descriptor dict -- there is no "success" key, so the previous
+            # check was always falsy and the PNG was written to disk but never
+            # listed in the manifest.
+            if screenshot_result.get("file_path"):
                 artifacts.append("screenshot.png")
 
             # 2. Capture UI hierarchy
@@ -194,6 +207,11 @@ class AppStateCapture:
                 str(snapshot_dir),
             )
 
+        except adb_exec.AdbError:
+            # adb never reached a device, so there is no state to capture and
+            # nothing partial worth reporting. main() prints the remedy the
+            # error already names.
+            raise
         except Exception as e:
             return False, f"Failed to capture state: {e}", None
 
@@ -206,44 +224,43 @@ class AppStateCapture:
         """
         info = {"package": self.package}
 
-        # Get version
-        try:
-            cmd = build_adb_command(
-                "shell", self.serial, "dumpsys", "package", self.package, "|", "grep", "versionName"
-            )
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            for line in result.stdout.split("\n"):
-                if "versionName" in line:
-                    info["version"] = line.split("=")[1].strip()
-                    break
-        except Exception:
-            pass
+        # Get version. The pipe runs in the device's own shell; a package with
+        # no versionName line just makes grep exit non-zero, which is an answer
+        # rather than a failure, so this does not pass check=True.
+        result = adb_exec.run_adb(
+            "shell",
+            self.serial,
+            "dumpsys",
+            "package",
+            self.package,
+            "|",
+            "grep",
+            "versionName",
+            timeout=DUMPSYS_TIMEOUT_SECONDS,
+        )
+        for line in result.stdout.split("\n"):
+            if "versionName" in line and "=" in line:
+                info["version"] = line.split("=")[1].strip()
+                break
 
-        # Get PID
-        try:
-            cmd = build_adb_command("shell", self.serial, "pidof", self.package)
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            info["pid"] = result.stdout.strip()
-        except Exception:
-            info["pid"] = None
+        # Get PID. `pidof` exits non-zero when the app is not running.
+        result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
+        info["pid"] = result.stdout.strip() if result.ok else None
 
         # Get current activity
-        try:
-            cmd = build_adb_command(
-                "shell",
-                self.serial,
-                "dumpsys",
-                "activity",
-                "activities",
-                "|",
-                "grep",
-                "mResumedActivity",
-            )
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if result.stdout:
-                info["current_activity"] = result.stdout.strip()
-        except Exception:
-            pass
+        result = adb_exec.run_adb(
+            "shell",
+            self.serial,
+            "dumpsys",
+            "activity",
+            "activities",
+            "|",
+            "grep",
+            "mResumedActivity",
+            timeout=DUMPSYS_TIMEOUT_SECONDS,
+        )
+        if result.stdout:
+            info["current_activity"] = result.stdout.strip()
 
         return info
 
@@ -257,39 +274,31 @@ class AppStateCapture:
         """
         info: dict = {"model": None, "sdk": None, "density": None}
 
+        # These are cheap property reads; the default adb_exec budget is ample.
+        # A probe that answers non-zero simply leaves its field None, but a
+        # device-level failure raises and reaches main().
+
         # ro.product.model
-        try:
-            cmd = build_adb_command("shell", self.serial, "getprop", "ro.product.model")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            value = result.stdout.strip()
-            if value:
-                info["model"] = value
-        except Exception:
-            pass
+        value = adb_exec.run_adb("shell", self.serial, "getprop", "ro.product.model").stdout.strip()
+        if value:
+            info["model"] = value
 
         # ro.build.version.sdk
-        try:
-            cmd = build_adb_command("shell", self.serial, "getprop", "ro.build.version.sdk")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            value = result.stdout.strip()
-            if value:
-                try:
-                    info["sdk"] = int(value)
-                except ValueError:
-                    info["sdk"] = value
-        except Exception:
-            pass
+        value = adb_exec.run_adb(
+            "shell", self.serial, "getprop", "ro.build.version.sdk"
+        ).stdout.strip()
+        if value:
+            try:
+                info["sdk"] = int(value)
+            except ValueError:
+                info["sdk"] = value
 
         # Display density (adb shell wm density)
-        try:
-            cmd = build_adb_command("shell", self.serial, "wm", "density")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            # Format: "Physical density: 420" (and optionally "Override density: N")
-            match = re.search(r"density:\s*(\d+)", result.stdout)
-            if match:
-                info["density"] = int(match.group(1))
-        except Exception:
-            pass
+        result = adb_exec.run_adb("shell", self.serial, "wm", "density")
+        # Format: "Physical density: 420" (and optionally "Override density: N")
+        match = re.search(r"density:\s*(\d+)", result.stdout)
+        if match:
+            info["density"] = int(match.group(1))
 
         return info
 
@@ -308,34 +317,32 @@ class AppStateCapture:
             Dict with ``captured`` plus ``lines``/``errors``/``warnings`` on
             success, or a ``reason``/``error`` on failure.
         """
-        # Parse duration
-        match = re.match(r"(\d+)([sm])", duration)
-        if not match:
+        # `logcat -t N` means the last N LINES; a bare duration passed here
+        # silently became a line count, so "--logs 1m" returned 60 lines. The
+        # time-window form takes a "MM-DD HH:MM:SS.mmm" timestamp, which is what
+        # common.logcat builds -- the same grammar and the same argv order every
+        # other logcat reader in the skill uses. Routing through it is also what
+        # made `--logs 1h` work here: this parser accepted only `[sm]`.
+        try:
+            since = logcat.window_start_for(duration)
+        except ValueError:
             with open(output_path, "w") as f:
                 f.write(f"Invalid log duration: {duration!r}\n")
             return {"captured": False, "reason": f"Invalid log duration: {duration!r}"}
 
-        value, unit = match.groups()
-        value = int(value)
-
-        if unit == "m":
-            value *= 60
-
-        # Build logcat command
-        cmd = build_adb_command("logcat", self.serial, "-d", "-t", f"{value}")
-
-        # Add package filter if PID available
-        pid_cmd = build_adb_command("shell", self.serial, "pidof", self.package)
-        try:
-            result = subprocess.run(pid_cmd, capture_output=True, text=True, check=True)
-            pid = result.stdout.strip()
-            if pid:
-                cmd.append(f"--pid={pid}")
-        except Exception:
-            pass
+        # Add package filter if PID available. `pidof` exits non-zero when the
+        # app is not running; the snapshot then keeps the unfiltered window.
+        pid_result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
+        pid = pid_result.stdout.strip() if pid_result.ok else ""
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = adb_exec.run_adb(
+                "logcat",
+                self.serial,
+                *logcat.logcat_args(since=since, fmt=None, pid=pid),
+                timeout=LOGCAT_TIMEOUT_SECONDS,
+                check=True,
+            )
             lines = result.stdout.split("\n")
 
             # Cap retained lines (keep the most recent) for token efficiency.
@@ -349,6 +356,10 @@ class AppStateCapture:
             stats = analyze_logcat(text)
             stats["captured"] = True
             return stats
+        except adb_exec.DeviceError:
+            # Nothing reached the device. A snapshot that merely notes "logs
+            # unavailable" would hide a problem main() can state with a remedy.
+            raise
         except Exception as e:
             with open(output_path, "w") as f:
                 f.write(f"Error capturing logs: {e}\n")
@@ -431,7 +442,9 @@ Examples:
     parser.add_argument(
         "--serial", dest="device_serial", help="Device serial (uses default if not specified)"
     )
-    parser.add_argument("--logs", default="30s", help="Duration of logs to capture (e.g., 30s, 1m)")
+    parser.add_argument(
+        "--logs", default="30s", help="Duration of logs to capture (e.g., 30s, 5m, 1h)"
+    )
     parser.add_argument("--no-logs", action="store_true", help="Don't capture logs")
     parser.add_argument(
         "--log-lines",
@@ -455,13 +468,20 @@ Examples:
     if args.verbose:
         print(f"Capturing state for: {args.package}")
 
-    success, message, snapshot_path = capturer.capture(
-        output_dir=args.output,
-        include_logs=not args.no_logs,
-        log_duration=args.logs,
-        log_lines=args.log_lines,
-        screenshot_size=args.screenshot_size,
-    )
+    # CLI boundary: a device-level adb failure (ambiguous target, wrong serial,
+    # offline, unauthorized) means no command ever ran. Print the remedy the
+    # error already carries rather than letting a traceback reach the user.
+    try:
+        success, message, snapshot_path = capturer.capture(
+            output_dir=args.output,
+            include_logs=not args.no_logs,
+            log_duration=args.logs,
+            log_lines=args.log_lines,
+            screenshot_size=args.screenshot_size,
+        )
+    except adb_exec.AdbError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     if args.json:
         print(

@@ -53,13 +53,15 @@ Configuration (env overrides, ANDROID_EMU_ prefix):
 
 import argparse
 import json as json_lib
-import subprocess
+import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common import adb_exec
+from common.device_utils import resolve_device_identifier
 from common.env_config import env_int
+from common.hierarchy import capture_hierarchy
 
 # Preview limits (env-configurable; see SKILL.md -> Configuration).
 # BUTTONS_PREVIEW caps how many button labels render on the summary line.
@@ -86,23 +88,35 @@ class ScreenMapper:
         - Navigation-focused: Highlight elements relevant for automation
     """
 
-    # Element types we care about for navigation
-    # These are Android View class names that indicate user interaction points
-    INTERACTIVE_TYPES = {
+    # Interactivity is decided by an element's PROPERTIES, not its class name.
+    #
+    # The previous version gated on a whitelist of View class names (Button,
+    # EditText, TextView, ...). Jetpack Compose -- the default Android UI
+    # toolkit since 2022 -- renders its semantics nodes as plain
+    # `android.view.View`, so on a Compose screen the whitelist matched almost
+    # nothing and this reported ~0 interactive elements (defect R11).
+    #
+    # Measured on a recorded Compose dump: of seven controls, five report class
+    # `android.view.View`; a Switch produces no `android.widget.Switch` at all.
+    # Only Checkbox, TextField and Image map to widget classes.
+    INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollable")
+
+    # Class names still used for *labelling* an element, never for eligibility.
+    KNOWN_WIDGET_CLASSES = {
         "Button",
         "ImageButton",
         "EditText",
-        "TextView",  # Often clickable in Android
         "CheckBox",
         "RadioButton",
         "Switch",
         "ToggleButton",
         "SeekBar",
         "Spinner",
-        "TabWidget",
-        "ListView",
-        "RecyclerView",
     }
+
+    # Cap on text gathered from a control's subtree, so a long list does not
+    # turn one entry into a wall of text.
+    MAX_RECOVERED_LABEL_PARTS = 3
 
     def __init__(self, serial: str | None = None):
         """
@@ -119,37 +133,20 @@ class ScreenMapper:
 
     def get_ui_hierarchy(self) -> ET.Element:
         """
-        Fetch UI hierarchy from Android device via uiautomator dump.
+        Fetch the current UI hierarchy.
+
+        Delegates to :func:`common.hierarchy.capture_hierarchy`, which captures
+        via ``adb exec-out`` and so writes no file on either the device or the
+        host -- this used to pull to a fixed ``/tmp`` path shared with navigator
+        and device_utils, where concurrent runs read each other's screen.
 
         Returns:
-            XML root element
+            XML root element.
 
         Raises:
-            RuntimeError: If UI dump fails
+            RuntimeError: If the hierarchy could not be captured.
         """
-        try:
-            # Dump UI hierarchy to device
-            dump_cmd = build_adb_command(
-                "shell", self.serial, "uiautomator", "dump", "/sdcard/window_dump.xml"
-            )
-            result = subprocess.run(dump_cmd, capture_output=True, text=True, check=True)
-
-            if "ERROR" in result.stdout or "error" in result.stderr.lower():
-                raise RuntimeError(f"UI dump failed: {result.stdout or result.stderr}")
-
-            # Pull XML file to local temp
-            temp_file = "/tmp/android_window_dump.xml"
-            pull_cmd = build_adb_command("pull", self.serial, "/sdcard/window_dump.xml", temp_file)
-            subprocess.run(pull_cmd, capture_output=True, text=True, check=True)
-
-            # Parse XML
-            tree = ET.parse(temp_file)
-            return tree.getroot()
-
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to get UI hierarchy: {e.stderr}") from e
-        except ET.ParseError as e:
-            raise RuntimeError(f"Failed to parse UI hierarchy XML: {e}") from e
+        return capture_hierarchy(self.serial)
 
     def analyze_tree(self, root: ET.Element) -> dict:
         """
@@ -173,7 +170,7 @@ class ScreenMapper:
             "secure_fields": 0,
         }
 
-        self._analyze_recursive(root, analysis)
+        self._analyze_recursive(root, analysis, parent=None)
 
         # Post-process for clean output
         analysis["elements_by_type"] = dict(analysis["elements_by_type"])
@@ -183,20 +180,24 @@ class ScreenMapper:
 
         return analysis
 
-    def _analyze_recursive(self, node: ET.Element, analysis: dict):
+    def _analyze_recursive(
+        self, node: ET.Element, analysis: dict, parent: ET.Element | None = None
+    ):
         """
         Recursively analyze XML nodes.
 
         Args:
             node: Current XML element
             analysis: Analysis dict to populate
+            parent: The node's parent, needed to recover a label from a
+                row-adjacent sibling (a Compose Checkbox or Switch carries no
+                text of its own; its caption is the next sibling).
         """
         # Get element attributes
         elem_class = node.get("class", "")
         text = node.get("text", "")
         content_desc = node.get("content-desc", "")
         resource_id = node.get("resource-id", "")
-        clickable = node.get("clickable", "false") == "true"
         focusable = node.get("focusable", "false") == "true"
         enabled = node.get("enabled", "true") == "true"
         # Android marks secure/password inputs with password="true".
@@ -212,29 +213,44 @@ class ScreenMapper:
             # Determine label for this element
             label = text or content_desc or resource_id or None
 
-            # Track interactive elements
-            if simple_class in self.INTERACTIVE_TYPES and enabled:
-                if clickable or focusable:
-                    analysis["interactive_elements"] += 1
+            # Track interactive elements.
+            #
+            # Eligibility is by property, not class name. Bounds must be
+            # non-zero: uiautomator emits no visibility attribute, so a
+            # zero-area rect is the only signal that an element cannot be
+            # touched. `focusable` is deliberately NOT sufficient on its own --
+            # focusable containers are everywhere and would flood the output.
+            interactive = (
+                enabled
+                and self._has_area(node)
+                and any(node.get(attr, "false") == "true" for attr in self.INTERACTIVE_ATTRIBUTES)
+            )
 
-                if label:
-                    analysis["elements_by_type"][simple_class].append(label)
+            if interactive:
+                analysis["interactive_elements"] += 1
 
-                # Special handling for common types
-                if simple_class == "Button" and label:
-                    analysis["buttons"].append(label)
+                # Compose controls carry no text of their own; recover it.
+                recovered = label or self._recover_label(node, parent)
+                bucket = simple_class if simple_class in self.KNOWN_WIDGET_CLASSES else "Control"
+                if recovered:
+                    analysis["elements_by_type"][bucket].append(recovered)
+
+                if simple_class in ("Button", "ImageButton") and recovered:
+                    analysis["buttons"].append(recovered)
                 elif simple_class == "EditText":
-                    is_filled = bool(text)
                     analysis["edit_texts"].append(
                         {
-                            "label": content_desc or resource_id or "Unnamed",
-                            "filled": is_filled,
+                            "label": recovered or content_desc or resource_id or "Unnamed",
+                            "filled": bool(text),
                             "secure": is_secure,
                         }
                     )
-                elif simple_class == "TextView" and label and clickable:
-                    # Only track clickable TextViews (often used as buttons)
-                    analysis["text_views"].append(label)
+                elif simple_class == "TextView" and recovered:
+                    analysis["text_views"].append(recovered)
+
+            elif label and simple_class == "TextView":
+                # Passive labels still describe the screen, so keep listing them.
+                analysis["elements_by_type"]["TextView"].append(label)
 
             # Count focusable
             if focusable and enabled:
@@ -246,7 +262,78 @@ class ScreenMapper:
 
         # Recurse to children
         for child in node:
-            self._analyze_recursive(child, analysis)
+            self._analyze_recursive(child, analysis, parent=node)
+
+    @staticmethod
+    def _bounds(node: ET.Element) -> tuple[int, int, int, int] | None:
+        """Parse ``bounds="[l,t][r,b]"``, or None when absent/malformed."""
+        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))
+        return tuple(int(g) for g in match.groups()) if match else None
+
+    def _has_area(self, node: ET.Element) -> bool:
+        """Whether the element occupies a non-zero rectangle.
+
+        uiautomator reports no visibility attribute, so this is the only
+        available proxy: a zero-area element cannot be tapped whatever its
+        flags claim.
+        """
+        box = self._bounds(node)
+        if box is None:
+            return True  # No bounds reported: do not exclude on a missing signal.
+        left, top, right, bottom = box
+        return right > left and bottom > top
+
+    @staticmethod
+    def _own_label(node: ET.Element) -> str:
+        return (node.get("text") or "").strip() or (node.get("content-desc") or "").strip()
+
+    def _recover_label(self, node: ET.Element, parent: ET.Element | None) -> str | None:
+        """Find text describing a control that carries none of its own.
+
+        Compose controls are unlabelled: measured on a real dump, all seven
+        interactive nodes had empty ``text`` and ``content-desc``. Their captions
+        sit in two different places, so both are searched:
+
+        - **Descendants** -- a Button's "Submit Order", a Card's item lines, a
+          list's rows. uiautomator dumps the *unmerged* semantics tree, so
+          ``mergeDescendants`` does not fold these into the parent and there is
+          no concatenated label to read.
+        - **A row-adjacent sibling** -- a Checkbox's "Remember me" and a Switch's
+          "Dark theme" are siblings, not children. Only an immediate sibling
+          whose bounds overlap vertically is used; scanning all siblings would
+          pull in the whole screen, since these controls share one flat parent.
+        """
+        parts = [self._own_label(child) for child in node.iter() if child is not node]
+        parts = [p for p in parts if p]
+        if parts:
+            return " ".join(parts[: self.MAX_RECOVERED_LABEL_PARTS])
+
+        if parent is None:
+            return None
+
+        siblings = list(parent)
+        try:
+            position = siblings.index(node)
+        except ValueError:
+            return None
+
+        own = self._bounds(node)
+        for offset in (1, -1):
+            index = position + offset
+            if not 0 <= index < len(siblings):
+                continue
+            sibling = siblings[index]
+            if own is not None:
+                box = self._bounds(sibling)
+                # Same row: vertical spans must overlap.
+                if box is not None and not (box[1] < own[3] and own[1] < box[3]):
+                    continue
+            candidate = self._own_label(sibling) or next(
+                (self._own_label(c) for c in sibling.iter() if self._own_label(c)), ""
+            )
+            if candidate:
+                return candidate
+        return None
 
     def _detect_screen_name(self, analysis: dict):
         """
@@ -259,15 +346,13 @@ class ScreenMapper:
         """
         # Try to get current activity name from device
         try:
-            cmd = build_adb_command(
+            result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "dumpsys",
                 "window",
                 "windows",
-            )
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=5, shell=False, check=False
+                timeout=5,
             )
 
             # Look for current focus
@@ -359,7 +444,7 @@ class ScreenMapper:
 
     def map_screen(
         self, verbose: bool = False, hints: bool = False, json_output: bool = False
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
         Main entry point: Map current screen and return formatted output.
 
@@ -369,20 +454,24 @@ class ScreenMapper:
             json_output: Return JSON instead of formatted text
 
         Returns:
-            Formatted summary or JSON string
+            ``(output, ok)``. The output format is unchanged; ``ok`` is False
+            when the screen could not be read, so ``main()`` can exit non-zero
+            instead of reporting success while serialising an error (R2).
         """
         try:
             root = self.get_ui_hierarchy()
             analysis = self.analyze_tree(root)
 
             if json_output:
-                return json_lib.dumps(analysis, indent=2)
-            return self.format_summary(analysis, verbose, hints)
+                return json_lib.dumps(analysis, indent=2), True
+            return self.format_summary(analysis, verbose, hints), True
 
         except RuntimeError as e:
+            # adb_exec's device errors subclass RuntimeError, so "more than one
+            # device" arrives here already carrying its remedy.
             if json_output:
-                return json_lib.dumps({"error": str(e)}, indent=2)
-            return f"Error: {e}"
+                return json_lib.dumps({"error": str(e)}, indent=2), False
+            return f"Error: {e}", False
 
 
 def main():
@@ -426,10 +515,20 @@ Examples:
 
     # Map screen
     mapper = ScreenMapper(serial)
-    output = mapper.map_screen(verbose=args.verbose, hints=args.hints, json_output=args.json)
+    try:
+        output, ok = mapper.map_screen(
+            verbose=args.verbose, hints=args.hints, json_output=args.json
+        )
+    except adb_exec.AdbError as error:
+        # Anything that escaped map_screen's own handling; the message names a
+        # remedy, so print it rather than letting a traceback bury it.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     print(output)
-    sys.exit(0)
+    # R2: exiting 0 after serialising an error made the status code useless to
+    # a caller that only checks it.
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

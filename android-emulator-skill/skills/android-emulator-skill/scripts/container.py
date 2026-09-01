@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 
 from common.cache_utils import ProgressiveCache
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
 
 # Cap on bytes pulled by --cat before truncation. Guards against dumping a
@@ -57,7 +57,12 @@ _RUN_AS_DENIED_MARKERS = (
     "unknown package",
     "run-as: package not found",
     "package not found",
-    "is not an application",
+    # Measured, not guessed: the device prints "run-as: package not an
+    # application: <pkg>". This entry used to read "is not an application",
+    # with an "is" the platform never emits, so a system or release package
+    # fell through to a generic "Command failed" instead of the hint below.
+    # Recorded as run_as_not_an_application.
+    "not an application",
     "user is not debuggable",
     "permission denied",
 )
@@ -376,7 +381,10 @@ class ContainerInspector:
             RunAsDeniedError: run-as refused (non-debuggable / missing package).
             _RunAsError: any other command failure.
         """
-        cmd = build_adb_command("shell", self.serial, "run-as", package, *argv)
+        quoted = [quote_for_device_shell(a) for a in argv]
+        cmd = build_adb_command(
+            "shell", self.serial, "run-as", quote_for_device_shell(package), *quoted
+        )
         result = self._invoke(cmd)
         combined = f"{result.stdout}\n{result.stderr}"
         _raise_if_denied(package, combined, result.returncode)
@@ -393,7 +401,10 @@ class ContainerInspector:
         Raises:
             RunAsDeniedError / _RunAsError as in :meth:`_run_as`.
         """
-        cmd = build_adb_command("exec-out", self.serial, "run-as", package, *argv)
+        quoted = [quote_for_device_shell(a) for a in argv]
+        cmd = build_adb_command(
+            "exec-out", self.serial, "run-as", quote_for_device_shell(package), *quoted
+        )
         try:
             result = subprocess.run(
                 cmd,

@@ -1,0 +1,26 @@
+usage: cmd notification post [flags] <tag> <text>
+
+flags:
+  -h|--help
+  -v|--verbose
+  -t|--title <text>
+  -i|--icon <iconspec>
+  -I|--large-icon <iconspec>
+  -S|--style <style> [styleargs]
+  -c|--content-intent <intentspec>
+
+styles: (default none)
+  bigtext
+  bigpicture --picture <iconspec>
+  inbox --line <text> --line <text> ...
+  messaging --conversation <title> --message <who>:<text> ...
+  media
+
+an <iconspec> is one of
+  file:///data/local/tmp/<img.png>
+  content://<provider>/<path>
+  @[<package>:]drawable/<img>
+  data:base64,<B64DATA==>
+
+an <intentspec> is (broadcast|service|activity) <args>
+  <args> are as described in `am start`

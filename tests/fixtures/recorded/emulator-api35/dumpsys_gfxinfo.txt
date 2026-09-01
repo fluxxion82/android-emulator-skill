@@ -1,0 +1,70 @@
+Applications Graphics Acceleration Info:
+Uptime: 386475 Realtime: 386475
+
+** Graphics info for pid 3563 [com.android.settings] **
+
+Stats since: 358788754629ns
+Total frames rendered: 48
+Janky frames: 13 (27.08%)
+Janky frames (legacy): 31 (64.58%)
+50th percentile: 29ms
+90th percentile: 93ms
+95th percentile: 150ms
+99th percentile: 400ms
+Number Missed Vsync: 3
+Number High input latency: 69
+Number Slow UI thread: 8
+Number Slow bitmap uploads: 0
+Number Slow issue draw commands: 11
+Number Frame deadline missed: 13
+Number Frame deadline missed (legacy): 11
+HISTOGRAM: 5ms=0 6ms=0 7ms=0 8ms=0 9ms=0 10ms=0 11ms=0 12ms=0 13ms=0 14ms=0 15ms=0 16ms=0 17ms=2 18ms=2 19ms=0 20ms=0 21ms=0 22ms=0 23ms=0 24ms=1 25ms=2 26ms=5 27ms=6 28ms=6 29ms=7 30ms=2 31ms=0 32ms=2 34ms=0 36ms=2 38ms=2 40ms=0 42ms=0 44ms=0 46ms=0 48ms=0 53ms=0 57ms=0 61ms=1 65ms=2 69ms=1 73ms=0 77ms=0 81ms=0 85ms=0 89ms=0 93ms=1 97ms=0 101ms=0 105ms=1 109ms=0 113ms=0 117ms=0 121ms=0 125ms=0 129ms=0 133ms=0 150ms=1 200ms=0 250ms=1 300ms=0 350ms=0 400ms=1 450ms=0 500ms=0 550ms=0 600ms=0 650ms=0 700ms=0 750ms=0 800ms=0 850ms=0 900ms=0 950ms=0 1000ms=0 1050ms=0 1100ms=0 1150ms=0 1200ms=0 1250ms=0 1300ms=0 1350ms=0 1400ms=0 1450ms=0 1500ms=0 1550ms=0 1600ms=0 1650ms=0 1700ms=0 1750ms=0 1800ms=0 1850ms=0 1900ms=0 1950ms=0 2000ms=0 2050ms=0 2100ms=0 2150ms=0 2200ms=0 2250ms=0 2300ms=0 2350ms=0 2400ms=0 2450ms=0 2500ms=0 2550ms=0 2600ms=0 2650ms=0 2700ms=0 2750ms=0 2800ms=0 2850ms=0 2900ms=0 2950ms=0 3000ms=0 3050ms=0 3100ms=0 3150ms=0 3200ms=0 3250ms=0 3300ms=0 3350ms=0 3400ms=0 3450ms=0 3500ms=0 3550ms=0 3600ms=0 3650ms=0 3700ms=0 3750ms=0 3800ms=0 3850ms=0 3900ms=0 3950ms=0 4000ms=0 4050ms=0 4100ms=0 4150ms=0 4200ms=0 4250ms=0 4300ms=0 4350ms=0 4400ms=0 4450ms=0 4500ms=0 4550ms=0 4600ms=0 4650ms=0 4700ms=0 4750ms=0 4800ms=0 4850ms=0 4900ms=0 4950ms=0
+50th gpu percentile: 17ms
+90th gpu percentile: 24ms
+95th gpu percentile: 4950ms
+99th gpu percentile: 4950ms
+GPU HISTOGRAM: 1ms=1 2ms=0 3ms=0 4ms=0 5ms=0 6ms=0 7ms=2 8ms=2 9ms=2 10ms=0 11ms=0 12ms=0 13ms=2 14ms=0 15ms=2 16ms=4 17ms=11 18ms=9 19ms=3 20ms=2 21ms=0 22ms=2 23ms=0 24ms=2 25ms=0 4950ms=4
+
+Pipeline=Skia (OpenGL)
+Memory policy:
+  Max surface area: 2617920
+  Max resource usage: 125.66MB (x48)
+  Background retention: 50% (altUiHidden = true)
+  GPU Context timeout: 10
+Contexts: 1 (stopped = 0)
+CPU Caches:
+  Glyph Cache: 172.92 KB (1 entry)
+  Glyph Count: 14 
+Total CPU memory usage:
+  177065 bytes, 172.92 KB (0.00 bytes is purgeable)
+GPU Caches:
+  Other:
+    Other: 9.97 KB (1 entry)
+  Image:
+    Texture: 647.72 KB (25 entries)
+  Scratch:
+    Buffer Object: 112.00 KB (3 entries)
+    Texture: 2.00 MB (1 entry)
+Total GPU memory usage:
+  2885312 bytes, 2.75 MB (711.72 KB is purgeable)
+
+GraphicBufferAllocator buffers:
+        Handle |        Size |     W (Stride) x H | Layers |   Format |      Usage | Requestor
+0xb4007da8b595ff70 |     unknown | 1080 (   0) x 2424 |      1 |        1 | 0x     b00 | VRI[SettingsHomepageActivity]#2(BLAST Consumer)2
+0xb4007da8b5960bd0 |     unknown | 1080 (   0) x 2424 |      1 |        1 | 0x     b00 | VRI[SettingsHomepageActivity]#2(BLAST Consumer)2
+0xb4007da8b5961050 |     unknown | 1080 (   0) x 2424 |      1 |        1 | 0x     b00 | VRI[SettingsHomepageActivity]#2(BLAST Consumer)2
+Total allocated by GraphicBufferAllocator (estimate): 0.00 KB
+GoldfishAllocator::dumpDebugInfo is not implemented
+Profile data in ms:
+
+	com.android.settings/com.android.settings.homepage.SettingsHomepageActivity/android.view.ViewRootImpl@bd682af (visibility=0)
+View hierarchy:
+
+  com.android.settings/com.android.settings.homepage.SettingsHomepageActivity/android.view.ViewRootImpl@bd682af
+  162 views, 287.18 kB of render nodes
+
+
+Total ViewRootImpl   : 1
+Total attached Views : 162
+Total RenderNode     : 287.18 kB (used) / 906.05 kB (capacity)
+

@@ -38,13 +38,14 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import select
 import signal
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 # Resolve imports whether run from repo root or scripts/ directory.
@@ -52,6 +53,7 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+from common import logcat  # noqa: E402
 from common.anr_pipeline import (  # noqa: E402
     build_normalised_event,
     compress_to_budget,
@@ -85,20 +87,13 @@ def _compute_start_timestamp(duration_str: str) -> str:
     """Parse a duration string and return a ``logcat -t`` start timestamp.
 
     logcat's ``-t`` accepts ``MM-DD HH:MM:SS.mmm`` and prints lines at or after
-    it, then exits (no live follow).
+    it, then exits (no live follow). Grammar and formatting are shared with
+    every other logcat reader in the skill via ``common.logcat``.
 
     Raises:
         ValueError: If the format is unrecognised.
     """
-    match = re.match(r"(\d+)([smh])", duration_str.lower())
-    if not match:
-        raise ValueError(
-            f"Invalid duration format: {duration_str!r}. Use format like '30s', '5m', '1h'."
-        )
-    value, unit = match.groups()
-    seconds = int(value) * {"s": 1, "m": 60, "h": 3600}[unit]
-    start = datetime.now() - timedelta(seconds=seconds)
-    return start.strftime("%m-%d %H:%M:%S.000")
+    return logcat.window_start_for(duration_str)
 
 
 def matches_package(event: dict, package: str) -> bool:
@@ -147,11 +142,7 @@ class AnrWatcher:
         Returns:
             Complete adb command list ready for subprocess.
         """
-        cmd = build_adb_command("logcat", self.serial)
-        if since is not None:
-            cmd.extend(["-d", "-t", since])
-        cmd.extend(["-v", "threadtime"])
-        return cmd
+        return logcat.build_logcat_command(self.serial, since=since)
 
     def watch(
         self,
@@ -175,18 +166,38 @@ class AnrWatcher:
                 text=True,
                 bufsize=1,
             )
+            # A quiet device blocks in readline(), so the in-loop clock check
+            # below never runs -- the same defect fixed in log_monitor (A2). The
+            # timer is what actually guarantees --duration returns; the in-loop
+            # check just stops sooner when lines are flowing.
+            deadline_timer: threading.Timer | None = None
+            if duration_seconds:
+
+                def _stop_at_deadline() -> None:
+                    self.interrupted = True
+                    if self._process and self._process.poll() is None:
+                        self._process.terminate()
+
+                deadline_timer = threading.Timer(float(duration_seconds), _stop_at_deadline)
+                deadline_timer.daemon = True
+                deadline_timer.start()
+
             start_time = datetime.now()
-            for raw_line in iter(self._process.stdout.readline, ""):
-                if not raw_line:
-                    break
-                self._handle_line(raw_line.rstrip(), package, json_mode)
-                if (
-                    duration_seconds
-                    and (datetime.now() - start_time).total_seconds() >= duration_seconds
-                ):
-                    break
-                if self.interrupted:
-                    break
+            try:
+                for raw_line in iter(self._process.stdout.readline, ""):
+                    if not raw_line:
+                        break
+                    self._handle_line(raw_line.rstrip(), package, json_mode)
+                    if (
+                        duration_seconds
+                        and (datetime.now() - start_time).total_seconds() >= duration_seconds
+                    ):
+                        break
+                    if self.interrupted:
+                        break
+            finally:
+                if deadline_timer:
+                    deadline_timer.cancel()
             if self._process and self._process.poll() is None:
                 self._process.terminate()
                 with contextlib.suppress(subprocess.TimeoutExpired):
@@ -277,12 +288,23 @@ class AnrWatcher:
         )
 
     def _register_signal_handler(self) -> None:
+        """Stop the stream on Ctrl-C, when we are in a position to ask for it.
+
+        ``signal.signal`` raises ValueError outside the main thread, so calling
+        ``watch()`` from any worker thread previously died here before the
+        stream even started. Ctrl-C handling is a convenience for interactive
+        use, not a correctness requirement -- the duration watchdog stops the
+        stream either way -- so a thread that cannot register simply goes
+        without it.
+        """
+
         def handle_sigint(_sig, _frame):
             self.interrupted = True
             if self._process:
                 self._process.terminate()
 
-        signal.signal(signal.SIGINT, handle_sigint)
+        with contextlib.suppress(ValueError):
+            signal.signal(signal.SIGINT, handle_sigint)
 
 
 # === ANRBUSTER (session mode) ===
@@ -354,15 +376,31 @@ class AnrBuster:
             total_lines=line_counters.get("total", 0),
             dropped_below_threshold=line_counters.get("dropped", 0),
         )
-        effective_top_n = top_n or env_int("ANDROID_EMU_ANR_DEFAULT_TOP_N", 3)
-        summary.clusters = summary.clusters[:effective_top_n]
+        # Persist the complete summary BEFORE any capping. Top-N is a display
+        # concern; truncating first destroyed every cluster past N on disk, so
+        # `--get-details --cluster 4` could never resolve and `--diff` compared
+        # two truncated sets, reporting clusters as new or resolved purely
+        # because they fell outside the cap.
         self.store.stop(session_id, summary)
+
+        # `top_n or default` treated both None (no flag) and 0 (--all, "no cap")
+        # as "unset", so --all returned exactly the default it was meant to lift.
+        effective_top_n = env_int("ANDROID_EMU_ANR_DEFAULT_TOP_N", 3) if top_n is None else top_n
+
+        view = summary
+        if effective_top_n > 0:
+            view = replace(summary, clusters=summary.clusters[:effective_top_n])
+
         if json_mode:
-            return json.dumps(summary_to_json(summary), indent=2)
+            return json.dumps(summary_to_json(view), indent=2)
         if terse:
-            return format_l0(summary)
+            return format_l0(view)
         budget = budget_tokens or env_int("ANDROID_EMU_ANR_BUDGET_TOKENS", 0) or None
-        return compress_to_budget(summary, max_tokens=budget, default_top_n=effective_top_n)
+        return compress_to_budget(
+            view,
+            max_tokens=budget,
+            default_top_n=effective_top_n if effective_top_n > 0 else len(view.clusters),
+        )
 
     def get_details(
         self,
@@ -374,6 +412,8 @@ class AnrBuster:
         """Drill into a stored session. ``cluster`` is 1-indexed for human use."""
         try:
             self.store.load_meta(session_id)
+        except ValueError as error:
+            return f"{error}"
         except FileNotFoundError:
             return f"Unknown session: {session_id}"
         summary = self.store.load_summary(session_id)
@@ -728,6 +768,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Also reachable as `python scripts/logs.py anr ...` — the unified log entry
+point, which routes here unchanged. Both invocations are supported.
+
 Examples:
   # ANRBuster session mode (agent-friendly):
   SID=$(python scripts/anr_watcher.py --start --package com.myapp)
@@ -829,14 +872,22 @@ def main():
 
     if args.stop:
         buster = AnrBuster()
-        top_n = None if args.all_clusters else args.top_n
-        out = buster.stop(
-            args.stop,
-            budget_tokens=args.budget_tokens,
-            top_n=top_n,
-            terse=args.terse,
-            json_mode=args.json,
-        )
+        # 0 means no cap, matching the repo's '0 = disabled' convention.
+        top_n = 0 if args.all_clusters else args.top_n
+        try:
+            out = buster.stop(
+                args.stop,
+                budget_tokens=args.budget_tokens,
+                top_n=top_n,
+                terse=args.terse,
+                json_mode=args.json,
+            )
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError:
+            print(f"Error: unknown session {args.stop}", file=sys.stderr)
+            sys.exit(1)
         print(out)
         sys.exit(0)
 

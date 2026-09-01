@@ -35,11 +35,11 @@ Output Format:
 """
 
 import argparse
-import subprocess
 import sys
 import time
 
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common import adb_exec
+from common.device_utils import quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via ANDROID_EMU_* env vars).
@@ -75,6 +75,10 @@ class KeyboardSimulator:
         "volume_down": "KEYCODE_VOLUME_DOWN",
         "power": "KEYCODE_POWER",
         "camera": "KEYCODE_CAMERA",
+        # Documented in press_button() but previously unmapped, so the call
+        # always returned "Unknown key".
+        "recent_apps": "KEYCODE_APP_SWITCH",
+        "app_switch": "KEYCODE_APP_SWITCH",
     }
 
     def __init__(self, serial: str | None = None):
@@ -83,24 +87,33 @@ class KeyboardSimulator:
 
     @staticmethod
     def _escape_text(text: str) -> str:
-        """Escape text for `adb shell input text` (space -> %s, etc.)."""
-        return (
-            text.replace("\\", "\\\\")
-            .replace(" ", "%s")
-            .replace('"', '\\"')
-            .replace("'", "\\'")
-            .replace("$", "\\$")
-            .replace("`", "\\`")
-        )
+        """Prepare text for ``adb shell input text``.
+
+        Two separate concerns, previously conflated into one hand-rolled escape
+        that missed ``& ; | < > ( ) *`` and newline:
+
+        1. ``input text`` treats ``%s`` as a space, so spaces are encoded that
+           way rather than relying on argv splitting.
+        2. The argument still crosses the *device* shell, which re-parses it --
+           so the result is quoted. Without this, ``x;id`` ran ``id`` on the
+           device.
+        """
+        return quote_for_device_shell(text.replace(" ", "%s"))
 
     def _input_text(self, text: str) -> tuple:
-        """Send a single `input text` chunk; returns (success, message)."""
+        """Send a single `input text` chunk; returns (success, message).
+
+        Device-level failures (no device, wrong serial, offline) are *not*
+        caught here: they mean the keystroke never reached a device at all, and
+        their message names the remedy. ``main()`` reports them.
+        """
         try:
-            cmd = build_adb_command("shell", self.serial, "input", "text", self._escape_text(text))
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb(
+                "shell", self.serial, "input", "text", self._escape_text(text), check=True
+            )
             return True, ""
-        except subprocess.CalledProcessError as e:
-            return False, f"Type failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Type failed: {e}"
 
     def type_text(self, text: str, delay: float = 0.0) -> tuple:
         """
@@ -149,13 +162,12 @@ class KeyboardSimulator:
         repeats = max(count, 1)
 
         try:
-            cmd = build_adb_command("shell", self.serial, "input", "keyevent", keycode)
             for i in range(repeats):
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                adb_exec.run_adb("shell", self.serial, "input", "keyevent", keycode, check=True)
                 if i < repeats - 1 and KEY_REPEAT_DELAY > 0:
                     time.sleep(KEY_REPEAT_DELAY)
-        except subprocess.CalledProcessError as e:
-            return False, f"Key press failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Key press failed: {e}"
 
         if repeats > 1:
             return True, f"Pressed: {keycode} ({repeats}x)"
@@ -191,28 +203,6 @@ class KeyboardSimulator:
 
         return True, f"Cleared: {count} characters"
 
-    def show_keyboard(self) -> tuple:
-        """
-        Show soft keyboard.
-
-        Returns:
-            (success, message) tuple
-        """
-        try:
-            # Toggle IME visibility - show
-            cmd = build_adb_command(
-                "shell",
-                self.serial,
-                "am",
-                "broadcast",
-                "-a",
-                "android.intent.action.INPUT_METHOD_CHANGED",
-            )
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True, "Keyboard shown"
-        except subprocess.CalledProcessError as e:
-            return False, f"Show keyboard failed: {e.stderr}"
-
     def hide_keyboard(self) -> tuple:
         """
         Hide soft keyboard.
@@ -222,11 +212,10 @@ class KeyboardSimulator:
         """
         try:
             # Press back to hide keyboard
-            cmd = build_adb_command("shell", self.serial, "input", "keyevent", "KEYCODE_BACK")
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb("shell", self.serial, "input", "keyevent", "KEYCODE_BACK", check=True)
             return True, "Keyboard hidden"
-        except subprocess.CalledProcessError as e:
-            return False, f"Hide keyboard failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Hide keyboard failed: {e}"
 
     def dismiss_keyboard(self) -> tuple:
         """
@@ -323,8 +312,12 @@ Available Keys:
     parser.add_argument("--button", help="Press hardware button")
     parser.add_argument("--keys", help="Press multiple keys (comma-separated)")
     parser.add_argument("--clear", type=int, metavar="COUNT", help="Clear text (delete N times)")
-    parser.add_argument("--show-keyboard", action="store_true", help="Show soft keyboard")
-    parser.add_argument("--hide-keyboard", action="store_true", help="Hide soft keyboard")
+    # Documented in the module docstring and the epilog, and dispatched below,
+    # but never declared -- so any invocation that fell through to it (notably
+    # --dismiss) died with AttributeError instead of running.
+    parser.add_argument(
+        "--hide-keyboard", action="store_true", help="Hide the soft keyboard (press BACK)"
+    )
     parser.add_argument("--dismiss", action="store_true", help="Dismiss the keyboard (press BACK)")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -343,25 +336,29 @@ Available Keys:
     success = False
     message = ""
 
-    if args.type:
-        success, message = keyboard.type_text(args.type, args.delay)
-    elif args.key:
-        success, message = keyboard.press_key(args.key, args.count)
-    elif args.button:
-        success, message = keyboard.press_button(args.button)
-    elif args.keys:
-        keys = [k.strip() for k in args.keys.split(",")]
-        success, message = keyboard.key_combination(keys)
-    elif args.clear is not None:
-        success, message = keyboard.clear_text(args.clear)
-    elif args.show_keyboard:
-        success, message = keyboard.show_keyboard()
-    elif args.hide_keyboard:
-        success, message = keyboard.hide_keyboard()
-    elif args.dismiss:
-        success, message = keyboard.dismiss_keyboard()
-    else:
-        parser.print_help()
+    try:
+        if args.type:
+            success, message = keyboard.type_text(args.type, args.delay)
+        elif args.key:
+            success, message = keyboard.press_key(args.key, args.count)
+        elif args.button:
+            success, message = keyboard.press_button(args.button)
+        elif args.keys:
+            keys = [k.strip() for k in args.keys.split(",")]
+            success, message = keyboard.key_combination(keys)
+        elif args.clear is not None:
+            success, message = keyboard.clear_text(args.clear)
+        elif args.hide_keyboard:
+            success, message = keyboard.hide_keyboard()
+        elif args.dismiss:
+            success, message = keyboard.dismiss_keyboard()
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except adb_exec.AdbError as error:
+        # The command never reached a device. The error names the remedy, so
+        # print it rather than letting a traceback bury it.
+        print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
 
     if args.json:

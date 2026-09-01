@@ -47,6 +47,13 @@ from common.env_config import env_int
 DEVICE_MATCH_CUTOFF = env_int("ANDROID_EMU_DEVICE_MATCH_CUTOFF", 60, min_value=0)
 DEVICE_MATCH_SUGGEST = env_int("ANDROID_EMU_DEVICE_MATCH_SUGGEST", 5, min_value=1)
 
+# avdmanager and sdkmanager are Android SDK tools, not adb, so they do not go
+# through common.adb_exec. They still need a ceiling: an unbounded call wedges
+# the caller with no diagnosis. `sdkmanager --list` fetches the remote package
+# index, so it gets the longer budget; every other call here is local.
+SDK_TOOL_TIMEOUT = 120
+SDK_LIST_TIMEOUT = 300
+
 
 def _normalize_device_token(value: str) -> str:
     """Lowercase and strip non-alphanumerics so 'Pixel 7' ~= 'pixel_7' ~= 'pixel7'."""
@@ -249,6 +256,7 @@ class EmulatorCreator:
                 [avdmanager, "list", "device"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
 
@@ -260,7 +268,19 @@ class EmulatorCreator:
                 if line.startswith("id:"):
                     if current_device:
                         devices.append(current_device)
-                    current_device = {"id": line.split(":", 1)[1].strip()}
+                    # `id: 53 or "pixel_9"` is TWO identifiers for one device,
+                    # not one. This used to keep the whole tail as the id and
+                    # pass it to `avdmanager --device`, which answered
+                    # `No device found matching --device 53 or "pixel_9"` --
+                    # echoing back the string it had been handed. Recorded as
+                    # avdmanager_list_device.
+                    raw = line.split(":", 1)[1].strip()
+                    numeric, _, quoted = raw.partition(" or ")
+                    current_device = {
+                        "id": quoted.strip().strip('"') or numeric.strip(),
+                        "index": numeric.strip(),
+                        "raw_id": raw,
+                    }
                 elif line.startswith("Name:"):
                     current_device["name"] = line.split(":", 1)[1].strip()
                 elif line.startswith("OEM"):
@@ -271,7 +291,7 @@ class EmulatorCreator:
 
             return devices
 
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
     def list_system_images(self) -> list:
@@ -290,6 +310,7 @@ class EmulatorCreator:
                 [sdkmanager, "--list"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_LIST_TIMEOUT,
                 check=True,
             )
 
@@ -323,7 +344,7 @@ class EmulatorCreator:
 
             return images
 
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
     def list_installed_system_images(self) -> list:
@@ -346,17 +367,30 @@ class EmulatorCreator:
                 [sdkmanager, "--list_installed"],
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
         images = []
         for line in result.stdout.split("\n"):
             stripped = line.strip()
-            if not stripped.startswith("system-images;"):
+            # `--list_installed` prints PATHS, not package ids, in
+            # whitespace-padded columns:
+            #
+            #   system-images/android-34/google_apis/arm64-v8a   14.0.0   Google APIs...
+            #
+            # This used to look for `system-images;` and split on `|`, matching
+            # nothing -- so the installed list was always empty, every image
+            # reported as "not installed", and creating an AVD was impossible.
+            # Recorded as sdkmanager_list_installed.
+            if not stripped.startswith("system-images/"):
                 continue
-            image_id = stripped.split("|", 1)[0].strip()
+            path = stripped.split()[0]
+            # The *install* id uses semicolons, so convert back: the error we
+            # show tells the user to run `sdkmanager 'system-images;...'`.
+            image_id = path.replace("/", ";")
             match = re.match(r"system-images;android-(\d+);([^;]+);([^;\s]+)", image_id)
             if match:
                 api_level, variant, abi = match.groups()
@@ -434,26 +468,24 @@ class EmulatorCreator:
         # Build system image path
         system_image = f"system-images;android-{api_level};{variant};{abi}"
 
-        # Check if system image is installed
-        sdkmanager = self.get_sdkmanager_path()
-        if sdkmanager:
-            try:
-                result = subprocess.run(
-                    [sdkmanager, "--list"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-
-                if system_image not in result.stdout:
-                    return (
-                        False,
-                        f"System image not installed: {system_image}\n"
-                        f"Install with: sdkmanager '{system_image}'",
-                        None,
-                    )
-            except subprocess.CalledProcessError:
-                pass  # Continue anyway
+        # Check the image is installed, against the LOCAL package list.
+        #
+        # This used to run `sdkmanager --list` and ask whether the semicolon
+        # form appeared anywhere in its stdout. It never does: --list prints
+        # paths with slashes. So every image looked missing and no AVD could
+        # ever be created -- with an error telling the user to install
+        # something they already had. `--list` also reaches the network, so the
+        # check was slow and failed offline for the wrong reason.
+        installed = self.list_installed_system_images()
+        if installed and system_image not in {image["id"] for image in installed}:
+            available = sorted(image["id"] for image in installed)
+            return (
+                False,
+                f"System image not installed: {system_image}\n"
+                f"Install with: sdkmanager '{system_image}'\n"
+                f"Or use one you already have: {', '.join(available)}",
+                None,
+            )
 
         # Create AVD
         cmd = [
@@ -470,11 +502,12 @@ class EmulatorCreator:
 
         try:
             # Use 'no' to decline custom hardware profile
-            result = subprocess.run(
+            subprocess.run(
                 cmd,
                 input="no\n",
                 capture_output=True,
                 text=True,
+                timeout=SDK_TOOL_TIMEOUT,
                 check=True,
             )
 
@@ -483,6 +516,14 @@ class EmulatorCreator:
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to create AVD: {error_msg}", None
+
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                f"avdmanager did not finish creating {name} within {SDK_TOOL_TIMEOUT}s. "
+                f"Check for a stale avdmanager process and retry.",
+                None,
+            )
 
     def delete(self, name: str) -> tuple:
         """
@@ -504,12 +545,21 @@ class EmulatorCreator:
         cmd = [avdmanager, "delete", "avd", "--name", name]
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cmd, capture_output=True, text=True, timeout=SDK_TOOL_TIMEOUT, check=True
+            )
             return True, f"AVD deleted: {name}"
 
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to delete AVD: {error_msg}"
+
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                f"avdmanager did not finish deleting {name} within {SDK_TOOL_TIMEOUT}s. "
+                f"Check for a stale avdmanager process and retry.",
+            )
 
 
 def main():

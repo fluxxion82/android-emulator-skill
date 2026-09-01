@@ -1,0 +1,41 @@
+Android console commands:
+    help|h|?
+    help-verbose
+    ping
+    automation
+    event
+    geo
+    gsm
+    cdma
+    crash
+    crash-on-exit
+    kill
+    restart
+    network
+    grpc
+    power
+    quit|exit
+    redir
+    sms
+    avd
+    qemu
+    sensor
+    physics
+    finger
+    debug
+    rotate
+    screenrecord
+    fold
+    unfold
+    posture
+    multidisplay
+    icebox
+    nodraw
+    resize-display
+    virtualscene-image
+    proxy
+    phonenumber
+
+Try 'help-verbose' for more description
+Try 'help <command>' for command-specific help
+OK

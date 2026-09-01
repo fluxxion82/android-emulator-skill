@@ -1,0 +1,7 @@
+Available Android Virtual Devices:
+    Name: Pixel_9
+  Device: pixel_9 (Google)
+    Path: /Users/<user>/.android/avd/Pixel_9.avd
+  Target: 16 KB Page Size (Google Inc.)
+          Based on: Android 15.0 ("VanillaIceCream") Tag/ABI: page_size_16kb/arm64-v8a
+  Sdcard: 512M

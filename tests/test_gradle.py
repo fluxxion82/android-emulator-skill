@@ -110,64 +110,126 @@ def test_find_test_result_files_missing_path(tmp_path: Path):
 
 
 # --- Build output parsing ----------------------------------------------------
+#
+# Every input here is a RECORDED Gradle run (tests/record_gradle_fixtures.py
+# against tests/fixtures/scaffold/compile), never a hand-typed log. Recording
+# them found two defects that the previous hand-typed log could not have shown,
+# because it was written in the shape the parser already expected:
+#
+#   * Kotlin K2 prints `e: file:///abs/path.kt:5:13 Message.`, not Kotlin 1.x's
+#     `e: file: /path.kt: (5, 13): message`. Every Kotlin diagnostic since
+#     Kotlin 2.0 parsed to file/line/column all None.
+#   * Gradle reprints the compiler output indented by two spaces inside its
+#     "* What went wrong:" block, and the javac pattern's `[^:]+` file group
+#     matched the indent, so each javac diagnostic was counted twice over.
 
-GRADLE_ERROR_LOG = """\
-> Task :app:compileDebugKotlin FAILED
-e: file: /src/main/java/com/example/Main.kt: (10, 5): unresolved reference: foo
-w: file: /src/main/java/com/example/Main.kt: (12, 1): variable 'x' is never used
-/src/main/java/com/example/Other.java:42: error: cannot find symbol
-/src/main/java/com/example/Other.java:50: warning: deprecated API usage
 
-FAILURE: Build failed with an exception.
-
-* What went wrong:
-Execution failed for task ':app:compileDebugKotlin'.
-"""
-
-
-def test_parse_build_output_errors():
-    parsed = parse_build_output(GRADLE_ERROR_LOG, "")
+def test_parse_build_output_finds_the_kotlin_error_and_its_task(recorded_gradle):
+    parsed = parse_build_output(recorded_gradle("gradle_kotlin_compile_error"), "")
     messages = [e["message"] for e in parsed["errors"]]
 
-    assert any("Task :app:compileDebugKotlin FAILED" in m for m in messages)
-    assert any("unresolved reference: foo" in m for m in messages)
-    assert any("cannot find symbol" in m for m in messages)
-    assert ":app:compileDebugKotlin" in parsed["failed_tasks"]
+    assert any("Unresolved reference" in m for m in messages)
+    assert any("compileKotlin FAILED" in m for m in messages)
+    assert ":kotlin-error:compileKotlin" in parsed["failed_tasks"]
 
 
-def test_parse_build_output_warnings():
-    parsed = parse_build_output(GRADLE_ERROR_LOG, "")
-    messages = [w["message"] for w in parsed["warnings"]]
+def test_parse_build_output_locates_a_k2_kotlin_error(recorded_gradle):
+    """The K2 `file://` URI form, which used to parse to no location at all."""
+    parsed = parse_build_output(recorded_gradle("gradle_kotlin_compile_error"), "")
+    err = next(e for e in parsed["errors"] if e["type"] == "kotlin")
 
-    assert any("never used" in m for m in messages)
-    assert any("deprecated API usage" in m for m in messages)
-
-
-def test_parse_build_output_kotlin_location():
-    parsed = parse_build_output("e: file: /src/Main.kt: (10, 5): boom", "")
-    err = parsed["errors"][0]
-    assert err["type"] == "kotlin"
-    assert err["location"]["file"] == "/src/Main.kt"
-    assert err["location"]["line"] == 10
-    assert err["location"]["column"] == 5
-    assert err["message"] == "boom"
+    assert err["location"]["file"].endswith("/com/example/Broken.kt")
+    assert err["location"]["line"] == 5
+    assert err["location"]["column"] == 13
+    # The URI scheme belongs to the compiler's output, not to the answer.
+    assert not err["location"]["file"].startswith("file://")
+    assert err["message"] == "Unresolved reference 'missingSymbol'."
 
 
-def test_parse_build_output_javac_location():
-    parsed = parse_build_output("/src/Other.java:42: error: cannot find symbol", "")
-    err = parsed["errors"][0]
-    assert err["type"] == "javac"
-    assert err["location"]["file"] == "/src/Other.java"
-    assert err["location"]["line"] == 42
+def test_parse_build_output_locates_a_kotlin_warning(recorded_gradle):
+    """Warnings take the same K2 shape, and are recorded separately.
+
+    A compiler that has errored stops reporting warnings, so one build log
+    carrying both an `e:` and a `w:` from the same module is a shape neither
+    kotlinc nor javac actually produces.
+    """
+    parsed = parse_build_output(recorded_gradle("gradle_kotlin_compile_warning"), "")
+    located = [w for w in parsed["warnings"] if w["location"]["file"]]
+
+    assert len(located) == 1
+    assert located[0]["location"]["file"].endswith("/com/example/Warned.kt")
+    assert located[0]["location"]["line"] == 7
+    assert located[0]["location"]["column"] == 21
+    assert "is deprecated" in located[0]["message"]
+    assert parsed["errors"] == []
 
 
-def test_parse_build_output_reads_stderr_too():
-    parsed = parse_build_output("", "e: /src/A.kt: (1, 1): nope")
-    assert len(parsed["errors"]) == 1
+def test_a_plugin_warning_without_a_location_is_still_a_warning(recorded_gradle):
+    """`w: ⚠️ Deprecated Gradle Version` — a `w:` whose body is prose.
+
+    The Kotlin Gradle plugin emits this, and its continuation lines carry no
+    `w:` prefix at all. Recorded proof that a `w:` line is not always a
+    file/line/column diagnostic.
+    """
+    parsed = parse_build_output(recorded_gradle("gradle_kotlin_compile_warning"), "")
+    prose = [w for w in parsed["warnings"] if w["location"]["file"] is None]
+
+    assert prose, "the plugin's own w: line was dropped"
+    assert "Deprecated Gradle Version" in prose[0]["message"]
 
 
-def test_parse_build_output_clean_log():
-    parsed = parse_build_output("BUILD SUCCESSFUL in 12s\n42 actionable tasks", "")
+def test_parse_build_output_locates_a_javac_error(recorded_gradle):
+    parsed = parse_build_output(recorded_gradle("gradle_javac_compile_error"), "")
+    err = next(e for e in parsed["errors"] if e["type"] == "javac")
+
+    assert err["location"]["file"].endswith("/com/example/Broken.java")
+    assert err["location"]["line"] == 6
+    assert err["message"] == "cannot find symbol"
+    assert ":java-error:compileJava" in parsed["failed_tasks"]
+
+
+def test_gradles_indented_reprint_is_not_counted_again(recorded_gradle):
+    """Gradle repeats the whole compiler output inside '* What went wrong:'.
+
+    Indented by two spaces. Counting those copies made one missing type into
+    four javac errors. javac's own duplicate — it reports this mistake twice,
+    once per caret position, and says so with a trailing '2 errors' — is real
+    output and is left alone.
+    """
+    text = recorded_gradle("gradle_javac_compile_error")
+    assert "  /scaffold/" in text, "fixture no longer carries the indented reprint"
+
+    parsed = parse_build_output(text, "")
+    javac = [e for e in parsed["errors"] if e["type"] == "javac"]
+
+    assert len(javac) == text.count("2 errors")
+
+
+def test_parse_build_output_locates_a_javac_warning(recorded_gradle):
+    parsed = parse_build_output(recorded_gradle("gradle_javac_compile_warning"), "")
+    warn = next(w for w in parsed["warnings"] if w["type"] == "javac")
+
+    assert warn["location"]["file"].endswith("/com/example/Warned.java")
+    assert warn["location"]["line"] == 6
+    # The lint category rides inside the message; a hand-written sample said
+    # "deprecated API usage", which javac never prints.
+    assert warn["message"].startswith("[deprecation]")
+    assert parsed["errors"] == []
+
+
+def test_parse_build_output_reads_stderr_too(recorded_gradle):
+    """Same recorded text, handed in on the other stream."""
+    text = recorded_gradle("gradle_kotlin_compile_error")
+    from_stdout = parse_build_output(text, "")
+    from_stderr = parse_build_output("", text)
+
+    assert from_stderr == from_stdout
+    assert from_stderr["errors"]
+
+
+def test_parse_build_output_clean_log(recorded_gradle):
+    """A successful build must not cry wolf."""
+    parsed = parse_build_output(recorded_gradle("gradle_build_successful"), "")
     assert parsed["errors"] == []
     assert parsed["warnings"] == []
     assert parsed["failed_tasks"] == []

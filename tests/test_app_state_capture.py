@@ -2,15 +2,26 @@
 
 Covers the pure helpers (UI element counting, logcat error/warning parsing)
 and the arg->adb-command mapping for device-info probes and the log-lines cap,
-with the module's ``subprocess.run`` monkeypatched so no device is needed.
+with the ``subprocess.run`` that ``common.adb_exec`` calls monkeypatched so no
+device is needed. Every adb call now goes through ``adb_exec.run_adb`` -- which
+is where the time bound and the typed, remedy-naming errors live -- so the
+fakes below stand in for adb itself rather than for a per-module
+``subprocess``.
+
+A snapshot is several dumps back to back, so this file also pins the bound:
+nothing goes out unbounded, and the two dumps that legitimately outlast the
+default carry their own budget instead of raising it for the whole skill.
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import app_state_capture
+import pytest
 from app_state_capture import AppStateCapture, analyze_logcat, count_ui_elements
 
 
@@ -76,7 +87,7 @@ def test_device_info_builds_expected_adb_commands(monkeypatch):
             out = ""
         return SimpleNamespace(stdout=out, stderr="", returncode=0)
 
-    monkeypatch.setattr(app_state_capture.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
 
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
     info = capturer._get_device_info()
@@ -85,9 +96,7 @@ def test_device_info_builds_expected_adb_commands(monkeypatch):
 
     # Verify the adb command shapes (serial targeting + getprop/wm density).
     joined = [" ".join(c) for c in calls]
-    assert any(
-        c == "adb -s emulator-5554 shell getprop ro.product.model" for c in joined
-    ), joined
+    assert any(c == "adb -s emulator-5554 shell getprop ro.product.model" for c in joined), joined
     assert any(
         c == "adb -s emulator-5554 shell getprop ro.build.version.sdk" for c in joined
     ), joined
@@ -114,7 +123,7 @@ def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path):
             return SimpleNamespace(stdout=log_text, stderr="", returncode=0)
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
-    monkeypatch.setattr(app_state_capture.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
 
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
     out_path = tmp_path / "app-logs.txt"
@@ -131,7 +140,7 @@ def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path):
 
 def test_capture_logs_invalid_duration_reports_reason(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        app_state_capture.subprocess,
+        app_state_capture.adb_exec.subprocess,
         "run",
         lambda *a, **k: SimpleNamespace(stdout="", stderr="", returncode=0),
     )
@@ -163,3 +172,124 @@ def test_write_summary_md(tmp_path: Path):
     assert "Elements: 42" in md
     assert "Errors: 2" in md
     assert "Warnings: 1" in md
+
+
+# === bounding: a snapshot is several dumps, and none may be unbounded ===
+
+
+def test_no_snapshot_probe_goes_out_unbounded(monkeypatch, tmp_path):
+    """An unbounded adb call wedges the connection for whatever runs next."""
+    seen: list[dict] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        seen.append(kwargs)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+
+    capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
+    capturer._get_app_info()
+    capturer._get_device_info()
+    capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
+
+    assert len(seen) == 8, f"expected 8 adb calls, saw {len(seen)}"
+    assert all(kwargs.get("timeout") for kwargs in seen), "an adb call went out unbounded"
+
+
+def test_the_long_dumps_carry_their_own_budget(monkeypatch):
+    """`dumpsys` outlasts the default on a loaded emulator; the default stays put."""
+    seen: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        seen.append((cmd, kwargs))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+
+    AppStateCapture(package="com.example.app", serial="emulator-5554")._get_app_info()
+
+    budgets = {" ".join(cmd): kwargs["timeout"] for cmd, kwargs in seen if "dumpsys" in cmd}
+    assert budgets, "no dumpsys call issued"
+    assert all(
+        value == app_state_capture.DUMPSYS_TIMEOUT_SECONDS for value in budgets.values()
+    ), budgets
+    assert app_state_capture.DUMPSYS_TIMEOUT_SECONDS > app_state_capture.adb_exec.DEFAULT_TIMEOUT
+
+    # The cheap property reads keep the module-wide default.
+    getprop = [kwargs["timeout"] for cmd, kwargs in seen if "pidof" in cmd]
+    assert getprop == [app_state_capture.adb_exec.DEFAULT_TIMEOUT]
+
+
+def test_logcat_window_carries_its_own_budget(monkeypatch, tmp_path):
+    """A wide `logcat -d` window drains the whole ring buffer."""
+    seen: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        seen.append((cmd, kwargs))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+
+    capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
+    capturer._capture_logs(tmp_path / "logs.txt", "5m", 200)
+
+    logcat = [kwargs for cmd, kwargs in seen if "logcat" in cmd]
+    assert logcat, "no logcat command issued"
+    assert logcat[0]["timeout"] == app_state_capture.LOGCAT_TIMEOUT_SECONDS
+
+
+# === device-level failures reach the CLI boundary, not the user's terminal ===
+
+
+def test_device_error_is_not_recorded_as_a_partial_snapshot(monkeypatch, tmp_path):
+    """ "more than one device" means nothing was captured, not "logs missing"."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "adb: more than one device/emulator\n")
+
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+
+    capturer = AppStateCapture(package="com.example.app")
+    with pytest.raises(app_state_capture.adb_exec.MultipleDevicesError):
+        capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
+
+
+def test_unknown_serial_exits_one_with_an_actionable_message(
+    monkeypatch, capsys, tmp_path, recorded_anywhere
+):
+    """A wrong --serial must yield a remedy and exit 1, never a traceback."""
+    fixture = recorded_anywhere("adb_device_not_found")
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", fixture)
+
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        app_state_capture,
+        "capture_screenshot",
+        lambda *_a, **_k: {"mode": "file", "file_path": "screenshot.png", "size_bytes": 10},
+    )
+    monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app_state_capture.py",
+            "--package",
+            "com.example.app",
+            "--serial",
+            "no-such-serial-xyz",
+            "--output",
+            str(tmp_path),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_state_capture.main()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: ")
+    assert "no-such-serial-xyz" in captured.err
+    assert "adb devices" in captured.err, "the error does not say how to see what is attached"
+    assert "Traceback" not in captured.err

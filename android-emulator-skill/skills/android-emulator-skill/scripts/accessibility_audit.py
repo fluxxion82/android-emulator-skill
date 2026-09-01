@@ -3,8 +3,13 @@
 Android Accessibility Audit
 
 Audit app screens for accessibility issues and compliance.
-Checks for common accessibility problems like missing content descriptions,
-low contrast, small touch targets, etc.
+Checks missing content descriptions, unlabelled fields, disabled-but-clickable
+controls, and touch targets below 48dp (measured against the device's real
+density, not in raw pixels).
+
+Contrast is deliberately not claimed: it needs pixel sampling from a
+screenshot, which this script does not do. It was listed here before it was
+written, which is worse than not offering it.
 
 Usage Examples:
     # Audit current screen
@@ -31,7 +36,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from common.device_utils import get_ui_hierarchy
+from common.adb_exec import AdbError
+from common.device_utils import get_device_density, get_ui_hierarchy
 from common.env_config import env_int
 
 # Tunable thresholds (overridable via env, ANDROID_EMU_ prefix).
@@ -79,7 +85,17 @@ class AccessibilityAuditor:
     """Audits Android screens for accessibility issues."""
 
     # Minimum touch target size (dp)
-    MIN_TOUCH_TARGET_SIZE = 48
+    # Material's minimum touch target, in dp. uiautomator reports bounds in
+    # physical PIXELS, so this must be converted before any comparison -- see
+    # min_touch_target_px(). Comparing pixels against this literal meant the
+    # check only fired on elements roughly 2.6x too small at 420dpi, and its
+    # message labelled the pixel figures "dp" (S7).
+    MIN_TOUCH_TARGET_DP = 48
+
+    # Fallback density when the device cannot be queried. mdpi means 1dp == 1px,
+    # so the check degrades to the old dp-vs-pixel comparison rather than
+    # inventing a scale factor.
+    DEFAULT_DENSITY_DPI = 160
 
     # Minimum text size (sp)
     MIN_TEXT_SIZE = 12
@@ -96,6 +112,58 @@ class AccessibilityAuditor:
         self.serial = serial
         self.max_nesting = A11Y_MAX_NESTING if max_nesting is None else max_nesting
         self.issues = []
+        # Resolved lazily from the device on first use, so constructing an
+        # auditor stays device-free for tests and for callers that only parse.
+        self.density: int | None = None
+
+    def _resolve_density(self) -> int:
+        """The device's effective dpi, queried once and cached.
+
+        Falls back to mdpi (1dp == 1px) when the device cannot be asked, which
+        degrades the touch-target check to its previous behaviour rather than
+        inventing a scale factor.
+        """
+        if self.density is None:
+            try:
+                self.density = get_device_density(self.serial)
+            except (AdbError, RuntimeError):
+                self.density = self.DEFAULT_DENSITY_DPI
+        return self.density
+
+    def px_to_dp(self, pixels: float) -> float:
+        """Convert a pixel measurement to density-independent pixels."""
+        return pixels / (self._resolve_density() / 160.0)
+
+    def min_touch_target_px(self) -> float:
+        """The 48dp minimum expressed in this device's pixels.
+
+        At 420dpi that is 126px, so a 100px control -- about 38dp, clearly under
+        the minimum -- was previously passed because 100 > 48.
+        """
+        return self.MIN_TOUCH_TARGET_DP * (self._resolve_density() / 160.0)
+
+    @staticmethod
+    def _descendants(node: dict):
+        """Yield every node beneath this one, in the dict hierarchy shape."""
+        for child in node.get("children", []) or []:
+            yield child
+            yield from AccessibilityAuditor._descendants(child)
+
+    def audit_tree(self, hierarchy: dict) -> list:
+        """Run every check over an already-fetched hierarchy.
+
+        Split out from :meth:`audit` so the checks can be exercised against a
+        recorded dump without a device.
+
+        Args:
+            hierarchy: The dict shape returned by ``get_ui_hierarchy``.
+
+        Returns:
+            The accumulated issue list.
+        """
+        self.issues = []
+        self._audit_node(hierarchy)
+        return self.issues
 
     def audit(self) -> tuple:
         """
@@ -109,8 +177,7 @@ class AccessibilityAuditor:
             hierarchy = get_ui_hierarchy(self.serial)
 
             # Run checks
-            self.issues = []
-            self._audit_node(hierarchy)
+            self.audit_tree(hierarchy)
 
             # Categorize issues
             critical = [i for i in self.issues if i["severity"] == "critical"]
@@ -176,17 +243,22 @@ class AccessibilityAuditor:
                     }
                 )
 
-        # Check 2: Touch target size
+        # Check 2: Touch target size. Bounds are pixels; the minimum is dp.
         if clickable and enabled and bounds:
             width = bounds.get("right", 0) - bounds.get("left", 0)
             height = bounds.get("bottom", 0) - bounds.get("top", 0)
+            minimum_px = self.min_touch_target_px()
 
-            if width < self.MIN_TOUCH_TARGET_SIZE or height < self.MIN_TOUCH_TARGET_SIZE:
+            if width < minimum_px or height < minimum_px:
                 self.issues.append(
                     {
                         "type": "small_touch_target",
                         "severity": "warning",
-                        "message": f"Touch target too small: {width}x{height}dp (min: {self.MIN_TOUCH_TARGET_SIZE}dp)",
+                        "message": (
+                            f"Touch target too small: "
+                            f"{self.px_to_dp(width):.0f}x{self.px_to_dp(height):.0f}dp "
+                            f"({width}x{height}px, min: {self.MIN_TOUCH_TARGET_DP}dp)"
+                        ),
                         "fix": _fix_for("small_touch_target"),
                         "element": {
                             "class": class_name,
@@ -212,10 +284,22 @@ class AccessibilityAuditor:
                 }
             )
 
-        # Check 4: EditText should have hints
+        # Check 4: an input the user cannot identify.
+        #
+        # This used to read attrs.get("hint"), but uiautomator emits no `hint`
+        # attribute -- verified across every recorded dump -- so the condition
+        # collapsed to "this field is empty" and flagged every correctly-hinted
+        # empty field. A field's label is discoverable, just not there: Compose
+        # puts a TextField's label in its subtree, and View layouts often place
+        # it in an adjacent node. Only flag a field with no describing text
+        # anywhere beneath it.
         if "edittext" in class_name.lower():
-            hint = attrs.get("hint", "")
-            if not hint and not text and not content_desc:
+            described_by_child = any(
+                (child.get("attributes", {}).get("text") or "").strip()
+                or (child.get("attributes", {}).get("content-desc") or "").strip()
+                for child in self._descendants(node)
+            )
+            if not described_by_child and not text and not content_desc:
                 self.issues.append(
                     {
                         "type": "edittext_missing_hint",

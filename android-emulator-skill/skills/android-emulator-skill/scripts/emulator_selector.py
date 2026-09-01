@@ -43,7 +43,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common.device_utils import build_adb_command, get_connected_devices
+from common import adb_exec
+from common.device_utils import get_connected_devices
 from common.env_config import env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -74,8 +75,20 @@ COMMON_MODELS = [
     "pixel",
 ]
 
+# Ceiling for the per-serial AVD-name query. Short: this runs once per attached
+# emulator while building a ranking, so a stalled console must not hold up the
+# whole suggestion.
+PROBE_TIMEOUT_SECONDS = 5
+
+# `emulator` is an Android SDK tool, not adb, so it does not go through
+# common.adb_exec -- but it still needs a ceiling.
+EMULATOR_TOOL_TIMEOUT = 30
+
 CONFIG_FILENAME = "config.json"
 FALLBACK_CONFIG_DIR = Path.home() / ".android-emulator-skill"
+# Pre-0.5 installs kept history next to the script, inside the distributed
+# package. Still read if present so nobody loses their history; never created.
+LEGACY_CONFIG_PATH = Path(__file__).resolve().parent / CONFIG_FILENAME
 
 
 def _normalize(value: str) -> str:
@@ -215,11 +228,19 @@ class EmulatorSelector:
 
     @staticmethod
     def _default_config_path() -> Path:
-        """Resolve the config path, preferring a writable script-local file."""
-        script_local = Path(__file__).resolve().parent / CONFIG_FILENAME
-        parent = script_local.parent
-        if script_local.exists() or _is_writable_dir(parent):
-            return script_local
+        """Resolve where recent-AVD history lives.
+
+        User state goes under the user's config directory, never into the
+        installed package. This previously preferred a file next to the script
+        whenever that directory was writable -- which it normally is -- so the
+        history was written into the distributed plugin: shared across every
+        project and checkout, and lost on reinstall.
+
+        An existing legacy file is still read so nobody silently loses history,
+        but a new one is never created there.
+        """
+        if LEGACY_CONFIG_PATH.exists():
+            return LEGACY_CONFIG_PATH
         return FALLBACK_CONFIG_DIR / CONFIG_FILENAME
 
     def list_avds(self) -> list[dict]:
@@ -249,6 +270,7 @@ class EmulatorSelector:
                 ["emulator", "-list-avds"],
                 capture_output=True,
                 text=True,
+                timeout=EMULATOR_TOOL_TIMEOUT,
                 check=True,
             )
         except FileNotFoundError:
@@ -258,7 +280,7 @@ class EmulatorSelector:
                 file=sys.stderr,
             )
             return []
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
@@ -273,6 +295,11 @@ class EmulatorSelector:
         try:
             devices = get_connected_devices()
         except RuntimeError:
+            # Deliberate: with nothing attached (or no adb at all) there is
+            # nothing running, and --suggest must still rank the AVDs on disk.
+            # Note this also absorbs an adb_exec.AdbError out of the listing,
+            # which subclasses RuntimeError. The per-serial resolution below is
+            # outside this guard on purpose -- see _avd_name_for_serial.
             return running
 
         for dev in devices:
@@ -284,12 +311,15 @@ class EmulatorSelector:
         return running
 
     def _avd_name_for_serial(self, serial: str) -> str | None:
-        """Resolve an emulator serial to its AVD name (None on failure)."""
-        try:
-            cmd = build_adb_command("emu", serial, "avd", "name")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
-        except Exception:
-            return None
+        """Resolve an emulator serial to its AVD name (None when it answers nothing).
+
+        A console that declines to answer yields None, which simply costs that
+        AVD its "currently running" bonus. Device-level adb errors are *not*
+        swallowed: the serial came straight from ``adb devices``, so one that can
+        no longer be reached means the running check went unanswered, and ranking
+        a live AVD as idle is how a second copy of it gets booted.
+        """
+        result = adb_exec.run_adb("emu", serial, "avd", "name", timeout=PROBE_TIMEOUT_SECONDS)
         # `adb emu avd name` prints the name then an "OK" line.
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -317,9 +347,21 @@ class EmulatorSelector:
         """
         recent = [name, *(n for n in self.load_recent() if n != name)]
         recent = recent[:RECENT_HISTORY_MAX]
+
+        # Merge rather than replace: this file is shared config, and a
+        # whole-file rewrite silently discarded every key except "recent".
+        payload: dict = {}
+        try:
+            payload = json.loads(self.config_path.read_text())
+            if not isinstance(payload, dict):
+                payload = {}
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+
+        payload["recent"] = recent
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            self.config_path.write_text(json.dumps({"recent": recent}, indent=2))
+            self.config_path.write_text(json.dumps(payload, indent=2))
         except OSError:
             pass
 
@@ -372,6 +414,9 @@ class EmulatorSelector:
         if headless:
             cmd.append("-no-window")
         try:
+            # Exempt from run_adb/timeout: this is not an adb call, and the
+            # emulator process is meant to outlive this script -- bounding it
+            # would kill the emulator we just launched.
             subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -486,7 +531,17 @@ def format_candidates(candidates: list[dict], json_format: bool = False) -> str:
 
 
 def main():
-    """Main entry point."""
+    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    try:
+        _run()
+    except adb_exec.AdbError as error:
+        # run_adb raises errors whose message already names a remedy. Print it
+        # rather than a traceback -- for an agent, stderr is the retry prompt.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run():
     parser = argparse.ArgumentParser(
         description="Suggest, list, and boot the best Android AVD for a task",
         formatter_class=argparse.RawDescriptionHelpFormatter,

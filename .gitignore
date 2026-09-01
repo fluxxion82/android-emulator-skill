@@ -33,6 +33,11 @@ build/
 .AppleDouble
 .LSOverride
 
+# Gradle scaffold build output (the scaffold sources are committed,
+# its build artifacts are not)
+tests/fixtures/scaffold/**/build/
+tests/fixtures/scaffold/**/.gradle/
+
 # Android (for testing)
 *.apk
 *.aab
@@ -52,8 +57,11 @@ captures/
 # Release artifacts (built by CI)
 *.zip
 
-# Local skill config (user-specific)
+# Local skill config (user-specific). The scripts/ path is where
+# emulator_selector used to write recent-AVD history; the rule above it
+# pointed at a path nothing ever wrote, so the real file was never ignored.
 android-emulator-skill/skills/android-emulator-skill/config.json
+android-emulator-skill/skills/android-emulator-skill/scripts/config.json
 
 # Other
 .claude

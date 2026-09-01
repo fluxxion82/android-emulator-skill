@@ -9,6 +9,32 @@ These exercise the three pieces of pure logic without any emulator/adb:
 
 The device-touching path (set_coordinate / replay_gpx) is also covered by
 monkeypatching the module's subprocess.run so no real device is needed.
+
+A documented exception to the recorded-fixture rule
+---------------------------------------------------
+The GPX documents below are written here rather than read from
+``tests/fixtures/recorded/``, and ``test_location.py::parse_gpx`` stays in
+``KNOWN_VIOLATIONS`` in ``tests/test_fixture_policy.py`` because of it.
+
+The rule exists for **tool output** -- text some command prints, which can be
+captured by running that command and looking at it. GPX is not that. It is a
+document the *user* hands to ``location.py --gpx``, produced by a GPS device or
+a mapping service; nothing in this skill, in adb, or in the Android SDK emits
+GPX, so there is no tool for a recorder to run. (Checked: the SDK ships no .gpx
+of any kind, and no GPX-producing tool is a dependency of this repo.) A real
+track is also a record of somebody's movements, which must not be committed to
+a public repository.
+
+The line the ratchet actually flags is ``lat="north"`` -- a deliberately
+malformed document, which by definition no producer emits.
+
+What is genuinely untested here, and worth saying plainly: no real-world GPX
+file has ever been through this parser. A track exported by a watch or a
+mapping service carries ``<metadata>``, ``<ele>`` and ``<time>`` children,
+``xsi:schemaLocation``, ``<extensions>``, and GPX 1.0's different namespace.
+``parse_gpx`` walks ``root.iter()`` and matches on the local tag name, so it
+should tolerate all of that -- but "should" is exactly the word this repo
+distrusts, and nobody has checked.
 """
 
 from __future__ import annotations

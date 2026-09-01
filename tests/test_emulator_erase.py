@@ -1,19 +1,24 @@
 """Device-free tests for emulator_erase.
 
-These mock the module's ``subprocess`` (for the running check) and point the AVD
-home at a ``tmp_path`` so no emulator/adb is needed. They assert the pure logic
-for the new feature deltas: ``--all`` (batch erase with structured counts),
-``--verify`` (poll the AVD on disk until the wipe lands), and the
-env-configurable ``ANDROID_EMU_ERASE_TIMEOUT`` tunable.
+These mock the ``subprocess`` boundary underneath ``common.adb_exec`` (for the
+running check) and point the AVD home at a ``tmp_path`` so no emulator/adb is
+needed. They assert the pure logic for the feature deltas -- ``--all`` (batch
+erase with structured counts), ``--verify`` (poll the AVD on disk until the wipe
+lands), the env-configurable ``ANDROID_EMU_ERASE_TIMEOUT`` tunable -- plus the
+error contract the adb_exec migration introduced: the running check must never
+answer "not running" because adb failed to reach the device.
 """
 
 from __future__ import annotations
 
 import importlib
+import subprocess
 from pathlib import Path
 
 import emulator_erase
 import pytest
+
+from common import adb_exec
 
 
 def _make_avd(avd_home: Path, name: str, with_userdata: bool = True) -> Path:
@@ -107,29 +112,104 @@ def test_erase_all_empty(eraser):
     assert (succeeded, failed, results) == (0, 0, [])
 
 
-def test_running_check_uses_adb_command_mapping(monkeypatch, tmp_path):
-    """is_avd_running builds plain adb commands (no shell=True)."""
+def _fake_adb(monkeypatch, responses):
+    """Answer adb calls at the subprocess boundary under common.adb_exec.
+
+    ``responses`` maps a command prefix tuple to (returncode, stdout, stderr).
+    Every call is recorded, argv and kwargs both, so the tests can assert the
+    command mapping and that nothing goes out unbounded.
+    """
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        for prefix, (returncode, stdout, stderr) in responses.items():
+            if tuple(cmd[: len(prefix)]) == prefix or prefix == ():
+                return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    return calls
+
+
+def test_running_check_uses_adb_command_mapping(monkeypatch, tmp_path, recorded):
+    """is_avd_running builds plain adb commands (no shell=True) and bounds them.
+
+    The adb output is the recorded article rather than a hand-written stand-in:
+    the real `adb devices` line carries trailing `product:`/`model:` fields, and
+    the emulator console answers `avd name` with its own "OK" line.
+    """
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     e = emulator_erase.EmulatorEraser()
 
-    calls: list[list[str]] = []
+    calls = _fake_adb(
+        monkeypatch,
+        {
+            ("adb", "devices"): (0, recorded.text("adb_devices_single"), ""),
+            ("adb", "-s"): (0, recorded.text("emu_avd_name"), ""),
+        },
+    )
 
-    class _Result:
-        def __init__(self, stdout: str):
-            self.stdout = stdout
+    assert e.is_avd_running("Pixel_9") is True
+    assert calls[0]["cmd"] == ["adb", "devices"]
+    assert calls[1]["cmd"] == ["adb", "-s", "emulator-5554", "emu", "avd", "name"]
+    assert all(c["kwargs"].get("timeout") for c in calls), "an adb call went out unbounded"
 
-    def fake_run(cmd, **_kwargs):
-        calls.append(cmd)
-        if cmd[:2] == ["adb", "devices"]:
-            return _Result("List of devices attached\nemulator-5554\tdevice\n")
-        # adb -s emulator-5554 emu avd name
-        return _Result("Pixel_5_API_33\nOK\n")
 
-    monkeypatch.setattr(emulator_erase.subprocess, "run", fake_run)
+def test_running_check_still_answers_no_on_a_plain_command_failure(monkeypatch, tmp_path):
+    """A command that ran and failed is not evidence the AVD is running.
 
-    assert e.is_avd_running("Pixel_5_API_33") is True
-    assert calls[0] == ["adb", "devices"]
-    assert calls[1] == ["adb", "-s", "emulator-5554", "emu", "avd", "name"]
+    This is the behaviour the pre-migration `except CalledProcessError` had, and
+    it is preserved: only *device-level* failures are escalated.
+    """
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
+    e = emulator_erase.EmulatorEraser()
+    _fake_adb(monkeypatch, {("adb", "devices"): (1, "", "some other adb complaint\n")})
+
+    assert e.is_avd_running("Pixel_9") is False
+
+
+def test_a_device_error_is_not_answered_as_not_running(monkeypatch, tmp_path, recorded_anywhere):
+    """The dangerous swallow: "adb could not reach the device" != "not running".
+
+    Answering False here let an erase wipe the user data of an emulator that was
+    actually live. The typed device error now reaches the caller instead, and
+    the wipe does not happen.
+    """
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
+    avd_dir = _make_avd(tmp_path, "Pixel_9")
+    e = emulator_erase.EmulatorEraser()
+
+    _fake_adb(
+        monkeypatch,
+        {
+            ("adb", "devices"): (0, "List of devices attached\nemulator-5554\tdevice\n", ""),
+            ("adb", "-s"): (1, "", recorded_anywhere("adb_device_not_found")),
+        },
+    )
+
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        e.erase("Pixel_9")
+
+    assert (avd_dir / "userdata-qemu.img").exists(), "user data was wiped on an unanswered check"
+
+
+def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, capsys):
+    """At the CLI boundary the agent gets the remedy, not a stack trace."""
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
+    _make_avd(tmp_path, "Pixel_9")
+    _fake_adb(monkeypatch, {("adb",): (1, "", "error: device offline\n")})
+    monkeypatch.setattr(emulator_erase.sys, "argv", ["emulator_erase.py", "--name", "Pixel_9"])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_erase.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: ")
+    assert "Traceback" not in captured.err
+    message = captured.err.lower()
+    assert "reconnect" in message or "kill-server" in message, "no remedy named"
 
 
 def test_default_tunables():

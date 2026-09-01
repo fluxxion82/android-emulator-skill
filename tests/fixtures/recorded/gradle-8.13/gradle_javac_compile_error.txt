@@ -1,0 +1,49 @@
+
+> Configure project :kotlin-error
+w: ⚠️ Deprecated Gradle Version
+The used Gradle version (Gradle 8.13) is deprecated and will not be supported in future Kotlin Gradle Plugin releases.
+The minimum supported Gradle version will become Gradle 8.14.4 in Kotlin 2.5.0.
+
+This warning can be suppressed in 'gradle.properties':
+    kotlin.suppressGradlePluginWarnings=DeprecatedGradleVersionWarning
+Solution: Please update the Gradle version to at least Gradle 8.14.4.
+
+
+> Task :java-error:compileJava FAILED
+
+[Incubating] Problems report is available at: file:///scaffold/build/reports/problems/problems-report.html
+1 actionable task: 1 executed
+/scaffold/java-error/src/main/java/com/example/Broken.java:6: error: cannot find symbol
+        MissingType value = new MissingType();
+        ^
+  symbol:   class MissingType
+  location: class Broken
+/scaffold/java-error/src/main/java/com/example/Broken.java:6: error: cannot find symbol
+        MissingType value = new MissingType();
+                                ^
+  symbol:   class MissingType
+  location: class Broken
+2 errors
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':java-error:compileJava'.
+> Compilation failed; see the compiler output below.
+  /scaffold/java-error/src/main/java/com/example/Broken.java:6: error: cannot find symbol
+          MissingType value = new MissingType();
+          ^
+    symbol:   class MissingType
+    location: class Broken
+  /scaffold/java-error/src/main/java/com/example/Broken.java:6: error: cannot find symbol
+          MissingType value = new MissingType();
+                                  ^
+    symbol:   class MissingType
+    location: class Broken
+  2 errors
+
+* Try:
+> Check your code and dependencies to fix the compilation error(s)
+> Run with --scan to get full insights.
+
+BUILD FAILED in 0s

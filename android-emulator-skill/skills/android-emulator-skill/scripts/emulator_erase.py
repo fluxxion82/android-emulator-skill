@@ -22,12 +22,11 @@ Usage Examples:
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-from common.device_utils import build_adb_command
+from common import adb_exec
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -98,12 +97,7 @@ class EmulatorEraser:
             True if running
         """
         try:
-            result = subprocess.run(
-                build_adb_command("devices"),
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            result = adb_exec.run_adb("devices", None, check=True)
 
             # Check if any emulator is running with this AVD
             for line in result.stdout.split("\n"):
@@ -111,18 +105,18 @@ class EmulatorEraser:
                     # Get emulator serial
                     serial = line.split()[0]
                     # Query AVD name
-                    avd_result = subprocess.run(
-                        build_adb_command("emu", serial, "avd", "name"),
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
+                    avd_result = adb_exec.run_adb("emu", serial, "avd", "name", check=True)
                     if name in avd_result.stdout:
                         return True
 
             return False
 
-        except subprocess.CalledProcessError:
+        except adb_exec.AdbCommandError:
+            # adb reached a device and the command failed; that is not evidence
+            # the AVD is running. Device-level errors (offline / not found /
+            # more than one device) are deliberately NOT caught here: they mean
+            # the check never ran, and answering "not running" would let the
+            # erase wipe the user data of a live AVD. They surface at main().
             return False
 
     def erase(
@@ -261,7 +255,17 @@ class EmulatorEraser:
 
 
 def main():
-    """Main entry point."""
+    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    try:
+        _run()
+    except adb_exec.AdbError as error:
+        # run_adb raises errors whose message already names a remedy. Print it
+        # rather than a traceback -- for an agent, stderr is the retry prompt.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run():
     parser = argparse.ArgumentParser(
         description="Erase/Reset Android Virtual Devices to factory state",
         formatter_class=argparse.RawDescriptionHelpFormatter,

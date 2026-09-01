@@ -262,6 +262,27 @@ class SessionStore:
         return self._events_path(session_id)
 
     def session_dir(self, session_id: str) -> Path:
+        """Directory for one session, validating the id first.
+
+        Session ids reach this from argv -- ``anr_watcher --get-details SID``
+        and ``--stop SID`` -- and joining an unvalidated string onto the storage
+        root lets a traversing id read ``<root>/../../x/meta.json`` and, on the
+        stop path, *write* meta.json and summary.json there.
+
+        Args:
+            session_id: Caller-supplied session id.
+
+        Returns:
+            The session directory, always directly under the storage root.
+
+        Raises:
+            ValueError: If the id is not a plain session id.
+        """
+        if not session_id or not _SAFE_SESSION_ID_RE.fullmatch(session_id):
+            raise ValueError(
+                f"Invalid session id {session_id!r}. Expected a plain id like "
+                f"'anr-20260617-143000-a1b2' (letters, digits, dash, underscore)."
+            )
         return self.base_dir / session_id
 
     def session_total_bytes(self, session_id: str) -> int:
@@ -383,13 +404,13 @@ class SessionStore:
     # === PRIVATE ===
 
     def _meta_path(self, session_id: str) -> Path:
-        return self.base_dir / session_id / "meta.json"
+        return self.session_dir(session_id) / "meta.json"
 
     def _events_path(self, session_id: str) -> Path:
-        return self.base_dir / session_id / "events.jsonl"
+        return self.session_dir(session_id) / "events.jsonl"
 
     def _summary_path(self, session_id: str) -> Path:
-        return self.base_dir / session_id / "summary.json"
+        return self.session_dir(session_id) / "summary.json"
 
     def _write_meta(self, meta: SessionMeta) -> None:
         path = self._meta_path(meta.session_id)
@@ -426,6 +447,12 @@ class SessionStore:
                 _remove_tree(entry)
                 deleted += 1
         return deleted
+
+
+# Session ids are generated as "anr-<YYYYmmdd>-<HHMMSS>-<4 hex>". Anything
+# outside this alphabet cannot be one, and a separator or ".." would let an
+# id address paths outside the storage root.
+_SAFE_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 # === MODULE-LEVEL HELPERS ===

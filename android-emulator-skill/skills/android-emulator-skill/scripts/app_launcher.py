@@ -15,15 +15,13 @@ Key features:
 
 import argparse
 import json as json_lib
-import subprocess
+import re
 import sys
 import time
-from typing import Optional
 
+from common import adb_exec
 from common.device_utils import (
-    build_adb_command,
     get_current_activity,
-    get_default_device,
     list_installed_packages,
     resolve_device_identifier,
 )
@@ -31,6 +29,14 @@ from common.env_config import env_float
 
 # Delay between terminate and launch when restarting an app.
 RELAUNCH_DELAY_SECONDS = env_float("ANDROID_EMU_RELAUNCH_DELAY_MS", 1000.0) / 1000.0
+
+# `adb install` streams an APK to the device and lets the package manager
+# verify and optimise it; a large debug build routinely runs past the 30s
+# adb_exec default, so it gets its own budget rather than raising that default
+# for every call in the skill. Uninstall touches package-manager state too but
+# moves no bytes, so it needs far less.
+INSTALL_TIMEOUT_SECONDS = 300
+UNINSTALL_TIMEOUT_SECONDS = 60
 
 
 def parse_extras(pairs: list[str] | None) -> dict[str, str]:
@@ -99,7 +105,7 @@ class AppLauncher:
                 extra_args.extend(["--es", key, value])
 
             # Launch activity
-            cmd = build_adb_command(
+            result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "am",
@@ -109,16 +115,21 @@ class AppLauncher:
                 "-a",
                 "android.intent.action.MAIN",
                 *extra_args,
+                check=True,
             )
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
             if "Error" in result.stdout or "error" in result.stderr.lower():
                 return False, f"Launch failed: {result.stdout or result.stderr}"
 
             return True, f"Launched: {package_name}"
 
-        except subprocess.CalledProcessError as e:
-            return False, f"Launch failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Launch failed: {e}"
+        except adb_exec.AdbError:
+            # The command never reached a device (ambiguous target, wrong
+            # serial, offline, unauthorized). That is not "the launch failed";
+            # re-raise so main() can print the remedy the error already names.
+            raise
         except Exception as e:
             return False, f"Launch error: {e}"
 
@@ -133,13 +144,12 @@ class AppLauncher:
             (success, message) tuple
         """
         try:
-            cmd = build_adb_command("shell", self.serial, "am", "force-stop", package_name)
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            adb_exec.run_adb("shell", self.serial, "am", "force-stop", package_name, check=True)
 
             return True, f"Terminated: {package_name}"
 
-        except subprocess.CalledProcessError as e:
-            return False, f"Terminate failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Terminate failed: {e}"
 
     def restart(
         self,
@@ -185,19 +195,21 @@ class AppLauncher:
             (success, message) tuple
         """
         try:
-            cmd = build_adb_command("install", self.serial)
-            if replace:
-                cmd.append("-r")
-            cmd.append(apk_path)
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            install_args = ["-r", apk_path] if replace else [apk_path]
+            result = adb_exec.run_adb(
+                "install",
+                self.serial,
+                *install_args,
+                timeout=INSTALL_TIMEOUT_SECONDS,
+                check=True,
+            )
 
             if "Success" in result.stdout:
                 return True, f"Installed: {apk_path}"
             return False, f"Install failed: {result.stdout}"
 
-        except subprocess.CalledProcessError as e:
-            return False, f"Install failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Install failed: {e}"
 
     def uninstall(self, package_name: str) -> tuple:
         """
@@ -210,15 +222,20 @@ class AppLauncher:
             (success, message) tuple
         """
         try:
-            cmd = build_adb_command("uninstall", self.serial, package_name)
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = adb_exec.run_adb(
+                "uninstall",
+                self.serial,
+                package_name,
+                timeout=UNINSTALL_TIMEOUT_SECONDS,
+                check=True,
+            )
 
             if "Success" in result.stdout:
                 return True, f"Uninstalled: {package_name}"
             return False, f"Uninstall failed: {result.stdout}"
 
-        except subprocess.CalledProcessError as e:
-            return False, f"Uninstall failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Uninstall failed: {e}"
 
     def open_url(self, url: str) -> tuple:
         """
@@ -231,18 +248,25 @@ class AppLauncher:
             (success, message) tuple
         """
         try:
-            cmd = build_adb_command(
-                "shell", self.serial, "am", "start", "-a", "android.intent.action.VIEW", "-d", url
+            result = adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "am",
+                "start",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                url,
+                check=True,
             )
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
             if "Error" in result.stdout or "error" in result.stderr.lower():
                 return False, f"Open URL failed: {result.stdout or result.stderr}"
 
             return True, f"Opened URL: {url}"
 
-        except subprocess.CalledProcessError as e:
-            return False, f"Open URL failed: {e.stderr}"
+        except adb_exec.AdbCommandError as e:
+            return False, f"Open URL failed: {e}"
 
     def list_packages(self, filter_text: str | None = None) -> tuple:
         """
@@ -283,10 +307,11 @@ class AppLauncher:
             if not installed:
                 return True, {"package": package_name, "installed": False, "running": False}
 
-            # Check if running (has process)
-            cmd = build_adb_command("shell", self.serial, "pidof", package_name)
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            running = result.returncode == 0 and result.stdout.strip()
+            # Check if running (has process). `pidof` exits non-zero when the
+            # app is not running, which is an answer rather than a failure, so
+            # this deliberately does not pass check=True.
+            result = adb_exec.run_adb("shell", self.serial, "pidof", package_name)
+            running = result.ok and result.stdout.strip()
 
             # Get current activity
             current_activity = get_current_activity(self.serial)
@@ -300,6 +325,10 @@ class AppLauncher:
                 "current_activity": current_activity if is_foreground else None,
             }
 
+        except adb_exec.AdbError:
+            # Device-level failure: nothing was inspected, so reporting a state
+            # dict would be a guess. Let main() print the remedy.
+            raise
         except Exception as e:
             return False, {"error": str(e)}
 
@@ -307,42 +336,59 @@ class AppLauncher:
         """
         Get launcher activity for package.
 
+        Asks the package manager the same question the launcher asks:
+        ``cmd package resolve-activity --brief -c
+        android.intent.category.LAUNCHER <package>``. Recorded output (see
+        ``tests/fixtures/recorded/*/resolve_activity_launcher.txt``) is::
+
+            priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true
+            com.android.settings/.Settings
+
+        so the answer is the last non-blank line, and it is a single
+        unambiguous component.
+
         Args:
             package_name: App package name
 
         Returns:
-            Activity name, or None if not found
+            The ``package/activity`` component, or None if nothing resolves.
         """
         # For Settings, use known activity
         if package_name == "com.android.settings":
             return ".Settings"
 
-        try:
-            # Use pm dump to get main activity
-            cmd = build_adb_command("shell", self.serial, "pm", "dump", package_name)
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = adb_exec.run_adb(
+            "shell",
+            self.serial,
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            package_name,
+        )
 
-            # Look for MAIN/LAUNCHER intent filter
-            import re
+        return self._parse_resolved_component(result.stdout)
 
-            for line in result.stdout.split("\n"):
-                if (
-                    "android.intent.action.MAIN" in line
-                    and "android.intent.category.LAUNCHER" in line
-                ):
-                    # Look at previous or surrounding lines for activity name
-                    pass
-                elif "Activity" in line and package_name in line:
-                    # Extract activity from lines like:
-                    # com.android.settings/.Settings
-                    match = re.search(rf"{re.escape(package_name)}/([\.A-Za-z0-9_]+)", line)
-                    if match:
-                        return match.group(1)
+    @staticmethod
+    def _parse_resolved_component(output: str) -> str | None:
+        """Pull the ``package/activity`` component out of resolve-activity output.
 
-            return None
+        Anything that is not a bare component -- ``No activity found``, the
+        ``priority=...`` header line -- yields None rather than a plausible
+        looking fragment.
 
-        except Exception:
-            return None
+        Args:
+            output: stdout from ``cmd package resolve-activity --brief``
+
+        Returns:
+            The component, or None when the output names no activity.
+        """
+        for line in reversed([ln.strip() for ln in output.splitlines() if ln.strip()]):
+            if re.fullmatch(r"[\w.]+/[\w.$]+", line):
+                return line
+        return None
 
 
 def main():
@@ -420,107 +466,117 @@ Examples:
 
     launcher = AppLauncher(serial)
 
-    # Execute operation
-    if args.launch:
-        success, message = launcher.launch(args.launch, args.activity, extras or None)
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": success, "message": message, "action": "launch"}, indent=2
+    # Execute operation.
+    #
+    # CLI boundary: a device-level adb failure (ambiguous target, wrong
+    # serial, offline, unauthorized) means the command never ran. Those
+    # errors already carry a remedy, so print it rather than letting a
+    # traceback reach the user.
+    try:
+        if args.launch:
+            success, message = launcher.launch(args.launch, args.activity, extras or None)
+            if args.json:
+                print(
+                    json_lib.dumps(
+                        {"success": success, "message": message, "action": "launch"}, indent=2
+                    )
                 )
-            )
-        else:
-            print(message)
-        sys.exit(0 if success else 1)
+            else:
+                print(message)
+            sys.exit(0 if success else 1)
 
-    elif args.restart:
-        success, message = launcher.restart(args.restart, args.activity, extras or None)
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": success, "message": message, "action": "restart"}, indent=2
+        elif args.restart:
+            success, message = launcher.restart(args.restart, args.activity, extras or None)
+            if args.json:
+                print(
+                    json_lib.dumps(
+                        {"success": success, "message": message, "action": "restart"}, indent=2
+                    )
                 )
-            )
-        else:
-            print(message)
-        sys.exit(0 if success else 1)
+            else:
+                print(message)
+            sys.exit(0 if success else 1)
 
-    elif args.terminate:
-        success, message = launcher.terminate(args.terminate)
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": success, "message": message, "action": "terminate"}, indent=2
+        elif args.terminate:
+            success, message = launcher.terminate(args.terminate)
+            if args.json:
+                print(
+                    json_lib.dumps(
+                        {"success": success, "message": message, "action": "terminate"}, indent=2
+                    )
                 )
-            )
-        else:
-            print(message)
-        sys.exit(0 if success else 1)
+            else:
+                print(message)
+            sys.exit(0 if success else 1)
 
-    elif args.install:
-        success, message = launcher.install(args.install)
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": success, "message": message, "action": "install"}, indent=2
+        elif args.install:
+            success, message = launcher.install(args.install)
+            if args.json:
+                print(
+                    json_lib.dumps(
+                        {"success": success, "message": message, "action": "install"}, indent=2
+                    )
                 )
-            )
-        else:
-            print(message)
-        sys.exit(0 if success else 1)
+            else:
+                print(message)
+            sys.exit(0 if success else 1)
 
-    elif args.uninstall:
-        success, message = launcher.uninstall(args.uninstall)
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": success, "message": message, "action": "uninstall"}, indent=2
+        elif args.uninstall:
+            success, message = launcher.uninstall(args.uninstall)
+            if args.json:
+                print(
+                    json_lib.dumps(
+                        {"success": success, "message": message, "action": "uninstall"}, indent=2
+                    )
                 )
-            )
-        else:
-            print(message)
-        sys.exit(0 if success else 1)
+            else:
+                print(message)
+            sys.exit(0 if success else 1)
 
-    elif args.open_url:
-        success, message = launcher.open_url(args.open_url)
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": success, "message": message, "action": "open_url"}, indent=2
+        elif args.open_url:
+            success, message = launcher.open_url(args.open_url)
+            if args.json:
+                print(
+                    json_lib.dumps(
+                        {"success": success, "message": message, "action": "open_url"}, indent=2
+                    )
                 )
-            )
-        else:
-            print(message)
-        sys.exit(0 if success else 1)
+            else:
+                print(message)
+            sys.exit(0 if success else 1)
 
-    elif args.list:
-        success, packages = launcher.list_packages(args.filter)
-        if args.json:
-            print(json_lib.dumps({"packages": packages, "count": len(packages)}, indent=2))
-        else:
-            print(f"Installed packages ({len(packages)}):")
-            for pkg in packages:
-                print(f"  - {pkg}")
-        sys.exit(0)
+        elif args.list:
+            success, packages = launcher.list_packages(args.filter)
+            if args.json:
+                print(json_lib.dumps({"packages": packages, "count": len(packages)}, indent=2))
+            else:
+                print(f"Installed packages ({len(packages)}):")
+                for pkg in packages:
+                    print(f"  - {pkg}")
+            sys.exit(0)
 
-    elif args.state:
-        success, state = launcher.get_state(args.state)
-        if args.json:
-            print(json_lib.dumps(state, indent=2))
-        elif state.get("installed"):
-            print(f"Package: {state['package']}")
-            print("Installed: Yes")
-            print(f"Running: {'Yes' if state.get('running') else 'No'}")
-            print(f"Foreground: {'Yes' if state.get('foreground') else 'No'}")
-            if state.get("current_activity"):
-                print(f"Current Activity: {state['current_activity']}")
-        else:
-            print(f"Package: {state['package']}")
-            print("Installed: No")
-        sys.exit(0)
+        elif args.state:
+            success, state = launcher.get_state(args.state)
+            if args.json:
+                print(json_lib.dumps(state, indent=2))
+            elif state.get("installed"):
+                print(f"Package: {state['package']}")
+                print("Installed: Yes")
+                print(f"Running: {'Yes' if state.get('running') else 'No'}")
+                print(f"Foreground: {'Yes' if state.get('foreground') else 'No'}")
+                if state.get("current_activity"):
+                    print(f"Current Activity: {state['current_activity']}")
+            else:
+                print(f"Package: {state['package']}")
+                print("Installed: No")
+            sys.exit(0)
 
-    else:
-        parser.print_help()
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    except adb_exec.AdbError as error:
+        print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
 
 

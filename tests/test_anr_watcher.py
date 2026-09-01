@@ -2,13 +2,22 @@
 
 All adb/subprocess interaction is mocked. Session storage is redirected to
 ``tmp_path`` via ``SessionStore(base_dir=...)`` so nothing touches the real home.
+
+Every logcat line fed to the parser here is a RECORDED one -- see
+``tests/fixtures/recorded/`` and the module docstring of ``test_anr_pipeline``.
+The lines these tests used to build by hand claimed ActivityManager writes
+``ANR in com.example.app (com.example.app/.Main)``; a real broadcast ANR
+carries no parenthesised component at all, so the ``--package`` filter was only
+ever exercised against a ``component`` field the device does not populate.
 """
 
 from __future__ import annotations
 
 import json
+import re
 
 import anr_watcher
+
 from common.anr_pipeline import build_normalised_event, event_to_jsonl, parse_logcat_anr
 from common.anr_sessions import SessionStore
 
@@ -101,27 +110,49 @@ def test_show_since_runs_dump_command(monkeypatch):
 # --- post-parse --package filter -------------------------------------------
 
 
-def test_matches_package_by_anr_package():
-    event = parse_logcat_anr(
-        "06-17 14:31:00.000 2 2 E ActivityManager: ANR in com.example.app (com.example.app/.Main)"
-    )
-    assert anr_watcher.matches_package(event, "com.example.app") is True
+def _recorded_anr(recorded) -> dict:
+    """The recorded ActivityManager ANR line, parsed.
+
+    Note what it does NOT have: a component. That is measured, not a
+    simplification -- a broadcast ANR names the package and nothing else.
+    """
+    line = next(ln for ln in recorded.lines("logcat_anr_broadcast") if "ANR in " in ln)
+    event = parse_logcat_anr(line)
+    assert event is not None
+    return event
+
+
+def test_matches_package_by_anr_package(recorded):
+    event = _recorded_anr(recorded)
+    assert event.get("component") is None, "the recording grew a component; revisit this test"
+
+    assert anr_watcher.matches_package(event, "com.example.composefixture") is True
     assert anr_watcher.matches_package(event, "com.other.thing") is False
 
 
-def test_matches_package_by_short_name():
-    event = parse_logcat_anr(
-        "06-17 14:31:00.000 2 2 E ActivityManager: ANR in com.example.app (com.example.app/.Main)"
-    )
-    # Short suffix match keeps it lenient for the tag-only jank case.
-    assert anr_watcher.matches_package(event, "com.foo.app") is True
+def test_matches_package_by_short_name(recorded):
+    """Short-suffix matching, and how lenient it really is.
+
+    The filter also matches on the last dotted segment, so an unrelated package
+    that happens to end the same way matches too. Kept because the tag-only
+    jank case has no package to match on at all -- but worth seeing against a
+    real event rather than a typed one.
+    """
+    event = _recorded_anr(recorded)
+    assert anr_watcher.matches_package(event, "com.somebody.else.composefixture") is True
 
 
 # --- --stop summary over a seeded events.jsonl -----------------------------
 
 
-def _seed_session(tmp_path, frames_list, package=None):
-    """Create a session dir + seed events.jsonl with normalised jank events."""
+def _seed_session(recorded, tmp_path, frames_list, package=None):
+    """Create a session dir + seed events.jsonl with normalised jank events.
+
+    Each seeded line is the RECORDED Choreographer line with only its frame
+    count substituted. The counts have to vary -- these tests are about
+    severity ranking -- but nothing else about the line is invented.
+    """
+    template = next(ln for ln in recorded.lines("logcat_choreographer_jank") if "Skipped" in ln)
     store = SessionStore(base_dir=tmp_path / "anr-sessions")
     meta = store.create({"package": package} if package else {})
     store.claim_worker(meta.session_id, pid=99999)
@@ -129,15 +160,16 @@ def _seed_session(tmp_path, frames_list, package=None):
     with open(path, "a") as handle:
         for i, frames in enumerate(frames_list):
             raw = parse_logcat_anr(
-                f"06-17 14:30:5{i % 9}.123  1234  1234 I Choreographer: Skipped {frames} frames!"
+                re.sub(r"Skipped \d+ frames", f"Skipped {frames} frames", template)
             )
+            assert raw is not None
             event = build_normalised_event(raw, session_start_ms=0, current_ms=(i + 1) * 100)
             handle.write(event_to_jsonl(event) + "\n")
     return store, meta.session_id
 
 
-def test_stop_builds_summary_over_seeded_events(tmp_path, monkeypatch):
-    store, session_id = _seed_session(tmp_path, [35, 65, 150])
+def test_stop_builds_summary_over_seeded_events(recorded, tmp_path, monkeypatch):
+    store, session_id = _seed_session(recorded, tmp_path, [35, 65, 150])
     buster = anr_watcher.AnrBuster(store=store)
     # signal_worker would try os.kill the fake pid; stub it out.
     monkeypatch.setattr(store, "signal_worker", lambda *_a, **_k: False)
@@ -152,16 +184,16 @@ def test_stop_builds_summary_over_seeded_events(tmp_path, monkeypatch):
     assert summary.event_count == 3
 
 
-def test_stop_terse_is_one_line(tmp_path, monkeypatch):
-    store, session_id = _seed_session(tmp_path, [120])
+def test_stop_terse_is_one_line(recorded, tmp_path, monkeypatch):
+    store, session_id = _seed_session(recorded, tmp_path, [120])
     buster = anr_watcher.AnrBuster(store=store)
     monkeypatch.setattr(store, "signal_worker", lambda *_a, **_k: False)
     out = buster.stop(session_id, terse=True)
     assert "\n" not in out
 
 
-def test_stop_json_mode(tmp_path, monkeypatch):
-    store, session_id = _seed_session(tmp_path, [35, 150])
+def test_stop_json_mode(recorded, tmp_path, monkeypatch):
+    store, session_id = _seed_session(recorded, tmp_path, [35, 150])
     buster = anr_watcher.AnrBuster(store=store)
     monkeypatch.setattr(store, "signal_worker", lambda *_a, **_k: False)
     out = buster.stop(session_id, json_mode=True)

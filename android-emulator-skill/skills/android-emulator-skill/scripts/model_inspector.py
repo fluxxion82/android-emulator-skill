@@ -39,7 +39,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
 
 # Cap on bytes pulled from a device DB before we give up reading its schema
@@ -59,7 +59,12 @@ _RUN_AS_DENIED_MARKERS = (
     "unknown package",
     "run-as: package not found",
     "package not found",
-    "is not an application",
+    # Measured: the device prints "run-as: package not an application: <pkg>".
+    # This read "is not an application", with an "is" Android never emits, so a
+    # real denial fell through and the failure was reported as
+    # "app.db is not a valid SQLite database" -- blaming the database for a
+    # permissions problem. Recorded as run_as_not_an_application.
+    "not an application",
     "user is not debuggable",
     "permission denied",
 )
@@ -675,7 +680,10 @@ class LiveInspector:
 
     def _run_as(self, package: str, argv: list[str]) -> str:
         """Run ``adb shell run-as <pkg> <argv>`` returning text stdout."""
-        cmd = build_adb_command("shell", self.serial, "run-as", package, *argv)
+        quoted = [quote_for_device_shell(a) for a in argv]
+        cmd = build_adb_command(
+            "shell", self.serial, "run-as", quote_for_device_shell(package), *quoted
+        )
         try:
             result = subprocess.run(
                 cmd,
@@ -698,7 +706,10 @@ class LiveInspector:
 
     def _exec_out_run_as(self, package: str, argv: list[str]) -> bytes:
         """Run ``adb exec-out run-as <pkg> <argv>`` returning raw bytes."""
-        cmd = build_adb_command("exec-out", self.serial, "run-as", package, *argv)
+        quoted = [quote_for_device_shell(a) for a in argv]
+        cmd = build_adb_command(
+            "exec-out", self.serial, "run-as", quote_for_device_shell(package), *quoted
+        )
         try:
             result = subprocess.run(
                 cmd,

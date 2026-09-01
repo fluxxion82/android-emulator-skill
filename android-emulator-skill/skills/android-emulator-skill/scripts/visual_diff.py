@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageChops, ImageDraw
+    from PIL import Image, ImageChops
 
     _PIL_AVAILABLE = True
 except ImportError:
