@@ -14,6 +14,7 @@ separate directory.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from pathlib import Path
@@ -318,13 +319,30 @@ def _option_tokens(help_text: str) -> set[str]:
 
     Only tokens in the leading option column of a line count; anything in a
     help *description* is prose, not a flag.
+
+    Descriptions wrap, and a wrapped line can *begin* with something that looks
+    like a flag -- `anr_watcher`'s reads "... via 'logcat\n-d -t'", and
+    `test_recorder`'s reads "--clear: only delete sessions older than". Taking
+    those would have put `-d` into the set of flags anr_watcher accepts, which
+    it does not, so a doc claiming `-d` would have passed. argparse indents
+    every option entry to the same column and every description deeper, so the
+    entries are exactly the lines at the shallowest of those indents.
     """
-    tokens: set[str] = set()
+    candidates: list[tuple[int, str]] = []
     for line in help_text.splitlines():
         if not line.startswith((" ", "\t")):
             continue
         stripped = line.strip()
         if not stripped.startswith("-"):
+            continue
+        candidates.append((len(line) - len(line.lstrip()), stripped))
+    if not candidates:
+        return set()
+
+    option_column = min(indent for indent, _ in candidates)
+    tokens: set[str] = set()
+    for indent, stripped in candidates:
+        if indent != option_column:
             continue
         # "  --json, -j METAVAR   description..." -> the part before 2+ spaces.
         column = re.split(r"\s{2,}", stripped)[0]
@@ -333,6 +351,85 @@ def _option_tokens(help_text: str) -> set[str]:
             if flag.startswith("-"):
                 tokens.add(flag)
     return tokens
+
+
+@functools.cache
+def _help_text(script: str) -> str:
+    """`--help` for one script. Cached: several guards below ask for the same one."""
+    import subprocess
+    import sys
+
+    helped = subprocess.run(
+        [sys.executable, script, "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert helped.returncode == 0, f"{Path(script).name} --help failed: {helped.stderr[:200]}"
+    return helped.stdout
+
+
+_SCRIPT_ENTRY = re.compile(r"^\d+\.\s+\*\*([A-Za-z_]\w*\.py)\*\*")
+_BACKTICKED = re.compile(r"`([^`]*)`")
+_FLAG = re.compile(r"--?[A-Za-z][\w-]*")
+_OPTIONS_BULLET = "- Options:"
+
+
+def _documented_options(markdown: str) -> dict[str, set[str]]:
+    """{script: flags} from SKILL.md's `- Options:` bullets.
+
+    Structural on the doc side as well as the argparse side, and the two rules
+    that make it so are the whole point:
+
+    * Only an `- Options:` bullet is read -- not the entry's prose bullets.
+    * Within that bullet only *backticked* tokens count.
+
+    Three entries currently explain a flag that deliberately does not exist
+    ("there is no ``--list``", "There is no ``--text``", "the old
+    ``--list-channels`` never worked"). A guard that scanned an entry for
+    backticked flags, or the file for the string, would read those denials as
+    claims and fail on documentation that is correct -- and the repair for that
+    failure is to delete the honest sentence.
+    """
+    lines = markdown.splitlines()
+    documented: dict[str, set[str]] = {}
+    unattached: list[int] = []
+    current: str | None = None
+
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        entry = _SCRIPT_ENTRY.match(line)
+        if entry:
+            current = entry.group(1)
+
+        if not line.strip().startswith(_OPTIONS_BULLET):
+            index += 1
+            continue
+
+        body = line.strip()[len(_OPTIONS_BULLET) :]
+        indent = len(line) - len(line.lstrip())
+        cursor = index + 1
+        while cursor < len(lines):  # the bullet wraps; a wrap is indented deeper
+            wrapped = lines[cursor]
+            stripped = wrapped.strip()
+            if not stripped or stripped.startswith("-"):
+                break
+            if len(wrapped) - len(wrapped.lstrip()) <= indent:
+                break
+            body += " " + stripped
+            cursor += 1
+
+        if current is None:
+            unattached.append(index + 1)
+        else:
+            flags = {flag for chunk in _BACKTICKED.findall(body) for flag in _FLAG.findall(chunk)}
+            documented.setdefault(current, set()).update(flags)
+        index = cursor
+
+    assert not unattached, f"SKILL.md has an Options: bullet under no script entry: {unattached}"
+    return documented
 
 
 def test_every_script_offers_the_documented_json_contract():
@@ -351,25 +448,68 @@ def test_every_script_offers_the_documented_json_contract():
     substring-versus-structure mistake this repo keeps making -- a guard that
     matches its own documentation.
     """
-    import subprocess
-    import sys
-
     scripts = sorted((SKILL_ROOT / "scripts").glob("*.py"))
     assert scripts, "no scripts found"
 
-    missing = []
-    for script in scripts:
-        helped = subprocess.run(
-            [sys.executable, str(script), "--help"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        assert helped.returncode == 0, f"{script.name} --help failed: {helped.stderr[:200]}"
-        if "--json" not in _option_tokens(helped.stdout):
-            missing.append(script.name)
+    missing = [s.name for s in scripts if "--json" not in _option_tokens(_help_text(str(s)))]
 
     assert not missing, (
         f"these scripts do not offer --json, which CLAUDE.md states every script has: " f"{missing}"
+    )
+
+
+def test_every_flag_documented_in_skill_md_exists():
+    """SKILL.md is the interface an agent reads; a flag it invents costs a turn.
+
+    An agent does not run `--help` first -- it reads SKILL.md, picks the flag
+    named there, and runs it. So a documented flag that argparse never
+    registered is not a typo in a doc, it is a broken API, and the agent's
+    reward is `unrecognized arguments` with no hint at the real spelling.
+
+    Five were wrong at once, and each in a different way, which is why the
+    check has to be mechanical rather than a careful read:
+
+    * `screen_mapper --list` -- never existed; listing is the default output.
+    * `keyboard --text` -- the flag is `--type`; `--text` belongs to a
+      different script, so the guess is *plausible*, which is worse.
+    * `push_notification --title/--message/--id/--data/--method` -- the script
+      was rescoped to what adb can do, and its whole documented flag set was
+      left behind describing the version that was removed.
+    * `test_recorder --test-name/--output/--inline` -- likewise; it became
+      session-based (`--start`/`--step`/`--stop`).
+    * `visual_diff` -- documented as having no `--json` after it gained one.
+
+    The last two show the failure mode: the rescoping was deliberate and the
+    Status section even describes it, so nobody reading the file top to bottom
+    sees a contradiction. Only argparse knows.
+
+    Both sides are extracted structurally -- see `_documented_options` for why
+    matching prose instead would fail on the sentences that are *correct*.
+    """
+    scripts = sorted((SKILL_ROOT / "scripts").glob("*.py"))
+    assert scripts, "no scripts found"
+
+    documented = _documented_options(SKILL_MD.read_text(encoding="utf-8"))
+
+    # A script with no Options: bullet is not exempt from the guard, it is
+    # invisible to it -- which is exactly how visual_diff and anr_watcher drifted.
+    undocumented = [s.name for s in scripts if not documented.get(s.name)]
+    assert not undocumented, (
+        "these scripts have no `- Options:` bullet with backticked flags in "
+        f"SKILL.md, so nothing checks their documented interface: {undocumented}"
+    )
+
+    stray = sorted(set(documented) - {s.name for s in scripts})
+    assert not stray, f"SKILL.md documents options for scripts that do not exist: {stray}"
+
+    wrong: dict[str, list[str]] = {}
+    for script in scripts:
+        real = _option_tokens(_help_text(str(script)))
+        bogus = sorted(documented[script.name] - real)
+        if bogus:
+            wrong[script.name] = bogus
+
+    assert not wrong, (
+        "SKILL.md documents flags that argparse does not accept; an agent "
+        f"following it gets 'unrecognized arguments': {wrong}"
     )

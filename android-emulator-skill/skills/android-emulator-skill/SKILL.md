@@ -118,9 +118,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 #### Navigation & Interaction (4 scripts)
 12. **screen_mapper.py** - Analyze current screen and list interactive elements
     - Count elements by type
-    - List buttons, EditTexts, etc.
+    - Listing is the default, not a mode: **there is no `--list`.** The bare
+      command prints the summary; `--verbose` expands it to the per-element
+      breakdown, `--hints` adds navigation suggestions.
     - Token-efficient summaries
-    - Options: `--serial`, `--verbose`, `--json`, `--list`
+    - Options: `--serial`/`-s`, `--verbose`/`-v`, `--hints`, `--json`
 
 13. **navigator.py** - Find and interact with elements semantically
     - Find by text, type, resource ID
@@ -146,12 +148,18 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--swipe`, `--from-edge`, `--duration`, `--long-press`, `--scroll`, `--serial`, `--json`
 
 15. **keyboard.py** - Text input and hardware buttons
-    - Type text
-    - Press hardware keys (back, home, enter, etc.)
-    - Clear text
-    - Options: `--text`, `--key`, `--button`, `--clear`, `--serial`, `--json`
+    - Type text with **`--type`**. There is no `--text` — that flag belongs to
+      `push_notification.py`, and guessing it here costs a turn. `--delay N`
+      types one character at a time for fields that debounce.
+    - Press special keys (`--key enter`, repeated with `--count N`) and hardware
+      buttons (`--button back`); `--keys a,b` presses a sequence. `--key` and
+      `--button` share one name table, so either accepts either name.
+    - `--clear N` deletes N characters; `--hide-keyboard` / `--dismiss` put the
+      soft keyboard away.
+    - Options: `--type`, `--delay`, `--key`, `--count`, `--keys`, `--button`,
+      `--clear`, `--hide-keyboard`, `--dismiss`, `--serial`/`-s`, `--json`
 
-#### Testing & Analysis (5 scripts) ✓ COMPLETE
+#### Testing & Analysis (4 scripts) ✓ COMPLETE
 16. **accessibility_audit.py** ⭐ NEW - WCAG compliance checking
     - Missing content descriptions
     - Touch target size verification
@@ -165,15 +173,27 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Pixel-perfect comparison
     - Highlight differences
     - Generate diff images
-    - Usage: `visual_diff.py BASELINE CURRENT [--output DIR] [--threshold N] [--details]`
-    - Note: the two images are **positional**; there is no `--json` (use `--details`)
+    - Usage: `visual_diff.py BASELINE CURRENT [--output DIR] [--threshold N] [--json]`
+    - Note: the two images are **positional**. `--json` now emits the full
+      report, so this script keeps the same contract as every other one;
+      `--details` survives as a deprecated alias for callers written before it.
+    - Options: `--output`, `--threshold`, `--json`, `--details`
 
-18. **test_recorder.py** ⭐ NEW - Automatically document test execution
-    - Record test steps with screenshots
-    - Capture UI hierarchy per step
-    - Generate test reports (JSON + Markdown)
-    - Inline mode for vision-based testing
-    - Options: `--test-name`, `--output`, `--serial`, `--inline`, `--size`, `--app-name`
+18. **test_recorder.py** - Document a test run, step by step
+    - **Session-based, one process per step** — there is no `--test-name`,
+      `--output` or `--inline`. `--start NAME` opens a session and prints its
+      id; each later `--step "description"` captures the current screen into
+      it; `--stop` writes `report.md` + `manifest.json`. `--step` and `--stop`
+      default to the newest session, or target one with `--session ID`.
+    - Each step records a screenshot and the UI hierarchy, plus optional
+      `--screen`, `--state` and `--assert` (`--assert-failed` marks it failed).
+    - Sessions live under `~/.android-emulator-skill`, not in an output
+      directory you pass: retrieve with `--list` / `--get-details ID`, remove
+      with `--clear [--older-than 24h]`.
+    - Options: `--start`, `--step`, `--stop`, `--list`, `--get-details`,
+      `--clear`, `--session`, `--serial`, `--app-name`, `--size`, `--screen`,
+      `--state`, `--assert`, `--assert-failed`, `--failed`, `--older-than`,
+      `--verbose`, `--json`
 
 19. **app_state_capture.py** ⭐ NEW - Complete debugging snapshots
     - Capture screenshot + UI hierarchy + logs + app info
@@ -181,7 +201,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - All-in-one debugging artifact
     - Options: `--package`, `--output`, `--serial`, `--logs`, `--no-logs`, `--screenshot-size`, `--json`
 
-#### Advanced Testing & Permissions (4 scripts) ✓ COMPLETE
+#### Advanced Testing & Permissions (3 scripts) ✓ COMPLETE
 20. **privacy_manager.py** ⭐ NEW - App permission management
     - Grant/revoke permissions
     - List app permissions
@@ -189,7 +209,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Batch operations
     - Options: `--grant`, `--revoke`, `--list`, `--package`, `--serial`, `--list-permissions`, `--json`
 
-22. **status_bar.py** ⭐ NEW - Status bar control
+21. **status_bar.py** ⭐ NEW - Status bar control
     - Set battery level and charging state
     - Set WiFi/mobile signal strength
     - Set time display (for consistent screenshots)
@@ -199,65 +219,82 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       bar *draws*. It does not change what the app reads from the system
       (`BatteryManager` still reports the real level).
 
-23. **push_notification.py** ⭐ NEW - Push notification simulation
-    - Send test notifications
-    - List notification channels
-    - Multiple delivery methods
-    - Options: `--package`, `--title`, `--message`, `--id`, `--data`, `--method`, `--serial`, `--json`
-    - ⚠️ Being reworked. It cannot deliver into an app's own FCM handler --
-      no adb path reaches that -- and `--list-channels` never worked, because
-      `cmd notification` has no `list channels` subcommand.
+22. **push_notification.py** - Post into the shade, and read back what is posted
+    - Rescoped in v0.5.0 to what adb can actually do. It no longer claims to
+      send an app's notifications: `--post` posts via `cmd notification post`,
+      and the result is owned by **com.android.shell** on channel `shell_cmd`,
+      *not* by the app under test. The app's own channel, receiver and
+      rendering are therefore not exercised. It is still the way to drive a
+      NotificationListenerService, the shade UI, or an agent that reacts to a
+      notification. `--tag` is the title and key, `--text` the body.
+    - `--list` reads back what is really posted, by any package — the check
+      that a notification exists rather than that a command exited 0.
+      `--expect-package PKG` turns that read-back into an exit status.
+    - `--grant-permission` / `--revoke-permission` toggle `POST_NOTIFICATIONS`
+      (API 33+) on `--package`, for exercising the runtime-permission path.
+    - Options: `--post`, `--list`, `--grant-permission`, `--revoke-permission`,
+      `--tag`, `--text`, `--no-verify`, `--expect-package`, `--package`,
+      `--serial`, `--json`, `--verbose`
+    - ⚠️ It cannot deliver into an app's own FCM handler — no adb path reaches
+      that, because the c2dm receiver is protected by a permission held by
+      Play services, not by the shell user. Send through FCM instead. Channels
+      cannot be listed either: `cmd notification` has no `list channels`
+      subcommand, which is why the old `--list-channels` never worked.
 
-#### Discovery & Device State (6 scripts) ⭐ NEW
+#### Discovery & Device State (14 scripts) ⭐ NEW
 
-24. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
+23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
 
-25. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
+24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
     - Options: `--get-details`, `--device-type`/`--name`, `--json`
 
-26. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
+25. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
-27. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
+26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
     - Options: `--res DIR`, `--source DIR`, `--locale CODE`, `--strict`, `--json`, `--verbose`
 
-28. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
+27. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
     - Options: `--theme {light,dark}`, `--text-size {small,default,large,xl}`, `--font-scale`, `--locale`, `--reset`, `--serial`, `--json`
 
-29. **location.py** - Simulate GPS on an emulator via `adb emu geo fix` (fixed coords, city presets, GPX route replay). Emulator-only.
+28. **location.py** - Simulate GPS on an emulator via `adb emu geo fix` (fixed coords, city presets, GPX route replay). Emulator-only.
     - Options: `--lat`/`--lng`, `--city`, `--gpx FILE`, `--interval`/`--speed`, `--clear`, `--list-cities`, `--serial`, `--json`
 
-30. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
+29. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
     - List/read files, dump `shared_prefs` XML, list databases and dump SQLite schema (Room == SQLite), export a snapshot
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
 
-31. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
+30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
     - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
-32. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
+31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
     - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
-    - Legacy: `--watch [--duration N]`, `--since 5m`; plus `--budget-tokens`, `--terse`, `--json`
+    - Legacy: `--watch [--duration N]`, `--since 5m`
+    - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
+      `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,
+      `--duration`, `--min-frames`, `--top`, `--all`, `--budget-tokens`,
+      `--cluster`, `--raw`, `--older-than`, `--terse`, `--json`
 
-33. **sms.py** ⭐ NEW - Deliver an inbound SMS to an emulator and **prove it arrived**. Emulator-only.
+32. **sms.py** ⭐ NEW - Deliver an inbound SMS to an emulator and **prove it arrived**. Emulator-only.
     - `--send` reads the inbox back and reports `accepted` and `delivered` separately: the console's `OK` means the command was taken, not that a message exists. Delivery is asynchronous (~2s measured), so it polls.
     - `--otp` extracts a one-time code from the newest message and prints the message it came from, so the heuristic can be checked.
     - Options: `--send --to NUM --body TEXT [--no-verify]`, `--list [--limit N]`, `--otp`, `--serial`, `--json`, `--verbose`
 
-34. **snapshot.py** ⭐ NEW - Save/load/delete emulator snapshots (`adb emu avd snapshot`). A ~2s state reset in place of a 60s reboot. Emulator-only.
+33. **snapshot.py** ⭐ NEW - Save/load/delete emulator snapshots (`adb emu avd snapshot`). A ~2s state reset in place of a 60s reboot. Emulator-only.
     - A failed load is reported as a failure, which is the whole point: `adb emu` exits 0 even when it answers `KO`, so a restore that did not happen would otherwise be reported as success and the next test would run against unknown state.
     - Options: `--list`, `--save NAME`, `--load NAME`, `--delete NAME`, `--no-verify`, `--timeout`, `--serial`, `--json`, `--verbose`
 
-35. **crash_triage.py** ⭐ NEW - Parse the dedicated crash buffer (`logcat -b crash`) into structured crashes, grouped by fault.
+34. **crash_triage.py** ⭐ NEW - Parse the dedicated crash buffer (`logcat -b crash`) into structured crashes, grouped by fault.
     - Groups repeats by package + exception + signature frame (a crash loop otherwise floods the output), and names the frame most useful for triage, **labelled with the basis for the choice** — including "no app frame; every frame is framework code" when that is the honest answer.
     - Exit status answers "did triage run", not "did anything crash" — branch on `crash_count` in `--json`, or pass `--fail-on-crash`.
     - Options: `--package PKG`, `--clear`, `--fail-on-crash`, `--serial`, `--json`, `--verbose`
 
-36. **logs.py** ⭐ NEW - One entry point for reading logs; routes on the question being asked.
+35. **logs.py** ⭐ NEW - One entry point for reading logs; routes on the question being asked.
     - `logs.py tail` (main buffers) → `log_monitor.py`; `logs.py crashes` (`-b crash`) → `crash_triage.py`; `logs.py anr` (ANR/jank, incl. session mode) → `anr_watcher.py`.
     - Arguments are passed through verbatim, so each verb takes the full flag set of the script it delegates to, and those scripts remain callable unchanged.
     - Options: `<verb> [verb options]`, `--json` (routing table), `--help`
 
-37. **avd.py** ⭐ NEW - One entry point for the emulator/AVD lifecycle; routes on the question being asked.
+36. **avd.py** ⭐ NEW - One entry point for the emulator/AVD lifecycle; routes on the question being asked.
     - `avd.py list` → `device_list.py`; `pick` → `emulator_selector.py`; `create` → `emulator_create.py`; `start` → `emulator_boot.py`; `stop` → `emulator_shutdown.py`; `reset` (wipe data, keep the AVD) → `emulator_erase.py`; `delete` (remove the AVD) → `emulator_delete.py`.
     - `reset` and `delete` are separate verbs because they destroy different things, and a near-miss between them is asked about rather than guessed.
     - Arguments are passed through verbatim, so each verb takes the full flag set of the script it delegates to — including its own confirmation flag (`delete --yes`, `reset --force`) — and those scripts remain callable unchanged.
@@ -303,7 +340,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### ⚙️ Advanced
 - **privacy_manager.py** - Test permission flows
-- **push_notification.py** - Test notification handling
+- **push_notification.py** - Post to the shade as the shell; verify what an app posted
 - **status_bar.py** - Fine-grained control
 - **emulator_create/delete/erase.py** - CI/CD provisioning
 - **sms.py** - Inbound SMS, and OTP login flows end to end (emulator-only)
@@ -330,17 +367,22 @@ python3 "$SKILL_DIR/scripts/screen_mapper.py"
 ```
 
 ### Automated Testing Flow
+
+`test_recorder.py` is driven from the shell, one process per step — the session
+is stored on disk, so nothing has to be held open between commands.
+
 ```bash
-# 1. Start recording
-recorder = TestRecorder("Login Flow")
+# 1. Start recording; the session id is printed, and later steps default to it
+python3 "$SKILL_DIR/scripts/test_recorder.py" --start "Login Flow" --app-name MyApp
 
-# 2. Execute test steps
-recorder.step("Launch app", screen_name="Splash")
+# 2. Execute test steps, capturing the screen after each interaction
+python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Launch app" --screen Splash
 # ... interactions ...
-recorder.step("Verify logged in", screen_name="Home")
+python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Verify logged in" \
+    --screen Home --assert "Home screen shown"
 
-# 3. Finish
-recorder.finish(passed=True)
+# 3. Finish: writes report.md + manifest.json (add --failed to mark it failed)
+python3 "$SKILL_DIR/scripts/test_recorder.py" --stop
 ```
 
 ### CI/CD Flow
@@ -511,7 +553,9 @@ planned rather than an invented percentage.
 
 **Permission Testing**: Programmatic grant/revoke of runtime permissions.
 
-**Notification Testing**: Simulate push notifications for testing handling logic.
+**Notification Testing**: Post a notification into the shade as the shell, and
+read back what a package has actually posted. Delivering into an app's own FCM
+handler is not reachable from adb — see `push_notification.py` above.
 
 ## Status & Roadmap
 
