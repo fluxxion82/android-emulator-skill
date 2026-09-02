@@ -48,10 +48,43 @@ jobs:
     name: Emulator lane
     uses: ./.github/workflows/emulator.yml
 
+  # The four manifests must agree with the tag. This ran as a SEPARATE
+  # workflow on the same trigger, so a mismatched version produced a red
+  # check *beside* a successfully uploaded zip -- the check reported the
+  # problem after the artifact had already shipped.
+  version:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Manifests must agree with the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected="${TAG#v}"
+          fail=0
+          check() {
+            found=$(grep -oE "$2" "$1" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+            if [ "$found" != "$expected" ]; then
+              echo "::error file=$1::expected $expected, found '${found:-none}'"
+              fail=1
+            else
+              echo "ok  $1 -> $found"
+            fi
+          }
+          check android-emulator-skill/skills/android-emulator-skill/SKILL.md '^version: *[0-9.]+'
+          check android-emulator-skill/.claude-plugin/plugin.json '"version" *: *"[0-9.]+"'
+          check .claude-plugin/marketplace.json '"version" *: *"[0-9.]+"'
+          check pyproject.toml '^version *= *"[0-9.]+"'
+          exit $fail
+
   package:
     name: Package skill and upload to release
     runs-on: ubuntu-latest
-    needs: [verify, emulator]
+    needs: [verify, emulator, version]
 
     steps:
       - name: Checkout repository
@@ -70,7 +103,10 @@ jobs:
           cd android-emulator-skill
           zip -r ../android-emulator-skill-${{ github.ref_name }}.zip . \
             -x "*.pyc" \
+            -x "*/__pycache__/*" \
             -x "__pycache__/*" \
+            -x "*/__pycache__" \
+            -x "__pycache__" \
             -x "*.DS_Store"
           cd ..
           echo "📦 Created package: android-emulator-skill-${{ github.ref_name }}.zip"

@@ -142,6 +142,44 @@ def test_a_release_cannot_be_cut_without_running_the_tests():
     assert "emulator" in needs, "packaging no longer requires the device-backed lane"
 
 
+def test_a_mismatched_version_cannot_ship_an_artifact():
+    """Version consistency must GATE packaging, not merely report on it.
+
+    `validate-version.yml` runs on the same `release: published` trigger as
+    `release.yml`, but as a separate workflow -- so tagging v0.6.0 with the
+    manifests still saying 0.5.0 produced a red check BESIDE a successfully
+    uploaded zip. The check reported the problem after the artifact had
+    shipped, which is the same shape as a test that runs after the thing it
+    was meant to prevent.
+    """
+    import yaml
+
+    release = yaml.safe_load((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
+    needs = release["jobs"]["package"].get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
+
+    assert "version" in needs, (
+        "packaging does not require the version check, so a tag that disagrees "
+        "with the manifests can still upload a release asset"
+    )
+
+    steps = release["jobs"]["version"]["steps"]
+    commands = " ".join(step.get("run", "") for step in steps)
+    for manifest in ("SKILL.md", "plugin.json", "marketplace.json", "pyproject.toml"):
+        assert manifest in commands, f"the version gate does not check {manifest}"
+
+
+def test_the_release_zip_excludes_bytecode_directories():
+    """`-x "__pycache__/*"` misses nested and empty __pycache__ entries.
+
+    Not a CI blocker -- a fresh checkout has none -- but the exclusion did not
+    do what it said, and a zip built on a developer machine carried empty
+    `scripts/__pycache__/` entries.
+    """
+    release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+    assert '-x "*/__pycache__/*"' in release, "nested __pycache__ is not excluded"
+
+
 def test_the_release_gate_actually_runs_the_suites_it_claims_to():
     """`needs:` on a job that tests nothing would satisfy the test above."""
     release = _yaml("release.yml")
