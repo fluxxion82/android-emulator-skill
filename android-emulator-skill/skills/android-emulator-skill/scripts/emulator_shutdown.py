@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 
+from common import adb_exec
 from common.device_utils import build_adb_command, get_connected_devices
 from common.env_config import env_float, env_int
 
@@ -173,6 +174,10 @@ def resolve_serial_by_avd_name(avd_name: str) -> str | None:
 
     Returns:
         The matching emulator serial, or None if no running emulator uses it.
+
+    Raises:
+        adb_exec.AdbError: If adb cannot be run or the device query fails. Left
+            to propagate to ``main``, which prints the error's own remedy.
     """
     devices = get_connected_devices()
     emulators = [d for d in devices if d["type"] == "emulator" and d["state"] == "device"]
@@ -191,6 +196,10 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
 
     Returns:
         (success_count, fail_count) tuple
+
+    Raises:
+        adb_exec.AdbError: If adb cannot be run or the device query fails. Left
+            to propagate to ``main``, which prints the error's own remedy.
     """
     devices = get_connected_devices()
     emulators = [d for d in devices if d["type"] == "emulator"]
@@ -210,6 +219,17 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
 
 
 def main():
+    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    try:
+        _run()
+    except adb_exec.AdbError as error:
+        # run_adb raises errors whose message already names a remedy ("pass
+        # --serial ...", "start an emulator ..."). That message is the point.
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run():
     parser = argparse.ArgumentParser(
         description="Shutdown Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
