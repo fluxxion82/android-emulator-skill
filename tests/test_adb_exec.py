@@ -12,9 +12,18 @@ Two problems this replaces, measured with AST across the skill:
    "pass --serial emulator-5554" does. Every error raised here must name a
    remedy, and that is asserted below rather than left to good intentions.
 
-Error strings are matched against recorded adb output where a fixture exists —
-`adb_device_not_found.txt` proves the prefix is `error:` and not `adb:`, which
-is the kind of detail that gets hardcoded wrong.
+Error strings are matched against recorded adb output where a fixture exists,
+and the two profiles disagree about the prefix: `adb_shell_device_not_found`
+(emulator-api35) is `adb: device '...' not found`, while
+`adb_device_not_found` (pixel4xl-api33) is `error: ...`. The matcher is
+therefore prefix-AGNOSTIC, and anchoring it on either would silently stop
+classifying the other profile's failure.
+
+This docstring used to claim the fixture "proves the prefix is `error:` and not
+`adb:`". It proves no such thing — the other profile shows the opposite. Which
+is the point: prose asserting a precision the code does not have is the same
+failure this suite exists to catch, just moved from the assertion into the
+comment above it.
 """
 
 from __future__ import annotations
@@ -140,7 +149,12 @@ def test_multiple_devices_is_typed_and_names_the_remedy(fake_run):
 
 
 def test_device_not_found_is_typed_and_names_the_remedy(fake_run, recorded_anywhere):
-    """Matched against real adb output: the prefix is 'error:', not 'adb:'.
+    """Matched against real adb output, without depending on the prefix.
+
+    This fixture happens to carry `error:`; the emulator profile's
+    `adb_shell_device_not_found` carries `adb:` for the same condition. The
+    assertion below does not care, and must not: see
+    `test_the_not_found_match_is_prefix_agnostic`, which runs both.
 
     This is host adb-client output, identical whatever device is attached,
     so it is looked up in whichever profile happens to hold it.
@@ -313,3 +327,87 @@ def test_a_flag_passed_as_the_serial_is_rejected(fake_run):
     fake_run()
     with pytest.raises(ValueError, match="serial"):
         adb_exec.run_adb("devices", "-l")
+
+
+# ---------------------------------------------------------------------------
+# adb can fail to run in more ways than "missing".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "situation"),
+    [
+        (PermissionError(13, "Permission denied"), "a non-executable file named adb"),
+        (IsADirectoryError(21, "Is a directory"), "the SDK root on PATH, so adb is a directory"),
+        (NotADirectoryError(20, "Not a directory"), "a PATH entry that is not a directory"),
+    ],
+)
+def test_adb_that_cannot_be_executed_is_an_adb_error(monkeypatch, error, situation):
+    """Only FileNotFoundError was caught, so the rest escaped as tracebacks.
+
+    Reproduced before fixing, with nothing but a `chmod 000` stub on PATH:
+
+        PermissionError: [Errno 13] Permission denied: 'adb'
+
+    reaching the user instead of a remedy. The directory case is the same shape
+    as the `emulator` bug -- put the SDK ROOT on PATH rather than
+    `platform-tools`, and the name resolves to a directory.
+
+    Raised as AdbNotInstalledError rather than a new type: callers already
+    handle it, and the remedy ("point PATH at platform-tools") is the same.
+    """
+
+    def _raise(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _raise)
+
+    with pytest.raises(adb_exec.AdbNotInstalledError) as excinfo:
+        adb_exec.run_adb("devices", None)
+
+    message = str(excinfo.value)
+    assert "platform-tools" in message, f"the remedy is missing for {situation}"
+    assert "not executable" in message or "not on PATH" in message
+
+
+def test_the_not_found_match_is_prefix_agnostic(recorded_anywhere):
+    """The two profiles disagree about the prefix, so neither may be anchored on.
+
+    `adb -s <unknown> shell` prints `adb: device '...' not found` on
+    emulator-api35 and `error: device '...' not found` on pixel4xl-api33. Both
+    are recorded. A matcher anchored on either prefix silently stops
+    classifying the other profile's failure, and the module docstring used to
+    claim it was anchored on `error:` -- documentation asserting a precision the
+    code never had.
+    """
+    for name in ("adb_shell_device_not_found", "adb_device_not_found"):
+        text = recorded_anywhere(name)
+        error = adb_exec._classify(text, "no-such-serial-xyz")
+        assert isinstance(
+            error, adb_exec.DeviceNotFoundError
+        ), f"{name} ({text.strip()!r}) was not classified as a missing device"
+
+
+def test_a_requested_serial_is_named_even_when_nothing_is_attached(monkeypatch):
+    """Asking for a serial with no devices attached must still name the serial.
+
+    The "not found" branch names it, but only when something IS attached, so
+    the no-devices case dropped the one detail the caller supplied and
+    answered "No devices connected". An agent's next move differs completely
+    between "I named the wrong device" and "there is no device", and the
+    message has to tell it which.
+
+    Surfaced by test_agent_task_e2e's actionable-error test on a CI runner
+    whose emulator had died mid-run -- the assertion that the error mentions
+    the requested serial was right, and the code was not.
+    """
+    from common import device_utils
+
+    monkeypatch.setattr(device_utils, "get_connected_devices", lambda: [])
+
+    with pytest.raises(RuntimeError) as excinfo:
+        device_utils.resolve_device_identifier("no-such-device")
+
+    message = str(excinfo.value)
+    assert "no-such-device" in message, f"the requested serial was dropped: {message}"
+    assert "adb devices" in message, "the remedy is missing"

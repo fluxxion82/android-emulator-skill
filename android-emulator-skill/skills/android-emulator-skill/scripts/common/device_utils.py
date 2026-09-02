@@ -211,10 +211,17 @@ def resolve_device_identifier(identifier: str | None) -> str | None:
     available = [d for d in devices if d["state"] == "device"]
 
     if not available:
+        # Name what the caller asked for. The "not found" branch below does,
+        # but only when something is attached -- so asking for a specific
+        # serial with nothing plugged in used to get a generic "No devices
+        # connected", dropping the one detail the caller supplied. For an
+        # agent, whose next move depends on whether it named the wrong device
+        # or has no device at all, that distinction is the whole answer.
         raise RuntimeError(
-            "No devices connected. Start an emulator or connect a device:\n"
-            "  emulator -avd <device-name>\n"
-            "  adb devices"
+            f"Device '{identifier}' was requested, but no devices are connected. "
+            f"Start an emulator or connect a device:\n"
+            f"  emulator -avd <device-name>\n"
+            f"  adb devices"
         )
 
     # Exact match

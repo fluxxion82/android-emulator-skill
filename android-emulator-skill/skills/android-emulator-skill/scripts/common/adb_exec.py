@@ -26,9 +26,14 @@ Design notes
 - **A non-zero exit is not, by itself, an error.** ``adb shell exit 7``
   propagates 7 (verified on a device); plenty of commands answer that way. Use
   ``check=True`` when a non-zero status is genuinely a failure.
-- Error strings are matched against recorded adb output where a fixture exists.
-  ``adb_device_not_found.txt`` is why the "not found" match is anchored on
-  ``error:`` rather than the ``adb:`` prefix a guess would have used.
+- Error strings are matched against recorded adb output where a fixture exists,
+  and the two profiles disagree about the prefix: ``adb -s <unknown> shell``
+  prints ``adb: device '...' not found`` on emulator-api35, while
+  ``adb_device_not_found.txt`` on pixel4xl-api33 prints ``error: ...``. So the
+  match is deliberately prefix-AGNOSTIC ("not found" and "device"); anchoring on
+  either prefix would break the other profile. This docstring previously claimed
+  the match was anchored on ``error:``, which the code never did -- a doc
+  asserting a precision the code does not have.
 """
 
 from __future__ import annotations
@@ -296,10 +301,23 @@ def run_adb(
             timeout=budget,
             check=False,
         )
-    except FileNotFoundError as exc:
+    except OSError as exc:
+        # OSError, not just FileNotFoundError. Exec can fail several ways that
+        # are all "adb could not be run", and only one of them is "missing":
+        #
+        #   PermissionError    a non-executable file named adb is found first
+        #   IsADirectoryError  `adb` resolves to a directory -- which is exactly
+        #                      what happens when the SDK ROOT is on PATH, the
+        #                      same shape as the `emulator` directory bug
+        #
+        # Both were reproduced: with only such a stub on PATH, the raw
+        # PermissionError escaped this function and reached the user as a
+        # traceback instead of a remedy.
         raise AdbNotInstalledError(
-            "adb is not on PATH. Install the Android SDK platform-tools and add "
-            'them to PATH, e.g. export PATH="$ANDROID_HOME/platform-tools:$PATH".'
+            "adb could not be run: it is not on PATH, or the file found is not "
+            "executable. Install the Android SDK platform-tools and add them to "
+            'PATH, e.g. export PATH="$ANDROID_HOME/platform-tools:$PATH" -- note '
+            "that is the platform-tools directory, not the SDK root."
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise AdbTimeoutError(

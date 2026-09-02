@@ -43,6 +43,22 @@ RETRY_DELAY_SECONDS = 0.5
 
 _IDLE_ERROR = "could not get idle state"
 
+# The other transient uiautomator failure, and the one that only showed up in
+# CI: `ERROR: null root node returned by UiTestAutomationBridge.` It means no
+# window was focused yet -- the app had been launched but had not drawn. A
+# developer machine rarely produces it because the screen is already settled;
+# a headless runner produces it readily. Retried for the same reason as the
+# idle error: waiting a moment is the whole fix.
+_NO_ROOT_ERROR = "null root node"
+
+_TRANSIENT_ERRORS = (_IDLE_ERROR, _NO_ROOT_ERROR)
+
+
+def _is_transient(payload: str) -> bool:
+    """Whether a failed dump is worth retrying."""
+    lowered = payload.lower()
+    return any(marker in lowered for marker in _TRANSIENT_ERRORS)
+
 
 class HierarchyError(RuntimeError):
     """The UI hierarchy could not be captured or parsed.
@@ -120,11 +136,18 @@ def capture_hierarchy(
 
         # Only the idle-state failure is worth retrying; anything else will not
         # fix itself and retrying just delays the error.
-        if _IDLE_ERROR not in last_payload.lower():
+        if not _is_transient(last_payload):
             break
         if attempt < attempts - 1:
             time.sleep(RETRY_DELAY_SECONDS)
 
+    if _NO_ROOT_ERROR in last_payload.lower():
+        raise HierarchyError(
+            f"uiautomator found no focused window after {attempts} attempts "
+            f'("null root node returned by UiTestAutomationBridge"). Nothing is '
+            f"drawn yet, or the display is off: launch the app first, and check "
+            f"`adb shell dumpsys window | grep mCurrentFocus`."
+        )
     if _IDLE_ERROR in last_payload.lower():
         raise HierarchyError(
             f"uiautomator could not get an idle state after {attempts} attempts. "
