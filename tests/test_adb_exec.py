@@ -386,3 +386,28 @@ def test_the_not_found_match_is_prefix_agnostic(recorded_anywhere):
         assert isinstance(
             error, adb_exec.DeviceNotFoundError
         ), f"{name} ({text.strip()!r}) was not classified as a missing device"
+
+
+def test_a_requested_serial_is_named_even_when_nothing_is_attached(monkeypatch):
+    """Asking for a serial with no devices attached must still name the serial.
+
+    The "not found" branch names it, but only when something IS attached, so
+    the no-devices case dropped the one detail the caller supplied and
+    answered "No devices connected". An agent's next move differs completely
+    between "I named the wrong device" and "there is no device", and the
+    message has to tell it which.
+
+    Surfaced by test_agent_task_e2e's actionable-error test on a CI runner
+    whose emulator had died mid-run -- the assertion that the error mentions
+    the requested serial was right, and the code was not.
+    """
+    from common import device_utils
+
+    monkeypatch.setattr(device_utils, "get_connected_devices", lambda: [])
+
+    with pytest.raises(RuntimeError) as excinfo:
+        device_utils.resolve_device_identifier("no-such-device")
+
+    message = str(excinfo.value)
+    assert "no-such-device" in message, f"the requested serial was dropped: {message}"
+    assert "adb devices" in message, "the remedy is missing"
