@@ -152,6 +152,120 @@ def test_list_installed_system_images_parses_sdkmanager(monkeypatch, recorded):
     assert emulator_create.latest_api_level(images) == 35
 
 
+def test_list_system_images_reads_both_sections_of_sdkmanager_list(monkeypatch, recorded):
+    """AVD-LIST-IMAGES: `--list-images` read a format `sdkmanager --list` never printed.
+
+    It required `system-images;` lines split on `|`; sdkmanager prints
+    slash-separated paths in whitespace-padded columns, so the listing was
+    empty on every machine. `--list` also differs from `--list_installed` in the
+    one way that matters here: it prints an `Available packages:` section after
+    the installed one, and only the section boundary says which images are
+    already on disk.
+    """
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=recorded.text("sdkmanager_list"), stderr=""
+        )
+
+    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+
+    images = creator.list_system_images()
+
+    assert captured["cmd"] == ["/fake/sdkmanager", "--list"]
+    assert images, "no images parsed from real sdkmanager output"
+    assert all(image["id"].startswith("system-images;") for image in images)
+    assert any(image["installed"] for image in images)
+    assert any(not image["installed"] for image in images)
+    # build-tools, platforms, ndk and add-ons share the listing and are not images.
+    assert not any("build-tools" in image["id"] for image in images)
+
+
+def test_the_installed_section_of_list_agrees_with_list_installed(monkeypatch, recorded):
+    """Two recordings of the same machine, cross-checked.
+
+    `sdkmanager --list` and `sdkmanager --list_installed` were captured minutes
+    apart from one SDK, so the images `--list` files under `Installed packages:`
+    must be exactly the ones `--list_installed` prints. This is what pins the
+    section tracking: a parser that ignored the headers would mark all 325 rows
+    installed and still satisfy every other assertion here.
+    """
+    creator = emulator_create.EmulatorCreator()
+
+    from_list = {
+        image["id"]
+        for image in emulator_create.parse_system_images(recorded.text("sdkmanager_list"))
+        if image["installed"]
+    }
+    from_list_installed = {
+        image["id"]
+        for image in emulator_create.parse_system_images(recorded.text("sdkmanager_list_installed"))
+    }
+
+    assert from_list == from_list_installed, from_list ^ from_list_installed
+    assert len(from_list) < len(
+        emulator_create.parse_system_images(recorded.text("sdkmanager_list"))
+    ), "everything came back installed; the section headers were ignored"
+    assert creator is not None
+
+
+def test_an_api_token_is_not_always_an_integer(recorded):
+    """`android-34-ext12`, `android-36.1`, `android-37.2-beta1`, `android-CANARY`.
+
+    76 of the 325 image rows in the recording have an API token that is not a
+    bare integer. A parser demanding `android-(\\d+)` drops a quarter of the
+    listing, so the token is kept verbatim in `api` and `api_level` is left None
+    when it is not an integer -- `create()` builds its package id as
+    `system-images;android-{api_level};...`, so calling `34-ext12` "API 34"
+    would name an image that is not installed.
+    """
+    images = emulator_create.parse_system_images(recorded.text("sdkmanager_list"))
+    levels = {image["api"]: image["api_level"] for image in images}
+    ids = {image["id"] for image in images}
+
+    assert "34-ext12" in levels, sorted(levels)[:20]
+    assert levels["34-ext12"] is None
+    assert levels["CANARY"] is None
+    assert levels["34"] == 34
+    assert "system-images;android-34-ext12;google_apis_playstore;x86_64" in ids
+    # And they are listed, not silently dropped.
+    assert sum(1 for image in images if image["api_level"] is None) > 0
+
+
+def test_list_system_images_falls_back_to_the_local_listing_when_list_fails(monkeypatch, recorded):
+    """`--list` refreshes the remote package index, so it fails offline.
+
+    Returning [] there reads as "this machine has no system images", which is
+    the same wrong answer the defect gave. The local `--list_installed` still
+    works with no network, so a failed `--list` degrades to it.
+    """
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+
+    attempted: list = []
+
+    def fake_run(cmd, **kwargs):
+        attempted.append(cmd)
+        if "--list" in cmd:
+            raise subprocess.CalledProcessError(1, cmd, stderr="Connection refused")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=recorded.text("sdkmanager_list_installed"), stderr=""
+        )
+
+    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+
+    images = creator.list_system_images()
+
+    assert [cmd[-1] for cmd in attempted] == ["--list", "--list_installed"]
+    assert images, "an offline listing came back empty instead of local-only"
+    assert all(image["installed"] for image in images)
+
+
 # --- Delta 2: auto-generated AVD name --------------------------------------
 
 

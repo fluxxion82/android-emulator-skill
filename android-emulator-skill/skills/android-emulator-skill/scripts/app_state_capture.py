@@ -17,6 +17,7 @@ Usage Examples:
 """
 
 import argparse
+import contextlib
 import json
 import re
 import sys
@@ -24,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from common import adb_exec, logcat
-from common.device_utils import get_ui_hierarchy
+from common.device_utils import get_ui_hierarchy, parse_display_density
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
 
@@ -293,12 +294,27 @@ class AppStateCapture:
             except ValueError:
                 info["sdk"] = value
 
-        # Display density (adb shell wm density)
+        # Display density (adb shell wm density).
+        #
+        # Through the shared parser, which prefers the Override line. Taking the
+        # FIRST `density:` match reports the PHYSICAL density, and when an
+        # override is active -- `wm density 560` on a 420dpi device, or any
+        # emulator started with a different density -- that is silently the
+        # wrong number, written into every snapshot's device-info.json with
+        # nothing to say it is stale. Recorded: wm_density_override.txt is
+        # `Physical density: 420` / `Override density: 560`; the first match is
+        # 420 and the effective answer is 560.
+        #
+        # This is the third time a defect class fixed in one file survived in
+        # another (see R4 in screenshots, R11 in navigator), so it goes through
+        # common.device_utils rather than growing a third density parser.
         result = adb_exec.run_adb("shell", self.serial, "wm", "density")
-        # Format: "Physical density: 420" (and optionally "Override density: N")
-        match = re.search(r"density:\s*(\d+)", result.stdout)
-        if match:
-            info["density"] = int(match.group(1))
+        # The shared parser raises when it cannot find a density; the old regex
+        # simply skipped. Keep the tolerance: a snapshot that captured the
+        # screen, the hierarchy and the logs should not be discarded because one
+        # optional field was unreadable. The key is omitted, not guessed.
+        with contextlib.suppress(RuntimeError):
+            info["density"] = parse_display_density(result.stdout)
 
         return info
 

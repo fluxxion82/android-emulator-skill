@@ -1253,6 +1253,28 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="sdkmanager_list",
+        args=[],
+        host_argv=["{sdkmanager}", "--list"],
+        post=_scrub_home_paths,
+        timeout=180,
+        catches=("AVD-LIST-IMAGES",),
+        description=(
+            "`sdkmanager --list` -- what `--list-images` reads, and inert for "
+            "the same reason its sibling was: it looked for `system-images;` "
+            "lines split on `|`, and sdkmanager prints neither. The rows are "
+            "the same slash-separated paths in whitespace-padded columns as "
+            "`--list_installed`, in TWO sections -- `Installed packages:` then "
+            "`Available packages:` -- which is the only thing here that says "
+            "whether an image is already on the machine or has to be "
+            "downloaded. It is also the only recording that contains API "
+            "tokens which are not bare integers (`android-34-ext12`, "
+            "`android-36.1`, `android-37.2-beta1`, `android-CANARY`): they are "
+            "76 of the 325 image rows, so a parser requiring `android-<int>` "
+            "silently drops a quarter of the listing."
+        ),
+    ),
+    Fixture(
         name="emu_help",
         args=["emu", "help"],
         description=(
@@ -1598,7 +1620,8 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                             )
                         )
                         for a in fixture.host_argv
-                    ]
+                    ],
+                    fixture.timeout,
                 )
             else:
                 raw = _run(fixture.args, serial, fixture.timeout)
