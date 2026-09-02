@@ -249,3 +249,37 @@ def test_capture_is_not_reimplemented(module: str):
             f"{module} still issues its own uiautomator dump at line {node.lineno}; "
             f"call common.hierarchy.capture_hierarchy instead"
         )
+
+
+def test_a_null_root_node_is_retried(fake_dump):
+    """The transient failure that only CI produced.
+
+    `ERROR: null root node returned by UiTestAutomationBridge.` means no window
+    was focused yet -- the app had launched but had not drawn. A developer
+    machine rarely sees it because the screen is already settled; a headless
+    runner sees it readily, and it failed the end-to-end agent test there while
+    every local run passed.
+
+    Retried for the same reason as the idle error: waiting is the entire fix.
+    """
+    fake_dump(
+        "ERROR: null root node returned by UiTestAutomationBridge.",
+        _recorded("uiautomator_compose_default"),
+    )
+    assert hierarchy.capture_hierarchy("emulator-5554").tag == "hierarchy"
+    assert len(fake_dump.calls) == 2, "a null root node was not retried"
+
+
+def test_a_persistent_null_root_node_says_what_to_check(fake_dump):
+    """Giving up must still be actionable, and must not blame the wrong thing."""
+    fake_dump("ERROR: null root node returned by UiTestAutomationBridge.")
+
+    with pytest.raises(hierarchy.HierarchyError) as excinfo:
+        hierarchy.capture_hierarchy("emulator-5554", retries=2)
+
+    message = str(excinfo.value)
+    assert "mCurrentFocus" in message, "the error does not say how to check the focus"
+    assert "animat" not in message.lower(), (
+        "a null root node is being reported as the idle-state/animation failure, "
+        "which sends the reader after the wrong cause"
+    )
