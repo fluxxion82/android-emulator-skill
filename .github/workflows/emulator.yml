@@ -28,10 +28,23 @@ on:
     - cron: '0 6 * * *'
   pull_request:
     branches: [main]
-    paths:
-      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**'
-      - 'tests/**'
-      - '.github/workflows/emulator.yml'
+    # Deliberately NO `paths:` filter.
+    #
+    # This check is REQUIRED by branch protection on main, and a required check
+    # that does not run is never reported as skipped -- GitHub leaves it
+    # "Expected" and the pull request is blocked forever. A path filter here
+    # therefore does not save work, it deadlocks any PR that misses the filter.
+    # The v0.6.0 release PR, which touches only version manifests, hit exactly
+    # that and could not be merged.
+    #
+    # The alternative -- a companion job that reports this check as passed when
+    # the paths do not match -- is worse here: it is a green result from
+    # something that ran nothing, which is the failure shape this lane's own
+    # script goes out of its way to reject. Better to spend the runner minutes.
+    #
+    # It also fixes a real gap: the old filter omitted
+    # `.github/scripts/run-emulator-lane.sh`, so editing the lane script did not
+    # re-run the lane.
 
 jobs:
   emulator:

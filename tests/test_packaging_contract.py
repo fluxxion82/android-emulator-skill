@@ -551,3 +551,31 @@ def test_every_flag_documented_in_skill_md_exists():
         "SKILL.md documents flags that argparse does not accept; an agent "
         f"following it gets 'unrecognized arguments': {wrong}"
     )
+
+
+def test_the_required_emulator_lane_has_no_path_filter():
+    """A REQUIRED status check must run on every PR, or it blocks them forever.
+
+    GitHub does not report a filtered-out workflow as skipped: the required
+    check stays "Expected" and the pull request is permanently BLOCKED. The
+    v0.6.0 release PR, which touched only version manifests, hit exactly this.
+
+    So the pull_request trigger must have no `paths:` filter for as long as
+    this check is required by branch protection on main. The tempting
+    alternative -- a companion job reporting the same check as passed when the
+    paths do not match -- is a green result from something that ran nothing,
+    which is precisely what `.github/scripts/run-emulator-lane.sh` refuses to
+    let happen inside the lane.
+    """
+    import yaml
+
+    emulator = yaml.safe_load((WORKFLOWS / "emulator.yml").read_text(encoding="utf-8"))
+    # PyYAML parses a bare `on:` key as the boolean True.
+    triggers = emulator.get("on", emulator.get(True))
+    pull_request = triggers.get("pull_request")
+
+    assert pull_request is not None, "the lane no longer runs on pull requests"
+    assert "paths" not in (pull_request or {}), (
+        "emulator.yml filters pull requests by path while branch protection "
+        "requires it; any PR outside the filter can never be merged"
+    )
