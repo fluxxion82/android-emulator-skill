@@ -413,12 +413,15 @@ def _sdk_double(monkeypatch, recorded):
         calls.append(list(cmd))
         if "list" in cmd and "device" in cmd:
             text = recorded.text("avdmanager_list_device")
-        elif "--list_installed" in cmd or "--list" in cmd:
-            # `--list` prints the installed section first, in exactly this
-            # format, then the available packages. Only the installed section
-            # is recorded: `--list` reaches the network, so capturing it would
-            # make the corpus depend on what Google is publishing today.
+        elif "--list_installed" in cmd:
             text = recorded.text("sdkmanager_list_installed")
+        elif "--list" in cmd:
+            # Both are recorded now, and they are not interchangeable: `--list`
+            # adds an `Available packages:` section after the installed one, and
+            # that section is the only place the non-integer API tokens live.
+            # Serving the installed recording for both would hide whether the
+            # section boundary is honoured at all.
+            text = recorded.text("sdkmanager_list")
         else:
             text = ""
         return subprocess.CompletedProcess(cmd, 0, text, "")
@@ -537,31 +540,38 @@ def test_no_recorded_sdkmanager_output_uses_the_pipe_delimited_id_format(recorde
     `system-images;` and `|` are what the original parsers required. Neither
     appears anywhere in what sdkmanager actually printed on a real machine.
     """
-    text = recorded.text("sdkmanager_list_installed")
-    assert "system-images/" in text
-    assert "system-images;" not in text
-    assert "|" not in text
+    for name in ("sdkmanager_list_installed", "sdkmanager_list"):
+        text = recorded.text(name)
+        assert "system-images/" in text, name
+        assert "system-images;" not in text, name
+        assert "|" not in text, name
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "AVD-LIST-IMAGES: `avd.py create --list-images` still parses the invented "
-        "`system-images;<id> | <rev> | <desc>` format from `sdkmanager --list` -- the "
-        "same defect 19325db fixed in list_installed_system_images, left in the sibling "
-        "method it did not touch. It prints an empty list on every machine. Delete this "
-        "marker in the same commit as the fix."
-    ),
-)
 def test_routed_list_images_reads_the_format_sdkmanager_actually_prints(
     monkeypatch, recorded, capsys
 ):
-    """`--list-images` is advertised in `--help` and answers nothing, always."""
-    _sdk_double(monkeypatch, recorded)
+    """AVD-LIST-IMAGES: `--list-images` was advertised in `--help` and answered nothing.
+
+    It looked for `system-images;<id> | <rev> | <desc>` in `sdkmanager --list`
+    -- the same invented format 19325db removed from
+    `list_installed_system_images`, left behind in the sibling method that
+    commit did not touch. Both now go through one parser, so the two cannot
+    disagree about what sdkmanager prints again.
+    """
+    calls = _sdk_double(monkeypatch, recorded)
 
     assert avd.main(["create", "--list-images", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["system_images"], "no images parsed from real sdkmanager output"
+    images = payload["system_images"]
+
+    assert images, "no images parsed from real sdkmanager output"
+    assert [cmd for cmd in calls if "--list" in cmd], calls
+    # The listing prints paths; the id an agent has to hand back to sdkmanager
+    # or avdmanager uses semicolons.
+    assert all(image["id"].startswith("system-images;") for image in images)
+    # `--list` is the only listing that answers "and which do I already have".
+    assert any(image["installed"] for image in images)
+    assert any(not image["installed"] for image in images)
 
 
 def test_routed_list_reads_avdmanagers_real_block_shape(recorded):

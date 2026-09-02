@@ -70,7 +70,12 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
-from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
+from common.device_utils import (
+    build_adb_command,
+    permission_state,
+    quote_for_device_shell,
+    resolve_device_identifier,
+)
 from common.env_config import env_int
 
 # `cmd notification post` posts on behalf of the shell, not the target app.
@@ -351,12 +356,20 @@ class NotificationTester:
     def set_post_permission(self, package: str, granted: bool) -> tuple[bool, dict]:
         """Grant or revoke ``android.permission.POST_NOTIFICATIONS`` for a package.
 
+        The outcome is proved by reading the permission back out of
+        ``dumpsys package``, the same way ``--post`` proves a post: ``pm grant``
+        of a permission the app never requested prints nothing on either stream
+        and exits 0 (recorded as ``pm_grant_not_requested``), which is
+        indistinguishable from a grant that worked. Exit status alone reported
+        a no-op as a success.
+
         Args:
             package: Target package.
             granted: True to ``pm grant``, False to ``pm revoke``.
 
         Returns:
-            (success, result_dict).
+            (success, result_dict). ``verified`` says whether the device's own
+            record was read back and agreed.
         """
         verb = "grant" if granted else "revoke"
         code, stdout, stderr = self._shell(
@@ -368,6 +381,7 @@ class NotificationTester:
             "permission": POST_NOTIFICATIONS,
             "granted": granted,
             "exit_code": code,
+            "verified": False,
         }
 
         # `pm grant`/`pm revoke` print nothing when they work. Anything on either
@@ -377,7 +391,33 @@ class NotificationTester:
         if code != 0 or complaint:
             result["error"] = complaint or f"pm {verb} exited {code}"
             return False, result
-        return True, result
+
+        dump_code, dump, dump_err = self._shell(
+            "dumpsys", "package", quote_for_device_shell(package)
+        )
+        if dump_code != 0:
+            result["error"] = (
+                f"pm {verb} exited 0, but {package} could not be read back to "
+                f"confirm it: {(dump_err or dump).strip()}"
+            )
+            return False, result
+
+        state = permission_state(dump, POST_NOTIFICATIONS)
+        result["state"] = state
+        if state is granted or (not granted and state is None):
+            result["verified"] = True
+            return True, result
+        if state is None:
+            result["error"] = (
+                f"{package} does not request {POST_NOTIFICATIONS}, so `pm grant` "
+                f"exited 0 without granting it"
+            )
+        else:
+            result["error"] = (
+                f"pm {verb} exited 0 but {POST_NOTIFICATIONS} is still "
+                f"granted={str(state).lower()} for {package}"
+            )
+        return False, result
 
     # === INTERNAL ===
 
@@ -461,6 +501,8 @@ def _print_permission(success: bool, result: dict, verbose: bool) -> None:
         )
         return
     print(f"+ {'Granted' if granted else 'Revoked'} {POST_NOTIFICATIONS} for {result['package']}")
+    if result.get("verified"):
+        print(f"  Verified in `dumpsys package`: granted={result.get('state')}")
     if verbose:
         print("  Only meaningful on API 33+; the app must also declare the permission.")
 

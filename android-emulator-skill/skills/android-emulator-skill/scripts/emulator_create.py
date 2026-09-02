@@ -141,6 +141,81 @@ def suggest_devices(query: str, devices: list, limit: int = DEVICE_MATCH_SUGGEST
     return scored[:limit]
 
 
+# sdkmanager listings -- both `--list` and `--list_installed` -- print package
+# PATHS with SLASHES in whitespace-padded columns, under section headers:
+#
+#   Installed packages:
+#     system-images/android-34/google_apis/arm64-v8a   14.0.0   Google APIs ...
+#   Available packages:
+#     system-images/android-36/google_apis/x86_64      13.0.0   Google APIs ...
+#
+# There is no pipe anywhere and no semicolon anywhere. Both listings were once
+# parsed as `system-images;<id> | <rev> | <desc>`, a format neither command has
+# ever printed, so both matched nothing: creation was impossible (fixed in
+# 19325db) and `--list-images` printed an empty list (this). One parser now, so
+# the two cannot drift apart again. Recorded as sdkmanager_list and
+# sdkmanager_list_installed.
+SYSTEM_IMAGE_PREFIX = "system-images/"
+_INSTALLED_HEADER = "installed packages"
+_AVAILABLE_HEADER = "available packages"
+
+
+def parse_system_images(text: str) -> list:
+    """
+    Parse the system-image rows out of an sdkmanager listing.
+
+    Args:
+        text: stdout of ``sdkmanager --list`` or ``sdkmanager --list_installed``.
+
+    Returns:
+        One dict per ``system-images/...`` row, in the order printed:
+
+        - ``id``: the install id, semicolons not slashes -- what
+          ``sdkmanager '<id>'`` and ``avdmanager --package`` want.
+        - ``api``: the API token verbatim, minus the ``android-`` prefix.
+          Not always an integer: ``34-ext12``, ``36.1``, ``37.2-beta1`` and
+          ``CANARY`` are all real rows in the recording.
+        - ``api_level``: that token as an int when it is a bare integer, else
+          None. Deliberately strict, because ``create()`` builds its package id
+          as ``system-images;android-{api_level};...`` -- calling ``34-ext12``
+          "API 34" would name an image that is not installed.
+        - ``variant`` / ``abi``.
+        - ``installed``: True while the rows are under ``Installed packages:``.
+          ``--list_installed`` prints only that section; ``--list`` prints the
+          installed one first and then everything downloadable.
+    """
+    images = []
+    installed = True
+    for line in text.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith(_AVAILABLE_HEADER):
+            installed = False
+            continue
+        if lowered.startswith(_INSTALLED_HEADER):
+            installed = True
+            continue
+        if not stripped.startswith(SYSTEM_IMAGE_PREFIX):
+            continue
+        path = stripped.split()[0]
+        parts = path.split("/")
+        if len(parts) != 4:
+            continue
+        _, api_token, variant, abi = parts
+        bare_integer = re.fullmatch(r"android-(\d+)", api_token)
+        images.append(
+            {
+                "id": path.replace("/", ";"),
+                "api": api_token.removeprefix("android-"),
+                "api_level": int(bare_integer.group(1)) if bare_integer else None,
+                "variant": variant,
+                "abi": abi,
+                "installed": installed,
+            }
+        )
+    return images
+
+
 def latest_api_level(images: list) -> int | None:
     """
     Pick the highest API level from a list of (installed) system-image dicts.
@@ -296,10 +371,23 @@ class EmulatorCreator:
 
     def list_system_images(self) -> list:
         """
-        List available system images.
+        List every system image sdkmanager knows about, flagging the local ones.
+
+        ``sdkmanager --list`` is the only command that answers both halves of
+        the question in one call: it prints the installed section first and then
+        every downloadable package, so each entry carries ``installed`` and the
+        caller can tell "I can create this now" from "this needs a download".
+
+        The cost is that ``--list`` refreshes the remote package index: measured
+        at ~4s warm here, and it is the reason this call gets SDK_LIST_TIMEOUT
+        rather than SDK_TOOL_TIMEOUT. When it fails -- offline, or a repository
+        that will not answer -- we fall back to the purely local
+        ``--list_installed`` rather than returning nothing, because a short true
+        answer ("here is what you already have") beats an empty one that reads
+        as "no system images exist".
 
         Returns:
-            List of system image dicts
+            List of system image dicts, as parse_system_images() shapes them.
         """
         sdkmanager = self.get_sdkmanager_path()
         if not sdkmanager:
@@ -313,39 +401,10 @@ class EmulatorCreator:
                 timeout=SDK_LIST_TIMEOUT,
                 check=True,
             )
-
-            images = []
-            in_system_images = False
-
-            for line in result.stdout.split("\n"):
-                if "system-images" in line and "|" in line:
-                    in_system_images = True
-
-                if in_system_images and line.strip().startswith("system-images;"):
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) >= 1:
-                        image_id = parts[0]
-                        # Parse system-images;android-34;google_apis;x86_64
-                        match = re.match(r"system-images;android-(\d+);([^;]+);([^;\s]+)", image_id)
-                        if match:
-                            api_level, variant, abi = match.groups()
-                            images.append(
-                                {
-                                    "id": image_id,
-                                    "api_level": int(api_level),
-                                    "variant": variant,
-                                    "abi": abi,
-                                }
-                            )
-
-                # Stop at next section
-                if in_system_images and "---" in line and len(images) > 0:
-                    break
-
-            return images
-
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return []
+            return self.list_installed_system_images()
+
+        return parse_system_images(result.stdout)
 
     def list_installed_system_images(self) -> list:
         """
@@ -373,36 +432,9 @@ class EmulatorCreator:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
 
-        images = []
-        for line in result.stdout.split("\n"):
-            stripped = line.strip()
-            # `--list_installed` prints PATHS, not package ids, in
-            # whitespace-padded columns:
-            #
-            #   system-images/android-34/google_apis/arm64-v8a   14.0.0   Google APIs...
-            #
-            # This used to look for `system-images;` and split on `|`, matching
-            # nothing -- so the installed list was always empty, every image
-            # reported as "not installed", and creating an AVD was impossible.
-            # Recorded as sdkmanager_list_installed.
-            if not stripped.startswith("system-images/"):
-                continue
-            path = stripped.split()[0]
-            # The *install* id uses semicolons, so convert back: the error we
-            # show tells the user to run `sdkmanager 'system-images;...'`.
-            image_id = path.replace("/", ";")
-            match = re.match(r"system-images;android-(\d+);([^;]+);([^;\s]+)", image_id)
-            if match:
-                api_level, variant, abi = match.groups()
-                images.append(
-                    {
-                        "id": image_id,
-                        "api_level": int(api_level),
-                        "variant": variant,
-                        "abi": abi,
-                    }
-                )
-        return images
+        # Same rows, same parser as `--list`: `--list_installed` prints only the
+        # `Installed packages:` section, so everything it yields is installed.
+        return parse_system_images(result.stdout)
 
     def resolve_api_level(self, requested: int | None) -> int | None:
         """
@@ -562,6 +594,41 @@ class EmulatorCreator:
             )
 
 
+def print_system_images(images: list) -> None:
+    """
+    Print a system-image listing that stays readable at 300+ entries.
+
+    ``sdkmanager --list`` knows about hundreds of images and typically four of
+    them are installed. One line each would bury the answer to the question
+    actually being asked -- "what can I boot right now" -- so the installed ones
+    are listed in full and the rest are folded to one line per API level. The
+    whole list, unfolded, is what ``--json`` is for.
+
+    Args:
+        images: Dicts as parse_system_images() shapes them.
+    """
+    installed = [image for image in images if image["installed"]]
+    available = [image for image in images if not image["installed"]]
+
+    print(f"System Images: {len(installed)} installed, {len(images)} known to sdkmanager")
+
+    if installed:
+        print("Installed:")
+        for image in installed:
+            print(f"  API {image['api']}: {image['variant']} ({image['abi']}) - {image['id']}")
+
+    if available:
+        by_api: dict[str, dict[str, list]] = {}
+        for image in available:
+            by_api.setdefault(image["api"], {}).setdefault(image["variant"], []).append(
+                image["abi"]
+            )
+        print(f"Available to install ({len(available)}; use --json for the full list):")
+        for api, variants in by_api.items():
+            detail = ", ".join(f"{v} ({', '.join(abis)})" for v, abis in variants.items())
+            print(f"  API {api}: {detail}")
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -636,11 +703,7 @@ Examples:
         if args.json:
             print(json.dumps({"system_images": images}, indent=2))
         else:
-            print("Available System Images:")
-            for image in images:
-                print(
-                    f"  API {image['api_level']}: {image['variant']} ({image['abi']}) - {image['id']}"
-                )
+            print_system_images(images)
         sys.exit(0)
 
     # Create operation. Only --device is strictly required now: --api defaults to

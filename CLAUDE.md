@@ -89,10 +89,15 @@ Therefore:
    violations that exist today are frozen in `KNOWN_VIOLATIONS` as debt, and a
    stale entry fails too, so paying one off cannot silently re-open the door.
 
-   The two worth paying off first are `test_container.py` and
-   `test_model_inspector.py`, which test parsers against hand-written `run-as
-   ls -la` and `sqlite3 .schema` output. Neither command has any recorded
-   fixture, so there is currently nothing to compare against.
+   `test_container.py` and `test_model_inspector.py` were the two worth paying
+   off first, and they are paid: both now read the real thing from
+   `tests/fixtures/recorded/` — `run_as_ls_data_dir`, `run_as_ls_databases`,
+   `run_as_not_an_application`, `shared_prefs_settings_xml`,
+   `sqlite_schema_host`.
+
+   Read the current debt off `KNOWN_VIOLATIONS`, not off this paragraph. The
+   frozen set is the copy that fails when it is wrong; a prose list of what is
+   outstanding goes stale silently, which this one did.
 
 4. **Known defects are pinned with `@pytest.mark.xfail(strict=True)`** and a
    defect ID, in `tests/test_recorded_fixtures.py`. `strict=True` means fixing

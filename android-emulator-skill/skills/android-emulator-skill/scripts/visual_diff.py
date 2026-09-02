@@ -159,8 +159,26 @@ def main():
         default=0.01,
         help="Acceptable difference threshold (0.01 = 1%%, default: 0.01)",
     )
+    # `--json` is the repo-wide contract for machine-readable output (CLAUDE.md:
+    # "--help and --json on every script"), and this was the one script without
+    # it: the same output was reachable only as `--details`, whose help text
+    # reads like a --verbose. An agent following SKILL.md would pass --json here
+    # and get an argparse error.
+    #
+    # `--details` is kept as an alias rather than renamed, because it is a
+    # published flag -- the same reason logs.py and avd.py left every script
+    # they route to callable unchanged.
     parser.add_argument(
-        "--details", action="store_true", help="Show detailed output (increases tokens)"
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the full report as JSON",
+    )
+    parser.add_argument(
+        "--details",
+        dest="json_output",
+        action="store_true",
+        help="Deprecated alias for --json",
     )
 
     args = parser.parse_args()
@@ -197,7 +215,7 @@ def main():
         print(f"Warning: Could not generate images - {e}")
 
     # Output results (token-optimized)
-    if args.details:
+    if args.json_output:
         # Detailed output
         report = {
             "summary": {

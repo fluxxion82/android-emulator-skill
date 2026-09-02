@@ -293,3 +293,37 @@ def test_unknown_serial_exits_one_with_an_actionable_message(
     assert "no-such-serial-xyz" in captured.err
     assert "adb devices" in captured.err, "the error does not say how to see what is attached"
     assert "Traceback" not in captured.err
+
+
+def test_device_info_records_the_effective_density_not_the_physical_one(monkeypatch, recorded):
+    """An override makes the physical density the wrong answer.
+
+    `wm density` prints `Physical density: 420` and, when an override is
+    active, `Override density: 560`. This took the FIRST `density:` match and
+    so recorded 420 into every snapshot's device-info.json -- silently wrong,
+    with nothing to say it was stale, on any device whose density has been
+    overridden (`wm density 560`, or an emulator started at another density).
+
+    The repo already had both the override fixture and a shared parser that
+    prefers the Override line; only this file did not use them. That makes it
+    the third defect class fixed in one file and left standing in another,
+    after R4 in screenshots and R11 in navigator.
+    """
+    from common import adb_exec
+
+    override = recorded.text("wm_density_override")
+    assert "Override density" in override, "fixture no longer exercises an override"
+
+    def _run(operation, serial=None, *args, **kwargs):
+        joined = " ".join(str(a) for a in args)
+        stdout = override if "density" in joined else ""
+        return adb_exec.AdbResult(returncode=0, stdout=stdout, stderr="", command=["adb"])
+
+    monkeypatch.setattr(app_state_capture.adb_exec, "run_adb", _run)
+
+    capture = app_state_capture.AppStateCapture("com.example.app", serial="emulator-5554")
+    info = capture._get_device_info()
+
+    assert (
+        info["density"] == 560
+    ), f"recorded the physical density instead of the effective one: {info}"
