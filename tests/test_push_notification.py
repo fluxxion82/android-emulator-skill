@@ -514,12 +514,15 @@ def test_expect_package_requires_list(monkeypatch, fake_adb):
 # ---------------------------------------------------------------------------
 
 
-def test_grant_uses_pm_grant_with_the_real_permission(fake_adb):
+def test_grant_uses_pm_grant_with_the_real_permission(fake_adb, recorded):
+    fake_adb.when("dumpsys", "package", stdout=recorded.text("dumpsys_package_permissions"))
+
     success, result = push_notification.NotificationTester().set_post_permission(
-        "com.example.app", granted=True
+        "com.google.android.deskclock", granted=True
     )
     assert success is True
     assert result["permission"] == "android.permission.POST_NOTIFICATIONS"
+    assert result["verified"] is True
     issued = fake_adb.commands_matching("pm", "grant")
     assert issued, f"no pm grant issued: {fake_adb.calls}"
     assert "android.permission.POST_NOTIFICATIONS" in issued[0]
@@ -549,31 +552,61 @@ def test_a_refused_grant_is_a_failure(recorded, fake_adb):
     assert "SecurityException" in result["error"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "pm grant of a permission the app never requested is a silent no-op: "
-        "recorded as pm_grant_not_requested -- no output, exit 0, and the "
-        "permission is still not held. set_post_permission's success test is "
-        "'exit 0 and nothing printed', which is exactly what the no-op looks "
-        "like, so it reports a grant that did not happen. Proving a grant "
-        "needs a read-back, the way post() proves a post. Delete this marker "
-        "in the commit that adds one."
-    ),
-)
 def test_a_grant_that_did_nothing_is_not_a_success(recorded, fake_adb):
+    """`pm grant` of a permission the app never requested is a silent no-op.
+
+    Recorded as pm_grant_not_requested: no output, exit 0, and the permission
+    still not held. "Exit 0 and nothing printed" was the success test, and it
+    is exactly what the no-op looks like, so a grant that never happened was
+    reported as done. The proof has to come from the state afterwards --
+    dumpsys_package_after_silent_grant, captured immediately after that same
+    command, does not mention POST_NOTIFICATIONS at all.
+    """
     silent = recorded.text("pm_grant_not_requested")
     assert silent.strip() == "exit=0", "the fixture no longer records a silent success"
+    after = recorded.text("dumpsys_package_after_silent_grant")
+    assert "android.permission.POST_NOTIFICATIONS" not in after
 
     fake_adb.when("pm", "grant", returncode=0, stdout="")
-    success, _ = push_notification.NotificationTester().set_post_permission(
+    fake_adb.when("dumpsys", "package", stdout=after)
+
+    success, result = push_notification.NotificationTester().set_post_permission(
+        "com.example.composefixture", granted=True
+    )
+    assert success is False
+    assert result["verified"] is False
+    assert "does not request" in result["error"]
+
+
+def test_a_grant_is_read_back_from_the_device(fake_adb, recorded):
+    """The read-back is a real dumpsys call, not an assumption."""
+    fake_adb.when("dumpsys", "package", stdout=recorded.text("dumpsys_package_permissions"))
+
+    push_notification.NotificationTester().set_post_permission(
+        "com.google.android.deskclock", granted=True
+    )
+
+    assert fake_adb.commands_matching(
+        "dumpsys", "package"
+    ), f"grant never read the state back: {fake_adb.calls}"
+
+
+def test_a_read_back_that_could_not_run_is_not_a_success(fake_adb):
+    """No evidence is not evidence of success."""
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    fake_adb.when("dumpsys", "package", returncode=1, stderr="device offline")
+
+    success, result = push_notification.NotificationTester().set_post_permission(
         "com.example.app", granted=True
     )
     assert success is False
+    assert "could not be read back" in result["error"]
 
 
-def test_permission_cli_exit_codes(fake_adb, monkeypatch):
-    assert _run_main(monkeypatch, ["--grant-permission", "--package", "com.example.app"]) == 0
+def test_permission_cli_exit_codes(fake_adb, monkeypatch, recorded):
+    fake_adb.when("dumpsys", "package", stdout=recorded.text("dumpsys_package_permissions"))
+    argv = ["--grant-permission", "--package", "com.google.android.deskclock"]
+    assert _run_main(monkeypatch, argv) == 0
     fake_adb.when("pm", "revoke", returncode=255, stderr="Unknown permission")
     assert _run_main(monkeypatch, ["--revoke-permission", "--package", "com.example.app"]) == 1
 

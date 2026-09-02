@@ -15,6 +15,55 @@ Used by:
 - Multiple scripts - ADB command building
 - navigator.py, gesture.py - Touch simulation
 - test_recorder.py, app_state_capture.py - Auto-device detection
+- privacy_manager.py, push_notification.py - Permission state from dumpsys
+
+Permission parsing note
+-----------------------
+``dumpsys package <pkg>`` has NO ``granted permissions:`` section.
+``privacy_manager --list`` looked for exactly that header, never found it, and
+so answered every query with two empty lists while exiting 0. The sections that
+do exist, recorded in ``tests/fixtures/recorded/*/dumpsys_package_*.txt``, sit
+at four spaces of indent under ``Package [<pkg>]``::
+
+    declared permissions:
+      NAME: prot=signature|privileged
+    requested permissions:
+      NAME
+    install permissions:
+      NAME: granted=true
+    User 0: ceDataInode=...
+      runtime permissions:
+        NAME: granted=false, flags=[ USER_SENSITIVE_WHEN_GRANTED|... ]
+
+Two distinctions the old code did not make, and both matter to a caller.
+*Install vs runtime*: an install permission is fixed at install time and
+``pm grant`` on one raises a SecurityException, so a runtime permission is the
+only kind a permission-flow test can move. *Granted vs merely requested*:
+``requested permissions:`` is the manifest's ask, carrying no state at all, so
+reading it as "granted" reports every denied permission as held.
+
+Every section can also appear more than once, and the two repeats pull in
+opposite directions -- which is why "find the header" is not enough on its own:
+
+* An **updated system app** repeats all four sections under the top-level
+  ``Hidden system packages:`` header. ``com.google.android.deskclock`` does
+  this. Measured on API 35, that copy is not stale -- granting READ_CALENDAR
+  flips ``granted`` in both copies -- so the cost of reading it is a doubled
+  list, not a wrong value.
+* A package in a **shared uid** has its runtime state tracked against the uid,
+  not the package, so it is printed under ``Shared users:`` and NOT under
+  ``Packages:``. ``com.android.settings`` does this, and so does the recorded
+  ``com.android.localtransport``: their ``Packages:`` block has no
+  ``runtime permissions:`` line at all, so a parser confined to ``Packages:``
+  reports a system app as holding no runtime permissions whatsoever.
+
+So the parser reads the whole dump and keeps the FIRST occurrence of each
+section. That one rule covers both: the live copy is printed before the
+``Hidden system packages:`` repeat, and user 0 -- the user ``pm grant``
+targets without ``--user`` -- is printed before any secondary user. A
+top-level allow-list of blocks was tried first and dropped: it was redundant
+with this rule, and no recorded dump could tell the two apart, which makes it
+a guard nothing could check.
 """
 
 import re
@@ -477,6 +526,151 @@ def get_package_info(package_name: str, serial: str | None = None) -> dict:
         # `pm dump` exits non-zero for a package that is not installed, which is
         # an answer rather than a failure.
         return {"package": package_name, "installed": False}
+
+
+# A section header, at whatever indent the dump chose. The indent is captured
+# because it -- not a blank line or a heuristic -- is what ends the section:
+# entries are strictly more indented than their header.
+_SECTION_RE = re.compile(r"^(\s*)(declared|requested|install|runtime) permissions:\s*$")
+
+# "NAME: granted=true, flags=[ A|B ]" -- the flags clause is present on runtime
+# entries and absent on install ones.
+_STATE_RE = re.compile(
+    r"^(?P<name>\S+?):\s*granted=(?P<granted>true|false)"
+    r"(?:,\s*flags=\[\s*(?P<flags>[^\]]*?)\s*\])?\s*$"
+)
+
+# Every real package has one. Its absence is how "not installed" is detected,
+# because `dumpsys package <unknown>` exits 0 like everything else here.
+_PACKAGES_HEADER = "Packages:"
+
+
+def parse_package_permissions(dump: str) -> dict:
+    """Parse ``adb shell dumpsys package <pkg>`` into permission state.
+
+    Args:
+        dump: Verbatim stdout of ``dumpsys package <pkg>``.
+
+    Returns:
+        A dict with:
+
+        * ``found`` -- whether the dump described an installed package at all.
+          ``dumpsys package <unknown>`` prints one line, ``Unable to find
+          package: X``, and exits 0, so the exit status cannot be used and an
+          empty result would otherwise read as "this app has no permissions".
+        * ``declared`` -- permissions the app defines, as ``{name: protection}``.
+        * ``requested`` -- names from the manifest, in dump order. Requested is
+          not held; see ``granted``.
+        * ``install`` -- ``[{"permission", "granted"}]`` for install-time
+          permissions.
+        * ``runtime`` -- ``[{"permission", "granted", "flags"}]`` for runtime
+          permissions, for user 0.
+        * ``granted`` -- names actually held, install and runtime together.
+        * ``denied`` -- names the dump reports with ``granted=false``.
+
+        A dump with no ``Packages:`` block yields the same keys, all empty,
+        and ``found`` False.
+    """
+    declared: dict[str, str] = {}
+    requested: list[str] = []
+    install: list[dict] = []
+    runtime: list[dict] = []
+    seen_sections: set[str] = set()
+
+    section: str | None = None
+    section_indent = 0
+    found = False
+
+    for line in dump.splitlines():
+        if not line.strip():
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            found = found or line.strip() == _PACKAGES_HEADER
+            section = None
+            continue
+
+        if section is not None and indent <= section_indent:
+            section = None
+
+        header = _SECTION_RE.match(line)
+        if header is not None:
+            name = header.group(2)
+            # First occurrence wins, and it is the only thing keeping the
+            # repeats out. See the module docstring: a multi-user device
+            # prints one "runtime permissions:" per "User N:" and user 0 --
+            # what `pm grant` without --user targets -- comes first, and an
+            # updated system app repeats every section under "Hidden system
+            # packages:" AFTER the live copy.
+            section = None if name in seen_sections else name
+            seen_sections.add(name)
+            section_indent = len(header.group(1))
+            continue
+
+        if section is None:
+            continue
+
+        entry: str = line.strip()
+        if section == "requested":
+            requested.append(entry)
+            continue
+
+        name, _, detail = entry.partition(":")
+        if section == "declared":
+            declared[name] = detail.strip().removeprefix("prot=")
+            continue
+
+        state = _STATE_RE.match(entry)
+        if state is None:
+            # Never guess. An unparsed line is a format change, and inventing a
+            # value for it is how this script came to report an empty list as
+            # the truth.
+            continue
+        record: dict = {
+            "permission": state.group("name"),
+            "granted": state.group("granted") == "true",
+        }
+        if section == "install":
+            install.append(record)
+        else:
+            flags = state.group("flags") or ""
+            record["flags"] = [f for f in flags.split("|") if f]
+            runtime.append(record)
+
+    held = [e["permission"] for e in install + runtime if e["granted"]]
+    denied = [e["permission"] for e in install + runtime if not e["granted"]]
+    return {
+        "found": found,
+        "declared": declared,
+        "requested": requested,
+        "install": install,
+        "runtime": runtime,
+        "granted": held,
+        "denied": denied,
+    }
+
+
+def permission_state(dump: str, permission: str) -> bool | None:
+    """Whether ``permission`` is held, according to the dump itself.
+
+    Args:
+        dump: Verbatim stdout of ``dumpsys package <pkg>``.
+        permission: Full permission name, e.g. ``android.permission.CAMERA``.
+
+    Returns:
+        ``True`` or ``False`` as the dump reports it, or ``None`` when the
+        package lists no state for it at all -- which is what a ``pm grant``
+        of an unrequested permission leaves behind. ``None`` is deliberately
+        not ``False``: "the app does not ask for this" and "the user said no"
+        are different answers, and only the first means the caller's command
+        could never have worked.
+    """
+    parsed = parse_package_permissions(dump)
+    for entry in parsed["install"] + parsed["runtime"]:
+        if entry["permission"] == permission:
+            return bool(entry["granted"])
+    return None
 
 
 def list_installed_packages(serial: str | None = None) -> list:

@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-02T04:14:01Z",
+  "recorded_at": "2026-09-02T04:55:22Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 0,
+  "redacted_package_count": 2,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -179,6 +179,44 @@
       "description": "Memory breakdown including the Objects block (Views, ViewRootImpl, Activities, AppContexts). The Activities count is the Activity-leak test: navigate in and out N times and see whether it grew by N.",
       "catches": [],
       "bytes": 3309
+    },
+    {
+      "name": "dumpsys_package_after_silent_grant",
+      "file": "dumpsys_package_after_silent_grant.txt",
+      "command": "adb shell dumpsys package com.example.composefixture",
+      "description": "The read-back that catches the no-op recorded as pm_grant_not_requested. Captured immediately AFTER that exact `pm grant` (exit 0, no output at all): the fixture app's 'runtime permissions:' section is still empty and POST_NOTIFICATIONS appears nowhere in the dump. Exit status and printed output cannot tell a real grant from this one; the dump can, which is why grant/revoke now prove themselves by reading the state back.",
+      "catches": [
+        "S16"
+      ],
+      "bytes": 5966
+    },
+    {
+      "name": "dumpsys_package_permissions",
+      "file": "dumpsys_package_permissions.txt",
+      "command": "adb shell dumpsys package com.google.android.deskclock",
+      "description": "The permission state of an installed package, which is what `privacy_manager --list` parses and what proves a grant took effect. There is NO 'granted permissions:' section -- the header privacy_manager looked for, which is why --list always answered with two empty lists. The real headers, at four spaces of indent under `Package [<pkg>]`, are 'declared permissions:' (name: prot=...), 'requested permissions:' (bare names), 'install permissions:' (name: granted=<bool>), and -- nested one level deeper, under 'User 0:' -- 'runtime permissions:' (name: granted=<bool>, flags=[...]).\nDeskclock is recorded rather than the fixture app because it is an UPDATED system app, so the dump repeats all four sections a second time under the top-level 'Hidden system packages:' header. Measured: that copy is NOT stale -- granting READ_CALENDAR flips `granted` in both copies -- so the cost of reading it is a doubled list rather than a wrong value, and taking the first occurrence of each section is what keeps it out. It also carries both outcomes: POST_NOTIFICATIONS granted=true, READ_CALENDAR and READ_MEDIA_AUDIO granted=false.",
+      "catches": [
+        "S15"
+      ],
+      "bytes": 31208
+    },
+    {
+      "name": "dumpsys_package_shared_uid",
+      "file": "dumpsys_package_shared_uid.txt",
+      "command": "adb shell dumpsys package com.android.localtransport",
+      "description": "The other place `install permissions:` shows up twice, and the one that costs data rather than adds it. A package in a shared uid has its runtime permission state tracked against the UID, so the dump prints it under the top-level 'Shared users:' header and NOT under 'Packages:' -- this package's Packages block has no 'runtime permissions:' line at all, while the SharedUser [android.uid.system] block below it has twenty-three. A parser that reads only 'Packages:' (the obvious fix for the stale copy under 'Hidden system packages:') answers that a system app holds no runtime permissions whatsoever. com.android.settings has the same shape at five times the size.",
+      "catches": [
+        "S15"
+      ],
+      "bytes": 41473
+    },
+    {
+      "name": "dumpsys_package_unknown",
+      "file": "dumpsys_package_unknown.txt",
+      "command": "adb shell dumpsys package com.example.not.installed; echo exit=$?",
+      "description": "`dumpsys package` asked about a package that is not installed: one line, 'Unable to find package: X', and exit status 0. So `--list` cannot tell 'not installed' from 'installed and holds nothing' by exit status, and an empty parse must not be printed as an answer. The structural signal is the absence of the top-level 'Packages:' block. (The echo is part of the recorded command because a file cannot show an exit status.)",
+      "catches": [],
+      "bytes": 57
     },
     {
       "name": "dumpsys_window_focus",

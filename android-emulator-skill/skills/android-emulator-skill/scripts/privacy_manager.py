@@ -40,7 +40,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-from common.device_utils import build_adb_command
+from common.device_utils import build_adb_command, parse_package_permissions, permission_state
 from common.env_config import env_int
 
 # Subprocess timeout (seconds) for adb calls. Permission ops are fast; dumpsys
@@ -126,16 +126,17 @@ class PrivacyManager:
             subprocess.run(
                 cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
             )
-            return True, f"Granted {permission} to {package}"
-
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             # Check common errors
-            if "not requested" in error_msg.lower():
-                return False, f"Permission {permission} not declared in app manifest"
             if "unknown package" in error_msg.lower():
                 return False, f"Package not found: {package}"
             return False, f"Failed to grant permission: {error_msg}"
+
+        confirmed, detail = self.confirm_permission(package, full_permission, expect_granted=True)
+        if not confirmed:
+            return False, f"Grant of {permission} to {package} did not take effect: {detail}"
+        return True, f"Granted {permission} to {package} (verified)"
 
     def revoke_permission(self, package: str, permission: str) -> tuple:
         """
@@ -161,11 +162,64 @@ class PrivacyManager:
             subprocess.run(
                 cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
             )
-            return True, f"Revoked {permission} from {package}"
-
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to revoke permission: {error_msg}"
+
+        confirmed, detail = self.confirm_permission(package, full_permission, expect_granted=False)
+        if not confirmed:
+            return False, f"Revoke of {permission} from {package} did not take effect: {detail}"
+        return True, f"Revoked {permission} from {package} (verified){detail}"
+
+    def confirm_permission(
+        self, package: str, full_permission: str, expect_granted: bool
+    ) -> tuple[bool, str]:
+        """Read a permission's state back from the device and judge the outcome.
+
+        This is the check ``pm grant`` and ``pm revoke`` cannot supply
+        themselves. Granting a permission the app never requested is a silent
+        no-op: no output on either stream, exit status 0, and the permission
+        still not held -- recorded as ``pm_grant_not_requested``. "Exit 0 and
+        nothing printed" is therefore what BOTH a working grant and a no-op
+        look like, so the only honest evidence is the state afterwards.
+
+        Args:
+            package: App package name.
+            full_permission: Full permission name, e.g. ``android.permission.CAMERA``.
+            expect_granted: The state the caller's command was supposed to
+                produce.
+
+        Returns:
+            (confirmed, detail). ``detail`` explains the disagreement when
+            ``confirmed`` is False, and is empty or a parenthetical note
+            otherwise. Revoking is judged on "not held", so a permission the
+            package does not even request counts as revoked -- with a note,
+            because it usually means a typo.
+        """
+        cmd = build_adb_command("shell", self.serial, "dumpsys", "package", package)
+        try:
+            dump = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            ).stdout
+        except subprocess.CalledProcessError as e:
+            return False, f"could not read {package} back to check: {e.stderr or e}"
+
+        state = permission_state(dump, full_permission)
+        if expect_granted:
+            if state is True:
+                return True, ""
+            if state is None:
+                return False, (
+                    f"{package} does not request {full_permission}, so `pm grant` "
+                    f"exited 0 without changing anything"
+                )
+            return False, f"{full_permission} is still denied for {package}"
+
+        if state is True:
+            return False, f"{full_permission} is still granted for {package}"
+        if state is None:
+            return True, " (package does not request it)"
+        return True, ""
 
     def reset_permission(self, package: str, permission: str) -> tuple:
         """
@@ -195,13 +249,21 @@ class PrivacyManager:
 
     def list_app_permissions(self, package: str) -> tuple:
         """
-        List all permissions for an app.
+        List all permissions for an app, split by when they are decided.
+
+        The previous implementation looked for a ``granted permissions:``
+        header. ``dumpsys package`` has no such section, so ``--list`` reported
+        an empty result for every package on every device while exiting 0. See
+        :mod:`common.device_utils` for the sections that do exist and for the
+        two places the dump repeats them.
 
         Args:
             package: App package name
 
         Returns:
-            (success, message, permissions_dict) tuple
+            (success, message, permissions_dict) tuple. The dict carries
+            ``install`` and ``runtime`` entries with their real ``granted``
+            state, plus flattened ``granted`` / ``denied`` name lists.
         """
         cmd = build_adb_command("shell", self.serial, "dumpsys", "package", package)
 
@@ -209,49 +271,16 @@ class PrivacyManager:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
             )
-
-            # Parse dumpsys output for permissions
-            granted_permissions = []
-            requested_permissions = []
-
-            in_granted_section = False
-            in_requested_section = False
-
-            for line in result.stdout.split("\n"):
-                stripped = line.strip()
-
-                # Look for sections
-                if "granted permissions:" in stripped.lower():
-                    in_granted_section = True
-                    in_requested_section = False
-                    continue
-                if "requested permissions:" in stripped.lower():
-                    in_requested_section = True
-                    in_granted_section = False
-                    continue
-                if stripped and not stripped.startswith("android.permission."):
-                    in_granted_section = False
-                    in_requested_section = False
-
-                # Parse permissions
-                if in_granted_section and "android.permission." in stripped:
-                    perm = stripped.strip()
-                    granted_permissions.append(perm)
-                elif in_requested_section and "android.permission." in stripped:
-                    perm = stripped.split(":")[0].strip()
-                    requested_permissions.append(perm)
-
-            permissions_data = {
-                "package": package,
-                "granted": granted_permissions,
-                "requested": requested_permissions,
-            }
-
-            return True, "Permissions retrieved", permissions_data
-
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to list permissions: {error_msg}", None
+
+        permissions_data = {"package": package, **parse_package_permissions(result.stdout)}
+        if not permissions_data["found"]:
+            # `dumpsys package <unknown>` prints "Unable to find package: X"
+            # and exits 0, so an empty result must not read as "no permissions".
+            return False, f"Package not installed on this device: {package}", permissions_data
+        return True, "Permissions retrieved", permissions_data
 
 
 def build_test_trail(scenario: str | None, step: int | None) -> dict | None:
@@ -279,6 +308,48 @@ def build_test_trail(scenario: str | None, step: int | None) -> dict | None:
     if step is not None:
         trail["step"] = step
     return trail
+
+
+def print_permissions(package: str, data: dict, verbose: bool) -> None:
+    """Print the ``--list`` report.
+
+    Runtime permissions come first and are always listed: they are the only
+    ones a permission-flow test can move, and there are rarely more than a
+    handful. Install-time permissions are counted by default and listed under
+    ``--verbose``, because a system app has close to two hundred of them and
+    none of them can change.
+
+    Args:
+        package: App package name.
+        data: Result dict from :meth:`PrivacyManager.list_app_permissions`.
+        verbose: Also list install-time and requested-only permissions.
+    """
+    runtime = data["runtime"]
+    install = data["install"]
+    held = sum(1 for entry in install if entry["granted"])
+    print(f"{package}: {len(runtime)} runtime, {len(install)} install-time ({held} granted)")
+
+    if runtime:
+        print("Runtime:")
+        for entry in runtime:
+            symbol = "✓" if entry["granted"] else "✗"
+            print(f"  {symbol} {entry['permission']}")
+    else:
+        print("Runtime: none (nothing here can be granted or revoked at runtime)")
+
+    if not verbose:
+        return
+
+    print(f"Install-time ({len(install)}):")
+    for entry in install:
+        print(f"  {'✓' if entry['granted'] else '✗'} {entry['permission']}")
+
+    stated = {entry["permission"] for entry in install + runtime}
+    unstated = [name for name in data["requested"] if name not in stated]
+    if unstated:
+        print(f"Requested, no state reported ({len(unstated)}):")
+        for name in unstated:
+            print(f"  ? {name}")
 
 
 def main():
@@ -372,15 +443,7 @@ Examples:
             else:
                 print(json.dumps({"success": False, "message": message}, indent=2))
         elif success:
-            print(f"Permissions for {args.package}:")
-            print(f"\nGranted ({len(perms_data['granted'])}):")
-            for perm in perms_data["granted"]:
-                print(f"  ✓ {perm}")
-            print(f"\nRequested ({len(perms_data['requested'])}):")
-            for perm in perms_data["requested"]:
-                granted = perm in perms_data["granted"]
-                symbol = "✓" if granted else "✗"
-                print(f"  {symbol} {perm}")
+            print_permissions(args.package, perms_data, args.verbose)
         else:
             print(message, file=sys.stderr)
 

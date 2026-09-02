@@ -321,13 +321,20 @@ def _trim_hierarchy(raw: str) -> str:
     return raw[start : end + len("</hierarchy>")] + "\n"
 
 
-def _requires(*needles: str) -> Callable[[str], str]:
+def _requires(*needles: str, absent: tuple[str, ...] = ()) -> Callable[[str], str]:
     """Refuse a capture that does not carry the fact it exists to record.
 
     A grep that matched nothing, a device with only one serial attached, a
     command whose failure mode changed -- all of them produce a short, valid,
     completely useless file. Writing it would put something that looks like
     ground truth on disk, which is the failure this recorder exists to prevent.
+
+    Args:
+        *needles: Text that must appear.
+        absent: Text that must NOT appear. Some fixtures exist to record an
+            absence -- ``dumpsys_package_after_silent_grant`` is the read-back
+            proving ``pm grant`` did nothing, and it is worthless if the
+            permission turns out to be there.
     """
 
     def check(text: str) -> str:
@@ -336,6 +343,12 @@ def _requires(*needles: str) -> Callable[[str], str]:
                 raise CaptureError(
                     f"capture does not contain {needle!r}, so it is not the "
                     f"output this fixture is meant to record"
+                )
+        for needle in absent:
+            if needle in text:
+                raise CaptureError(
+                    f"capture contains {needle!r}, whose absence is the whole "
+                    f"point of this fixture"
                 )
         return text
 
@@ -1047,6 +1060,104 @@ FIXTURES: list[Fixture] = [
             "is exactly what a no-op looks like."
         ),
         post=_requires("exit=0"),
+    ),
+    Fixture(
+        name="dumpsys_package_permissions",
+        args=["shell", "dumpsys", "package", "com.google.android.deskclock"],
+        description=(
+            "The permission state of an installed package, which is what "
+            "`privacy_manager --list` parses and what proves a grant took "
+            "effect. There is NO 'granted permissions:' section -- the header "
+            "privacy_manager looked for, which is why --list always answered "
+            "with two empty lists. The real headers, at four spaces of indent "
+            "under `Package [<pkg>]`, are 'declared permissions:' "
+            "(name: prot=...), 'requested permissions:' (bare names), "
+            "'install permissions:' (name: granted=<bool>), and -- nested one "
+            "level deeper, under 'User 0:' -- 'runtime permissions:' "
+            "(name: granted=<bool>, flags=[...]).\n"
+            "Deskclock is recorded rather than the fixture app because it is "
+            "an UPDATED system app, so the dump repeats all four sections a "
+            "second time under the top-level 'Hidden system packages:' header. "
+            "Measured: that copy is NOT stale -- granting READ_CALENDAR flips "
+            "`granted` in both copies -- so the cost of reading it is a "
+            "doubled list rather than a wrong value, and taking the first "
+            "occurrence of each section is what keeps it out. It also carries "
+            "both outcomes: POST_NOTIFICATIONS granted=true, READ_CALENDAR and "
+            "READ_MEDIA_AUDIO granted=false."
+        ),
+        catches=("S15",),
+        timeout=60,
+        post=_requires(
+            "install permissions:",
+            "runtime permissions:",
+            "Hidden system packages:",
+            "android.permission.POST_NOTIFICATIONS: granted=true",
+            "android.permission.READ_CALENDAR: granted=false",
+            absent=("granted permissions:",),
+        ),
+    ),
+    Fixture(
+        name="dumpsys_package_unknown",
+        args=["shell", "dumpsys package com.example.not.installed; echo exit=$?"],
+        description=(
+            "`dumpsys package` asked about a package that is not installed: "
+            "one line, 'Unable to find package: X', and exit status 0. So "
+            "`--list` cannot tell 'not installed' from 'installed and holds "
+            "nothing' by exit status, and an empty parse must not be printed "
+            "as an answer. The structural signal is the absence of the "
+            "top-level 'Packages:' block. (The echo is part of the recorded "
+            "command because a file cannot show an exit status.)"
+        ),
+        post=_requires("Unable to find package", "exit=0"),
+    ),
+    Fixture(
+        name="dumpsys_package_shared_uid",
+        args=["shell", "dumpsys", "package", "com.android.localtransport"],
+        description=(
+            "The other place `install permissions:` shows up twice, and the "
+            "one that costs data rather than adds it. A package in a shared "
+            "uid has its runtime permission state tracked against the UID, so "
+            "the dump prints it under the top-level 'Shared users:' header and "
+            "NOT under 'Packages:' -- this package's Packages block has no "
+            "'runtime permissions:' line at all, while the SharedUser "
+            "[android.uid.system] block below it has twenty-three. A parser "
+            "that reads only 'Packages:' (the obvious fix for the stale copy "
+            "under 'Hidden system packages:') answers that a system app holds "
+            "no runtime permissions whatsoever. com.android.settings has the "
+            "same shape at five times the size."
+        ),
+        catches=("S15",),
+        timeout=60,
+        post=_requires(
+            "Shared users:",
+            "SharedUser [android.uid.system]",
+            "runtime permissions:",
+            "android.permission.CAMERA: granted=true",
+        ),
+    ),
+    Fixture(
+        name="dumpsys_package_after_silent_grant",
+        args=["shell", "dumpsys", "package", COMPOSE_PACKAGE],
+        setup=[
+            ["shell", f"pm grant {COMPOSE_PACKAGE} android.permission.POST_NOTIFICATIONS"],
+        ],
+        description=(
+            "The read-back that catches the no-op recorded as "
+            "pm_grant_not_requested. Captured immediately AFTER that exact "
+            "`pm grant` (exit 0, no output at all): the fixture app's "
+            "'runtime permissions:' section is still empty and "
+            "POST_NOTIFICATIONS appears nowhere in the dump. Exit status and "
+            "printed output cannot tell a real grant from this one; the dump "
+            "can, which is why grant/revoke now prove themselves by reading "
+            "the state back."
+        ),
+        catches=("S16",),
+        timeout=60,
+        post=_requires(
+            "runtime permissions:",
+            "install permissions:",
+            absent=("android.permission.POST_NOTIFICATIONS",),
+        ),
     ),
     Fixture(
         name="cmd_notification_post_rejected",

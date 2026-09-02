@@ -1,0 +1,2 @@
+Unable to find package: com.example.not.installed
+exit=0
