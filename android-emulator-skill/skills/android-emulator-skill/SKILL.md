@@ -1,6 +1,6 @@
 ---
 name: android-emulator-skill
-version: 0.5.0
+version: 0.6.0
 description: Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output. Android equivalent of ios-simulator-skill.
 ---
 
@@ -42,7 +42,7 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 
 All scripts support `--help` for detailed options and `--json` for machine-readable output.
 
-## Scripts (v0.5.0)
+## Scripts (v0.6.0)
 
 ### Implemented (32 scripts)
 
@@ -220,7 +220,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       (`BatteryManager` still reports the real level).
 
 22. **push_notification.py** - Post into the shade, and read back what is posted
-    - Rescoped in v0.5.0 to what adb can actually do. It no longer claims to
+    - Rescoped in v0.6.0 to what adb can actually do. It no longer claims to
       send an app's notifications: `--post` posts via `cmd notification post`,
       and the result is owned by **com.android.shell** on channel `shell_cmd`,
       *not* by the app under test. The app's own channel, receiver and
@@ -486,7 +486,7 @@ On an emulator only, the gRPC control API does expose `setClipboard` /
 `getClipboard` (see `$ANDROID_HOME/emulator/lib/emulator_controller.proto`).
 That needs a gRPC client and the emulator's auth token, and is not wired up here.
 
-`clipboard.py` was removed in v0.5.0 for this reason: its surviving code path
+`clipboard.py` was removed in v0.6.0 for this reason: its surviving code path
 called `service call clipboard 1` with the pre-Android-10 signature and always
 failed.
 
