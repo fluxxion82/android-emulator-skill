@@ -13,6 +13,8 @@ import importlib
 import emulator_shutdown
 import pytest
 
+from common import adb_exec
+
 
 class _FakeResult:
     """Stand-in for subprocess.CompletedProcess."""
@@ -169,3 +171,65 @@ def test_cli_verify_default_and_opt_out(monkeypatch, argv, expected_verify):
 
     assert exc.value.code == 0
     assert captured["verify"] is expected_verify
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--all"],
+        ["--name", "Pixel_9"],
+        ["--serial", "emulator-5554"],
+        ["--all", "--json"],
+    ],
+    ids=["all", "by-name", "by-serial", "all-json"],
+)
+def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys, argv):
+    """At the CLI boundary the agent gets the remedy, not a stack trace.
+
+    All four device-query call sites in this module are deliberately unguarded
+    and reach ``main``; this covers each path that reaches one.
+    """
+
+    def _raise():
+        raise adb_exec.MultipleDevicesError(
+            "More than one device is attached, so adb could not choose one. "
+            "Pass --serial with one of: emulator-5554, emulator-5556."
+        )
+
+    monkeypatch.setattr(emulator_shutdown, "get_connected_devices", _raise)
+    monkeypatch.setattr(emulator_shutdown.sys, "argv", ["emulator_shutdown.py", *argv])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_shutdown.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: ")
+    assert "Traceback" not in captured.err
+    assert "--serial" in captured.err, "no remedy named"
+
+
+def test_cli_surfaces_a_missing_adb_rather_than_an_oserror(monkeypatch, capsys):
+    """The original defect: adb off PATH escaped as a raw OSError traceback.
+
+    Driven through the real ``run_adb`` rather than a stubbed device query, so
+    it pins the whole chain: OSError -> AdbNotInstalledError -> CLI remedy.
+    """
+
+    def _no_adb(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "adb")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _no_adb)
+    monkeypatch.setattr(emulator_shutdown.sys, "argv", ["emulator_shutdown.py", "--all"])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_shutdown.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    # Assert the type's own remedy reaches the boundary intact, not its current
+    # wording -- the wording is adb_exec's to change.
+    with pytest.raises(adb_exec.AdbNotInstalledError) as raised:
+        adb_exec.run_adb("devices", None, "-l")
+    assert captured.err == f"Error: {raised.value}\n"
