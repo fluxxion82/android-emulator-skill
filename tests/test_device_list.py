@@ -180,6 +180,11 @@ class _FakeResult:
         self.returncode = returncode
 
 
+def _fake_emulator_on_path(monkeypatch):
+    """Pin emulator resolution to the bare name so argv assertions stay stable."""
+    monkeypatch.setattr(device_list, "get_emulator_path", lambda: "emulator")
+
+
 def _fake_run_factory(adb_out: str, emulator_out: str, avdmanager_out: str):
     def fake_run(cmd, **_kwargs):
         if cmd[:2] == ["adb", "devices"]:
@@ -194,6 +199,7 @@ def _fake_run_factory(adb_out: str, emulator_out: str, avdmanager_out: str):
 
 
 def test_collect_aggregates_counts(monkeypatch):
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(
         device_list.subprocess,
         "run",
@@ -213,6 +219,7 @@ def test_collect_aggregates_counts(monkeypatch):
 
 
 def test_collect_filter_narrows_devices_and_avds(monkeypatch):
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(
         device_list.subprocess,
         "run",
@@ -256,3 +263,61 @@ def test_tunables_env_override(monkeypatch):
         monkeypatch.delenv("ANDROID_EMU_LIST_PREVIEW_COUNT", raising=False)
         monkeypatch.delenv("ANDROID_EMU_LIST_TIMEOUT", raising=False)
         importlib.reload(device_list)
+
+
+# ---------------------------------------------------------------------------
+# Emulator resolution (SDK-root-on-PATH regression)
+# ---------------------------------------------------------------------------
+def test_collect_survives_permission_error_from_a_directory_argv0(monkeypatch):
+    """An unresolvable `emulator` must degrade to "no AVDs", not traceback.
+
+    With the SDK root on PATH the bare name `emulator` resolves to the
+    <sdk>/emulator *directory* and execve raises PermissionError, which is an
+    OSError but not a FileNotFoundError.
+    """
+
+    def boom(_cmd, **_kwargs):
+        raise PermissionError(13, "Permission denied", "emulator")
+
+    monkeypatch.setattr(device_list.subprocess, "run", boom)
+
+    data = device_list.DeviceLister().collect()
+    assert data["devices"] == []
+    assert data["avds"] == []
+
+
+def test_get_avds_skips_emulator_when_binary_is_unresolvable(monkeypatch):
+    """No resolved emulator -> no exec attempt at all."""
+    monkeypatch.setattr(device_list, "get_emulator_path", lambda: None)
+
+    attempted: list[list[str]] = []
+
+    def record(cmd, **_kwargs):
+        attempted.append(cmd)
+        return _FakeResult("", returncode=1)
+
+    monkeypatch.setattr(device_list.subprocess, "run", record)
+
+    assert device_list.DeviceLister().get_avds() == []
+    assert all(cmd[0] != "emulator" for cmd in attempted)
+
+
+def test_get_avds_uses_the_resolved_emulator_path(monkeypatch, recorded):
+    """The resolved absolute path is what gets exec'd, not the bare name."""
+    monkeypatch.setattr(device_list, "get_emulator_path", lambda: "/opt/sdk/emulator/emulator")
+
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        seen.append(cmd)
+        if cmd[0] == "/opt/sdk/emulator/emulator":
+            return _FakeResult(recorded.text("emulator_list_avds"))
+        return _FakeResult("", returncode=1)
+
+    monkeypatch.setattr(device_list.subprocess, "run", fake_run)
+
+    avds = device_list.DeviceLister().get_avds()
+
+    expected = [ln.strip() for ln in recorded.lines("emulator_list_avds") if ln.strip()]
+    assert [a["name"] for a in avds] == expected
+    assert ["/opt/sdk/emulator/emulator", "-list-avds"] in seen

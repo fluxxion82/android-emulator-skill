@@ -34,8 +34,14 @@ def _no_connected_devices(monkeypatch):
     monkeypatch.setattr(emulator_boot, "get_connected_devices", lambda: [])
 
 
+def _fake_emulator_on_path(monkeypatch):
+    """Pin emulator resolution to the bare name so argv assertions stay stable."""
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: "emulator")
+
+
 def test_boot_all_boots_every_defined_avd(monkeypatch):
     _no_connected_devices(monkeypatch)
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(
         emulator_boot,
         "list_avds",
@@ -65,6 +71,7 @@ def test_boot_all_boots_every_defined_avd(monkeypatch):
 
 def test_boot_all_headless_appends_no_window(monkeypatch):
     _no_connected_devices(monkeypatch)
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(emulator_boot, "list_avds", lambda: [{"name": "Pixel_5_API_33"}])
     monkeypatch.setattr(emulator_boot.time, "sleep", lambda _s: None)
 
@@ -84,6 +91,7 @@ def test_boot_all_headless_appends_no_window(monkeypatch):
 
 def test_boot_all_counts_failures(monkeypatch):
     _no_connected_devices(monkeypatch)
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(emulator_boot, "list_avds", lambda: [{"name": "Broken_AVD"}])
     monkeypatch.setattr(emulator_boot.time, "sleep", lambda _s: None)
 
@@ -127,6 +135,7 @@ def test_tunables_env_override(monkeypatch):
 @pytest.mark.parametrize("headless", [False, True])
 def test_single_boot_command_mapping(monkeypatch, headless):
     _no_connected_devices(monkeypatch)
+    _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(emulator_boot.time, "sleep", lambda _s: None)
 
     launched: list[list[str]] = []
@@ -220,6 +229,7 @@ def test_avd_name_probe_is_bounded(monkeypatch, recorded):
 
 def test_avd_listing_is_bounded(monkeypatch):
     """`emulator -list-avds` is an SDK tool, not adb -- but still not unbounded."""
+    _fake_emulator_on_path(monkeypatch)
     calls = _fake_adb(monkeypatch, {("emulator",): (0, "Pixel_9\nPixel_5_API_33\n", "")})
 
     assert emulator_boot.list_avds() == [{"name": "Pixel_9"}, {"name": "Pixel_5_API_33"}]
@@ -229,6 +239,7 @@ def test_avd_listing_is_bounded(monkeypatch):
 
 def test_avd_listing_survives_its_own_timeout(monkeypatch):
     """A bounded call raises TimeoutExpired, which must not become a traceback."""
+    _fake_emulator_on_path(monkeypatch)
     _fake_adb(
         monkeypatch,
         {("emulator",): subprocess.TimeoutExpired(cmd="emulator", timeout=30)},
@@ -256,3 +267,84 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
     assert captured.err.startswith("Error: ")
     assert "Traceback" not in captured.err
     assert "--serial" in captured.err, "no remedy named"
+
+
+# ---------------------------------------------------------------------------
+# Emulator resolution (SDK-root-on-PATH regression)
+# ---------------------------------------------------------------------------
+def test_list_avds_survives_permission_error_from_a_directory_argv0(monkeypatch, capsys):
+    """`emulator` resolving to a directory raises PermissionError, not ENOENT."""
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: "/sdk/emulator/emulator")
+
+    def boom(_cmd, **_kwargs):
+        raise PermissionError(13, "Permission denied", "emulator")
+
+    monkeypatch.setattr(emulator_boot.subprocess, "run", boom)
+
+    assert emulator_boot.list_avds() == []
+    assert "Permission denied" not in capsys.readouterr().out
+
+
+def test_list_avds_reports_actionable_hint_when_unresolvable(monkeypatch, capsys):
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: None)
+
+    def unexpected(_cmd, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("must not exec an unresolved emulator")
+
+    monkeypatch.setattr(emulator_boot.subprocess, "run", unexpected)
+
+    assert emulator_boot.list_avds() == []
+    assert "$ANDROID_HOME/emulator" in capsys.readouterr().err
+
+
+def test_list_avds_parses_recorded_emulator_output(monkeypatch, recorded):
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: "/sdk/emulator/emulator")
+
+    seen: list[list[str]] = []
+
+    class _Result:
+        stdout = recorded.text("emulator_list_avds")
+
+    def fake_run(cmd, **_kwargs):
+        seen.append(cmd)
+        return _Result()
+
+    monkeypatch.setattr(emulator_boot.subprocess, "run", fake_run)
+
+    expected = [ln.strip() for ln in recorded.lines("emulator_list_avds") if ln.strip()]
+    assert [a["name"] for a in emulator_boot.list_avds()] == expected
+    assert seen == [["/sdk/emulator/emulator", "-list-avds"]]
+
+
+def test_boot_uses_the_resolved_emulator_path(monkeypatch):
+    _no_connected_devices(monkeypatch)
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: "/sdk/emulator/emulator")
+    monkeypatch.setattr(emulator_boot.time, "sleep", lambda _s: None)
+
+    launched: list[list[str]] = []
+
+    def fake_popen(cmd, **_kwargs):
+        launched.append(cmd)
+        return _FakeProcess(returncode=None)
+
+    monkeypatch.setattr(emulator_boot.subprocess, "Popen", fake_popen)
+
+    success, _message = emulator_boot.EmulatorBooter("Pixel_9").boot()
+
+    assert success is True
+    assert launched == [["/sdk/emulator/emulator", "-avd", "Pixel_9"]]
+
+
+def test_boot_reports_actionable_hint_when_unresolvable(monkeypatch):
+    _no_connected_devices(monkeypatch)
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: None)
+
+    def unexpected(_cmd, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("must not exec an unresolved emulator")
+
+    monkeypatch.setattr(emulator_boot.subprocess, "Popen", unexpected)
+
+    success, message = emulator_boot.EmulatorBooter("Pixel_9").boot()
+
+    assert success is False
+    assert "$ANDROID_HOME/emulator" in message

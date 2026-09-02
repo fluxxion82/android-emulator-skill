@@ -21,6 +21,7 @@ import time
 from common import adb_exec
 from common.device_utils import get_connected_devices
 from common.env_config import env_float, env_int
+from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_BOOT_TIMEOUT = env_int("ANDROID_EMU_BOOT_TIMEOUT", 300)
@@ -78,8 +79,15 @@ class EmulatorBooter:
                         f"({emu['serial']}) [checked in {elapsed:.1f}s]"
                     )
 
+        # Resolve the emulator binary. Exec'ing the bare name is unsafe: with
+        # the SDK root on PATH it hits the <sdk>/emulator directory and raises
+        # PermissionError instead of FileNotFoundError.
+        emulator = get_emulator_path()
+        if not emulator:
+            return False, EMULATOR_NOT_FOUND_MESSAGE
+
         # Build emulator command
-        cmd = ["emulator", "-avd", self.avd_name]
+        cmd = [emulator, "-avd", self.avd_name]
         if headless:
             cmd.append("-no-window")
 
@@ -102,13 +110,8 @@ class EmulatorBooter:
             if process.poll() is not None:
                 return False, f"Emulator failed to start (exit code: {process.returncode})"
 
-        except FileNotFoundError:
-            return False, (
-                "Error: 'emulator' command not found. "
-                "Make sure Android SDK is installed and emulator is in PATH:\n"
-                "  export ANDROID_HOME=$HOME/Library/Android/sdk\n"
-                "  export PATH=$PATH:$ANDROID_HOME/emulator"
-            )
+        except OSError as e:
+            return False, f"{EMULATOR_NOT_FOUND_MESSAGE}\n  (exec of {emulator!r} failed: {e})"
         except Exception as e:
             return False, f"Boot error: {e}"
 
@@ -256,32 +259,36 @@ def list_avds() -> list:
     """
     List available AVDs.
 
+    The emulator binary is resolved explicitly (see :mod:`common.sdk_tools`)
+    rather than exec'd by bare name, which raises ``PermissionError`` when PATH
+    holds the SDK root instead of ``$ANDROID_HOME/emulator``.
+
     Returns:
         List of AVD dicts with name and target info
     """
+    emulator = get_emulator_path()
+    if not emulator:
+        print(EMULATOR_NOT_FOUND_MESSAGE, file=sys.stderr)
+        return []
+
     try:
-        cmd = ["emulator", "-list-avds"]
+        cmd = [emulator, "-list-avds"]
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=EMULATOR_TOOL_TIMEOUT, check=True
         )
-
-        avds = []
-        for line in result.stdout.split("\n"):
-            line = line.strip()
-            if line:
-                avds.append({"name": line})
-
-        return avds
-
-    except FileNotFoundError:
-        print(
-            "Error: 'emulator' command not found. "
-            "Make sure Android SDK is installed and emulator is in PATH",
-            file=sys.stderr,
-        )
+    except OSError as e:
+        print(f"Error: could not run {emulator!r}: {e}", file=sys.stderr)
         return []
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return []
+
+    avds = []
+    for line in result.stdout.split("\n"):
+        name = line.strip()
+        if name:
+            avds.append({"name": name})
+
+    return avds
 
 
 def main():
