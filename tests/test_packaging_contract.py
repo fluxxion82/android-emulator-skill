@@ -311,3 +311,65 @@ def test_the_trailer_check_actually_rejects_a_trailer(tmp_path):
         [sys.executable, str(script), str(good)], capture_output=True, text=True, check=False
     )
     assert accepted.returncode == 0, f"a clean message was rejected: {accepted.stderr}"
+
+
+def _option_tokens(help_text: str) -> set[str]:
+    """The flags argparse actually registered, from its own --help output.
+
+    Only tokens in the leading option column of a line count; anything in a
+    help *description* is prose, not a flag.
+    """
+    tokens: set[str] = set()
+    for line in help_text.splitlines():
+        if not line.startswith((" ", "\t")):
+            continue
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        # "  --json, -j METAVAR   description..." -> the part before 2+ spaces.
+        column = re.split(r"\s{2,}", stripped)[0]
+        for piece in column.split(","):
+            flag = piece.strip().split("=")[0].split(" ")[0]
+            if flag.startswith("-"):
+                tokens.add(flag)
+    return tokens
+
+
+def test_every_script_offers_the_documented_json_contract():
+    """CLAUDE.md: "`--help` and `--json` on every script".
+
+    That is the machine-readable contract an agent depends on, and it was true
+    of every script but one: `visual_diff.py` reached the same output only as
+    `--details`, whose help text reads like a `--verbose`. An agent following
+    the documented contract would pass `--json` and get an argparse error.
+
+    Checked by running each script's own `--help` and extracting the OPTION
+    TOKENS, not by searching the help text for the string "--json". The first
+    version of this test did the latter and was vacuous: `visual_diff`'s
+    `--details` help reads "Deprecated alias for --json", so the prose satisfied
+    the check and renaming the real flag left it green. That is the same
+    substring-versus-structure mistake this repo keeps making -- a guard that
+    matches its own documentation.
+    """
+    import subprocess
+    import sys
+
+    scripts = sorted((SKILL_ROOT / "scripts").glob("*.py"))
+    assert scripts, "no scripts found"
+
+    missing = []
+    for script in scripts:
+        helped = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert helped.returncode == 0, f"{script.name} --help failed: {helped.stderr[:200]}"
+        if "--json" not in _option_tokens(helped.stdout):
+            missing.append(script.name)
+
+    assert not missing, (
+        f"these scripts do not offer --json, which CLAUDE.md states every script has: " f"{missing}"
+    )
