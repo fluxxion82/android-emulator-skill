@@ -235,7 +235,7 @@ def _names_printed(report: str) -> list[str]:
 
 
 @pytest.mark.emulator
-def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app):
+def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app, compose_device):
     """Quick Start, run as written, in the order an agent would run it.
 
     Each step asserts on what the previous one produced, so a break anywhere is
