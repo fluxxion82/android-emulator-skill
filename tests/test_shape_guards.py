@@ -1183,13 +1183,31 @@ _BOUNDS_GRAMMAR = re.compile(r"\\\[[^\]]*-?\\d")
 # repaired by weakening it.
 _BOUNDS_PARSER_NAMES = frozenset({"_parse_bounds", "_bounds"})
 
-KNOWN_BOUNDS_SITES: tuple[Expectation, ...] = (
-    Expectation("accessibility_audit.py", "_parse_bounds", BOUNDS_FUNCTION),  # :70
-    Expectation("accessibility_audit.py", "_parse_bounds", BOUNDS_REGEX, "signed"),  # :72
-    Expectation("navigator.py", "_parse_bounds", BOUNDS_FUNCTION),  # :290
-    Expectation("navigator.py", "_parse_bounds", BOUNDS_REGEX, "unsigned"),  # :301
-    Expectation("screen_mapper.py", "_bounds", BOUNDS_FUNCTION),  # :268
-    Expectation("screen_mapper.py", "_bounds", BOUNDS_REGEX, "unsigned"),  # :270
+# Empty, and that is the finished state of C5/C7: one `parse_bounds()` in
+# common/hierarchy.py and no grammar, and no parser named after one, anywhere
+# else. What it used to hold, before Inc 1:
+#
+#     accessibility_audit.py  _parse_bounds  function        :70
+#     accessibility_audit.py  _parse_bounds  regex, signed   :72
+#     navigator.py            _parse_bounds  function        :290
+#     navigator.py            _parse_bounds  regex, unsigned :301
+#     screen_mapper.py        _bounds        function        :268
+#     screen_mapper.py        _bounds        regex, unsigned :270
+#
+# An empty enumeration proves nothing about the detector on its own, which is
+# what `test_the_bounds_guard_flags_a_synthetic_violation` and
+# `test_the_bounds_guard_ignores_docstrings` are for: they keep the scanner
+# honest without a live violation to point at.
+KNOWN_BOUNDS_SITES: tuple[Expectation, ...] = ()
+
+# ...and exactly one INSIDE it. Enumerating the shared parser is what makes the
+# guard say "one grammar" rather than "none of them here": with only the
+# negative half, deleting `parse_bounds` altogether -- or growing a second
+# grammar beside it, which is how three of them appeared in the first place --
+# passes. `parse_bounds` itself is not matched by the name rule
+# (`_parse_bounds`/`_bounds`), so the single expected site is its regex.
+KNOWN_SHARED_BOUNDS_SITES: tuple[Expectation, ...] = (
+    Expectation(HIERARCHY, "<module>", BOUNDS_REGEX, "signed"),
 )
 
 
@@ -1240,24 +1258,29 @@ def bounds_grammars_outside_hierarchy() -> list[Site]:
     return found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C5/C7: three bounds grammars in three files, two of them unsigned. "
-        "Inc 1 replaces them with one parse_bounds() in common/hierarchy.py."
-    ),
-)
-def test_bounds_are_parsed_in_one_place():
-    """One grammar, or the three disagree about a view that is half off-screen.
+def bounds_grammars_inside_hierarchy() -> list[Site]:
+    """What the shared module itself spells. Exactly one grammar is correct."""
+    path = SCRIPTS / HIERARCHY
+    return scan_bounds(HIERARCHY, path.read_text(encoding="utf-8"))
 
-    ``navigator._parse_bounds`` and ``screen_mapper._bounds`` both match
-    ``\\d+``, so a bounds string with a negative coordinate -- what uiautomator
-    writes for a partially scrolled-off view -- fails to match. Navigator then
-    returns ``(0, 0, 0, 0)`` and offers the element as tappable at the top-left
-    corner of the screen; screen_mapper reads None and its area check says
-    "do not exclude on a missing signal", so the same element counts as
-    interactive. ``accessibility_audit._parse_bounds`` already has the signed
-    grammar, which is how the disagreement is provable rather than theoretical.
+
+def test_bounds_are_parsed_in_one_place():
+    """One grammar, or the three disagree about the same element.
+
+    ``navigator._parse_bounds`` and ``screen_mapper._bounds`` both matched
+    ``\\d+`` and ``accessibility_audit._parse_bounds`` matched ``-?\\d+``, so the
+    three did not answer alike -- and the two unsigned ones did not fail
+    loudly: navigator returned ``(0, 0, 0, 0)`` for anything its grammar missed
+    and offered the element as tappable at the top-left corner of the screen,
+    while screen_mapper read None and its area check said "do not exclude on a
+    missing signal", so the same element counted as interactive.
+
+    (The disagreement is provable from the grammars themselves. The scenario
+    originally given for it -- a partially scrolled-off view -- turns out not to
+    arise on API 35, where uiautomator clips every rectangle to the display;
+    eight recipes for an off-screen node all came back clipped. The single
+    parser is signed anyway, and `parse_bounds` returning None where it cannot
+    read a value is what removes the corner tap.)
     """
     offenders = bounds_grammars_outside_hierarchy()
     assert not offenders, (
@@ -1341,14 +1364,23 @@ def test_the_bounds_guard_enumerates_todays_sites():
     )
 
 
-def test_the_shared_parser_home_exists():
-    """The guard asserts absence elsewhere; that only means something with a there.
+def test_exactly_one_bounds_grammar_lives_in_the_shared_module():
+    """Zero elsewhere is only half the rule; one HERE is the other half.
 
-    Inc 1 adds ``parse_bounds()`` to ``common/hierarchy.py``. Today the module
-    exists and the function does not, which is stated rather than asserted --
-    the guard above is about the three copies, not about this file.
+    "No grammar outside common/hierarchy.py" is satisfied by a skill with no
+    parser at all, and by one whose shared module holds two of them -- which is
+    the precise failure this whole guard exists to prevent, moved one directory
+    over. So the shared module is enumerated positively, and its single site is
+    named.
     """
     assert (SCRIPTS / HIERARCHY).exists(), "the intended home for the shared parser is gone"
+    _assert_enumeration(
+        KNOWN_SHARED_BOUNDS_SITES, bounds_grammars_inside_hierarchy(), "KNOWN_SHARED_BOUNDS_SITES"
+    )
+
+    from common import hierarchy
+
+    assert callable(hierarchy.parse_bounds), "the shared parser is not callable"
 
 
 # ===========================================================================

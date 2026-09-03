@@ -63,10 +63,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 #### App Management (1 script)
 4. **app_launcher.py** - App lifecycle management
-   - Launch apps by package name
+   - Launch apps by package name. `--launch` **waits for the activity to be
+     displayed** (`am start -W`) and fails if the system reports anything but
+     `Status: ok`, so the next command maps the app's screen rather than
+     whatever was still in front. The message reports the activity that came up
+     and how long it took.
    - Terminate apps
    - Install/uninstall APKs
-   - Deep link navigation
+   - Deep link navigation. `--open-url` waits the same way `--launch` does and
+     fails when the intent resolves to nothing, rather than reporting a URL it
+     merely handed to the system.
    - List installed packages
    - Check app state
    - Options: `--launch`, `--terminate`, `--install`, `--uninstall`, `--open-url`, `--list`, `--state`, `--json`
@@ -128,17 +134,49 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 #### Navigation & Interaction (4 scripts)
 12. **screen_mapper.py** - Analyze current screen and list interactive elements
-    - Count elements by type
     - Listing is the default, not a mode: **there is no `--list`.** The bare
       command prints the summary; `--verbose` expands it to the per-element
       breakdown, `--hints` adds navigation suggestions.
-    - Token-efficient summaries
+    - The default output **names every interactive control**, one line per kind
+      (`Button:`, `Control:`, `CheckBox:`, `EditText:` …), capped per kind. Those
+      names are exactly what `navigator.py --find-text` accepts, so step 2 of
+      Quick Start feeds step 3 directly. It used to print counts only, and on a
+      Compose screen the names existed solely under `--verbose`/`--json`.
+    - A control with no text of its own is named by the caption recovered from
+      its subtree or its row; one with a resource id is named by the **bare** id
+      (`com.android.settings:id/search_action_bar` prints as
+      `search_action_bar`), which is what `navigator` prints and what
+      `--find-id` takes. Compose test tags are already bare, so both toolkits
+      name things the same way.
+    - `--hints` prints the next command to run, already filled in.
     - Options: `--serial`/`-s`, `--verbose`/`-v`, `--hints`, `--json`
 
 13. **navigator.py** - Find and interact with elements semantically
     - Find by text, type, resource ID
     - Tap, enter text, get bounds
     - Fuzzy matching support
+    - `--find-text` matches **any name the screen report printed**: an element's
+      own text or content-desc, the caption recovered for an unlabelled control,
+      or a resource id (bare or fully qualified, matched whole). A match on a
+      caption resolves to the control that owns it -- the control it sits
+      inside, or the one beside it in the same row -- so the tap lands on the
+      checkbox rather than 143px to its right. The owner must be **tappable**
+      (clickable / long-clickable / checkable): a scrolling container is
+      interactive, but it is not what a caption inside it names, and resolving
+      to it would tap the middle of the screen. A name that matches only a
+      passive label with no such control is refused, not tapped.
+    - `--tap` and `--enter-text` **require a target**: one of `--find-text`,
+      `--find-exact`, `--find-type`, `--find-id`, or explicit `--tap-at x,y`.
+      Without one it is a usage error (exit 2) and nothing is sent to the device.
+    - `--max-scrolls` is capped at 50 (so is `ANDROID_EMU_MAX_SCROLLS`), and a
+      `--scroll-to-find` search is also bounded in wall-clock time
+      (`ANDROID_EMU_SCROLL_SEARCH_DEADLINE`, default 120s -- see `--help`),
+      which bounds the screen dumps too. Each scroll prints a progress line to
+      stderr as it happens.
+    - Under `--json`, a successful `--tap`/`--enter-text` reports
+      **`tapped_at: [x, y]`** -- the coordinates that reached the device, so a
+      caller can check where the tap went without parsing prose. Every failure,
+      including a usage error, prints `{"error": ...}` and exits non-zero.
     - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible
       screen, and `Not found` is indistinguishable from "the item is two rows down". The default
       path now says which it was: `(searched 1 screen; this screen scrolls -- retry with
@@ -178,7 +216,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 #### Testing & Analysis (4 scripts) ✓ COMPLETE
 16. **accessibility_audit.py** ⭐ NEW - WCAG compliance checking
-    - Missing content descriptions
+    - Missing content descriptions: any **operable** control (by its uiautomator
+      properties, not its class name) with no describing text in itself or its
+      subtree is critical. The old class-name gate could not fire on a Compose
+      screen at all, where controls are plain `android.view.View`.
     - Touch target size verification
     - EditText hint checking
     - Image accessibility

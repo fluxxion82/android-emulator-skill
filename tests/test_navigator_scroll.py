@@ -43,17 +43,21 @@ the tests can assert on the argv that *would* have been sent.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import gesture
 import navigator
 import pytest
+from app_launcher import am_start_error, parse_am_start
 from navigator import Navigator
 
 from common import adb_exec
+from common.device_utils import parse_focused_activity
 
 TOP = "uiautomator_settings_top"
 HALF = "uiautomator_settings_half"
@@ -64,6 +68,12 @@ NO_SCROLL = "uiautomator_dialer_keypad"
 # On this profile the label is 'About emulated device'; the same row is 'About
 # phone' on a handset. Either way it is the last row of the list.
 TARGET = "About emulated device"
+
+# The row that owns that caption, in the SCROLLED dump: the caption TextView is
+# [189,1953][729,2024] and the clickable LinearLayout around it is this. Taken
+# from the recording (see test_the_owning_row_is_what_the_recorded_screen_says),
+# because a tap has to land on the row and the row alone.
+TARGET_ROW_BOUNDS = "[0,1899][1080,2130]"
 VISIBLE = "Notifications"
 ABSENT = "Wormhole Calibration"
 
@@ -128,6 +138,22 @@ def _bounds_string(xml: str, text: str) -> str:
     raise AssertionError(f"{text!r} is not in this recorded screen")
 
 
+def _rect(bounds: str) -> tuple[int, int, int, int]:
+    """``"[l,t][r,b]"`` as four ints, parsed here rather than imported."""
+    left, top, right, bottom = (int(part) for part in re.findall(r"-?\d+", bounds))
+    return left, top, right, bottom
+
+
+def _encloses(outer: tuple[int, int, int, int], inner: tuple[int, int, int, int]) -> bool:
+    """Whether ``outer`` covers every pixel of ``inner``."""
+    return (
+        outer[0] <= inner[0]
+        and outer[1] <= inner[1]
+        and outer[2] >= inner[2]
+        and outer[3] >= inner[3]
+    )
+
+
 def _stub_resolve(monkeypatch, serial: str = "emulator-5554") -> None:
     monkeypatch.setattr(navigator, "resolve_device_identifier", lambda arg: serial)
 
@@ -151,6 +177,23 @@ def test_recorded_screens_are_successive_states_of_one_list(recorded):
     # The middle screen moved a long way and still does not contain the target,
     # which is why a miss must not end the search.
     assert TARGET not in half and "Network" not in half and VISIBLE in half
+
+
+def test_the_owning_row_is_what_the_recorded_screen_says(recorded):
+    """The literal above, held to the dump it was read from.
+
+    Without this the rectangle in `TARGET_ROW_BOUNDS` is a number somebody
+    typed; with it, a re-recorded fixture that moves the row fails here rather
+    than making the coordinate test assert against a stale expectation.
+    """
+    screen = ET.fromstring(recorded.text(SCROLLED))
+    parents = {child: parent for parent in screen.iter() for child in parent}
+
+    caption = next(node for node in screen.iter() if node.get("text") == TARGET)
+    row = parents[parents[caption]]
+
+    assert row.get("clickable") == "true", "the enclosing row is not the control"
+    assert row.get("bounds") == TARGET_ROW_BOUNDS
 
 
 def test_recorded_end_of_list_dumps_are_identical(recorded):
@@ -185,7 +228,10 @@ def test_visible_element_is_found_without_scrolling(monkeypatch, recorded):
     result = nav.find_element_scrolling(text=VISIBLE)
 
     assert result.element is not None
-    assert result.element.text == VISIBLE
+    # The row, not the caption inside it: a name resolves to the control that
+    # answers to it, which is what makes the tap land on something (C1).
+    assert VISIBLE in result.element.label
+    assert result.element.interactive, f"{result.element.description} cannot be operated"
     assert result.scrolls == 0
     assert result.screens_searched == 1
     assert not _swipes(commands), "scrolled for an element that was already on screen"
@@ -214,8 +260,12 @@ def test_found_element_carries_coordinates_from_the_final_screen(monkeypatch, re
 
     result = nav.find_element_scrolling(text=TARGET)
 
-    x1, y1, x2, y2 = result.element.bounds
-    assert f"[{x1},{y1}][{x2},{y2}]" == _bounds_string(recorded.text(SCROLLED), TARGET)
+    # The exact row, as the LAST dump reports it. "Something that encloses the
+    # caption" would also be satisfied by the RecyclerView, the ScrollView or
+    # the window -- every one of which taps somewhere else -- so the expectation
+    # is the one rectangle, read out of the recorded screen.
+    assert result.element.bounds == _rect(TARGET_ROW_BOUNDS)
+    assert _encloses(result.element.bounds, _rect(_bounds_string(recorded.text(SCROLLED), TARGET)))
 
 
 def test_scroll_search_drives_the_content_down_not_the_finger(monkeypatch, recorded):
@@ -401,7 +451,9 @@ def test_cli_scroll_search_finds_below_the_fold(monkeypatch, recorded, capsys):
     assert exc.value.code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["success"] is True
-    assert payload["element"]["label"] == TARGET
+    # The row is reported under the caption it recovered, which begins with the
+    # searched-for title and continues with the row's summary line.
+    assert TARGET in payload["element"]["label"]
     assert payload["search"]["scrolls"] == 2
     assert payload["search"]["screens_searched"] == 3
 
@@ -507,7 +559,10 @@ def test_cli_find_id_also_scrolls(monkeypatch, recorded):
     result = nav.find_element_scrolling(resource_id="title", text=TARGET)
 
     assert result.element is not None
-    assert result.element.resource_id == "title"
+    # `--find-id` matches on any part of the id, and the name both scripts print
+    # for an id is the bare one (INC1-08). This node carries text as well, so its
+    # label is that text; the id it was found by is `title`.
+    assert result.element.resource_id.rsplit("/", maxsplit=1)[-1] == "title"
 
 
 # ---------------------------------------------------------------------------
@@ -524,18 +579,62 @@ def _navigator_cli(adb_path: str, serial: str, args: list[str]) -> subprocess.Co
         / "scripts"
         / "navigator.py"
     )
-    subprocess.run(
+    stopped = subprocess.run(
         [adb_path, "-s", serial, "shell", "am", "force-stop", "com.android.settings"],
         capture_output=True,
+        text=True,
         timeout=30,
         check=False,
     )
-    subprocess.run(
-        [adb_path, "-s", serial, "shell", "am", "start", "-a", "android.settings.SETTINGS"],
+    assert stopped.returncode == 0, (
+        f"could not force-stop Settings, so the screen below is whatever was "
+        f"already there: {stopped.stdout.strip()} {stopped.stderr.strip()}"
+    )
+
+    # `-W`, then poll for focus: this is E1 in the place it was not fixed. The
+    # bare `am start` returned as soon as the intent was dispatched, so the dump
+    # below could catch the launcher instead of Settings -- and the failure read
+    # "nothing on it scrolls, so there is no content below", which is a
+    # confident statement about the wrong screen.
+    #
+    # Both results are checked. Ignoring them left the same hole one layer down:
+    # the launch could fail, the focus loop could time out, and the test would
+    # still run navigator against whatever was in front and blame navigator for
+    # what it found.
+    started = subprocess.run(
+        [adb_path, "-s", serial, "shell", "am", "start", "-W", "-a", "android.settings.SETTINGS"],
         capture_output=True,
-        timeout=30,
+        text=True,
+        timeout=120,
         check=False,
     )
+    report = parse_am_start(started.stdout)
+    assert (report.get("status") or "").lower() == "ok", (
+        f"Settings did not start: {am_start_error(started.stdout) or started.stdout.strip()!r}. "
+        f"Nothing below this point would be measuring Settings."
+    )
+
+    deadline = time.monotonic() + 30
+    focused = None
+    while time.monotonic() < deadline:
+        dumped = subprocess.run(
+            [adb_path, "-s", serial, "shell", "dumpsys", "window"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        focused = parse_focused_activity(dumped.stdout)
+        if (focused or "").startswith("com.android.settings"):
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError(
+            f"am start reported {report.get('activity')!r} as displayed, but "
+            f"{focused!r} is focused after 30s -- the screen this test is about "
+            f"to make claims about is not Settings."
+        )
+
     return subprocess.run(
         [sys.executable, str(script), "--serial", serial, *args],
         capture_output=True,
@@ -569,6 +668,8 @@ def test_live_absent_text_reports_the_search_rather_than_a_bare_miss(adb, emulat
 
     assert result.returncode == 1
     payload = json.loads(result.stdout)
-    assert "searched" in payload["message"]
+    # Every failure answers `{"error": ...}` under --json (INC1-07); the search
+    # detail rides alongside it, which is what makes "not found" actionable.
+    assert "searched" in payload["error"]
     detail = payload["search"]["detail"]
     assert "scrolled to the end" in detail or "nothing on it scrolls" in detail

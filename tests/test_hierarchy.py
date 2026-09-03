@@ -298,3 +298,164 @@ def test_a_persistent_null_root_node_says_what_to_check(fake_dump):
         "a null root node is being reported as the idle-state/animation failure, "
         "which sends the reader after the wrong cause"
     )
+
+
+# ---------------------------------------------------------------------------
+# The two questions every consumer of a dump asks (C5 / C7)
+# ---------------------------------------------------------------------------
+#
+# `parse_bounds` and `is_interactive` replaced three bounds grammars and two
+# eligibility rules spread across navigator, screen_mapper and
+# accessibility_audit. Their tests live here, with the implementation, rather
+# than once per consumer.
+
+
+def test_bounds_are_read_off_the_recorded_screen(recorded):
+    """Every node in a real dump parses, and to the numbers the dump states."""
+    root = ET.fromstring(recorded.text("uiautomator_settings_top"))
+    boxes = {
+        node.get("bounds"): hierarchy.parse_bounds(node.get("bounds"))
+        for node in root.iter()
+        if node.get("bounds")
+    }
+
+    assert boxes, "the recorded screen carries no bounds at all"
+    unparsed = [raw for raw, box in boxes.items() if box is None]
+    assert not unparsed, f"the shared grammar cannot read a recorded value: {unparsed}"
+    assert boxes["[0,142][1080,2361]"] == (0, 142, 1080, 2361)
+
+
+# The recorded Compose CheckBox: a real control, used below as the body on
+# which one attribute at a time is changed. Nothing here invents a node.
+_CHECKBOX_BOUNDS = "[33,754][159,880]"
+
+
+def _recorded_control(recorded, bounds: str) -> ET.Element:
+    """The recorded CheckBox with its ``bounds`` replaced, and nothing else.
+
+    uiautomator on API 35 writes a well-formed rectangle for every node -- the
+    recording unit tried eight recipes for an off-screen or unreadable one and
+    got a clipped rectangle every time -- so a dump in which `bounds` cannot be
+    parsed is not something that can be recorded on demand. It is derived
+    instead, from a control that IS recorded, by changing the single attribute
+    under test. Every other attribute, and the node's place in the tree, is the
+    device's.
+    """
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    node = next(item for item in root.iter() if item.get("bounds") == _CHECKBOX_BOUNDS)
+    node.set("bounds", bounds)
+    return node
+
+
+@pytest.mark.parametrize(
+    ("bounds", "why"),
+    [
+        ("", "the attribute is present but empty"),
+        ("[33,754]", "one corner: half a rectangle is not a rectangle"),
+        ("[33,754][159,880]junk", "trailing text -- re.match would take the numbers in front"),
+        ("[33,754](159,880)", "the wrong brackets on the second corner"),
+    ],
+    ids=["empty", "one-corner", "trailing-junk", "wrong-brackets"],
+)
+def test_a_bounds_value_that_will_not_parse_is_none(recorded, bounds, why):
+    """None means "unknown"; `(0, 0, 0, 0)` would mean "the top-left corner".
+
+    The distinction is the whole of C5. Two of the three grammars this replaced
+    returned the corner for anything they could not read, and navigator duly
+    offered it as a tappable point.
+    """
+    node = _recorded_control(recorded, bounds)
+    assert hierarchy.parse_bounds(node.get("bounds")) is None, why
+    assert hierarchy.parse_bounds(None) is None
+
+
+def test_a_control_whose_bounds_will_not_parse_is_not_operable(recorded):
+    """Eligibility needs a rectangle, not merely the absence of a bad one.
+
+    "Operable" means an agent can act on it, and nothing can act on a position
+    nobody can read -- so a missing or unreadable `bounds` is a No, where it
+    used to be waved through as a missing signal.
+    """
+    assert hierarchy.is_interactive(_recorded_control(recorded, _CHECKBOX_BOUNDS))
+    assert not hierarchy.is_interactive(_recorded_control(recorded, "[33,754]"))
+
+    without = _recorded_control(recorded, _CHECKBOX_BOUNDS)
+    del without.attrib["bounds"]
+    assert not hierarchy.is_interactive(without)
+
+
+def test_the_grammar_is_signed(recorded):
+    """Kept as precaution, not as observation.
+
+    uiautomator on API 35 clips every rectangle to the display, so no recorded
+    dump has a negative bound. The signed grammar is retained because
+    `accessibility_audit`'s already was, because older API levels are not known
+    to clip, and because it costs nothing. Shown here on the recorded control
+    with its rectangle shifted off the left edge.
+    """
+    node = _recorded_control(recorded, "[-12,754][159,880]")
+    assert hierarchy.parse_bounds(node.get("bounds")) == (-12, 754, 159, 880)
+    assert hierarchy.is_interactive(node), "a negative left edge is still a rectangle"
+
+
+def test_a_control_is_eligible_by_its_properties_not_its_class(recorded):
+    """Compose renders controls as `android.view.View`; a class whitelist misses them."""
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    controls = [node for node in root.iter() if hierarchy.is_interactive(node)]
+
+    assert len(controls) == 7, f"expected the fixture's seven controls, got {len(controls)}"
+    assert any(
+        node.get("class") == "android.view.View" for node in controls
+    ), "no plain View was found eligible, which is R11 all over again"
+
+
+def test_a_collapsed_rectangle_is_not_operable(recorded):
+    """The recorded Settings screen ends with `[0,2401][1080,2361]` -- bottom above top.
+
+    uiautomator emits no visibility attribute, so a collapsed rectangle is the
+    only signal that a flagged node cannot be touched.
+    """
+    root = ET.fromstring(recorded.text("uiautomator_settings_top"))
+    collapsed = [node for node in root.iter() if node.get("bounds") == "[0,2401][1080,2361]"]
+
+    assert collapsed, "the fixture no longer carries a collapsed row; find another"
+    assert collapsed[0].get("clickable") == "true", "the row is flagged clickable"
+    assert not hierarchy.is_interactive(collapsed[0])
+
+
+def test_eligibility_reads_the_dict_shape_too(recorded):
+    """accessibility_audit holds the hierarchy as dicts, and asks the same rule."""
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    checkbox = next(node for node in root.iter() if node.get("bounds") == "[33,754][159,880]")
+
+    assert hierarchy.is_interactive(checkbox)
+    assert hierarchy.is_interactive(hierarchy.element_to_dict(checkbox))
+
+
+def test_focusable_alone_does_not_make_a_control(recorded):
+    """Focusable containers are everywhere; counting them reports the screen as one control."""
+    root = ET.fromstring(recorded.text("uiautomator_settings_top"))
+    focusable_only = [
+        node
+        for node in root.iter()
+        if node.get("focusable") == "true"
+        and not any(node.get(name) == "true" for name in hierarchy.INTERACTIVE_ATTRIBUTES)
+    ]
+
+    assert focusable_only, "the fixture no longer has a focusable non-control"
+    assert not any(hierarchy.is_interactive(node) for node in focusable_only)
+
+
+def test_a_disabled_control_is_not_operable(recorded):
+    """A recorded control with ONE attribute flipped.
+
+    No recorded screen carries `enabled="false"`: the recorder captured live
+    screens, and a disabled control is a state an app has to be driven into.
+    So the case is made by changing that one attribute on a real node -- every
+    other byte is the device's -- rather than by inventing a dump.
+    """
+    checkbox = _recorded_control(recorded, _CHECKBOX_BOUNDS)
+    assert hierarchy.is_interactive(checkbox), "the recorded control is operable to begin with"
+
+    checkbox.set("enabled", "false")
+    assert not hierarchy.is_interactive(checkbox)

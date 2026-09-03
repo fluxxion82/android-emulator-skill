@@ -22,16 +22,17 @@ Both sides are parsed, not grepped -- fenced-block extraction for the Markdown
 *describes* a command is not a command), and `ast` for the Python (a substring
 search for "navigator.py" would be satisfied by a comment mentioning it).
 
-Because the coverage assertion is `xfail`, it cannot police its own extractors:
-an extractor that quietly stopped seeing `app_launcher.py --launch` on either
-side would still produce a red test, and the marker would swallow it. So both
+The coverage assertion cannot police its own extractors: one that quietly
+stopped seeing `app_launcher.py --launch` on either side would make the two
+sides agree about nothing at all, and the assertion would pass. So both
 extractors are held to a **complete literal baseline** of what they return
-today. A mutation to either one shows up as a baseline mismatch, not as a
-differently-worded xfail. When Inc 1 extends `test_agent_task_e2e.py`, the e2e
-baseline is updated deliberately, in that commit.
+today. A mutation to either one shows up as a baseline mismatch rather than as
+silence.
 
-The coverage assertion is `xfail(strict=True)`; Inc 1 extends
-`test_agent_task_e2e.py` and deletes the marker in the same commit.
+Inc 1 extended `test_agent_task_e2e.py` to walk all five Quick Start commands --
+including step 3, `navigator --find-text --tap`, seeded from what step 2 printed
+-- so the coverage assertion is green and its `xfail(strict=True)` marker is
+gone. The e2e baseline below was updated in that same commit.
 """
 
 from __future__ import annotations
@@ -39,8 +40,6 @@ from __future__ import annotations
 import ast
 import shlex
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_MD = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "SKILL.md"
@@ -61,19 +60,19 @@ QUICK_START_BASELINE = (
 )
 
 # Every `run_skill(...)` call in test_agent_task_e2e.py, normalised. Duplicates
-# are kept -- the e2e test maps the screen twice -- so a collector that
-# deduplicated or skipped a call fails here. Inc 1 extends that test; this
-# baseline is updated in the same commit, which is the point of stating it.
+# are kept -- the e2e test maps the screen twice, once by default output for the
+# name it will tap and once as JSON to confirm the field filled -- so a collector
+# that deduplicated or skipped a call fails here. When that test grows a step,
+# this baseline is updated in the same commit, which is the point of stating it.
 E2E_BASELINE = (
-    ("app_launcher.py", ("--launch",)),
+    ("accessibility_audit.py", ()),
+    ("app_launcher.py", ("--json", "--launch")),
+    ("app_launcher.py", ("--json", "--terminate")),
     ("log_monitor.py", ("--duration", "--json")),
     ("navigator.py", ("--enter-text", "--find-type")),
+    ("navigator.py", ("--find-text", "--json", "--tap")),
+    ("screen_mapper.py", ()),
     ("screen_mapper.py", ("--json",)),
-    ("screen_mapper.py", ("--json",)),
-)
-
-XFAIL_REASON = (
-    "QS: Quick Start step(s) not exercised by the e2e test; Inc 1 extends test_agent_task_e2e.py"
 )
 
 
@@ -203,7 +202,6 @@ def _uncovered() -> list[tuple[str, frozenset[str]]]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_REASON)
 def test_every_quick_start_command_is_exercised_by_the_e2e_test():
     """The documented path and the verified path must be the same path.
 

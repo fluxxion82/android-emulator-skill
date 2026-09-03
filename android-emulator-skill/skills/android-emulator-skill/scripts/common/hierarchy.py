@@ -21,12 +21,22 @@ Two things make this module the single implementation:
 The dump also fails transiently while the screen is animating, with
 ``ERROR: could not get idle state``. Every script that reads the screen was
 flaky because of it, so a bounded retry lives here instead of in each caller.
+
+Two questions every consumer of a dump asks -- *where is this node* and *can it
+be operated* -- are answered here too, by :func:`parse_bounds` and
+:func:`is_interactive`. They used to be answered three and two times
+respectively, in navigator, screen_mapper and accessibility_audit, and the
+copies disagreed: two of the three bounds grammars rejected the negative
+coordinate a partially off-screen view reports and silently returned
+``(0, 0, 0, 0)``, which is a tappable point at the top-left corner (C5/C7).
 """
 
 from __future__ import annotations
 
+import re
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 
 from .adb_exec import AdbError, run_adb
 from .env_config import env_int
@@ -53,6 +63,33 @@ _NO_ROOT_ERROR = "null root node"
 
 _TRANSIENT_ERRORS = (_IDLE_ERROR, _NO_ROOT_ERROR)
 
+# `bounds="[left,top][right,bottom]"`, with SIGNED coordinates.
+#
+# Not because a negative bound was observed: on API 35 uiautomator clips every
+# node's rectangle to the display, and eight recipes aimed at producing one
+# (mid-fling dumps, a half-pulled shade, the task switcher mid-animation)
+# returned min_left=0 and max_right=1080 every time. The grammar is signed
+# because `accessibility_audit`'s already was, because older API levels are not
+# known to clip, and because it costs nothing -- what matters is the other half:
+# an unparseable value yields None instead of `(0, 0, 0, 0)`, which the two
+# `\d+` grammars this replaces returned for anything they did not match. That is
+# a rectangle whose centre is a real, tappable pixel (C5).
+_BOUNDS_PATTERN = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+# The properties by which uiautomator says an element can be OPERATED AT ALL --
+# the eligibility question, used for enumeration. `focusable` is deliberately
+# absent: focusable containers are everywhere, and including it reports the
+# whole screen as interactive.
+INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollable")
+
+# The subset that answers a narrower question: can this element be operated by a
+# TAP. `scrollable` is the difference, and it matters in one place -- resolving a
+# caption to the control it names. A ScrollView or RecyclerView is legitimately
+# interactive (an agent scrolls it), but it is not what any caption inside it
+# describes, and treating it as one turns "tap the row labelled Battery" into a
+# tap on the middle of the screen, reported as a success naming the row.
+ACTION_ATTRIBUTES = ("clickable", "long-clickable", "checkable")
+
 
 def _is_transient(payload: str) -> bool:
     """Whether a failed dump is worth retrying."""
@@ -66,6 +103,171 @@ class HierarchyError(RuntimeError):
     Subclasses RuntimeError so the CLI boundaries that already catch it keep
     working, as :class:`common.adb_exec.AdbError` does.
     """
+
+
+def parse_bounds(value: str | None) -> tuple[int, int, int, int] | None:
+    """Parse a uiautomator ``bounds`` string into ``(left, top, right, bottom)``.
+
+    The one grammar. Signed (see :data:`_BOUNDS_PATTERN` for why that is
+    precaution rather than observation), and returning None rather than a zero
+    rectangle, because ``(0, 0, 0, 0)`` is indistinguishable from a real element
+    in the corner: every caller that treated it as one issued ``input tap 0 0``.
+
+    Args:
+        value: The raw ``bounds`` attribute, e.g. ``"[0,142][1080,2361]"``.
+
+    Returns:
+        The four coordinates, or None when the value is absent or malformed.
+        None means "unknown", and a caller that cannot act without coordinates
+        must refuse rather than substitute any.
+
+    The whole value must be a rectangle, not merely start with one:
+    ``re.match`` accepted ``"[1,2][3,4]junk"`` and returned the numbers in
+    front of the junk, which is a confident answer to a value nobody wrote.
+
+    Example:
+        >>> parse_bounds("[-12,50][200,150]")
+        (-12, 50, 200, 150)
+        >>> parse_bounds("not-bounds") is None
+        True
+    """
+    match = _BOUNDS_PATTERN.fullmatch((value or "").strip())
+    if match is None:
+        return None
+    left, top, right, bottom = (int(group) for group in match.groups())
+    return (left, top, right, bottom)
+
+
+def node_attributes(node: ET.Element | Mapping) -> Mapping[str, str]:
+    """The raw attribute mapping of a hierarchy node, whatever shape it arrives in.
+
+    Three shapes are in use across the skill and all three reach these
+    predicates: the parsed ``ET.Element`` (navigator, screen_mapper), the
+    documented dict shape ``{"tag", "attributes", "children"}`` that
+    ``get_ui_hierarchy`` returns (accessibility_audit), and a bare attribute
+    mapping. Normalising here is what lets one eligibility rule serve all of
+    them.
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+
+    Returns:
+        The node's attributes, with uiautomator's string values unchanged.
+    """
+    if isinstance(node, ET.Element):
+        return node.attrib
+    if isinstance(node, Mapping):
+        attributes = node.get("attributes")
+        return attributes if isinstance(attributes, Mapping) else node
+    raise TypeError(f"not a hierarchy node: {type(node).__name__}")
+
+
+def _operable(node: ET.Element | Mapping, properties: tuple[str, ...]) -> bool:
+    """The one eligibility rule, asked about one set of properties.
+
+    Both public predicates below are this function; they differ only in which
+    properties count as operating the element. Keeping the enabled check and the
+    rectangle check in a single place is the point -- they are the two conditions
+    that were answered differently in three files (C7).
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+        properties: The attributes that count as "can be operated".
+
+    Returns:
+        True when the node is enabled, has a readable rectangle with positive
+        area, and advertises at least one of ``properties``.
+    """
+    attributes = node_attributes(node)
+    if attributes.get("enabled", "true") != "true":
+        return False
+
+    box = parse_bounds(attributes.get("bounds"))
+    if box is None or box[2] <= box[0] or box[3] <= box[1]:
+        return False
+
+    return any(attributes.get(name, "false") == "true" for name in properties)
+
+
+def is_actionable(node: ET.Element | Mapping) -> bool:
+    """Whether this node can be operated BY A TAP.
+
+    :func:`is_interactive` minus ``scrollable``. The distinction exists for one
+    caller -- ``navigator._owning_control``, which turns a caption into the
+    control that caption names. Scroll containers enclose most of a screen, so
+    the first interactive ancestor of a passive label is very often a
+    ScrollView or a RecyclerView; resolving to it sends the tap to the centre of
+    the screen and reports it as a success naming the label. A container is
+    something the agent acts on by scrolling, never something a caption inside
+    it stands for.
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+
+    Returns:
+        True when the node is enabled, has a usable rectangle, and advertises
+        one of :data:`ACTION_ATTRIBUTES`.
+    """
+    return _operable(node, ACTION_ATTRIBUTES)
+
+
+def is_interactive(node: ET.Element | Mapping) -> bool:
+    """Whether an agent can operate this node.
+
+    The one eligibility rule, and it is decided by PROPERTIES, not class names:
+    Jetpack Compose renders its controls as plain ``android.view.View``, so a
+    whitelist of widget classes matches almost nothing on a Compose screen
+    (defect R11).
+
+    Three conditions, all required:
+
+    - ``enabled`` -- a disabled control does nothing when tapped.
+    - a rectangle this skill can read, with positive area. uiautomator emits no
+      visibility attribute, so a zero or negative area is the only signal that a
+      flagged node cannot be touched; the recorded Settings dump ends with
+      exactly such a row, ``[0,2401][1080,2361]``. A node whose bounds do not
+      parse fails this too: "operable" means an agent can act on it, and nothing
+      can act on a rectangle nobody can read. Treating a missing signal as
+      permission is how an element with no usable position was offered as
+      tappable in the first place.
+    - at least one of :data:`INTERACTIVE_ATTRIBUTES`.
+
+    This is the ELIGIBILITY question -- what gets enumerated, counted and listed
+    -- and it includes ``scrollable``, because a list an agent can scroll is
+    something an agent can act on. See :func:`is_actionable` for the narrower
+    question a tap has to ask.
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+
+    Returns:
+        True when the node is a control an agent can act on.
+    """
+    return _operable(node, INTERACTIVE_ATTRIBUTES)
+
+
+def bare_resource_id(value: str | None) -> str | None:
+    """The name half of a resource id: ``com.x:id/submit`` -> ``submit``.
+
+    One rule, because two scripts print this name and an agent copies it from
+    one into the other. navigator rendered the bare name while screen_mapper
+    printed the qualified one, so a name the screen report showed was not a name
+    the navigator answered to (C1).
+
+    The bare form is the one that is chosen, for two reasons: it is what
+    ``--find-id`` has always matched, and Compose's ``testTagsAsResourceId``
+    already emits an unqualified tag, so the qualified form would have made the
+    two toolkits print names of different shapes for the same thing.
+
+    Args:
+        value: A ``resource-id`` attribute, qualified or not.
+
+    Returns:
+        The name after the last ``/``, or None when there is no id.
+    """
+    if not value:
+        return None
+    return value.rsplit("/", maxsplit=1)[-1] or None
 
 
 def _extract_xml(payload: str) -> str | None:
@@ -86,7 +288,6 @@ def capture_hierarchy(
     *,
     timeout: int | None = None,
     retries: int | None = None,
-    display: int | None = None,
 ) -> ET.Element:
     """Capture the current screen's UI hierarchy.
 
@@ -97,8 +298,6 @@ def capture_hierarchy(
         retries: Total attempts, not retries. Defaults to
             ``ANDROID_EMU_UI_DUMP_ATTEMPTS`` (3). A dump fails transiently while
             the screen is animating.
-        display: Display id for a multi-display device. Omitted when None,
-            which targets the default display.
 
     Returns:
         The parsed ``<hierarchy>`` root element.
@@ -115,10 +314,10 @@ def capture_hierarchy(
     attempts = CAPTURE_ATTEMPTS if retries is None else max(1, retries)
     budget = CAPTURE_TIMEOUT if timeout is None else timeout
 
-    args: list[object] = ["uiautomator", "dump"]
-    if display is not None:
-        args.extend(["--display", display])
-    args.append("/dev/tty")
+    # No `--display`: the parameter existed, was never passed by any caller, and
+    # was never recorded against a device, so the one thing nobody could say was
+    # whether it worked (C11). Deleted rather than left as an untested option.
+    args: list[object] = ["uiautomator", "dump", "/dev/tty"]
 
     last_payload = ""
     for attempt in range(attempts):
@@ -193,9 +392,16 @@ def capture_hierarchy_dict(serial: str | None = None, **kwargs) -> dict:
 
 
 __all__ = [
+    "ACTION_ATTRIBUTES",
+    "INTERACTIVE_ATTRIBUTES",
     "AdbError",
     "HierarchyError",
+    "bare_resource_id",
     "capture_hierarchy",
     "capture_hierarchy_dict",
     "element_to_dict",
+    "is_actionable",
+    "is_interactive",
+    "node_attributes",
+    "parse_bounds",
 ]

@@ -31,7 +31,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 
 import pytest
-from accessibility_audit import AccessibilityAuditor, _attr_bool, _parse_bounds
+from accessibility_audit import AccessibilityAuditor, _attr_bool
 
 from common.device_utils import _xml_to_dict
 
@@ -74,18 +74,24 @@ def _of_type(auditor: AccessibilityAuditor, issue_type: str) -> list[dict]:
     return [issue for issue in auditor.issues if issue["type"] == issue_type]
 
 
-def test_parse_bounds_valid():
-    assert _parse_bounds("[0,0][1080,2400]") == {
-        "left": 0,
-        "top": 0,
-        "right": 1080,
-        "bottom": 2400,
-    }
+def test_the_report_carries_the_rectangle_as_ints(recorded):
+    """A finding reports the rectangle parsed, not the raw attribute string.
 
+    `accessibility_audit._parse_bounds` is gone: it was one of the skill's three
+    bounds grammars, and the grammar now lives in `common.hierarchy.parse_bounds`
+    where `test_hierarchy.py` tests it. What this file still owns is the shape a
+    finding hands back, which a consumer indexes by name.
+    """
+    auditor = _audit(recorded.text("uiautomator_compose_default"))
 
-def test_parse_bounds_invalid():
-    assert _parse_bounds("") == {}
-    assert _parse_bounds("not-bounds") == {}
+    reported = [
+        issue["element"]["bounds"] for issue in auditor.issues if "bounds" in issue["element"]
+    ]
+    assert reported, "no finding carried an element rectangle"
+    assert all(
+        isinstance(value, int) for box in reported for value in box.values()
+    ), f"a rectangle came back unparsed: {reported}"
+    assert {"left", "top", "right", "bottom"} == set(reported[0])
 
 
 def test_attr_bool():
@@ -191,12 +197,8 @@ def test_a_field_with_no_describing_text_anywhere_is_flagged(recorded):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="L3: missing_content_description keys off class name; fixed in Inc 1",
-)
 def test_unlabelled_clickable_nodes_are_critical(recorded):
-    """Quick Start step 5 returns zero criticals on every Compose app.
+    """Quick Start step 5 used to return zero criticals on every Compose app.
 
     This screen has six clickable, enabled nodes with no text and no
     content-desc: four `android.view.View`, an EditText and a CheckBox. Check 1
@@ -206,8 +208,8 @@ def test_unlabelled_clickable_nodes_are_critical(recorded):
     the whole corpus: zero criticals on compose_default, compose_testtags,
     current_screen, settings_top and dialer_keypad.
 
-    Inc 1 rebases the check on `is_interactive()` plus "no label anywhere in
-    the subtree" (C7 + C5 + L3). Delete this marker in that commit.
+    Inc 1 rebased the check on `is_interactive()` plus "no label anywhere in
+    the subtree" (C7 + C5 + L3), and this test is unmarked from that commit on.
     """
     auditor = _audit(recorded.text("uiautomator_compose_default"))
 
@@ -232,10 +234,17 @@ def test_missing_resource_id_is_reported_and_testtags_clear_it(recorded):
     """Compose emits no resource-id, which `testTagsAsResourceId` fixes.
 
     The two dumps are the same screen recorded either side of that modifier, so
-    the delta is evidence rather than assertion: six findings become none.
+    the delta is evidence rather than assertion: seven findings become none.
+
+    Seven, not the six this asserted when the check read `clickable and
+    enabled`: the scrolling list at [32,1164][1048,1637] is driven by
+    `scrollable`, carries no `clickable`, and was therefore invisible to a
+    check about interactive elements. It is one of the seven controls the
+    screen report names, so the audit was answering about a different set of
+    controls than the rest of the skill (C7 / INC1-05).
     """
     default = _of_type(_audit(recorded.text("uiautomator_compose_default")), "missing_resource_id")
-    assert len(default) == 6
+    assert len(default) == 7
     assert {issue["severity"] for issue in default} == {"info"}
     assert all(issue["fix"] for issue in default)
 

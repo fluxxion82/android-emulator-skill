@@ -33,11 +33,17 @@ Usage Examples:
     python scripts/screen_mapper.py --json
 
 Output Format (default):
-    Screen: MainActivity (45 elements, 7 interactive)
-    Buttons: "Login", "Cancel", "Forgot Password"
+    Screen: com.example.app/.MainActivity (45 elements, 7 interactive)
+    Button: "Login", "Cancel", "Forgot Password"
+    Control: "Remember me", "Dark theme"
+    EditText: "Email address"
     EditTexts: 2 (0 filled) [1 secure]
-    TextViews: "Sign In", "Welcome"
     Focusable: 7 elements
+
+    Every interactive element is NAMED, not just counted, and the names are the
+    ones `navigator.py --find-text` accepts -- the default report is what Quick
+    Start step 2 produces and step 3 consumes. Counting seven controls without
+    naming them left the agent with nothing to hand to the next command (C4).
 
 Technical Details:
 - Uses uiautomator dump via `adb shell uiautomator dump`
@@ -53,15 +59,15 @@ Configuration (env overrides, ANDROID_EMU_ prefix):
 
 import argparse
 import json as json_lib
-import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 from common import adb_exec
-from common.device_utils import resolve_device_identifier
+from common.device_utils import get_current_activity, resolve_device_identifier
 from common.env_config import env_int
-from common.hierarchy import capture_hierarchy
+from common.hierarchy import INTERACTIVE_ATTRIBUTES as _INTERACTIVE_ATTRIBUTES
+from common.hierarchy import bare_resource_id, capture_hierarchy, is_interactive, parse_bounds
 
 # Preview limits (env-configurable; see SKILL.md -> Configuration).
 # BUTTONS_PREVIEW caps how many button labels render on the summary line.
@@ -88,18 +94,17 @@ class ScreenMapper:
         - Navigation-focused: Highlight elements relevant for automation
     """
 
-    # Interactivity is decided by an element's PROPERTIES, not its class name.
-    #
-    # The previous version gated on a whitelist of View class names (Button,
-    # EditText, TextView, ...). Jetpack Compose -- the default Android UI
-    # toolkit since 2022 -- renders its semantics nodes as plain
-    # `android.view.View`, so on a Compose screen the whitelist matched almost
-    # nothing and this reported ~0 interactive elements (defect R11).
+    # Interactivity is decided by an element's PROPERTIES, not its class name,
+    # and the rule itself lives in `common.hierarchy.is_interactive` so that
+    # navigator, accessibility_audit and this file cannot answer the same
+    # question differently (C7). Re-exported here because the class-level name
+    # is what the older comments and tests refer to.
     #
     # Measured on a recorded Compose dump: of seven controls, five report class
     # `android.view.View`; a Switch produces no `android.widget.Switch` at all.
-    # Only Checkbox, TextField and Image map to widget classes.
-    INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollable")
+    # Only Checkbox, TextField and Image map to widget classes -- which is why a
+    # whitelist of View class names reported ~0 interactive elements (R11).
+    INTERACTIVE_ATTRIBUTES = _INTERACTIVE_ATTRIBUTES
 
     # Class names still used for *labelling* an element, never for eligibility.
     KNOWN_WIDGET_CLASSES = {
@@ -197,7 +202,12 @@ class ScreenMapper:
         elem_class = node.get("class", "")
         text = node.get("text", "")
         content_desc = node.get("content-desc", "")
-        resource_id = node.get("resource-id", "")
+        # The BARE id: `com.android.settings:id/search_action_bar` is reported as
+        # `search_action_bar`, which is what navigator prints and what
+        # `--find-id` takes, so one control has one name across both scripts
+        # (C1). Compose's testTagsAsResourceId already emits an unqualified tag,
+        # so this is also the form under which both toolkits look alike.
+        resource_id = bare_resource_id(node.get("resource-id")) or ""
         focusable = node.get("focusable", "false") == "true"
         enabled = node.get("enabled", "true") == "true"
         # Android marks secure/password inputs with password="true".
@@ -213,20 +223,10 @@ class ScreenMapper:
             # Determine label for this element
             label = text or content_desc or resource_id or None
 
-            # Track interactive elements.
-            #
-            # Eligibility is by property, not class name. Bounds must be
-            # non-zero: uiautomator emits no visibility attribute, so a
-            # zero-area rect is the only signal that an element cannot be
-            # touched. `focusable` is deliberately NOT sufficient on its own --
-            # focusable containers are everywhere and would flood the output.
-            interactive = (
-                enabled
-                and self._has_area(node)
-                and any(node.get(attr, "false") == "true" for attr in self.INTERACTIVE_ATTRIBUTES)
-            )
-
-            if interactive:
+            # Track interactive elements. The rule is `hierarchy.is_interactive`
+            # and nothing local: enabled, an uncollapsed rectangle, and at least
+            # one interaction property.
+            if is_interactive(node):
                 analysis["interactive_elements"] += 1
 
                 # Compose controls carry no text of their own; recover it.
@@ -265,25 +265,6 @@ class ScreenMapper:
             self._analyze_recursive(child, analysis, parent=node)
 
     @staticmethod
-    def _bounds(node: ET.Element) -> tuple[int, int, int, int] | None:
-        """Parse ``bounds="[l,t][r,b]"``, or None when absent/malformed."""
-        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))
-        return tuple(int(g) for g in match.groups()) if match else None
-
-    def _has_area(self, node: ET.Element) -> bool:
-        """Whether the element occupies a non-zero rectangle.
-
-        uiautomator reports no visibility attribute, so this is the only
-        available proxy: a zero-area element cannot be tapped whatever its
-        flags claim.
-        """
-        box = self._bounds(node)
-        if box is None:
-            return True  # No bounds reported: do not exclude on a missing signal.
-        left, top, right, bottom = box
-        return right > left and bottom > top
-
-    @staticmethod
     def _own_label(node: ET.Element) -> str:
         return (node.get("text") or "").strip() or (node.get("content-desc") or "").strip()
 
@@ -317,14 +298,14 @@ class ScreenMapper:
         except ValueError:
             return None
 
-        own = self._bounds(node)
+        own = parse_bounds(node.get("bounds"))
         for offset in (1, -1):
             index = position + offset
             if not 0 <= index < len(siblings):
                 continue
             sibling = siblings[index]
             if own is not None:
-                box = self._bounds(sibling)
+                box = parse_bounds(sibling.get("bounds"))
                 # Same row: vertical spans must overlap.
                 if box is not None and not (box[1] < own[3] and own[1] < box[3]):
                     continue
@@ -336,36 +317,46 @@ class ScreenMapper:
         return None
 
     def _detect_screen_name(self, analysis: dict):
-        """
-        Try to detect screen/activity name from UI elements.
+        """Name the screen from the device's focused activity.
 
-        Looks for common patterns like ActionBar titles, TextViews with IDs containing "title", etc.
+        Asked through :func:`common.device_utils.get_current_activity`, which is
+        the one place that runs ``dumpsys window`` and parses its focus lines
+        against recorded output. This file used to carry a second parser with a
+        different grammar -- it matched ``([A-Za-z0-9_]+Activity)``, so it
+        reported a bare ``NexusLauncherActivity`` where the shared parser
+        reports the full ``package/activity`` component, and it found nothing at
+        all for an activity whose class name does not end in "Activity" (C9).
 
         Args:
-            analysis: Analysis dict to update
+            analysis: Analysis dict to update.
         """
-        # Try to get current activity name from device
         try:
-            result = adb_exec.run_adb(
-                "shell",
-                self.serial,
-                "dumpsys",
-                "window",
-                "windows",
-                timeout=5,
-            )
-
-            # Look for current focus
-            # Format: mCurrentFocus=Window{abc123 u0 com.example.app/com.example.app.MainActivity}
-            import re
-
-            match = re.search(r"mCurrentFocus=.*?([A-Za-z0-9_]+Activity)", result.stdout)
-            if match:
-                analysis["screen_name"] = match.group(1)
-
+            analysis["screen_name"] = get_current_activity(self.serial)
         except Exception:
-            # Fallback: Use package name or None
+            # A screen with no name is still a screen worth reporting, so this
+            # never fails the map -- the header falls back to "Unknown Screen".
             analysis["screen_name"] = None
+
+    @staticmethod
+    def interactive_names(analysis: dict) -> list[tuple[str, list[str]]]:
+        """The control names the report offers, per bucket, in reporting order.
+
+        Every bucket except the passive ``TextView`` one holds controls an agent
+        can operate; each is capped at ``BUTTONS_PREVIEW`` so one crowded screen
+        cannot turn the summary into a wall. Buckets are alphabetical, which is
+        also the order ``--json`` yields, so the two reports agree.
+
+        Args:
+            analysis: Analysis dict from :meth:`analyze_tree`.
+
+        Returns:
+            ``(bucket, names)`` pairs, buckets with no names omitted.
+        """
+        return [
+            (bucket, labels[:BUTTONS_PREVIEW])
+            for bucket, labels in sorted(analysis["elements_by_type"].items())
+            if bucket != "TextView" and labels
+        ]
 
     def format_summary(self, analysis: dict, verbose: bool = False, hints: bool = False) -> str:
         """
@@ -387,15 +378,23 @@ class ScreenMapper:
         interactive = analysis["interactive_elements"]
         lines.append(f"Screen: {screen} ({total} elements, {interactive} interactive)")
 
-        # Buttons
-        if analysis["buttons"]:
-            button_labels = '", "'.join(analysis["buttons"][:BUTTONS_PREVIEW])
-            if len(analysis["buttons"]) > BUTTONS_PREVIEW:
-                lines.append(f'Buttons: "{button_labels}", ... ({len(analysis["buttons"])} total)')
-            else:
-                lines.append(f'Buttons: "{button_labels}"')
+        # Every interactive control, BY NAME.
+        #
+        # This is C4. The default report used to name only the `Button` and
+        # clickable-`TextView` buckets, and on a Compose screen neither exists:
+        # every control lands in `Control`, which was printed under --verbose or
+        # --json and nowhere else. Quick Start step 2 runs this command with
+        # neither flag and step 3 asks the agent to feed a name from it into
+        # `navigator --find-text`, so the documented path handed the agent a
+        # count and no names.
+        for bucket, names in self.interactive_names(analysis):
+            available = len(analysis["elements_by_type"][bucket])
+            rendered = '", "'.join(names)
+            suffix = f", ... ({available} total)" if available > len(names) else ""
+            lines.append(f'{bucket}: "{rendered}"{suffix}')
 
-        # EditTexts
+        # EditTexts: the names are on the bucket line above; this line carries
+        # what a name cannot say -- how many are filled, and how many are secure.
         if analysis["edit_texts"]:
             filled_count = sum(1 for et in analysis["edit_texts"] if et["filled"])
             edit_line = f"EditTexts: {len(analysis['edit_texts'])} ({filled_count} filled)"
@@ -403,16 +402,6 @@ class ScreenMapper:
             if secure_count:
                 edit_line += f" [{secure_count} secure]"
             lines.append(edit_line)
-
-        # Clickable TextViews
-        if analysis["text_views"]:
-            text_labels = '", "'.join(analysis["text_views"][:3])
-            if len(analysis["text_views"]) > 3:
-                lines.append(
-                    f'Clickable Text: "{text_labels}", ... ({len(analysis["text_views"])} total)'
-                )
-            else:
-                lines.append(f'Clickable Text: "{text_labels}"')
 
         # Focusable count
         focusable = analysis["focusable"]
@@ -428,17 +417,22 @@ class ScreenMapper:
                 if len(elements) > SECTION_ITEMS_PREVIEW:
                     lines.append(f"  ... and {len(elements) - SECTION_ITEMS_PREVIEW} more")
 
-        # Hints mode: Navigation suggestions
+        # Hints mode: the next command, ready to run.
+        #
+        # Seeded from the same named buckets as the summary, so a hint can only
+        # ever name a control the report just printed -- and it is printed as
+        # the navigator invocation Quick Start step 3 documents, rather than as
+        # a noun phrase the agent has to translate.
         if hints:
             lines.append("\n--- Navigation Hints ---")
-            if analysis["buttons"]:
-                lines.append(f"• Tap buttons: {', '.join(analysis['buttons'][:3])}")
-            if analysis["edit_texts"]:
-                unfilled = [et for et in analysis["edit_texts"] if not et["filled"]]
-                if unfilled:
-                    lines.append(f"• Fill text fields: {unfilled[0]['label']}")
-            if analysis["text_views"]:
-                lines.append(f"• Tap text: {analysis['text_views'][0]}")
+            for _bucket, names in self.interactive_names(analysis)[:3]:
+                lines.append(f'• navigator.py --find-text "{names[0]}" --tap')
+            unfilled = [et for et in analysis["edit_texts"] if not et["filled"]]
+            if unfilled:
+                lines.append(
+                    f'• navigator.py --find-text "{unfilled[0]["label"]}" '
+                    f'--enter-text "your text"'
+                )
 
         return "\n".join(lines)
 

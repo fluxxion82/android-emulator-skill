@@ -167,29 +167,34 @@ def test_summary_omits_secure_marker_when_zero(recorded):
 
 # --- Delta 1: env-configurable preview limits ------------------------------
 #
-# The dialer keypad, because it is the recorded screen that HAS buttons:
-# "More options", "backspace" and "Call", in that order. The Compose screen has
-# none at all -- its clickable nodes report android.view.View -- which is C4's
-# whole point and why the truncation deltas cannot be shown there.
+# The dialer keypad, because it is the recorded screen with the most controls:
+# 17 in the `Control` bucket, "Call" in `Button`, and "More options" and
+# "backspace" in `ImageButton`. Since C4 the cap applies PER BUCKET -- a screen
+# with twenty dial keys must not push the one Button off the report -- so the
+# truncation is shown on the bucket that overflows and the completeness on the
+# ones that do not.
 
 
 def test_buttons_preview_limit_truncates(monkeypatch, recorded):
     monkeypatch.setattr(screen_mapper, "BUTTONS_PREVIEW", 2)
     analysis = _analyze(recorded.text("uiautomator_dialer_keypad"))
-    assert len(analysis["buttons"]) == 3, f"fixture changed: {analysis['buttons']}"
+    assert len(analysis["elements_by_type"]["Control"]) == 17, "fixture changed"
 
     summary = ScreenMapper().format_summary(analysis)
-    assert '"More options", "backspace"' in summary
-    assert "(3 total)" in summary
-    assert "Call" not in summary
+    controls = next(line for line in summary.splitlines() if line.startswith("Control:"))
+    assert controls.count('"') == 4, f"more than two names survived the cap: {controls}"
+    assert "(17 total)" in controls, controls
+    # The cap is per bucket, so a small bucket keeps all of its names.
+    assert 'ImageButton: "More options", "backspace"' in summary
 
 
 def test_buttons_preview_no_truncation_under_limit(monkeypatch, recorded):
-    monkeypatch.setattr(screen_mapper, "BUTTONS_PREVIEW", 15)
+    monkeypatch.setattr(screen_mapper, "BUTTONS_PREVIEW", 20)
     analysis = _analyze(recorded.text("uiautomator_dialer_keypad"))
     summary = ScreenMapper().format_summary(analysis)
     assert "total)" not in summary
-    assert '"More options", "backspace", "Call"' in summary
+    assert 'Button: "Call"' in summary
+    assert 'ImageButton: "More options", "backspace"' in summary
 
 
 def test_section_items_preview_limit_truncates_verbose(monkeypatch, recorded):

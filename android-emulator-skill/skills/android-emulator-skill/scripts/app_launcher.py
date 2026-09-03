@@ -62,6 +62,96 @@ def parse_extras(pairs: list[str] | None) -> dict[str, str]:
     return extras
 
 
+# The keys `am start -W` reports that this script reads. Recorded in
+# `am_start_wait_settings`; anything else in the output is ignored.
+_AM_START_KEYS = ("status", "activity", "totaltime", "waittime", "launchstate")
+
+# The failure shape, recorded in `am_start_wait_missing`: no `Status:` line at
+# all, `Error type 3` and `Error: Activity class {...} does not exist.` on
+# STDOUT with stderr empty, exit 1. A parser that decides success by the absence
+# of a problem calls that a launch.
+_AM_START_ERROR_PREFIX = "error"
+
+
+def parse_am_start(output: str) -> dict[str, str]:
+    """Read the ``Key: value`` report ``am start -W`` prints when it returns.
+
+    Backed by two recordings, ``am_start_wait_settings`` (success) and
+    ``am_start_wait_missing`` (a class that does not exist), and both carry a
+    trap for a parser written from memory:
+
+    - On success ``Activity:`` names the component that actually came up, which
+      is **not** the one that was requested when the request named an alias:
+      asking for ``com.android.settings/.Settings`` reports
+      ``com.android.settings/.homepage.SettingsHomepageActivity``. So a launch
+      can never be confirmed by comparing those two strings; it is confirmed by
+      ``Status: ok``, and the resolved component is information.
+    - On failure there is **no ``Status:`` line at all** -- just ``Error type 3``
+      and an ``Error:`` line, on stdout. Absence of a status is therefore
+      evidence of failure, never of success, which is why :func:`am_start_error`
+      exists beside this.
+
+    Args:
+        output: stdout from ``am start -W``.
+
+    Returns:
+        The recognised keys, lowercased, mapped to their values.
+    """
+    report: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.strip().partition(":")
+        if not separator:
+            continue
+        name = key.strip().lower()
+        if name in _AM_START_KEYS:
+            report[name] = value.strip()
+    return report
+
+
+def am_start_error(output: str) -> str | None:
+    """The ``Error:`` line ``am start`` printed, if it printed one.
+
+    On stdout, because that is where the recording puts it: the missing-activity
+    capture has 172 bytes on stdout and zero on stderr, so a caller reading
+    stderr to find out what went wrong finds nothing at all.
+
+    Args:
+        output: stdout from ``am start``.
+
+    Returns:
+        The first ``Error:`` line, stripped, or None.
+    """
+    for line in output.splitlines():
+        stripped = line.strip()
+        key, separator, value = stripped.partition(":")
+        if separator and key.strip().lower() == _AM_START_ERROR_PREFIX:
+            return value.strip()
+    return None
+
+
+def _launch_failure(package_name: str, component: str, output: str) -> str:
+    """One failure message for a launch that did not put the activity in front.
+
+    Built the same way whether `am start` exited non-zero or merely failed to
+    say `Status: ok`, because the agent's next step is the same either way and
+    the two paths differ only in how adb chose to report it.
+
+    Args:
+        package_name: The package that was asked for.
+        component: The component that was asked for.
+        output: stdout from `am start`.
+
+    Returns:
+        The failure text, carrying the device's own diagnostic and a remedy.
+    """
+    detail = am_start_error(output) or f"no `Status: ok` in the report ({output.strip()[:200]!r})"
+    return (
+        f"Launch failed: {detail} Asked for {component}; check the activity exists and is "
+        f"exported (`adb shell cmd package resolve-activity --brief {package_name}`), and "
+        f"that the device is unlocked."
+    )
+
+
 class AppLauncher:
     """Manage Android app lifecycle."""
 
@@ -76,7 +166,7 @@ class AppLauncher:
         extras: dict[str, str] | None = None,
     ) -> tuple:
         """
-        Launch app by package name.
+        Launch app by package name, and wait for it to be displayed.
 
         Args:
             package_name: App package name (e.g., "com.example.app")
@@ -85,16 +175,24 @@ class AppLauncher:
                 "--es KEY VALUE" pairs
 
         Returns:
-            (success, message) tuple
+            ``(success, message, report)``. ``report`` is what ``am start -W``
+            said, parsed -- chiefly ``activity``, the component that actually
+            came to the front, which is not the requested one when the request
+            named an alias. A caller that has to verify the right screen is in
+            front needs that resolved name, and prose is not a place to keep it.
         """
         try:
             # If no activity specified, try to get launcher activity
             if not activity:
                 activity = self._get_launcher_activity(package_name)
                 if not activity:
-                    return False, (
-                        f"Could not find launcher activity for {package_name}. "
-                        "Specify --activity explicitly."
+                    return (
+                        False,
+                        (
+                            f"Could not find launcher activity for {package_name}. "
+                            "Specify --activity explicitly."
+                        ),
+                        {},
                     )
 
             # Build activity component name
@@ -114,12 +212,21 @@ class AppLauncher:
                 for part in ("--es", key, value)
             ]
 
-            # Launch activity
+            # Launch the activity and WAIT for it to be displayed.
+            #
+            # `-W` is the whole of E1. Without it `am start` returns as soon as
+            # the intent is dispatched, so a caller that maps the screen next
+            # dumps whatever is still in front -- the launcher, or a splash. On
+            # a hosted emulator that is a coin flip: the e2e test saw 2
+            # interactive elements on a 7-control Compose screen and blamed the
+            # mapper. The wait is bounded by run_adb's own timeout, so a launch
+            # that never completes still returns rather than hanging.
             result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "am",
                 "start",
+                "-W",
                 "-n",
                 quote_for_device_shell(component),
                 "-a",
@@ -128,20 +235,38 @@ class AppLauncher:
                 check=True,
             )
 
-            if "Error" in result.stdout or "error" in result.stderr.lower():
-                return False, f"Launch failed: {result.stdout or result.stderr}"
+            report = parse_am_start(result.stdout)
+            status = (report.get("status") or "").lower()
 
-            return True, f"Launched: {package_name}"
+            # Success is `Status: ok` and nothing else. The recorded failure has
+            # no `Status:` line at all, so "no status" is the failure shape and
+            # not a quiet success -- which is what treating the parser as inert
+            # made it.
+            if status != "ok":
+                return False, _launch_failure(package_name, component, result.stdout), report
+
+            # `Activity:` is the component that actually came up, which for an
+            # alias is not the one that was asked for. Reported, never compared.
+            displayed = report.get("activity") or component
+            timing = f" in {report['totaltime']}ms" if "totaltime" in report else ""
+            return True, f"Launched: {package_name} ({displayed} displayed{timing})", report
 
         except adb_exec.AdbCommandError as e:
-            return False, f"Launch failed: {e}"
+            # `am start` exits non-zero for a component that does not resolve,
+            # and puts the whole diagnostic on STDOUT with stderr empty. The
+            # same failure message is built from it as for a bad report, so the
+            # remedy does not depend on which way the failure arrived.
+            stdout = getattr(getattr(e, "result", None), "stdout", "") or ""
+            if am_start_error(stdout):
+                return False, _launch_failure(package_name, component, stdout), {}
+            return False, f"Launch failed: {e}", {}
         except adb_exec.AdbError:
             # The command never reached a device (ambiguous target, wrong
             # serial, offline, unauthorized). That is not "the launch failed";
             # re-raise so main() can print the remedy the error already names.
             raise
         except Exception as e:
-            return False, f"Launch error: {e}"
+            return False, f"Launch error: {e}", {}
 
     def terminate(self, package_name: str) -> tuple:
         """
@@ -194,7 +319,7 @@ class AppLauncher:
         if delay > 0:
             time.sleep(delay)
 
-        launch_success, launch_message = self.launch(package_name, activity, extras)
+        launch_success, launch_message, _report = self.launch(package_name, activity, extras)
         if not launch_success:
             return False, launch_message
 
@@ -271,11 +396,19 @@ class AppLauncher:
             (success, message) tuple
         """
         try:
+            # `-W`, and the verdict read from the report -- the same contract as
+            # `launch()`. This was the last place in the skill inferring success
+            # from the absence of an "Error" substring: an intent that resolves
+            # to nothing prints `Error: Activity not started, unable to resolve
+            # Intent` and no `Status:` line at all, so "no error seen" and "the
+            # link opened" were the same answer, and the deep link an agent
+            # asked for could silently reach nothing (E1's shape).
             result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "am",
                 "start",
+                "-W",
                 "-a",
                 "android.intent.action.VIEW",
                 "-d",
@@ -283,12 +416,30 @@ class AppLauncher:
                 check=True,
             )
 
-            if "Error" in result.stdout or "error" in result.stderr.lower():
-                return False, f"Open URL failed: {result.stdout or result.stderr}"
+            report = parse_am_start(result.stdout)
+            if (report.get("status") or "").lower() != "ok":
+                detail = am_start_error(result.stdout) or (
+                    f"no `Status: ok` in the report ({result.stdout.strip()[:200]!r})"
+                )
+                return False, (
+                    f"Open URL failed: {detail} Nothing on the device handles {url!r} -- "
+                    f"check the scheme and host against the app's intent filters "
+                    f"(`adb shell cmd package resolve-activity --brief -a "
+                    f"android.intent.action.VIEW -d '<url>'`)."
+                )
 
-            return True, f"Opened URL: {url}"
+            opened = report.get("activity")
+            where = f" ({opened})" if opened else ""
+            return True, f"Opened URL: {url}{where}"
 
         except adb_exec.AdbCommandError as e:
+            stdout = getattr(getattr(e, "result", None), "stdout", "") or ""
+            detail = am_start_error(stdout)
+            if detail:
+                return False, (
+                    f"Open URL failed: {detail} Nothing on the device handles {url!r} -- "
+                    f"check the scheme and host against the app's intent filters."
+                )
             return False, f"Open URL failed: {e}"
 
     def list_packages(self, filter_text: str | None = None) -> tuple:
@@ -449,7 +600,13 @@ def _report_failure(args: argparse.Namespace, message: str) -> None:
     sys.exit(1)
 
 
-def _report_action(args: argparse.Namespace, action: str, success: bool, message: str) -> None:
+def _report_action(
+    args: argparse.Namespace,
+    action: str,
+    success: bool,
+    message: str,
+    details: dict | None = None,
+) -> None:
     """Print the outcome of one lifecycle action and exit.
 
     The success shape is unchanged (``success`` / ``message`` / ``action``).
@@ -464,12 +621,16 @@ def _report_action(args: argparse.Namespace, action: str, success: bool, message
         action: The action name reported in the JSON payload.
         success: Whether the action succeeded.
         message: The outcome text; on failure it carries the remedy.
+        details: Extra JSON keys for the success payload -- the activity
+            ``am start -W`` resolved, for instance.
     """
     if not success:
         _report_failure(args, message)
 
     if args.json:
-        print(json_lib.dumps({"success": True, "message": message, "action": action}, indent=2))
+        payload = {"success": True, "message": message, "action": action}
+        payload.update(details or {})
+        print(json_lib.dumps(payload, indent=2))
     else:
         print(message)
     sys.exit(0)
@@ -558,8 +719,17 @@ Examples:
     # traceback reach the user.
     try:
         if args.launch:
-            success, message = launcher.launch(args.launch, args.activity, extras or None)
-            _report_action(args, "launch", success, message)
+            success, message, report = launcher.launch(args.launch, args.activity, extras or None)
+            # The resolved component travels as data, so a caller checking that
+            # the right screen is in front compares against what the system
+            # reported rather than against the string it asked for.
+            _report_action(
+                args,
+                "launch",
+                success,
+                message,
+                details={"activity": report["activity"]} if report.get("activity") else None,
+            )
 
         elif args.restart:
             success, message = launcher.restart(args.restart, args.activity, extras or None)
