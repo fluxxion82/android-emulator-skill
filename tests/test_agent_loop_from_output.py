@@ -19,11 +19,12 @@ This module drives the documented path instead:
       -> the `input tap x y` argv that actually reached adb
 
 and asserts the tap landed inside the control that name belongs to. The expected
-rectangle is computed *here*, from the recorded hierarchy, and never read off
-navigator's own ``Tapped:`` line: a test that trusts the tool's report of where
-it tapped is structurally unable to see the tool tapping the wrong thing. That
-is the same mistake one layer up -- ``test_compose_visibility.py`` asserts the
-label is *produced*, never that it is *usable*.
+rectangle is a literal in the inventory below, checked against the recorded
+hierarchy by ``test_the_case_inventory_matches_the_recorded_screen``, and never
+read off navigator's own ``Tapped:`` line: a test that trusts the tool's report
+of where it tapped is structurally unable to see the tool tapping the wrong
+thing. That is the same mistake one layer up -- ``test_compose_visibility.py``
+asserts the label is *produced*, never that it is *usable*.
 
 Two recorded screens, because they fail differently. The Compose fixture carries
 unlabelled controls whose captions are row-adjacent siblings; the Settings
@@ -32,7 +33,9 @@ fixture is View-based, with genuine ``text`` attributes and resource-id labels.
 Everything runs in-process against ``tests/fixtures/recorded/``:
 ``capture_hierarchy`` is stubbed to the recorded XML and every adb call is
 recorded rather than issued, so this belongs to the required mocked check and
-touches no device. The emulator lane repeats the same walk live.
+touches no device. The emulator lane repeats the same walk live. Collection
+parses no XML and runs no production code -- the case list is static, and the
+fixture proves it right from inside the harness.
 
 Red cases are pinned ``xfail(strict=True)`` against C1, C2 and C4. ``strict``
 means fixing one turns its case red until the marker is deleted in the same
@@ -49,7 +52,6 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from pathlib import Path
 from types import SimpleNamespace
 
 import navigator
@@ -58,15 +60,12 @@ import screen_mapper
 
 from common import adb_exec
 
-RECORDED_DIR = Path(__file__).resolve().parent / "fixtures" / "recorded" / "emulator-api35"
-
 COMPOSE = "uiautomator_compose_default.xml"
 SETTINGS = "uiautomator_settings_top.xml"
 SCREENS = (COMPOSE, SETTINGS)
 
 # A screen an agent can act on names at least this many of its controls. The
-# plan's floor for C4, applied to both toolkits: the Compose fixture has seven
-# interactive controls and the Settings fixture eleven.
+# plan's floor for C4, applied to both toolkits.
 MINIMUM_NAMED_CONTROLS = 5
 
 # `elements_by_type` collects passive captions under this key; every other key
@@ -90,23 +89,62 @@ _QUOTED = re.compile(r'"([^"]*)"')
 
 
 # ---------------------------------------------------------------------------
+# The case inventory.
+# ---------------------------------------------------------------------------
+#
+# Each entry is a control name the screen report hands the agent, paired with
+# the rectangle a tap for that name has to land in. Static and explicit, in the
+# order the report produces them, so collection reads no XML and executes none
+# of the code under test.
+#
+# It cannot rot: `test_the_case_inventory_matches_the_recorded_screen` drives
+# `screen_mapper --json` against the recorded dump inside the harness and
+# requires exactly these names in exactly this order, then re-derives every
+# rectangle from the hierarchy.
+
+COMPOSE_CONTROLS: tuple[tuple[str, tuple[int, int, int, int]], ...] = (
+    ("Remember me", (33, 754, 159, 880)),
+    ("Submit Order", (32, 217, 375, 343)),
+    ("Order #4821 2 items Ships tomorrow", (32, 353, 1048, 584)),
+    ("Dark theme", (32, 890, 169, 1016)),
+    ("Company logo", (33, 1028, 159, 1154)),
+    ("List item 0 List item 1 List item 2", (32, 1164, 1048, 1637)),
+    ("Email address", (32, 595, 1048, 742)),
+)
+
+SETTINGS_CONTROLS: tuple[tuple[str, tuple[int, int, int, int]], ...] = (
+    ("com.android.settings:id/settings_homepage_container", (0, 142, 1080, 2361)),
+    ("Profile picture, double tap to open Google Account", (891, 289, 1017, 415)),
+    ("com.android.settings:id/search_action_bar", (42, 605, 1038, 742)),
+    ("com.android.settings:id/main_content_scrollable_container", (0, 784, 1080, 2361)),
+    ("Network & internet Mobile, Wi‑Fi, hotspot", (0, 784, 1080, 1015)),
+    ("Connected devices Bluetooth, pairing", (0, 1015, 1080, 1246)),
+    ("Apps Assistant, recent apps, default apps", (0, 1246, 1080, 1477)),
+    ("Notifications Notification history, conversations", (0, 1477, 1080, 1708)),
+    ("Battery 100%", (0, 1708, 1080, 1939)),
+    ("Storage 86% used - 1.08 GB free", (0, 1939, 1080, 2170)),
+    ("Sound & vibration Volume, haptics, Do Not Disturb", (0, 2170, 1080, 2361)),
+)
+
+SCREEN_CONTROLS = {COMPOSE: COMPOSE_CONTROLS, SETTINGS: SETTINGS_CONTROLS}
+
+
+# ---------------------------------------------------------------------------
 # The defect register.
 # ---------------------------------------------------------------------------
 #
-# Every pair below is a control name `screen_mapper` prints that
-# `navigator --find-text <name> --tap` does not land on today. Measured against
-# the recorded XML by driving both CLIs, not predicted:
+# Names above that `navigator --find-text <name> --tap` does not land on today.
+# Measured by driving both CLIs against the recorded dumps, not predicted:
 #
-#   Compose, tap issued but outside the control
+#   Tap issued but outside the control
 #     "Remember me"  -> (302, 816), the caption TextView; the CheckBox is
 #                       [33,754][159,880], so the tap misses it by 143px.
 #     "Dark theme"   -> (282, 953); the Switch is [32,890][169,1016].
 #     "Company logo" -> (221, 1090); the icon button is [33,1028][159,1154].
-#   Compose, nothing found at all (exit 1, no argv issued)
-#     "Order #4821 2 items Ships tomorrow", "List item 0 List item 1 List item 2"
-#   Settings, nothing found at all
-#     the three resource-id captions, and all seven row captions, none of which
-#     exists as any single node's `text` or `content-desc`.
+#   Nothing found at all (exit 1, no argv issued)
+#     both Compose recovered captions, all seven Settings row captions, and the
+#     three Settings resource-id captions -- none of which exists as any single
+#     node's `text` or `content-desc`.
 #
 # C1 is why: `_find_in` (navigator.py:449) matches `text + content_desc` only,
 # so `recovered_label` -- the caption `--list` and the mapper both print
@@ -187,11 +225,6 @@ _NO_SUBPROCESS = SimpleNamespace(
 )
 
 
-def _refuse_adb(*args, **kwargs):
-    """Stand-in for `run_adb` while a hierarchy is analysed at collection time."""
-    raise AssertionError(f"run_adb reached a device during collection: {args!r} {kwargs!r}")
-
-
 class _AdbRecorder:
     """Stands in for ``adb_exec.run_adb`` and keeps every argv it was handed.
 
@@ -263,15 +296,6 @@ def _run_cli(module, argv: list[str], screen: ET.Element, monkeypatch) -> _Run:
 # ---------------------------------------------------------------------------
 # Reading the hierarchy independently of the scripts under test.
 # ---------------------------------------------------------------------------
-
-
-def _screen(name: str) -> ET.Element:
-    """A recorded screen, for parametrisation at collection time.
-
-    Test bodies take the same file through the ``recorded`` fixture; a
-    parametrisation cannot, because it is built before fixtures exist.
-    """
-    return ET.fromstring((RECORDED_DIR / name).read_text(encoding="utf-8"))
 
 
 def _bounds(node: ET.Element) -> tuple[int, int, int, int] | None:
@@ -365,9 +389,8 @@ def _controls(root: ET.Element) -> list[tuple[ET.Element, set[str]]]:
 
 
 def _expected_rect(root: ET.Element, label: str) -> tuple[int, int, int, int]:
-    """The rectangle a tap for ``label`` has to land in.
+    """The rectangle a tap for ``label`` has to land in, re-derived from the XML.
 
-    Resolved from the hierarchy, never from navigator's ``Tapped:`` output.
     Ambiguity fails loudly rather than picking one: two controls answering to
     the same name is a finding in its own right, not something to average over.
     """
@@ -396,24 +419,8 @@ def _inside(rect: tuple[int, int, int, int], x: int, y: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# The labels the agent is handed.
+# Reading the report.
 # ---------------------------------------------------------------------------
-
-
-def _mapper_analysis(screen: ET.Element) -> dict:
-    """``screen_mapper --json``'s payload for one recorded screen.
-
-    ``analyze_tree`` asks the device for the focused activity, which at
-    collection time would run adb against whatever is plugged in. The refusal
-    goes in first; ``_detect_screen_name`` swallows it and leaves the screen
-    name unset, which is all this needs.
-    """
-    real_run_adb = adb_exec.run_adb
-    adb_exec.run_adb = _refuse_adb
-    try:
-        return screen_mapper.ScreenMapper().analyze_tree(screen)
-    finally:
-        adb_exec.run_adb = real_run_adb
 
 
 def _interactive_labels(analysis: dict) -> list[str]:
@@ -429,18 +436,6 @@ def _interactive_labels(analysis: dict) -> list[str]:
         if bucket != PASSIVE_BUCKET
         for label in labels[: screen_mapper.BUTTONS_PREVIEW]
     ]
-
-
-def _seed_labels(screen_name: str) -> list[str]:
-    """The names an agent would pick a target from.
-
-    Seeded from ``--json``'s ``elements_by_type`` because of C4: today the
-    default text report names nothing at all, so seeding from the documented
-    path would parametrise over an empty list and prove nothing. Once C4 is
-    fixed this seed becomes ``_names_printed(<default report>)`` -- the report
-    Quick Start step 2 actually produces -- and this comment goes away.
-    """
-    return _interactive_labels(_mapper_analysis(_screen(screen_name)))
 
 
 def _names_printed(report: str) -> list[str]:
@@ -469,24 +464,22 @@ def _screen_id(screen_name: str) -> str:
 
 
 def _c1_params() -> list:
-    """One case per (screen, label the report printed)."""
-    params = []
-    for screen_name in SCREENS:
-        for label in _seed_labels(screen_name):
-            marks = (
+    """One case per inventory entry: the name, and the rectangle it must hit."""
+    return [
+        pytest.param(
+            screen_name,
+            label,
+            rect,
+            marks=(
                 [pytest.mark.xfail(strict=True, reason=C1_REASON)]
                 if (screen_name, label) in C1_RED
                 else []
-            )
-            params.append(
-                pytest.param(
-                    screen_name,
-                    label,
-                    marks=marks,
-                    id=f"{_screen_id(screen_name)}-{_slug(label)}",
-                )
-            )
-    return params
+            ),
+            id=f"{_screen_id(screen_name)}-{_slug(label)}",
+        )
+        for screen_name in SCREENS
+        for label, rect in SCREEN_CONTROLS[screen_name]
+    ]
 
 
 def _c4_params() -> list:
@@ -500,6 +493,9 @@ def _c4_params() -> list:
         )
         for screen_name in SCREENS
     ]
+
+
+_SCREEN_IDS = [_screen_id(name) for name in SCREENS]
 
 
 # ---------------------------------------------------------------------------
@@ -544,16 +540,18 @@ def test_the_default_screen_report_names_the_controls_it_counts(recorded, monkey
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("screen_name", "label"), _c1_params())
-def test_a_reported_name_taps_the_control_it_names(recorded, monkeypatch, screen_name, label):
+@pytest.mark.parametrize(("screen_name", "label", "expected"), _c1_params())
+def test_a_reported_name_taps_the_control_it_names(
+    recorded, monkeypatch, screen_name, label, expected
+):
     """The loop, closed: a name the screen report produced goes back in as a tap.
 
-    The expected rectangle comes from the hierarchy, so a tap on the caption
-    beside a checkbox fails here even though navigator reports it as a success
-    naming the right thing.
+    The expected rectangle comes from the inventory, which the fixture-backed
+    inventory test holds to the hierarchy. So a tap on the caption beside a
+    checkbox fails here even though navigator reports it as a success naming the
+    right thing.
     """
     screen = ET.fromstring(recorded.text(screen_name))
-    expected = _expected_rect(screen, label)
 
     run = _run_cli(navigator, ["navigator.py", "--find-text", label, "--tap"], screen, monkeypatch)
     taps = run.adb.shell_inputs("tap")
@@ -576,7 +574,7 @@ def test_a_reported_name_taps_the_control_it_names(recorded, monkeypatch, screen
     )
 
 
-@pytest.mark.parametrize("screen_name", SCREENS, ids=[_screen_id(name) for name in SCREENS])
+@pytest.mark.parametrize("screen_name", SCREENS, ids=_SCREEN_IDS)
 @pytest.mark.parametrize("action", [["--tap"], ["--enter-text", "x"]], ids=["tap", "enter-text"])
 @pytest.mark.xfail(strict=True, reason=C2_REASON)
 def test_an_action_with_no_criterion_is_refused(recorded, monkeypatch, screen_name, action):
@@ -601,17 +599,44 @@ def test_an_action_with_no_criterion_is_refused(recorded, monkeypatch, screen_na
 
 
 # ---------------------------------------------------------------------------
-# The register cannot rot, and the cases cannot be vacuous.
+# The inventory and the register cannot rot.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("screen_name", SCREENS, ids=[_screen_id(name) for name in SCREENS])
-def test_every_screen_seeds_enough_labels_to_be_worth_asserting(screen_name):
-    """A parametrisation over an empty list passes and proves nothing."""
-    labels = _seed_labels(screen_name)
-    assert len(labels) >= MINIMUM_NAMED_CONTROLS, (
-        f"{screen_name} seeds only {len(labels)} labels ({labels}); the loop "
-        f"cases above would be near-vacuous"
+@pytest.mark.parametrize("screen_name", SCREENS, ids=_SCREEN_IDS)
+def test_the_case_inventory_matches_the_recorded_screen(recorded, monkeypatch, screen_name):
+    """The static case list is exactly what the recorded screen produces.
+
+    This is what lets the cases above be literals. Both halves are checked:
+    the names, against ``screen_mapper --json`` driven through the harness; and
+    the rectangles, re-derived from the recorded hierarchy. A re-recorded
+    fixture that moves a control, or a mapper that starts reporting a different
+    set, fails here rather than quietly making every case above assert against
+    a stale rectangle.
+    """
+    inventory = SCREEN_CONTROLS[screen_name]
+    assert (
+        len(inventory) >= MINIMUM_NAMED_CONTROLS
+    ), f"{screen_name} has only {len(inventory)} cases; the loop tests would be near-vacuous"
+
+    screen = ET.fromstring(recorded.text(screen_name))
+    payload = json.loads(
+        _run_cli(screen_mapper, ["screen_mapper.py", "--json"], screen, monkeypatch).stdout
+    )
+
+    assert _interactive_labels(payload) == [label for label, _ in inventory], (
+        f"the names screen_mapper reports for {screen_name} are no longer the "
+        f"names this module has cases for. Update the inventory deliberately."
+    )
+
+    drifted = {
+        label: (rect, _expected_rect(screen, label))
+        for label, rect in inventory
+        if _expected_rect(screen, label) != rect
+    }
+    assert not drifted, (
+        f"inventory rectangles disagree with the recorded hierarchy "
+        f"(name: inventory vs hierarchy): {drifted}"
     )
 
 
@@ -621,25 +646,24 @@ def test_the_red_register_names_only_cases_that_exist():
     Same shape as ``test_fixture_policy.test_the_debt_list_does_not_rot``: the
     frozen set is the copy that fails when it is wrong.
     """
-    seeded = {
-        (screen_name, label) for screen_name in SCREENS for label in _seed_labels(screen_name)
+    known = {
+        (screen_name, label) for screen_name in SCREENS for label, _ in SCREEN_CONTROLS[screen_name]
     }
-    stale = C1_RED - seeded
+    stale = C1_RED - known
     assert not stale, (
-        f"{sorted(stale)} are pinned as C1 failures but are no longer labels "
-        f"any screen report produces. Delete them, or re-record the fixture "
-        f"they came from."
+        f"{sorted(stale)} are pinned as C1 failures but are no longer names any "
+        f"screen report produces. Delete them, or update the inventory."
     )
 
 
-def test_the_expectation_is_not_read_from_the_tool_under_test():
+def test_the_expectation_is_not_read_from_the_tool_under_test(recorded):
     """Guard on this module's own method.
 
     The resolver has to disagree with navigator somewhere, or it is only
     restating what navigator did. On the Compose fixture it does: the caption
     "Remember me" resolves to the CheckBox, while navigator taps the TextView.
     """
-    screen = _screen(COMPOSE)
+    screen = ET.fromstring(recorded.text(COMPOSE))
     assert _expected_rect(screen, "Remember me") == (33, 754, 159, 880)
     assert _expected_rect(screen, "Dark theme") == (32, 890, 169, 1016)
     assert _expected_rect(screen, "Submit Order") == (32, 217, 375, 343)
