@@ -17,25 +17,27 @@ nineteen sites are wrapped; the invariant no longer carries an xfail, and it is
 enumerated from both sides -- see ``KNOWN_UNQUOTED`` (now empty) and
 ``KNOWN_QUOTED``.
 
-**Emulator console (L7).** ``common/emu_console.run_emu`` exists because the
-console answers ``KO`` at exit status 0, frames its replies with ``OK``, and is
-absent on a physical device. Five scripts still spell ``adb emu`` themselves and
-each carries its own partial handling of those three facts.
+**Emulator console (L7) -- green since v0.7.0.** ``common/emu_console.run_emu``
+exists because the console answers ``KO`` at exit status 0, frames its replies
+with ``OK``, and is absent on a physical device. Five scripts used to spell
+``adb emu`` themselves, each with its own partial handling of those three
+facts. Every call now goes through ``run_emu``, and ``KNOWN_CONSOLE_CALLS``
+enumerates the remaining sites exactly.
 
-**Bounds grammar (C5 / C7).** uiautomator writes ``bounds="[l,t][r,b]"`` and
-those numbers go negative for a partially off-screen view. The repo parses that
-string with three different regexes in three files; two of them reject a
-negative coordinate and substitute ``(0,0,0,0)``, which navigator then offers as
-a tappable rectangle.
+**Bounds grammar (C5 / C7) -- green since v0.7.0.** uiautomator writes
+``bounds="[l,t][r,b]"`` and those numbers go negative for a partially
+off-screen view. The repo used to parse that string with three different
+regexes in three files; two of them rejected a negative coordinate and
+substituted ``(0,0,0,0)``, which navigator then offered as a tappable
+rectangle. There is one grammar now, in ``common/hierarchy.py``.
 
-The console and bounds invariants are still red, so each carries
-``xfail(strict=True)`` naming its finding: the guard states the defect without
-blocking the PR, and the fix must delete the marker. Quoting was red the same
-way and its marker is gone. What is *not* xfail is the evidence that each guard
-works -- every one has a self-test that injects a synthetic violation and a
-self-test that enumerates the real sites as an exact multiset of file,
-function, kind and what was found there. A guard nobody has seen fail is a
-guard nobody has seen.
+All three invariants are green, so none carries an ``xfail`` today. When one
+goes red again the convention is ``xfail(strict=True)`` naming its finding: the
+guard states the defect without blocking the PR, and the fix must delete the
+marker. What is *not* xfail is the evidence that each guard works -- every one
+has a self-test that injects a synthetic violation and a self-test that
+enumerates the real sites as an exact multiset of file, function, kind and what
+was found there. A guard nobody has seen fail is a guard nobody has seen.
 
 An emptied enumeration needs one more thing, because "no site reports a
 violation" is also what a detector that has gone blind produces, and what
@@ -359,9 +361,11 @@ KNOWN_CONSOLE_CALLS: tuple[Expectation, ...] = (
 )
 
 
-# Today's counts are 47 device-shell calls and 1 `adb emu` argv construction
-# (in common/emu_console.py, the only file allowed one). The shell floor sits
-# below the count: the point is not to pin the number, it is that a refactor
+# Measured today: 45 device-shell calls and 1 `adb emu` argv construction (in
+# common/emu_console.py, the only file allowed one). That 45 is an observation,
+# not a contract -- only the floors below are asserted, and the count moves
+# whenever a call is added or removed. The shell floor sits well below it: the
+# point is not to pin the number, it is that a refactor
 # which renames the builder -- or an edit to this file that breaks resolution
 # -- must not leave the guard reporting "all clear" over a corpus it can no
 # longer see. The console side is pinned exactly instead, by
@@ -398,13 +402,13 @@ def test_the_guards_still_see_the_production_code():
 
 
 def test_every_console_call_site_is_where_it_should_be():
-    """The positive enumeration: the nine `run_emu` calls, by file and function.
+    """The positive enumeration: the six `run_emu` calls, by file and function.
 
     An empty bypass list means "nobody speaks the console protocol by hand". It
-    does NOT mean the console is still being spoken to -- deleting all nine
+    does NOT mean the console is still being spoken to -- deleting all six
     calls would satisfy it perfectly. This is the half that notices, and it is
-    an exact multiset rather than a floor, because a floor of six under a count
-    of nine accepts three sites disappearing without a word.
+    an exact multiset rather than a floor, because any floor set below the
+    count accepts sites disappearing without a word.
     """
     _assert_enumeration(KNOWN_CONSOLE_CALLS, run_emu_call_sites(), "KNOWN_CONSOLE_CALLS")
 
@@ -1160,7 +1164,12 @@ def test_the_emu_guard_does_not_flag_run_emu():
 
 
 def test_the_emu_guard_enumerates_todays_sites():
-    """The five bypassing scripts, by file, function and which builder they call."""
+    """Nobody bypasses `run_emu` today: KNOWN_EMU_BYPASSES is empty.
+
+    It listed five scripts, each with its own partial handling of the console
+    protocol, until L7 routed them all through `run_emu`. The enumeration stays
+    so a new bypass has to be added here deliberately rather than appearing.
+    """
     _assert_enumeration(KNOWN_EMU_BYPASSES, emu_console_bypasses(), "KNOWN_EMU_BYPASSES")
 
 
@@ -1372,7 +1381,12 @@ def test_the_bounds_guard_ignores_functions_that_only_read_a_rectangle():
 
 
 def test_the_bounds_guard_enumerates_todays_sites():
-    """Three files, three grammars, each with its function, matched one-for-one."""
+    """No bounds grammar outside the shared module: KNOWN_BOUNDS_SITES is empty.
+
+    It held three files with three grammars until C5/C7 collapsed them into
+    `common/hierarchy.py`. The companion test below is what stops "none out
+    here" from being satisfied by a skill with no parser at all.
+    """
     _assert_enumeration(
         KNOWN_BOUNDS_SITES, bounds_grammars_outside_hierarchy(), "KNOWN_BOUNDS_SITES"
     )

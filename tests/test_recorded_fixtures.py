@@ -3,8 +3,9 @@
 These are the payoff of ``tests/record_fixtures.py``. Every assertion here runs
 against bytes a real device actually produced, never a hand-written literal.
 
-Several tests are marked ``xfail(strict=True)`` against a defect ID. That is
-deliberate and load-bearing:
+A known defect is pinned here with ``xfail(strict=True)`` against its defect ID
+until it is fixed; none is pinned today. That convention is deliberate and
+load-bearing:
 
 - The suite stays honest — a known-broken parser is not reported as passing.
 - ``strict=True`` means the test *fails* if it unexpectedly passes, so whoever

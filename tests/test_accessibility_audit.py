@@ -11,9 +11,10 @@ Two things this file used to get wrong, both fixed here (T2).
 2. The imagined dump was shaped to make the audit look good. It carried a
    clickable ``android.widget.ImageView`` with no label, which is the one thing
    the ``critical`` check can fire on -- and no recorded screen has one. That is
-   finding L3, pinned below with ``xfail(strict=True)`` rather than papered
-   over: the check keys off the class NAME, and on Compose every unlabelled
-   clickable node reports ``android.view.View``.
+   finding L3, which was pinned below with ``xfail(strict=True)`` rather than
+   papered over: the check keyed off the class NAME, and on Compose every
+   unlabelled clickable node reports ``android.view.View``. Inc 1 rebased the
+   check on ``is_interactive()``, so that test is unmarked now.
 
 Dumps used:
 

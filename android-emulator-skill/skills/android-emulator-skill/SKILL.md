@@ -1,6 +1,6 @@
 ---
 name: android-emulator-skill
-version: 0.6.0
+version: 0.7.0
 description: Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output. Android equivalent of ios-simulator-skill.
 ---
 
@@ -42,7 +42,7 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 
 All scripts support `--help` for detailed options and `--json` for machine-readable output.
 
-## Scripts (v0.6.0)
+## Scripts (v0.7.0)
 
 ### Implemented (32 scripts)
 
@@ -680,40 +680,85 @@ handler is not reachable from adb — see `push_notification.py` above.
 
 ## Status & Roadmap
 
-**Under active repair, not feature work.** An audit found that several scripts
-were written against *assumed* tool output — and their tests were written
-against the same assumption, so the suite stayed green while the script did
-nothing. Some called Android commands that do not exist.
+**v0.7.0 — the agent loop is verified from this skill's own printed output.**
+Earlier releases checked that a fix existed at a given line. This one checks
+that the loop closes: a test reads what `screen_mapper` prints and feeds each
+printed name back into `navigator`, so "implemented but unreachable" fails.
 
-The correction is fixture-driven: `tests/fixtures/recorded/` holds verbatim
-output captured from real devices, parser tests consume it, and known defects
-are pinned with `xfail(strict=True)` so fixing one forces the marker's removal.
-See `CLAUDE.md` in the source repository.
+- **`screen_mapper` names up to 15 controls per bucket in the default report
+  (the full inventory is in `--json`), and `navigator` finds and taps every
+  name it printed** — including Jetpack Compose captions, which the dump leaves
+  anonymous and which are resolved to the control that owns them. A
+  caption whose only enclosing "owner" is a scroll container is *refused*, not
+  tapped at that container's centre.
+- **A bare `--tap` is refused.** A tap lands inside the rectangle the name
+  describes — the test resolves that rectangle from the dump with its own
+  parser, so navigator is checked against the screen rather than against
+  itself.
+- **`--launch` and `--open-url` wait for the activity** — `am start -W`, with
+  `Status: ok` required — instead of returning as soon as `am start` exits.
+- **`emulator_shutdown` cannot power off a handset.** `reboot -p` is gone and a
+  non-emulator serial is refused before anything is issued. One tri-state probe
+  answers "which AVD is this serial" for every caller, so "the device listing
+  itself failed" is no longer read as "not running".
+- **Every value crossing the device shell is quoted** — all 19 sites, each
+  enumerated positively by a guard, so "zero unquoted sites" cannot come from a
+  blind detector.
+- **Every failing mode exits non-zero.** A runtime sweep drives 23 documented
+  invocations across 16 scripts against a toolchain where every tool fails, and
+  asserts the exit status rather than the message. The JSON failure *shape* is
+  not yet uniform, and the sweep does not assert it: `app_launcher`,
+  `screen_mapper`, `navigator`, `anr_watcher`, `app_state_capture`,
+  `device_list` and the `emulator_*` lifecycle scripts answer `{"error": ...}`
+  under `--json`, while `status_bar`, `appearance`, `privacy_manager`,
+  `keyboard`, `gesture`, `location`, `emulator_create` and `build_and_test`
+  still answer `{"success": false, "message": ...}`.
+- **A missing SDK tool says so in the lifecycle scripts** — `device_list`,
+  `emulator_boot`, `emulator_delete`, `emulator_erase` and `emulator_selector`
+  route through `common/sdk_tools.py`, which names where the tool was looked
+  for and gives the `cmdline-tools` remedy instead of returning an empty list.
+  A tool that ran and genuinely found nothing still exits 0. (`device_list`
+  keeps a missing `avdmanager` as a *warning*: it only decorates AVDs the
+  emulator already listed.)
 
-**Fixed so far:** Gradle failures now report a diagnostic instead of
-"0 errors"; errored tests no longer count as a pass; `log_monitor` parses
-device output at all and `--duration` terminates; `anr_watcher --all` no longer
-returns 3 clusters and delete the rest from disk; the focused-activity lookup
-works; cache ids can no longer address files outside the cache directory;
-selector history no longer writes into the installed package; arguments
-crossing into the device shell are quoted; `screen_mapper` sees Jetpack Compose
-screens; touch targets are measured in dp against the device's real density;
-display overrides (`wm size` / `wm density`) are honoured, so coordinates are
-right while one is active; every script reads the screen through one
-implementation that writes no temp files, so concurrent runs and multi-device
-runs can no longer read each other's screen; `test_recorder` records again
-(screenshots, UI dumps and a Markdown report per step); `push_notification` is
-rescoped to what adb can actually do — post to the shade, and read back what a
-package really posted — instead of broadcasting to a receiver class this skill
-invented.
+The correction remains fixture-driven: `tests/fixtures/recorded/` holds verbatim
+output captured from real devices on two API levels, parser tests consume it,
+and a known defect, when one exists, is pinned with `xfail(strict=True)` so
+fixing it forces the marker's removal. None is pinned in v0.7.0. See
+`CLAUDE.md` in the source repository.
 
-**Known-broken, being worked:**
+**Known gaps, for the next release:**
 
-- `accessibility_audit.py` — no contrast check, despite the script's own
-  description mentioning one. Contrast needs pixel sampling from a screenshot,
-  which is not implemented.
-- AVD management needs `cmdline-tools`; the legacy `tools/bin` copies cannot run
-  on Java 11+ (they use JAXB, removed in Java 11).
+- `build_and_test` takes its verdict from Gradle's exit code alone, so a project
+  built with `ignoreFailures = true` is reported as a success with failing tests.
+- `log_monitor --severity` does not validate its names. An unrecognised one
+  (`warn`, say) matches nothing, so the capture silently filters to empty.
+- `app_state_capture` counts a logcat line as an error when the words "error" or
+  "exception" appear anywhere in its free text, rather than reading the priority
+  column, so prose about errors inflates the count.
+- `anr_watcher` does not attach an ANR's `Reason:` / `PID:` continuation lines to
+  the `ANR in` event above them, so one ANR can surface as two clusters.
+- `status_bar --time` must be given zero-padded — `09:41`, not `9:41`. The value
+  reaches SystemUI's demo mode as `hhmm`; an unpadded one is ignored while the
+  script still reports success.
+- `accessibility_audit` has no contrast check. Contrast needs pixel sampling
+  from a screenshot, which is not implemented.
+- `privacy_manager` acts on the default user only. It passes no `--user`, so a
+  work profile or a secondary user is out of reach.
+- `emulator_create` still returns an empty list when `avdmanager` or
+  `sdkmanager` is missing or fails, so `--list-devices` and `--list-images`
+  print nothing and exit 0 — the shape the lifecycle scripts above no longer
+  have.
+- The JSON failure shape is `{"error": ...}` only for the scripts reworked in
+  this release. Two groups remain: `status_bar`, `appearance`,
+  `privacy_manager`, `keyboard`, `gesture`, `location`, `emulator_create` and
+  `build_and_test` answer `{"success": false, "message": ...}` (`snapshot`,
+  `sms` and `container` emit both keys at once), and `navigator`,
+  `log_monitor`, `crash_triage` and `status_bar` refuse an unreachable device
+  before any JSON is built, printing prose on stderr and no JSON at all.
+  Unifying them is next.
+- Instrumented tests are not a feature. Nothing here drives
+  `connectedAndroidTest`; the build and test scripts run unit tests.
 
 Removed rather than repaired: `clipboard.py` — see "Platform limitations"
 above; writing the clipboard is not reachable from adb on any modern Android,

@@ -3,9 +3,10 @@
 The finding this pins (C6, X5, X8, X3, L8) is one shape in four places: a
 failure converted into an empty result, printed calmly, and reported as
 success. ``app_launcher --list`` answered ``Installed packages (0)`` when adb
-never ran -- fixed in Inc 1, and green here unmarked since; ``device_list
---json`` still answers ``{"devices": [], "avds": []}`` when the SDK is not
-installed. An agent cannot tell "nothing is there" from "I could not look", and
+never ran, and ``device_list --json`` answered ``{"devices": [], "avds": []}``
+when the SDK was not installed. Both were fixed during v0.7.0 and are green
+here unmarked; the shape survives in ``emulator_create``, which this sweep does
+not cover. An agent cannot tell "nothing is there" from "I could not look", and
 it has no second signal to consult -- exit status is the signal.
 
 **Why this is a runtime sweep and not another AST guard.** The obvious static
@@ -34,12 +35,15 @@ Each mode also asserts that a fake tool was *invoked*, so a script that answers
 without ever looking cannot pass the sweep vacuously. The two modes that
 legitimately touch no tool say so in the table.
 
-Each mode is checked by three separate tests, and only one of them carries
-the ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
+Each mode is checked by three separate tests, and only one of them can carry
+an ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
 unexpected *pass*, never an unexpected reason for failing, so a single combined
 test would accept a hang, a fresh Python traceback or a vanished marker file as
-"the expected failure" for the six red modes -- the sweep would go on
-reporting the defect it already knows about while a new one hid behind it. So:
+"the expected failure" for any mode still pinned red -- the sweep would go on
+reporting the defect it already knows about while a new one hid behind it.
+Every mode is green today -- v0.7.0 closed the eight that were red -- so no
+mode sets ``defect`` and nothing is marked; the split stands for the next one.
+So:
 completion and the absence of a traceback are asserted unmarked for all
 twenty-three modes, the tool-invocation floor is asserted unmarked for the
 twenty-one that touch a tool, and the ``xfail`` covers exactly one assertion,
@@ -107,8 +111,9 @@ class Mode(NamedTuple):
 
 
 # The sweep table. `defect` is filled from an unmarked run, not from a guess:
-# every entry below was observed, and the six marked ones printed a zero exit
-# status with an empty-looking answer.
+# every entry below was observed, and the eight that were marked printed a zero
+# exit status with an empty-looking answer. All eight are fixed; no entry sets
+# `defect` today.
 MODES: tuple[Mode, ...] = (
     # --- C6: app_launcher ---------------------------------------------------
     # Green since Inc 1: list_packages no longer answers a failed lookup with
