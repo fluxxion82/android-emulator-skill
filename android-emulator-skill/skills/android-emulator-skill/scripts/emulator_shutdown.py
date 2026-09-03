@@ -14,6 +14,8 @@ Key features:
 Tunables (env, ANDROID_EMU_ prefix):
     ANDROID_EMU_SHUTDOWN_TIMEOUT      Verification timeout, seconds (default 30)
     ANDROID_EMU_SHUTDOWN_POLL_INTERVAL  Poll interval while verifying, seconds (default 0.5)
+    ANDROID_EMU_SHUTDOWN_KILL_TIMEOUT   `emu kill` budget, seconds (default 10)
+    ANDROID_EMU_SHUTDOWN_NAME_TIMEOUT   `emu avd name` budget, seconds (default 5)
 """
 
 import argparse
