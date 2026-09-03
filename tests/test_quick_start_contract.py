@@ -22,6 +22,14 @@ Both sides are parsed, not grepped -- fenced-block extraction for the Markdown
 *describes* a command is not a command), and `ast` for the Python (a substring
 search for "navigator.py" would be satisfied by a comment mentioning it).
 
+Because the coverage assertion is `xfail`, it cannot police its own extractors:
+an extractor that quietly stopped seeing `app_launcher.py --launch` on either
+side would still produce a red test, and the marker would swallow it. So both
+extractors are held to a **complete literal baseline** of what they return
+today. A mutation to either one shows up as a baseline mismatch, not as a
+differently-worded xfail. When Inc 1 extends `test_agent_task_e2e.py`, the e2e
+baseline is updated deliberately, in that commit.
+
 The coverage assertion is `xfail(strict=True)`; Inc 1 extends
 `test_agent_task_e2e.py` and deletes the marker in the same commit.
 """
@@ -29,7 +37,6 @@ The coverage assertion is `xfail(strict=True)`; Inc 1 extends
 from __future__ import annotations
 
 import ast
-import re
 import shlex
 from pathlib import Path
 
@@ -41,15 +48,29 @@ E2E_TEST = Path(__file__).resolve().parent / "test_agent_task_e2e.py"
 
 QUICK_START_HEADING = "## Quick Start"
 
-# Quick Start documents five commands today. Pinned so the guard cannot pass by
-# finding nothing -- a heading rename or a fence that stops closing would
-# otherwise turn this file into a no-op that still reports green.
-QUICK_START_COMMAND_COUNT = 5
+# Every command SKILL.md's Quick Start block documents, normalised. Complete,
+# not a count: a count survives an extractor that drops `--launch` from
+# app_launcher and picks up a stray line elsewhere, and that mutation is exactly
+# what would make the coverage assertion below quietly stop checking step 1.
+QUICK_START_BASELINE = (
+    ("accessibility_audit.py", ()),
+    ("app_launcher.py", ("--launch",)),
+    ("navigator.py", ("--enter-text", "--find-type")),
+    ("navigator.py", ("--find-text", "--tap")),
+    ("screen_mapper.py", ()),
+)
 
-# The e2e test drives five `run_skill` calls. A floor rather than an equality:
-# the test is expected to grow, and it must, but a collector that silently
-# matched nothing would satisfy any superset check vacuously.
-MINIMUM_E2E_INVOCATIONS = 3
+# Every `run_skill(...)` call in test_agent_task_e2e.py, normalised. Duplicates
+# are kept -- the e2e test maps the screen twice -- so a collector that
+# deduplicated or skipped a call fails here. Inc 1 extends that test; this
+# baseline is updated in the same commit, which is the point of stating it.
+E2E_BASELINE = (
+    ("app_launcher.py", ("--launch",)),
+    ("log_monitor.py", ("--duration", "--json")),
+    ("navigator.py", ("--enter-text", "--find-type")),
+    ("screen_mapper.py", ("--json",)),
+    ("screen_mapper.py", ("--json",)),
+)
 
 XFAIL_REASON = (
     "QS: Quick Start step(s) not exercised by the e2e test; Inc 1 extends test_agent_task_e2e.py"
@@ -154,6 +175,11 @@ def e2e_invocations() -> list[tuple[str, frozenset[str]]]:
     return calls
 
 
+def _normalise(commands) -> list[tuple[str, tuple[str, ...]]]:
+    """Commands in a comparable, order-independent form, duplicates preserved."""
+    return sorted((script, tuple(sorted(flags))) for script, flags in commands)
+
+
 def _render(command: tuple[str, frozenset[str]]) -> str:
     """One command as it would be typed, for an assertion message."""
     script, flags = command
@@ -203,40 +229,34 @@ def test_every_quick_start_command_is_exercised_by_the_e2e_test():
 # ---------------------------------------------------------------------------
 
 
-def test_the_quick_start_extractor_finds_every_documented_command():
-    """A superset check over an empty list is green and worthless."""
-    commands = quick_start_commands()
-    assert len(commands) == QUICK_START_COMMAND_COUNT, (
-        f"Quick Start parsed to {len(commands)} commands, not "
-        f"{QUICK_START_COMMAND_COUNT}: {commands}. Either the section changed "
-        f"-- update the count deliberately -- or the extractor stopped seeing "
-        f"the fence."
+def test_the_quick_start_extractor_returns_exactly_the_documented_commands():
+    """Every Quick Start command, complete, with flags and without their values.
+
+    A count would let an extractor lose `app_launcher.py --launch` and gain
+    something else. The literal also pins that `--find-text "Login"` yields the
+    flag and not the search term: no baseline entry carries a value.
+    """
+    assert _normalise(quick_start_commands()) == list(QUICK_START_BASELINE), (
+        f"the Quick Start extractor no longer returns the documented set.\n"
+        f"  parsed:   {_normalise(quick_start_commands())}\n"
+        f"  baseline: {list(QUICK_START_BASELINE)}\n"
+        f"If SKILL.md changed, update the baseline deliberately; otherwise the "
+        f"extractor broke and the coverage assertion above is checking less "
+        f"than it claims."
     )
-    assert all(
-        script.endswith(".py") for script, _ in commands
-    ), f"a parsed command names no script: {commands}"
 
 
-def test_the_extractor_reads_flags_and_not_their_values():
-    """`--find-text "Login"` is a flag the agent must exercise, not a search term."""
-    by_script: dict[str, set[str]] = {}
-    for script, flags in quick_start_commands():
-        by_script.setdefault(script, set()).update(flags)
+def test_the_e2e_collector_returns_exactly_the_calls_in_the_test():
+    """Every `run_skill` invocation the e2e test makes, duplicates included.
 
-    assert "navigator.py" in by_script, f"Quick Start no longer drives navigator: {by_script}"
-    assert {"--find-text", "--tap"} <= by_script["navigator.py"]
-    assert not any(
-        re.search(r"Login|EditText|example", flag) for flag in by_script["navigator.py"]
-    ), f"values leaked into the flag set: {by_script['navigator.py']}"
-
-
-def test_the_e2e_collector_finds_the_calls_that_are_there():
-    """A collector that matched nothing would make every command look covered."""
-    invocations = e2e_invocations()
-    assert len(invocations) >= MINIMUM_E2E_INVOCATIONS, (
-        f"only {len(invocations)} run_skill calls were parsed out of "
-        f"{E2E_TEST.name}: {invocations}. The collector, not the e2e test, is "
-        f"probably what broke."
+    A collector that silently matched nothing, or dropped one call, would make
+    the Quick Start commands look covered -- or make an already-covered one look
+    missing -- and the xfail above would hide either.
+    """
+    assert _normalise(e2e_invocations()) == list(E2E_BASELINE), (
+        f"the run_skill collector no longer returns the calls in "
+        f"{E2E_TEST.name}.\n"
+        f"  parsed:   {_normalise(e2e_invocations())}\n"
+        f"  baseline: {list(E2E_BASELINE)}\n"
+        f"If the e2e test grew a step, update the baseline in that commit."
     )
-    scripts = {script for script, _ in invocations}
-    assert "screen_mapper.py" in scripts, f"the e2e test no longer maps the screen: {scripts}"
