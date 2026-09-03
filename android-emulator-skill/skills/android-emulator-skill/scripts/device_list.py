@@ -345,6 +345,7 @@ class DeviceLister:
             SdkToolError: The emulator is absent or failed, so the AVD list
                 would be empty for a reason that is not "no AVDs exist".
         """
+        self.warnings = []
         emulator = get_emulator_path()
         if not emulator:
             raise missing_emulator_error()
@@ -355,7 +356,6 @@ class DeviceLister:
         )
         names = parse_emulator_avds(names_output)
 
-        self.warnings = []
         meta_output = self._run_optional(["avdmanager", "list", "avd"])
         if meta_output is None:
             self.warnings.append(
