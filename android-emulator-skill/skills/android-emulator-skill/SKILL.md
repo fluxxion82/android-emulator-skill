@@ -80,9 +80,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
-   - Shutdown by serial number
+   - Shutdown by serial number. Emulators only: a serial that is not an
+     `emulator-NNNN` is refused before any adb command runs, so this never powers off an
+     attached phone or tablet
    - Optional verification of shutdown completion
-   - Batch shutdown operations
+   - Batch shutdown operations (running emulators only)
    - Options: `--serial`, `--verify`, `--timeout`, `--all`, `--json`
 
 7. **emulator_create.py** ⭐ NEW - Create AVDs dynamically

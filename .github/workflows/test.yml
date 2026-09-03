@@ -1,18 +1,15 @@
 name: Run Tests
 
+# Deliberately NO `paths:` filter: this workflow's job is a REQUIRED status
+# check on main, and GitHub never reports a filtered-out workflow as skipped --
+# it stays "Expected" and the pull request is blocked forever. See
+# tests/test_packaging_contract.py::test_no_required_check_filters_by_path.
+
 on:
   pull_request:
     branches: [main]
-    paths:
-      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py'
-      - 'tests/**'
-      - 'pyproject.toml'
-      - '.github/workflows/test.yml'
   push:
     branches: [main]
-    paths:
-      - 'android-emulator-skill/skills/android-emulator-skill/scripts/**/*.py'
-      - 'tests/**'
 
 jobs:
   test:

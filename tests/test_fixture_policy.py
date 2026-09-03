@@ -85,7 +85,12 @@ OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
 #
 # STILL OUTSTANDING:
 #
-#   test_emulator_create.py, test_emulator_shutdown.py — not yet recorded.
+#   test_emulator_create.py — not yet recorded.
+#
+#   test_emulator_shutdown.py — partly paid: the shutdown-path tests now read
+#     `adb devices -l` from the corpus. What still trips the detector is the
+#     f-string feeding `emu avd name` output in the AVD-resolution test, which
+#     has no recording yet.
 #
 #   test_location.py::parse_gpx — a documented EXCEPTION, in the same class as
 #     test_emu_console.py, and not expected to be paid off. GPX is not tool

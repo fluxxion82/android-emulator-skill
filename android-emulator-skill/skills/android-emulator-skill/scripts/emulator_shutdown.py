@@ -6,6 +6,8 @@ This script shuts down one or more emulators and optionally verifies shutdown co
 
 Key features:
 - Shutdown by serial number or AVD name
+- Emulators only: a serial that is not an `emulator-NNNN` is refused before any
+  adb command is issued, so this can never power off an attached handset
 - Verification of shutdown completion (on by default; opt out with --no-verify)
 - Batch shutdown operations (all emulators)
 
@@ -59,27 +61,30 @@ class EmulatorShutdown:
         if not device:
             return False, f"Error: Device {self.serial} not found"
 
-        # Execute shutdown command. `adb emu kill` is the emulator-native graceful
-        # stop; fall back to `reboot -p` (power off) for the rare device that
-        # rejects the console kill.
+        # Refuse a handset BEFORE issuing anything. `--all` and `--name` already
+        # filter on type; `--serial` did not, and `adb emu kill` fails on a
+        # device with no emulator console -- which used to fall through to
+        # `adb shell reboot -p` and power off whatever phone was plugged in.
+        if device["type"] != "emulator":
+            return False, (
+                f"Error: {self.serial} is a physical device, not an emulator. "
+                f"This script only stops emulators and will not power off a "
+                f"handset. Disconnect the device, or pass an emulator serial "
+                f"(emulator-NNNN)."
+            )
+
+        # Execute shutdown command: `adb emu kill` is the emulator-native
+        # graceful stop. There is deliberately no fallback -- the only device
+        # that rejects the console kill is one that has no console, i.e. not an
+        # emulator, and that case is refused above.
         try:
             cmd = build_adb_command("emu", self.serial, "kill")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
 
             if result.returncode != 0:
-                # Capture the primary failure before trying the fallback so we can
-                # surface real adb stderr if both paths fail.
-                primary_error = (result.stderr or result.stdout or "").strip()
-
-                cmd = build_adb_command("shell", self.serial, "reboot", "-p")
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=10, check=False
-                )
-
-                if result.returncode != 0:
-                    error = (result.stderr or result.stdout or primary_error or "").strip()
-                    detail = f": {error}" if error else ""
-                    return False, f"Shutdown failed: {self.serial}{detail}"
+                error = (result.stderr or result.stdout or "").strip()
+                detail = f": {error}" if error else ""
+                return False, f"Shutdown failed: {self.serial}{detail}"
 
         except subprocess.TimeoutExpired:
             return False, "Shutdown command timed out"
