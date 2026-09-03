@@ -229,19 +229,27 @@ class _Captured:
     returncode = 0
 
 
-def _capture_adb(monkeypatch, module) -> list[list[str]]:
-    """Record every argv ``common.adb_exec`` would hand to the host subprocess."""
+def _capture_adb(monkeypatch, module, stdout: str = "") -> list[list[str]]:
+    """Record every argv ``common.adb_exec`` would hand to the host subprocess.
+
+    ``stdout`` is what the fake device answers. It matters for the `am start`
+    paths, which now read their verdict out of the report rather than assuming
+    silence means success -- so a test that wants those to succeed has to hand
+    them a real one.
+    """
     seen: list[list[str]] = []
 
     def _run(cmd, **_kwargs):
         seen.append(list(cmd))
-        return _Captured()
+        captured = _Captured()
+        captured.stdout = stdout
+        return captured
 
     monkeypatch.setattr(module.adb_exec.subprocess, "run", _run)
     return seen
 
 
-def test_open_url_sends_a_query_string_as_one_argument(monkeypatch):
+def test_open_url_sends_a_query_string_as_one_argument(monkeypatch, recorded):
     """`--open-url 'https://x/?a=1&b=2'` opened `?a=1` and backgrounded `am start`.
 
     The `&` was an operator on the device: the intent received the truncated
@@ -250,12 +258,14 @@ def test_open_url_sends_a_query_string_as_one_argument(monkeypatch):
     """
     import app_launcher
 
-    seen = _capture_adb(monkeypatch, app_launcher)
+    # The recorded `am start -W` report, because `open_url` now reads its
+    # verdict from `Status: ok` rather than from the absence of an error.
+    seen = _capture_adb(monkeypatch, app_launcher, stdout=recorded.text("am_start_wait_settings"))
     url = "https://example.com/?a=1&b=2"
 
     success, message = app_launcher.AppLauncher(serial="emulator-5554").open_url(url)
 
-    assert success is True
+    assert success is True, message
     assert url in message
     _assert_single_word(seen[0], url)
 

@@ -396,11 +396,19 @@ class AppLauncher:
             (success, message) tuple
         """
         try:
+            # `-W`, and the verdict read from the report -- the same contract as
+            # `launch()`. This was the last place in the skill inferring success
+            # from the absence of an "Error" substring: an intent that resolves
+            # to nothing prints `Error: Activity not started, unable to resolve
+            # Intent` and no `Status:` line at all, so "no error seen" and "the
+            # link opened" were the same answer, and the deep link an agent
+            # asked for could silently reach nothing (E1's shape).
             result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "am",
                 "start",
+                "-W",
                 "-a",
                 "android.intent.action.VIEW",
                 "-d",
@@ -408,12 +416,30 @@ class AppLauncher:
                 check=True,
             )
 
-            if "Error" in result.stdout or "error" in result.stderr.lower():
-                return False, f"Open URL failed: {result.stdout or result.stderr}"
+            report = parse_am_start(result.stdout)
+            if (report.get("status") or "").lower() != "ok":
+                detail = am_start_error(result.stdout) or (
+                    f"no `Status: ok` in the report ({result.stdout.strip()[:200]!r})"
+                )
+                return False, (
+                    f"Open URL failed: {detail} Nothing on the device handles {url!r} -- "
+                    f"check the scheme and host against the app's intent filters "
+                    f"(`adb shell cmd package resolve-activity --brief -a "
+                    f"android.intent.action.VIEW -d '<url>'`)."
+                )
 
-            return True, f"Opened URL: {url}"
+            opened = report.get("activity")
+            where = f" ({opened})" if opened else ""
+            return True, f"Opened URL: {url}{where}"
 
         except adb_exec.AdbCommandError as e:
+            stdout = getattr(getattr(e, "result", None), "stdout", "") or ""
+            detail = am_start_error(stdout)
+            if detail:
+                return False, (
+                    f"Open URL failed: {detail} Nothing on the device handles {url!r} -- "
+                    f"check the scheme and host against the app's intent filters."
+                )
             return False, f"Open URL failed: {e}"
 
     def list_packages(self, filter_text: str | None = None) -> tuple:

@@ -488,6 +488,46 @@ def test_parse_am_start_reads_the_recorded_report(recorded):
     )
 
 
+def test_a_deep_link_that_resolves_to_nothing_is_not_reported_as_opened(monkeypatch, recorded):
+    """`--open-url` was the last place inferring success from a missing error.
+
+    It ran a bare `am start` and answered "Opened URL" unless the word "Error"
+    appeared, so an intent that resolved to nothing -- a typo in the scheme, an
+    app that does not declare the filter -- was reported as a link the agent had
+    followed. It now waits (`-W`) and reads `Status: ok` like every other launch.
+
+    The stdout here is the recorded `am start -W` failure. Its *command* was
+    `-n <component>` rather than `-a VIEW -d <url>`, and what is being exercised
+    is the shape both produce and the parser keys on: an `Error:` line and no
+    `Status:` line at all. Every byte is the device's; only the command that
+    produced them differs, which is stated rather than papered over.
+    """
+    failure = recorded.text("am_start_wait_missing")
+
+    def fake_run(cmd, **kwargs):
+        return _ok(failure)
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+
+    success, message = AppLauncher(serial="emulator-5554").open_url("myapp://nowhere")
+
+    assert success is False, "a link that opened nothing was reported as opened"
+    assert "does not exist" in message, message
+    assert "myapp://nowhere" in message
+    assert "intent filters" in message, f"the failure names no remedy: {message}"
+
+
+def test_a_deep_link_that_opens_reports_where_it_landed(monkeypatch, recorded):
+    """The control: `Status: ok` is what success means, and the report is passed on."""
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", _launch_aware(recorded))
+
+    success, message = AppLauncher(serial="emulator-5554").open_url("https://example.com/")
+
+    assert success is True, message
+    assert "https://example.com/" in message
+    assert "com.android.settings/.homepage.SettingsHomepageActivity" in message
+
+
 # --- C6: a failed lookup is not an empty answer ----------------------------
 #
 # `--list` used to catch every exception, answer `[]`, print

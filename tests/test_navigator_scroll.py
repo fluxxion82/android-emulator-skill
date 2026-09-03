@@ -53,6 +53,7 @@ from pathlib import Path
 import gesture
 import navigator
 import pytest
+from app_launcher import am_start_error, parse_am_start
 from navigator import Navigator
 
 from common import adb_exec
@@ -578,24 +579,43 @@ def _navigator_cli(adb_path: str, serial: str, args: list[str]) -> subprocess.Co
         / "scripts"
         / "navigator.py"
     )
-    subprocess.run(
+    stopped = subprocess.run(
         [adb_path, "-s", serial, "shell", "am", "force-stop", "com.android.settings"],
         capture_output=True,
+        text=True,
         timeout=30,
         check=False,
     )
+    assert stopped.returncode == 0, (
+        f"could not force-stop Settings, so the screen below is whatever was "
+        f"already there: {stopped.stdout.strip()} {stopped.stderr.strip()}"
+    )
+
     # `-W`, then poll for focus: this is E1 in the place it was not fixed. The
     # bare `am start` returned as soon as the intent was dispatched, so the dump
     # below could catch the launcher instead of Settings -- and the failure read
     # "nothing on it scrolls, so there is no content below", which is a
     # confident statement about the wrong screen.
-    subprocess.run(
+    #
+    # Both results are checked. Ignoring them left the same hole one layer down:
+    # the launch could fail, the focus loop could time out, and the test would
+    # still run navigator against whatever was in front and blame navigator for
+    # what it found.
+    started = subprocess.run(
         [adb_path, "-s", serial, "shell", "am", "start", "-W", "-a", "android.settings.SETTINGS"],
         capture_output=True,
+        text=True,
         timeout=120,
         check=False,
     )
+    report = parse_am_start(started.stdout)
+    assert (report.get("status") or "").lower() == "ok", (
+        f"Settings did not start: {am_start_error(started.stdout) or started.stdout.strip()!r}. "
+        f"Nothing below this point would be measuring Settings."
+    )
+
     deadline = time.monotonic() + 30
+    focused = None
     while time.monotonic() < deadline:
         dumped = subprocess.run(
             [adb_path, "-s", serial, "shell", "dumpsys", "window"],
@@ -604,9 +624,16 @@ def _navigator_cli(adb_path: str, serial: str, args: list[str]) -> subprocess.Co
             timeout=30,
             check=False,
         )
-        if (parse_focused_activity(dumped.stdout) or "").startswith("com.android.settings"):
+        focused = parse_focused_activity(dumped.stdout)
+        if (focused or "").startswith("com.android.settings"):
             break
         time.sleep(0.5)
+    else:
+        raise AssertionError(
+            f"am start reported {report.get('activity')!r} as displayed, but "
+            f"{focused!r} is focused after 30s -- the screen this test is about "
+            f"to make claims about is not Settings."
+        )
 
     return subprocess.run(
         [sys.executable, str(script), "--serial", serial, *args],

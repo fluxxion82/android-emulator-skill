@@ -70,7 +70,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      and how long it took.
    - Terminate apps
    - Install/uninstall APKs
-   - Deep link navigation
+   - Deep link navigation. `--open-url` waits the same way `--launch` does and
+     fails when the intent resolves to nothing, rather than reporting a URL it
+     merely handed to the system.
    - List installed packages
    - Check app state
    - Options: `--launch`, `--terminate`, `--install`, `--uninstall`, `--open-url`, `--list`, `--state`, `--json`

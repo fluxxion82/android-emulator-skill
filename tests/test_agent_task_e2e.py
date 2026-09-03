@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 import pytest
+from app_launcher import parse_am_start
 
 # The independent resolver from the fixture-driven loop spec, imported rather
 # than re-implemented: the rectangle a tap must land in is computed from the
@@ -182,12 +183,17 @@ def compose_app(run_skill, adb: str, compose_device: str):
     Returns the package, and the focused activity as the test last saw it, so a
     shortfall can say which screen was actually mapped.
     """
-    # Force-stop first. The lane boots from a saved snapshot, so whatever state
-    # the app was left in at the end of the previous run comes back with it --
-    # including an ANR dialog, whose "Close app" / "Wait" buttons are the only
-    # two controls the mapper can then see. Terminating is how the run starts
-    # from a screen this test is entitled to make claims about.
-    run_skill("app_launcher.py", "--terminate", APP)
+    # Force-stop first, and check that it worked. The lane boots from a saved
+    # snapshot, so whatever state the app was left in at the end of the previous
+    # run comes back with it -- including an ANR dialog, whose "Close app" /
+    # "Wait" buttons are the only two controls the mapper can then see.
+    # Terminating is how the run starts from a screen this test is entitled to
+    # make claims about, and a terminate whose result nobody read is not a
+    # guarantee of anything: it permits precisely the state it was added to
+    # prevent.
+    stopped = run_skill("app_launcher.py", "--terminate", APP, "--json")
+    assert stopped.returncode == 0, f"could not force-stop {APP}: {stopped.stderr}"
+    assert json.loads(stopped.stdout).get("success") is True, stopped.stdout
 
     launched = run_skill("app_launcher.py", "--launch", ACTIVITY, "--json")
     assert launched.returncode == 0, f"could not launch: {launched.stderr}"
@@ -337,21 +343,52 @@ def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app
     ), f"lines were read but none classified, which is the A1 signature: {statistics}"
 
 
-def test_the_two_spellings_of_one_component_compare_equal():
-    """The comparison above, held to the pair the lane produced.
+def test_the_two_spellings_of_one_component_compare_equal(recorded):
+    """The comparison above, held to recorded output rather than to my memory of it.
 
     Not a device test: it is the one line of judgement in the fixture, and it
-    got the lane wrong once already by comparing the strings as written.
-    """
-    reported = "com.example.composefixture/.DefaultActivity"
-    focused = "com.example.composefixture/com.example.composefixture.DefaultActivity"
-    assert _expand_component(reported) == _expand_component(focused)
+    got the lane wrong once already by comparing the strings as written. So the
+    pair comes from a recording and is read with the production parser.
 
-    # An alias resolves to a genuinely different class, and must NOT compare
-    # equal to the name that was requested -- that is what the wait is for.
-    assert _expand_component("com.android.settings/.Settings") != _expand_component(
-        "com.android.settings/.homepage.SettingsHomepageActivity"
+    ``dumpsys_window_focus`` carries both spellings of ONE activity, which is
+    the whole phenomenon in two lines of real output: ``mCurrentFocus`` names it
+    fully qualified and ``mFocusedApp`` names it with the leading-dot shorthand.
+    """
+    lines = [line for line in recorded.lines("dumpsys_window_focus") if line.strip()]
+    qualified = parse_focused_activity(next(line for line in lines if "mCurrentFocus" in line))
+    shorthand = parse_focused_activity(next(line for line in lines if "mFocusedApp" in line))
+
+    assert qualified and shorthand
+    assert qualified != shorthand, (
+        "the recording no longer spells one activity two ways, so this test is "
+        "no longer about anything -- re-derive it from a dump that does"
     )
+    assert _expand_component(qualified) == _expand_component(shorthand)
+
+
+def test_an_alias_does_not_compare_equal_to_what_was_requested(recorded):
+    """The other half: expansion must not make two different activities equal.
+
+    From the same recording the launch wait depends on. `am start -W -n
+    com.android.settings/.Settings` (the command in the manifest) answers
+    `Activity: com.android.settings/.homepage.SettingsHomepageActivity` -- an
+    alias resolving to a different class. If expansion collapsed that
+    difference, the fixture would accept any screen in the package and the wait
+    would be worthless.
+    """
+    report = parse_am_start(recorded.text("am_start_wait_settings"))
+    resolved = report["activity"]
+
+    # What was asked for, read from the recording's own provenance rather than
+    # retyped: the manifest stores the exact command that produced the capture.
+    entry = next(
+        item for item in recorded.manifest["fixtures"] if item["name"] == "am_start_wait_settings"
+    )
+    command = entry["command"].split()
+    requested = command[command.index("-n") + 1]
+
+    assert requested == "com.android.settings/.Settings", entry["command"]
+    assert _expand_component(resolved) != _expand_component(requested)
 
 
 @pytest.mark.emulator
