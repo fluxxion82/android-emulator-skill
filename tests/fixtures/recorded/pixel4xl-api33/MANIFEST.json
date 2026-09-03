@@ -1,6 +1,6 @@
 {
   "profile": "pixel4xl-api33",
-  "recorded_at": "2026-09-01T02:13:11Z",
+  "recorded_at": "2026-09-03T07:26:41Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "Pixel 4 XL",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/coral/coral:13/TP1A.221005.002.B2/9382335:user/release-keys"
   },
-  "redacted_package_count": 0,
+  "redacted_package_count": 393,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -21,6 +21,16 @@
         "R5"
       ],
       "bytes": 45
+    },
+    {
+      "name": "adb_shell_device_not_found",
+      "file": "adb_shell_device_not_found.txt",
+      "command": "adb -s no-such-serial-xyz shell getprop ro.build.version.sdk",
+      "description": "`adb -s <unknown> shell` -- the call shape the skill's scripts actually make. The prefix here is 'adb:', where the same failure from `get-state` (adb_device_not_found) says 'error:'. adb mixes the two, which is why adb_exec._classify matches the message body rather than the prefix; recorded so that stays a measured fact rather than a comment.",
+      "catches": [],
+      "bytes": 43,
+      "exit_status": 1,
+      "stream": "stderr"
     },
     {
       "name": "am_broadcast_missing_receiver",
@@ -53,6 +63,42 @@
       "bytes": 1790
     },
     {
+      "name": "dumpsys_activity_anr",
+      "file": "dumpsys_activity_anr.txt",
+      "command": "adb shell dumpsys activity anr",
+      "description": "There is no `anr` subcommand of `dumpsys activity`. ActivityManager answers 'Unknown command: anr' / 'Bad activity command, or no activities match: anr' / 'Use -h for help.' -- and **exits 0**, which is the part that matters (see exit_status in this entry). anr_watcher._pull_dumpsys_anr guarded on `returncode != 0`, so the guard never fired; it then fed these three usage lines to a logcat-line parser, which matched none of them. The 'historical ANR pull' the docstring advertised has always been three lines of help text going into a parser that discards them.",
+      "catches": [
+        "T5"
+      ],
+      "bytes": 88,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "dumpsys_input_method_shown",
+      "file": "dumpsys_input_method_shown.txt",
+      "command": "adb shell dumpsys input_method",
+      "description": "IME visibility flags, filtered out of `dumpsys input_method` to the lines matching mInputShown|mIsInputViewShown|mImeWindowVis. Measured on API 33 and API 35: `mInputShown` and `mIsInputViewShown` both exist; **`mImeWindowVis` does not appear on either**, so code keying on it reads nothing. Note the second key shares its line with `mStatusIcon`, so a parser splitting the line on whitespace gets two fields, not one. The full dump is 7000+ lines and names the user's IME, keyboard app and open windows, so it is filtered BEFORE anything is written -- package redaction does not catch free text.",
+      "catches": [
+        "C8"
+      ],
+      "bytes": 130,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "pidof_not_running",
+      "file": "pidof_not_running.txt",
+      "command": "adb shell pidof com.example.definitely.not.installed",
+      "description": "`pidof` for a package that is not running: **no output at all**, on either stream, and exit status 1. The file is deliberately zero bytes -- that emptiness IS the recording, and the exit_status field in this entry is what distinguishes it from a capture that failed. Any caller that decides liveness by parsing stdout sees the same empty string it would get from a device that is not responding at all; only the exit status separates the two.",
+      "catches": [
+        "D4"
+      ],
+      "bytes": 0,
+      "exit_status": 1,
+      "stream": "empty"
+    },
+    {
       "name": "resolve_activity_launcher",
       "file": "resolve_activity_launcher.txt",
       "command": "adb shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.android.settings",
@@ -63,12 +109,37 @@
       "bytes": 106
     },
     {
+      "name": "wm_density_override",
+      "file": "wm_density_override.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` with an override active \u2014 emits BOTH 'Physical density:' and 'Override density:'. Needed for a correct px->dp conversion. The override is 480 because it has to differ from the PHYSICAL density of every profile this is recorded on: it used to be 560, which is exactly the Pixel 4 XL's physical density, so the same capture on that device produced Physical 560 / Override 560 and could not show which of the two lines a parser had read.",
+      "catches": [
+        "S7",
+        "S9"
+      ],
+      "bytes": 44,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "wm_density_physical",
       "file": "wm_density_physical.txt",
       "command": "adb shell wm density",
       "description": "`wm density` with no override set \u2014 only a 'Physical density:' line.",
       "catches": [],
       "bytes": 22
+    },
+    {
+      "name": "wm_size_override",
+      "file": "wm_size_override.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` with an override active \u2014 emits BOTH 'Physical size:' and 'Override size:'. device_utils matches only Physical, so every tap coordinate is wrong by the ratio while an override is set.",
+      "catches": [
+        "S9"
+      ],
+      "bytes": 50,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "wm_size_physical",
