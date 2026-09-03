@@ -206,18 +206,33 @@ def test_capture_gives_up_with_an_actionable_error(fake_dump):
 
 
 def test_element_to_dict_matches_the_documented_contract():
-    """CLAUDE.md: {"tag", "attributes": {...}, "children": [...]}, all strings."""
-    root = ET.fromstring(
-        '<hierarchy rotation="0"><node class="android.widget.Button" text="Go" '
-        'clickable="true" bounds="[0,0][10,10]"><node class="X" text="child"/></node></hierarchy>'
-    )
+    """CLAUDE.md: {"tag", "attributes": {...}, "children": [...]}, all strings.
+
+    Read off a recorded dump rather than a two-node sample: the contract is
+    about what a real screen converts to, and the recorded EditText carries its
+    caption in a child, which is the nesting the shape has to survive.
+    """
+    root = ET.fromstring(_recorded("uiautomator_compose_default"))
     converted = hierarchy.element_to_dict(root)
 
     assert set(converted) == {"tag", "attributes", "children"}
-    button = converted["children"][0]
-    assert button["attributes"]["class"] == "android.widget.Button"
-    assert button["attributes"]["clickable"] == "true", "attribute values stay strings"
-    assert button["children"][0]["attributes"]["text"] == "child"
+    assert converted["tag"] == "hierarchy"
+
+    def _walk(node):
+        yield node
+        for child in node["children"]:
+            yield from _walk(child)
+
+    nodes = list(_walk(converted))
+    assert all(set(n) == {"tag", "attributes", "children"} for n in nodes)
+    assert all(
+        isinstance(value, str) for n in nodes for value in n["attributes"].values()
+    ), "attribute values must stay strings"
+
+    field = next(n for n in nodes if n["attributes"].get("class", "").endswith(".EditText"))
+    assert field["attributes"]["clickable"] == "true"
+    captions = [c["attributes"].get("text") for c in field["children"]]
+    assert "Email address" in captions, captions
 
 
 def test_dict_and_element_capture_describe_the_same_tree(fake_dump):

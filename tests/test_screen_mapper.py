@@ -19,6 +19,21 @@ pulled file, which is why these tests once patched ``ET.parse``.
 screen_mapper reaches adb only through ``adb_exec.run_adb`` now, so the fake
 goes there; patching ``screen_mapper.subprocess`` would stop intercepting and
 let these tests dump a real device's screen.
+
+**Every hierarchy here is a recorded one** (T2). It used to be four
+hand-written ``<hierarchy>`` blocks, and `analyze_tree` matched neither of the
+fixture policy's name rules, so the file testing "see the screen" was outside
+the policy entirely. The dumps used, and why:
+
+- ``uiautomator_compose_default`` — a Compose screen with no
+  testTagsAsResourceId: one EditText, one CheckBox, five nodes bucketed as
+  Control and no ``android.widget.Button`` at all.
+- ``uiautomator_dialer_keypad`` — an AOSP-widget screen that does have Buttons
+  (three of them), which is what the preview-truncation deltas need.
+
+Where a scenario appears in no recording (a ``password="true"`` field; a
+zero-area node), the test derives it by editing ONE attribute of a recorded
+dump with ElementTree, and says so. The base is always ground truth.
 """
 
 from __future__ import annotations
@@ -46,112 +61,95 @@ def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
     return result
 
 
-# A hierarchy with one plain EditText and one password EditText so the secure
-# count is independently observable from the total EditText count.
-HIERARCHY_WITH_SECURE = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
-<hierarchy rotation="0">
-  <node index="0" class="android.widget.FrameLayout" enabled="true" bounds="[0,0][1080,2400]">
-    <node index="0" text="" resource-id="com.example.app:id/email"
-          class="android.widget.EditText" content-desc="" clickable="true"
-          enabled="true" focusable="true" password="false" bounds="[40,360][1040,460]" />
-    <node index="1" text="" resource-id="com.example.app:id/password"
-          class="android.widget.EditText" content-desc="" clickable="true"
-          enabled="true" focusable="true" password="true" bounds="[40,520][1040,620]" />
-    <node index="2" text="Log In" resource-id="com.example.app:id/login_button"
-          class="android.widget.Button" content-desc="Log in" clickable="true"
-          enabled="true" bounds="[40,680][1040,800]" />
-  </node>
-</hierarchy>"""
-
-
 def _analyze(xml: str) -> dict:
     mapper = ScreenMapper()
     return mapper.analyze_tree(ET.fromstring(xml))
 
 
-def _buttons_hierarchy(count: int) -> str:
-    nodes = "".join(
-        f'<node index="{i}" text="Btn{i}" class="android.widget.Button" '
-        f'content-desc="" clickable="true" enabled="true" '
-        f'bounds="[0,{i},10][10,{i}]" />'
-        for i in range(count)
-    )
-    return (
-        '<hierarchy rotation="0">'
-        '<node index="0" class="android.widget.FrameLayout" enabled="true" '
-        f'bounds="[0,0][1080,2400]">{nodes}</node>'
-        "</hierarchy>"
-    )
+def _compose_with_a_password_field(recorded) -> str:
+    """The recorded Compose screen with its EditText marked ``password="true"``.
+
+    No recorded dump has a password field -- the fixture app has no password
+    input -- and the attribute is what the delta reads, so it is the one thing
+    substituted. Everything else (the unmerged semantics tree, the empty
+    resource-ids, the label living in a child TextView) is as the device
+    dumped it.
+    """
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    fields = [n for n in root.iter("node") if n.get("class", "").endswith(".EditText")]
+    assert len(fields) == 1, f"fixture no longer has exactly one EditText: {len(fields)}"
+    fields[0].set("password", "true")
+    return ET.tostring(root, encoding="unicode")
 
 
 # --- Delta 2: secure/password field tracking -------------------------------
 
 
-def test_secure_field_counted_separately():
-    analysis = _analyze(HIERARCHY_WITH_SECURE)
-    # Two EditTexts total, exactly one of them secure.
-    assert len(analysis["edit_texts"]) == 2
+def test_secure_field_counted_separately(recorded):
+    analysis = _analyze(_compose_with_a_password_field(recorded))
+
+    assert len(analysis["edit_texts"]) == 1
     assert analysis["secure_fields"] == 1
     secure = [et for et in analysis["edit_texts"] if et["secure"]]
     assert len(secure) == 1
-    assert secure[0]["label"] == "com.example.app:id/password"
+    # Compose emits no resource-id, so the label is recovered from the field's
+    # own subtree -- the caption TextView sitting inside it.
+    assert secure[0]["label"] == "Email address"
 
 
-def test_no_secure_fields_when_none_marked():
-    xml = """<hierarchy rotation="0">
-      <node index="0" class="android.widget.FrameLayout" enabled="true" bounds="[0,0][1,1]">
-        <node index="0" class="android.widget.EditText" enabled="true"
-              clickable="true" focusable="true" bounds="[0,0][1,1]" />
-      </node>
-    </hierarchy>"""
-    analysis = _analyze(xml)
+def test_no_secure_fields_when_none_marked(recorded):
+    """The same screen unmodified: the field is there, the secure count is not."""
+    analysis = _analyze(recorded.text("uiautomator_compose_default"))
+    assert analysis["edit_texts"], "fixture no longer has a field to count"
     assert analysis["secure_fields"] == 0
     assert all(not et["secure"] for et in analysis["edit_texts"])
 
 
-def test_summary_reports_secure_count():
-    analysis = _analyze(HIERARCHY_WITH_SECURE)
+def test_summary_reports_secure_count(recorded):
+    analysis = _analyze(_compose_with_a_password_field(recorded))
     summary = ScreenMapper().format_summary(analysis)
-    assert "EditTexts: 2 (0 filled) [1 secure]" in summary
+    assert "EditTexts: 1 (0 filled) [1 secure]" in summary
 
 
-def test_summary_omits_secure_marker_when_zero():
-    xml = """<hierarchy rotation="0">
-      <node index="0" class="android.widget.FrameLayout" enabled="true" bounds="[0,0][1,1]">
-        <node index="0" class="android.widget.EditText" enabled="true"
-              clickable="true" focusable="true" bounds="[0,0][1,1]" />
-      </node>
-    </hierarchy>"""
-    summary = ScreenMapper().format_summary(_analyze(xml))
+def test_summary_omits_secure_marker_when_zero(recorded):
+    summary = ScreenMapper().format_summary(_analyze(recorded.text("uiautomator_compose_default")))
     assert "secure" not in summary
 
 
 # --- Delta 1: env-configurable preview limits ------------------------------
+#
+# The dialer keypad, because it is the recorded screen that HAS buttons:
+# "More options", "backspace" and "Call", in that order. The Compose screen has
+# none at all -- its clickable nodes report android.view.View -- which is C4's
+# whole point and why the truncation deltas cannot be shown there.
 
 
-def test_buttons_preview_limit_truncates(monkeypatch):
-    monkeypatch.setattr(screen_mapper, "BUTTONS_PREVIEW", 3)
-    analysis = _analyze(_buttons_hierarchy(5))
+def test_buttons_preview_limit_truncates(monkeypatch, recorded):
+    monkeypatch.setattr(screen_mapper, "BUTTONS_PREVIEW", 2)
+    analysis = _analyze(recorded.text("uiautomator_dialer_keypad"))
+    assert len(analysis["buttons"]) == 3, f"fixture changed: {analysis['buttons']}"
+
     summary = ScreenMapper().format_summary(analysis)
-    # 5 buttons total, preview capped at 3 -> truncation marker with total.
-    assert '"Btn0", "Btn1", "Btn2"' in summary
-    assert "(5 total)" in summary
-    assert "Btn3" not in summary
+    assert '"More options", "backspace"' in summary
+    assert "(3 total)" in summary
+    assert "Call" not in summary
 
 
-def test_buttons_preview_no_truncation_under_limit(monkeypatch):
+def test_buttons_preview_no_truncation_under_limit(monkeypatch, recorded):
     monkeypatch.setattr(screen_mapper, "BUTTONS_PREVIEW", 15)
-    analysis = _analyze(_buttons_hierarchy(2))
+    analysis = _analyze(recorded.text("uiautomator_dialer_keypad"))
     summary = ScreenMapper().format_summary(analysis)
     assert "total)" not in summary
-    assert '"Btn0", "Btn1"' in summary
+    assert '"More options", "backspace", "Call"' in summary
 
 
-def test_section_items_preview_limit_truncates_verbose(monkeypatch):
+def test_section_items_preview_limit_truncates_verbose(monkeypatch, recorded):
     monkeypatch.setattr(screen_mapper, "SECTION_ITEMS_PREVIEW", 2)
-    analysis = _analyze(_buttons_hierarchy(5))
+    analysis = _analyze(recorded.text("uiautomator_compose_default"))
+    # 13 TextViews on this screen, previewed at 2.
+    assert len(analysis["elements_by_type"]["TextView"]) == 13
     summary = ScreenMapper().format_summary(analysis, verbose=True)
-    assert "... and 3 more" in summary
+    assert "... and 11 more" in summary
 
 
 def test_env_int_overrides_at_import(monkeypatch):
@@ -190,13 +188,19 @@ def _patch_adb(monkeypatch, result_for=None):
     return calls, budgets
 
 
-def _dump_result(_cmd):
+def _dump_result_for(xml: str):
     """Serve the hierarchy on stdout, the way `exec-out` delivers it."""
-    return _fake_result(stdout=HIERARCHY_WITH_SECURE)
+
+    def _serve(_cmd):
+        return _fake_result(stdout=xml)
+
+    return _serve
 
 
-def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch):
-    calls, budgets = _patch_adb(monkeypatch, result_for=_dump_result)
+def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch, recorded):
+    calls, budgets = _patch_adb(
+        monkeypatch, result_for=_dump_result_for(_compose_with_a_password_field(recorded))
+    )
 
     root = ScreenMapper(serial="emulator-5554").get_ui_hierarchy()
     analysis = ScreenMapper().analyze_tree(root)
@@ -256,8 +260,11 @@ def test_main_json_error_payload_is_preserved_and_exits_non_zero(monkeypatch, ca
     assert "error" in payload, "the JSON error contract changed"
 
 
-def test_main_exits_zero_when_the_screen_is_read(monkeypatch, capsys):
-    _patch_adb(monkeypatch, result_for=_dump_result)
+def test_main_exits_zero_when_the_screen_is_read(monkeypatch, capsys, recorded):
+    _patch_adb(
+        monkeypatch,
+        result_for=_dump_result_for(recorded.text("uiautomator_compose_default")),
+    )
     monkeypatch.setattr(screen_mapper, "resolve_device_identifier", lambda arg: arg)
     monkeypatch.setattr(
         screen_mapper.sys, "argv", ["screen_mapper.py", "--serial", "emulator-5554"]

@@ -187,15 +187,26 @@ def test_control_labels_are_recovered_from_the_tree(expected: str):
 
 
 def test_bounds_are_required_so_zero_size_nodes_are_not_offered():
-    """A zero-area node cannot be tapped, whatever its flags say."""
+    """A zero-area node cannot be tapped, whatever its flags say.
+
+    No recorded dump has one -- uiautomator reports no visibility attribute, so
+    a collapsed control is exactly what cannot be captured on demand. The
+    scenario is therefore the recorded Compose screen with the CheckBox's
+    `bounds` collapsed and nothing else touched: one fewer interactive element,
+    and it is the checkbox that goes.
+    """
     from screen_mapper import ScreenMapper
 
-    zero = ET.fromstring(
-        '<hierarchy><node class="android.view.View" clickable="true" enabled="true" '
-        'text="" content-desc="" resource-id="" bounds="[0,0][0,0]" /></hierarchy>'
-    )
-    analysis = ScreenMapper().analyze_tree(zero)
-    assert analysis["interactive_elements"] == 0
+    root = _root("uiautomator_compose_default")
+    before = ScreenMapper().analyze_tree(root)
+    assert "CheckBox" in before["elements_by_type"]
+
+    checkbox = next(n for n in root.iter("node") if n.get("class", "").endswith(".CheckBox"))
+    checkbox.set("bounds", "[0,0][0,0]")
+
+    after = ScreenMapper().analyze_tree(root)
+    assert after["interactive_elements"] == before["interactive_elements"] - 1
+    assert "CheckBox" not in after["elements_by_type"]
 
 
 # ---------------------------------------------------------------------------

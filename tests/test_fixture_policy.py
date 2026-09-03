@@ -117,6 +117,15 @@ RECORDED_SOURCES = frozenset({"recorded", "recorded_anywhere", "recorded_gradle"
 #     database carries android_metadata and sqlite_sequence, so a table count
 #     taken from a hand-written schema is short by two.
 #
+#   test_screen_mapper.py, test_accessibility_audit.py, test_hierarchy.py,
+#     test_compose_visibility.py — paid off when parser detection stopped
+#     depending on the function's NAME (T2). `analyze_tree` and `_audit_node`
+#     contain neither "parse" nor "scan_", so the two files testing "see the
+#     screen" were outside the policy: four hand-written `<hierarchy>` blocks
+#     in one, and a single fifteen-line imagined dump in the other, which was
+#     shaped to make the checks it was written beside pass. Recording it found
+#     L3 (see the xfail in test_accessibility_audit.py).
+#
 # STILL OUTSTANDING — one line each, and what would retire it:
 KNOWN_VIOLATIONS = frozenset(
     {
@@ -141,28 +150,82 @@ KNOWN_VIOLATIONS = frozenset(
         # No AVD `config.ini` is recorded. Same PR should capture one; until
         # then the hand-written key/value block stands.
         "test_emulator_selector.py::parse_config_ini",
-        # Hand-written `<hierarchy>` XML fed to screen_mapper through a mocked
-        # dump. T2 repoints this file at the recorded uiautomator dumps and
-        # deletes this entry.
-        "test_screen_mapper.py::_fake_result",
     }
 )
 
 # `_build_parser` is argparse, not a tool-output parser.
 NOT_A_TOOL_PARSER = {"_build_parser"}
 
+# Annotations that say "this takes a uiautomator hierarchy".
+HIERARCHY_ANNOTATIONS = frozenset({"Element", "ElementTree"})
+
+# The key `get_ui_hierarchy()` nests every UI field under (see CLAUDE.md's
+# hierarchy contract). A function reading it consumes a dumped screen, whatever
+# it is called.
+HIERARCHY_ATTRS_KEY = "attributes"
+
+
+def _takes_a_hierarchy(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether any parameter is annotated as an XML element."""
+    args = func.args
+    for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+        if arg is None or arg.annotation is None:
+            continue
+        for sub in ast.walk(arg.annotation):
+            if isinstance(sub, ast.Name) and sub.id in HIERARCHY_ANNOTATIONS:
+                return True
+            if isinstance(sub, ast.Attribute) and sub.attr in HIERARCHY_ANNOTATIONS:
+                return True
+    return False
+
+
+def _reads_hierarchy_nodes(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether the body reads ``node["attributes"]`` / ``node.get("attributes")``."""
+    for sub in ast.walk(func):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "get"
+            and sub.args
+            and isinstance(sub.args[0], ast.Constant)
+            and sub.args[0].value == HIERARCHY_ATTRS_KEY
+        ):
+            return True
+        if (
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.slice, ast.Constant)
+            and sub.slice.value == HIERARCHY_ATTRS_KEY
+        ):
+            return True
+    return False
+
 
 def _parser_names() -> set[str]:
-    """Functions in the skill that turn tool output into data."""
+    """Functions in the skill that turn tool output into data.
+
+    Naming alone missed the two that matter most (T2). `screen_mapper`'s
+    `analyze_tree` and `accessibility_audit`'s `_audit_node` are the whole of
+    "see the screen", and neither contains "parse" nor starts with "scan_", so
+    the files testing them were outside the policy and both fed the audit a
+    hand-written 15-line dump nobody recorded. Detection is therefore
+    structural as well: a function that takes an ``ET.Element``, or that reads
+    the ``attributes`` key `get_ui_hierarchy()` nests UI fields under, is a
+    parser regardless of what it is called.
+    """
     names: set[str] = set()
     for path in SCRIPTS.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             if node.name in NOT_A_TOOL_PARSER:
                 continue
-            if "parse" in node.name or node.name.startswith("scan_"):
+            if (
+                "parse" in node.name
+                or node.name.startswith("scan_")
+                or _takes_a_hierarchy(node)
+                or _reads_hierarchy_nodes(node)
+            ):
                 names.add(node.name)
     return names
 
@@ -348,6 +411,72 @@ def test_the_debt_list_does_not_rot():
         f"anything. Delete them from KNOWN_VIOLATIONS -- leaving them there "
         f"re-opens the door they were holding."
     )
+
+
+def test_the_two_hierarchy_parsers_are_in_policy():
+    """T2, named rather than implied.
+
+    `screen_mapper.analyze_tree` and `accessibility_audit._audit_node` are the
+    whole of "see the screen", and matched neither name rule, so the files
+    testing them were outside the ratchet. Naming them here means the coverage
+    cannot regress silently when the detection rules are next edited.
+    """
+    parsers = _parser_names()
+    for name in ("analyze_tree", "_audit_node"):
+        assert name in parsers, (
+            f"{name} is not detected as a parser, so the tests feeding it "
+            f"hierarchies are outside the fixture policy again"
+        )
+
+
+def test_a_function_taking_an_element_is_a_parser():
+    """Structural rule 1: the annotation says it consumes a dumped screen."""
+    tree = ast.parse(
+        "def render(root: ET.Element) -> dict:\n"
+        "    return {}\n"
+        "def render_maybe(node: Element | None):\n"
+        "    return None\n"
+    )
+    found = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and _takes_a_hierarchy(node)
+    }
+    assert found == {"render", "render_maybe"}
+
+
+def test_a_function_reading_the_attributes_key_is_a_parser():
+    """Structural rule 2: `_audit_node` is annotated `dict`, not `ET.Element`.
+
+    What identifies it is the hierarchy contract it reads -- every UI field
+    nested under ``node["attributes"]`` -- so that is what the rule looks for.
+    """
+    tree = ast.parse(
+        "def audit(node: dict):\n"
+        '    attrs = node.get("attributes", {})\n'
+        "    return attrs\n"
+        "def subscripted(node):\n"
+        '    return node["attributes"]\n'
+        "def unrelated(node):\n"
+        '    return node.get("children", [])\n'
+    )
+    found = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and _reads_hierarchy_nodes(node)
+    }
+    assert found == {"audit", "subscripted"}
+
+
+def test_a_hand_written_hierarchy_fed_to_a_hierarchy_parser_is_caught():
+    """The T2 violation itself, end to end."""
+    found = _scan_source(
+        'HIERARCHY = "<hierarchy rotation=\\"0\\"><node index=\\"0\\" '
+        'class=\\"android.widget.EditText\\" password=\\"true\\" /></hierarchy>"\n'
+        "analyze_tree(ET.fromstring(HIERARCHY))\n",
+        _parser_names(),
+    )
+    assert found == {"analyze_tree"}
 
 
 def test_the_detector_actually_detects():
