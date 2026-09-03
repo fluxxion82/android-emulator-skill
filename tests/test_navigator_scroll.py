@@ -43,6 +43,7 @@ the tests can assert on the argv that *would* have been sent.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -128,6 +129,22 @@ def _bounds_string(xml: str, text: str) -> str:
     raise AssertionError(f"{text!r} is not in this recorded screen")
 
 
+def _rect(bounds: str) -> tuple[int, int, int, int]:
+    """``"[l,t][r,b]"`` as four ints, parsed here rather than imported."""
+    left, top, right, bottom = (int(part) for part in re.findall(r"-?\d+", bounds))
+    return left, top, right, bottom
+
+
+def _encloses(outer: tuple[int, int, int, int], inner: tuple[int, int, int, int]) -> bool:
+    """Whether ``outer`` covers every pixel of ``inner``."""
+    return (
+        outer[0] <= inner[0]
+        and outer[1] <= inner[1]
+        and outer[2] >= inner[2]
+        and outer[3] >= inner[3]
+    )
+
+
 def _stub_resolve(monkeypatch, serial: str = "emulator-5554") -> None:
     monkeypatch.setattr(navigator, "resolve_device_identifier", lambda arg: serial)
 
@@ -185,7 +202,10 @@ def test_visible_element_is_found_without_scrolling(monkeypatch, recorded):
     result = nav.find_element_scrolling(text=VISIBLE)
 
     assert result.element is not None
-    assert result.element.text == VISIBLE
+    # The row, not the caption inside it: a name resolves to the control that
+    # answers to it, which is what makes the tap land on something (C1).
+    assert VISIBLE in result.element.label
+    assert result.element.interactive, f"{result.element.description} cannot be operated"
     assert result.scrolls == 0
     assert result.screens_searched == 1
     assert not _swipes(commands), "scrolled for an element that was already on screen"
@@ -214,8 +234,14 @@ def test_found_element_carries_coordinates_from_the_final_screen(monkeypatch, re
 
     result = nav.find_element_scrolling(text=TARGET)
 
-    x1, y1, x2, y2 = result.element.bounds
-    assert f"[{x1},{y1}][{x2},{y2}]" == _bounds_string(recorded.text(SCROLLED), TARGET)
+    # The caption sits inside the row the search resolves to, so the row's
+    # rectangle must enclose the caption's -- as the caption stands in the FINAL
+    # dump, which is the whole point of the test.
+    caption = _rect(_bounds_string(recorded.text(SCROLLED), TARGET))
+    assert _encloses(result.element.bounds, caption), (
+        f"the element's bounds {result.element.bounds} do not cover the caption "
+        f"{caption} as the last screen reported it"
+    )
 
 
 def test_scroll_search_drives_the_content_down_not_the_finger(monkeypatch, recorded):
@@ -401,7 +427,9 @@ def test_cli_scroll_search_finds_below_the_fold(monkeypatch, recorded, capsys):
     assert exc.value.code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["success"] is True
-    assert payload["element"]["label"] == TARGET
+    # The row is reported under the caption it recovered, which begins with the
+    # searched-for title and continues with the row's summary line.
+    assert TARGET in payload["element"]["label"]
     assert payload["search"]["scrolls"] == 2
     assert payload["search"]["screens_searched"] == 3
 
@@ -507,7 +535,10 @@ def test_cli_find_id_also_scrolls(monkeypatch, recorded):
     result = nav.find_element_scrolling(resource_id="title", text=TARGET)
 
     assert result.element is not None
-    assert result.element.resource_id == "title"
+    # Resource ids are carried and reported in full, as `screen_mapper` prints
+    # them, so that one name serves both scripts; `--find-id` still matches on
+    # any part of it.
+    assert result.element.resource_id == "android:id/title"
 
 
 # ---------------------------------------------------------------------------

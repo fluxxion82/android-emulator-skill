@@ -77,12 +77,11 @@ Technical Details:
 
 import argparse
 import json as json_lib
-import re
 import sys
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Sibling script, resolved the same way build_and_test.py imports gradle: the
 # scripts directory is on sys.path whether navigator is run directly or
@@ -101,7 +100,7 @@ from common.device_utils import (
     resolve_device_identifier,
 )
 from common.env_config import env_float, env_int
-from common.hierarchy import HierarchyError, capture_hierarchy
+from common.hierarchy import HierarchyError, capture_hierarchy, is_interactive, parse_bounds
 
 # Tunable defaults (overridable via ANDROID_EMU_* env vars; see SKILL.md).
 MAX_ELEMENTS_LISTED = env_int("ANDROID_EMU_MAX_ELEMENTS", 25)
@@ -111,6 +110,28 @@ TAP_SETTLE_SECONDS = env_float("ANDROID_EMU_TAP_SETTLE_MS", 500.0) / 1000.0
 # than one that gives up with a count, so this is a hard bound even when the
 # screen keeps changing (an infinite list does exactly that).
 MAX_SCROLLS = env_int("ANDROID_EMU_MAX_SCROLLS", 10, min_value=1)
+
+# Hard ceiling on --max-scrolls, whatever the caller asks for. Each scroll costs
+# a swipe, a settle and a hierarchy dump -- roughly a second and a half on the
+# recorded emulator -- so a four-digit budget is not a longer search, it is a
+# hang with a plausible explanation (C15).
+MAX_SCROLLS_CEILING = 50
+
+# Refusal for an element whose bounds uiautomator did not report in a form this
+# skill can read. Naming the element and the remedy matters more than usual
+# here: the alternative this replaces was a silent tap at (0, 0), which looks
+# like success and lands on whatever occupies the corner.
+_NO_BOUNDS_MESSAGE = (
+    "Cannot act: element has no usable bounds -- {description} reported none this skill "
+    "could parse. Re-read the screen with screen_mapper.py, or target the control "
+    "directly with --tap-at x,y."
+)
+
+# Wall-clock budget for one --scroll-to-find, across every scroll it makes.
+# The scroll count alone does not bound the time: a dump on a busy screen
+# retries for up to ANDROID_EMU_UI_DUMP_TIMEOUT (60s) each, so ten scrolls can
+# take ten minutes and the agent has no way to tell that from a hang.
+SCROLL_SEARCH_DEADLINE_SECONDS = env_float("ANDROID_EMU_SCROLL_SEARCH_DEADLINE", 120.0)
 
 # Pause between the scroll swipe and the next hierarchy dump. A fling keeps
 # moving after the finger lifts; uiautomator then either refuses to dump
@@ -127,7 +148,11 @@ class Element:
     text: str | None
     content_desc: str | None
     resource_id: str | None
-    bounds: tuple  # (x1, y1, x2, y2)
+    # (x1, y1, x2, y2), or None when uiautomator reported no parseable bounds.
+    # None means "where this is, is unknown" and every action refuses it; the
+    # previous `(0, 0, 0, 0)` fallback meant "the top-left corner", which is a
+    # real pixel and was duly tapped (C5).
+    bounds: tuple[int, int, int, int] | None
     clickable: bool
     enabled: bool
     # Compose drives Checkbox, Switch and list rows through these rather than
@@ -137,37 +162,79 @@ class Element:
     long_clickable: bool = False
     scrollable: bool = False
     # A caption borrowed from the subtree or a row-adjacent sibling, for a
-    # control that carries none of its own (every interactive Compose node).
+    # control that carries no name of its own (every interactive Compose node).
     # Deliberately NOT folded into `content_desc`: a container row would then
     # match a --find-text for the text of its own child and be returned instead
     # of it, moving the tap from the label to the whole row.
     recovered_label: str | None = None
+    # The raw uiautomator attributes this element was built from, so that
+    # `interactive` can be answered by the one shared rule rather than by a
+    # second local copy of it (C7). Synthesised from the typed fields when an
+    # Element is constructed directly.
+    attributes: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+    # The node and its parent, kept so a match on a caption can be resolved to
+    # the control that caption names (C1). Never serialised.
+    node: ET.Element | None = field(default=None, repr=False, compare=False)
+    parent: ET.Element | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Back-fill `attributes` for an Element built from typed fields alone."""
+        if self.attributes:
+            return
+        self.attributes = {
+            "enabled": "true" if self.enabled else "false",
+            "clickable": "true" if self.clickable else "false",
+            "checkable": "true" if self.checkable else "false",
+            "long-clickable": "true" if self.long_clickable else "false",
+            "scrollable": "true" if self.scrollable else "false",
+        }
+        if self.bounds is not None:
+            left, top, right, bottom = self.bounds
+            self.attributes["bounds"] = f"[{left},{top}][{right},{bottom}]"
 
     @property
-    def center(self) -> tuple:
-        """Calculate center point for tapping."""
+    def center(self) -> tuple[int, int] | None:
+        """Centre point for tapping, or None when the bounds are unknown."""
+        if self.bounds is None:
+            return None
         x1, y1, x2, y2 = self.bounds
-        x = (x1 + x2) // 2
-        y = (y1 + y2) // 2
-        return (x, y)
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
 
     @property
     def interactive(self) -> bool:
         """Whether this element can be operated at all.
 
-        Any of the four interaction attributes, matching
-        `screen_mapper.INTERACTIVE_ATTRIBUTES`. Both files decide the same
-        question and must not answer it differently.
+        Answered by :func:`common.hierarchy.is_interactive`, which is also what
+        `screen_mapper` and `accessibility_audit` ask. Three files deciding the
+        same question three ways is how navigator came to list a control that
+        the screen report had already ruled out, and vice versa (C7).
         """
-        return self.enabled and (
-            self.clickable or self.checkable or self.long_clickable or self.scrollable
-        )
+        return is_interactive(self.attributes)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The human-readable names this element answers to.
+
+        Its own ``text`` and ``content-desc``, plus the caption recovered from
+        its subtree or its row -- which is what ``--list`` and `screen_mapper`
+        print for a control with no text of its own, and therefore what an agent
+        has to hand to ``--find-text`` (C1). A resource id is deliberately not
+        here: ids are matched in full (see :meth:`Navigator._matches_text`),
+        because ``com.android.settings:id/...`` makes a fuzzy search for
+        "settings" match every node on the screen.
+        """
+        return tuple(name for name in (self.text, self.content_desc, self.recovered_label) if name)
 
     @property
     def label(self) -> str:
-        """Get best label for this element."""
+        """Get best label for this element.
+
+        Same precedence as `screen_mapper`'s, deliberately: the two scripts
+        print one name for one control, so a name the screen report showed is a
+        name ``--find-text`` accepts.
+        """
         return (
-            self.text or self.content_desc or self.recovered_label or self.resource_id or "Unnamed"
+            self.text or self.content_desc or self.resource_id or self.recovered_label or "Unnamed"
         )
 
     @property
@@ -200,6 +267,8 @@ class ScrollSearch:
             at its end. Measured on Settings/API 35: from the end of the list,
             successive dumps across a swipe are byte-identical.
         hit_limit: The scroll budget was exhausted while still moving.
+        hit_deadline: The wall-clock budget ran out. Distinct from hit_limit:
+            the scrolls were not used up, the time was.
         failure: Message from a scroll gesture that failed, else None.
     """
 
@@ -209,6 +278,7 @@ class ScrollSearch:
     scrollable: bool
     stopped_unchanged: bool = False
     hit_limit: bool = False
+    hit_deadline: bool = False
     failure: str | None = None
 
     @property
@@ -228,6 +298,12 @@ class ScrollSearch:
             return (
                 f"searched {screens}, scrolled to the end: the screen stopped "
                 f"changing after {scrolls}"
+            )
+        if self.hit_deadline:
+            return (
+                f"searched {screens}, then ran out of time after "
+                f"{SCROLL_SEARCH_DEADLINE_SECONDS:.0f}s; raise "
+                f"ANDROID_EMU_SCROLL_SEARCH_DEADLINE to look longer"
             )
         if self.hit_limit:
             return (
@@ -287,22 +363,6 @@ class Navigator:
         self._tree_cache = capture_hierarchy(self.serial)
         return self._tree_cache
 
-    def _parse_bounds(self, bounds_str: str) -> tuple:
-        """
-        Parse bounds string to coordinates.
-
-        Args:
-            bounds_str: Bounds string like "[0,0][1080,1920]"
-
-        Returns:
-            Tuple of (x1, y1, x2, y2)
-        """
-        # Format: [x1,y1][x2,y2]
-        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
-        if match:
-            return tuple(int(x) for x in match.groups())
-        return (0, 0, 0, 0)
-
     def _flatten_tree(
         self,
         node: ET.Element,
@@ -312,9 +372,17 @@ class Navigator:
         """
         Flatten UI hierarchy into list of elements.
 
+        The ``<hierarchy>`` root is walked but never emitted: it carries no
+        ``class``, no bounds and no label, yet it satisfied every criterion an
+        empty search applies, so it was `matches[0]` for a bare ``--tap`` and
+        the tap went to (0, 0) (C2). `screen_mapper` has always gated on the
+        same attribute.
+
         Args:
             node: Current XML element
             elements: List to accumulate elements
+            parent: The node's parent, needed to recover a caption from a
+                row-adjacent sibling and to resolve a caption to its control.
 
         Returns:
             List of Element objects
@@ -322,49 +390,44 @@ class Navigator:
         if elements is None:
             elements = []
 
-        # Get element attributes
         elem_class = node.get("class", "")
-        text = node.get("text", "")
-        content_desc = node.get("content-desc", "")
-        resource_id = node.get("resource-id", "")
-        bounds_str = node.get("bounds", "[0,0][0,0]")
-        clickable = node.get("clickable", "false") == "true"
-        enabled = node.get("enabled", "true") == "true"
-        checkable = node.get("checkable", "false") == "true"
-        long_clickable = node.get("long-clickable", "false") == "true"
-        scrollable = node.get("scrollable", "false") == "true"
+        if elem_class:
+            text = node.get("text", "")
+            content_desc = node.get("content-desc", "")
+            resource_id = node.get("resource-id", "")
 
-        # Extract simple class name
-        simple_class = elem_class.split(".")[-1] if elem_class else "Unknown"
+            # Compose controls carry no name of their own, so borrow the caption
+            # that describes them -- from the subtree for a Button or Card, from
+            # a row-adjacent sibling for a Checkbox or Switch.
+            #
+            # Gated exactly as `screen_mapper` gates it: only for a control, and
+            # only when it has no name of its own. Both halves matter. A caption
+            # recovered for a passive container is the concatenation of every
+            # caption below it, so the root FrameLayout would answer to "Submit
+            # Order" -- and, being first in document order, would take the tap
+            # to the middle of the screen.
+            recovered_label = None
+            if not (text or content_desc or resource_id) and is_interactive(node):
+                recovered_label = self._labeller._recover_label(node, parent) or None
 
-        # Parse bounds
-        bounds = self._parse_bounds(bounds_str)
-
-        # Compose controls carry no text of their own, so borrow the caption
-        # that describes them -- from the subtree for a Button or Card, from a
-        # row-adjacent sibling for a Checkbox or Switch. Without this, `--list`
-        # answers "Unnamed" for every control and an agent has nothing to pick.
-        recovered_label = None
-        if not (text or content_desc):
-            recovered_label = self._labeller._recover_label(node, parent) or None
-
-        # Create element
-        element = Element(
-            type=simple_class,
-            text=text if text else None,
-            content_desc=content_desc if content_desc else None,
-            resource_id=(
-                resource_id.split("/")[-1] if resource_id else None
-            ),  # Extract ID from full path
-            bounds=bounds,
-            clickable=clickable,
-            enabled=enabled,
-            checkable=checkable,
-            long_clickable=long_clickable,
-            scrollable=scrollable,
-            recovered_label=recovered_label,
-        )
-        elements.append(element)
+            elements.append(
+                Element(
+                    type=elem_class.split(".")[-1],
+                    text=text or None,
+                    content_desc=content_desc or None,
+                    resource_id=resource_id or None,
+                    bounds=parse_bounds(node.get("bounds")),
+                    clickable=node.get("clickable", "false") == "true",
+                    enabled=node.get("enabled", "true") == "true",
+                    checkable=node.get("checkable", "false") == "true",
+                    long_clickable=node.get("long-clickable", "false") == "true",
+                    scrollable=node.get("scrollable", "false") == "true",
+                    recovered_label=recovered_label,
+                    attributes=dict(node.attrib),
+                    node=node,
+                    parent=parent,
+                )
+            )
 
         # Recurse to children
         for child in node:
@@ -429,8 +492,11 @@ class Navigator:
             Element if found, None otherwise.
         """
         elements = self._flatten_tree(root)
+        by_node = {id(element.node): element for element in elements}
+        parent_of = {id(child): node for node in root.iter() for child in node}
 
-        matches = []
+        matches: list[Element] = []
+        seen: set[int] = set()
 
         for elem in elements:
             # Skip disabled elements
@@ -446,20 +512,123 @@ class Navigator:
                 if not elem.resource_id or resource_id not in elem.resource_id:
                     continue
 
-            # Check text (in text or content_desc)
-            if text:
-                elem_text = (elem.text or "") + " " + (elem.content_desc or "")
-                if fuzzy:
-                    if text.lower() not in elem_text.lower():
-                        continue
-                elif text not in (elem.text, elem.content_desc):
-                    continue
+            # Check text (own text, content-desc, recovered caption, or a
+            # resource id given in full).
+            if text and not self._matches_text(elem, text, fuzzy):
+                continue
 
-            matches.append(elem)
+            # A caption is not a control. Hand back the thing the caption names
+            # so that `center` -- and therefore the tap -- belongs to the
+            # control and not to the label beside it (C1).
+            #
+            # Only for a search by name alone. `--find-id` and `--find-type`
+            # point at a node, and the control that owns it carries neither that
+            # id nor that class, so resolving there would answer with something
+            # that does not satisfy the criterion the caller gave.
+            resolved = elem
+            if text and not (element_type or resource_id) and not elem.interactive:
+                resolved = self._owning_control(elem, by_node, parent_of, text, fuzzy) or elem
+
+            if id(resolved.node) in seen:
+                continue
+            seen.add(id(resolved.node))
+            matches.append(resolved)
 
         if matches and index < len(matches):
             return matches[index]
 
+        return None
+
+    def _matches_text(self, elem: Element, text: str, fuzzy: bool) -> bool:
+        """Whether ``elem`` answers to ``text``.
+
+        The names are the ones the agent was shown -- ``--list`` and
+        `screen_mapper` print :attr:`Element.label`, and a control with no text
+        of its own is printed under its recovered caption -- so every printed
+        name is findable. That is the whole of C1: the caption was printed and
+        then not searchable, which left two of the seven labels on a Compose
+        screen answering "Not found".
+
+        A resource id matches only in full (as ``pkg:id/name`` or as ``name``),
+        never as a substring: ids embed the package, so a fuzzy search for
+        "settings" would otherwise match every node in the Settings app.
+        """
+        if fuzzy:
+            lowered = text.lower()
+            if any(lowered in name.lower() for name in elem.names):
+                return True
+        elif text in elem.names:
+            return True
+
+        if elem.resource_id:
+            return text in (elem.resource_id, elem.resource_id.rsplit("/", maxsplit=1)[-1])
+        return False
+
+    def _owning_control(
+        self,
+        caption: Element,
+        by_node: dict[int, Element],
+        parent_of: dict[int, ET.Element],
+        text: str,
+        fuzzy: bool,
+    ) -> Element | None:
+        """The control a caption describes, or None when the caption stands alone.
+
+        Two placements, both measured on recorded dumps:
+
+        - **An ancestor.** A Compose Button's "Submit Order" and a Settings
+          row's "Battery 100%" sit *inside* the control, so the nearest
+          interactive ancestor owns them.
+        - **A row-adjacent sibling.** A Compose Checkbox's "Remember me" and a
+          Switch's "Dark theme" are siblings of the control, not ancestors of
+          it -- so a "nearest interactive ancestor" rule alone taps the caption
+          and misses the Checkbox by 143px, which is exactly what v0.6.0 did.
+          The row is established by overlapping vertical bounds, not by
+          parentage.
+
+        In both cases the candidate must answer to the same name. Without that
+        proviso a tap on a passive label resolves to whatever scrollable
+        container happens to enclose it, which moves the tap to the middle of
+        the screen -- a worse answer than tapping the label.
+        """
+
+        def owns(candidate: Element | None) -> bool:
+            return (
+                candidate is not None
+                and candidate.interactive
+                and self._matches_text(candidate, text, fuzzy)
+            )
+
+        ancestor = parent_of.get(id(caption.node))
+        while ancestor is not None:
+            owner = by_node.get(id(ancestor))
+            if owner is not None and owner.interactive:
+                return owner if owns(owner) else None
+            ancestor = parent_of.get(id(ancestor))
+
+        parent = caption.parent
+        if parent is None or caption.bounds is None:
+            return None
+        siblings = list(parent)
+        position = next(
+            (index for index, node in enumerate(siblings) if node is caption.node), None
+        )
+        if position is None:
+            return None
+
+        _, caption_top, _, caption_bottom = caption.bounds
+        for offset in (1, -1):
+            neighbour = position + offset
+            if not 0 <= neighbour < len(siblings):
+                continue
+            candidate = by_node.get(id(siblings[neighbour]))
+            if candidate is None or candidate.bounds is None:
+                continue
+            # Same row: the vertical spans must overlap.
+            if not (caption_top < candidate.bounds[3] and candidate.bounds[1] < caption_bottom):
+                continue
+            if owns(candidate):
+                return candidate
         return None
 
     @staticmethod
@@ -530,11 +699,18 @@ class Navigator:
         costs exactly one hierarchy dump and no gesture. Only when that misses
         does anything move.
 
-        The search is bounded twice over. ``max_scrolls`` is the hard ceiling,
-        and it stops earlier when a scroll leaves the screen unchanged -- the
-        end of a list. Without that second bound the loop would keep swiping at
-        a list that is already at its end, reporting a confident "searched 10
-        screens" after searching one screen ten times.
+        The search is bounded three times over. ``max_scrolls`` is the hard
+        ceiling on gestures, and it stops earlier when a scroll leaves the
+        screen unchanged -- the end of a list. Without that second bound the
+        loop would keep swiping at a list that is already at its end, reporting
+        a confident "searched 10 screens" after searching one screen ten times.
+
+        The third bound is wall-clock: ``ANDROID_EMU_SCROLL_SEARCH_DEADLINE``
+        (default 120s). A scroll count is not a time bound, because each dump
+        retries for up to ``ANDROID_EMU_UI_DUMP_TIMEOUT`` on a screen that will
+        not settle -- which is precisely the screen a scroll search creates. The
+        deadline is checked before each scroll, so the search never starts work
+        it has no time to finish (C15).
 
         Args:
             text: Text to search in text/content-desc.
@@ -580,8 +756,16 @@ class Navigator:
 
         signature = self._screen_signature(root)
         scrolls = 0
+        deadline = time.monotonic() + SCROLL_SEARCH_DEADLINE_SECONDS
 
         for _ in range(max_scrolls):
+            if SCROLL_SEARCH_DEADLINE_SECONDS > 0 and time.monotonic() >= deadline:
+                note(
+                    f"the {SCROLL_SEARCH_DEADLINE_SECONDS:.0f}s search deadline passed after "
+                    f"{scrolls} scrolls; stopping"
+                )
+                return ScrollSearch(None, screens, scrolls, True, hit_deadline=True)
+
             success, message = self.gestures().scroll(direction)
             if not success:
                 note(f"scroll failed: {message}")
@@ -619,7 +803,10 @@ class Navigator:
         Returns:
             (success, message) tuple
         """
-        x, y = element.center
+        centre = element.center
+        if centre is None:
+            return False, _NO_BOUNDS_MESSAGE.format(description=element.description)
+        x, y = centre
         success, message = self.tap_at(x, y)
         if success:
             return True, f"Tapped: {element.description} at ({x}, {y})"
@@ -713,6 +900,31 @@ class Navigator:
         return elements
 
 
+def _scroll_budget(value: str) -> int:
+    """Validate ``--max-scrolls``: a positive integer, bounded above.
+
+    Both ends are usage errors rather than surprises. A budget of zero would
+    report "stopped at the 0-scroll limit" from a search that never scrolled;
+    a budget of 500 is not a longer search but a twenty-minute one, and the
+    agent that typed it has no way to see the difference from a hang (C15).
+    """
+    try:
+        budget = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a whole number of scrolls") from None
+    if budget < 1:
+        raise argparse.ArgumentTypeError(
+            "must be at least 1; omit --scroll-to-find to search only the visible screen"
+        )
+    if budget > MAX_SCROLLS_CEILING:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {MAX_SCROLLS_CEILING}; a search that needs more scrolls than "
+            f"that is looking for something the screen does not have -- narrow it with "
+            f"--find-id or --find-type instead"
+        )
+    return budget
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Android semantic element navigation",
@@ -750,8 +962,13 @@ Examples:
 Environment overrides:
   ANDROID_EMU_TAP_SETTLE_MS     Settle delay after each tap, ms (default: 500)
   ANDROID_EMU_MAX_ELEMENTS      Max elements shown by --list (default: 25)
-  ANDROID_EMU_MAX_SCROLLS       Default --max-scrolls (default: 10)
+  ANDROID_EMU_MAX_SCROLLS       Default --max-scrolls (default: 10, max: 50)
   ANDROID_EMU_SCROLL_SETTLE_MS  Settle delay after each scroll, ms (default: 600)
+  ANDROID_EMU_SCROLL_SEARCH_DEADLINE
+                                Wall-clock budget for one --scroll-to-find,
+                                seconds (default: 120). Bounds the whole search,
+                                which --max-scrolls alone does not: a dump on an
+                                unsettled screen can take a minute by itself.
         """,
     )
 
@@ -785,9 +1002,12 @@ Environment overrides:
     )
     parser.add_argument(
         "--max-scrolls",
-        type=int,
+        type=_scroll_budget,
         default=MAX_SCROLLS,
-        help=f"Scroll budget for --scroll-to-find (default: {MAX_SCROLLS})",
+        help=(
+            f"Scroll budget for --scroll-to-find "
+            f"(default: {MAX_SCROLLS}, maximum: {MAX_SCROLLS_CEILING})"
+        ),
     )
     parser.add_argument("--tap", action="store_true", help="Tap the found element")
     parser.add_argument("--enter-text", help="Enter text into found element")
@@ -803,11 +1023,23 @@ Environment overrides:
 
     args = parser.parse_args()
 
-    if args.max_scrolls < 1:
-        # A budget of zero would report "stopped at the 0-scroll limit" from a
-        # search that never scrolled, which is a worse answer than a usage
-        # error. Omit --scroll-to-find to search only the visible screen.
-        parser.error("--max-scrolls must be at least 1")
+    # An action needs a target (C2).
+    #
+    # Without this, `--tap` with no criterion matched every enabled node, and
+    # the first of those was the `<hierarchy>` root: `input tap 0 0` was issued,
+    # the exit status was 0, and the message named a real on-screen element that
+    # had never been touched. That is the worst available answer, because it is
+    # indistinguishable from success. Refused here, before anything reaches the
+    # device.
+    if (args.tap or args.enter_text) and not any(
+        (args.find_text, args.find_exact, args.find_type, args.find_id, args.tap_at)
+    ):
+        action = "--tap" if args.tap else "--enter-text"
+        parser.error(
+            f"{action} needs a target: name one with --find-text, --find-exact, --find-type "
+            f"or --find-id, or give coordinates with --tap-at x,y. Run --list (or "
+            f"screen_mapper.py) to see what is on the screen."
+        )
 
     # Resolve device
     try:
@@ -866,8 +1098,9 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
         else:
             print(f"Interactive elements ({total}):")
             for i, elem in enumerate(shown):
-                x, y = elem.center
-                line = f"  {i}. {elem.description} at ({x}, {y})"
+                centre = elem.center
+                where = f"({centre[0]}, {centre[1]})" if centre else "(bounds not reported)"
+                line = f"  {i}. {elem.description} at {where}"
                 if args.verbose:
                     line += f" bounds={elem.bounds}"
                 print(line)
@@ -913,7 +1146,10 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
             fuzzy=fuzzy,
             direction=args.scroll_direction,
             max_scrolls=args.max_scrolls,
-            progress=(lambda line: print(f"  {line}", file=sys.stderr)) if args.verbose else None,
+            # Always reported, not only under --verbose: a scroll search can
+            # take a minute or more, and a silent minute is indistinguishable
+            # from a hang. It goes to stderr, so nothing parsing stdout sees it.
+            progress=lambda line: print(f"  {line}", file=sys.stderr),
         )
     else:
         element = navigator.find_element(
@@ -966,6 +1202,11 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
         success, message = navigator.tap(element)
     elif args.enter_text:
         success, message = navigator.enter_text(element, args.enter_text)
+    elif element.center is None:
+        # Reporting a match this skill cannot point at is still an answer, but
+        # it is not a successful one: the agent's next step would be a tap.
+        success = False
+        message = _NO_BOUNDS_MESSAGE.format(description=element.description)
     else:
         # Just found the element, report it
         x, y = element.center
@@ -1013,6 +1254,7 @@ def _search_json(search: ScrollSearch) -> dict:
         "screen_scrollable": search.scrollable,
         "stopped_unchanged": search.stopped_unchanged,
         "hit_scroll_limit": search.hit_limit,
+        "hit_search_deadline": search.hit_deadline,
         "scroll_failure": search.failure,
         "detail": search.detail,
     }

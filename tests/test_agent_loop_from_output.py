@@ -37,9 +37,10 @@ touches no device. The emulator lane repeats the same walk live. Collection
 parses no XML and runs no production code -- the case list is static, and the
 fixture proves it right from inside the harness.
 
-Red cases are pinned ``xfail(strict=True)`` against C1, C2 and C4. ``strict``
-means fixing one turns its case red until the marker is deleted in the same
-commit -- the defect register stays executable rather than aspirational.
+The C1, C2 and C4 cases were pinned ``xfail(strict=True)`` when this module was
+written and are unmarked now: Inc 1 fixed all three, and ``strict`` is what made
+the fix delete the markers rather than leave them claiming a defect that was
+gone. The measurements they carried are kept as a comment below.
 """
 
 from __future__ import annotations
@@ -130,69 +131,31 @@ SCREEN_CONTROLS = {COMPOSE: COMPOSE_CONTROLS, SETTINGS: SETTINGS_CONTROLS}
 
 
 # ---------------------------------------------------------------------------
-# The defect register.
+# The defect register: empty, and here is what was in it.
 # ---------------------------------------------------------------------------
 #
-# Names above that `navigator --find-text <name> --tap` does not land on today.
-# Measured by driving both CLIs against the recorded dumps, not predicted:
+# Inc 1 closed C1, C2 and C4, so no case above is pinned any more and the
+# parametrisations below carry no marks. What the register recorded, measured by
+# driving both CLIs against these recorded dumps before the fix:
 #
-#   Tap issued but outside the control
+#   C1 -- tap issued but outside the control
 #     "Remember me"  -> (302, 816), the caption TextView; the CheckBox is
-#                       [33,754][159,880], so the tap misses it by 143px.
+#                       [33,754][159,880], so the tap missed it by 143px.
 #     "Dark theme"   -> (282, 953); the Switch is [32,890][169,1016].
 #     "Company logo" -> (221, 1090); the icon button is [33,1028][159,1154].
-#   Nothing found at all (exit 1, no argv issued)
+#   C1 -- nothing found at all (exit 1, no argv issued)
 #     both Compose recovered captions, all seven Settings row captions, and the
 #     three Settings resource-id captions -- none of which exists as any single
 #     node's `text` or `content-desc`.
+#   C4 -- the default report named no control on either screen: the Compose
+#     report was three lines (a header, an EditText count, a focusable count)
+#     and the Settings report two.
+#   C2 -- `--tap` with no criterion matched the `<hierarchy>` root and issued
+#     `input tap 0 0` with exit status 0.
 #
-# C1 is why: `_find_in` (navigator.py:449) matches `text + content_desc` only,
-# so `recovered_label` -- the caption `--list` and the mapper both print
-# (navigator.py:343) -- is not searchable, and a match on the caption returns
-# the caption's own non-interactive node instead of the control it describes.
-C1_RED = frozenset(
-    {
-        (COMPOSE, "Order #4821 2 items Ships tomorrow"),
-        (COMPOSE, "Dark theme"),
-        (COMPOSE, "Company logo"),
-        (COMPOSE, "List item 0 List item 1 List item 2"),
-        (COMPOSE, "Remember me"),
-        (SETTINGS, "com.android.settings:id/settings_homepage_container"),
-        (SETTINGS, "com.android.settings:id/search_action_bar"),
-        (SETTINGS, "com.android.settings:id/main_content_scrollable_container"),
-        (SETTINGS, "Network & internet Mobile, Wi‑Fi, hotspot"),
-        (SETTINGS, "Connected devices Bluetooth, pairing"),
-        (SETTINGS, "Apps Assistant, recent apps, default apps"),
-        (SETTINGS, "Notifications Notification history, conversations"),
-        (SETTINGS, "Battery 100%"),
-        (SETTINGS, "Storage 86% used - 1.08 GB free"),
-        (SETTINGS, "Sound & vibration Volume, haptics, Do Not Disturb"),
-    }
-)
-
-# Screens whose DEFAULT (non-verbose, non-JSON) report names no control at all.
-# Both of them, measured: the Compose report is three lines -- a header, an
-# EditText count and a focusable count -- and the Settings report two. The names
-# exist; they are reachable only under `--verbose` or `--json`, neither of which
-# Quick Start step 2 tells the agent to pass.
-C4_RED = frozenset(SCREENS)
-
-C1_REASON = (
-    "C1: navigator._find_in matches text + content_desc only, so a label the "
-    "screen report printed is either unfindable or resolves to the caption "
-    "node instead of the control it names (navigator.py:343,449)"
-)
-C2_REASON = (
-    "C2: --tap/--enter-text with no --find-*/--tap-at matches every enabled "
-    "node, so matches[0] is the <hierarchy> root at (0,0,0,0); `input tap 0 0` "
-    "is issued, the exit status is 0 and the message names a real element "
-    "(navigator.py:431,896)"
-)
-C4_REASON = (
-    "C4: the default screen report names no interactive control -- they land in "
-    "the `Control` bucket, printed only under --verbose or --json, while Quick "
-    "Start step 2 runs screen_mapper with neither"
-)
+# `_find_in` now matches `recovered_label` and resolves a caption to the control
+# that owns it; the default report names every interactive bucket; and an action
+# with no criterion is a usage error before anything reaches the device.
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +433,6 @@ def _c1_params() -> list:
             screen_name,
             label,
             rect,
-            marks=(
-                [pytest.mark.xfail(strict=True, reason=C1_REASON)]
-                if (screen_name, label) in C1_RED
-                else []
-            ),
             id=f"{_screen_id(screen_name)}-{_slug(label)}",
         )
         for screen_name in SCREENS
@@ -483,16 +441,7 @@ def _c1_params() -> list:
 
 
 def _c4_params() -> list:
-    return [
-        pytest.param(
-            screen_name,
-            marks=(
-                [pytest.mark.xfail(strict=True, reason=C4_REASON)] if screen_name in C4_RED else []
-            ),
-            id=_screen_id(screen_name),
-        )
-        for screen_name in SCREENS
-    ]
+    return [pytest.param(screen_name, id=_screen_id(screen_name)) for screen_name in SCREENS]
 
 
 _SCREEN_IDS = [_screen_id(name) for name in SCREENS]
@@ -576,7 +525,6 @@ def test_a_reported_name_taps_the_control_it_names(
 
 @pytest.mark.parametrize("screen_name", SCREENS, ids=_SCREEN_IDS)
 @pytest.mark.parametrize("action", [["--tap"], ["--enter-text", "x"]], ids=["tap", "enter-text"])
-@pytest.mark.xfail(strict=True, reason=C2_REASON)
 def test_an_action_with_no_criterion_is_refused(recorded, monkeypatch, screen_name, action):
     """Acting on nothing must fail, and must not touch the screen on its way.
 
@@ -608,11 +556,16 @@ def test_the_case_inventory_matches_the_recorded_screen(recorded, monkeypatch, s
     """The static case list is exactly what the recorded screen produces.
 
     This is what lets the cases above be literals. Both halves are checked:
-    the names, against ``screen_mapper --json`` driven through the harness; and
-    the rectangles, re-derived from the recorded hierarchy. A re-recorded
-    fixture that moves a control, or a mapper that starts reporting a different
-    set, fails here rather than quietly making every case above assert against
-    a stale rectangle.
+    the names, read off the DEFAULT text report -- the one Quick Start step 2
+    tells the agent to run, with no ``--json`` and no ``--verbose`` -- and the
+    rectangles, re-derived from the recorded hierarchy. A re-recorded fixture
+    that moves a control, or a mapper that starts reporting a different set,
+    fails here rather than quietly making every case above assert against a
+    stale rectangle.
+
+    The seed is the default report and not ``--json`` deliberately: JSON always
+    exposed the ``Control`` names, so seeding from it is how a loop test passes
+    with C4 unfixed while the agent following the documented path sees nothing.
     """
     inventory = SCREEN_CONTROLS[screen_name]
     assert (
@@ -620,13 +573,13 @@ def test_the_case_inventory_matches_the_recorded_screen(recorded, monkeypatch, s
     ), f"{screen_name} has only {len(inventory)} cases; the loop tests would be near-vacuous"
 
     screen = ET.fromstring(recorded.text(screen_name))
-    payload = json.loads(
-        _run_cli(screen_mapper, ["screen_mapper.py", "--json"], screen, monkeypatch).stdout
-    )
+    report = _run_cli(screen_mapper, ["screen_mapper.py"], screen, monkeypatch)
+    assert report.status == 0, f"screen_mapper failed: {report.stderr.strip()}"
 
-    assert _interactive_labels(payload) == [label for label, _ in inventory], (
-        f"the names screen_mapper reports for {screen_name} are no longer the "
-        f"names this module has cases for. Update the inventory deliberately."
+    assert _names_printed(report.stdout) == [label for label, _ in inventory], (
+        f"the names screen_mapper prints for {screen_name} are no longer the "
+        f"names this module has cases for. Update the inventory deliberately.\n"
+        f"{report.stdout.strip()}"
     )
 
     drifted = {
@@ -637,22 +590,6 @@ def test_the_case_inventory_matches_the_recorded_screen(recorded, monkeypatch, s
     assert not drifted, (
         f"inventory rectangles disagree with the recorded hierarchy "
         f"(name: inventory vs hierarchy): {drifted}"
-    )
-
-
-def test_the_red_register_names_only_cases_that_exist():
-    """A stale xfail entry hides a defect that was already fixed.
-
-    Same shape as ``test_fixture_policy.test_the_debt_list_does_not_rot``: the
-    frozen set is the copy that fails when it is wrong.
-    """
-    known = {
-        (screen_name, label) for screen_name in SCREENS for label, _ in SCREEN_CONTROLS[screen_name]
-    }
-    stale = C1_RED - known
-    assert not stale, (
-        f"{sorted(stale)} are pinned as C1 failures but are no longer names any "
-        f"screen report produces. Delete them, or update the inventory."
     )
 
 

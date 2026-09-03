@@ -31,7 +31,6 @@ Tunables (env, ANDROID_EMU_ prefix):
 
 import argparse
 import json
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +38,7 @@ from pathlib import Path
 from common.adb_exec import AdbError
 from common.device_utils import get_device_density, get_ui_hierarchy
 from common.env_config import env_int
+from common.hierarchy import is_interactive, parse_bounds
 
 # Tunable thresholds (overridable via env, ANDROID_EMU_ prefix).
 A11Y_MAX_NESTING = env_int("ANDROID_EMU_A11Y_MAX_NESTING", 5)
@@ -68,11 +68,16 @@ _SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
 
 def _parse_bounds(bounds_str: str) -> dict:
-    """Parse a uiautomator bounds string '[l,t][r,b]' into a dict of ints."""
-    match = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", bounds_str or "")
-    if not match:
+    """Parse a uiautomator bounds string '[l,t][r,b]' into a dict of ints.
+
+    The grammar itself lives in :func:`common.hierarchy.parse_bounds` -- there
+    were three of them in this skill and they did not agree (C5/C7). This keeps
+    the dict shape the report's ``element`` payload has always carried.
+    """
+    box = parse_bounds(bounds_str)
+    if box is None:
         return {}
-    left, top, right, bottom = (int(g) for g in match.groups())
+    left, top, right, bottom = box
     return {"left": left, "top": top, "right": right, "bottom": bottom}
 
 
@@ -149,6 +154,28 @@ class AccessibilityAuditor:
             yield child
             yield from AccessibilityAuditor._descendants(child)
 
+    @staticmethod
+    def _own_label(node: dict) -> str:
+        """The text this node carries in its own right."""
+        attributes = node.get("attributes", {})
+        return (attributes.get("text") or "").strip() or (
+            attributes.get("content-desc") or ""
+        ).strip()
+
+    @classmethod
+    def _has_label(cls, node: dict) -> bool:
+        """Whether anything names this control -- its own text, or its subtree's.
+
+        A screen reader announces a node from its own ``text``/``contentDescription``
+        or from those of the nodes it contains. A caption that merely sits
+        *beside* the control is not in either place, which is why a sibling does
+        not count here even though `screen_mapper` uses one to name the control
+        for a sighted agent: that caption is exactly the accessibility defect.
+        """
+        return bool(cls._own_label(node)) or any(
+            cls._own_label(child) for child in cls._descendants(node)
+        )
+
     def audit_tree(self, hierarchy: dict) -> list:
         """Run every check over an already-fetched hierarchy.
 
@@ -223,25 +250,33 @@ class AccessibilityAuditor:
         content_desc = attrs.get("content-desc", "")
         resource_id = attrs.get("resource-id", "")
 
-        # Check 1: Interactive elements need content description
-        if clickable and enabled and not content_desc and not text:
-            # Buttons, ImageButtons, etc. need descriptions
-            if any(
-                widget in class_name.lower() for widget in ["button", "imagebutton", "imageview"]
-            ):
-                self.issues.append(
-                    {
-                        "type": "missing_content_description",
-                        "severity": "critical",
-                        "message": f"Interactive {class_name} missing content description",
-                        "fix": _fix_for("missing_content_description"),
-                        "element": {
-                            "class": class_name,
-                            "resource_id": resource_id,
-                            "bounds": bounds,
-                        },
-                    }
-                )
+        # Check 1: a control a screen reader cannot announce.
+        #
+        # Eligibility is `hierarchy.is_interactive` and the label test is "is
+        # there any describing text in this node or below it" -- not a class
+        # name. The class-name gate ("button", "imagebutton", "imageview") could
+        # not fire on a Compose screen at all: Compose renders its controls as
+        # `android.view.View`, so the check that Quick Start step 5 exists to
+        # run reported zero criticals on every Compose app ever audited (L3).
+        # It also missed a clickable `LinearLayout` row, which is how most
+        # View-based lists are built.
+        if is_interactive(node) and not self._has_label(node):
+            self.issues.append(
+                {
+                    "type": "missing_content_description",
+                    "severity": "critical",
+                    "message": (
+                        f"Interactive {class_name or 'element'} has no label: nothing in its "
+                        f"own text, content-desc or subtree names it"
+                    ),
+                    "fix": _fix_for("missing_content_description"),
+                    "element": {
+                        "class": class_name,
+                        "resource_id": resource_id,
+                        "bounds": bounds,
+                    },
+                }
+            )
 
         # Check 2: Touch target size. Bounds are pixels; the minimum is dp.
         if clickable and enabled and bounds:
@@ -290,28 +325,22 @@ class AccessibilityAuditor:
         # attribute -- verified across every recorded dump -- so the condition
         # collapsed to "this field is empty" and flagged every correctly-hinted
         # empty field. A field's label is discoverable, just not there: Compose
-        # puts a TextField's label in its subtree, and View layouts often place
-        # it in an adjacent node. Only flag a field with no describing text
-        # anywhere beneath it.
-        if "edittext" in class_name.lower():
-            described_by_child = any(
-                (child.get("attributes", {}).get("text") or "").strip()
-                or (child.get("attributes", {}).get("content-desc") or "").strip()
-                for child in self._descendants(node)
+        # puts a TextField's label in its subtree. Only flag a field with no
+        # describing text in it or beneath it -- the same label test check 1
+        # applies, so the two cannot drift into disagreeing about "labelled".
+        if "edittext" in class_name.lower() and not self._has_label(node):
+            self.issues.append(
+                {
+                    "type": "edittext_missing_hint",
+                    "severity": "warning",
+                    "message": "EditText missing hint text",
+                    "fix": _fix_for("edittext_missing_hint"),
+                    "element": {
+                        "class": class_name,
+                        "resource_id": resource_id,
+                    },
+                }
             )
-            if not described_by_child and not text and not content_desc:
-                self.issues.append(
-                    {
-                        "type": "edittext_missing_hint",
-                        "severity": "warning",
-                        "message": "EditText missing hint text",
-                        "fix": _fix_for("edittext_missing_hint"),
-                        "element": {
-                            "class": class_name,
-                            "resource_id": resource_id,
-                        },
-                    }
-                )
 
         # Check 5: Text readability
         if text and len(text) > 100:

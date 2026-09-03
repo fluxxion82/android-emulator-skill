@@ -21,12 +21,22 @@ Two things make this module the single implementation:
 The dump also fails transiently while the screen is animating, with
 ``ERROR: could not get idle state``. Every script that reads the screen was
 flaky because of it, so a bounded retry lives here instead of in each caller.
+
+Two questions every consumer of a dump asks -- *where is this node* and *can it
+be operated* -- are answered here too, by :func:`parse_bounds` and
+:func:`is_interactive`. They used to be answered three and two times
+respectively, in navigator, screen_mapper and accessibility_audit, and the
+copies disagreed: two of the three bounds grammars rejected the negative
+coordinate a partially off-screen view reports and silently returned
+``(0, 0, 0, 0)``, which is a tappable point at the top-left corner (C5/C7).
 """
 
 from __future__ import annotations
 
+import re
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 
 from .adb_exec import AdbError, run_adb
 from .env_config import env_int
@@ -53,6 +63,18 @@ _NO_ROOT_ERROR = "null root node"
 
 _TRANSIENT_ERRORS = (_IDLE_ERROR, _NO_ROOT_ERROR)
 
+# `bounds="[left,top][right,bottom]"`. The coordinates are SIGNED: a view scrolled
+# half off the left edge, or one laid out above the status bar, reports a
+# negative left or top. The two grammars this replaces used `\d+`, so they did
+# not match such a node at all and their callers fell back to `(0, 0, 0, 0)` --
+# a rectangle whose centre is a real, tappable pixel (C5).
+_BOUNDS_PATTERN = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+# The four properties by which uiautomator says an element can be operated.
+# `focusable` is deliberately absent: focusable containers are everywhere, and
+# including it reports the whole screen as interactive.
+INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollable")
+
 
 def _is_transient(payload: str) -> bool:
     """Whether a failed dump is worth retrying."""
@@ -66,6 +88,95 @@ class HierarchyError(RuntimeError):
     Subclasses RuntimeError so the CLI boundaries that already catch it keep
     working, as :class:`common.adb_exec.AdbError` does.
     """
+
+
+def parse_bounds(value: str | None) -> tuple[int, int, int, int] | None:
+    """Parse a uiautomator ``bounds`` string into ``(left, top, right, bottom)``.
+
+    The one grammar. Signed, because a partially off-screen view reports a
+    negative coordinate, and returning None rather than a zero rectangle,
+    because ``(0, 0, 0, 0)`` is indistinguishable from a real element in the
+    corner: every caller that treated it as one issued ``input tap 0 0``.
+
+    Args:
+        value: The raw ``bounds`` attribute, e.g. ``"[0,142][1080,2361]"``.
+
+    Returns:
+        The four coordinates, or None when the value is absent or malformed.
+        None means "unknown", and a caller that cannot act without coordinates
+        must refuse rather than substitute any.
+
+    Example:
+        >>> parse_bounds("[-12,50][200,150]")
+        (-12, 50, 200, 150)
+        >>> parse_bounds("not-bounds") is None
+        True
+    """
+    match = _BOUNDS_PATTERN.match(value or "")
+    if match is None:
+        return None
+    left, top, right, bottom = (int(group) for group in match.groups())
+    return (left, top, right, bottom)
+
+
+def node_attributes(node: ET.Element | Mapping) -> Mapping[str, str]:
+    """The raw attribute mapping of a hierarchy node, whatever shape it arrives in.
+
+    Three shapes are in use across the skill and all three reach these
+    predicates: the parsed ``ET.Element`` (navigator, screen_mapper), the
+    documented dict shape ``{"tag", "attributes", "children"}`` that
+    ``get_ui_hierarchy`` returns (accessibility_audit), and a bare attribute
+    mapping. Normalising here is what lets one eligibility rule serve all of
+    them.
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+
+    Returns:
+        The node's attributes, with uiautomator's string values unchanged.
+    """
+    if isinstance(node, ET.Element):
+        return node.attrib
+    if isinstance(node, Mapping):
+        attributes = node.get("attributes")
+        return attributes if isinstance(attributes, Mapping) else node
+    raise TypeError(f"not a hierarchy node: {type(node).__name__}")
+
+
+def is_interactive(node: ET.Element | Mapping) -> bool:
+    """Whether an agent can operate this node.
+
+    The one eligibility rule, and it is decided by PROPERTIES, not class names:
+    Jetpack Compose renders its controls as plain ``android.view.View``, so a
+    whitelist of widget classes matches almost nothing on a Compose screen
+    (defect R11).
+
+    Three conditions, all required:
+
+    - ``enabled`` -- a disabled control does nothing when tapped.
+    - a rectangle that is not collapsed. uiautomator emits no visibility
+      attribute, so a zero or negative area is the only signal that a flagged
+      node cannot be touched; the recorded Settings dump ends with exactly such
+      a row, ``[0,2401][1080,2361]``. A node with no parseable bounds is *not*
+      excluded here -- that is a missing signal, not a collapsed rectangle -- but
+      nothing can be tapped on it either, so acting on it is refused separately.
+    - at least one of :data:`INTERACTIVE_ATTRIBUTES`.
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+
+    Returns:
+        True when the node is a control an agent can act on.
+    """
+    attributes = node_attributes(node)
+    if attributes.get("enabled", "true") != "true":
+        return False
+
+    box = parse_bounds(attributes.get("bounds"))
+    if box is not None and (box[2] <= box[0] or box[3] <= box[1]):
+        return False
+
+    return any(attributes.get(name, "false") == "true" for name in INTERACTIVE_ATTRIBUTES)
 
 
 def _extract_xml(payload: str) -> str | None:
@@ -86,7 +197,6 @@ def capture_hierarchy(
     *,
     timeout: int | None = None,
     retries: int | None = None,
-    display: int | None = None,
 ) -> ET.Element:
     """Capture the current screen's UI hierarchy.
 
@@ -97,8 +207,6 @@ def capture_hierarchy(
         retries: Total attempts, not retries. Defaults to
             ``ANDROID_EMU_UI_DUMP_ATTEMPTS`` (3). A dump fails transiently while
             the screen is animating.
-        display: Display id for a multi-display device. Omitted when None,
-            which targets the default display.
 
     Returns:
         The parsed ``<hierarchy>`` root element.
@@ -115,10 +223,10 @@ def capture_hierarchy(
     attempts = CAPTURE_ATTEMPTS if retries is None else max(1, retries)
     budget = CAPTURE_TIMEOUT if timeout is None else timeout
 
-    args: list[object] = ["uiautomator", "dump"]
-    if display is not None:
-        args.extend(["--display", display])
-    args.append("/dev/tty")
+    # No `--display`: the parameter existed, was never passed by any caller, and
+    # was never recorded against a device, so the one thing nobody could say was
+    # whether it worked (C11). Deleted rather than left as an untested option.
+    args: list[object] = ["uiautomator", "dump", "/dev/tty"]
 
     last_payload = ""
     for attempt in range(attempts):
@@ -193,9 +301,13 @@ def capture_hierarchy_dict(serial: str | None = None, **kwargs) -> dict:
 
 
 __all__ = [
+    "INTERACTIVE_ATTRIBUTES",
     "AdbError",
     "HierarchyError",
     "capture_hierarchy",
     "capture_hierarchy_dict",
     "element_to_dict",
+    "is_interactive",
+    "node_attributes",
+    "parse_bounds",
 ]
