@@ -736,15 +736,31 @@ def parse_focused_activity(dumpsys_output: str) -> str | None:
     return None
 
 
-def get_current_activity(serial: str | None = None) -> str | None:
+def get_current_activity(serial: str | None = None, strict: bool = False) -> str | None:
     """
     Get currently focused activity.
 
+    Two failures look identical in the return value and are not the same
+    thing: "nothing is focused" and "the device could not be asked". By
+    default this collapses both to None, which is what a best-effort caller
+    labelling a recording wants. A caller whose whole answer depends on the
+    lookup -- ``app_launcher.get_state`` reports ``foreground`` -- passes
+    ``strict=True`` and gets the adb failure, with its remedy, instead of a
+    plausible-looking None (C6).
+
+    A dump that simply names no focused window still returns None under
+    ``strict``: that is an answer, not a failure.
+
     Args:
         serial: Device serial (uses default if None)
+        strict: Propagate an adb failure instead of returning None.
 
     Returns:
         Activity name (e.g., "com.example.app/.MainActivity"), or None if not found
+
+    Raises:
+        AdbError: only when ``strict`` is True and adb failed.
+        OSError: only when ``strict`` is True and the binary could not be run.
 
     Example:
         activity = get_current_activity("emulator-5554")
@@ -761,6 +777,8 @@ def get_current_activity(serial: str | None = None) -> str | None:
         return parse_focused_activity(result.stdout)
 
     except (AdbError, OSError):
+        if strict:
+            raise
         return None
 
 

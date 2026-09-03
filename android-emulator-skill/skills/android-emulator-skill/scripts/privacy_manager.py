@@ -40,7 +40,12 @@ import subprocess
 import sys
 from datetime import datetime
 
-from common.device_utils import build_adb_command, parse_package_permissions, permission_state
+from common.device_utils import (
+    build_adb_command,
+    parse_package_permissions,
+    permission_state,
+    quote_for_device_shell,
+)
 from common.env_config import env_int
 
 # Subprocess timeout (seconds) for adb calls. Permission ops are fast; dumpsys
@@ -120,7 +125,14 @@ class PrivacyManager:
                 f"Unknown permission: {permission}. Use --list-permissions to see available.",
             )
 
-        cmd = build_adb_command("shell", self.serial, "pm", "grant", package, full_permission)
+        cmd = build_adb_command(
+            "shell",
+            self.serial,
+            "pm",
+            "grant",
+            quote_for_device_shell(package),
+            quote_for_device_shell(full_permission),
+        )
 
         try:
             subprocess.run(
@@ -156,7 +168,14 @@ class PrivacyManager:
                 f"Unknown permission: {permission}. Use --list-permissions to see available.",
             )
 
-        cmd = build_adb_command("shell", self.serial, "pm", "revoke", package, full_permission)
+        cmd = build_adb_command(
+            "shell",
+            self.serial,
+            "pm",
+            "revoke",
+            quote_for_device_shell(package),
+            quote_for_device_shell(full_permission),
+        )
 
         try:
             subprocess.run(
@@ -196,7 +215,9 @@ class PrivacyManager:
             package does not even request counts as revoked -- with a note,
             because it usually means a typo.
         """
-        cmd = build_adb_command("shell", self.serial, "dumpsys", "package", package)
+        cmd = build_adb_command(
+            "shell", self.serial, "dumpsys", "package", quote_for_device_shell(package)
+        )
         try:
             dump = subprocess.run(
                 cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
@@ -265,7 +286,9 @@ class PrivacyManager:
             ``install`` and ``runtime`` entries with their real ``granted``
             state, plus flattened ``granted`` / ``denied`` name lists.
         """
-        cmd = build_adb_command("shell", self.serial, "dumpsys", "package", package)
+        cmd = build_adb_command(
+            "shell", self.serial, "dumpsys", "package", quote_for_device_shell(package)
+        )
 
         try:
             result = subprocess.run(

@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from common import adb_exec, logcat
-from common.device_utils import get_ui_hierarchy, parse_display_density
+from common.device_utils import get_ui_hierarchy, parse_display_density, quote_for_device_shell
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
 
@@ -120,6 +120,19 @@ class AppStateCapture:
         """
         Capture complete app state.
 
+        A component the caller *asked for* and did not get makes the snapshot a
+        failure (X8): an invalid ``--logs`` window, a log capture that failed
+        on a device that was otherwise answering, a screenshot or a hierarchy
+        dump that raised. All of those used to end up either as
+        ``captured: false`` underneath the words "State captured" and an exit
+        status of 0, or -- for anything that raised -- as a discarded snapshot
+        whose artifacts were already on disk.
+
+        Every component is therefore collected independently and every one of
+        their failures is recorded rather than thrown away. The artifacts that
+        *were* collected are still written and still returned: a partial
+        snapshot is worth keeping, it is just not a success.
+
         Args:
             output_dir: Directory to save artifacts
             include_logs: Include app logs
@@ -128,7 +141,9 @@ class AppStateCapture:
             screenshot_size: Screenshot size (full, half, quarter)
 
         Returns:
-            (success, message, output_path) tuple
+            ``(success, message, output_path, partial)``. ``partial`` is the
+            snapshot summary as far as it got, and lists what failed under
+            ``failures``.
         """
         # Create output directory with timestamp
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -136,10 +151,20 @@ class AppStateCapture:
         snapshot_dir = Path(output_dir) / f"{app_name}-{timestamp}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        artifacts = []
+        # Each component is collected on its own, and what it produced is kept
+        # whether or not the next one works. Wrapping the whole sequence in one
+        # `try` meant a device error during the logs discarded the screenshot
+        # and the hierarchy already written to disk, and reported the snapshot
+        # as though nothing had been captured at all.
+        artifacts: list[str] = []
+        failures: list[str] = []
+        element_count = 0
+        app_info: dict = {}
+        device_info: dict = {}
+        log_stats: dict | None = None
 
+        # 1. Capture screenshot
         try:
-            # 1. Capture screenshot
             screenshot_path = snapshot_dir / "screenshot.png"
             screenshot_result = capture_screenshot(
                 self.serial,
@@ -152,69 +177,102 @@ class AppStateCapture:
             # listed in the manifest.
             if screenshot_result.get("file_path"):
                 artifacts.append("screenshot.png")
+        except Exception as exc:
+            failures.append(f"the screenshot failed ({exc})")
 
-            # 2. Capture UI hierarchy
+        # 2. Capture UI hierarchy
+        try:
             ui_path = snapshot_dir / "ui-hierarchy.json"
             hierarchy = get_ui_hierarchy(self.serial)
             with open(ui_path, "w") as f:
                 json.dump(hierarchy, f, indent=2)
             artifacts.append("ui-hierarchy.json")
             element_count = count_ui_elements(hierarchy)
+        except Exception as exc:
+            failures.append(f"the UI hierarchy failed ({exc})")
 
-            # 3. Capture app info
-            app_info_path = snapshot_dir / "app-info.json"
+        # 3. Capture app info
+        try:
             app_info = self._get_app_info()
+            app_info_path = snapshot_dir / "app-info.json"
             with open(app_info_path, "w") as f:
                 json.dump(app_info, f, indent=2)
             artifacts.append("app-info.json")
+        except Exception as exc:
+            failures.append(f"reading the app info failed ({exc})")
 
-            # 4. Capture device info
+        # 4. Capture device info
+        try:
             device_info = self._get_device_info()
             device_info_path = snapshot_dir / "device-info.json"
             with open(device_info_path, "w") as f:
                 json.dump(device_info, f, indent=2)
             artifacts.append("device-info.json")
+        except Exception as exc:
+            failures.append(f"reading the device info failed ({exc})")
 
-            # 5. Capture logs if requested
-            log_stats = None
-            if include_logs:
-                log_path = snapshot_dir / "app-logs.txt"
+        # 5. Capture logs if requested
+        if include_logs:
+            log_path = snapshot_dir / "app-logs.txt"
+            try:
                 log_stats = self._capture_logs(log_path, log_duration, log_lines)
                 artifacts.append("app-logs.txt")
+            except Exception as exc:
+                # `_capture_logs` re-raises a device error rather than writing
+                # "logs unavailable" into the summary. That is right at the
+                # method level and wrong here: the artifacts collected before
+                # it are on disk and still worth handing over.
+                log_stats = {"captured": False, "error": str(exc)}
+            if not log_stats.get("captured"):
+                reason = log_stats.get("reason") or log_stats.get("error") or "log capture failed"
+                failures.append(f"logs were requested and {reason}")
 
-            # 6. Create summary
-            summary = {
-                "timestamp": timestamp,
-                "package": self.package,
-                "device_serial": self.serial,
-                "artifacts": artifacts,
-                "app_info": app_info,
-                "device_info": device_info,
-                "ui_element_count": element_count,
-            }
-            if log_stats is not None:
-                summary["logs"] = log_stats
+        # 6. Create summary
+        summary = {
+            "timestamp": timestamp,
+            "package": self.package,
+            "device_serial": self.serial,
+            "artifacts": artifacts,
+            "app_info": app_info,
+            "device_info": device_info,
+            "ui_element_count": element_count,
+        }
+        if log_stats is not None:
+            summary["logs"] = log_stats
+        if failures:
+            summary["failures"] = failures
 
+        try:
             summary_path = snapshot_dir / "snapshot-summary.json"
             with open(summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
 
             # 7. Human-readable markdown summary
             self._write_summary_md(snapshot_dir, summary)
+        except OSError as exc:
+            failures.append(f"writing the snapshot manifest failed ({exc})")
 
+        # 8. A component that was requested and did not arrive is a failed
+        #    snapshot, not a footnote inside a successful one.
+        if failures:
             return (
-                True,
-                f"State captured: {snapshot_dir}/",
+                False,
+                (
+                    f"Snapshot incomplete: {'; '.join(failures)}. "
+                    f"What was captured is in {snapshot_dir}/. "
+                    f"Check the device is reachable with `adb devices`; for logs "
+                    f"pass a valid window (e.g. --logs 30s) or --no-logs to skip them."
+                ),
                 str(snapshot_dir),
+                summary,
             )
 
-        except adb_exec.AdbError:
-            # adb never reached a device, so there is no state to capture and
-            # nothing partial worth reporting. main() prints the remedy the
-            # error already names.
-            raise
-        except Exception as e:
-            return False, f"Failed to capture state: {e}", None
+        return (
+            True,
+            f"State captured: {snapshot_dir}/",
+            str(snapshot_dir),
+            summary,
+        )
 
     def _get_app_info(self) -> dict:
         """
@@ -233,7 +291,7 @@ class AppStateCapture:
             self.serial,
             "dumpsys",
             "package",
-            self.package,
+            quote_for_device_shell(self.package),
             "|",
             "grep",
             "versionName",
@@ -245,7 +303,9 @@ class AppStateCapture:
                 break
 
         # Get PID. `pidof` exits non-zero when the app is not running.
-        result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
+        result = adb_exec.run_adb(
+            "shell", self.serial, "pidof", quote_for_device_shell(self.package)
+        )
         info["pid"] = result.stdout.strip() if result.ok else None
 
         # Get current activity
@@ -348,7 +408,9 @@ class AppStateCapture:
 
         # Add package filter if PID available. `pidof` exits non-zero when the
         # app is not running; the snapshot then keeps the unfiltered window.
-        pid_result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
+        pid_result = adb_exec.run_adb(
+            "shell", self.serial, "pidof", quote_for_device_shell(self.package)
+        )
         pid = pid_result.stdout.strip() if pid_result.ok else ""
 
         try:
@@ -428,6 +490,23 @@ class AppStateCapture:
             f.write("- `snapshot-summary.json`\n")
 
 
+def _report_failure(args: argparse.Namespace, message: str, partial: dict) -> None:
+    """Report a failed capture and exit 1, in whichever output mode was asked for.
+
+    Args:
+        args: Parsed CLI arguments; only ``--json`` is consulted.
+        message: What failed, already carrying its remedy.
+        partial: The snapshot summary as far as it got; ``{}`` when nothing was
+            written. Handed over rather than discarded so the agent can still
+            use the artifacts that did arrive.
+    """
+    if args.json:
+        print(json.dumps({"error": message, "partial": partial}, indent=2))
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -488,7 +567,7 @@ Examples:
     # offline, unauthorized) means no command ever ran. Print the remedy the
     # error already carries rather than letting a traceback reach the user.
     try:
-        success, message, snapshot_path = capturer.capture(
+        success, message, snapshot_path, partial = capturer.capture(
             output_dir=args.output,
             include_logs=not args.no_logs,
             log_duration=args.logs,
@@ -496,8 +575,18 @@ Examples:
             screenshot_size=args.screenshot_size,
         )
     except adb_exec.AdbError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        # Defensive: capture() maps every component failure to a partial
+        # result, so nothing inside it is expected to raise this. It goes
+        # through the same reporter anyway -- printing to stderr and leaving
+        # stdout empty under `--json` gave an agent parsing stdout nothing at
+        # all to read.
+        _report_failure(args, str(error), {})
+
+    if not success:
+        # X8: a missing component used to be reported under "State captured"
+        # with exit 0. What WAS captured is still handed over, under `partial`,
+        # so the agent can use the screenshot it did get -- but the run failed.
+        _report_failure(args, message, partial)
 
     if args.json:
         print(
@@ -509,7 +598,7 @@ Examples:
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ itself rather than for a per-module ``subprocess``.
 
 from __future__ import annotations
 
+import json as json_lib
 import subprocess
 import sys
 
@@ -307,3 +308,250 @@ def test_ambiguous_device_tells_the_agent_which_flag_to_pass(monkeypatch, capsys
 
     assert excinfo.value.code == 1
     assert "--serial" in capsys.readouterr().err
+
+
+# --- C6: every mode reports a failure the same way -------------------------
+#
+# Six modes answered `{"success": false, "message": ...}` while --list and
+# --state answered `{"error": ...}`. The runtime sweep cannot see the
+# difference: it breaks adb at the device level, which main() maps before any
+# of these branches decides anything. So the failed *command* is injected here.
+
+
+ACTION_MODES = [
+    ("launch", ["--launch", "com.example.app", "--activity", ".MainActivity"]),
+    ("restart", ["--restart", "com.example.app", "--activity", ".MainActivity"]),
+    ("terminate", ["--terminate", "com.example.app"]),
+    ("install", ["--install", "/tmp/app.apk"]),
+    ("uninstall", ["--uninstall", "com.example.app"]),
+    ("open_url", ["--open-url", "myapp://main"]),
+]
+
+
+@pytest.mark.parametrize(("action", "argv"), ACTION_MODES, ids=[m[0] for m in ACTION_MODES])
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_every_action_mode_reports_a_failed_command_the_same_way(
+    monkeypatch, capsys, action, argv, json_mode
+):
+    """adb ran, the command failed: exit 1, and `{"error": ...}` under --json."""
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_launcher.time, "sleep", _noop_sleep)
+
+    code = _run_cli(monkeypatch, [*argv, *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert code == 1, f"{action} reported success after the command failed"
+    assert "Traceback" not in captured.err
+    if json_mode:
+        payload = json_lib.loads(captured.out)
+        assert set(payload) == {"error"}, f"{action} answered {payload}"
+        assert payload["error"], "the error payload is empty"
+    else:
+        assert captured.out == "", f"{action} printed an answer on failure: {captured.out!r}"
+        assert captured.err.startswith("Error: ")
+
+
+@pytest.mark.parametrize(("action", "argv"), ACTION_MODES, ids=[m[0] for m in ACTION_MODES])
+def test_the_success_shape_of_every_action_mode_is_unchanged(monkeypatch, capsys, action, argv):
+    """The negative control: the JSON a working run prints must not have moved."""
+
+    def fake_run(cmd, **kwargs):
+        return _ok("Success\n")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_launcher.time, "sleep", _noop_sleep)
+
+    code = _run_cli(monkeypatch, [*argv, "--json"])
+    payload = json_lib.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["success"] is True
+    assert payload["action"] == action
+    assert payload["message"]
+
+
+# --- C6: a failed lookup is not an empty answer ----------------------------
+#
+# `--list` used to catch every exception, answer `[]`, print
+# "Installed packages (0):" and exit 0. "Nothing is installed" and "I could
+# not look" are different answers and the agent has no second signal.
+
+
+def _run_cli(monkeypatch, argv: list[str]):
+    """Run main() with argv, returning the SystemExit code."""
+    monkeypatch.setattr(app_launcher, "resolve_device_identifier", lambda value: value)
+    monkeypatch.setattr(sys, "argv", ["app_launcher.py", *argv])
+    with pytest.raises(SystemExit) as excinfo:
+        app_launcher.main()
+    return excinfo.value.code
+
+
+def test_list_packages_raises_rather_than_answering_with_an_empty_list(monkeypatch):
+    """The method-level half of C6: the failure must reach the caller."""
+
+    def boom(_serial):
+        raise app_launcher.adb_exec.DeviceNotFoundError("adb: device 'x' not found")
+
+    monkeypatch.setattr(app_launcher, "list_installed_packages", boom)
+
+    with pytest.raises(app_launcher.adb_exec.DeviceNotFoundError):
+        AppLauncher(serial="emulator-5554").list_packages()
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_list_exits_non_zero_when_the_device_cannot_be_reached(monkeypatch, capsys, json_mode):
+    """Both output modes, because C6 was one contract kept in neither."""
+
+    def boom(_serial):
+        raise app_launcher.adb_exec.DeviceNotFoundError(
+            "device 'no-such-serial-xyz' not found; run `adb devices` to see what is attached"
+        )
+
+    monkeypatch.setattr(app_launcher, "list_installed_packages", boom)
+
+    code = _run_cli(monkeypatch, ["--list", *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert "Installed packages" not in captured.out, "a failed lookup printed an answer"
+    if json_mode:
+        payload = json_lib.loads(captured.out)
+        assert set(payload) == {"error"}, payload
+        assert "adb devices" in payload["error"], "the error does not name its remedy"
+    else:
+        assert "adb devices" in captured.err, "the error does not name its remedy"
+
+
+def test_a_failed_pm_list_is_not_a_traceback(monkeypatch, capsys):
+    """`list_installed_packages` re-raises a non-zero `pm list packages` as a
+    plain RuntimeError, not an AdbError.
+
+    Catching only ``adb_exec.AdbError`` at the CLI boundary was survivable
+    while ``list_packages`` swallowed everything; the moment it stopped, this
+    became the traceback path.
+    """
+
+    def boom(_serial):
+        raise RuntimeError("Failed to list packages: pm exited 1; check the device is unlocked")
+
+    monkeypatch.setattr(app_launcher, "list_installed_packages", boom)
+
+    code = _run_cli(monkeypatch, ["--list"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert captured.err.startswith("Error: ")
+    assert "pm exited 1" in captured.err
+
+
+def test_state_text_mode_does_not_index_an_error_dict(monkeypatch, capsys):
+    """`--state` printed `state['package']` on whatever get_state returned.
+
+    Reported as a failure, that dict has no ``package`` key, so the CLI died
+    with a KeyError traceback. get_state now raises instead of returning one,
+    and this pins the branch that keeps a future failure return off the
+    indexing path.
+    """
+    monkeypatch.setattr(
+        AppLauncher,
+        "get_state",
+        lambda self, package: (False, {"error": "could not read app state; run `adb devices`"}),
+    )
+
+    code = _run_cli(monkeypatch, ["--state", "com.example.app"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert "adb devices" in captured.err
+
+
+def test_state_json_mode_reports_the_error_and_exits_non_zero(monkeypatch, capsys):
+    """The other half: `--state --json` printed the error dict and exited 0."""
+    monkeypatch.setattr(
+        AppLauncher,
+        "get_state",
+        lambda self, package: (False, {"error": "could not read app state; run `adb devices`"}),
+    )
+
+    code = _run_cli(monkeypatch, ["--state", "com.example.app", "--json"])
+    payload = json_lib.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert set(payload) == {"error"}, payload
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_state_fails_when_only_the_activity_lookup_cannot_reach_the_device(
+    monkeypatch, capsys, recorded_anywhere, json_mode
+):
+    """The staged failure: the package and PID probes answer, `dumpsys window` does not.
+
+    `get_current_activity` maps an adb failure to None by default, so
+    `foreground` came back None and `--state` reported success having never
+    learned the answer. get_state now asks in strict mode, so the device error
+    reaches the CLI boundary with its remedy.
+    """
+    not_found = recorded_anywhere("adb_shell_device_not_found")
+
+    def fake_run(cmd, **kwargs):
+        if "dumpsys" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", not_found)
+        if "pidof" in cmd:
+            return _ok("4242\n")
+        return _ok("package:com.example.app\n")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+
+    argv = ["--serial", "no-such-serial-xyz", "--state", "com.example.app"]
+    code = _run_cli(monkeypatch, [*argv, *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    if json_mode:
+        payload = json_lib.loads(captured.out)
+        assert set(payload) == {"error"}, payload
+        assert "no-such-serial-xyz" in payload["error"]
+    else:
+        assert "Foreground" not in captured.out, "reported a foreground it never read"
+        assert "no-such-serial-xyz" in captured.err
+
+
+def test_the_default_activity_lookup_still_tolerates_a_failure(monkeypatch, recorded_anywhere):
+    """The negative control, and the reason strict is a parameter.
+
+    `test_recorder` labels a recording with whatever activity it can see and
+    must not fail the recording over it. Changing the default would have
+    changed that caller silently.
+    """
+    from common import device_utils
+
+    monkeypatch.setattr(
+        app_launcher.adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: subprocess.CompletedProcess(
+            cmd, 1, "", recorded_anywhere("adb_shell_device_not_found")
+        ),
+    )
+
+    assert device_utils.get_current_activity("no-such-serial-xyz") is None
+    with pytest.raises(device_utils.AdbError):
+        device_utils.get_current_activity("no-such-serial-xyz", strict=True)
+
+
+def test_state_still_answers_for_an_uninstalled_package(monkeypatch, capsys):
+    """The negative control: "not installed" is an answer, not a failure."""
+    monkeypatch.setattr(app_launcher, "list_installed_packages", lambda _serial: ["com.other"])
+
+    code = _run_cli(monkeypatch, ["--state", "com.example.app"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "Installed: No" in captured.out
