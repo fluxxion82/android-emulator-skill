@@ -355,8 +355,11 @@ class AppLauncher:
         )
         running = result.ok and result.stdout.strip()
 
-        # Get current activity
-        current_activity = get_current_activity(self.serial)
+        # Get current activity. strict=True because `foreground` is part of
+        # the answer this method returns: the non-strict lookup maps an adb
+        # failure to None, which would be reported as "not in the foreground"
+        # after nothing was asked (C6).
+        current_activity = get_current_activity(self.serial, strict=True)
         is_foreground = current_activity and package_name in current_activity
 
         return True, {
@@ -446,6 +449,32 @@ def _report_failure(args: argparse.Namespace, message: str) -> None:
     sys.exit(1)
 
 
+def _report_action(args: argparse.Namespace, action: str, success: bool, message: str) -> None:
+    """Print the outcome of one lifecycle action and exit.
+
+    The success shape is unchanged (``success`` / ``message`` / ``action``).
+    A failure goes through :func:`_report_failure`, so ``--json`` answers
+    ``{"error": ...}`` on every mode of this script rather than six modes
+    answering ``{"success": false, ...}`` while two answered ``{"error": ...}``
+    -- an agent should not have to know which flag it passed to know where the
+    failure is written.
+
+    Args:
+        args: Parsed CLI arguments; only ``--json`` is consulted.
+        action: The action name reported in the JSON payload.
+        success: Whether the action succeeded.
+        message: The outcome text; on failure it carries the remedy.
+    """
+    if not success:
+        _report_failure(args, message)
+
+    if args.json:
+        print(json_lib.dumps({"success": True, "message": message, "action": action}, indent=2))
+    else:
+        print(message)
+    sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Android app lifecycle management",
@@ -530,75 +559,27 @@ Examples:
     try:
         if args.launch:
             success, message = launcher.launch(args.launch, args.activity, extras or None)
-            if args.json:
-                print(
-                    json_lib.dumps(
-                        {"success": success, "message": message, "action": "launch"}, indent=2
-                    )
-                )
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            _report_action(args, "launch", success, message)
 
         elif args.restart:
             success, message = launcher.restart(args.restart, args.activity, extras or None)
-            if args.json:
-                print(
-                    json_lib.dumps(
-                        {"success": success, "message": message, "action": "restart"}, indent=2
-                    )
-                )
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            _report_action(args, "restart", success, message)
 
         elif args.terminate:
             success, message = launcher.terminate(args.terminate)
-            if args.json:
-                print(
-                    json_lib.dumps(
-                        {"success": success, "message": message, "action": "terminate"}, indent=2
-                    )
-                )
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            _report_action(args, "terminate", success, message)
 
         elif args.install:
             success, message = launcher.install(args.install)
-            if args.json:
-                print(
-                    json_lib.dumps(
-                        {"success": success, "message": message, "action": "install"}, indent=2
-                    )
-                )
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            _report_action(args, "install", success, message)
 
         elif args.uninstall:
             success, message = launcher.uninstall(args.uninstall)
-            if args.json:
-                print(
-                    json_lib.dumps(
-                        {"success": success, "message": message, "action": "uninstall"}, indent=2
-                    )
-                )
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            _report_action(args, "uninstall", success, message)
 
         elif args.open_url:
             success, message = launcher.open_url(args.open_url)
-            if args.json:
-                print(
-                    json_lib.dumps(
-                        {"success": success, "message": message, "action": "open_url"}, indent=2
-                    )
-                )
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            _report_action(args, "open_url", success, message)
 
         elif args.list:
             success, packages = launcher.list_packages(args.filter)

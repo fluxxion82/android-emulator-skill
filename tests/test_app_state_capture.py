@@ -375,6 +375,111 @@ def test_a_partial_snapshot_reports_json_as_an_error_with_what_it_kept(
     assert payload["partial"]["logs"]["captured"] is False
 
 
+def test_a_screenshot_that_raises_fails_the_snapshot(monkeypatch, tmp_path, capsys):
+    """`capture_screenshot` raises on failure, and the whole capture used to go
+    with it -- including the artifacts collected after it would have been."""
+
+    def boom(*_a, **_k):
+        raise app_state_capture.adb_exec.DeviceNotFoundError(
+            "device 'no-such-serial-xyz' not found; run `adb devices` to see what is attached"
+        )
+
+    monkeypatch.setattr(app_state_capture, "capture_screenshot", boom)
+    monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app_state_capture.py",
+            "--package",
+            "com.example.app",
+            "--output",
+            str(tmp_path),
+            "--no-logs",
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_state_capture.main()
+    payload = json.loads(capsys.readouterr().out)
+
+    assert excinfo.value.code == 1
+    assert set(payload) == {"error", "partial"}, payload
+    assert "screenshot" in payload["error"]
+    assert "adb devices" in payload["error"], "the error does not name its remedy"
+    # The hierarchy came after the screenshot and is still there.
+    assert "screenshot.png" not in payload["partial"]["artifacts"]
+    assert "ui-hierarchy.json" in payload["partial"]["artifacts"]
+
+
+def test_a_late_device_error_keeps_the_artifacts_already_written(
+    monkeypatch, tmp_path, capsys, recorded_anywhere
+):
+    """The logs fail at the device level *after* four artifacts are on disk.
+
+    `_capture_logs` re-raises a DeviceError rather than writing "logs
+    unavailable" into the summary, and `capture()` let it out -- so a snapshot
+    that had already written the screenshot, the hierarchy and both info files
+    was reported as if nothing had happened, and `--json` printed nothing at
+    all.
+    """
+    not_found = recorded_anywhere("adb_shell_device_not_found")
+
+    def fake_run(cmd, *_a, **_k):
+        if "logcat" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", not_found)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(
+        app_state_capture,
+        "capture_screenshot",
+        lambda *_a, **_k: {"mode": "file", "file_path": "screenshot.png", "size_bytes": 10},
+    )
+    monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app_state_capture.py",
+            "--package",
+            "com.example.app",
+            "--serial",
+            "no-such-serial-xyz",
+            "--output",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_state_capture.main()
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert excinfo.value.code == 1
+    assert "Traceback" not in captured.err
+    assert set(payload) == {"error", "partial"}, payload
+    assert "logs" in payload["error"]
+    assert sorted(payload["partial"]["artifacts"]) == [
+        "app-info.json",
+        "device-info.json",
+        "screenshot.png",
+        "ui-hierarchy.json",
+    ]
+    assert payload["partial"]["logs"]["captured"] is False
+    # The manifest on disk records the same partial result.
+    summaries = list(tmp_path.rglob("snapshot-summary.json"))
+    assert summaries, "no snapshot-summary.json written for a partial capture"
+    assert json.loads(summaries[0].read_text(encoding="utf-8"))["failures"]
+
+
 def test_a_snapshot_that_was_not_asked_for_logs_still_succeeds(monkeypatch, tmp_path, capsys):
     """The negative control: --no-logs must not read as a missing component."""
     code = _snapshot_cli(monkeypatch, tmp_path, ["--no-logs"])

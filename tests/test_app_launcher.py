@@ -310,6 +310,70 @@ def test_ambiguous_device_tells_the_agent_which_flag_to_pass(monkeypatch, capsys
     assert "--serial" in capsys.readouterr().err
 
 
+# --- C6: every mode reports a failure the same way -------------------------
+#
+# Six modes answered `{"success": false, "message": ...}` while --list and
+# --state answered `{"error": ...}`. The runtime sweep cannot see the
+# difference: it breaks adb at the device level, which main() maps before any
+# of these branches decides anything. So the failed *command* is injected here.
+
+
+ACTION_MODES = [
+    ("launch", ["--launch", "com.example.app", "--activity", ".MainActivity"]),
+    ("restart", ["--restart", "com.example.app", "--activity", ".MainActivity"]),
+    ("terminate", ["--terminate", "com.example.app"]),
+    ("install", ["--install", "/tmp/app.apk"]),
+    ("uninstall", ["--uninstall", "com.example.app"]),
+    ("open_url", ["--open-url", "myapp://main"]),
+]
+
+
+@pytest.mark.parametrize(("action", "argv"), ACTION_MODES, ids=[m[0] for m in ACTION_MODES])
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_every_action_mode_reports_a_failed_command_the_same_way(
+    monkeypatch, capsys, action, argv, json_mode
+):
+    """adb ran, the command failed: exit 1, and `{"error": ...}` under --json."""
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_launcher.time, "sleep", _noop_sleep)
+
+    code = _run_cli(monkeypatch, [*argv, *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert code == 1, f"{action} reported success after the command failed"
+    assert "Traceback" not in captured.err
+    if json_mode:
+        payload = json_lib.loads(captured.out)
+        assert set(payload) == {"error"}, f"{action} answered {payload}"
+        assert payload["error"], "the error payload is empty"
+    else:
+        assert captured.out == "", f"{action} printed an answer on failure: {captured.out!r}"
+        assert captured.err.startswith("Error: ")
+
+
+@pytest.mark.parametrize(("action", "argv"), ACTION_MODES, ids=[m[0] for m in ACTION_MODES])
+def test_the_success_shape_of_every_action_mode_is_unchanged(monkeypatch, capsys, action, argv):
+    """The negative control: the JSON a working run prints must not have moved."""
+
+    def fake_run(cmd, **kwargs):
+        return _ok("Success\n")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_launcher.time, "sleep", _noop_sleep)
+
+    code = _run_cli(monkeypatch, [*argv, "--json"])
+    payload = json_lib.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["success"] is True
+    assert payload["action"] == action
+    assert payload["message"]
+
+
 # --- C6: a failed lookup is not an empty answer ----------------------------
 #
 # `--list` used to catch every exception, answer `[]`, print
@@ -421,6 +485,65 @@ def test_state_json_mode_reports_the_error_and_exits_non_zero(monkeypatch, capsy
 
     assert code == 1
     assert set(payload) == {"error"}, payload
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_state_fails_when_only_the_activity_lookup_cannot_reach_the_device(
+    monkeypatch, capsys, recorded_anywhere, json_mode
+):
+    """The staged failure: the package and PID probes answer, `dumpsys window` does not.
+
+    `get_current_activity` maps an adb failure to None by default, so
+    `foreground` came back None and `--state` reported success having never
+    learned the answer. get_state now asks in strict mode, so the device error
+    reaches the CLI boundary with its remedy.
+    """
+    not_found = recorded_anywhere("adb_shell_device_not_found")
+
+    def fake_run(cmd, **kwargs):
+        if "dumpsys" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", not_found)
+        if "pidof" in cmd:
+            return _ok("4242\n")
+        return _ok("package:com.example.app\n")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+
+    argv = ["--serial", "no-such-serial-xyz", "--state", "com.example.app"]
+    code = _run_cli(monkeypatch, [*argv, *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    if json_mode:
+        payload = json_lib.loads(captured.out)
+        assert set(payload) == {"error"}, payload
+        assert "no-such-serial-xyz" in payload["error"]
+    else:
+        assert "Foreground" not in captured.out, "reported a foreground it never read"
+        assert "no-such-serial-xyz" in captured.err
+
+
+def test_the_default_activity_lookup_still_tolerates_a_failure(monkeypatch, recorded_anywhere):
+    """The negative control, and the reason strict is a parameter.
+
+    `test_recorder` labels a recording with whatever activity it can see and
+    must not fail the recording over it. Changing the default would have
+    changed that caller silently.
+    """
+    from common import device_utils
+
+    monkeypatch.setattr(
+        app_launcher.adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: subprocess.CompletedProcess(
+            cmd, 1, "", recorded_anywhere("adb_shell_device_not_found")
+        ),
+    )
+
+    assert device_utils.get_current_activity("no-such-serial-xyz") is None
+    with pytest.raises(device_utils.AdbError):
+        device_utils.get_current_activity("no-such-serial-xyz", strict=True)
 
 
 def test_state_still_answers_for_an_uninstalled_package(monkeypatch, capsys):

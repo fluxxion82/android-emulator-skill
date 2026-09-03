@@ -7,12 +7,15 @@ review counted eleven instances of it. Three are pinned here, each as an AST
 invariant that enumerates every site rather than checking the one that was
 noticed:
 
-**Quoting (C3 / X2).** ``adb shell a b c`` joins its arguments into one string
-and the *device's* ``sh -c`` re-parses the result -- ``common/device_utils.py``
-says so at :84-91, right above ``quote_for_device_shell``. Five files
-interpolate a package name, a URL, a locale or a permission into a device-shell
-argv without it, so ``--open-url 'https://x/?a=1&b=2'`` opens ``?a=1`` and
-backgrounds ``am start``.
+**Quoting (C3 / X2) -- green since Inc 1.** ``adb shell a b c`` joins its
+arguments into one string and the *device's* ``sh -c`` re-parses the result --
+``common/device_utils.py`` says so at :84-91, right above
+``quote_for_device_shell``. Five files interpolated a package name, a URL, a
+locale or a permission into a device-shell argv without it, so ``--open-url
+'https://x/?a=1&b=2'`` opened ``?a=1`` and backgrounded ``am start``. All
+nineteen sites are wrapped; the invariant no longer carries an xfail, and it is
+enumerated from both sides -- see ``KNOWN_UNQUOTED`` (now empty) and
+``KNOWN_QUOTED``.
 
 **Emulator console (L7).** ``common/emu_console.run_emu`` exists because the
 console answers ``KO`` at exit status 0, frames its replies with ``OK``, and is
@@ -25,12 +28,21 @@ string with three different regexes in three files; two of them reject a
 negative coordinate and substitute ``(0,0,0,0)``, which navigator then offers as
 a tappable rectangle.
 
-Each invariant is red today, so it carries ``xfail(strict=True)`` naming the
-finding: the guard states the defect without blocking the PR, and the fix must
-delete the marker. What is *not* xfail is the evidence that each guard works --
-every one has a self-test that injects a synthetic violation and a self-test
-that enumerates the real sites as an exact multiset of file, function, kind and
-what was found there. A guard nobody has seen fail is a guard nobody has seen.
+The console and bounds invariants are still red, so each carries
+``xfail(strict=True)`` naming its finding: the guard states the defect without
+blocking the PR, and the fix must delete the marker. Quoting was red the same
+way and its marker is gone. What is *not* xfail is the evidence that each guard
+works -- every one has a self-test that injects a synthetic violation and a
+self-test that enumerates the real sites as an exact multiset of file,
+function, kind and what was found there. A guard nobody has seen fail is a
+guard nobody has seen.
+
+An emptied enumeration needs one more thing, because "no site reports a
+violation" is also what a detector that has gone blind produces, and what
+deleting the calls produces. So the fixed shape is enumerated *positively* as
+well: the quoting scan reports the wrapped arguments on request, and
+``KNOWN_QUOTED`` pins them. Removing one wrapper moves a site from one list to
+the other and fails both.
 
 Two failure modes of a guard like this are specifically defended against, both
 found by review rather than by imagination:
