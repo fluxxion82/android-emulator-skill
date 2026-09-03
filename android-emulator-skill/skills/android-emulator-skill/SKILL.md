@@ -110,12 +110,27 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - List available AVDs
    - Every mode reports a missing or failing `avdmanager` the same way: exit 1
      with the `cmdline-tools` remedy, never "No AVDs deleted" at exit 0
+   - `--old N` ranks by the mtime of `<name>.avd`; an AVD whose directory
+     cannot be found fails the whole ranking (exit 1) rather than sorting
+     oldest and being deleted. The AVD home is `$ANDROID_AVD_HOME`, else
+     `$ANDROID_SDK_HOME/.android/avd`, else `~/.android/avd`
+   - `N` must be at least 1: `--old 0` keeps nothing, so it is rejected as a
+     usage error (exit 2) pointing at `--all --yes`
    - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
 
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
    - Wipe user data without deleting AVD
    - Preserve AVD configuration
-   - Options: `--name`, `--force`, `--list`, `--json`
+   - Batch erase with `--all`; `--verify` polls the AVD on disk until the wipe
+     lands, bounded by `--timeout` (default 90s, `ANDROID_EMU_ERASE_TIMEOUT`)
+   - Refuses to erase unless every attached emulator has been identified and
+     none of them is this AVD. A console query that failed, or an emulator not
+     yet in state `device`, is "unknown" and refuses -- `--force` erases anyway
+   - **Snapshots are kept**: a successful erase prints "snapshots kept; use
+     snapshot.py --delete `<name>` to remove them", because a later
+     `snapshot.py --load` can otherwise undo the factory state
+   - Options: `--name`, `--all`, `--force`, `--verify`, `--timeout`, `--list`,
+     `--json`, `--verbose`
 
 #### Build & Development (2 scripts) ✓ COMPLETE
 10. **build_and_test.py** - Gradle build/test automation with progressive disclosure (backed by the `gradle/` subpackage)
@@ -517,11 +532,15 @@ emulator -version
 ### As Claude Code Skill
 
 ```bash
-# Personal installation
-git clone <repository-url> ~/.claude/skills/android-emulator-skill
+# As a plugin (preferred; updating is then two commands -- see README.md)
+claude plugin marketplace add fluxxion82/android-emulator-skill
+claude plugin install android-emulator-skill@fluxxion82
 
-# Project installation
-git clone <repository-url> .claude/skills/android-emulator-skill
+# Personal installation, from a clone
+git clone https://github.com/fluxxion82/android-emulator-skill ~/.claude/skills/android-emulator-skill
+
+# Project installation, from a clone
+git clone https://github.com/fluxxion82/android-emulator-skill .claude/skills/android-emulator-skill
 ```
 
 ## Documentation

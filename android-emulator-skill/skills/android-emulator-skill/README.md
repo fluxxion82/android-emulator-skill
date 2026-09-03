@@ -27,8 +27,19 @@ notes the exceptions.
 
 - Python 3.12+
 - Android SDK platform-tools on `PATH` (`adb`), plus `emulator` for AVD work
+- `cmdline-tools` on `PATH` for AVD management (`avdmanager`, `sdkmanager`).
+  Android Studio does not install it by default, and the legacy
+  `tools/bin/avdmanager` cannot stand in: it dies with
+  `NoClassDefFoundError: javax/xml/bind/annotation/XmlSchema` on Java 11+
+- Java 21, for Gradle builds
 - Pillow, for screenshot resizing and image diffs
 - A booted emulator or a connected device with USB debugging enabled
+
+Put `$ANDROID_HOME/emulator` on `PATH`, **not** `$ANDROID_HOME`. The SDK root
+contains a *directory* called `emulator`; the binary is
+`$ANDROID_HOME/emulator/emulator`. With the root on `PATH` the launch fails with
+`PermissionError: [Errno 13] Permission denied` rather than "not found", which
+sends you looking in the wrong place.
 
 `scripts/android_health_check.sh` verifies the environment and lists what it
 finds.

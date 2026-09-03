@@ -250,6 +250,112 @@ def test_shipped_readme_is_not_stale():
 
 
 # ---------------------------------------------------------------------------
+# Installation instructions someone can actually run (P8).
+# ---------------------------------------------------------------------------
+
+README = REPO_ROOT / "README.md"
+
+# Commands, not prose: a `<placeholder>` in a sentence *about* placeholders is
+# not a defect, and this file contains one. The check therefore reads only the
+# fenced code blocks -- the lines a reader copies -- which is the same reason
+# `_code_block_lines` exists for the invocation guard above.
+PLACEHOLDER = re.compile(r"<[a-z][a-z0-9_-]*>")
+
+# Metavars a reader is meant to substitute, which are legitimate in a command.
+# Kept explicit so the exemption cannot quietly grow to cover a real hole.
+SUBSTITUTABLE = frozenset({"<name>", "<serial>", "<id>", "<package>"})
+
+
+@pytest.mark.parametrize(
+    "doc", [README, SKILL_ROOT / "README.md", SKILL_MD], ids=lambda p: p.parent.name + "/" + p.name
+)
+def test_no_documented_command_still_carries_a_placeholder(doc):
+    """`git clone <repository-url>` is not a command; it is a TODO (P8).
+
+    It shipped on a tagged release, where the reader has no way to work out
+    what the URL should be.
+    """
+    offenders = [
+        line.strip()
+        for line in _code_block_lines(doc.read_text(encoding="utf-8"))
+        if any(match not in SUBSTITUTABLE for match in PLACEHOLDER.findall(line))
+    ]
+    assert not offenders, f"{doc.name} documents commands nobody can run: {offenders[:5]}"
+
+
+@pytest.mark.parametrize("doc", [README, SKILL_ROOT / "README.md"], ids=["repo", "packaged"])
+def test_no_readme_says_the_install_instructions_are_unfinished(doc):
+    """ "will be finalized once feature parity work lands" (P8).
+
+    Parity landed; the sentence outlived it and read as "not ready" on a
+    tagged release. Asserted on both READMEs because the packaged one is what
+    a plugin consumer actually receives.
+    """
+    text = doc.read_text(encoding="utf-8").lower()
+    assert "will be finalized" not in text, f"{doc.name} still defers its install instructions"
+
+
+def test_the_readme_documents_both_halves_of_an_update():
+    """`claude plugin update` alone does nothing, and fails silently.
+
+    It moves the installed plugin to whatever the *marketplace* update fetched,
+    so without the first command it looks exactly like "no update available".
+    Both commands, in that order, or the instruction is a trap.
+    """
+    commands = [line.strip() for line in _code_block_lines(README.read_text(encoding="utf-8"))]
+    marketplace = next(
+        (
+            i
+            for i, line in enumerate(commands)
+            if line.startswith("claude plugin marketplace update")
+        ),
+        None,
+    )
+    plugin = next(
+        (i for i, line in enumerate(commands) if line.startswith("claude plugin update")), None
+    )
+    assert marketplace is not None, "README does not show `claude plugin marketplace update`"
+    assert plugin is not None, "README does not show `claude plugin update`"
+    assert marketplace < plugin, "the marketplace update must come first or it does nothing"
+
+
+def test_the_readme_offers_a_clone_fallback_with_a_real_url():
+    """Not everyone installs through the plugin system; iOS documents this too."""
+    clones = [
+        line.strip()
+        for line in _code_block_lines(README.read_text(encoding="utf-8"))
+        if line.strip().startswith("git clone")
+    ]
+    assert clones, "README offers no git-clone fallback"
+    repository = json.loads(
+        (REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+    )
+    owner = repository["owner"]["name"] if isinstance(repository.get("owner"), dict) else None
+    assert owner, "marketplace.json declares no owner to check the clone URL against"
+    assert any(
+        f"github.com/{owner}/android-emulator-skill" in line for line in clones
+    ), f"the clone URL does not point at {owner}'s repository: {clones}"
+
+
+def test_the_readme_names_the_emulator_path_trap():
+    """The one prerequisite that costs hours, because the error misleads.
+
+    `$ANDROID_HOME` on PATH makes `execve("emulator")` hit the SDK root's
+    `emulator` DIRECTORY and raise PermissionError -- not the FileNotFoundError
+    anyone would go looking for. Asserted against the remedy `sdk_tools.py`
+    already states, so the two cannot drift apart.
+    """
+    text = README.read_text(encoding="utf-8")
+    assert "$ANDROID_HOME/emulator" in text, "the README does not say which directory to add"
+    assert "cmdline-tools" in text, "the README does not mention the command-line tools"
+    source = (SKILL_ROOT / "scripts" / "common" / "sdk_tools.py").read_text(encoding="utf-8")
+    assert 'PATH="$PATH:$ANDROID_HOME/emulator"' in source, (
+        "sdk_tools.py no longer states the emulator PATH remedy; the README's "
+        "version is now the only copy and nothing checks it"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Version, in one place per manifest and all agreeing.
 # ---------------------------------------------------------------------------
 
