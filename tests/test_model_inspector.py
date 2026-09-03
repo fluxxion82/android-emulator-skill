@@ -312,53 +312,37 @@ def test_schema_invalid_json_fails(tmp_path):
 # === LIVE MODE (sqlite parsing + run-as command construction) ==============
 
 
-SCHEMA_SQL = """CREATE TABLE android_metadata (locale TEXT);
-CREATE TABLE `users` (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    full_name TEXT NOT NULL,
-    email TEXT,
-    FOREIGN KEY (team_id) REFERENCES teams(id)
-);
-CREATE INDEX index_users_email ON users(email);
-CREATE TABLE IF NOT EXISTS "notes" (
-    note_id INTEGER PRIMARY KEY,
-    body TEXT
-);
-"""
+def test_parse_sqlite_schema_skips_indexes(recorded):
+    """A CREATE INDEX is not a table, including the UNIQUE form."""
+    schema = recorded.text("sqlite_schema_host")
+    assert "CREATE INDEX index_order_items_order_id" in schema
+    assert "CREATE UNIQUE INDEX index_orders_reference" in schema
 
-
-def test_parse_sqlite_schema_tables_and_columns():
-    tables = {t["name"]: t for t in parse_sqlite_schema(SCHEMA_SQL)}
-    assert set(tables) == {"android_metadata", "users", "notes"}
-    user_cols = {c["name"]: c["type"] for c in tables["users"]["columns"]}
-    assert user_cols["id"] == "INTEGER"
-    assert user_cols["full_name"] == "TEXT"
-    # Table-level FOREIGN KEY constraint is not a column.
-    assert "team_id" not in user_cols
-    assert "FOREIGN" not in user_cols
-
-
-def test_parse_sqlite_schema_skips_indexes():
-    assert all(t["name"] != "index_users_email" for t in parse_sqlite_schema(SCHEMA_SQL))
+    names = {t["name"] for t in parse_sqlite_schema(schema)}
+    assert "index_order_items_order_id" not in names
+    assert "index_orders_reference" not in names
 
 
 def _completed(cmd, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
-def test_live_dump_schema_via_device_sqlite3(monkeypatch):
+def test_live_dump_schema_via_device_sqlite3(monkeypatch, recorded):
     captured: list[list[str]] = []
+    schema = recorded.text("sqlite_schema_host")
 
     def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
-        return _completed(cmd, stdout=SCHEMA_SQL)
+        return _completed(cmd, stdout=schema)
 
     monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
 
     ok, result = LiveInspector(serial="emulator-5554").execute("com.example.app", db_name="app.db")
     assert ok is True
     assert result["method"] == "device-sqlite3"
-    assert result["total_tables"] == 3
+    # Four, not two: android_metadata and sqlite_sequence are in every Android
+    # database, and only a hand-written schema leaves them out.
+    assert result["total_tables"] == 4
 
     cmd = captured[0]
     # Right device, run-as for the right package, sqlite3 .schema on the DB path.

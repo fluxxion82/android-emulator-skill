@@ -16,51 +16,44 @@ import device_list
 # ---------------------------------------------------------------------------
 # parse_adb_devices
 # ---------------------------------------------------------------------------
-ADB_OUTPUT = """List of devices attached
-emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64x transport_id:1
-ABC123DEF456           device product:redfin model:Pixel_5 device:redfin transport_id:2
-99887766               offline
-77665544               unauthorized
-"""
 
 
-def test_parse_adb_devices_extracts_records():
-    devices = device_list.parse_adb_devices(ADB_OUTPUT)
-    assert len(devices) == 4
+def test_parse_adb_devices_extracts_records(recorded):
+    """Two attached emulators, as `adb devices -l` actually prints them."""
+    devices = device_list.parse_adb_devices(recorded.text("adb_devices_multiple"))
+    assert len(devices) == 2
 
     emu = devices[0]
     assert emu["serial"] == "emulator-5554"
     assert emu["type"] == "emulator"
     assert emu["state"] == "device"
     assert emu["online"] is True
-    assert emu["model"] == "sdk_gphone64_x86_64"
+    assert emu["model"] == "sdk_gphone16k_arm64"
 
-    phys = devices[1]
-    assert phys["serial"] == "ABC123DEF456"
-    assert phys["type"] == "device"
-    assert phys["model"] == "Pixel_5"
-    assert phys["online"] is True
+    assert [d["serial"] for d in devices] == ["emulator-5554", "emulator-5556"]
 
 
-def test_parse_adb_devices_offline_and_unauthorized_not_online():
-    devices = device_list.parse_adb_devices(ADB_OUTPUT)
-    by_serial = {d["serial"]: d for d in devices}
-    assert by_serial["99887766"]["online"] is False
-    assert by_serial["99887766"]["state"] == "offline"
-    assert by_serial["77665544"]["online"] is False
-    assert by_serial["77665544"]["state"] == "unauthorized"
+def test_a_hardware_serial_is_typed_as_a_device_not_an_emulator(recorded):
+    """`type` is read off the serial alone, so only the serial is substituted.
 
+    No `adb devices -l` listing with a handset attached is recorded (and a real
+    one carries somebody's device serial), but the classification rule reads
+    nothing else: the recorded line is used verbatim apart from the field under
+    test. Emulator-vs-device is what the shutdown path keys off, so it needs
+    coverage rather than deletion.
+    """
+    listing = recorded.text("adb_devices_single").replace("emulator-5554", "9B021FFAZ0057H")
+    devices = device_list.parse_adb_devices(listing)
 
-def test_parse_adb_devices_skips_header_and_daemon_noise():
-    output = (
-        "* daemon not running; starting now at tcp:5037 *\n"
-        "* daemon started successfully *\n"
-        "List of devices attached\n"
-        "emulator-5554   device model:Foo\n"
-    )
-    devices = device_list.parse_adb_devices(output)
     assert len(devices) == 1
-    assert devices[0]["serial"] == "emulator-5554"
+    assert devices[0]["serial"] == "9B021FFAZ0057H"
+    assert devices[0]["type"] == "device"
+
+
+def test_parse_adb_devices_skips_the_header(recorded):
+    listing = recorded.text("adb_devices_single")
+    assert listing.startswith("List of devices attached")
+    assert len(device_list.parse_adb_devices(listing)) == 1
 
 
 def test_parse_adb_devices_empty():
@@ -76,17 +69,11 @@ def test_parse_adb_devices_missing_model_yields_empty_model():
 # ---------------------------------------------------------------------------
 # parse_emulator_avds
 # ---------------------------------------------------------------------------
-def test_parse_emulator_avds_names():
-    output = "Pixel_5_API_33\nPixel_7_API_34\n"
-    avds = device_list.parse_emulator_avds(output)
-    assert [a["name"] for a in avds] == ["Pixel_5_API_33", "Pixel_7_API_34"]
+def test_parse_emulator_avds_names(recorded):
+    """`emulator -list-avds`: one bare AVD name per line, no header."""
+    avds = device_list.parse_emulator_avds(recorded.text("emulator_list_avds"))
+    assert [a["name"] for a in avds] == ["Pixel_9"]
     assert all(a["kind"] == "avd" and a["online"] is False for a in avds)
-
-
-def test_parse_emulator_avds_skips_banner_lines_with_spaces():
-    output = "INFO | Storing crashdata in: /tmp/foo\nPixel_5_API_33\n"
-    avds = device_list.parse_emulator_avds(output)
-    assert [a["name"] for a in avds] == ["Pixel_5_API_33"]
 
 
 def test_parse_emulator_avds_empty():
@@ -96,34 +83,23 @@ def test_parse_emulator_avds_empty():
 # ---------------------------------------------------------------------------
 # parse_avdmanager_avds
 # ---------------------------------------------------------------------------
-AVDMANAGER_OUTPUT = """Available Android Virtual Devices:
-    Name: Pixel_5_API_33
-  Device: pixel_5 (Google)
-    Path: /Users/me/.android/avd/Pixel_5_API_33.avd
-  Target: Google APIs (Google Inc.)
-          Based on: Android 13 (Tiramisu) Tag/ABI: google_apis/x86_64
----------
-    Name: Pixel_7_API_34
-  Device: pixel_7 (Google)
-    Path: /Users/me/.android/avd/Pixel_7_API_34.avd
-  Target: Android 14
-          Based on: Android 14 (UpsideDownCake) Tag/ABI: default/arm64-v8a
-"""
 
 
-def test_parse_avdmanager_avds_metadata():
-    meta = device_list.parse_avdmanager_avds(AVDMANAGER_OUTPUT)
-    assert set(meta.keys()) == {"Pixel_5_API_33", "Pixel_7_API_34"}
+def test_parse_avdmanager_avds_metadata(recorded):
+    """Real `avdmanager list avd`, whose shape is nothing like a tidy sample.
 
-    p5 = meta["Pixel_5_API_33"]
-    assert p5["device"] == "pixel_5 (Google)"
-    assert p5["target"] == "Google APIs (Google Inc.)"
-    assert p5["based_on"] == "Android 13 (Tiramisu)"
-    assert p5["abi"] == "google_apis/x86_64"
+    Inconsistent leading whitespace (`    Name:` four spaces, `  Device:`
+    two), Tag/ABI riding on the `Based on:` continuation line rather than
+    having a key of its own, and a `Sdcard:` key the parser must ignore.
+    """
+    meta = device_list.parse_avdmanager_avds(recorded.text("avdmanager_list_avd"))
+    assert set(meta.keys()) == {"Pixel_9"}
 
-    p7 = meta["Pixel_7_API_34"]
-    assert p7["abi"] == "default/arm64-v8a"
-    assert p7["based_on"] == "Android 14 (UpsideDownCake)"
+    entry = meta["Pixel_9"]
+    assert entry["device"] == "pixel_9 (Google)"
+    assert entry["target"] == "16 KB Page Size (Google Inc.)"
+    assert entry["based_on"] == 'Android 15.0 ("VanillaIceCream")'
+    assert entry["abi"] == "page_size_16kb/arm64-v8a"
 
 
 def test_parse_avdmanager_avds_empty():
@@ -134,16 +110,18 @@ def test_parse_avdmanager_avds_empty():
 # ---------------------------------------------------------------------------
 # merge_avds
 # ---------------------------------------------------------------------------
-def test_merge_avds_enriches_matching_names():
-    names = device_list.parse_emulator_avds("Pixel_5_API_33\nGhost_AVD\n")
-    meta = device_list.parse_avdmanager_avds(AVDMANAGER_OUTPUT)
+def test_merge_avds_enriches_matching_names(recorded):
+    # A second name appended to the recorded listing: avdmanager knows nothing
+    # about it, which is the case under test (it must survive the merge).
+    names = device_list.parse_emulator_avds(recorded.text("emulator_list_avds") + "Ghost_AVD\n")
+    meta = device_list.parse_avdmanager_avds(recorded.text("avdmanager_list_avd"))
     merged = device_list.merge_avds(names, meta)
 
     by_name = {a["name"]: a for a in merged}
     # Names from emulator are the source of truth -> both kept.
-    assert set(by_name.keys()) == {"Pixel_5_API_33", "Ghost_AVD"}
+    assert set(by_name.keys()) == {"Pixel_9", "Ghost_AVD"}
     # Matching AVD enriched.
-    assert by_name["Pixel_5_API_33"]["abi"] == "google_apis/x86_64"
+    assert by_name["Pixel_9"]["abi"] == "page_size_16kb/arm64-v8a"
     # Unknown-to-avdmanager AVD kept without metadata, never dropped.
     assert "abi" not in by_name["Ghost_AVD"]
 
@@ -198,38 +176,49 @@ def _fake_run_factory(adb_out: str, emulator_out: str, avdmanager_out: str):
     return fake_run
 
 
-def test_collect_aggregates_counts(monkeypatch):
+def _recorded_run(recorded, monkeypatch):
+    """Serve all three tools their own recorded output."""
     _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(
         device_list.subprocess,
         "run",
-        _fake_run_factory(ADB_OUTPUT, "Pixel_5_API_33\nPixel_7_API_34\n", AVDMANAGER_OUTPUT),
+        _fake_run_factory(
+            recorded.text("adb_devices_multiple"),
+            recorded.text("emulator_list_avds"),
+            recorded.text("avdmanager_list_avd"),
+        ),
     )
+
+
+def test_collect_aggregates_counts(monkeypatch, recorded):
+    _recorded_run(recorded, monkeypatch)
 
     data = device_list.DeviceLister().collect()
     summary = data["summary"]
 
-    assert summary["online"] == 2  # emulator-5554 + ABC123DEF456
-    assert summary["offline"] == 2  # offline + unauthorized
-    assert summary["avds"] == 2
-    assert summary["total"] == 4 + 2
+    assert summary["online"] == 2  # emulator-5554 + emulator-5556
+    assert summary["offline"] == 0
+    assert summary["avds"] == 1
+    assert summary["total"] == 2 + 1
     # AVDs enriched from avdmanager.
-    p5 = next(a for a in data["avds"] if a["name"] == "Pixel_5_API_33")
-    assert p5["abi"] == "google_apis/x86_64"
+    avd = next(a for a in data["avds"] if a["name"] == "Pixel_9")
+    assert avd["abi"] == "page_size_16kb/arm64-v8a"
 
 
-def test_collect_filter_narrows_devices_and_avds(monkeypatch):
-    _fake_emulator_on_path(monkeypatch)
-    monkeypatch.setattr(
-        device_list.subprocess,
-        "run",
-        _fake_run_factory(ADB_OUTPUT, "Pixel_5_API_33\nPixel_7_API_34\n", AVDMANAGER_OUTPUT),
-    )
+def test_collect_filter_narrows_avds(monkeypatch, recorded):
+    _recorded_run(recorded, monkeypatch)
 
-    data = device_list.DeviceLister(name_filter="Pixel_5").collect()
-    # Only the AVD named Pixel_5_API_33 matches; physical device model is "Pixel_5".
-    assert [a["name"] for a in data["avds"]] == ["Pixel_5_API_33"]
-    assert [d["serial"] for d in data["devices"]] == ["ABC123DEF456"]
+    data = device_list.DeviceLister(name_filter="Pixel_9").collect()
+    assert [a["name"] for a in data["avds"]] == ["Pixel_9"]
+    assert data["devices"] == []
+
+
+def test_collect_filter_narrows_devices(monkeypatch, recorded):
+    _recorded_run(recorded, monkeypatch)
+
+    data = device_list.DeviceLister(name_filter="5556").collect()
+    assert [d["serial"] for d in data["devices"]] == ["emulator-5556"]
+    assert data["avds"] == []
 
 
 def test_collect_handles_missing_tools(monkeypatch):
