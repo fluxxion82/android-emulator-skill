@@ -67,6 +67,7 @@ QUICK_START_BASELINE = (
 E2E_BASELINE = (
     ("accessibility_audit.py", ()),
     ("app_launcher.py", ("--json", "--launch")),
+    ("app_launcher.py", ("--terminate",)),
     ("log_monitor.py", ("--duration", "--json")),
     ("navigator.py", ("--enter-text", "--find-type")),
     ("navigator.py", ("--find-text", "--json", "--tap")),

@@ -158,6 +158,13 @@ def compose_app(run_skill, adb: str, compose_device: str):
     Returns the package, and the focused activity as the test last saw it, so a
     shortfall can say which screen was actually mapped.
     """
+    # Force-stop first. The lane boots from a saved snapshot, so whatever state
+    # the app was left in at the end of the previous run comes back with it --
+    # including an ANR dialog, whose "Close app" / "Wait" buttons are the only
+    # two controls the mapper can then see. Terminating is how the run starts
+    # from a screen this test is entitled to make claims about.
+    run_skill("app_launcher.py", "--terminate", APP)
+
     launched = run_skill("app_launcher.py", "--launch", ACTIVITY, "--json")
     assert launched.returncode == 0, f"could not launch: {launched.stderr}"
 

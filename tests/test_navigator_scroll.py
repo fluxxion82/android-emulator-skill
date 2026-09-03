@@ -46,6 +46,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -55,6 +56,7 @@ import pytest
 from navigator import Navigator
 
 from common import adb_exec
+from common.device_utils import parse_focused_activity
 
 TOP = "uiautomator_settings_top"
 HALF = "uiautomator_settings_half"
@@ -582,12 +584,30 @@ def _navigator_cli(adb_path: str, serial: str, args: list[str]) -> subprocess.Co
         timeout=30,
         check=False,
     )
+    # `-W`, then poll for focus: this is E1 in the place it was not fixed. The
+    # bare `am start` returned as soon as the intent was dispatched, so the dump
+    # below could catch the launcher instead of Settings -- and the failure read
+    # "nothing on it scrolls, so there is no content below", which is a
+    # confident statement about the wrong screen.
     subprocess.run(
-        [adb_path, "-s", serial, "shell", "am", "start", "-a", "android.settings.SETTINGS"],
+        [adb_path, "-s", serial, "shell", "am", "start", "-W", "-a", "android.settings.SETTINGS"],
         capture_output=True,
-        timeout=30,
+        timeout=120,
         check=False,
     )
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        dumped = subprocess.run(
+            [adb_path, "-s", serial, "shell", "dumpsys", "window"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if (parse_focused_activity(dumped.stdout) or "").startswith("com.android.settings"):
+            break
+        time.sleep(0.5)
+
     return subprocess.run(
         [sys.executable, str(script), "--serial", serial, *args],
         capture_output=True,
@@ -621,6 +641,8 @@ def test_live_absent_text_reports_the_search_rather_than_a_bare_miss(adb, emulat
 
     assert result.returncode == 1
     payload = json.loads(result.stdout)
-    assert "searched" in payload["message"]
+    # Every failure answers `{"error": ...}` under --json (INC1-07); the search
+    # detail rides alongside it, which is what makes "not found" actionable.
+    assert "searched" in payload["error"]
     detail = payload["search"]["detail"]
     assert "scrolled to the end" in detail or "nothing on it scrolls" in detail
