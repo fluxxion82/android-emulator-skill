@@ -45,7 +45,7 @@ from pathlib import Path
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import EmuConsoleError, run_emu
+from common.emu_console import EmulatorProbe, avd_name_for_serial, probe_emulators
 from common.env_config import env_int
 from common.sdk_tools import (
     EMULATOR_NOT_FOUND_MESSAGE,
@@ -53,6 +53,7 @@ from common.sdk_tools import (
     SdkToolError,
     get_emulator_path,
     missing_emulator_error,
+    resolve_avd_home,
     run_sdk_tool,
 )
 
@@ -234,6 +235,10 @@ class EmulatorSelector:
                 falling back to ``~/.android-emulator-skill/config.json``.
         """
         self.config_path = config_path or self._default_config_path()
+        # Emulators the last suggest() could not identify, for the CLI to
+        # report. Empty until suggest() runs, so reading it earlier is not an
+        # AttributeError -- a CLI that only lists AVDs never probes at all.
+        self.unidentified: tuple[EmulatorProbe, ...] = ()
 
     @staticmethod
     def _default_config_path() -> Path:
@@ -304,50 +309,39 @@ class EmulatorSelector:
         Each ready emulator serial is resolved to its AVD name via
         ``adb -s <serial> emu avd name``.
         """
-        running: set[str] = set()
+        return {probe.avd_name for probe in self.probe_running() if probe.identified}
+
+    def probe_running(self) -> list[EmulatorProbe]:
+        """Every attached emulator, identified or not.
+
+        Split out from :meth:`running_avd_names` so an emulator that would not
+        say which AVD it is stops vanishing (R3). It is still excluded from the
+        "currently running" bonus -- ranking on a guess is worse than ranking
+        without one -- but it is now reportable, and ``--suggest`` names it with
+        its state so a reader can see that the ranking was taken over an
+        incomplete picture.
+        """
         try:
             devices = get_connected_devices()
         except RuntimeError:
             # Deliberate: with nothing attached (or no adb at all) there is
             # nothing running, and --suggest must still rank the AVDs on disk.
             # Note this also absorbs an adb_exec.AdbError out of the listing,
-            # which subclasses RuntimeError. The per-serial resolution below is
-            # outside this guard on purpose -- see _avd_name_for_serial.
-            return running
-
-        for dev in devices:
-            if dev["type"] != "emulator" or dev["state"] != "device":
-                continue
-            avd_name = self._avd_name_for_serial(dev["serial"])
-            if avd_name:
-                running.add(avd_name)
-        return running
+            # which subclasses RuntimeError.
+            return []
+        return probe_emulators(devices, timeout=PROBE_TIMEOUT_SECONDS)
 
     def _avd_name_for_serial(self, serial: str) -> str | None:
         """Resolve an emulator serial to its AVD name (None when it answers nothing).
 
-        A console that declines to answer yields None, which simply costs that
-        AVD its "currently running" bonus. Device-level adb errors are *not*
-        swallowed: the serial came straight from ``adb devices``, so one that can
-        no longer be reached means the running check went unanswered, and ranking
-        a live AVD as idle is how a second copy of it gets booted.
-
-        The console is spoken to through :func:`common.emu_console.run_emu`,
-        which strips the trailing ``OK`` the console frames its replies with and
-        turns a ``KO`` -- delivered at exit status 0 -- into an exception rather
-        than a plausible-looking AVD name.
+        Delegates to the one probe in :mod:`common.emu_console`. This method
+        held its own console call, its own timeout and its own idea of what a
+        failure means, as did three sibling scripts -- and they disagreed, which
+        is R3. A name that cannot be read still costs that AVD its "currently
+        running" bonus; what changed is that :meth:`probe_running` can now say
+        so out loud instead of the emulator disappearing from the picture.
         """
-        try:
-            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
-        except EmuConsoleError:
-            # "The console declined to answer", which the ranking treats as no
-            # bonus rather than as a failure: an emulator part-way through boot
-            # is in `adb devices` before its console is up. Only the console
-            # protocol is absorbed here -- a device-level AdbError still
-            # propagates, because that one means the check never ran.
-            return None
-        lines = reply.lines
-        return lines[0] if lines else None
+        return avd_name_for_serial(serial, timeout=PROBE_TIMEOUT_SECONDS)
 
     def load_recent(self) -> list[str]:
         """Load the recent-use AVD history (most-recent first); [] on miss."""
@@ -395,7 +389,13 @@ class EmulatorSelector:
         candidate, then defers ordering to the pure :func:`rank_candidates`.
         """
         candidates = self.list_avds()
-        running = self.running_avd_names()
+        probes = self.probe_running()
+        # Kept for the CLI to report (R3). An emulator that would not say which
+        # AVD it is gets no "currently running" bonus -- ranking on a guess is
+        # worse than ranking without one -- but it used to vanish entirely, so
+        # the ranking silently claimed a completeness it did not have.
+        self.unidentified = tuple(probe for probe in probes if not probe.identified)
+        running = {probe.avd_name for probe in probes if probe.identified}
         recent = self.load_recent()
         recent_pos = {name: i for i, name in enumerate(recent)}
 
@@ -467,8 +467,15 @@ def read_avd_config(name: str) -> dict[str, str]:
     """
     Read an AVD's ``config.ini`` into a flat key->value dict.
 
-    Looks under ``~/.android/avd/<name>.avd/config.ini``. Returns an empty dict
-    when the file is missing or unreadable so callers can degrade gracefully.
+    Looks under ``<avd home>/<name>.avd/config.ini``, where the AVD home is
+    resolved the way avdmanager resolves it -- ``ANDROID_AVD_HOME``, else
+    ``ANDROID_SDK_HOME/.android/avd``, else ``~/.android/avd``. It was hard-coded
+    to the last of those, so on a host that relocates the AVD tree every config
+    read returned ``{}`` and every AVD silently lost its API level, its device
+    profile and its ABI from the ranking (R4).
+
+    Returns an empty dict when the file is missing or unreadable so callers can
+    degrade gracefully.
 
     Args:
         name: AVD name (without the ``.avd`` suffix).
@@ -476,7 +483,7 @@ def read_avd_config(name: str) -> dict[str, str]:
     Returns:
         Dict of config.ini keys to string values.
     """
-    config_path = Path.home() / ".android" / "avd" / f"{name}.avd" / "config.ini"
+    config_path = resolve_avd_home() / f"{name}.avd" / "config.ini"
     try:
         text = config_path.read_text()
     except (FileNotFoundError, OSError):
@@ -527,19 +534,33 @@ def parse_api_level(config: dict[str, str]) -> int | None:
     return None
 
 
-def format_candidates(candidates: list[dict], json_format: bool = False) -> str:
+def format_candidates(
+    candidates: list[dict],
+    json_format: bool = False,
+    unidentified: "tuple[EmulatorProbe, ...]" = (),
+) -> str:
     """
     Format candidates for output (token-efficient by default).
 
     Args:
         candidates: Ranked/annotated candidate dicts.
         json_format: If True, emit pretty JSON.
+        unidentified: Emulators that would not say which AVD they are. Listed
+            with their state so a reader can see the ranking was taken over an
+            incomplete picture (R3); omitted entirely when there are none, so
+            the common output is unchanged.
 
     Returns:
         Formatted output string.
     """
     if json_format:
-        return json.dumps({"suggestions": candidates}, indent=2)
+        payload: dict = {"suggestions": candidates}
+        if unidentified:
+            payload["unidentified_emulators"] = [
+                {"serial": probe.serial, "state": probe.state, "reason": probe.reason}
+                for probe in unidentified
+            ]
+        return json.dumps(payload, indent=2)
 
     if not candidates:
         return "No AVDs found"
@@ -553,7 +574,19 @@ def format_candidates(candidates: list[dict], json_format: bool = False) -> str:
         if reasons:
             line += f" - {', '.join(reasons)}"
         lines.append(line)
+    for probe in unidentified:
+        lines.append(f"   ! {probe.describe()}")
     return "\n".join(lines)
+
+
+def _warn_unidentified(unidentified: "tuple[EmulatorProbe, ...]") -> None:
+    """Say on stderr that the ranking was taken over an incomplete picture.
+
+    On stderr in every mode, including --json, so a caller parsing stdout still
+    gets a clean document but a human running the same command is told.
+    """
+    for probe in unidentified:
+        print(f"Warning: {probe.describe()}", file=sys.stderr)
 
 
 def _fail(error: object, *, json_mode: bool) -> None:
@@ -659,13 +692,15 @@ def _dispatch(args: argparse.Namespace) -> None:
     # List mode (every candidate, ranked for context)
     if args.list:
         candidates = selector.suggest(count=len(selector.list_avds()) or 1)
-        print(format_candidates(candidates, args.json))
+        print(format_candidates(candidates, args.json, selector.unidentified))
+        _warn_unidentified(selector.unidentified)
         sys.exit(0)
 
     # Default + --suggest: ranked top N
     suggestions = selector.suggest(args.count)
+    _warn_unidentified(selector.unidentified)
     if args.json or args.verbose:
-        print(format_candidates(suggestions, args.json))
+        print(format_candidates(suggestions, args.json, selector.unidentified))
     elif suggestions:
         # Token-efficient default: the single best pick plus its reasons.
         best = suggestions[0]

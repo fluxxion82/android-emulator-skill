@@ -32,7 +32,7 @@ notes the exceptions.
   `tools/bin/avdmanager` cannot stand in: it dies with
   `NoClassDefFoundError: javax/xml/bind/annotation/XmlSchema` on Java 11+
 - Java 21, for Gradle builds
-- Pillow, for screenshot resizing and image diffs
+- Optional: Pillow, for screenshot resizing and image diffs
 - A booted emulator or a connected device with USB debugging enabled
 
 Put `$ANDROID_HOME/emulator` on `PATH`, **not** `$ANDROID_HOME`. The SDK root

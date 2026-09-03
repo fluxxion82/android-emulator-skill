@@ -20,7 +20,7 @@ import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import run_emu
+from common.emu_console import avd_name_for_serial, probe_emulators
 from common.env_config import env_float, env_int
 from common.sdk_tools import (
     EMULATOR_NOT_FOUND_MESSAGE,
@@ -73,19 +73,37 @@ class EmulatorBooter:
 
         start_time = time.time()
 
-        # Check if already booted
-        devices = get_connected_devices()
-        emulators = [d for d in devices if d["type"] == "emulator" and d["state"] == "device"]
-        if emulators:
-            # Check if this AVD is already running by checking emulator name
-            for emu in emulators:
-                emu_avd = self._get_avd_name_for_serial(emu["serial"])
-                if emu_avd == self.avd_name:
-                    elapsed = time.time() - start_time
-                    return True, (
-                        f"Emulator already booted: {self.avd_name} "
-                        f"({emu['serial']}) [checked in {elapsed:.1f}s]"
-                    )
+        # Check if already booted. The probe is tri-state (L4/R3): an emulator
+        # that will not say which AVD it is used to be filtered out here --
+        # non-`device` state, or a console query that failed -- and filtering
+        # it out is indistinguishable from it not being there. Launching a
+        # second instance of an AVD that is already up corrupts its userdata,
+        # which is the defect the already-booted short-circuit exists to
+        # prevent, so an unidentified emulator stops the boot instead.
+        # The listing stays on this module's own seam (get_connected_devices);
+        # only the console question is centralised.
+        probes = probe_emulators(get_connected_devices(), timeout=PROBE_TIMEOUT_SECONDS)
+
+        for probe in probes:
+            if probe.avd_name == self.avd_name:
+                elapsed = time.time() - start_time
+                return True, (
+                    f"Emulator already booted: {self.avd_name} "
+                    f"({probe.serial}) [checked in {elapsed:.1f}s]"
+                )
+
+        unidentified = [probe for probe in probes if not probe.identified]
+        if unidentified:
+            # Warned on stderr as well as returned, because --wait-ready callers
+            # read the message late and this one decides whether to retry.
+            detail = "; ".join(probe.describe() for probe in unidentified)
+            print(f"Warning: {detail}", file=sys.stderr)
+            return False, (
+                f"Refusing to boot {self.avd_name}: {detail}. It may already be "
+                f"this AVD, and a second instance of one AVD corrupts its "
+                f"userdata. Shut that emulator down, or restart the adb "
+                f"connection (`adb kill-server && adb start-server`), then retry."
+            )
 
         # Resolve the emulator binary. Exec'ing the bare name is unsafe: with
         # the SDK root on PATH it hits the <sdk>/emulator directory and raises
@@ -215,23 +233,14 @@ class EmulatorBooter:
         Returns:
             AVD name, or None if not found
         """
-        try:
-            # Through run_emu, not a hand-rolled `adb emu`: the console
-            # terminates every reply with its own "OK" line, so the raw response
-            # is "Pixel_9\r\nOK\r\n". Stripping alone leaves "Pixel_9\nOK",
-            # which never equalled the AVD name -- so the already-booted
-            # short-circuit was dead and a second emulator got spawned for an
-            # AVD that was already running (defect S5). run_emu removes the
-            # framing, and answers a `KO` with an exception instead of a name.
-            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
-            lines = reply.lines
-            return lines[0] if lines else None
-        except adb_exec.AdbError:
-            # Same reasoning as _is_boot_completed: an emulator that has not
-            # finished booting cannot answer its console yet. EmuConsoleError
-            # subclasses AdbError, so a `KO` and a no-console device land here
-            # too -- both mean "no name to be had", which is what None says.
-            return None
+        # Delegates to the one probe in common/emu_console.py. This function
+        # used to hold its own copy of the console call, its own timeout and
+        # its own idea of what a failure means -- as did the same function in
+        # emulator_erase, emulator_selector and emulator_shutdown, and the four
+        # disagreed. The lossy None is kept here because callers of THIS
+        # helper only want a name; boot() itself reads the probe, so it can
+        # tell "not this AVD" from "would not say".
+        return avd_name_for_serial(serial, timeout=PROBE_TIMEOUT_SECONDS)
 
     @staticmethod
     def boot_all(headless: bool = False) -> tuple[int, int, list[dict]]:

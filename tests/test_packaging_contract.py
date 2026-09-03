@@ -251,29 +251,54 @@ def test_shipped_readme_is_not_stale():
 
 # ---------------------------------------------------------------------------
 # Installation instructions someone can actually run (P8).
+#
+# Every guard below states which STREAM of the Markdown it reads, because the
+# two need different rules and conflating them is how a doc guard becomes a
+# grep. `_code_block_lines` is the commands a reader copies: a `<placeholder>`
+# there is a defect. `_prose_lines` is the claims the document makes: a
+# sentence deferring the instructions is a defect there, and a `<placeholder>`
+# is not. Neither guard reads the whole file, and no guard reads this one.
 # ---------------------------------------------------------------------------
 
 README = REPO_ROOT / "README.md"
+PACKAGED_README = SKILL_ROOT / "README.md"
 
-# Commands, not prose: a `<placeholder>` in a sentence *about* placeholders is
-# not a defect, and this file contains one. The check therefore reads only the
-# fenced code blocks -- the lines a reader copies -- which is the same reason
-# `_code_block_lines` exists for the invocation guard above.
+
+def _prose_lines(markdown: str) -> list[str]:
+    """Lines OUTSIDE fenced code blocks -- what the document claims.
+
+    The complement of :func:`_code_block_lines`. A claim about installation is
+    prose, so a guard on it cannot read code blocks only; what it must not do
+    is read the whole file, or a documented `# will be finalized` comment
+    inside an example would satisfy it.
+    """
+    lines, inside = [], False
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        if not inside:
+            lines.append(line)
+    return lines
+
+
+# A metavar a reader is meant to substitute is legitimate in a command; a
+# `<repository-url>` nobody can resolve is not. Listed explicitly so the
+# exemption cannot quietly grow to cover a real hole.
 PLACEHOLDER = re.compile(r"<[a-z][a-z0-9_-]*>")
-
-# Metavars a reader is meant to substitute, which are legitimate in a command.
-# Kept explicit so the exemption cannot quietly grow to cover a real hole.
 SUBSTITUTABLE = frozenset({"<name>", "<serial>", "<id>", "<package>"})
 
 
 @pytest.mark.parametrize(
-    "doc", [README, SKILL_ROOT / "README.md", SKILL_MD], ids=lambda p: p.parent.name + "/" + p.name
+    "doc", [README, PACKAGED_README, SKILL_MD], ids=["repo", "packaged", "skill"]
 )
 def test_no_documented_command_still_carries_a_placeholder(doc):
     """`git clone <repository-url>` is not a command; it is a TODO (P8).
 
     It shipped on a tagged release, where the reader has no way to work out
-    what the URL should be.
+    what the URL should be. Only SKILL.md carried one -- the other two
+    parametrisations were already clean, and are here as the false-positive
+    control rather than as evidence.
     """
     offenders = [
         line.strip()
@@ -283,16 +308,23 @@ def test_no_documented_command_still_carries_a_placeholder(doc):
     assert not offenders, f"{doc.name} documents commands nobody can run: {offenders[:5]}"
 
 
-@pytest.mark.parametrize("doc", [README, SKILL_ROOT / "README.md"], ids=["repo", "packaged"])
-def test_no_readme_says_the_install_instructions_are_unfinished(doc):
+def test_the_repo_readme_does_not_defer_its_install_instructions():
     """ "will be finalized once feature parity work lands" (P8).
 
-    Parity landed; the sentence outlived it and read as "not ready" on a
-    tagged release. Asserted on both READMEs because the packaged one is what
-    a plugin consumer actually receives.
+    Parity landed; the sentence outlived it and read as "not ready" on a tagged
+    release. A claim, so this reads the prose stream. The packaged README never
+    carried the sentence and is deliberately not parametrised in: a guard that
+    was green before the change it claims to enforce is not evidence.
     """
-    text = doc.read_text(encoding="utf-8").lower()
-    assert "will be finalized" not in text, f"{doc.name} still defers its install instructions"
+    # Joined before matching, not scanned line by line: Markdown prose wraps,
+    # and a sentence broken across two lines is the same sentence. A
+    # line-at-a-time version of this guard passed against a README that had the
+    # deferral in it, which is how it was caught.
+    prose = " ".join(line.strip() for line in _prose_lines(README.read_text(encoding="utf-8")))
+    deferral = re.search(
+        r"[^.]*will be\s+(finalized|finalised|determined|decided)[^.]*\.", prose, re.IGNORECASE
+    )
+    assert not deferral, f"README defers its own instructions: {deferral.group(0).strip()!r}"
 
 
 def test_the_readme_documents_both_halves_of_an_update():
@@ -300,7 +332,7 @@ def test_the_readme_documents_both_halves_of_an_update():
 
     It moves the installed plugin to whatever the *marketplace* update fetched,
     so without the first command it looks exactly like "no update available".
-    Both commands, in that order, or the instruction is a trap.
+    Both commands, in that order, read from the fenced blocks.
     """
     commands = [line.strip() for line in _code_block_lines(README.read_text(encoding="utf-8"))]
     marketplace = next(
@@ -319,8 +351,55 @@ def test_the_readme_documents_both_halves_of_an_update():
     assert marketplace < plugin, "the marketplace update must come first or it does nothing"
 
 
-def test_the_readme_offers_a_clone_fallback_with_a_real_url():
-    """Not everyone installs through the plugin system; iOS documents this too."""
+def _clone_installations(markdown: str) -> list[tuple[str, str]]:
+    """(clone destination, installed source) pairs from a document's commands.
+
+    Parsed out of the fenced blocks: a ``git clone <url> <dest>`` establishes
+    where the repository lands, and each later ``ln -s``/``cp -R`` whose source
+    starts with that destination says which directory inside the clone is being
+    installed. Returning the pair is what lets the guard below resolve the
+    source against this repository instead of trusting the prose around it.
+    """
+    destination = None
+    installations = []
+    for raw in _code_block_lines(markdown):
+        parts = raw.strip().split()
+        if parts[:2] == ["git", "clone"] and len(parts) >= 4:
+            destination = parts[3]
+        elif destination and parts and parts[0] in {"ln", "cp"}:
+            sources = [part for part in parts[1:] if part.startswith(destination)]
+            installations.extend((destination, source) for source in sources)
+    return installations
+
+
+@pytest.mark.parametrize("doc", [README, SKILL_MD], ids=["repo", "skill"])
+def test_the_clone_fallback_installs_a_directory_that_is_actually_a_skill(doc):
+    """A clone of the REPO ROOT is not an installable skill (R2).
+
+    `SKILL.md` lives two levels down, at
+    `android-emulator-skill/skills/android-emulator-skill/`, so
+    `git clone <url> ~/.claude/skills/android-emulator-skill` produces a
+    directory Claude Code cannot load. Both documents said exactly that.
+
+    Checked by resolving the documented source path against this repository --
+    strip the clone destination off the front of what is being linked, and what
+    remains must name a directory here that holds a SKILL.md -- rather than by
+    matching the string that happens to appear.
+    """
+    installations = _clone_installations(doc.read_text(encoding="utf-8"))
+    assert installations, f"{doc.name} documents no clone-and-install fallback"
+
+    for destination, source in installations:
+        relative = source[len(destination) :].strip("/")
+        resolved = REPO_ROOT / relative if relative else REPO_ROOT
+        assert (resolved / "SKILL.md").is_file(), (
+            f"{doc.name} installs {source!r}, which resolves to {relative or '.'!r} in this "
+            f"repository -- and there is no SKILL.md there, so Claude Code loads nothing"
+        )
+
+
+def test_the_clone_url_points_at_this_repositorys_owner():
+    """The URL is checked against marketplace.json, not hard-coded here."""
     clones = [
         line.strip()
         for line in _code_block_lines(README.read_text(encoding="utf-8"))
@@ -342,12 +421,23 @@ def test_the_readme_names_the_emulator_path_trap():
 
     `$ANDROID_HOME` on PATH makes `execve("emulator")` hit the SDK root's
     `emulator` DIRECTORY and raise PermissionError -- not the FileNotFoundError
-    anyone would go looking for. Asserted against the remedy `sdk_tools.py`
-    already states, so the two cannot drift apart.
+    anyone would go looking for.
+
+    Two streams, deliberately: the export a reader copies is a command, so it is
+    checked in the fenced blocks; the warning about why is a claim, so it is
+    checked in the prose. The remedy is also asserted to still exist in
+    `sdk_tools.py`, so the README does not quietly become its only copy.
     """
     text = README.read_text(encoding="utf-8")
-    assert "$ANDROID_HOME/emulator" in text, "the README does not say which directory to add"
-    assert "cmdline-tools" in text, "the README does not mention the command-line tools"
+    exports = [line for line in _code_block_lines(text) if "ANDROID_HOME/emulator" in line]
+    assert exports, "the README shows no export putting the emulator directory on PATH"
+
+    prose = "\n".join(_prose_lines(text))
+    assert "cmdline-tools" in prose, "the README does not mention the command-line tools"
+    assert re.search(
+        r"not\s+`?\$ANDROID_HOME`?[,.\s]", prose
+    ), "the README does not warn against putting the SDK root on PATH"
+
     source = (SKILL_ROOT / "scripts" / "common" / "sdk_tools.py").read_text(encoding="utf-8")
     assert 'PATH="$PATH:$ANDROID_HOME/emulator"' in source, (
         "sdk_tools.py no longer states the emulator PATH remedy; the README's "

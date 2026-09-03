@@ -88,11 +88,23 @@ only it looks exactly like "no update available".
 
 ### Without the plugin system
 
-The scripts are plain Python and run from a clone:
+The skill Claude Code loads is the inner directory
+`android-emulator-skill/skills/android-emulator-skill` (the one holding
+`SKILL.md` and `scripts/`), **not** the repository root. Clone the repo
+somewhere of your own, then link that directory into place:
 
 ```bash
-git clone https://github.com/fluxxion82/android-emulator-skill ~/.claude/skills/android-emulator-skill
+git clone https://github.com/fluxxion82/android-emulator-skill ~/src/android-emulator-skill
+
+# Personal: available in every project
+ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulator-skill ~/.claude/skills/android-emulator-skill
+
+# Project-local: commit it, or add it to .gitignore
+ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulator-skill .claude/skills/android-emulator-skill
 ```
+
+Use `cp -R` in place of `ln -s` if you would rather not have a symlink; a
+`git pull` then needs the copy repeating.
 
 ## Documentation
 

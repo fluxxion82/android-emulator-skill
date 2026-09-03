@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -46,7 +47,7 @@ def eraser(monkeypatch, tmp_path):
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     e = emulator_erase.EmulatorEraser()
     # Never shell out to adb during these tests.
-    monkeypatch.setattr(e, "is_avd_running", lambda _name: False)
+    monkeypatch.setattr(e, "running_check", lambda _name: None)
     monkeypatch.setattr(emulator_erase.time, "sleep", lambda _s: None)
     return e
 
@@ -159,7 +160,9 @@ def test_running_check_uses_adb_command_mapping(monkeypatch, tmp_path, recorded)
     )
 
     assert e.is_avd_running("Pixel_9") is True
-    assert calls[0]["cmd"] == ["adb", "devices"]
+    # `-l` because the listing goes through device_utils.get_connected_devices
+    # now: one row parser for the whole skill, rather than this script's own.
+    assert calls[0]["cmd"] == ["adb", "devices", "-l"]
     assert calls[1]["cmd"] == ["adb", "-s", "emulator-5554", "emu", "avd", "name"]
     assert all(c["kwargs"].get("timeout") for c in calls), "an adb call went out unbounded"
 
@@ -198,8 +201,11 @@ def test_a_device_error_is_not_answered_as_not_running(
     """The dangerous swallow: "adb could not reach the device" != "not running".
 
     Answering False here let an erase wipe the user data of an emulator that was
-    actually live. The typed device error now reaches the caller instead, and
-    the wipe does not happen.
+    actually live. The device error now reaches the caller as an UNKNOWN
+    verdict rather than a raise -- the emulator is named, adb's own message is
+    quoted as the reason, and the wipe does not happen. That is strictly more
+    than the typed exception carried: an agent is told which serial went
+    unanswered, not only that something did.
     """
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     avd_dir = _make_avd(tmp_path, "Pixel_9")
@@ -213,10 +219,12 @@ def test_a_device_error_is_not_answered_as_not_running(
         },
     )
 
-    with pytest.raises(adb_exec.DeviceNotFoundError):
-        e.erase("Pixel_9")
+    success, message = e.erase("Pixel_9")
 
+    assert success is False
     assert (avd_dir / "userdata-qemu.img").exists(), "user data was wiped on an unanswered check"
+    assert "emulator-5554" in message, f"the refusal does not say which emulator: {message}"
+    assert "kill-server" in message and "--force" in message, f"no remedy named: {message}"
 
 
 # --- L4: three ways the running check said "no" without knowing --------------
@@ -431,6 +439,41 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, cap
     assert "Traceback" not in captured.err
     message = captured.err.lower()
     assert "reconnect" in message or "kill-server" in message, "no remedy named"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--name", "Pixel_9", "--json"],
+        ["--all", "--json"],
+        ["--json"],
+    ],
+    ids=["name", "all", "no-target"],
+)
+def test_every_failing_json_mode_prints_an_error_document(monkeypatch, tmp_path, capsys, argv):
+    """R1: `--json` promised `{"error": ...}` and delivered an empty stdout.
+
+    The CLI boundary caught AdbError but was outside the arg parsing, so it had
+    no idea `--json` had been asked for: a RunningCheckError produced exit 1,
+    prose on stderr, and nothing at all on the stream an agent parses. Argument
+    parsing now happens first, so the handler can answer in the mode it was
+    asked in -- checked for the usage error too, since that had the same shape
+    (argparse help text, no JSON).
+    """
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
+    _make_avd(tmp_path, "Pixel_9")
+    _fake_adb(monkeypatch, {("adb", "devices"): (1, "", "some other adb complaint\n")})
+    monkeypatch.setattr(emulator_erase.sys, "argv", ["emulator_erase.py", *argv])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_erase.main()
+
+    assert exc.value.code != 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert "error" in payload, f"--json reported no error document: {payload}"
+    assert payload["error"], "the error document is empty"
+    assert "Traceback" not in captured.err
 
 
 def test_default_tunables():

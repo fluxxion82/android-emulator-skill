@@ -89,15 +89,23 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      looked for, and exits 1 (`{"error": ...}` under `--json`) — "no AVDs" and
      "could not look" are different answers. `--all` reports the same failure
      the same way
+   - Refuses to boot while any attached emulator cannot say which AVD it is
+     (a non-`device` state, or a console that will not answer): it may be this
+     AVD, and a second instance of one AVD corrupts its userdata. The refusal
+     names the serial, its state and the remedy
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
    - Shutdown by serial number. Emulators only: a serial that is not an
      `emulator-NNNN` is refused before any adb command runs, so this never powers off an
      attached phone or tablet
+   - `--name AVD` resolves the AVD to a serial. If some emulator could not be
+     queried, that is reported as itself and exits non-zero — never as
+     "No running emulator found", which is a confident negative over a device
+     nobody managed to ask
    - Optional verification of shutdown completion
    - Batch shutdown operations (running emulators only)
-   - Options: `--serial`, `--verify`, `--timeout`, `--all`, `--json`
+   - Options: `--serial`, `--name`, `--verify`, `--timeout`, `--all`, `--json`
 
 7. **emulator_create.py** ⭐ NEW - Create AVDs dynamically
    - Create by device type and API level
@@ -125,7 +133,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      lands, bounded by `--timeout` (default 90s, `ANDROID_EMU_ERASE_TIMEOUT`)
    - Refuses to erase unless every attached emulator has been identified and
      none of them is this AVD. A console query that failed, or an emulator not
-     yet in state `device`, is "unknown" and refuses -- `--force` erases anyway
+     yet in state `device`, is "unknown" and refuses, naming the serial, its
+     state and the remedy — `--force` erases anyway
+   - Every failure answers in the mode it was asked in: `{"error": ...}` on
+     stdout under `--json`, the message on stderr otherwise, always non-zero
    - **Snapshots are kept**: a successful erase prints "snapshots kept; use
      snapshot.py --delete `<name>` to remove them", because a later
      `snapshot.py --load` can otherwise undo the factory state
@@ -329,6 +340,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 25. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
     - A host with no AVDs ranks nothing and exits 0; a missing or failing
       `emulator` binary exits 1 with the remedy instead of an empty ranking
+    - An emulator that will not say which AVD it is gets no "currently running"
+      bonus, but is listed with its state (`unidentified_emulators` under
+      `--json`, a warning on stderr otherwise) so the ranking never claims a
+      completeness it does not have
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
@@ -536,11 +551,15 @@ emulator -version
 claude plugin marketplace add fluxxion82/android-emulator-skill
 claude plugin install android-emulator-skill@fluxxion82
 
-# Personal installation, from a clone
-git clone https://github.com/fluxxion82/android-emulator-skill ~/.claude/skills/android-emulator-skill
+# From a clone: the skill is the INNER directory (this file's own), not the
+# repository root, so clone the repo and link that directory into place.
+git clone https://github.com/fluxxion82/android-emulator-skill ~/src/android-emulator-skill
 
-# Project installation, from a clone
-git clone https://github.com/fluxxion82/android-emulator-skill .claude/skills/android-emulator-skill
+# Personal installation
+ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulator-skill ~/.claude/skills/android-emulator-skill
+
+# Project installation
+ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulator-skill .claude/skills/android-emulator-skill
 ```
 
 ## Documentation

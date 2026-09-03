@@ -242,6 +242,61 @@ def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
     assert emulator_shutdown.resolve_serial_by_avd_name("No_Such_AVD") is None
 
 
+def test_shutdown_by_name_refuses_when_an_emulator_could_not_be_queried(monkeypatch, capsys):
+    """R3: "I could not look" must not be reported as "nothing to shut down".
+
+    Two emulators are attached; one answers with a different AVD name and the
+    other will not answer at all. `--name Pixel_9` used to skip the silent one
+    and report "No running emulator found", which is a confident negative over
+    a device nobody managed to ask -- and the emulator the user wanted killed
+    is left running while the command exits saying there was nothing to kill.
+    """
+    _connected(
+        monkeypatch,
+        [
+            {"serial": "emulator-5554", "state": "device", "type": "emulator"},
+            {"serial": "emulator-5556", "state": "device", "type": "emulator"},
+        ],
+    )
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[2] == "emulator-5554":
+            return _FakeResult(returncode=1, stderr="protocol fault\n")
+        return _FakeResult(returncode=0, stdout="Some_Other_AVD\nOK\n")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        emulator_shutdown.sys, "argv", ["emulator_shutdown.py", "--name", "Pixel_9"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_shutdown.main()
+
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "emulator-5554" in err, f"the failure does not say which emulator: {err}"
+    assert "kill-server" in err, f"no remedy named: {err}"
+
+
+def test_shutdown_by_name_still_reports_a_genuine_miss(monkeypatch, capsys):
+    """The false-positive control: every emulator answered, none is this AVD."""
+    _connected(monkeypatch, [{"serial": "emulator-5554", "state": "device", "type": "emulator"}])
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda *_a, **_k: _FakeResult(returncode=0, stdout="Some_Other_AVD\nOK\n"),
+    )
+    monkeypatch.setattr(
+        emulator_shutdown.sys, "argv", ["emulator_shutdown.py", "--name", "Pixel_9"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_shutdown.main()
+
+    assert exc.value.code != 0
+    assert "No running emulator found" in capsys.readouterr().err
+
+
 def test_get_avd_name_skips_ok_status_line(monkeypatch):
     monkeypatch.setattr(
         adb_exec.subprocess,

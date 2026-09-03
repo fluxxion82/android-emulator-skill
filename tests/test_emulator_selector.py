@@ -214,8 +214,13 @@ def test_running_avd_names_resolves_serials(monkeypatch, tmp_path, recorded):
 def test_a_device_error_is_not_ranked_as_not_running(monkeypatch, tmp_path, recorded_anywhere):
     """An unanswered running-check must not quietly read as "idle".
 
-    Ranking a live AVD as not-running is how a second copy of it gets booted, so
-    the typed error propagates to the CLI boundary instead of being swallowed.
+    The invariant is unchanged; where it is enforced moved (R3). It used to be
+    a raise out of this ranking, which made a *suggestion* fatal over a
+    condition it cannot do anything about. Now the emulator is reported as
+    unidentified with adb's own message as the reason, it contributes no name
+    to the running set, and the thing that must not happen -- a second copy of
+    a live AVD being booted -- is refused by `emulator_boot` itself, which is
+    the only place that can actually prevent it.
     """
     _fake_adb(monkeypatch, {("adb", "-s"): (1, "", recorded_anywhere("adb_device_not_found"))})
     monkeypatch.setattr(
@@ -225,8 +230,104 @@ def test_a_device_error_is_not_ranked_as_not_running(monkeypatch, tmp_path, reco
     )
 
     selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
-    with pytest.raises(adb_exec.DeviceNotFoundError):
-        selector.running_avd_names()
+
+    assert selector.running_avd_names() == set(), "a name was invented for an unanswered probe"
+    probes = selector.probe_running()
+    assert [p.serial for p in probes] == ["emulator-5554"], "the emulator vanished from the picture"
+    assert probes[0].identified is False
+    assert "emulator-5554" in probes[0].reason
+
+
+def test_suggest_lists_an_emulator_it_could_not_identify(monkeypatch, tmp_path, recorded):
+    """R3: the ranking says when it was taken over an incomplete picture.
+
+    An emulator that will not say which AVD it is gets no "currently running"
+    bonus -- ranking on a guess is worse than ranking without one -- but it used
+    to vanish from the output entirely, so the ranking claimed a completeness it
+    did not have.
+    """
+    serials = [
+        line.split()[0]
+        for line in recorded.text("adb_devices_multiple").splitlines()
+        if line.split() and line.split()[0].startswith("emulator-")
+    ]
+    monkeypatch.setattr(
+        emulator_selector,
+        "get_connected_devices",
+        lambda: [
+            {"serial": serials[0], "state": "offline", "type": "emulator"},
+            {"serial": serials[1], "state": "device", "type": "emulator"},
+        ],
+    )
+    _fake_emulator_on_path(monkeypatch)
+    _fake_adb(
+        monkeypatch,
+        {
+            ("emulator",): (0, "Pixel_9\nPixel_9_Pro\n", ""),
+            ("adb", "-s"): (0, recorded.text("emu_avd_name"), ""),
+        },
+    )
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    suggestions = selector.suggest(4)
+
+    assert selector.running_avd_names() == {"Pixel_9"}, "the identified emulator lost its bonus"
+    assert [p.serial for p in selector.unidentified] == [serials[0]]
+
+    text = emulator_selector.format_candidates(suggestions, False, selector.unidentified)
+    assert serials[0] in text and "offline" in text, f"the unidentified emulator is absent: {text}"
+
+    payload = json.loads(
+        emulator_selector.format_candidates(suggestions, True, selector.unidentified)
+    )
+    assert payload["unidentified_emulators"][0]["serial"] == serials[0]
+    assert payload["unidentified_emulators"][0]["state"] == "offline"
+
+
+def test_a_complete_picture_adds_no_noise_to_the_output(monkeypatch, tmp_path, recorded):
+    """The false-positive control: nothing unidentified, nothing extra printed."""
+    monkeypatch.setattr(
+        emulator_selector,
+        "get_connected_devices",
+        lambda: [{"serial": "emulator-5554", "state": "device", "type": "emulator"}],
+    )
+    _fake_emulator_on_path(monkeypatch)
+    _fake_adb(
+        monkeypatch,
+        {
+            ("emulator",): (0, "Pixel_9\n", ""),
+            ("adb", "-s"): (0, recorded.text("emu_avd_name"), ""),
+        },
+    )
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    suggestions = selector.suggest(4)
+
+    assert selector.unidentified == ()
+    payload = json.loads(
+        emulator_selector.format_candidates(suggestions, True, selector.unidentified)
+    )
+    assert "unidentified_emulators" not in payload
+
+
+def test_read_avd_config_honours_the_resolved_avd_home(monkeypatch, tmp_path):
+    """R4: it was hard-coded to ~/.android/avd.
+
+    On a host that relocates the AVD tree every config read returned {}, so
+    every AVD silently lost its API level, device profile and ABI from the
+    ranking -- a ranking with no inputs, reported as a recommendation.
+    """
+    avd_home = tmp_path / "avds"
+    (avd_home / "Pixel_9.avd").mkdir(parents=True)
+    (avd_home / "Pixel_9.avd" / "config.ini").write_text(
+        "image.sysdir.1=system-images/android-35/\n"
+    )
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(avd_home))
+
+    config = emulator_selector.read_avd_config("Pixel_9")
+
+    assert config, "the config under $ANDROID_AVD_HOME was not read"
+    assert config["image.sysdir.1"] == "system-images/android-35/"
 
 
 def _fake_emulator_on_path(monkeypatch):
@@ -245,8 +346,15 @@ def test_avd_listing_is_bounded(monkeypatch, tmp_path):
     assert calls[0]["kwargs"].get("timeout"), "`emulator -list-avds` went out unbounded"
 
 
-def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, capsys):
-    """At the CLI boundary the agent gets the remedy, not a stack trace."""
+def test_the_cli_names_an_emulator_it_could_not_identify(monkeypatch, tmp_path, capsys):
+    """At the CLI boundary the agent gets the remedy, not a stack trace.
+
+    Retargeted with R3: an unauthorized emulator no longer makes `--suggest`
+    exit 1. It ranks what it can and says on stderr which emulator it could not
+    identify, its state and adb's own remedy -- so the ranking never silently
+    claims a completeness it does not have. The CLI's failure boundary is still
+    covered, by the AVD-discovery tests below.
+    """
     _fake_emulator_on_path(monkeypatch)
     monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
@@ -263,11 +371,13 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, cap
     with pytest.raises(SystemExit) as exc:
         emulator_selector.main()
 
-    assert exc.value.code == 1
+    assert exc.value.code == 0, "a suggestion was made fatal by one unreadable emulator"
     captured = capsys.readouterr()
-    assert captured.err.startswith("Error: ")
+    assert captured.err.startswith("Warning: ")
+    assert "emulator-5554" in captured.err, "the warning does not say which emulator"
     assert "Traceback" not in captured.err
     assert "usb debugging" in captured.err.lower(), "no remedy named"
+    assert "Recommended:" in captured.out, "the ranking it could compute was not printed"
 
 
 # ---------------------------------------------------------------------------

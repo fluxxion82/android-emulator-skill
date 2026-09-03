@@ -24,7 +24,7 @@ import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import run_emu
+from common.emu_console import RunningVerdict, avd_name_for_serial, avd_running, run_emu
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -149,28 +149,19 @@ def get_avd_name_for_serial(serial: str) -> str | None:
     """
     Get the AVD name for a running emulator serial.
 
-    Uses the emulator console (`adb -s <serial> emu avd name`), mirroring the
-    boot path's resolution so a name supplied to --name maps to the same serial.
+    Delegates to the one probe in :mod:`common.emu_console`. This function held
+    its own console call and caught bare ``Exception``; three sibling scripts
+    held their own, and the four disagreed about what a failure means (R3).
 
     Args:
         serial: Emulator serial (e.g., "emulator-5554")
 
     Returns:
-        AVD name, or None if it cannot be determined.
+        AVD name, or None if it cannot be determined. Callers that must not act
+        on "cannot be determined" should use :func:`resolve_target_by_avd_name`,
+        which keeps the reason.
     """
-    try:
-        reply = run_emu("avd", "name", serial=serial, timeout=CONSOLE_NAME_TIMEOUT)
-    except Exception:
-        # Unchanged from the hand-rolled version: a serial that cannot be
-        # resolved to a name is "unknown", not an error -- the caller is
-        # matching --name against every attached emulator, and one that will
-        # not answer simply does not match.
-        return None
-
-    # run_emu has already removed the trailing "OK" the console frames its
-    # replies with; the first payload line is the name.
-    lines = reply.lines
-    return lines[0] if lines else None
+    return avd_name_for_serial(serial, timeout=CONSOLE_NAME_TIMEOUT)
 
 
 def resolve_serial_by_avd_name(avd_name: str) -> str | None:
@@ -181,18 +172,47 @@ def resolve_serial_by_avd_name(avd_name: str) -> str | None:
         avd_name: AVD name (e.g., "Pixel_5_API_33")
 
     Returns:
-        The matching emulator serial, or None if no running emulator uses it.
+        The matching emulator serial, or None if no running emulator uses it --
+        which does NOT distinguish "no emulator is that AVD" from "an emulator
+        would not say". :func:`resolve_target_by_avd_name` does.
 
     Raises:
         adb_exec.AdbError: If adb cannot be run or the device query fails. Left
             to propagate to ``main``, which prints the error's own remedy.
     """
-    devices = get_connected_devices()
-    emulators = [d for d in devices if d["type"] == "emulator" and d["state"] == "device"]
-    for emu in emulators:
-        if get_avd_name_for_serial(emu["serial"]) == avd_name:
-            return emu["serial"]
-    return None
+    return resolve_target_by_avd_name(avd_name)[0]
+
+
+def resolve_target_by_avd_name(avd_name: str) -> tuple[str | None, str | None]:
+    """
+    Resolve ``avd_name`` to a serial, or say why it could not be resolved.
+
+    A shutdown is destructive, so "I did not find it" and "I could not look"
+    must not be the same answer (R3). They were: every emulator that would not
+    answer its console was skipped, so `--name X` on a host with a wedged
+    emulator reported "no running emulator found for AVD name X" -- a confident
+    negative over a device nobody had managed to ask.
+
+    Args:
+        avd_name: AVD name (e.g., "Pixel_5_API_33")
+
+    Returns:
+        ``(serial, None)`` when an emulator identified itself as this AVD;
+        ``(None, None)`` when every emulator answered and none of them is it;
+        ``(None, reason)`` when at least one emulator could not be identified,
+        so the negative cannot be trusted.
+
+    Raises:
+        adb_exec.AdbError: If adb cannot be run or the device query fails.
+    """
+    # The listing stays on this module's own seam, which is where its tests
+    # stub it and where a device-level failure must still reach main().
+    answer = avd_running(avd_name, get_connected_devices(), timeout=CONSOLE_NAME_TIMEOUT)
+    if answer.verdict is RunningVerdict.RUNNING:
+        return answer.serial, None
+    if answer.verdict is RunningVerdict.UNKNOWN:
+        return None, answer.describe_unknown()
+    return None, None
 
 
 def shutdown_all_emulators(verify: bool = False) -> tuple:
@@ -314,9 +334,15 @@ Examples:
     # Resolve target serial: explicit --serial wins; otherwise resolve --name.
     serial = args.serial
     if not serial and args.name:
-        serial = resolve_serial_by_avd_name(args.name)
+        serial, unknown = resolve_target_by_avd_name(args.name)
         if not serial:
-            message = f"Error: No running emulator found for AVD name '{args.name}'"
+            # "I could not look" is reported as itself, never as a confident
+            # "nothing to shut down" (R3).
+            message = (
+                f"Error: cannot tell whether '{args.name}' is running: {unknown}"
+                if unknown
+                else f"Error: No running emulator found for AVD name '{args.name}'"
+            )
             if args.json:
                 import json
 

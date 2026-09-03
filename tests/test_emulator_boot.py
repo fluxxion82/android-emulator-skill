@@ -221,6 +221,73 @@ def test_avd_name_probe_treats_an_unreachable_device_as_unknown(monkeypatch):
     assert booter._get_avd_name_for_serial("emulator-5554") is None
 
 
+# --- R3: an emulator that will not identify itself stops the boot ----------
+# Filtering it out of the "already booted" check is indistinguishable from it
+# not being there, and launching a second instance of one AVD corrupts its
+# userdata -- which is what the check exists to prevent (S5/L4).
+
+
+def _recorded_emulators(recorded, states=("device", "device")):
+    """The recorded two-emulator listing, as get_connected_devices reports it.
+
+    States are substituted per row so an emulator mid-boot can be represented:
+    no profile has recorded a device in a state other than `device` (see the
+    `parse_adb_devices` entry in tests/test_fixture_policy.py), and provoking
+    one means killing an emulator mid-boot on the recording host.
+    """
+    serials = [
+        line.split()[0]
+        for line in recorded.text("adb_devices_multiple").splitlines()
+        if line.split() and line.split()[0].startswith("emulator-")
+    ]
+    assert len(serials) == len(states), f"the recording no longer holds two emulators: {serials}"
+    return [
+        {"serial": serial, "state": state, "type": "emulator"}
+        for serial, state in zip(serials, states, strict=True)
+    ]
+
+
+def test_boot_refuses_while_an_emulator_cannot_be_identified(monkeypatch, recorded, capsys):
+    """R3: an offline emulator might BE this AVD, so booting is not safe."""
+    monkeypatch.setattr(
+        emulator_boot,
+        "get_connected_devices",
+        lambda: _recorded_emulators(recorded, ("offline", "device")),
+    )
+    _fake_emulator_on_path(monkeypatch)
+    _fake_adb(monkeypatch, {("adb", "-s"): (0, recorded.text("emu_avd_name"), "")})
+
+    def _must_not_launch(*_a, **_k):
+        raise AssertionError("a second emulator was launched over an unidentified one")
+
+    monkeypatch.setattr(emulator_boot.subprocess, "Popen", _must_not_launch)
+
+    success, message = emulator_boot.EmulatorBooter("Some_Other_AVD").boot()
+
+    assert success is False
+    assert "emulator-5554" in message and "offline" in message, message
+    assert "kill-server" in message, f"no remedy named: {message}"
+    assert "Warning:" in capsys.readouterr().err, "nothing was said on stderr"
+
+
+def test_boot_still_short_circuits_when_the_avd_is_positively_running(monkeypatch, recorded):
+    """The false-positive control: a known-running AVD is still recognised."""
+    monkeypatch.setattr(
+        emulator_boot, "get_connected_devices", lambda: _recorded_emulators(recorded)
+    )
+    _fake_adb(monkeypatch, {("adb", "-s"): (0, recorded.text("emu_avd_name"), "")})
+
+    def _must_not_launch(*_a, **_k):
+        raise AssertionError("a second copy of a running AVD was launched")
+
+    monkeypatch.setattr(emulator_boot.subprocess, "Popen", _must_not_launch)
+
+    success, message = emulator_boot.EmulatorBooter("Pixel_9").boot()
+
+    assert success is True
+    assert "already booted" in message
+
+
 def test_avd_name_probe_is_bounded(monkeypatch, recorded):
     calls = _fake_adb(monkeypatch, {("adb",): (0, recorded.text("emu_avd_name"), "")})
     booter = emulator_boot.EmulatorBooter("Pixel_9")
