@@ -5,6 +5,12 @@ Erase/Reset Android Virtual Devices (AVDs) to factory state.
 Wipes all user data from AVD while preserving the AVD configuration.
 Useful for getting a clean state between test runs.
 
+Snapshots are deliberately kept: a saved snapshot is a whole guest machine, not
+user data, and deleting one silently would throw away state somebody recorded
+on purpose. It does mean a later `snapshot.py --load` can restore the state this
+erase cleared, so every successful erase says so (`snapshot.py --delete <name>`
+removes one).
+
 Usage Examples:
     # Erase single AVD (must be shutdown first)
     python scripts/emulator_erase.py --name MyTestDevice
@@ -21,14 +27,14 @@ Usage Examples:
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
 
 from common import adb_exec
-from common.emu_console import run_emu
+from common.emu_console import RunningVerdict, avd_running
 from common.env_config import env_float, env_int
+from common.sdk_tools import resolve_avd_home
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_ERASE_TIMEOUT = env_int("ANDROID_EMU_ERASE_TIMEOUT", 90)
@@ -45,6 +51,13 @@ USERDATA_FILES = [
     "sdcard.img.qcow2",
 ]
 
+# Snapshots are NOT part of an erase (L9). A saved snapshot holds a whole guest
+# machine image, so deleting one here would throw away state the user recorded
+# deliberately -- but leaving it unmentioned lets "factory state" be undone by
+# the next `snapshot.py --load`, which is the half of the contract that was
+# missing. Said once, next to the wipe, rather than silently either way.
+SNAPSHOT_NOTE = "snapshots kept; use snapshot.py --delete <name> to remove them"
+
 
 class EmulatorEraser:
     """Erase/reset Android AVDs to factory state."""
@@ -55,18 +68,18 @@ class EmulatorEraser:
 
     def get_avd_home(self) -> Path:
         """
-        Get AVD home directory.
+        Get AVD home directory, resolved the way ``avdmanager`` resolves it.
+
+        The order matters and it is not obvious: ``ANDROID_AVD_HOME`` points at
+        the directory of ``.avd`` directories, while ``ANDROID_SDK_HOME`` points
+        at the *parent of* ``.android``. Ignoring the second one sent this
+        script to ``~/.android/avd`` on hosts that deliberately relocate it --
+        typically CI images -- where it found nothing (L5).
 
         Returns:
             Path to AVD home
         """
-        # Check ANDROID_AVD_HOME first
-        avd_home = os.environ.get("ANDROID_AVD_HOME")
-        if avd_home:
-            return Path(avd_home)
-
-        # Default to ~/.android/avd
-        return Path.home() / ".android" / "avd"
+        return resolve_avd_home()
 
     def list_avds(self) -> list:
         """
@@ -87,41 +100,83 @@ class EmulatorEraser:
 
         return avds
 
-    def is_avd_running(self, name: str) -> bool:
+    def running_check(self, name: str) -> str | None:
         """
-        Check if AVD is currently running.
+        Why an erase of ``name`` must not proceed, or None when it may.
+
+        The answer is tri-state, and the third state is the whole finding (L4).
+        ``common.emu_console.avd_running`` reports RUNNING, NOT_RUNNING or
+        UNKNOWN; only NOT_RUNNING permits a wipe, and it is only returned when
+        *every* attached emulator said which AVD it is.
+
+        Four things used to make this answer False without knowing:
+
+        - The whole scan sat inside one ``try``, so the *first* failing console
+          query returned False with later emulators never examined.
+        - Only the literal state ``device`` counted, so a second emulator still
+          booting (``offline``) was read as absent.
+        - A failed ``adb devices`` was read as "nothing is running".
+        - The name test was ``name in reply.payload``, a substring, so it also
+          reported "running" for AVDs the console never named -- ``--name
+          Pixel`` could not be erased while an unrelated ``Pixel_9`` was up.
+          Equality on the unframed payload is what "this emulator IS that AVD"
+          means, and it lives in the shared probe now.
 
         Args:
             name: AVD name
 
         Returns:
-            True if running
+            A refusal naming its remedy, or None when no emulator is this AVD
+            and every emulator was identified.
+
+        A failed listing is one of the refusals rather than an exception: it is
+        the same class of answer, and an erase that stops has one shape.
         """
-        try:
-            result = adb_exec.run_adb("devices", None, check=True)
+        answer = avd_running(name)
 
-            # Check if any emulator is running with this AVD
-            for line in result.stdout.split("\n"):
-                if "emulator" in line and "device" in line:
-                    # Get emulator serial
-                    serial = line.split()[0]
-                    # Query AVD name through the console wrapper: it strips the
-                    # trailing "OK" the console frames every reply with, and a
-                    # `KO` -- which arrives at exit status 0 -- raises instead
-                    # of being read as a name.
-                    reply = run_emu("avd", "name", serial=serial)
-                    if name in reply.payload:
-                        return True
+        if answer.unavailable:
+            # Not even the list of emulators is known, so nothing at all has
+            # been established about this AVD (F2). Distinct from an emulator
+            # that WAS listed and would not answer, and said differently.
+            return (
+                f"Refusing to erase {name}: {answer.describe_unknown()}. Then "
+                f"retry, or pass --force to erase without the running check."
+            )
+        if answer.verdict is RunningVerdict.RUNNING:
+            return (
+                f"Refusing to erase {name}: it is running on {answer.serial}. "
+                f"Shut it down (emulator_shutdown.py --serial {answer.serial}) "
+                f"and retry, or pass --force to erase without the check."
+            )
+        if answer.verdict is RunningVerdict.UNKNOWN:
+            # The remedy order matters and was wrong: an emulator that is
+            # `offline` cannot be console-killed, so `emulator_shutdown --all`
+            # is not the first thing to try -- it is the thing that will not
+            # work. Restarting the emulator or the adb connection is.
+            return (
+                f"Refusing to erase {name}: an emulator is attached that could "
+                f"not be identified, so it may be this AVD. "
+                f"{answer.describe_unknown()}. Then retry, or pass --force to "
+                f"erase without the check."
+            )
+        return None
 
-            return False
+    def is_avd_running(self, name: str) -> bool:
+        """
+        Whether an erase of ``name`` must be refused because an emulator is up.
 
-        except adb_exec.AdbCommandError:
-            # adb reached a device and the command failed; that is not evidence
-            # the AVD is running. Device-level errors (offline / not found /
-            # more than one device) are deliberately NOT caught here: they mean
-            # the check never ran, and answering "not running" would let the
-            # erase wipe the user data of a live AVD. They surface at main().
-            return False
+        The boolean face of :meth:`running_check`: True means "do not wipe",
+        for the AVD being up *or* for an emulator that would not identify
+        itself. Callers wanting to tell a reader which of those it was should
+        use :meth:`running_check`, whose string says so.
+
+        Args:
+            name: AVD name
+
+        Returns:
+            True when the erase must not proceed.
+        """
+        return self.running_check(name) is not None
 
     def erase(
         self,
@@ -147,12 +202,14 @@ class EmulatorEraser:
         if name not in avds:
             return False, f"AVD not found: {name}"
 
-        # Check if running
-        if not force and self.is_avd_running(name):
-            return (
-                False,
-                f"AVD is currently running: {name}. Shut it down first or use --force.",
-            )
+        # Check if running. The refusal says WHICH of the two it is -- the AVD
+        # is up on a named serial, or an emulator would not identify itself --
+        # because claiming the first when only the second is known is how this
+        # script came to assert things it had not established (L4).
+        if not force:
+            refusal = self.running_check(name)
+            if refusal:
+                return False, refusal
 
         # Get AVD directory
         avd_home = self.get_avd_home()
@@ -260,16 +317,36 @@ class EmulatorEraser:
 
 def main():
     """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    parser = _build_parser()
+    args = parser.parse_args()
     try:
-        _run()
+        _run(parser, args)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy. Print it
         # rather than a traceback -- for an agent, stderr is the retry prompt.
+        #
+        # Parsed BEFORE the try so this handler knows whether --json was asked
+        # for. It did not, and a `--json` run that hit a RunningCheckError got
+        # exit 1 with prose on stderr and an EMPTY stdout -- an agent parsing
+        # stdout saw nothing at all where the contract promises {"error": ...}.
+        _fail(error, json_mode=args.json)
+
+
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
+    and got a sentence on stderr has an empty stdout to parse. Same signature as
+    `emulator_boot` and `emulator_selector`, which have had it since #15.
+    """
+    if json_mode:
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
         print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+    sys.exit(1)
 
 
-def _run():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Erase/Reset Android Virtual Devices to factory state",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -314,9 +391,10 @@ Examples:
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    return parser
 
-    args = parser.parse_args()
 
+def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     eraser = EmulatorEraser()
 
     # List operation
@@ -341,18 +419,21 @@ Examples:
         )
         total = succeeded + failed
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "action": "erase_all",
-                        "succeeded": succeeded,
-                        "failed": failed,
-                        "total": total,
-                        "results": results,
-                    },
-                    indent=2,
-                )
-            )
+            payload = {
+                "action": "erase_all",
+                "succeeded": succeeded,
+                "failed": failed,
+                "total": total,
+                "results": results,
+            }
+            if succeeded:
+                payload["snapshots"] = SNAPSHOT_NOTE
+            if failed:
+                # The batch keeps its per-AVD report AND carries the documented
+                # error key, so "every failing mode answers {"error": ...}" is
+                # true of this one too without losing what it found (F5).
+                payload["error"] = f"{failed} of {total} AVDs were not erased"
+            print(json.dumps(payload, indent=2))
         elif total == 0:
             print("No AVDs found")
         else:
@@ -360,13 +441,18 @@ Examples:
             if args.verbose:
                 for result in results:
                     print(f"  {result['message']}")
+            if succeeded:
+                print(SNAPSHOT_NOTE)
         sys.exit(0 if failed == 0 else 1)
 
     # Erase operation
     if not args.name:
-        print("Error: --name is required", file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        _fail(
+            "--name is required (or --all to erase every AVD, --list to see them)",
+            json_mode=args.json,
+        )
 
     if args.verbose:
         print(f"Erasing AVD: {args.name}")
@@ -375,12 +461,21 @@ Examples:
         args.name, force=args.force, verify=args.verify, timeout_seconds=args.timeout
     )
 
+    if not success:
+        # Every failing mode answers the same way (F5). This path emitted
+        # `{"success": false, "message": ...}`, so a caller checking for the
+        # documented `error` key found none and read a refusal as a result.
+        _fail(message, json_mode=args.json)
+
     if args.json:
-        print(json.dumps({"success": success, "message": message}, indent=2))
+        print(
+            json.dumps({"success": True, "message": message, "snapshots": SNAPSHOT_NOTE}, indent=2)
+        )
     else:
         print(message)
+        print(SNAPSHOT_NOTE)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -306,11 +306,15 @@ def run_emu_call_sites() -> list[Site]:
     list is also what a detector that has stopped working returns. This one
     names the sites that must be there.
 
-    A count alone was not enough -- reviewed and rejected. Nine found against a
-    floor of six accepts three of them vanishing silently, which is exactly the
-    "a capability was migrated and then quietly dropped" case the enumeration
-    style exists for. So this is compared as an exact multiset, like the bypass
-    enumeration.
+    A count alone was not enough -- reviewed and rejected. A floor accepts
+    sites vanishing silently, which is exactly the "a capability was migrated
+    and then quietly dropped" case the enumeration style exists for. So this is
+    compared as an exact multiset, like the bypass enumeration.
+
+    The census is six sites, not the nine it was when this was written: R3
+    collapsed four hand-rolled "which AVD is this serial?" resolvers into one
+    ``identify_emulator``. KNOWN_CONSOLE_CALLS is the count that matters; a
+    number in prose here goes stale silently, which this one did.
     """
     sites: list[Site] = []
     for path in _script_files():
@@ -326,22 +330,32 @@ def run_emu_call_sites() -> list[Site]:
     return sorted(sites, key=lambda site: (site.file, site.line))
 
 
-# Every console call in the skill, by file and function. The first six after
-# emu_console's own are the L7 sites -- the ones this PR migrated, and the ones
-# a later refactor could quietly drop while the bypass guard still reported
-# "all clear". sms and snapshot were already correct and are the
-# false-positive control: the fix must not look like the defect, and the
-# sanctioned call must not go missing either.
+# Every console call in the skill, by file and function. sms and snapshot were
+# already correct before L7 and are the false-positive control: the fix must not
+# look like the defect, and the sanctioned call must not go missing either.
+#
+# R3 removed four of these, and the removal is the point rather than a side
+# effect. Each of the four asked the same question -- "which AVD is this
+# serial?" -- with its own console call, its own timeout and its own idea of
+# what a failure means:
+#
+#   emulator_boot.py       _get_avd_name_for_serial   caught AdbError    -> None
+#   emulator_erase.py      is_avd_running             caught AdbCommandError/
+#                                                     EmuConsoleError    -> False
+#   emulator_selector.py   _avd_name_for_serial       caught EmuConsoleError only
+#   emulator_shutdown.py   get_avd_name_for_serial    caught bare Exception -> None
+#
+# Four answers to one question, and every one of them collapsed "I could not
+# ask" into "it is not that AVD" -- which authorised a wipe, a second instance
+# of a live AVD, and a confident "nothing to shut down". They are now one
+# `identify_emulator` whose failure is a value the caller has to look at.
 KNOWN_CONSOLE_CALLS: tuple[Expectation, ...] = (
-    Expectation("common/emu_console.py", "console_available", CONSOLE_CALL),  # :198
-    Expectation("emulator_boot.py", "_get_avd_name_for_serial", CONSOLE_CALL),  # :226
-    Expectation("emulator_erase.py", "is_avd_running", CONSOLE_CALL),  # :112
-    Expectation("emulator_selector.py", "_avd_name_for_serial", CONSOLE_CALL),  # :341
-    Expectation("emulator_shutdown.py", "shutdown", CONSOLE_CALL),  # :94
-    Expectation("emulator_shutdown.py", "get_avd_name_for_serial", CONSOLE_CALL),  # :162
-    Expectation("location.py", "_run_geo_fix", CONSOLE_CALL),  # :261
-    Expectation("sms.py", "send", CONSOLE_CALL),  # :329
-    Expectation("snapshot.py", "_console", CONSOLE_CALL),  # :402
+    Expectation("common/emu_console.py", "identify_emulator", CONSOLE_CALL),
+    Expectation("common/emu_console.py", "console_available", CONSOLE_CALL),
+    Expectation("emulator_shutdown.py", "shutdown", CONSOLE_CALL),
+    Expectation("location.py", "_run_geo_fix", CONSOLE_CALL),
+    Expectation("sms.py", "send", CONSOLE_CALL),
+    Expectation("snapshot.py", "_console", CONSOLE_CALL),
 )
 
 

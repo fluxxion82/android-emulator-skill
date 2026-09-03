@@ -20,7 +20,7 @@ import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import run_emu
+from common.emu_console import avd_name_for_serial, survey_emulators
 from common.env_config import env_float, env_int
 from common.sdk_tools import (
     EMULATOR_NOT_FOUND_MESSAGE,
@@ -73,19 +73,52 @@ class EmulatorBooter:
 
         start_time = time.time()
 
-        # Check if already booted
-        devices = get_connected_devices()
-        emulators = [d for d in devices if d["type"] == "emulator" and d["state"] == "device"]
-        if emulators:
-            # Check if this AVD is already running by checking emulator name
-            for emu in emulators:
-                emu_avd = self._get_avd_name_for_serial(emu["serial"])
-                if emu_avd == self.avd_name:
-                    elapsed = time.time() - start_time
-                    return True, (
-                        f"Emulator already booted: {self.avd_name} "
-                        f"({emu['serial']}) [checked in {elapsed:.1f}s]"
-                    )
+        # Check if already booted. The probe is tri-state (L4/R3): an emulator
+        # that will not say which AVD it is used to be filtered out here --
+        # non-`device` state, or a console query that failed -- and filtering
+        # it out is indistinguishable from it not being there. Launching a
+        # second instance of an AVD that is already up corrupts its userdata,
+        # which is the defect the already-booted short-circuit exists to
+        # prevent, so an unidentified emulator stops the boot instead.
+        # The listing stays on this module's own seam (get_connected_devices);
+        # only the console question is centralised. It is passed as a CALLABLE
+        # so a failed listing comes back as a value rather than escaping as an
+        # uncaught RuntimeError -- which is what it did, from the one module
+        # family whose job is turning adb failures into remedies (F2).
+        survey = survey_emulators(get_connected_devices, timeout=PROBE_TIMEOUT_SECONDS)
+        if survey.unavailable:
+            return False, (
+                f"Refusing to boot {self.avd_name}: {survey.describe_gap()}. Until "
+                f"the running emulators can be listed, a boot may start a second "
+                f"instance of an AVD that is already up, which corrupts its userdata."
+            )
+
+        for probe in survey.probes:
+            if probe.avd_name == self.avd_name:
+                elapsed = time.time() - start_time
+                return True, (
+                    f"Emulator already booted: {self.avd_name} "
+                    f"({probe.serial}) [checked in {elapsed:.1f}s]"
+                )
+
+        unidentified = survey.unidentified
+        if unidentified:
+            # The remedy order is the shared one, and it matters (F3): the
+            # first version said "shut that emulator down" first, which for a
+            # stale `offline` emulator needs the very console that is not
+            # answering. Killing the process is the thing that actually works.
+            #
+            # Returned only, not also warned on stderr: since F2 every failure
+            # goes out through `_fail`, so a second copy on stderr was the same
+            # sentence twice.
+            return False, (
+                f"Refusing to boot {self.avd_name}: {survey.describe_gap()}. "
+                f"Terminate the stale emulator process itself before retrying "
+                f"(`pkill -f 'qemu-system.*{self.avd_name}'`, or quit it from "
+                f"Android Studio's Device Manager) -- `emulator_shutdown` cannot "
+                f"reach a console that is not answering. It may already be this "
+                f"AVD, and a second instance of one AVD corrupts its userdata."
+            )
 
         # Resolve the emulator binary. Exec'ing the bare name is unsafe: with
         # the SDK root on PATH it hits the <sdk>/emulator directory and raises
@@ -215,23 +248,14 @@ class EmulatorBooter:
         Returns:
             AVD name, or None if not found
         """
-        try:
-            # Through run_emu, not a hand-rolled `adb emu`: the console
-            # terminates every reply with its own "OK" line, so the raw response
-            # is "Pixel_9\r\nOK\r\n". Stripping alone leaves "Pixel_9\nOK",
-            # which never equalled the AVD name -- so the already-booted
-            # short-circuit was dead and a second emulator got spawned for an
-            # AVD that was already running (defect S5). run_emu removes the
-            # framing, and answers a `KO` with an exception instead of a name.
-            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
-            lines = reply.lines
-            return lines[0] if lines else None
-        except adb_exec.AdbError:
-            # Same reasoning as _is_boot_completed: an emulator that has not
-            # finished booting cannot answer its console yet. EmuConsoleError
-            # subclasses AdbError, so a `KO` and a no-console device land here
-            # too -- both mean "no name to be had", which is what None says.
-            return None
+        # Delegates to the one probe in common/emu_console.py. This function
+        # used to hold its own copy of the console call, its own timeout and
+        # its own idea of what a failure means -- as did the same function in
+        # emulator_erase, emulator_selector and emulator_shutdown, and the four
+        # disagreed. The lossy None is kept here because callers of THIS
+        # helper only want a name; boot() itself reads the probe, so it can
+        # tell "not this AVD" from "would not say".
+        return avd_name_for_serial(serial, timeout=PROBE_TIMEOUT_SECONDS)
 
     @staticmethod
     def boot_all(headless: bool = False) -> tuple[int, int, list[dict]]:
@@ -324,22 +348,26 @@ def main():
     The net, not the handler: modes are dispatched under a try that knows
     whether ``--json`` was asked for (see :func:`_run`).
     """
+    parser = _build_parser()
+    args = parser.parse_args()
     try:
-        _run()
+        _run(parser, args)
     except SdkToolError as error:
         # AVD discovery could not run. Reported as a failure, never as an empty
         # listing: an agent reading "No AVDs found" cannot tell that from a
         # host where the SDK is not installed (X3).
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        _fail(error, json_mode=args.json)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy ("pass
         # --serial ...", "start an emulator ..."). That message is the point.
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        #
+        # Parsed BEFORE the try so these handlers know whether --json was asked
+        # for; they did not, and answered a --json caller with prose on stderr
+        # and an empty stdout (R1's shape, F2's instruction for this script).
+        _fail(error, json_mode=args.json)
 
 
-def _run():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Boot Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -384,7 +412,11 @@ Examples:
     parser.add_argument("--list-avds", action="store_true", help="List available AVDs")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
-    args = parser.parse_args()
+    return parser
+
+
+def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     try:
         _dispatch(parser, args)
     except (SdkToolError, adb_exec.AdbError) as error:
@@ -447,19 +479,22 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         wait_ready=args.wait_ready, timeout_seconds=args.timeout, headless=args.headless
     )
 
-    if args.json:
-        import json
+    if not success:
+        # A refused boot is a failing mode like any other (F2/F5): one shape,
+        # `{"error": ...}` under --json and `Error: ` on stderr otherwise.
+        _fail(message, json_mode=args.json)
 
+    if args.json:
         print(
             json.dumps(
-                {"success": success, "message": message, "avd": args.avd, "action": "boot"},
+                {"success": True, "message": message, "avd": args.avd, "action": "boot"},
                 indent=2,
             )
         )
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

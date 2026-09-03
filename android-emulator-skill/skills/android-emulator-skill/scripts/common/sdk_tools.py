@@ -82,6 +82,48 @@ def get_android_sdk_root() -> str | None:
     return os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
 
 
+# What to tell someone whose AVDs are not where :func:`resolve_avd_home` looked.
+# Named separately so the two destructive scripts quote the same remedy.
+AVD_HOME_REMEDY = (
+    "set ANDROID_AVD_HOME to the directory that holds your .avd directories, "
+    "or ANDROID_SDK_HOME to its .android parent"
+)
+
+
+def resolve_avd_home() -> Path:
+    """Where this host keeps its ``<name>.avd`` directories.
+
+    Resolved in ``avdmanager``'s own order, which is not the obvious one:
+
+    1. ``$ANDROID_AVD_HOME`` -- the directory of ``.avd`` directories itself.
+    2. ``$ANDROID_SDK_HOME`` -- the *parent of* ``.android``, so the AVDs are a
+       further ``.android/avd`` down. Missing this one is L5: two scripts read
+       only ``ANDROID_AVD_HOME`` and then fell through to the home directory,
+       so on a host that relocates the AVD tree (CI images do) they looked
+       somewhere the AVDs are not, found no directory to stat, and -- in
+       ``emulator_delete --old`` -- ranked every AVD as equally ancient.
+    3. ``~/.android/avd``.
+
+    Note this is deliberately NOT under the SDK root: ``ANDROID_SDK_HOME`` is a
+    user-data location despite the name, which is why it is resolved here and
+    not through :func:`get_android_sdk_root`.
+
+    Returns:
+        The AVD home. It is not checked for existence -- "does this host even
+        have one" is the caller's question, and the two callers answer it
+        differently.
+    """
+    avd_home = os.environ.get("ANDROID_AVD_HOME")
+    if avd_home:
+        return Path(avd_home)
+
+    sdk_home = os.environ.get("ANDROID_SDK_HOME")
+    if sdk_home:
+        return Path(sdk_home) / ".android" / "avd"
+
+    return Path.home() / ".android" / "avd"
+
+
 def resolve_sdk_tool(tool: str, sdk_subdirs: Iterable[str]) -> str | None:
     """
     Resolve an SDK tool to an executable file path.

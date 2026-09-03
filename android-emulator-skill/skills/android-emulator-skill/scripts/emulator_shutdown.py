@@ -19,12 +19,20 @@ Tunables (env, ANDROID_EMU_ prefix):
 """
 
 import argparse
+import json
 import sys
 import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import run_emu
+from common.emu_console import (
+    EmulatorProbeError,
+    RunningVerdict,
+    avd_name_for_serial,
+    avd_running,
+    run_emu,
+    survey_emulators,
+)
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -58,7 +66,7 @@ class EmulatorShutdown:
             (success, message) tuple
         """
         if not self.serial:
-            return False, "Error: Device serial not specified"
+            return False, "Device serial not specified"
 
         start_time = time.time()
 
@@ -66,7 +74,7 @@ class EmulatorShutdown:
         devices = get_connected_devices()
         device = next((d for d in devices if d["serial"] == self.serial), None)
         if not device:
-            return False, f"Error: Device {self.serial} not found"
+            return False, f"Device {self.serial} not found"
 
         # Refuse a handset BEFORE issuing anything. `--all` and `--name` already
         # filter on type; `--serial` did not, and `adb emu kill` fails on a
@@ -74,7 +82,7 @@ class EmulatorShutdown:
         # `adb shell reboot -p` and power off whatever phone was plugged in.
         if device["type"] != "emulator":
             return False, (
-                f"Error: {self.serial} is a physical device, not an emulator. "
+                f"{self.serial} is a physical device, not an emulator. "
                 f"This script only stops emulators and will not power off a "
                 f"handset. Disconnect the device, or pass an emulator serial "
                 f"(emulator-NNNN)."
@@ -149,28 +157,19 @@ def get_avd_name_for_serial(serial: str) -> str | None:
     """
     Get the AVD name for a running emulator serial.
 
-    Uses the emulator console (`adb -s <serial> emu avd name`), mirroring the
-    boot path's resolution so a name supplied to --name maps to the same serial.
+    Delegates to the one probe in :mod:`common.emu_console`. This function held
+    its own console call and caught bare ``Exception``; three sibling scripts
+    held their own, and the four disagreed about what a failure means (R3).
 
     Args:
         serial: Emulator serial (e.g., "emulator-5554")
 
     Returns:
-        AVD name, or None if it cannot be determined.
+        AVD name, or None if it cannot be determined. Callers that must not act
+        on "cannot be determined" should use :func:`resolve_target_by_avd_name`,
+        which keeps the reason.
     """
-    try:
-        reply = run_emu("avd", "name", serial=serial, timeout=CONSOLE_NAME_TIMEOUT)
-    except Exception:
-        # Unchanged from the hand-rolled version: a serial that cannot be
-        # resolved to a name is "unknown", not an error -- the caller is
-        # matching --name against every attached emulator, and one that will
-        # not answer simply does not match.
-        return None
-
-    # run_emu has already removed the trailing "OK" the console frames its
-    # replies with; the first payload line is the name.
-    lines = reply.lines
-    return lines[0] if lines else None
+    return avd_name_for_serial(serial, timeout=CONSOLE_NAME_TIMEOUT)
 
 
 def resolve_serial_by_avd_name(avd_name: str) -> str | None:
@@ -181,18 +180,46 @@ def resolve_serial_by_avd_name(avd_name: str) -> str | None:
         avd_name: AVD name (e.g., "Pixel_5_API_33")
 
     Returns:
-        The matching emulator serial, or None if no running emulator uses it.
+        The matching emulator serial, or None if no running emulator uses it --
+        which does NOT distinguish "no emulator is that AVD" from "an emulator
+        would not say". :func:`resolve_target_by_avd_name` does.
 
     Raises:
         adb_exec.AdbError: If adb cannot be run or the device query fails. Left
             to propagate to ``main``, which prints the error's own remedy.
     """
-    devices = get_connected_devices()
-    emulators = [d for d in devices if d["type"] == "emulator" and d["state"] == "device"]
-    for emu in emulators:
-        if get_avd_name_for_serial(emu["serial"]) == avd_name:
-            return emu["serial"]
-    return None
+    return resolve_target_by_avd_name(avd_name)[0]
+
+
+def resolve_target_by_avd_name(avd_name: str) -> tuple[str | None, str | None]:
+    """
+    Resolve ``avd_name`` to a serial, or say why it could not be resolved.
+
+    A shutdown is destructive, so "I did not find it" and "I could not look"
+    must not be the same answer (R3). They were: every emulator that would not
+    answer its console was skipped, so `--name X` on a host with a wedged
+    emulator reported "no running emulator found for AVD name X" -- a confident
+    negative over a device nobody had managed to ask.
+
+    Args:
+        avd_name: AVD name (e.g., "Pixel_5_API_33")
+
+    Returns:
+        ``(serial, None)`` when an emulator identified itself as this AVD;
+        ``(None, None)`` when every emulator answered and none of them is it;
+        ``(None, reason)`` when at least one emulator could not be identified,
+        so the negative cannot be trusted.
+
+    """
+    # The listing stays on this module's own seam, which is where its tests
+    # stub it -- passed as a CALLABLE so a failure comes back as a value
+    # instead of escaping as an uncaught RuntimeError (F2).
+    answer = avd_running(avd_name, get_connected_devices, timeout=CONSOLE_NAME_TIMEOUT)
+    if answer.verdict is RunningVerdict.RUNNING:
+        return answer.serial, None
+    if answer.verdict is RunningVerdict.UNKNOWN:
+        return None, answer.describe_unknown()
+    return None, None
 
 
 def shutdown_all_emulators(verify: bool = False) -> tuple:
@@ -209,8 +236,15 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
         adb_exec.AdbError: If adb cannot be run or the device query fails. Left
             to propagate to ``main``, which prints the error's own remedy.
     """
-    devices = get_connected_devices()
-    emulators = [d for d in devices if d["type"] == "emulator"]
+    # Through the survey, so a listing failure is a typed AdbError rather than
+    # the BARE RuntimeError get_connected_devices re-wraps it as -- which is not
+    # an AdbError, so it escaped main's handler and reached the user as a
+    # traceback, from the module family whose job is turning adb failures into
+    # remedies (F2).
+    survey = survey_emulators(get_connected_devices)
+    if survey.unavailable:
+        raise EmulatorProbeError(survey.unavailable)
+    emulators = [{"serial": probe.serial} for probe in survey.probes]
 
     success_count = 0
     fail_count = 0
@@ -228,16 +262,36 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
 
 def main():
     """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    parser = _build_parser()
+    args = parser.parse_args()
     try:
-        _run()
+        _run(parser, args)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy ("pass
         # --serial ...", "start an emulator ..."). That message is the point.
+        #
+        # Parsed BEFORE the try so this handler knows whether --json was asked
+        # for. It did not, so `--all --json` against a broken adb exited 1 with
+        # prose on stderr and an EMPTY stdout -- the same defect R1 fixed in
+        # emulator_erase, still live here (F1).
+        _fail(error, json_mode=args.json)
+
+
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
+    and got a sentence on stderr has an empty stdout to parse. Same signature as
+    `emulator_boot` and `emulator_selector`, which have had it since #15.
+    """
+    if json_mode:
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
         print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+    sys.exit(1)
 
 
-def _run():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Shutdown Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -285,15 +339,15 @@ Examples:
     )
     parser.add_argument("--all", action="store_true", help="Shutdown all emulators")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    return parser
 
-    args = parser.parse_args()
 
+def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     # Shutdown all mode
     if args.all:
         success_count, fail_count = shutdown_all_emulators(verify=args.verify)
         if args.json:
-            import json
-
             print(
                 json.dumps(
                     {
@@ -314,41 +368,38 @@ Examples:
     # Resolve target serial: explicit --serial wins; otherwise resolve --name.
     serial = args.serial
     if not serial and args.name:
-        serial = resolve_serial_by_avd_name(args.name)
+        serial, unknown = resolve_target_by_avd_name(args.name)
         if not serial:
-            message = f"Error: No running emulator found for AVD name '{args.name}'"
-            if args.json:
-                import json
-
-                print(
-                    json.dumps(
-                        {
-                            "success": False,
-                            "message": message,
-                            "name": args.name,
-                            "action": "shutdown",
-                        },
-                        indent=2,
-                    )
-                )
-            else:
-                print(message, file=sys.stderr)
-            sys.exit(1)
+            # "I could not look" is reported as itself, never as a confident
+            # "nothing to shut down" (R3).
+            # Through the one failure helper, like every other failing mode:
+            # this path answered `{"success": false, "message": ...}`, so a
+            # caller checking for the documented `error` key found none (F5).
+            _fail(
+                (
+                    f"cannot tell whether '{args.name}' is running: {unknown}"
+                    if unknown
+                    else f"No running emulator found for AVD name '{args.name}'"
+                ),
+                json_mode=args.json,
+            )
 
     # Single device mode
     if not serial:
-        parser.print_help()
-        print("\nError: --serial or --name is required (or use --all)", file=sys.stderr)
-        sys.exit(1)
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        _fail("--serial or --name is required (or use --all)", json_mode=args.json)
 
     shutdown = EmulatorShutdown(serial)
     success, message = shutdown.shutdown(verify=args.verify, timeout_seconds=args.timeout)
 
-    if args.json:
-        import json
+    if not success:
+        # One failure shape for every mode (F5).
+        _fail(message, json_mode=args.json)
 
+    if args.json:
         payload = {
-            "success": success,
+            "success": True,
             "message": message,
             "serial": serial,
             "action": "shutdown",
@@ -359,7 +410,7 @@ Examples:
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
