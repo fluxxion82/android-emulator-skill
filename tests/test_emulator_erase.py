@@ -387,7 +387,16 @@ def test_a_successful_erase_says_snapshots_were_kept(monkeypatch, tmp_path, caps
     """
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     _make_avd(tmp_path, "Pixel_9")
-    monkeypatch.setattr(emulator_erase.EmulatorEraser, "is_avd_running", lambda _self, _name: False)
+    # running_check, not is_avd_running: erase() consults the former, and
+    # patching the boolean wrapper left the real probe running -- which passed
+    # locally, where adb is on PATH, and failed on a runner where it is not. A
+    # unit test reaching adb at all is the bug; the exit status only showed it.
+    monkeypatch.setattr(emulator_erase.EmulatorEraser, "running_check", lambda _self, _name: None)
+
+    def _no_adb(*_args, **_kwargs):
+        raise AssertionError("a unit test reached the adb boundary")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _no_adb)
     monkeypatch.setattr(emulator_erase.sys, "argv", ["emulator_erase.py", "--name", "Pixel_9"])
 
     with pytest.raises(SystemExit) as exc:
