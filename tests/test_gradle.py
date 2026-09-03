@@ -86,6 +86,86 @@ def test_parse_junit_xml_empty_and_malformed():
     assert parse_junit_xml("not xml <<<")["total"] == 0
 
 
+# --- the same parser, against XML a real Gradle run produced -----------------
+#
+# The literals above are hand-written, and recording the real thing showed one
+# of their assumptions to be wrong: they model a setup exception as an
+# `<error>` element, and Gradle does not emit one. See
+# tests/fixtures/scaffold/compile/junit-error, whose @Before throws.
+
+
+def test_parse_junit_xml_reads_a_real_gradle_report(recorded_gradle):
+    """The counts must come out right on XML nobody wrote by hand."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_error_case"))
+
+    assert result["total"] == 2, "both testcases are listed even though neither body ran"
+    assert result["failed"] == 2
+    assert result["passed"] == 0
+
+
+def test_a_throwing_setup_is_reported_as_failure_not_error(recorded_gradle):
+    """MEASURED: Gradle writes <failure> for a @Before that throws.
+
+    The obvious guess — that an exception outside an assertion becomes
+    `<error>` — is wrong, and the hand-written sample in this file encodes the
+    guess. A parser that located setup failures by looking for `<error>` would
+    find none here and report the class as green.
+    """
+    xml = recorded_gradle("junit_xml_error_case")
+    assert 'errors="0"' in xml, "the recording no longer supports this claim"
+    assert "<failure" in xml
+    assert "<error" not in xml
+
+    result = parse_junit_xml(xml)
+    assert result["errors"] == 0
+    names = {t["test_name"] for t in result["failed_tests"]}
+    assert names == {
+        "com.example.BeforeThrowsTest.erroredBySetup",
+        "com.example.BeforeThrowsTest.alsoErroredBySetup",
+    }
+    for test in result["failed_tests"]:
+        assert "fixture setup failed on purpose" in test["failure_message"]
+
+
+def test_ignore_failures_makes_the_build_log_claim_success(recorded_gradle):
+    """Why the XML has to be read at all: the log says the build succeeded.
+
+    With `ignoreFailures = true` the same run that produced two failing tests
+    prints BUILD SUCCESSFUL and exits 0. Anything deciding test outcome from
+    the build log or the exit status is told everything passed.
+    """
+    log = recorded_gradle("gradle_junit_error_ignorefailures")
+    assert "BUILD SUCCESSFUL" in log
+    assert "3 tests completed, 2 failed" in log
+    assert "BUILD FAILED" not in log
+
+    # Two tests failed, and the build-output parser reports no failed task and
+    # no error, because from the log's point of view nothing went wrong. The
+    # test outcome is recoverable only from the JUnit XML.
+    parsed = parse_build_output(log, "")
+    assert parsed["failed_tasks"] == []
+    assert parsed["errors"] == []
+
+
+def test_a_configuration_failure_reports_a_file_and_line(recorded_gradle):
+    """D8: `* Where:` is the only Gradle failure block that carries a location.
+
+    Every other recorded failure has no `* Where:` section at all, so a parser
+    that only knows `* What went wrong:` discards file and line on exactly the
+    failures that have them.
+    """
+    log = recorded_gradle("gradle_where_block")
+    assert "* Where:" in log
+    assert "build.gradle' line: 11" in log
+    assert "Could not find method implementaion()" in log
+
+    for other in ("gradle_javac_compile_error", "gradle_task_not_found"):
+        assert "* Where:" not in recorded_gradle(other), (
+            f"{other} now has a `* Where:` block too, which changes what this "
+            f"fixture is contrasting against"
+        )
+
+
 def test_find_and_aggregate_test_results(tmp_path: Path):
     # Standard Gradle layout: <module>/build/test-results/<task>/TEST-*.xml
     results_dir = tmp_path / "app" / "build" / "test-results" / "testDebugUnitTest"

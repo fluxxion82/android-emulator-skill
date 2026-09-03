@@ -1,0 +1,35 @@
+
+> Configure project :kotlin-error
+w: ⚠️ Deprecated Gradle Version
+The used Gradle version (Gradle 8.13) is deprecated and will not be supported in future Kotlin Gradle Plugin releases.
+The minimum supported Gradle version will become Gradle 8.14.4 in Kotlin 2.5.0.
+
+This warning can be suppressed in 'gradle.properties':
+    kotlin.suppressGradlePluginWarnings=DeprecatedGradleVersionWarning
+Solution: Please update the Gradle version to at least Gradle 8.14.4.
+
+
+> Task :junit-error:compileJava NO-SOURCE
+> Task :junit-error:processResources NO-SOURCE
+> Task :junit-error:classes UP-TO-DATE
+> Task :junit-error:compileTestJava
+> Task :junit-error:processTestResources NO-SOURCE
+> Task :junit-error:testClasses
+
+> Task :junit-error:test
+
+BeforeThrowsTest > erroredBySetup FAILED
+    java.lang.IllegalStateException at BeforeThrowsTest.java:32
+
+BeforeThrowsTest > alsoErroredBySetup FAILED
+    java.lang.IllegalStateException at BeforeThrowsTest.java:32
+
+PassingTest > passes PASSED
+There were failing tests. See the report at: file:///scaffold/junit-error/build/reports/tests/test/index.html
+
+[Incubating] Problems report is available at: file:///scaffold/build/reports/problems/problems-report.html
+
+BUILD SUCCESSFUL in 0s
+1 actionable tasks: 2 executed
+
+3 tests completed, 2 failed

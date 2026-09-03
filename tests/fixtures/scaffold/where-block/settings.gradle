@@ -1,0 +1,9 @@
+// A scaffold with exactly one job: fail during CONFIGURATION rather than during
+// a task, so Gradle emits the `* Where:` section of its failure report.
+//
+// It is a separate root rather than a subproject of `compile` because Gradle
+// configures every included project before running anything. A broken
+// build.gradle inside `compile` would therefore fail :java-error:compileJava
+// and every other fixture recorded from that scaffold — the fixture would take
+// the rest of the corpus down with it.
+rootProject.name = 'where-block-scaffold'

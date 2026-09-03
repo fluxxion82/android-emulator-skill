@@ -45,6 +45,8 @@ from pathlib import Path
 SCAFFOLDS = Path(__file__).resolve().parent / "fixtures" / "scaffold"
 FLAVORED = SCAFFOLDS / "flavored"
 COMPILE = SCAFFOLDS / "compile"
+WHERE_BLOCK = SCAFFOLDS / "where-block"
+ALL_SCAFFOLDS = (FLAVORED, COMPILE, WHERE_BLOCK)
 RECORDED_ROOT = Path(__file__).resolve().parent / "fixtures" / "recorded"
 
 GRADLE_TIMEOUT = 300
@@ -64,6 +66,12 @@ class GradleFixture:
             compiler output: an UP-TO-DATE task recompiles nothing and so
             prints no diagnostic, and a fixture recorded from that run would
             be an empty file that looks like a clean build.
+        artifact: Optional path, relative to ``scaffold``, of a file the build
+            *produces*. When set, that file is recorded instead of the build
+            log. Needed because the JUnit XML a results parser consumes is
+            written to disk by the test runner and never printed, so no amount
+            of capturing stdout can reach it.
+        ext: Extension for the recorded file. ``xml`` for produced artifacts.
     """
 
     name: str
@@ -72,6 +80,8 @@ class GradleFixture:
     catches: tuple[str, ...] = ()
     scaffold: Path = FLAVORED
     rerun: bool = False
+    artifact: str | None = None
+    ext: str = "txt"
 
 
 FIXTURES: list[GradleFixture] = [
@@ -182,6 +192,60 @@ FIXTURES: list[GradleFixture] = [
             "deprecates and calls its own method."
         ),
     ),
+    GradleFixture(
+        name="gradle_junit_error_ignorefailures",
+        args=[":junit-error:test"],
+        scaffold=COMPILE,
+        rerun=True,
+        description=(
+            "A test run with two erroring tests and one passing one, under "
+            "`test { ignoreFailures = true }`. The log says "
+            "'3 tests completed, 2 failed' and then **BUILD SUCCESSFUL**, and "
+            "gradle exits 0. That pairing is the fixture's point: a caller that "
+            "reads the exit status, or greps for 'BUILD FAILED', concludes the "
+            "suite passed. Only the JUnit XML (junit_xml_error_case.xml, "
+            "recorded from the same run) carries the truth."
+        ),
+        catches=("X7", "D2"),
+    ),
+    GradleFixture(
+        name="junit_xml_error_case",
+        args=[":junit-error:test"],
+        scaffold=COMPILE,
+        rerun=True,
+        artifact="junit-error/build/test-results/test/TEST-com.example.BeforeThrowsTest.xml",
+        ext="xml",
+        description=(
+            "The JUnit XML for a class whose @Before throws — the real thing, "
+            "which no test in this repo had. Measured shape, and it contradicts "
+            'the obvious guess: the suite carries failures="2" errors="0" and '
+            'each testcase holds a <failure type="java.lang.IllegalStateException"> '
+            "element. There is no <error> element, even though the exception came "
+            "from setup rather than from an assertion, so a parser keying on "
+            "<error> to find setup failures finds none. Both testcases are still "
+            "listed by name although neither body ran, and each carries the same "
+            "stack trace rooted at setUp. hostname/timestamp/time are normalised "
+            "by the recorder (see _scrub): Gradle writes the recording machine's "
+            "hostname into every testsuite element."
+        ),
+        catches=("X7", "D2"),
+    ),
+    GradleFixture(
+        name="gradle_where_block",
+        args=["help"],
+        scaffold=WHERE_BLOCK,
+        description=(
+            "A configuration-time failure, which is the only Gradle failure "
+            "shape that reports a LOCATION. `implementaion` (a typo for "
+            "`implementation`) makes Gradle emit a `* Where:` section naming the "
+            "build file and the line number, above the usual `* What went "
+            "wrong:` block. Every other recorded failure here has no `* Where:` "
+            "at all, so a parser that only knows the `* What went wrong:` shape "
+            "throws away the file and line on precisely the failures that have "
+            "one."
+        ),
+        catches=("D8",),
+    ),
 ]
 
 
@@ -222,20 +286,31 @@ def _scrub(text: str) -> str:
 
     Durations and absolute paths change every run and would make every
     re-record a noisy diff, hiding the format changes that actually matter.
-    Both scaffold roots are replaced, which also normalises the ``file://`` URI
+    Every scaffold root is replaced, which also normalises the ``file://`` URI
     K2 emits — ``file:///Users/<someone>/…`` becomes ``file:///scaffold/…`` —
     so a developer's account name never reaches this public repository.
+
+    The JUnit XML added three more that MUST be scrubbed, and the first is not
+    cosmetic: Gradle stamps every ``<testsuite>`` with
+    ``hostname="<machine>.local"``, which on a personal laptop is the owner's
+    name. It is written into the file by the test runner, so the package-name
+    redaction that guards the adb corpus never sees it. ``timestamp`` and the
+    per-test ``time`` are wall-clock values that would otherwise change on
+    every re-record.
     """
     text = re.sub(r"in \d+m?s\b", "in 0s", text)
     text = re.sub(r"\d+ actionable task", "1 actionable task", text)
-    for scaffold in (FLAVORED, COMPILE):
+    text = re.sub(r'hostname="[^"]*"', 'hostname="build-host"', text)
+    text = re.sub(r'timestamp="[^"]*"', 'timestamp="2020-01-01T00:00:00Z"', text)
+    text = re.sub(r'time="[\d.]+"', 'time="0.0"', text)
+    for scaffold in ALL_SCAFFOLDS:
         text = text.replace(str(scaffold), "/scaffold")
     return text
 
 
 def record(gradle: str) -> int:
     """Record every Gradle fixture and write the manifest."""
-    for scaffold in (FLAVORED, COMPILE):
+    for scaffold in ALL_SCAFFOLDS:
         if not scaffold.exists():
             print(f"scaffold missing: {scaffold}", file=sys.stderr)
             return 1
@@ -246,8 +321,22 @@ def record(gradle: str) -> int:
 
     entries = []
     for fixture in FIXTURES:
-        text = _scrub(_run(gradle, fixture))
-        path = out_dir / f"{fixture.name}.txt"
+        log = _run(gradle, fixture)
+        if fixture.artifact is None:
+            text = _scrub(log)
+        else:
+            # The build had to run to produce it, but what gets recorded is the
+            # file the build WROTE, not what it printed.
+            produced = fixture.scaffold / fixture.artifact
+            if not produced.exists():
+                print(
+                    f"  FAIL  {fixture.name}: {fixture.artifact} was not "
+                    f"produced. The build printed:\n{log[-2000:]}",
+                    file=sys.stderr,
+                )
+                return 1
+            text = _scrub(produced.read_text(encoding="utf-8"))
+        path = out_dir / f"{fixture.name}.{fixture.ext}"
         path.write_text(text, encoding="utf-8")
         entries.append(
             {
@@ -259,6 +348,7 @@ def record(gradle: str) -> int:
                     + " ".join(fixture.args)
                 ),
                 "scaffold": f"tests/fixtures/scaffold/{fixture.scaffold.name}",
+                "produced_artifact": fixture.artifact,
                 "description": fixture.description,
                 "catches": list(fixture.catches),
                 "bytes": len(text.encode("utf-8")),
@@ -270,10 +360,12 @@ def record(gradle: str) -> int:
         "profile": f"gradle-{version}",
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "gradle_version": version,
-        "scaffolds": ["tests/fixtures/scaffold/flavored", "tests/fixtures/scaffold/compile"],
+        "scaffolds": [f"tests/fixtures/scaffold/{s.name}" for s in ALL_SCAFFOLDS],
         "note": (
             "Durations and absolute paths are normalised so a re-record diffs "
-            "only on real format changes."
+            "only on real format changes. The JUnit XML additionally has its "
+            "hostname, timestamp and per-test time normalised: Gradle writes "
+            "the recording machine's hostname into every testsuite element."
         ),
         "fixtures": entries,
     }
