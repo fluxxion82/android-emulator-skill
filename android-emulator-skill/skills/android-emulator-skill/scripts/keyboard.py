@@ -50,11 +50,32 @@ DEFAULT_KEY_COUNT = env_int("ANDROID_EMU_KEYBOARD_KEY_COUNT", 1)
 # Small pause between repeated keyevents so the IME/app can register each one.
 KEY_REPEAT_DELAY = env_float("ANDROID_EMU_KEYBOARD_KEY_REPEAT_DELAY", 0.05)
 
-# The field in `dumpsys input_method` that says whether the IME is on screen.
-# InputMethodManagerService prints it as `mInputShown=true` / `mInputShown=false`.
+# The fields in `dumpsys input_method` that say whether the IME is on screen,
+# in the order they are consulted. Both were measured on API 33 and API 35 (see
+# tests/fixtures/recorded/*/dumpsys_input_method_shown.txt); `mInputShown` is
+# the one the finding named and the one InputMethodManagerService sets when the
+# IME is showing for a client, so it is asked first.
+#
+# `mImeWindowVis` is NOT here on purpose: it appears on neither recorded
+# profile, so code keying on it reads nothing at all and every keyboard looks
+# absent. That is the same shape as this repo's founding bug -- a field name
+# that was plausible rather than observed -- and the recordings are what settle
+# it. Do not add it back without a profile that shows it.
 IME_SHOWN_FIELD = "mInputShown"
+IME_VIEW_SHOWN_FIELD = "mIsInputViewShown"
+IME_SHOWN_FIELDS = (IME_SHOWN_FIELD, IME_VIEW_SHOWN_FIELD)
 
-_IME_SHOWN_RE = re.compile(rf"\b{IME_SHOWN_FIELD}\s*=\s*(true|false)\b", re.IGNORECASE)
+# Anchored on the field name, not on line position: API 33 prints
+# `mShowRequested=false mShowExplicitlyRequested=false mShowForced=false
+# mInputShown=false` on one line, so anything that read the first token, or
+# split the line on whitespace and took field 0, would answer with
+# `mShowRequested` -- a different question with a frequently different answer.
+# API 35 prints `mInputShown` alone on its line. The second field shares a line
+# with `mStatusIcon` on both.
+_IME_FIELD_RES = {
+    field: re.compile(rf"\b{field}\s*=\s*(true|false)\b", re.IGNORECASE)
+    for field in IME_SHOWN_FIELDS
+}
 
 
 def parse_ime_shown(dumpsys_output: str) -> bool | None:
@@ -64,22 +85,17 @@ def parse_ime_shown(dumpsys_output: str) -> bool | None:
         dumpsys_output: Raw output of ``adb shell dumpsys input_method``.
 
     Returns:
-        True or False from the ``mInputShown`` field, or None when the field is
-        absent -- which is not the same as False, and callers must not treat it
-        as False: "there is no keyboard up" and "I could not tell" lead to
-        different actions.
-
-    Note:
-        The corpus has no ``dumpsys input_method`` recording yet (Inc 0's
-        recording PR captures ``dumpsys_input_method_shown``). The field name is
-        the one the platform's InputMethodManagerService has printed for years,
-        and when the recording lands this function is what it should be pointed
-        at -- the grammar lives here, in one place, for that reason.
+        True or False, read from ``mInputShown`` or -- if that field is absent
+        -- from ``mIsInputViewShown``. None when neither field is there, which
+        is not the same as False and must not be collapsed into it: "there is
+        no keyboard up" and "I could not tell" lead to different actions, and
+        only one of them may press BACK.
     """
-    match = _IME_SHOWN_RE.search(dumpsys_output)
-    if match is None:
-        return None
-    return match.group(1).lower() == "true"
+    for field in IME_SHOWN_FIELDS:
+        match = _IME_FIELD_RES[field].search(dumpsys_output)
+        if match is not None:
+            return match.group(1).lower() == "true"
+    return None
 
 
 class KeyboardSimulator:
@@ -277,10 +293,11 @@ class KeyboardSimulator:
         if shown is None:
             return False, (
                 f"Could not tell whether a keyboard is shown: `dumpsys "
-                f"input_method` reported no {IME_SHOWN_FIELD} field. BACK was "
-                f"not pressed, because with no keyboard up it leaves the "
-                f"current screen; press it deliberately with "
-                f"`keyboard.py --button back` if that is what you want."
+                f"input_method` reported neither "
+                f"{' nor '.join(IME_SHOWN_FIELDS)}. BACK was not pressed, "
+                f"because with no keyboard up it leaves the current screen; "
+                f"press it deliberately with `keyboard.py --button back` if "
+                f"that is what you want."
             )
         if not shown:
             return True, "No keyboard shown; nothing to hide"

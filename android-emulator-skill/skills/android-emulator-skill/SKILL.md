@@ -169,7 +169,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       and with no keyboard up it leaves the current screen. With none shown they
       report "No keyboard shown", send no key event and exit 0; if the IME state
       cannot be read they exit 1 rather than guess. To press BACK regardless,
-      ask for it: `--button back`.
+      ask for it: `--button back`. (The state is read from `mInputShown`, with
+      `mIsInputViewShown` as a backup — both measured on API 33 and API 35.)
     - Options: `--type`, `--delay`, `--key`, `--count`, `--keys`, `--button`,
       `--clear`, `--hide-keyboard`, `--dismiss`, `--serial`/`-s`, `--json`
 
