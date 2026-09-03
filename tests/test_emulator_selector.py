@@ -18,22 +18,28 @@ import pytest
 from common import adb_exec
 from common.sdk_tools import SdkToolError
 
-
 # ---------------------------------------------------------------------------
 # config.ini parsing + API-level extraction (pure)
 # ---------------------------------------------------------------------------
+# The only config.ini text in this file, and the one `KNOWN_VIOLATIONS` already
+# freezes as `test_emulator_selector.py::parse_config_ini`. Hoisted so the
+# read-from-disk test below reuses it rather than inventing a second one (F4):
+# no AVD config.ini is recorded on any profile, and one cannot be captured here
+# -- recording it is the next candidate for `tests/record_fixtures.py`.
+CONFIG_INI = "\n".join(
+    [
+        "# a comment",
+        "AvdId=Pixel_9_Pro",
+        "abi.type = arm64-v8a",
+        "image.sysdir.1=system-images/android-36/google_apis_playstore/arm64-v8a/",
+        "",
+        "blank-without-equals",
+    ]
+)
+
+
 def test_parse_config_ini_basic():
-    text = "\n".join(
-        [
-            "# a comment",
-            "AvdId=Pixel_9_Pro",
-            "abi.type = arm64-v8a",
-            "image.sysdir.1=system-images/android-36/google_apis_playstore/arm64-v8a/",
-            "",
-            "blank-without-equals",
-        ]
-    )
-    config = emulator_selector.parse_config_ini(text)
+    config = emulator_selector.parse_config_ini(CONFIG_INI)
     assert config["AvdId"] == "Pixel_9_Pro"
     assert config["abi.type"] == "arm64-v8a"
     assert "image.sysdir.1" in config
@@ -263,7 +269,7 @@ def test_suggest_lists_an_emulator_it_could_not_identify(monkeypatch, tmp_path, 
     _fake_adb(
         monkeypatch,
         {
-            ("emulator",): (0, "Pixel_9\nPixel_9_Pro\n", ""),
+            ("emulator",): (0, recorded.text("emulator_list_avds"), ""),
             ("adb", "-s"): (0, recorded.text("emu_avd_name"), ""),
         },
     )
@@ -295,7 +301,7 @@ def test_a_complete_picture_adds_no_noise_to_the_output(monkeypatch, tmp_path, r
     _fake_adb(
         monkeypatch,
         {
-            ("emulator",): (0, "Pixel_9\n", ""),
+            ("emulator",): (0, recorded.text("emulator_list_avds"), ""),
             ("adb", "-s"): (0, recorded.text("emu_avd_name"), ""),
         },
     )
@@ -310,6 +316,47 @@ def test_a_complete_picture_adds_no_noise_to_the_output(monkeypatch, tmp_path, r
     assert "unidentified_emulators" not in payload
 
 
+def test_a_listing_that_failed_is_disclosed_not_ranked_as_all_idle(
+    monkeypatch, tmp_path, recorded, recorded_anywhere
+):
+    """F2: `except RuntimeError: return []` ranked every AVD as idle, silently.
+
+    On a host where adb cannot be reached at all, every candidate lost its
+    "currently running" bonus and nothing said why -- a ranking computed over a
+    picture nobody had, printed as a recommendation. Ranking still proceeds
+    (the AVDs on disk are real, and a suggestion is not destructive), but the
+    reason is carried out to the reader.
+    """
+    _fake_emulator_on_path(monkeypatch)
+    _fake_adb(
+        monkeypatch,
+        {
+            ("emulator",): (0, recorded.text("emulator_list_avds"), ""),
+            ("adb", "devices"): (1, "", recorded_anywhere("adb_device_not_found")),
+        },
+    )
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    suggestions = selector.suggest(4)
+
+    assert suggestions, "the ranking stopped instead of ranking what it could"
+    assert all(not c["running"] for c in suggestions), "a running bonus was invented"
+    assert selector.running_unavailable, "the failed listing left no trace"
+
+    payload = json.loads(
+        emulator_selector.format_candidates(
+            suggestions, True, selector.unidentified, selector.running_unavailable
+        )
+    )
+    assert payload["warnings"], "the JSON document does not disclose the gap"
+    assert "running state unavailable" in payload["warnings"][0]
+
+    text = emulator_selector.format_candidates(
+        suggestions, False, selector.unidentified, selector.running_unavailable
+    )
+    assert "running state unavailable" in text
+
+
 def test_read_avd_config_honours_the_resolved_avd_home(monkeypatch, tmp_path):
     """R4: it was hard-coded to ~/.android/avd.
 
@@ -319,15 +366,14 @@ def test_read_avd_config_honours_the_resolved_avd_home(monkeypatch, tmp_path):
     """
     avd_home = tmp_path / "avds"
     (avd_home / "Pixel_9.avd").mkdir(parents=True)
-    (avd_home / "Pixel_9.avd" / "config.ini").write_text(
-        "image.sysdir.1=system-images/android-35/\n"
-    )
+    # The file's single config.ini text, reused rather than a second invention.
+    (avd_home / "Pixel_9.avd" / "config.ini").write_text(CONFIG_INI)
     monkeypatch.setenv("ANDROID_AVD_HOME", str(avd_home))
 
     config = emulator_selector.read_avd_config("Pixel_9")
 
     assert config, "the config under $ANDROID_AVD_HOME was not read"
-    assert config["image.sysdir.1"] == "system-images/android-35/"
+    assert config == emulator_selector.parse_config_ini(CONFIG_INI)
 
 
 def _fake_emulator_on_path(monkeypatch):

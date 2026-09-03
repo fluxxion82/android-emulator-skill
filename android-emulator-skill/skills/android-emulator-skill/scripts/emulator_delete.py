@@ -493,6 +493,10 @@ def _report_batch(
             payload["keep_count"] = keep_count
         if args.verbose:
             payload["results"] = results
+        if failed:
+            # Carried alongside the summary so a failing batch answers with the
+            # documented error key, like every other failing mode (F5).
+            payload["error"] = f"{failed} of {total} AVDs were not deleted"
         print(json.dumps(payload, indent=2))
         return
 

@@ -138,6 +138,12 @@ RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
 #     for platform behaviour the parsers document and no recording covers --
 #     see their entries below. Everything else in both files reads recordings.
 #
+#   test_emulator_shutdown.py — the last f-string feeding `emu avd name` output
+#     is gone: `emu_avd_name` is read from the corpus and only the AVD NAME is
+#     substituted, so the console's `OK` framing -- the part that defeated the
+#     already-booted check for a whole release (S5) -- comes from the recording
+#     rather than from someone's memory of it.
+#
 #   test_screen_mapper.py, test_accessibility_audit.py, test_hierarchy.py,
 #     test_compose_visibility.py — paid off when parser detection stopped
 #     depending on the function's NAME (T2). `analyze_tree` and `_audit_node`
@@ -152,11 +158,6 @@ KNOWN_VIOLATIONS = frozenset(
     {
         # avdmanager create/delete output is not recorded on any profile yet.
         "test_emulator_create.py::CompletedProcess",
-        # Partly paid by Inc -1: the shutdown-path tests read `adb devices -l`
-        # from the corpus now. What still trips the detector is the f-string
-        # feeding `emu avd name` output in the AVD-resolution test, which has
-        # no recording yet.
-        "test_emulator_shutdown.py::_FakeResult",
         # EXCEPTION, not debt: GPX is a document the USER hands to
         # `location.py --gpx` (a GPS device or mapping service writes it), so
         # there is no tool for a recorder to run, nothing in the Android SDK

@@ -174,18 +174,21 @@ def test_a_failed_device_listing_stops_the_erase(monkeypatch, tmp_path, recorded
     was justified as "the command ran and failed, which is not evidence the AVD
     is running", but the absence of evidence is the point: the check never
     produced an answer, and an erase is irreversible (L4).
+
+    It is a refusal rather than an exception since F2: the listing failure is a
+    value now, and an erase that stops has one shape whichever gap stopped it.
     """
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     avd_dir = _make_avd(tmp_path, "Pixel_9")
     e = emulator_erase.EmulatorEraser()
     _fake_adb(monkeypatch, {("adb", "devices"): (1, "", "some other adb complaint\n")})
 
-    with pytest.raises(emulator_erase.RunningCheckError) as excinfo:
-        e.erase("Pixel_9")
+    success, message = e.erase("Pixel_9")
 
+    assert success is False
     assert (avd_dir / "userdata-qemu.img").exists(), "user data was wiped on an unanswered check"
-    message = str(excinfo.value)
-    assert "--force" in message and "kill-server" in message, f"no remedy named: {message}"
+    assert "running state unavailable" in message, message
+    assert "--force" in message, f"no way forward named: {message}"
     # An erase that was asked to skip the check still may.
     assert e.erase("Pixel_9", force=True)[0] is True
     assert not (avd_dir / "userdata-qemu.img").exists()
@@ -483,6 +486,29 @@ def test_every_failing_json_mode_prints_an_error_document(monkeypatch, tmp_path,
     assert "error" in payload, f"--json reported no error document: {payload}"
     assert payload["error"], "the error document is empty"
     assert "Traceback" not in captured.err
+
+
+def test_an_ordinary_failure_answers_with_the_documented_error_key(monkeypatch, tmp_path, capsys):
+    """F5: a missing AVD emitted `{"success": false, "message": ...}`.
+
+    SKILL.md promises every failing mode answers `{"error": ...}`, and every
+    other failing mode did. A caller checking for the documented key found none
+    here and read a refusal as a result -- the promise was the wrong half of
+    the pair to trust, so the code moved rather than the documentation.
+    """
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
+    monkeypatch.setattr(emulator_erase.EmulatorEraser, "running_check", lambda _self, _name: None)
+    monkeypatch.setattr(
+        emulator_erase.sys, "argv", ["emulator_erase.py", "--name", "DoesNotExist", "--json"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_erase.main()
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "not found" in payload.get("error", ""), payload
+    assert "success" not in payload, "a failure still reports a success field"
 
 
 def test_default_tunables():

@@ -306,11 +306,15 @@ def run_emu_call_sites() -> list[Site]:
     list is also what a detector that has stopped working returns. This one
     names the sites that must be there.
 
-    A count alone was not enough -- reviewed and rejected. Nine found against a
-    floor of six accepts three of them vanishing silently, which is exactly the
-    "a capability was migrated and then quietly dropped" case the enumeration
-    style exists for. So this is compared as an exact multiset, like the bypass
-    enumeration.
+    A count alone was not enough -- reviewed and rejected. A floor accepts
+    sites vanishing silently, which is exactly the "a capability was migrated
+    and then quietly dropped" case the enumeration style exists for. So this is
+    compared as an exact multiset, like the bypass enumeration.
+
+    The census is six sites, not the nine it was when this was written: R3
+    collapsed four hand-rolled "which AVD is this serial?" resolvers into one
+    ``identify_emulator``. KNOWN_CONSOLE_CALLS is the count that matters; a
+    number in prose here goes stale silently, which this one did.
     """
     sites: list[Site] = []
     for path in _script_files():

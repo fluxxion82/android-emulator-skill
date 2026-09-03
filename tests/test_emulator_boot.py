@@ -247,7 +247,7 @@ def _recorded_emulators(recorded, states=("device", "device")):
     ]
 
 
-def test_boot_refuses_while_an_emulator_cannot_be_identified(monkeypatch, recorded, capsys):
+def test_boot_refuses_while_an_emulator_cannot_be_identified(monkeypatch, recorded):
     """R3: an offline emulator might BE this AVD, so booting is not safe."""
     monkeypatch.setattr(
         emulator_boot,
@@ -267,7 +267,40 @@ def test_boot_refuses_while_an_emulator_cannot_be_identified(monkeypatch, record
     assert success is False
     assert "emulator-5554" in message and "offline" in message, message
     assert "kill-server" in message, f"no remedy named: {message}"
-    assert "Warning:" in capsys.readouterr().err, "nothing was said on stderr"
+    assert "Terminate the stale emulator process" in message, (
+        "the remedy still leads with shutting the emulator down, which needs "
+        f"the console that is not answering: {message}"
+    )
+
+
+def test_boot_refuses_when_the_emulators_cannot_be_listed(monkeypatch, capsys, recorded_anywhere):
+    """F2: a failed listing escaped as a bare RuntimeError, i.e. a traceback.
+
+    `get_connected_devices` re-wraps a failed listing as a plain RuntimeError,
+    which is not an AdbError -- so `main`'s handler never saw it, and the one
+    module family whose job is turning adb failures into remedies produced a
+    stack trace instead. It is a refused boot now: if what is running cannot be
+    listed, a boot may start a second instance of an AVD that is already up.
+    """
+    _fake_emulator_on_path(monkeypatch)
+    _fake_adb(monkeypatch, {("adb", "devices"): (1, "", recorded_anywhere("adb_device_not_found"))})
+
+    def _must_not_launch(*_a, **_k):
+        raise AssertionError("an emulator was launched over an unreadable device list")
+
+    monkeypatch.setattr(emulator_boot.subprocess, "Popen", _must_not_launch)
+    monkeypatch.setattr(
+        emulator_boot.sys, "argv", ["emulator_boot.py", "--avd", "Pixel_9", "--json"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_boot.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    payload = json.loads(captured.out)
+    assert "running state unavailable" in payload["error"], payload
 
 
 def test_boot_still_short_circuits_when_the_avd_is_positively_running(monkeypatch, recorded):
@@ -324,7 +357,15 @@ def test_avd_listing_reports_its_own_timeout(monkeypatch):
 
 
 def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
-    """At the CLI boundary the agent gets the remedy, not a stack trace."""
+    """At the CLI boundary the agent gets the remedy, not a stack trace.
+
+    Since F2 the listing failure is a refused boot rather than an escaping
+    exception -- `get_connected_devices` re-wraps a failed listing as a BARE
+    RuntimeError, which is not an AdbError and so reached the user as a
+    traceback. It is reported through the same `_fail` as every other failure,
+    so the remedy still arrives; what changed is that it arrives having said
+    which operation could not be completed.
+    """
 
     def _raise():
         raise adb_exec.MultipleDevicesError(

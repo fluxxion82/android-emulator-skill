@@ -90,9 +90,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      "could not look" are different answers. `--all` reports the same failure
      the same way
    - Refuses to boot while any attached emulator cannot say which AVD it is
-     (a non-`device` state, or a console that will not answer): it may be this
-     AVD, and a second instance of one AVD corrupts its userdata. The refusal
-     names the serial, its state and the remedy
+     (a non-`device` state, or a console that will not answer), or while the
+     emulators cannot be listed at all: it may be this AVD, and a second
+     instance of one AVD corrupts its userdata. The refusal names the serial,
+     its state, and says to terminate the stale emulator *process* — a console
+     that is not answering cannot be shut down through one
+   - Failures answer in the mode they were asked in: `{"error": ...}` under
+     `--json`, the message on stderr otherwise, always non-zero
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
@@ -100,9 +104,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `emulator-NNNN` is refused before any adb command runs, so this never powers off an
      attached phone or tablet
    - `--name AVD` resolves the AVD to a serial. If some emulator could not be
-     queried, that is reported as itself and exits non-zero — never as
-     "No running emulator found", which is a confident negative over a device
-     nobody managed to ask
+     queried — or the emulators could not be listed at all — that is reported
+     as itself and exits non-zero, never as "No running emulator found", which
+     is a confident negative over a device nobody managed to ask
+   - Failures answer in the mode they were asked in: `{"error": ...}` under
+     `--json`, the message on stderr otherwise, always non-zero
    - Optional verification of shutdown completion
    - Batch shutdown operations (running emulators only)
    - Options: `--serial`, `--name`, `--verify`, `--timeout`, `--all`, `--json`
@@ -124,6 +130,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `$ANDROID_SDK_HOME/.android/avd`, else `~/.android/avd`
    - `N` must be at least 1: `--old 0` keeps nothing, so it is rejected as a
      usage error (exit 2) pointing at `--all --yes`
+   - Failures answer `{"error": ...}` under `--json`; a batch keeps its summary
+     and carries `error` alongside it when any AVD failed
    - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
 
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
@@ -136,7 +144,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      yet in state `device`, is "unknown" and refuses, naming the serial, its
      state and the remedy — `--force` erases anyway
    - Every failure answers in the mode it was asked in: `{"error": ...}` on
-     stdout under `--json`, the message on stderr otherwise, always non-zero
+     stdout under `--json`, the message on stderr otherwise, always non-zero.
+     `--all` keeps its per-AVD summary and carries `error` alongside it when
+     any AVD failed
    - **Snapshots are kept**: a successful erase prints "snapshots kept; use
      snapshot.py --delete `<name>` to remove them", because a later
      `snapshot.py --load` can otherwise undo the factory state
@@ -343,7 +353,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - An emulator that will not say which AVD it is gets no "currently running"
       bonus, but is listed with its state (`unidentified_emulators` under
       `--json`, a warning on stderr otherwise) so the ranking never claims a
-      completeness it does not have
+      completeness it does not have. If the emulators cannot be listed at all,
+      the ranking still runs — the AVDs on disk are real — and says so
+      (`warnings` under `--json`)
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.

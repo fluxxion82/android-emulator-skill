@@ -45,7 +45,12 @@ from pathlib import Path
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import EmulatorProbe, avd_name_for_serial, probe_emulators
+from common.emu_console import (
+    EmulatorProbe,
+    EmulatorSurvey,
+    avd_name_for_serial,
+    survey_emulators,
+)
 from common.env_config import env_int
 from common.sdk_tools import (
     EMULATOR_NOT_FOUND_MESSAGE,
@@ -239,6 +244,9 @@ class EmulatorSelector:
         # report. Empty until suggest() runs, so reading it earlier is not an
         # AttributeError -- a CLI that only lists AVDs never probes at all.
         self.unidentified: tuple[EmulatorProbe, ...] = ()
+        # Why the running state could not be established at all, if it could
+        # not. Distinct from `unidentified`, which needs a listing to exist.
+        self.running_unavailable: str | None = None
 
     @staticmethod
     def _default_config_path() -> Path:
@@ -309,10 +317,10 @@ class EmulatorSelector:
         Each ready emulator serial is resolved to its AVD name via
         ``adb -s <serial> emu avd name``.
         """
-        return {probe.avd_name for probe in self.probe_running() if probe.identified}
+        return {probe.avd_name for probe in self.survey().probes if probe.identified}
 
-    def probe_running(self) -> list[EmulatorProbe]:
-        """Every attached emulator, identified or not.
+    def survey(self) -> EmulatorSurvey:
+        """Every attached emulator, identified or not -- or why nobody knows.
 
         Split out from :meth:`running_avd_names` so an emulator that would not
         say which AVD it is stops vanishing (R3). It is still excluded from the
@@ -320,16 +328,18 @@ class EmulatorSelector:
         without one -- but it is now reportable, and ``--suggest`` names it with
         its state so a reader can see that the ranking was taken over an
         incomplete picture.
+
+        A failed listing is the same kind of gap and used to be worse (F2):
+        ``except RuntimeError: return []`` ranked EVERY AVD as idle on a host
+        where adb could not be reached at all, silently. Ranking still proceeds
+        -- the AVDs on disk are real, and a suggestion is not destructive -- but
+        the reason is carried out and disclosed.
         """
-        try:
-            devices = get_connected_devices()
-        except RuntimeError:
-            # Deliberate: with nothing attached (or no adb at all) there is
-            # nothing running, and --suggest must still rank the AVDs on disk.
-            # Note this also absorbs an adb_exec.AdbError out of the listing,
-            # which subclasses RuntimeError.
-            return []
-        return probe_emulators(devices, timeout=PROBE_TIMEOUT_SECONDS)
+        return survey_emulators(get_connected_devices, timeout=PROBE_TIMEOUT_SECONDS)
+
+    def probe_running(self) -> list[EmulatorProbe]:
+        """The attached emulators, identified or not. Empty when unavailable."""
+        return list(self.survey().probes)
 
     def _avd_name_for_serial(self, serial: str) -> str | None:
         """Resolve an emulator serial to its AVD name (None when it answers nothing).
@@ -389,13 +399,15 @@ class EmulatorSelector:
         candidate, then defers ordering to the pure :func:`rank_candidates`.
         """
         candidates = self.list_avds()
-        probes = self.probe_running()
-        # Kept for the CLI to report (R3). An emulator that would not say which
-        # AVD it is gets no "currently running" bonus -- ranking on a guess is
-        # worse than ranking without one -- but it used to vanish entirely, so
-        # the ranking silently claimed a completeness it did not have.
-        self.unidentified = tuple(probe for probe in probes if not probe.identified)
-        running = {probe.avd_name for probe in probes if probe.identified}
+        survey = self.survey()
+        # Kept for the CLI to report (R3/F2). An emulator that would not say
+        # which AVD it is -- or a listing that failed outright -- gets no
+        # "currently running" bonus, because ranking on a guess is worse than
+        # ranking without one. Both used to vanish entirely, so the ranking
+        # silently claimed a completeness it did not have.
+        self.unidentified = survey.unidentified
+        self.running_unavailable = survey.unavailable
+        running = {probe.avd_name for probe in survey.probes if probe.identified}
         recent = self.load_recent()
         recent_pos = {name: i for i, name in enumerate(recent)}
 
@@ -538,6 +550,7 @@ def format_candidates(
     candidates: list[dict],
     json_format: bool = False,
     unidentified: "tuple[EmulatorProbe, ...]" = (),
+    unavailable: str | None = None,
 ) -> str:
     """
     Format candidates for output (token-efficient by default).
@@ -549,6 +562,9 @@ def format_candidates(
             with their state so a reader can see the ranking was taken over an
             incomplete picture (R3); omitted entirely when there are none, so
             the common output is unchanged.
+        unavailable: Why the running state could not be established at all
+            (F2). Reported as a `warnings` entry rather than silently ranking
+            every AVD as idle.
 
     Returns:
         Formatted output string.
@@ -560,10 +576,12 @@ def format_candidates(
                 {"serial": probe.serial, "state": probe.state, "reason": probe.reason}
                 for probe in unidentified
             ]
+        if unavailable:
+            payload["warnings"] = [unavailable]
         return json.dumps(payload, indent=2)
 
     if not candidates:
-        return "No AVDs found"
+        return f"No AVDs found\n   ! {unavailable}" if unavailable else "No AVDs found"
 
     lines = []
     for i, candidate in enumerate(candidates, 1):
@@ -576,10 +594,14 @@ def format_candidates(
         lines.append(line)
     for probe in unidentified:
         lines.append(f"   ! {probe.describe()}")
+    if unavailable:
+        lines.append(f"   ! {unavailable}")
     return "\n".join(lines)
 
 
-def _warn_unidentified(unidentified: "tuple[EmulatorProbe, ...]") -> None:
+def _warn_unidentified(
+    unidentified: "tuple[EmulatorProbe, ...]", unavailable: str | None = None
+) -> None:
     """Say on stderr that the ranking was taken over an incomplete picture.
 
     On stderr in every mode, including --json, so a caller parsing stdout still
@@ -587,6 +609,8 @@ def _warn_unidentified(unidentified: "tuple[EmulatorProbe, ...]") -> None:
     """
     for probe in unidentified:
         print(f"Warning: {probe.describe()}", file=sys.stderr)
+    if unavailable:
+        print(f"Warning: {unavailable}", file=sys.stderr)
 
 
 def _fail(error: object, *, json_mode: bool) -> None:
@@ -692,15 +716,23 @@ def _dispatch(args: argparse.Namespace) -> None:
     # List mode (every candidate, ranked for context)
     if args.list:
         candidates = selector.suggest(count=len(selector.list_avds()) or 1)
-        print(format_candidates(candidates, args.json, selector.unidentified))
-        _warn_unidentified(selector.unidentified)
+        print(
+            format_candidates(
+                candidates, args.json, selector.unidentified, selector.running_unavailable
+            )
+        )
+        _warn_unidentified(selector.unidentified, selector.running_unavailable)
         sys.exit(0)
 
     # Default + --suggest: ranked top N
     suggestions = selector.suggest(args.count)
-    _warn_unidentified(selector.unidentified)
+    _warn_unidentified(selector.unidentified, selector.running_unavailable)
     if args.json or args.verbose:
-        print(format_candidates(suggestions, args.json, selector.unidentified))
+        print(
+            format_candidates(
+                suggestions, args.json, selector.unidentified, selector.running_unavailable
+            )
+        )
     elif suggestions:
         # Token-efficient default: the single best pick plus its reasons.
         best = suggestions[0]

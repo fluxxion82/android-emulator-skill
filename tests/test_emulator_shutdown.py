@@ -10,6 +10,7 @@ physical-device serial, AVD-name->serial resolution, the default-verify /
 from __future__ import annotations
 
 import importlib
+import json
 
 import emulator_shutdown
 import pytest
@@ -170,7 +171,13 @@ def test_cli_exits_non_zero_when_refusing_a_physical_device(monkeypatch, capsys,
 
     assert exc.value.code == 1
     assert calls == [], f"an adb command was issued before the refusal: {calls}"
-    assert PHYSICAL_SERIAL in capsys.readouterr().out
+    # stderr, not stdout, since F5: a refusal is a failure and every failing
+    # mode reports the same way. The invariant this test protects -- the
+    # refusal reaches the caller naming the serial, and no adb ran -- is
+    # unchanged.
+    captured = capsys.readouterr()
+    assert PHYSICAL_SERIAL in captured.err
+    assert not captured.out, "a refusal was printed as a result"
 
 
 def test_emu_kill_failure_on_an_emulator_is_reported_not_worked_around(monkeypatch, recorded):
@@ -221,7 +228,19 @@ def test_a_console_kill_rejected_with_ko_is_a_failed_shutdown(monkeypatch, recor
     assert "KO: cannot kill" in message
 
 
-def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
+def _framed_reply(recorded, avd_name: str) -> str:
+    """The recorded `adb emu avd name` reply, with the AVD name substituted.
+
+    The framing is the part that matters and the part nobody would write by
+    hand: the console terminates every reply with its own `OK` line, which is
+    what defeated the already-booted check for a whole release (S5). So the
+    recording supplies it and only the name is swapped -- CLAUDE.md's
+    "text built by transforming recorded lines" (F4).
+    """
+    return recorded.text("emu_avd_name").replace("Pixel_9", avd_name)
+
+
+def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch, recorded):
     _connected(
         monkeypatch,
         [
@@ -234,7 +253,7 @@ def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
         # cmd: ["adb", "-s", <serial>, "emu", "avd", "name"]
         serial = cmd[2]
         names = {"emulator-5554": "Pixel_5_API_33", "emulator-5556": "Pixel_7_API_34"}
-        return _FakeResult(returncode=0, stdout=f"{names[serial]}\nOK\n")
+        return _FakeResult(returncode=0, stdout=_framed_reply(recorded, names[serial]))
 
     monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
 
@@ -242,7 +261,9 @@ def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
     assert emulator_shutdown.resolve_serial_by_avd_name("No_Such_AVD") is None
 
 
-def test_shutdown_by_name_refuses_when_an_emulator_could_not_be_queried(monkeypatch, capsys):
+def test_shutdown_by_name_refuses_when_an_emulator_could_not_be_queried(
+    monkeypatch, capsys, recorded
+):
     """R3: "I could not look" must not be reported as "nothing to shut down".
 
     Two emulators are attached; one answers with a different AVD name and the
@@ -262,7 +283,7 @@ def test_shutdown_by_name_refuses_when_an_emulator_could_not_be_queried(monkeypa
     def fake_run(cmd, **_kwargs):
         if cmd[2] == "emulator-5554":
             return _FakeResult(returncode=1, stderr="protocol fault\n")
-        return _FakeResult(returncode=0, stdout="Some_Other_AVD\nOK\n")
+        return _FakeResult(returncode=0, stdout=_framed_reply(recorded, "Some_Other_AVD"))
 
     monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
     monkeypatch.setattr(
@@ -278,13 +299,41 @@ def test_shutdown_by_name_refuses_when_an_emulator_could_not_be_queried(monkeypa
     assert "kill-server" in err, f"no remedy named: {err}"
 
 
-def test_shutdown_by_name_still_reports_a_genuine_miss(monkeypatch, capsys):
+def test_shutdown_by_name_when_the_emulators_cannot_be_listed(
+    monkeypatch, capsys, recorded_anywhere
+):
+    """F2: the listing failing is not evidence that nothing is running."""
+
+    def _fail_listing(*_a, **_k):
+        return _FakeResult(returncode=1, stderr=recorded_anywhere("adb_device_not_found"))
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _fail_listing)
+    monkeypatch.setattr(
+        emulator_shutdown.sys,
+        "argv",
+        ["emulator_shutdown.py", "--name", "Pixel_9", "--json"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_shutdown.main()
+
+    assert exc.value.code != 0
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    payload = json.loads(captured.out)
+    assert "running state unavailable" in payload["error"], payload
+    assert "No running emulator found" not in payload["error"]
+
+
+def test_shutdown_by_name_still_reports_a_genuine_miss(monkeypatch, capsys, recorded):
     """The false-positive control: every emulator answered, none is this AVD."""
     _connected(monkeypatch, [{"serial": "emulator-5554", "state": "device", "type": "emulator"}])
     monkeypatch.setattr(
         adb_exec.subprocess,
         "run",
-        lambda *_a, **_k: _FakeResult(returncode=0, stdout="Some_Other_AVD\nOK\n"),
+        lambda *_a, **_k: _FakeResult(
+            returncode=0, stdout=_framed_reply(recorded, "Some_Other_AVD")
+        ),
     )
     monkeypatch.setattr(
         emulator_shutdown.sys, "argv", ["emulator_shutdown.py", "--name", "Pixel_9"]
@@ -371,9 +420,19 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys, argv)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()
-    assert captured.err.startswith("Error: ")
     assert "Traceback" not in captured.err
-    assert "--serial" in captured.err, "no remedy named"
+
+    if "--json" in argv:
+        # Inverted from what this test used to require (F1). It asserted prose
+        # on stderr for the JSON parametrisation too, which is how `--all
+        # --json` came to exit 1 with an EMPTY stdout and stay green: a caller
+        # that asked for JSON parses stdout, and there was nothing in it.
+        payload = json.loads(captured.out)
+        assert "--serial" in payload["error"], "no remedy named"
+        assert not captured.err, "a JSON caller got prose as well"
+    else:
+        assert captured.err.startswith("Error: ")
+        assert "--serial" in captured.err, "no remedy named"
 
 
 def test_cli_surfaces_a_missing_adb_rather_than_an_oserror(monkeypatch, capsys):
@@ -397,6 +456,13 @@ def test_cli_surfaces_a_missing_adb_rather_than_an_oserror(monkeypatch, capsys):
     assert "Traceback" not in captured.err
     # Assert the type's own remedy reaches the boundary intact, not its current
     # wording -- the wording is adb_exec's to change.
+    #
+    # Containment rather than equality since F2: the listing failure is now
+    # reported as "running state unavailable: <the adb error>", which says
+    # WHERE it was noticed. The whole point of this test -- OSError becomes a
+    # typed error and its remedy reaches the user -- is what is asserted.
     with pytest.raises(adb_exec.AdbNotInstalledError) as raised:
         adb_exec.run_adb("devices", None, "-l")
-    assert captured.err == f"Error: {raised.value}\n"
+    assert captured.err.startswith("Error: ")
+    assert str(raised.value) in captured.err
+    assert captured.err.endswith("\n")

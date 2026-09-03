@@ -32,11 +32,7 @@ import time
 from pathlib import Path
 
 from common import adb_exec
-from common.emu_console import (
-    EmulatorProbeError,
-    RunningVerdict,
-    avd_running,
-)
+from common.emu_console import RunningVerdict, avd_running
 from common.env_config import env_float, env_int
 from common.sdk_tools import resolve_avd_home
 
@@ -61,15 +57,6 @@ USERDATA_FILES = [
 # the next `snapshot.py --load`, which is the half of the contract that was
 # missing. Said once, next to the wipe, rather than silently either way.
 SNAPSHOT_NOTE = "snapshots kept; use snapshot.py --delete <name> to remove them"
-
-
-class RunningCheckError(adb_exec.AdbError):
-    """The "is this AVD running" check could not be completed.
-
-    Subclasses :class:`common.adb_exec.AdbError` so ``main()`` prints it with a
-    remedy instead of a traceback, and so the erase stops rather than treating
-    an unanswerable question as "not running" -- the shape of L4.
-    """
 
 
 class EmulatorEraser:
@@ -142,19 +129,19 @@ class EmulatorEraser:
             A refusal naming its remedy, or None when no emulator is this AVD
             and every emulator was identified.
 
-        Raises:
-            RunningCheckError: The emulator listing itself failed, so not even
-                the set of emulators is known.
+        A failed listing is one of the refusals rather than an exception: it is
+        the same class of answer, and an erase that stops has one shape.
         """
-        try:
-            answer = avd_running(name)
-        except EmulatorProbeError as error:
-            raise RunningCheckError(
-                f"cannot tell whether {name} is running: {error}. Restart the "
-                f"adb server (`adb kill-server && adb start-server`) and retry, "
-                f"or pass --force to erase without the running check."
-            ) from error
+        answer = avd_running(name)
 
+        if answer.unavailable:
+            # Not even the list of emulators is known, so nothing at all has
+            # been established about this AVD (F2). Distinct from an emulator
+            # that WAS listed and would not answer, and said differently.
+            return (
+                f"Refusing to erase {name}: {answer.describe_unknown()}. Then "
+                f"retry, or pass --force to erase without the running check."
+            )
         if answer.verdict is RunningVerdict.RUNNING:
             return (
                 f"Refusing to erase {name}: it is running on {answer.serial}. "
@@ -188,9 +175,6 @@ class EmulatorEraser:
 
         Returns:
             True when the erase must not proceed.
-
-        Raises:
-            RunningCheckError: The emulator listing itself failed.
         """
         return self.running_check(name) is not None
 
@@ -345,15 +329,20 @@ def main():
         # for. It did not, and a `--json` run that hit a RunningCheckError got
         # exit 1 with prose on stderr and an EMPTY stdout -- an agent parsing
         # stdout saw nothing at all where the contract promises {"error": ...}.
-        _fail(args, str(error))
+        _fail(error, json_mode=args.json)
 
 
-def _fail(args: argparse.Namespace, message: str) -> None:
-    """Report a failure in the mode the caller asked for, and exit non-zero."""
-    if args.json:
-        print(json.dumps({"error": message}, indent=2))
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
+    and got a sentence on stderr has an empty stdout to parse. Same signature as
+    `emulator_boot` and `emulator_selector`, which have had it since #15.
+    """
+    if json_mode:
+        print(json.dumps({"error": str(error)}, indent=2))
     else:
-        print(f"Error: {message}", file=sys.stderr)
+        print(f"Error: {error}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -439,6 +428,11 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             }
             if succeeded:
                 payload["snapshots"] = SNAPSHOT_NOTE
+            if failed:
+                # The batch keeps its per-AVD report AND carries the documented
+                # error key, so "every failing mode answers {"error": ...}" is
+                # true of this one too without losing what it found (F5).
+                payload["error"] = f"{failed} of {total} AVDs were not erased"
             print(json.dumps(payload, indent=2))
         elif total == 0:
             print("No AVDs found")
@@ -455,7 +449,10 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if not args.name:
         if not args.json:
             parser.print_help(file=sys.stderr)
-        _fail(args, "--name is required (or --all to erase every AVD, --list to see them)")
+        _fail(
+            "--name is required (or --all to erase every AVD, --list to see them)",
+            json_mode=args.json,
+        )
 
     if args.verbose:
         print(f"Erasing AVD: {args.name}")
@@ -464,17 +461,21 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         args.name, force=args.force, verify=args.verify, timeout_seconds=args.timeout
     )
 
+    if not success:
+        # Every failing mode answers the same way (F5). This path emitted
+        # `{"success": false, "message": ...}`, so a caller checking for the
+        # documented `error` key found none and read a refusal as a result.
+        _fail(message, json_mode=args.json)
+
     if args.json:
-        payload = {"success": success, "message": message}
-        if success:
-            payload["snapshots"] = SNAPSHOT_NOTE
-        print(json.dumps(payload, indent=2))
+        print(
+            json.dumps({"success": True, "message": message, "snapshots": SNAPSHOT_NOTE}, indent=2)
+        )
     else:
         print(message)
-        if success:
-            print(SNAPSHOT_NOTE)
+        print(SNAPSHOT_NOTE)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

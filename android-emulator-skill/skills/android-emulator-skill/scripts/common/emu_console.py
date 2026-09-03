@@ -253,6 +253,55 @@ class EmulatorProbe:
 
 
 @dataclass(frozen=True)
+class EmulatorSurvey:
+    """What is attached, or the reason that could not be established.
+
+    ``adb devices`` failing is a third kind of gap, under the two
+    :class:`EmulatorProbe` already covers, and it was being handled three
+    different wrong ways (F2): `emulator_selector` caught every ``RuntimeError``
+    and ranked every AVD as idle, while `emulator_boot` and `emulator_shutdown`
+    let it escape as an uncaught ``RuntimeError`` -- a traceback, from the one
+    module family that exists to turn adb failures into remedies.
+
+    Attributes:
+        probes: One per attached emulator. Empty when ``unavailable`` is set --
+            not because nothing is attached, but because nobody looked.
+        unavailable: Why the listing failed, already phrased as "running state
+            unavailable: ...". None when the listing succeeded.
+    """
+
+    probes: tuple[EmulatorProbe, ...]
+    unavailable: str | None
+
+    @property
+    def unidentified(self) -> tuple[EmulatorProbe, ...]:
+        """The emulators that would not say which AVD they are."""
+        return tuple(probe for probe in self.probes if not probe.identified)
+
+    def describe_gap(self) -> str | None:
+        """Everything unknown about the running state, or None when nothing is.
+
+        One string for both gaps, because a caller deciding whether to boot or
+        wipe does not care which of them it hit -- only that the picture is
+        incomplete.
+
+        The listing failure carries NO extra remedy: `adb_exec` errors already
+        name their own ("pass --serial ...", "install platform-tools ..."), and
+        appending "restart the emulator" to "adb is not on PATH" is advice that
+        does not work. The unidentified case gets the remedy because nothing
+        else in that string names one.
+        """
+        if self.unavailable:
+            return self.unavailable
+        if self.unidentified:
+            return (
+                "; ".join(probe.describe() for probe in self.unidentified)
+                + f". {UNKNOWN_EMULATOR_REMEDY}"
+            )
+        return None
+
+
+@dataclass(frozen=True)
 class RunningAnswer:
     """The tri-state answer to "is AVD <name> running?".
 
@@ -266,6 +315,7 @@ class RunningAnswer:
     verdict: RunningVerdict
     serial: str | None
     probes: tuple[EmulatorProbe, ...]
+    unavailable: str | None = None
 
     @property
     def unidentified(self) -> tuple[EmulatorProbe, ...]:
@@ -274,10 +324,7 @@ class RunningAnswer:
 
     def describe_unknown(self) -> str:
         """Why the verdict is UNKNOWN, naming each emulator and its remedy."""
-        return (
-            "; ".join(probe.describe() for probe in self.unidentified)
-            + f". {UNKNOWN_EMULATOR_REMEDY}"
-        )
+        return EmulatorSurvey(self.probes, self.unavailable).describe_gap() or ""
 
 
 def identify_emulator(
@@ -393,9 +440,45 @@ def probe_emulators(
     ]
 
 
-def avd_running(
-    name: str, devices: list[dict] | None = None, *, timeout: int | None = None
-) -> RunningAnswer:
+def survey_emulators(list_devices=None, *, timeout: int | None = None) -> EmulatorSurvey:
+    """What emulators are attached and which AVD each is, failures included.
+
+    The listing failing is a VALUE here, never an exception: three scripts each
+    handled that case differently and all three were wrong (F2). One of them
+    turned it into "nothing is running", which is the same collapse as L4 one
+    layer out -- an answer manufactured from a question nobody managed to ask.
+
+    Args:
+        list_devices: Zero-argument callable returning a
+            :func:`common.device_utils.get_connected_devices` listing. Callers
+            pass their own module-level function so the listing stays on the
+            seam their tests already stub; omit it and the shared one is used.
+        timeout: Per-emulator console timeout.
+
+    Returns:
+        An :class:`EmulatorSurvey`. Never raises for a listing failure.
+    """
+    if list_devices is None:
+        # Imported here rather than at module scope: device_utils imports the
+        # hierarchy parser, and every `adb emu` caller would otherwise pay for
+        # a module it does not use.
+        from .device_utils import get_connected_devices
+
+        list_devices = get_connected_devices
+
+    try:
+        devices = list_devices()
+    except RuntimeError as error:
+        # RuntimeError, which covers the whole AdbError family (it subclasses
+        # RuntimeError) and get_connected_devices' own re-wrap of a failed
+        # listing, which is a bare RuntimeError the CLI boundaries do not
+        # recognise as an adb failure and would print as a traceback.
+        return EmulatorSurvey(probes=(), unavailable=f"running state unavailable: {error}")
+
+    return EmulatorSurvey(probes=tuple(probe_emulators(devices, timeout=timeout)), unavailable=None)
+
+
+def avd_running(name: str, list_devices=None, *, timeout: int | None = None) -> RunningAnswer:
     """Whether ``name`` is running: yes, no, or nobody knows.
 
     UNKNOWN wins over NOT_RUNNING and loses to RUNNING. That ordering is the
@@ -405,25 +488,23 @@ def avd_running(
 
     Args:
         name: AVD name, compared for equality against each console's reply.
-        devices: A listing from
-            :func:`common.device_utils.get_connected_devices`, when the caller
-            already has one. See :func:`probe_emulators`.
+        list_devices: Zero-argument listing callable; see
+            :func:`survey_emulators`.
         timeout: Per-emulator console timeout.
 
     Returns:
-        A :class:`RunningAnswer`.
-
-    Raises:
-        EmulatorProbeError: The device listing itself failed, when this
-            function did the listing.
+        A :class:`RunningAnswer`. A failed listing is UNKNOWN with
+        ``unavailable`` set -- never raised, and never NOT_RUNNING.
     """
-    probes = tuple(probe_emulators(devices, timeout=timeout))
-    for probe in probes:
+    survey = survey_emulators(list_devices, timeout=timeout)
+    if survey.unavailable:
+        return RunningAnswer(RunningVerdict.UNKNOWN, None, (), survey.unavailable)
+    for probe in survey.probes:
         if probe.avd_name == name:
-            return RunningAnswer(RunningVerdict.RUNNING, probe.serial, probes)
-    if any(not probe.identified for probe in probes):
-        return RunningAnswer(RunningVerdict.UNKNOWN, None, probes)
-    return RunningAnswer(RunningVerdict.NOT_RUNNING, None, probes)
+            return RunningAnswer(RunningVerdict.RUNNING, probe.serial, survey.probes)
+    if survey.unidentified:
+        return RunningAnswer(RunningVerdict.UNKNOWN, None, survey.probes)
+    return RunningAnswer(RunningVerdict.NOT_RUNNING, None, survey.probes)
 
 
 def console_available(serial: str | None = None) -> bool:
@@ -451,6 +532,7 @@ __all__ = [
     "EmuReply",
     "EmulatorProbe",
     "EmulatorProbeError",
+    "EmulatorSurvey",
     "RunningAnswer",
     "RunningVerdict",
     "avd_name_for_serial",
@@ -459,4 +541,5 @@ __all__ = [
     "identify_emulator",
     "probe_emulators",
     "run_emu",
+    "survey_emulators",
 ]

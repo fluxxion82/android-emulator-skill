@@ -20,7 +20,7 @@ import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
-from common.emu_console import avd_name_for_serial, probe_emulators
+from common.emu_console import avd_name_for_serial, survey_emulators
 from common.env_config import env_float, env_int
 from common.sdk_tools import (
     EMULATOR_NOT_FOUND_MESSAGE,
@@ -81,10 +81,19 @@ class EmulatorBooter:
         # which is the defect the already-booted short-circuit exists to
         # prevent, so an unidentified emulator stops the boot instead.
         # The listing stays on this module's own seam (get_connected_devices);
-        # only the console question is centralised.
-        probes = probe_emulators(get_connected_devices(), timeout=PROBE_TIMEOUT_SECONDS)
+        # only the console question is centralised. It is passed as a CALLABLE
+        # so a failed listing comes back as a value rather than escaping as an
+        # uncaught RuntimeError -- which is what it did, from the one module
+        # family whose job is turning adb failures into remedies (F2).
+        survey = survey_emulators(get_connected_devices, timeout=PROBE_TIMEOUT_SECONDS)
+        if survey.unavailable:
+            return False, (
+                f"Refusing to boot {self.avd_name}: {survey.describe_gap()}. Until "
+                f"the running emulators can be listed, a boot may start a second "
+                f"instance of an AVD that is already up, which corrupts its userdata."
+            )
 
-        for probe in probes:
+        for probe in survey.probes:
             if probe.avd_name == self.avd_name:
                 elapsed = time.time() - start_time
                 return True, (
@@ -92,17 +101,23 @@ class EmulatorBooter:
                     f"({probe.serial}) [checked in {elapsed:.1f}s]"
                 )
 
-        unidentified = [probe for probe in probes if not probe.identified]
+        unidentified = survey.unidentified
         if unidentified:
-            # Warned on stderr as well as returned, because --wait-ready callers
-            # read the message late and this one decides whether to retry.
-            detail = "; ".join(probe.describe() for probe in unidentified)
-            print(f"Warning: {detail}", file=sys.stderr)
+            # The remedy order is the shared one, and it matters (F3): the
+            # first version said "shut that emulator down" first, which for a
+            # stale `offline` emulator needs the very console that is not
+            # answering. Killing the process is the thing that actually works.
+            #
+            # Returned only, not also warned on stderr: since F2 every failure
+            # goes out through `_fail`, so a second copy on stderr was the same
+            # sentence twice.
             return False, (
-                f"Refusing to boot {self.avd_name}: {detail}. It may already be "
-                f"this AVD, and a second instance of one AVD corrupts its "
-                f"userdata. Shut that emulator down, or restart the adb "
-                f"connection (`adb kill-server && adb start-server`), then retry."
+                f"Refusing to boot {self.avd_name}: {survey.describe_gap()}. "
+                f"Terminate the stale emulator process itself before retrying "
+                f"(`pkill -f 'qemu-system.*{self.avd_name}'`, or quit it from "
+                f"Android Studio's Device Manager) -- `emulator_shutdown` cannot "
+                f"reach a console that is not answering. It may already be this "
+                f"AVD, and a second instance of one AVD corrupts its userdata."
             )
 
         # Resolve the emulator binary. Exec'ing the bare name is unsafe: with
@@ -333,22 +348,26 @@ def main():
     The net, not the handler: modes are dispatched under a try that knows
     whether ``--json`` was asked for (see :func:`_run`).
     """
+    parser = _build_parser()
+    args = parser.parse_args()
     try:
-        _run()
+        _run(parser, args)
     except SdkToolError as error:
         # AVD discovery could not run. Reported as a failure, never as an empty
         # listing: an agent reading "No AVDs found" cannot tell that from a
         # host where the SDK is not installed (X3).
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        _fail(error, json_mode=args.json)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy ("pass
         # --serial ...", "start an emulator ..."). That message is the point.
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        #
+        # Parsed BEFORE the try so these handlers know whether --json was asked
+        # for; they did not, and answered a --json caller with prose on stderr
+        # and an empty stdout (R1's shape, F2's instruction for this script).
+        _fail(error, json_mode=args.json)
 
 
-def _run():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Boot Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -393,7 +412,11 @@ Examples:
     parser.add_argument("--list-avds", action="store_true", help="List available AVDs")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
-    args = parser.parse_args()
+    return parser
+
+
+def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     try:
         _dispatch(parser, args)
     except (SdkToolError, adb_exec.AdbError) as error:
@@ -456,19 +479,22 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         wait_ready=args.wait_ready, timeout_seconds=args.timeout, headless=args.headless
     )
 
-    if args.json:
-        import json
+    if not success:
+        # A refused boot is a failing mode like any other (F2/F5): one shape,
+        # `{"error": ...}` under --json and `Error: ` on stderr otherwise.
+        _fail(message, json_mode=args.json)
 
+    if args.json:
         print(
             json.dumps(
-                {"success": success, "message": message, "avd": args.avd, "action": "boot"},
+                {"success": True, "message": message, "avd": args.avd, "action": "boot"},
                 indent=2,
             )
         )
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
