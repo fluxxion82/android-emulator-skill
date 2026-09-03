@@ -234,10 +234,17 @@ def test_missing_resource_id_is_reported_and_testtags_clear_it(recorded):
     """Compose emits no resource-id, which `testTagsAsResourceId` fixes.
 
     The two dumps are the same screen recorded either side of that modifier, so
-    the delta is evidence rather than assertion: six findings become none.
+    the delta is evidence rather than assertion: seven findings become none.
+
+    Seven, not the six this asserted when the check read `clickable and
+    enabled`: the scrolling list at [32,1164][1048,1637] is driven by
+    `scrollable`, carries no `clickable`, and was therefore invisible to a
+    check about interactive elements. It is one of the seven controls the
+    screen report names, so the audit was answering about a different set of
+    controls than the rest of the skill (C7 / INC1-05).
     """
     default = _of_type(_audit(recorded.text("uiautomator_compose_default")), "missing_resource_id")
-    assert len(default) == 6
+    assert len(default) == 7
     assert {issue["severity"] for issue in default} == {"info"}
     assert all(issue["fix"] for issue in default)
 

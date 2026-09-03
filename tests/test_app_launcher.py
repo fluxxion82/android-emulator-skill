@@ -22,6 +22,27 @@ def _ok(stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
 
+def _am_start_ok(recorded) -> str:
+    """The recorded stdout of a successful `am start -W`.
+
+    A launch is confirmed by `Status: ok` in this report and by nothing else,
+    so the fake adb has to produce the report. It used to produce an empty
+    string and the launch was called a success -- which is the same "absence of
+    a problem is a result" shape the whole increment is about, sitting in the
+    test that was supposed to prove the opposite.
+    """
+    return recorded.text("am_start_wait_settings")
+
+
+def _launch_aware(recorded, other: str = ""):
+    """A fake `subprocess.run` that answers `am start` with the recorded report."""
+
+    def fake_run(cmd, **kwargs):
+        return _ok(_am_start_ok(recorded) if "start" in cmd else other)
+
+    return fake_run
+
+
 def _noop_sleep(_seconds: float) -> None:
     """No-op replacement for time.sleep so restart tests don't actually wait."""
 
@@ -54,17 +75,17 @@ def test_parse_extras_rejects_malformed(bad):
 # --- launch with extras maps to --es KEY VALUE -----------------------------
 
 
-def test_launch_appends_es_extras(monkeypatch):
+def test_launch_appends_es_extras(monkeypatch, recorded):
     captured = {}
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return _ok()
+        return _ok(_am_start_ok(recorded))
 
     monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
 
     launcher = AppLauncher(serial="emulator-5554")
-    success, _ = launcher.launch(
+    success, _message, _report = launcher.launch(
         "com.example.app", activity=".MainActivity", extras={"mode": "test", "env": "ci"}
     )
 
@@ -80,12 +101,12 @@ def test_launch_appends_es_extras(monkeypatch):
     assert cmd[j : j + 3] == ["--es", "env", "ci"]
 
 
-def test_launch_without_extras_has_no_es(monkeypatch):
+def test_launch_without_extras_has_no_es(monkeypatch, recorded):
     captured = {}
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return _ok()
+        return _ok(_am_start_ok(recorded))
 
     monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
 
@@ -98,7 +119,7 @@ def test_launch_without_extras_has_no_es(monkeypatch):
 # --- restart = terminate then launch with a sleep between ------------------
 
 
-def test_restart_terminates_then_launches_with_delay(monkeypatch):
+def test_restart_terminates_then_launches_with_delay(monkeypatch, recorded):
     calls: list[str] = []
 
     def fake_run(cmd, **kwargs):
@@ -107,6 +128,7 @@ def test_restart_terminates_then_launches_with_delay(monkeypatch):
             calls.append("terminate")
         elif "start" in cmd:
             calls.append("launch")
+            return _ok(_am_start_ok(recorded))
         return _ok()
 
     sleeps: list[float] = []
@@ -125,12 +147,13 @@ def test_restart_terminates_then_launches_with_delay(monkeypatch):
     assert sleeps == [app_launcher.RELAUNCH_DELAY_SECONDS]
 
 
-def test_restart_forwards_extras_to_launch(monkeypatch):
+def test_restart_forwards_extras_to_launch(monkeypatch, recorded):
     launch_cmds: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         if "start" in cmd:
             launch_cmds.append(cmd)
+            return _ok(_am_start_ok(recorded))
         return _ok()
 
     monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
@@ -356,13 +379,13 @@ def test_every_action_mode_reports_a_failed_command_the_same_way(
 
 
 @pytest.mark.parametrize(("action", "argv"), ACTION_MODES, ids=[m[0] for m in ACTION_MODES])
-def test_the_success_shape_of_every_action_mode_is_unchanged(monkeypatch, capsys, action, argv):
+def test_the_success_shape_of_every_action_mode_is_unchanged(
+    monkeypatch, capsys, recorded, action, argv
+):
     """The negative control: the JSON a working run prints must not have moved."""
-
-    def fake_run(cmd, **kwargs):
-        return _ok("Success\n")
-
-    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        app_launcher.adb_exec.subprocess, "run", _launch_aware(recorded, other="Success\n")
+    )
     monkeypatch.setattr(app_launcher.time, "sleep", _noop_sleep)
 
     code = _run_cli(monkeypatch, [*argv, "--json"])
@@ -372,6 +395,97 @@ def test_the_success_shape_of_every_action_mode_is_unchanged(monkeypatch, capsys
     assert payload["success"] is True
     assert payload["action"] == action
     assert payload["message"]
+
+
+# --- E1: a launch is confirmed by the report, not by the absence of trouble --
+
+
+def test_a_launch_is_confirmed_by_status_ok_and_reports_the_resolved_activity(
+    monkeypatch, recorded
+):
+    """The success capture, and the alias trap it carries.
+
+    `am start -W -n com.android.settings/.Settings` answers
+    `Activity: com.android.settings/.homepage.SettingsHomepageActivity` -- the
+    alias resolves, so the component that comes up is NOT the string that was
+    asked for. A launcher that confirmed the launch by comparing those two
+    would call every alias a failure; the confirmation is `Status: ok`, and the
+    resolved component is information to hand on.
+    """
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", _launch_aware(recorded))
+
+    success, message, report = AppLauncher(serial="emulator-5554").launch(
+        "com.android.settings", activity=".Settings"
+    )
+
+    assert success is True, message
+    assert report["status"] == "ok"
+    assert report["activity"] == "com.android.settings/.homepage.SettingsHomepageActivity"
+    assert report["activity"] in message, "the resolved activity is not reported"
+    assert "575" in message, f"the launch time is not reported: {message}"
+
+
+def test_a_launch_that_did_not_start_is_a_failure_naming_the_remedy(monkeypatch, recorded):
+    """The failure capture: exit 1, everything on stdout, and NO `Status:` line.
+
+    This is why "no Status line" cannot mean success. The whole diagnostic --
+    `Error type 3`, `Error: Activity class {...} does not exist.` -- is on
+    stdout, with stderr empty (stderr_bytes: 0 in the manifest), so a launcher
+    reading stderr for the reason finds nothing and one waiting for a non-`ok`
+    status finds nothing either.
+    """
+    failure = recorded.text("am_start_wait_missing")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout=failure, stderr="")
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+
+    success, message, _report = AppLauncher(serial="emulator-5554").launch(
+        "com.android.settings", activity=".NoSuchActivity"
+    )
+
+    assert success is False
+    assert "does not exist" in message, message
+    assert "resolve-activity" in message, f"the failure names no remedy: {message}"
+
+
+def test_a_report_with_no_status_line_is_not_a_launch(monkeypatch, recorded):
+    """The same rule where adb itself exits 0: the report decides, not the status code.
+
+    Derived from the recorded failure by dropping the exit status to 0, which is
+    the one thing about it that cannot be recorded on demand -- some devices
+    answer a bad component with `Error:` and exit 0. Every byte of the output is
+    the device's.
+    """
+
+    def fake_run(cmd, **kwargs):
+        return _ok(recorded.text("am_start_wait_missing"))
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+
+    success, message, _report = AppLauncher(serial="emulator-5554").launch(
+        "com.android.settings", activity=".NoSuchActivity"
+    )
+
+    assert success is False, "a launch with no `Status: ok` was reported as one"
+    assert "does not exist" in message, message
+
+
+def test_parse_am_start_reads_the_recorded_report(recorded):
+    """The parser against both captures, as they were written to stdout."""
+    ok = app_launcher.parse_am_start(recorded.text("am_start_wait_settings"))
+    assert ok["status"] == "ok"
+    assert ok["launchstate"] == "COLD"
+    assert ok["totaltime"] == "575"
+    assert app_launcher.am_start_error(recorded.text("am_start_wait_settings")) is None
+
+    failed = app_launcher.parse_am_start(recorded.text("am_start_wait_missing"))
+    assert "status" not in failed, "the failure capture has no Status line to read"
+    assert app_launcher.am_start_error(recorded.text("am_start_wait_missing")) == (
+        "Activity class {com.android.settings/com.android.settings.NoSuchActivity} "
+        "does not exist."
+    )
 
 
 # --- C6: a failed lookup is not an empty answer ----------------------------

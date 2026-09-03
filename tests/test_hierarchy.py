@@ -325,29 +325,77 @@ def test_bounds_are_read_off_the_recorded_screen(recorded):
     assert boxes["[0,142][1080,2361]"] == (0, 142, 1080, 2361)
 
 
-def test_an_unreadable_bounds_value_is_none_and_not_a_rectangle():
+# The recorded Compose CheckBox: a real control, used below as the body on
+# which one attribute at a time is changed. Nothing here invents a node.
+_CHECKBOX_BOUNDS = "[33,754][159,880]"
+
+
+def _recorded_control(recorded, bounds: str) -> ET.Element:
+    """The recorded CheckBox with its ``bounds`` replaced, and nothing else.
+
+    uiautomator on API 35 writes a well-formed rectangle for every node -- the
+    recording unit tried eight recipes for an off-screen or unreadable one and
+    got a clipped rectangle every time -- so a dump in which `bounds` cannot be
+    parsed is not something that can be recorded on demand. It is derived
+    instead, from a control that IS recorded, by changing the single attribute
+    under test. Every other attribute, and the node's place in the tree, is the
+    device's.
+    """
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    node = next(item for item in root.iter() if item.get("bounds") == _CHECKBOX_BOUNDS)
+    node.set("bounds", bounds)
+    return node
+
+
+@pytest.mark.parametrize(
+    ("bounds", "why"),
+    [
+        ("", "the attribute is present but empty"),
+        ("[33,754]", "one corner: half a rectangle is not a rectangle"),
+        ("[33,754][159,880]junk", "trailing text -- re.match would take the numbers in front"),
+        ("[33,754](159,880)", "the wrong brackets on the second corner"),
+    ],
+    ids=["empty", "one-corner", "trailing-junk", "wrong-brackets"],
+)
+def test_a_bounds_value_that_will_not_parse_is_none(recorded, bounds, why):
     """None means "unknown"; `(0, 0, 0, 0)` would mean "the top-left corner".
 
     The distinction is the whole of C5. Two of the three grammars this replaced
     returned the corner for anything they could not read, and navigator duly
     offered it as a tappable point.
     """
-    assert hierarchy.parse_bounds("") is None
+    node = _recorded_control(recorded, bounds)
+    assert hierarchy.parse_bounds(node.get("bounds")) is None, why
     assert hierarchy.parse_bounds(None) is None
-    assert hierarchy.parse_bounds("not-bounds") is None
-    assert hierarchy.parse_bounds("[33,754]") is None, "half a rectangle is not a rectangle"
 
 
-def test_the_grammar_is_signed():
+def test_a_control_whose_bounds_will_not_parse_is_not_operable(recorded):
+    """Eligibility needs a rectangle, not merely the absence of a bad one.
+
+    "Operable" means an agent can act on it, and nothing can act on a position
+    nobody can read -- so a missing or unreadable `bounds` is a No, where it
+    used to be waved through as a missing signal.
+    """
+    assert hierarchy.is_interactive(_recorded_control(recorded, _CHECKBOX_BOUNDS))
+    assert not hierarchy.is_interactive(_recorded_control(recorded, "[33,754]"))
+
+    without = _recorded_control(recorded, _CHECKBOX_BOUNDS)
+    del without.attrib["bounds"]
+    assert not hierarchy.is_interactive(without)
+
+
+def test_the_grammar_is_signed(recorded):
     """Kept as precaution, not as observation.
 
-    uiautomator on API 35 clips every rectangle to the display -- eight recipes
-    for an off-screen node all came back clipped, so no recorded dump has a
-    negative bound. The signed grammar is retained because
+    uiautomator on API 35 clips every rectangle to the display, so no recorded
+    dump has a negative bound. The signed grammar is retained because
     `accessibility_audit`'s already was, because older API levels are not known
-    to clip, and because it costs nothing.
+    to clip, and because it costs nothing. Shown here on the recorded control
+    with its rectangle shifted off the left edge.
     """
-    assert hierarchy.parse_bounds("[-12,-4][200,150]") == (-12, -4, 200, 150)
+    node = _recorded_control(recorded, "[-12,754][159,880]")
+    assert hierarchy.parse_bounds(node.get("bounds")) == (-12, 754, 159, 880)
+    assert hierarchy.is_interactive(node), "a negative left edge is still a rectangle"
 
 
 def test_a_control_is_eligible_by_its_properties_not_its_class(recorded):
@@ -406,8 +454,7 @@ def test_a_disabled_control_is_not_operable(recorded):
     So the case is made by changing that one attribute on a real node -- every
     other byte is the device's -- rather than by inventing a dump.
     """
-    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
-    checkbox = next(node for node in root.iter() if node.get("bounds") == "[33,754][159,880]")
+    checkbox = _recorded_control(recorded, _CHECKBOX_BOUNDS)
     assert hierarchy.is_interactive(checkbox), "the recorded control is operable to begin with"
 
     checkbox.set("enabled", "false")

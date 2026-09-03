@@ -100,22 +100,78 @@ from common.device_utils import (
     resolve_device_identifier,
 )
 from common.env_config import env_float, env_int
-from common.hierarchy import HierarchyError, capture_hierarchy, is_interactive, parse_bounds
+from common.hierarchy import (
+    CAPTURE_ATTEMPTS,
+    HierarchyError,
+    bare_resource_id,
+    capture_hierarchy,
+    is_interactive,
+    parse_bounds,
+)
 
 # Tunable defaults (overridable via ANDROID_EMU_* env vars; see SKILL.md).
 MAX_ELEMENTS_LISTED = env_int("ANDROID_EMU_MAX_ELEMENTS", 25)
 TAP_SETTLE_SECONDS = env_float("ANDROID_EMU_TAP_SETTLE_MS", 500.0) / 1000.0
-
-# Ceiling on --scroll-to-find. A scroll search that never terminates is worse
-# than one that gives up with a count, so this is a hard bound even when the
-# screen keeps changing (an infinite list does exactly that).
-MAX_SCROLLS = env_int("ANDROID_EMU_MAX_SCROLLS", 10, min_value=1)
 
 # Hard ceiling on --max-scrolls, whatever the caller asks for. Each scroll costs
 # a swipe, a settle and a hierarchy dump -- roughly a second and a half on the
 # recorded emulator -- so a four-digit budget is not a longer search, it is a
 # hang with a plausible explanation (C15).
 MAX_SCROLLS_CEILING = 50
+
+
+def _bounded_scroll_budget(value: object, source: str) -> int:
+    """The one place a scroll budget is checked, whatever it came from.
+
+    Args:
+        value: The requested budget, as typed or as read from the environment.
+        source: What to name in the error -- a flag or an env var.
+
+    Returns:
+        The budget, guaranteed to be within 1..MAX_SCROLLS_CEILING.
+
+    Raises:
+        ValueError: When it is not a whole number in range.
+    """
+    try:
+        budget = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{source}={value!r} is not a whole number of scrolls") from None
+    if budget < 1:
+        raise ValueError(
+            f"{source} must be at least 1; omit --scroll-to-find to search only "
+            f"the visible screen"
+        )
+    if budget > MAX_SCROLLS_CEILING:
+        raise ValueError(
+            f"{source} must be at most {MAX_SCROLLS_CEILING}; a search that needs more "
+            f"scrolls than that is looking for something the screen does not have -- "
+            f"narrow it with --find-id or --find-type instead"
+        )
+    return budget
+
+
+def _default_max_scrolls() -> int:
+    """The default budget, held to the same ceiling as the flag.
+
+    `env_int` clamps the floor and nothing clamped the ceiling, so
+    `ANDROID_EMU_MAX_SCROLLS=5000` walked straight past the argparse validator
+    that exists to prevent exactly that -- the flag was checked and its default
+    was not.
+    """
+    try:
+        return _bounded_scroll_budget(
+            env_int("ANDROID_EMU_MAX_SCROLLS", 10, min_value=1), "ANDROID_EMU_MAX_SCROLLS"
+        )
+    except ValueError as error:
+        print(f"warning: {error}; using {MAX_SCROLLS_CEILING}", file=sys.stderr)
+        return MAX_SCROLLS_CEILING
+
+
+# Ceiling on --scroll-to-find. A scroll search that never terminates is worse
+# than one that gives up with a count, so this is a hard bound even when the
+# screen keeps changing (an infinite list does exactly that).
+MAX_SCROLLS = _default_max_scrolls()
 
 # Refusal for an element whose bounds uiautomator did not report in a form this
 # skill can read. Naming the element and the remedy matters more than usual
@@ -219,7 +275,7 @@ class Element:
         its subtree or its row -- which is what ``--list`` and `screen_mapper`
         print for a control with no text of its own, and therefore what an agent
         has to hand to ``--find-text`` (C1). A resource id is deliberately not
-        here: ids are matched in full (see :meth:`Navigator._matches_text`),
+        here: an id is matched whole (see :meth:`Navigator._matches_text`),
         because ``com.android.settings:id/...`` makes a fuzzy search for
         "settings" match every node on the screen.
         """
@@ -229,12 +285,20 @@ class Element:
     def label(self) -> str:
         """Get best label for this element.
 
-        Same precedence as `screen_mapper`'s, deliberately: the two scripts
-        print one name for one control, so a name the screen report showed is a
-        name ``--find-text`` accepts.
+        Same precedence as `screen_mapper`'s, and the same BARE resource id --
+        `com.android.settings:id/search_action_bar` prints as
+        `search_action_bar`. The two scripts print one name for one control, so
+        a name the screen report showed is a name ``--find-text`` accepts, and
+        the bare form is the one ``--find-id`` has always taken. Compose's
+        ``testTagsAsResourceId`` already emits an unqualified tag, so this is
+        also the only choice under which both toolkits name things alike.
         """
         return (
-            self.text or self.content_desc or self.resource_id or self.recovered_label or "Unnamed"
+            self.text
+            or self.content_desc
+            or bare_resource_id(self.resource_id)
+            or self.recovered_label
+            or "Unnamed"
         )
 
     @property
@@ -339,7 +403,9 @@ class Navigator:
             self._gestures = GestureSimulator(self.serial)
         return self._gestures
 
-    def get_ui_hierarchy(self, force_refresh: bool = False) -> ET.Element:
+    def get_ui_hierarchy(
+        self, force_refresh: bool = False, timeout: int | None = None
+    ) -> ET.Element:
         """
         Get the UI hierarchy, cached for the lifetime of this navigator.
 
@@ -350,6 +416,10 @@ class Navigator:
 
         Args:
             force_refresh: Re-capture even if a tree is already cached.
+            timeout: Seconds to allow per dump attempt. None uses
+                ``ANDROID_EMU_UI_DUMP_TIMEOUT``. A scroll search passes what is
+                left of its deadline, because a dump on a screen that will not
+                settle is the single longest thing this script does.
 
         Returns:
             XML root element.
@@ -360,7 +430,7 @@ class Navigator:
         if self._tree_cache is not None and not force_refresh:
             return self._tree_cache
 
-        self._tree_cache = capture_hierarchy(self.serial)
+        self._tree_cache = capture_hierarchy(self.serial, timeout=timeout)
         return self._tree_cache
 
     def _flatten_tree(
@@ -527,7 +597,13 @@ class Navigator:
             # that does not satisfy the criterion the caller gave.
             resolved = elem
             if text and not (element_type or resource_id) and not elem.interactive:
-                resolved = self._owning_control(elem, by_node, parent_of, text, fuzzy) or elem
+                owner = self._owning_control(elem, by_node, parent_of)
+                # No owner means the name belongs to a passive label and to
+                # nothing operable. Keeping the label in the results would let
+                # the caller "find" it and then tap a no-op; `_run_action`
+                # refuses on `interactive` being False, so it is kept here and
+                # rejected there, where the message can say so.
+                resolved = owner or elem
 
             if id(resolved.node) in seen:
                 continue
@@ -549,9 +625,13 @@ class Navigator:
         then not searchable, which left two of the seven labels on a Compose
         screen answering "Not found".
 
-        A resource id matches only in full (as ``pkg:id/name`` or as ``name``),
-        never as a substring: ids embed the package, so a fuzzy search for
-        "settings" would otherwise match every node in the Settings app.
+        A resource id matches only whole, in either the bare form this script
+        prints (``search_action_bar``) or the qualified form uiautomator
+        reports (``com.android.settings:id/search_action_bar``) -- never as a
+        substring, because ids embed the package and a fuzzy search for
+        "settings" would otherwise match every node in the Settings app. Both
+        forms are accepted so that a name copied from an older report, or from
+        a dump read directly, still resolves.
         """
         if fuzzy:
             lowered = text.lower()
@@ -561,7 +641,7 @@ class Navigator:
             return True
 
         if elem.resource_id:
-            return text in (elem.resource_id, elem.resource_id.rsplit("/", maxsplit=1)[-1])
+            return text in (elem.resource_id, bare_resource_id(elem.resource_id))
         return False
 
     def _owning_control(
@@ -569,12 +649,11 @@ class Navigator:
         caption: Element,
         by_node: dict[int, Element],
         parent_of: dict[int, ET.Element],
-        text: str,
-        fuzzy: bool,
     ) -> Element | None:
         """The control a caption describes, or None when the caption stands alone.
 
-        Two placements, both measured on recorded dumps:
+        Ownership is STRUCTURAL -- it asks where the caption sits, never what it
+        says. Two placements, both measured on recorded dumps:
 
         - **An ancestor.** A Compose Button's "Submit Order" and a Settings
           row's "Battery 100%" sit *inside* the control, so the nearest
@@ -584,26 +663,24 @@ class Navigator:
           it -- so a "nearest interactive ancestor" rule alone taps the caption
           and misses the Checkbox by 143px, which is exactly what v0.6.0 did.
           The row is established by overlapping vertical bounds, not by
-          parentage.
+          parentage; the NEXT sibling is tried before the previous one, because
+          a caption follows its control in both Compose layouts recorded here
+          and the reverse order would make "Dark theme" resolve to the Checkbox
+          above it.
 
-        In both cases the candidate must answer to the same name. Without that
-        proviso a tap on a passive label resolves to whatever scrollable
-        container happens to enclose it, which moves the tap to the middle of
-        the screen -- a worse answer than tapping the label.
+        The owner does NOT have to answer to the caption's name. It did in the
+        first version of this, and that requirement silently un-fixed C1 for
+        every control whose own name is a resource id: `search_action_bar`
+        carries an id, so it recovers no caption, so it "did not answer to"
+        `Search settings` and the tap went back to the passive TextView inside
+        it. What keeps the structural rule safe is the other end -- a match that
+        resolves to nothing operable is refused rather than tapped.
         """
-
-        def owns(candidate: Element | None) -> bool:
-            return (
-                candidate is not None
-                and candidate.interactive
-                and self._matches_text(candidate, text, fuzzy)
-            )
-
         ancestor = parent_of.get(id(caption.node))
         while ancestor is not None:
             owner = by_node.get(id(ancestor))
             if owner is not None and owner.interactive:
-                return owner if owns(owner) else None
+                return owner
             ancestor = parent_of.get(id(ancestor))
 
         parent = caption.parent
@@ -622,13 +699,12 @@ class Navigator:
             if not 0 <= neighbour < len(siblings):
                 continue
             candidate = by_node.get(id(siblings[neighbour]))
-            if candidate is None or candidate.bounds is None:
+            if candidate is None or not candidate.interactive or candidate.bounds is None:
                 continue
             # Same row: the vertical spans must overlap.
             if not (caption_top < candidate.bounds[3] and candidate.bounds[1] < caption_bottom):
                 continue
-            if owns(candidate):
-                return candidate
+            return candidate
         return None
 
     @staticmethod
@@ -734,7 +810,29 @@ class Navigator:
             if progress is not None:
                 progress(message)
 
-        root = self.get_ui_hierarchy(force_refresh=True)
+        # The clock starts HERE, before the first capture, because the first
+        # capture is inside the search: a dump on a screen that will not settle
+        # retries for up to ANDROID_EMU_UI_DUMP_TIMEOUT per attempt, and a
+        # deadline that started afterwards would have been measuring everything
+        # except the slowest thing it was meant to bound (C15).
+        deadline = time.monotonic() + SCROLL_SEARCH_DEADLINE_SECONDS
+
+        def out_of_time() -> bool:
+            return SCROLL_SEARCH_DEADLINE_SECONDS > 0 and time.monotonic() >= deadline
+
+        def capture() -> ET.Element:
+            """Dump the screen, giving it no more than the search has left."""
+            timeout = None
+            if SCROLL_SEARCH_DEADLINE_SECONDS > 0:
+                # `capture_hierarchy` retries, and `timeout` bounds one attempt,
+                # so the remaining budget is split across the attempts it may
+                # make. Otherwise a single dump could spend the whole deadline
+                # and the retries would run past it.
+                remaining = deadline - time.monotonic()
+                timeout = max(1, int(remaining / CAPTURE_ATTEMPTS))
+            return self.get_ui_hierarchy(force_refresh=True, timeout=timeout)
+
+        root = capture()
         screens = 1
         criteria = {
             "text": text,
@@ -756,10 +854,9 @@ class Navigator:
 
         signature = self._screen_signature(root)
         scrolls = 0
-        deadline = time.monotonic() + SCROLL_SEARCH_DEADLINE_SECONDS
 
         for _ in range(max_scrolls):
-            if SCROLL_SEARCH_DEADLINE_SECONDS > 0 and time.monotonic() >= deadline:
+            if out_of_time():
                 note(
                     f"the {SCROLL_SEARCH_DEADLINE_SECONDS:.0f}s search deadline passed after "
                     f"{scrolls} scrolls; stopping"
@@ -771,10 +868,22 @@ class Navigator:
                 note(f"scroll failed: {message}")
                 return ScrollSearch(None, screens, scrolls, True, failure=message)
             scrolls += 1
+            # Said now, not after the dump that follows. The dump is the slow
+            # part -- settle, then up to three attempts -- and a caller watching
+            # stderr needs to see that the scroll happened while it is waiting,
+            # not once the waiting is over.
+            note(f"scrolled {direction} ({scrolls}); reading the screen")
             if SCROLL_SETTLE_SECONDS > 0:
                 time.sleep(SCROLL_SETTLE_SECONDS)
 
-            root = self.get_ui_hierarchy(force_refresh=True)
+            if out_of_time():
+                note(
+                    f"the {SCROLL_SEARCH_DEADLINE_SECONDS:.0f}s search deadline passed after "
+                    f"{scrolls} scrolls; stopping"
+                )
+                return ScrollSearch(None, screens, scrolls, True, hit_deadline=True)
+
+            root = capture()
             screens += 1
             element = self._find_in(root, **criteria)
             note(
@@ -910,8 +1019,52 @@ class Navigator:
         return elements
 
 
+class _JsonAwareParser(argparse.ArgumentParser):
+    """An argparse parser that answers a usage error in JSON when asked to.
+
+    A caller that passed ``--json`` parses stdout. argparse writes usage prose
+    to stderr and exits 2, so `--tap --json` with no criterion -- the very thing
+    C2 added -- produced an empty stdout and a status the caller could see but
+    not read. Exit 2 is still correct for a usage error; the payload is what was
+    missing.
+
+    ``--json`` is read from argv rather than from parsed arguments because the
+    error happens *during* parsing, when there are none.
+    """
+
+    def error(self, message: str):
+        if "--json" in sys.argv[1:]:
+            print(json_lib.dumps({"error": message}, indent=2))
+            sys.exit(2)
+        super().error(message)
+
+
+def _fail(args: argparse.Namespace, message: str, **extra: object):
+    """Report a failed lookup or action, and exit non-zero.
+
+    One boundary, because the failure contract was kept in some branches and not
+    others: ``--json`` answered ``{"success": false, ...}`` for a miss,
+    ``{"error": ...}`` never, and nothing at all for a usage error. An agent
+    should not have to know which branch it hit to know where to read the
+    reason.
+
+    The text form stays on stdout, where every existing caller reads it: the
+    message is this tool's answer, not a diagnostic about it.
+
+    Args:
+        args: Parsed CLI arguments; only ``--json`` is consulted.
+        message: What failed, carrying its remedy.
+        **extra: Additional JSON keys (the search detail, for instance).
+    """
+    if args.json:
+        print(json_lib.dumps({"error": message, **extra}, indent=2))
+    else:
+        print(message)
+    sys.exit(1)
+
+
 def _scroll_budget(value: str) -> int:
-    """Validate ``--max-scrolls``: a positive integer, bounded above.
+    """argparse ``type`` for ``--max-scrolls``: the shared validator, re-worded.
 
     Both ends are usage errors rather than surprises. A budget of zero would
     report "stopped at the 0-scroll limit" from a search that never scrolled;
@@ -919,24 +1072,13 @@ def _scroll_budget(value: str) -> int:
     agent that typed it has no way to see the difference from a hang (C15).
     """
     try:
-        budget = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"'{value}' is not a whole number of scrolls") from None
-    if budget < 1:
-        raise argparse.ArgumentTypeError(
-            "must be at least 1; omit --scroll-to-find to search only the visible screen"
-        )
-    if budget > MAX_SCROLLS_CEILING:
-        raise argparse.ArgumentTypeError(
-            f"must be at most {MAX_SCROLLS_CEILING}; a search that needs more scrolls than "
-            f"that is looking for something the screen does not have -- narrow it with "
-            f"--find-id or --find-type instead"
-        )
-    return budget
+        return _bounded_scroll_budget(value, "--max-scrolls")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error).replace("--max-scrolls ", "")) from None
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = _JsonAwareParser(
         description="Android semantic element navigation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -1125,16 +1267,24 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     # Tap at coordinates mode
     if args.tap_at:
         try:
-            x, y = map(int, args.tap_at.split(","))
-            success, message = navigator.tap_at(x, y)
-            if args.json:
-                print(json_lib.dumps({"success": success, "message": message}, indent=2))
-            else:
-                print(message)
-            sys.exit(0 if success else 1)
+            x, y = (int(part) for part in args.tap_at.split(","))
         except ValueError:
-            print("Error: --tap-at requires format 'x,y' (e.g., 200,400)", file=sys.stderr)
-            sys.exit(1)
+            _fail(
+                args,
+                f"--tap-at requires two whole numbers as 'x,y' (e.g. 200,400); "
+                f"got {args.tap_at!r}",
+            )
+
+        success, message = navigator.tap_at(x, y)
+        if not success:
+            _fail(args, message)
+        if args.json:
+            print(
+                json_lib.dumps({"success": True, "message": message, "tapped_at": [x, y]}, indent=2)
+            )
+        else:
+            print(message)
+        sys.exit(0)
 
     # Resolve search text: --find-exact forces exact matching; --find-text is
     # fuzzy unless --exact is also passed. --find-exact takes precedence.
@@ -1193,17 +1343,23 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
             # reading this as "the element does not exist".
             detail = "searched 1 screen; this screen scrolls -- retry with --scroll-to-find"
         message = f"Not found: {', '.join(criteria)} ({detail})"
+        _fail(args, message, search=_search_json(search))
 
-        if args.json:
-            print(
-                json_lib.dumps(
-                    {"success": False, "message": message, "search": _search_json(search)},
-                    indent=2,
-                )
-            )
-        else:
-            print(message)
-        sys.exit(1)
+    # A name that matched only a passive label is not an answer.
+    #
+    # Ownership is structural (`_owning_control`), so a caption inside or beside
+    # a control resolves to that control. When nothing owns it, the match is a
+    # label and nothing else: tapping it does nothing, and reporting it as found
+    # invites exactly that tap. This is the safety catch that lets ownership
+    # ignore what the caption says (INC1-04).
+    if search_text and not (args.find_type or args.find_id) and not element.interactive:
+        _fail(
+            args,
+            f'Not actionable: "{element.label}" is a passive label with no control -- '
+            f"nothing on this screen that answers to that name can be tapped. Run "
+            f"screen_mapper.py to see the controls, or give coordinates with --tap-at x,y.",
+            search=_search_json(search),
+        )
 
     # Perform action on found element. Its bounds come from the screen as it
     # is now -- after any scrolling -- so a tap lands where the element ended
@@ -1225,6 +1381,8 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
 
     if search.scrolls:
         message = f"{message} ({search.detail})"
+    if not success:
+        _fail(args, message, search=_search_json(search))
     if args.verbose:
         print(
             f"  bounds={element.bounds} clickable={element.clickable} "
@@ -1234,7 +1392,7 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
 
     if args.json:
         result = {
-            "success": success,
+            "success": True,
             "message": message,
             "element": {
                 "type": element.type,
@@ -1244,11 +1402,16 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
             },
             "search": _search_json(search),
         }
+        if args.tap or args.enter_text:
+            # Where the tap actually went. Without this a caller checking that a
+            # name landed on the right control has only navigator's own prose to
+            # go on, which is the one source that cannot disagree with it.
+            result["tapped_at"] = list(element.center)
         print(json_lib.dumps(result, indent=2))
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 def _search_json(search: ScrollSearch) -> dict:

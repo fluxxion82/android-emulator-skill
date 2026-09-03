@@ -113,11 +113,17 @@ COMPOSE_CONTROLS: tuple[tuple[str, tuple[int, int, int, int]], ...] = (
     ("Email address", (32, 595, 1048, 742)),
 )
 
+# The three resource-id names are the BARE form as of Inc 1: both scripts print
+# `search_action_bar`, not `com.android.settings:id/search_action_bar`. That is
+# a deliberate change to this spec, made because the two scripts printed
+# different strings for one control and one of them had to give -- the bare form
+# is what `--find-id` has always matched and what Compose's testTagsAsResourceId
+# already emits. `_captions` below is changed to match, for the same reason.
 SETTINGS_CONTROLS: tuple[tuple[str, tuple[int, int, int, int]], ...] = (
-    ("com.android.settings:id/settings_homepage_container", (0, 142, 1080, 2361)),
+    ("settings_homepage_container", (0, 142, 1080, 2361)),
     ("Profile picture, double tap to open Google Account", (891, 289, 1017, 415)),
-    ("com.android.settings:id/search_action_bar", (42, 605, 1038, 742)),
-    ("com.android.settings:id/main_content_scrollable_container", (0, 784, 1080, 2361)),
+    ("search_action_bar", (42, 605, 1038, 742)),
+    ("main_content_scrollable_container", (0, 784, 1080, 2361)),
     ("Network & internet Mobile, Wi‑Fi, hotspot", (0, 784, 1080, 1015)),
     ("Connected devices Bluetooth, pairing", (0, 1015, 1080, 1246)),
     ("Apps Assistant, recent apps, default apps", (0, 1246, 1080, 1477)),
@@ -304,7 +310,10 @@ def _captions(node: ET.Element, parent: ET.Element | None) -> set[str]:
        descendants of it, so the row is resolved by vertical bounds overlap and
        not by parentage.
     """
-    own = _text_of(node) or (node.get("resource-id") or "").strip()
+    # The bare name of a resource id, matching what both scripts print since
+    # Inc 1 (see SETTINGS_CONTROLS). Spelled out here rather than imported, so
+    # this resolver still owes nothing to the code it checks.
+    own = _text_of(node) or (node.get("resource-id") or "").strip().rsplit("/", maxsplit=1)[-1]
     if own:
         return {own}
 

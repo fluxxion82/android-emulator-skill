@@ -38,7 +38,15 @@ from pathlib import Path
 
 import pytest
 
+# The independent resolver from the fixture-driven loop spec, imported rather
+# than re-implemented: the rectangle a tap must land in is computed from the
+# hierarchy by code that knows nothing about navigator, and there must be
+# exactly one such resolver or the live lane and the mocked one can disagree
+# about what "the right control" means.
+from test_agent_loop_from_output import _expected_rect
+
 from common.device_utils import parse_focused_activity
+from common.hierarchy import capture_hierarchy
 
 pytestmark = pytest.mark.emulator
 
@@ -150,18 +158,27 @@ def compose_app(run_skill, adb: str, compose_device: str):
     Returns the package, and the focused activity as the test last saw it, so a
     shortfall can say which screen was actually mapped.
     """
-    launched = run_skill("app_launcher.py", "--launch", ACTIVITY)
+    launched = run_skill("app_launcher.py", "--launch", ACTIVITY, "--json")
     assert launched.returncode == 0, f"could not launch: {launched.stderr}"
+
+    # The activity `am start -W` RESOLVED, not the one that was asked for. They
+    # differ whenever the request names an alias -- the recorded capture shows
+    # `.Settings` resolving to `.homepage.SettingsHomepageActivity` -- so the
+    # requested string is the wrong thing to wait for, and "any activity in the
+    # package" is too weak to catch a launch that landed on the wrong screen.
+    started = json.loads(launched.stdout)
+    resolved = started.get("activity")
+    assert resolved, f"--launch --json did not report the activity it started: {started}"
 
     deadline = time.monotonic() + FOCUS_TIMEOUT
     focused = _focused_activity(adb, compose_device)
-    while not (focused or "").startswith(APP) and time.monotonic() < deadline:
+    while focused != resolved and time.monotonic() < deadline:
         time.sleep(FOCUS_POLL_SECONDS)
         focused = _focused_activity(adb, compose_device)
 
-    assert (focused or "").startswith(APP), (
-        f"{ACTIVITY} was launched but {focused!r} is still focused after "
-        f"{FOCUS_TIMEOUT}s. Nothing below this point would be measuring the "
+    assert focused == resolved, (
+        f"am start reported {resolved!r} as displayed, but {focused!r} is focused "
+        f"after {FOCUS_TIMEOUT}s. Nothing below this point would be measuring the "
         f"fixture app."
     )
     return focused
@@ -215,18 +232,35 @@ def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app
 
     # --- 3. Tap what the report named (Quick Start step 3) -----------------
     #
-    # The name goes back in verbatim. Nothing here knows the control's
-    # rectangle; the point is that the name the agent was shown is a name the
-    # navigator can act on, and that it reports acting on that same control.
-    tapped = run_skill("navigator.py", "--find-text", target, "--tap")
+    # The name goes back in verbatim, and the tap is checked against the
+    # hierarchy rather than against navigator's own account of it. The screen is
+    # captured the way the skill captures it, the target's rectangle is derived
+    # from that capture by the independent resolver, and the coordinates come
+    # from `--json`. A test that read the `Tapped:` line for both the claim and
+    # the check could not see the tool tapping the wrong thing.
+    before = capture_hierarchy(compose_device)
+    expected = _expected_rect(before, target)
+
+    tapped = run_skill("navigator.py", "--find-text", target, "--tap", "--json")
     assert tapped.returncode == 0, (
         f"a name the screen report printed could not be tapped: {target!r}\n"
         f"  stdout: {tapped.stdout.strip()}\n  stderr: {tapped.stderr.strip()}"
     )
-    assert tapped.stdout.startswith("Tapped:"), tapped.stdout
-    assert target in tapped.stdout, (
+
+    result = json.loads(tapped.stdout)
+    assert target in result["message"], (
         f"the tap reported a different control than the one named: "
-        f"asked for {target!r}, got {tapped.stdout.strip()!r}"
+        f"asked for {target!r}, got {result['message']!r}"
+    )
+
+    x, y = result["tapped_at"]
+    left, top, right, bottom = expected
+    assert left <= x <= right and top <= y <= bottom, (
+        f"the tap landed outside the control the name belongs to.\n"
+        f"  name:    {target!r}\n"
+        f"  tapped:  ({x}, {y})\n"
+        f"  control: {expected}\n"
+        f"  said:    {result['message']!r}"
     )
 
     # --- 4. Enter text (Quick Start step 4) --------------------------------

@@ -67,7 +67,7 @@ from common import adb_exec
 from common.device_utils import get_current_activity, resolve_device_identifier
 from common.env_config import env_int
 from common.hierarchy import INTERACTIVE_ATTRIBUTES as _INTERACTIVE_ATTRIBUTES
-from common.hierarchy import capture_hierarchy, is_interactive, parse_bounds
+from common.hierarchy import bare_resource_id, capture_hierarchy, is_interactive, parse_bounds
 
 # Preview limits (env-configurable; see SKILL.md -> Configuration).
 # BUTTONS_PREVIEW caps how many button labels render on the summary line.
@@ -202,7 +202,12 @@ class ScreenMapper:
         elem_class = node.get("class", "")
         text = node.get("text", "")
         content_desc = node.get("content-desc", "")
-        resource_id = node.get("resource-id", "")
+        # The BARE id: `com.android.settings:id/search_action_bar` is reported as
+        # `search_action_bar`, which is what navigator prints and what
+        # `--find-id` takes, so one control has one name across both scripts
+        # (C1). Compose's testTagsAsResourceId already emits an unqualified tag,
+        # so this is also the form under which both toolkits look alike.
+        resource_id = bare_resource_id(node.get("resource-id")) or ""
         focusable = node.get("focusable", "false") == "true"
         enabled = node.get("enabled", "true") == "true"
         # Android marks secure/password inputs with password="true".

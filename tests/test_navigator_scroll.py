@@ -65,6 +65,12 @@ NO_SCROLL = "uiautomator_dialer_keypad"
 # On this profile the label is 'About emulated device'; the same row is 'About
 # phone' on a handset. Either way it is the last row of the list.
 TARGET = "About emulated device"
+
+# The row that owns that caption, in the SCROLLED dump: the caption TextView is
+# [189,1953][729,2024] and the clickable LinearLayout around it is this. Taken
+# from the recording (see test_the_owning_row_is_what_the_recorded_screen_says),
+# because a tap has to land on the row and the row alone.
+TARGET_ROW_BOUNDS = "[0,1899][1080,2130]"
 VISIBLE = "Notifications"
 ABSENT = "Wormhole Calibration"
 
@@ -170,6 +176,23 @@ def test_recorded_screens_are_successive_states_of_one_list(recorded):
     assert TARGET not in half and "Network" not in half and VISIBLE in half
 
 
+def test_the_owning_row_is_what_the_recorded_screen_says(recorded):
+    """The literal above, held to the dump it was read from.
+
+    Without this the rectangle in `TARGET_ROW_BOUNDS` is a number somebody
+    typed; with it, a re-recorded fixture that moves the row fails here rather
+    than making the coordinate test assert against a stale expectation.
+    """
+    screen = ET.fromstring(recorded.text(SCROLLED))
+    parents = {child: parent for parent in screen.iter() for child in parent}
+
+    caption = next(node for node in screen.iter() if node.get("text") == TARGET)
+    row = parents[parents[caption]]
+
+    assert row.get("clickable") == "true", "the enclosing row is not the control"
+    assert row.get("bounds") == TARGET_ROW_BOUNDS
+
+
 def test_recorded_end_of_list_dumps_are_identical(recorded):
     """Scrolling a list that is at its end changes nothing -- and still exits 0.
 
@@ -234,14 +257,12 @@ def test_found_element_carries_coordinates_from_the_final_screen(monkeypatch, re
 
     result = nav.find_element_scrolling(text=TARGET)
 
-    # The caption sits inside the row the search resolves to, so the row's
-    # rectangle must enclose the caption's -- as the caption stands in the FINAL
-    # dump, which is the whole point of the test.
-    caption = _rect(_bounds_string(recorded.text(SCROLLED), TARGET))
-    assert _encloses(result.element.bounds, caption), (
-        f"the element's bounds {result.element.bounds} do not cover the caption "
-        f"{caption} as the last screen reported it"
-    )
+    # The exact row, as the LAST dump reports it. "Something that encloses the
+    # caption" would also be satisfied by the RecyclerView, the ScrollView or
+    # the window -- every one of which taps somewhere else -- so the expectation
+    # is the one rectangle, read out of the recorded screen.
+    assert result.element.bounds == _rect(TARGET_ROW_BOUNDS)
+    assert _encloses(result.element.bounds, _rect(_bounds_string(recorded.text(SCROLLED), TARGET)))
 
 
 def test_scroll_search_drives_the_content_down_not_the_finger(monkeypatch, recorded):
@@ -535,10 +556,10 @@ def test_cli_find_id_also_scrolls(monkeypatch, recorded):
     result = nav.find_element_scrolling(resource_id="title", text=TARGET)
 
     assert result.element is not None
-    # Resource ids are carried and reported in full, as `screen_mapper` prints
-    # them, so that one name serves both scripts; `--find-id` still matches on
-    # any part of it.
-    assert result.element.resource_id == "android:id/title"
+    # `--find-id` matches on any part of the id, and the name both scripts print
+    # for an id is the bare one (INC1-08). This node carries text as well, so its
+    # label is that text; the id it was found by is `title`.
+    assert result.element.resource_id.rsplit("/", maxsplit=1)[-1] == "title"
 
 
 # ---------------------------------------------------------------------------

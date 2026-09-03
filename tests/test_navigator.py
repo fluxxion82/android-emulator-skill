@@ -249,17 +249,20 @@ def test_list_json_reports_total_and_truncation(monkeypatch, capsys):
 
 
 COMPOSE = "uiautomator_compose_default.xml"
+SETTINGS = "uiautomator_settings_top.xml"
 
-# The recorded CheckBox, whose caption "Remember me" is its next sibling.
-CHECKBOX_BOUNDS = "[33,754][159,880]"
+# The recorded search bar: interactive, and the one control on that screen with
+# a resource id an agent would name. Selected by id, not by bounds -- the
+# CardView wrapping it reports the same rectangle and comes first.
+SEARCH_BAR_ID = "com.android.settings:id/search_action_bar"
 
 
 def _screen_with_unreadable_bounds(xml: str) -> ET.Element:
-    """A recorded screen with ONE attribute corrupted: the CheckBox's bounds.
+    """A recorded screen with ONE attribute corrupted: the search bar's bounds.
 
     Derived rather than recorded, and deliberately so. uiautomator on API 35
-    clips every node's rectangle to the display -- the recording unit tried eight
-    recipes for an off-screen node (a half-row swipe, a mid-fling dump, a
+    clips every node's rectangle to the display -- the recording unit tried
+    eight recipes for an off-screen node (a half-row swipe, a mid-fling dump, a
     half-pulled shade, the task switcher mid-animation) and got min_left=0 /
     max_right=1080 / max_bottom=2424 every time -- so there is no recorded dump
     on this API level in which `bounds` cannot be read, and inventing a whole
@@ -267,10 +270,16 @@ def _screen_with_unreadable_bounds(xml: str) -> ET.Element:
     prevent. What IS real is that `bounds` is a string this skill parses, and
     that a value it cannot parse must not become a tap. One attribute of a real
     dump is changed; every other byte is the device's.
+
+    The lookup is by resource id, because an element whose bounds do not parse
+    is no longer eligible as a control (`hierarchy.is_interactive`) and so
+    cannot be reached by name -- `--find-id` is the route that still gets an
+    agent to it, and therefore the route on which the refusal has to hold.
     """
     screen = ET.fromstring(xml)
-    checkbox = next(node for node in screen.iter() if node.get("bounds") == CHECKBOX_BOUNDS)
-    checkbox.set("bounds", "[33,754]")  # truncated: no second corner
+    search_bar = next(node for node in screen.iter() if node.get("resource-id") == SEARCH_BAR_ID)
+    assert search_bar.get("bounds") == "[42,605][1038,742]", "the fixture moved; re-derive"
+    search_bar.set("bounds", "[42,605]")  # truncated: no second corner
     return screen
 
 
@@ -296,11 +305,11 @@ def test_an_element_whose_bounds_will_not_parse_is_refused_not_tapped(
     monkeypatch.setattr(
         navigator,
         "capture_hierarchy",
-        lambda serial=None, **kwargs: _screen_with_unreadable_bounds(recorded.text(COMPOSE)),
+        lambda serial=None, **kwargs: _screen_with_unreadable_bounds(recorded.text(SETTINGS)),
     )
     _stub_resolve(monkeypatch)
     monkeypatch.setattr(
-        navigator.sys, "argv", ["navigator.py", "--find-text", "Remember me", "--tap"]
+        navigator.sys, "argv", ["navigator.py", "--find-id", "search_action_bar", "--tap"]
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -312,6 +321,62 @@ def test_an_element_whose_bounds_will_not_parse_is_refused_not_tapped(
     out = capsys.readouterr().out
     assert "no usable bounds" in out, out
     assert "--tap-at" in out, f"the refusal does not say what to do instead: {out}"
+
+
+def test_a_name_that_is_only_a_passive_label_is_refused(monkeypatch, recorded, capsys):
+    """INC1-04's safety catch: ownership ignores what a caption says, so this must not.
+
+    "Fixture Screen" is the recorded Compose screen's heading -- a TextView with
+    no interactive ancestor and no control beside it. Resolution finds no owner,
+    and the match is then a label an agent could tap forever with no effect. The
+    refusal says which name, and where to look for a real one.
+    """
+    monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
+    issued: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        issued.append(list(cmd))
+        return _fake_result()
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    monkeypatch.setattr(
+        navigator,
+        "capture_hierarchy",
+        lambda serial=None, **kwargs: ET.fromstring(recorded.text(COMPOSE)),
+    )
+    _stub_resolve(monkeypatch)
+    monkeypatch.setattr(
+        navigator.sys, "argv", ["navigator.py", "--find-text", "Fixture Screen", "--tap"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        navigator.main()
+
+    assert exc.value.code != 0
+    assert not [cmd for cmd in issued if "tap" in cmd], f"a passive label was tapped: {issued}"
+    out = capsys.readouterr().out
+    assert "passive label" in out, out
+    assert "screen_mapper.py" in out, f"the refusal does not say where to look: {out}"
+
+
+def test_a_caption_inside_a_control_with_an_id_still_resolves(monkeypatch, recorded):
+    """The case that made "the owner must answer to the name" wrong.
+
+    On the recorded Settings screen "Search settings" is a TextView inside
+    `com.android.settings:id/search_action_bar`. The enclosing ViewGroup has a
+    resource id, so it recovers no caption of its own and never "answered to"
+    the name -- with the name test in place, the tap went back to the passive
+    TextView. Ownership is structural now, so it resolves to the ViewGroup.
+    """
+    nav = Navigator()
+    screen = ET.fromstring(recorded.text(SETTINGS))
+    monkeypatch.setattr(nav, "get_ui_hierarchy", lambda force_refresh=False: screen)
+
+    for fuzzy in (True, False):
+        found = nav.find_element(text="Search settings", fuzzy=fuzzy)
+        assert found is not None
+        assert found.bounds == (42, 605, 1038, 742), f"fuzzy={fuzzy}: {found}"
+        assert found.label == "search_action_bar", f"fuzzy={fuzzy}: {found.label}"
 
 
 # --- Device errors reach the agent with a remedy, not a traceback ----------

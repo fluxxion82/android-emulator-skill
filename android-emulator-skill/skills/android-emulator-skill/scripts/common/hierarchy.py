@@ -112,13 +112,17 @@ def parse_bounds(value: str | None) -> tuple[int, int, int, int] | None:
         None means "unknown", and a caller that cannot act without coordinates
         must refuse rather than substitute any.
 
+    The whole value must be a rectangle, not merely start with one:
+    ``re.match`` accepted ``"[1,2][3,4]junk"`` and returned the numbers in
+    front of the junk, which is a confident answer to a value nobody wrote.
+
     Example:
         >>> parse_bounds("[-12,50][200,150]")
         (-12, 50, 200, 150)
         >>> parse_bounds("not-bounds") is None
         True
     """
-    match = _BOUNDS_PATTERN.match(value or "")
+    match = _BOUNDS_PATTERN.fullmatch((value or "").strip())
     if match is None:
         return None
     left, top, right, bottom = (int(group) for group in match.groups())
@@ -160,12 +164,14 @@ def is_interactive(node: ET.Element | Mapping) -> bool:
     Three conditions, all required:
 
     - ``enabled`` -- a disabled control does nothing when tapped.
-    - a rectangle that is not collapsed. uiautomator emits no visibility
-      attribute, so a zero or negative area is the only signal that a flagged
-      node cannot be touched; the recorded Settings dump ends with exactly such
-      a row, ``[0,2401][1080,2361]``. A node with no parseable bounds is *not*
-      excluded here -- that is a missing signal, not a collapsed rectangle -- but
-      nothing can be tapped on it either, so acting on it is refused separately.
+    - a rectangle this skill can read, with positive area. uiautomator emits no
+      visibility attribute, so a zero or negative area is the only signal that a
+      flagged node cannot be touched; the recorded Settings dump ends with
+      exactly such a row, ``[0,2401][1080,2361]``. A node whose bounds do not
+      parse fails this too: "operable" means an agent can act on it, and nothing
+      can act on a rectangle nobody can read. Treating a missing signal as
+      permission is how an element with no usable position was offered as
+      tappable in the first place.
     - at least one of :data:`INTERACTIVE_ATTRIBUTES`.
 
     Args:
@@ -179,10 +185,34 @@ def is_interactive(node: ET.Element | Mapping) -> bool:
         return False
 
     box = parse_bounds(attributes.get("bounds"))
-    if box is not None and (box[2] <= box[0] or box[3] <= box[1]):
+    if box is None or box[2] <= box[0] or box[3] <= box[1]:
         return False
 
     return any(attributes.get(name, "false") == "true" for name in INTERACTIVE_ATTRIBUTES)
+
+
+def bare_resource_id(value: str | None) -> str | None:
+    """The name half of a resource id: ``com.x:id/submit`` -> ``submit``.
+
+    One rule, because two scripts print this name and an agent copies it from
+    one into the other. navigator rendered the bare name while screen_mapper
+    printed the qualified one, so a name the screen report showed was not a name
+    the navigator answered to (C1).
+
+    The bare form is the one that is chosen, for two reasons: it is what
+    ``--find-id`` has always matched, and Compose's ``testTagsAsResourceId``
+    already emits an unqualified tag, so the qualified form would have made the
+    two toolkits print names of different shapes for the same thing.
+
+    Args:
+        value: A ``resource-id`` attribute, qualified or not.
+
+    Returns:
+        The name after the last ``/``, or None when there is no id.
+    """
+    if not value:
+        return None
+    return value.rsplit("/", maxsplit=1)[-1] or None
 
 
 def _extract_xml(payload: str) -> str | None:
@@ -310,6 +340,7 @@ __all__ = [
     "INTERACTIVE_ATTRIBUTES",
     "AdbError",
     "HierarchyError",
+    "bare_resource_id",
     "capture_hierarchy",
     "capture_hierarchy_dict",
     "element_to_dict",

@@ -141,8 +141,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       Quick Start feeds step 3 directly. It used to print counts only, and on a
       Compose screen the names existed solely under `--verbose`/`--json`.
     - A control with no text of its own is named by the caption recovered from
-      its subtree or its row; one with a resource id is named by that id in full
-      (`pkg:id/name`), which is also how `navigator` prints it.
+      its subtree or its row; one with a resource id is named by the **bare** id
+      (`com.android.settings:id/search_action_bar` prints as
+      `search_action_bar`), which is what `navigator` prints and what
+      `--find-id` takes. Compose test tags are already bare, so both toolkits
+      name things the same way.
     - `--hints` prints the next command to run, already filled in.
     - Options: `--serial`/`-s`, `--verbose`/`-v`, `--hints`, `--json`
 
@@ -152,16 +155,23 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Fuzzy matching support
     - `--find-text` matches **any name the screen report printed**: an element's
       own text or content-desc, the caption recovered for an unlabelled control,
-      or a resource id given in full. A match on a caption resolves to the
-      control that caption names -- its enclosing control, or the one beside it
-      in the same row -- so the tap lands on the checkbox rather than 143px to
-      its right.
+      or a resource id (bare or fully qualified, matched whole). A match on a
+      caption resolves to the control that owns it -- the control it sits
+      inside, or the one beside it in the same row -- so the tap lands on the
+      checkbox rather than 143px to its right. A name that matches only a
+      passive label with no control is refused, not tapped.
     - `--tap` and `--enter-text` **require a target**: one of `--find-text`,
       `--find-exact`, `--find-type`, `--find-id`, or explicit `--tap-at x,y`.
       Without one it is a usage error (exit 2) and nothing is sent to the device.
-    - `--max-scrolls` is capped at 50, and a `--scroll-to-find` search is also
-      bounded in wall-clock time (`ANDROID_EMU_SCROLL_SEARCH_DEADLINE`, default
-      120s -- see `--help`). Each scroll prints a progress line to stderr.
+    - `--max-scrolls` is capped at 50 (so is `ANDROID_EMU_MAX_SCROLLS`), and a
+      `--scroll-to-find` search is also bounded in wall-clock time
+      (`ANDROID_EMU_SCROLL_SEARCH_DEADLINE`, default 120s -- see `--help`),
+      which bounds the screen dumps too. Each scroll prints a progress line to
+      stderr as it happens.
+    - Under `--json`, a successful `--tap`/`--enter-text` reports
+      **`tapped_at: [x, y]`** -- the coordinates that reached the device, so a
+      caller can check where the tap went without parsing prose. Every failure,
+      including a usage error, prints `{"error": ...}` and exits non-zero.
     - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible
       screen, and `Not found` is indistinguishable from "the item is two rows down". The default
       path now says which it was: `(searched 1 screen; this screen scrolls -- retry with

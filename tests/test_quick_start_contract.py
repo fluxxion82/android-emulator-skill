@@ -66,10 +66,10 @@ QUICK_START_BASELINE = (
 # this baseline is updated in the same commit, which is the point of stating it.
 E2E_BASELINE = (
     ("accessibility_audit.py", ()),
-    ("app_launcher.py", ("--launch",)),
+    ("app_launcher.py", ("--json", "--launch")),
     ("log_monitor.py", ("--duration", "--json")),
     ("navigator.py", ("--enter-text", "--find-type")),
-    ("navigator.py", ("--find-text", "--tap")),
+    ("navigator.py", ("--find-text", "--json", "--tap")),
     ("screen_mapper.py", ()),
     ("screen_mapper.py", ("--json",)),
 )

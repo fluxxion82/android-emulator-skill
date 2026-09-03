@@ -1200,6 +1200,16 @@ _BOUNDS_PARSER_NAMES = frozenset({"_parse_bounds", "_bounds"})
 # honest without a live violation to point at.
 KNOWN_BOUNDS_SITES: tuple[Expectation, ...] = ()
 
+# ...and exactly one INSIDE it. Enumerating the shared parser is what makes the
+# guard say "one grammar" rather than "none of them here": with only the
+# negative half, deleting `parse_bounds` altogether -- or growing a second
+# grammar beside it, which is how three of them appeared in the first place --
+# passes. `parse_bounds` itself is not matched by the name rule
+# (`_parse_bounds`/`_bounds`), so the single expected site is its regex.
+KNOWN_SHARED_BOUNDS_SITES: tuple[Expectation, ...] = (
+    Expectation(HIERARCHY, "<module>", BOUNDS_REGEX, "signed"),
+)
+
 
 def scan_bounds(filename: str, source: str) -> list[Site]:
     """Bounds grammars and bounds parsers, wherever they are spelled.
@@ -1246,6 +1256,12 @@ def bounds_grammars_outside_hierarchy() -> list[Site]:
             continue
         found.extend(scan_bounds(relative, path.read_text(encoding="utf-8")))
     return found
+
+
+def bounds_grammars_inside_hierarchy() -> list[Site]:
+    """What the shared module itself spells. Exactly one grammar is correct."""
+    path = SCRIPTS / HIERARCHY
+    return scan_bounds(HIERARCHY, path.read_text(encoding="utf-8"))
 
 
 def test_bounds_are_parsed_in_one_place():
@@ -1348,14 +1364,23 @@ def test_the_bounds_guard_enumerates_todays_sites():
     )
 
 
-def test_the_shared_parser_home_exists():
-    """The guard asserts absence elsewhere; that only means something with a there.
+def test_exactly_one_bounds_grammar_lives_in_the_shared_module():
+    """Zero elsewhere is only half the rule; one HERE is the other half.
 
-    Inc 1 adds ``parse_bounds()`` to ``common/hierarchy.py``. Today the module
-    exists and the function does not, which is stated rather than asserted --
-    the guard above is about the three copies, not about this file.
+    "No grammar outside common/hierarchy.py" is satisfied by a skill with no
+    parser at all, and by one whose shared module holds two of them -- which is
+    the precise failure this whole guard exists to prevent, moved one directory
+    over. So the shared module is enumerated positively, and its single site is
+    named.
     """
     assert (SCRIPTS / HIERARCHY).exists(), "the intended home for the shared parser is gone"
+    _assert_enumeration(
+        KNOWN_SHARED_BOUNDS_SITES, bounds_grammars_inside_hierarchy(), "KNOWN_SHARED_BOUNDS_SITES"
+    )
+
+    from common import hierarchy
+
+    assert callable(hierarchy.parse_bounds), "the shared parser is not callable"
 
 
 # ===========================================================================

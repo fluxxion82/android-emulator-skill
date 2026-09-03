@@ -236,8 +236,12 @@ class AccessibilityAuditor:
         # grow back (C5/C7).
         box = parse_bounds(attrs.get("bounds"))
         bounds = {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3]} if box else {}
-        clickable = _attr_bool(attrs.get("clickable", "false"))
-        enabled = _attr_bool(attrs.get("enabled", "true"))
+        # The one eligibility rule, asked once and used by every check below
+        # that is about a control. `clickable and enabled` was a second rule
+        # living beside it: it counted a node whose rectangle is collapsed or
+        # unreadable, and missed every Compose control driven by `checkable`,
+        # `long-clickable` or `scrollable` rather than by `clickable` (C7).
+        interactive = is_interactive(node)
         text = attrs.get("text", "")
         content_desc = attrs.get("content-desc", "")
         resource_id = attrs.get("resource-id", "")
@@ -252,7 +256,7 @@ class AccessibilityAuditor:
         # run reported zero criticals on every Compose app ever audited (L3).
         # It also missed a clickable `LinearLayout` row, which is how most
         # View-based lists are built.
-        if is_interactive(node) and not self._has_label(node):
+        if interactive and not self._has_label(node):
             self.issues.append(
                 {
                     "type": "missing_content_description",
@@ -271,7 +275,7 @@ class AccessibilityAuditor:
             )
 
         # Check 2: Touch target size. Bounds are pixels; the minimum is dp.
-        if clickable and enabled and bounds:
+        if interactive and bounds:
             width = bounds.get("right", 0) - bounds.get("left", 0)
             height = bounds.get("bottom", 0) - bounds.get("top", 0)
             minimum_px = self.min_touch_target_px()
@@ -352,7 +356,7 @@ class AccessibilityAuditor:
             )
 
         # Check 6: Interactive elements should have a resource-id for testing
-        if clickable and enabled and not resource_id:
+        if interactive and not resource_id:
             self.issues.append(
                 {
                     "type": "missing_resource_id",
