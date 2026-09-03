@@ -1183,14 +1183,22 @@ _BOUNDS_GRAMMAR = re.compile(r"\\\[[^\]]*-?\\d")
 # repaired by weakening it.
 _BOUNDS_PARSER_NAMES = frozenset({"_parse_bounds", "_bounds"})
 
-KNOWN_BOUNDS_SITES: tuple[Expectation, ...] = (
-    Expectation("accessibility_audit.py", "_parse_bounds", BOUNDS_FUNCTION),  # :70
-    Expectation("accessibility_audit.py", "_parse_bounds", BOUNDS_REGEX, "signed"),  # :72
-    Expectation("navigator.py", "_parse_bounds", BOUNDS_FUNCTION),  # :290
-    Expectation("navigator.py", "_parse_bounds", BOUNDS_REGEX, "unsigned"),  # :301
-    Expectation("screen_mapper.py", "_bounds", BOUNDS_FUNCTION),  # :268
-    Expectation("screen_mapper.py", "_bounds", BOUNDS_REGEX, "unsigned"),  # :270
-)
+# Empty, and that is the finished state of C5/C7: one `parse_bounds()` in
+# common/hierarchy.py and no grammar, and no parser named after one, anywhere
+# else. What it used to hold, before Inc 1:
+#
+#     accessibility_audit.py  _parse_bounds  function        :70
+#     accessibility_audit.py  _parse_bounds  regex, signed   :72
+#     navigator.py            _parse_bounds  function        :290
+#     navigator.py            _parse_bounds  regex, unsigned :301
+#     screen_mapper.py        _bounds        function        :268
+#     screen_mapper.py        _bounds        regex, unsigned :270
+#
+# An empty enumeration proves nothing about the detector on its own, which is
+# what `test_the_bounds_guard_flags_a_synthetic_violation` and
+# `test_the_bounds_guard_ignores_docstrings` are for: they keep the scanner
+# honest without a live violation to point at.
+KNOWN_BOUNDS_SITES: tuple[Expectation, ...] = ()
 
 
 def scan_bounds(filename: str, source: str) -> list[Site]:
@@ -1240,24 +1248,23 @@ def bounds_grammars_outside_hierarchy() -> list[Site]:
     return found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C5/C7: three bounds grammars in three files, two of them unsigned. "
-        "Inc 1 replaces them with one parse_bounds() in common/hierarchy.py."
-    ),
-)
 def test_bounds_are_parsed_in_one_place():
-    """One grammar, or the three disagree about a view that is half off-screen.
+    """One grammar, or the three disagree about the same element.
 
-    ``navigator._parse_bounds`` and ``screen_mapper._bounds`` both match
-    ``\\d+``, so a bounds string with a negative coordinate -- what uiautomator
-    writes for a partially scrolled-off view -- fails to match. Navigator then
-    returns ``(0, 0, 0, 0)`` and offers the element as tappable at the top-left
-    corner of the screen; screen_mapper reads None and its area check says
-    "do not exclude on a missing signal", so the same element counts as
-    interactive. ``accessibility_audit._parse_bounds`` already has the signed
-    grammar, which is how the disagreement is provable rather than theoretical.
+    ``navigator._parse_bounds`` and ``screen_mapper._bounds`` both matched
+    ``\\d+`` and ``accessibility_audit._parse_bounds`` matched ``-?\\d+``, so the
+    three did not answer alike -- and the two unsigned ones did not fail
+    loudly: navigator returned ``(0, 0, 0, 0)`` for anything its grammar missed
+    and offered the element as tappable at the top-left corner of the screen,
+    while screen_mapper read None and its area check said "do not exclude on a
+    missing signal", so the same element counted as interactive.
+
+    (The disagreement is provable from the grammars themselves. The scenario
+    originally given for it -- a partially scrolled-off view -- turns out not to
+    arise on API 35, where uiautomator clips every rectangle to the display;
+    eight recipes for an off-screen node all came back clipped. The single
+    parser is signed anyway, and `parse_bounds` returning None where it cannot
+    read a value is what removes the corner tap.)
     """
     offenders = bounds_grammars_outside_hierarchy()
     assert not offenders, (

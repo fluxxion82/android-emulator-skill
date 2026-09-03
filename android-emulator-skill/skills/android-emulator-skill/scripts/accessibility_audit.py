@@ -67,20 +67,6 @@ def _fix_for(issue_type: str) -> str:
 _SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
 
-def _parse_bounds(bounds_str: str) -> dict:
-    """Parse a uiautomator bounds string '[l,t][r,b]' into a dict of ints.
-
-    The grammar itself lives in :func:`common.hierarchy.parse_bounds` -- there
-    were three of them in this skill and they did not agree (C5/C7). This keeps
-    the dict shape the report's ``element`` payload has always carried.
-    """
-    box = parse_bounds(bounds_str)
-    if box is None:
-        return {}
-    left, top, right, bottom = box
-    return {"left": left, "top": top, "right": right, "bottom": bottom}
-
-
 def _attr_bool(value: str) -> bool:
     """Coerce a uiautomator string attribute ('true'/'false') to a bool."""
     return str(value).lower() == "true"
@@ -243,7 +229,13 @@ class AccessibilityAuditor:
         """
         attrs = node.get("attributes", {})
         class_name = attrs.get("class", "")
-        bounds = _parse_bounds(attrs.get("bounds", ""))
+        # The rectangle, in the dict shape the report's `element` payload has
+        # always carried. Shaped at the one place that needs it rather than in a
+        # local `_parse_bounds`: this file used to own one of the skill's three
+        # bounds grammars, and a wrapper of that name is where a fourth would
+        # grow back (C5/C7).
+        box = parse_bounds(attrs.get("bounds"))
+        bounds = {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3]} if box else {}
         clickable = _attr_bool(attrs.get("clickable", "false"))
         enabled = _attr_bool(attrs.get("enabled", "true"))
         text = attrs.get("text", "")
