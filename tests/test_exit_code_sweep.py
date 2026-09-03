@@ -33,9 +33,19 @@ Each mode also asserts that a fake tool was *invoked*, so a script that answers
 without ever looking cannot pass the sweep vacuously. The two modes that
 legitimately touch no tool say so in the table.
 
-Modes that are red today carry ``xfail(strict=True)`` individually, named for
-the finding, so the sweep merges green while stating exactly which eight of the
-twenty-three modes lie about their exit status.
+Each mode is checked by three separate tests, and only one of them carries
+the ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
+unexpected *pass*, never an unexpected reason for failing, so a single combined
+test would accept a hang, a fresh Python traceback or a vanished marker file as
+"the expected failure" for the eight red modes -- the sweep would go on
+reporting the defect it already knows about while a new one hid behind it. So:
+completion and the absence of a traceback are asserted unmarked for all
+twenty-three modes, the tool-invocation floor is asserted unmarked for the
+twenty-one that touch a tool, and the ``xfail`` covers exactly one assertion,
+``exit status != 0``.
+
+Each mode's subprocess runs once and the outcome is shared between its three
+tests, so all three describe the same run rather than three attempts at it.
 """
 
 from __future__ import annotations
@@ -214,15 +224,27 @@ def fake_sdk(tmp_path_factory, recorded_anywhere) -> FakeSdk:
     return FakeSdk(bin_dir=bin_dir, sdk_root=sdk_root, home=home)
 
 
+# Stands in for the exit status of a run that never finished. Non-zero on
+# purpose: a hung mode must fail the completion test loudly rather than quietly
+# satisfying the exit-status test, and for a mode carrying an xfail it turns
+# into an unexpected pass, which strict mode also reports.
+TIMED_OUT_STATUS = -1
+
+
 class Outcome(NamedTuple):
     returncode: int
     stdout: str
     stderr: str
     tools: tuple[str, ...]
+    timed_out: bool = False
 
 
 def _invoke(mode: Mode, fake: FakeSdk, workdir: Path) -> Outcome:
-    """Run one mode with the fake toolchain and nothing else on PATH."""
+    """Run one mode with the fake toolchain and nothing else on PATH.
+
+    A timeout is captured rather than raised, so the three tests sharing this
+    outcome each get to say their own thing about it.
+    """
     tool_log = workdir / "tools.log"
     tool_log.touch()
 
@@ -237,15 +259,26 @@ def _invoke(mode: Mode, fake: FakeSdk, workdir: Path) -> Outcome:
     }
     argv = [arg.replace(WORKDIR, str(workdir)) for arg in mode.argv]
 
-    completed = subprocess.run(
-        [sys.executable, str(SCRIPTS / mode.script), *argv],
-        env=env,
-        cwd=workdir,
-        capture_output=True,
-        text=True,
-        timeout=MODE_TIMEOUT_SECONDS,
-        check=False,
-    )
+    timed_out = False
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPTS / mode.script), *argv],
+            env=env,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=MODE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout = completed.stdout
+        stderr = completed.stderr
+    except subprocess.TimeoutExpired as expired:
+        timed_out = True
+        returncode = TIMED_OUT_STATUS
+        stdout = (expired.stdout or b"").decode(errors="replace")
+        stderr = (expired.stderr or b"").decode(errors="replace")
+
     invoked = tuple(
         sorted(
             {
@@ -255,7 +288,27 @@ def _invoke(mode: Mode, fake: FakeSdk, workdir: Path) -> Outcome:
             }
         )
     )
-    return Outcome(completed.returncode, completed.stdout, completed.stderr, invoked)
+    return Outcome(returncode, stdout, stderr, invoked, timed_out)
+
+
+@pytest.fixture(scope="session")
+def swept(fake_sdk: FakeSdk, tmp_path_factory):
+    """One subprocess per mode, memoised for the three tests that read it.
+
+    Sharing the run matters as well as saving it: "no traceback", "a tool was
+    invoked" and "the exit status was non-zero" are three statements about the
+    same invocation, and running the script three times would let them describe
+    three different ones.
+    """
+    seen: dict[str, Outcome] = {}
+
+    def _outcome(mode: Mode) -> Outcome:
+        if mode.ident not in seen:
+            workdir = tmp_path_factory.mktemp("mode")
+            seen[mode.ident] = _invoke(mode, fake_sdk, workdir)
+        return seen[mode.ident]
+
+    return _outcome
 
 
 def _params() -> list:
@@ -273,21 +326,57 @@ def _params() -> list:
     return marked
 
 
-@pytest.mark.parametrize("mode", _params())
-def test_a_failing_tool_produces_a_failing_exit_status(mode: Mode, fake_sdk: FakeSdk, tmp_path):
-    """Exit non-zero, and do not do it by crashing.
+@pytest.mark.parametrize("mode", [pytest.param(m, id=m.ident) for m in MODES])
+def test_the_mode_finishes_without_crashing(mode: Mode, swept):
+    """Unmarked, and covering every mode including the two local ANR ones.
 
-    Two assertions, because either one alone is satisfiable by the wrong fix.
-    A non-zero status reached through an unhandled exception is not a fixed
-    contract -- it hands the agent a Python traceback where a remedy belongs,
-    and the repo has shipped that twice (`emulator_shutdown`, `uiautomator`).
+    Deliberately outside the ``xfail``. A hang and a Python traceback are both
+    *worse* than the exit-status defect this file pins, and strict xfail only
+    rejects an unexpected pass -- so folded into the marked test they would be
+    swallowed as "still red, as expected". A non-zero status reached by raising
+    through ``main()`` is not the contract either: it hands the agent a
+    traceback where a remedy belongs, which this repo has shipped twice.
     """
-    outcome = _invoke(mode, fake_sdk, tmp_path)
+    outcome = swept(mode)
 
+    assert not outcome.timed_out, (
+        f"{mode.ident} did not finish within {MODE_TIMEOUT_SECONDS}s. Every fake "
+        f"tool exits immediately, so this is a hang, not slowness.\n"
+        f"partial stdout: {outcome.stdout[:400]!r}"
+    )
     assert "Traceback" not in outcome.stderr, (
         f"{mode.ident} failed by crashing:\n{outcome.stderr[-1500:]}\n"
         f"Report the failure; do not raise through main()."
     )
+
+
+@pytest.mark.parametrize("mode", [pytest.param(m, id=m.ident) for m in MODES if m.tool])
+def test_the_mode_actually_reaches_for_a_tool(mode: Mode, swept):
+    """Anti-vacuity, per mode, and unmarked for the same reason as above.
+
+    Without this a mode could pass the sweep by rejecting its own arguments
+    before touching the toolchain -- exit non-zero, no traceback, and no
+    evidence at all about the failure this file is written to catch. Keeping it
+    out of the ``xfail`` means a marker file that stops being written fails
+    here instead of disappearing into an expected failure. The two modes with
+    ``tool=None`` say in the table why they touch nothing.
+    """
+    outcome = swept(mode)
+    assert mode.tool in outcome.tools, (
+        f"{mode.ident} never invoked the fake {mode.tool} (saw {outcome.tools or 'nothing'}). "
+        f"The mode's exit status therefore says nothing about tool failure."
+    )
+
+
+@pytest.mark.parametrize("mode", _params())
+def test_a_failing_tool_produces_a_failing_exit_status(mode: Mode, swept):
+    """The one assertion the xfail covers: exit non-zero when the tool failed.
+
+    Nothing else lives in here, so an ``xfail`` on this test can only ever be
+    excusing the exit status -- never a hang, a crash, or a mode that never
+    reached for a tool at all.
+    """
+    outcome = swept(mode)
     assert outcome.returncode != 0, (
         f"{mode.ident} exited 0 with the toolchain broken.\n"
         f"stdout: {outcome.stdout[:400]!r}\n"
@@ -296,28 +385,11 @@ def test_a_failing_tool_produces_a_failing_exit_status(mode: Mode, fake_sdk: Fak
     )
 
 
-@pytest.mark.parametrize("mode", [pytest.param(m, id=m.ident) for m in MODES if m.tool])
-def test_the_mode_actually_reaches_for_a_tool(mode: Mode, fake_sdk: FakeSdk, tmp_path):
-    """Anti-vacuity, per mode: a script that never ran adb proves nothing.
-
-    Without this a mode could pass the sweep by rejecting its own arguments
-    before touching the toolchain -- exit non-zero, no traceback, and no
-    evidence at all about the failure this file is written to catch. The three
-    two modes with ``tool=None`` say in the table why they touch nothing.
-    """
-    outcome = _invoke(mode, fake_sdk, tmp_path)
-    assert mode.tool in outcome.tools, (
-        f"{mode.ident} never invoked the fake {mode.tool} (saw {outcome.tools or 'nothing'}). "
-        f"The mode's exit status therefore says nothing about tool failure."
-    )
-
-
 def test_the_fake_toolchain_shadows_any_real_one(fake_sdk: FakeSdk):
     """The harness must not be able to reach the machine's real adb.
 
-    A phone is attached to the machine this suite is developed on. The sweep
-    runs the whole table twice, and every one of those invocations would
-    otherwise drive it.
+    A phone is attached to the machine this suite is developed on, and every
+    invocation in the table would otherwise drive it.
     """
     path = os.pathsep.join([str(fake_sdk.bin_dir), "/usr/bin", "/bin"])
     for tool in ("adb", *MISSING_TOOLS):

@@ -29,8 +29,20 @@ Each invariant is red today, so it carries ``xfail(strict=True)`` naming the
 finding: the guard states the defect without blocking the PR, and the fix must
 delete the marker. What is *not* xfail is the evidence that each guard works --
 every one has a self-test that injects a synthetic violation and a self-test
-that enumerates the real sites by file, function and line. A guard nobody has
-seen fail is a guard nobody has seen.
+that enumerates the real sites as an exact multiset of file, function, kind and
+line. A guard nobody has seen fail is a guard nobody has seen.
+
+Two failure modes of a guard like this are specifically defended against, both
+found by review rather than by imagination:
+
+* **Evasion by renaming.** Keying on the terminal spelling of a call means
+  ``from common.adb_exec import run_adb as adb`` walks straight past. Import
+  aliases are resolved per module, and a *census* test asserts the guards still
+  see roughly as many device-shell and console calls as exist today -- so a
+  refactor that empties the result set fails instead of reporting "all clear".
+* **Evasion by counting.** Comparing sets keyed on file and function lets a
+  second finding inside an already-listed function disappear silently. The
+  enumerations are multisets, matched one-for-one.
 
 **These guards parse; they do not grep.** That rule is written down because the
 repo has been bitten by its opposite five times: a substring guard flags the
@@ -55,8 +67,8 @@ SCRIPTS = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-sk
 
 # How far a recorded line number may drift before the enumeration self-tests
 # stop believing they are looking at the same call. The sites are keyed on
-# file + function, which survives an edit above them; the line is carried as
-# corroboration, not as identity.
+# file + function + kind, which survives an edit above them; the line is
+# carried as corroboration, not as identity.
 LINE_DRIFT = 10
 
 
@@ -66,14 +78,16 @@ class Site(NamedTuple):
     file: str
     function: str
     line: int
-    detail: str
+    kind: str
+    detail: str = ""
 
     @property
-    def key(self) -> str:
-        return f"{self.file}::{self.function}"
+    def key(self) -> tuple[str, str, str]:
+        return (self.file, self.function, self.kind)
 
     def __str__(self) -> str:
-        return f"{self.file}:{self.line} ({self.function}) {self.detail}"
+        suffix = f" {self.detail}" if self.detail else ""
+        return f"{self.file}:{self.line} ({self.function}) [{self.kind}]{suffix}"
 
 
 def _script_files() -> list[Path]:
@@ -85,7 +99,13 @@ def _relative(path: Path) -> str:
 
 
 def _called_name(node: ast.Call) -> str | None:
-    """``foo(...)`` and ``x.foo(...)`` both answer ``foo``."""
+    """``foo(...)`` and ``x.foo(...)`` both answer ``foo``.
+
+    Used for *method* dispatch (``self._demo_broadcast(...)``), where the
+    spelling really is the identity. Module-level functions that build an adb
+    argv are resolved through the import table instead -- see
+    :func:`_sink_lookup`.
+    """
     if isinstance(node.func, ast.Attribute):
         return node.func.attr
     return getattr(node.func, "id", None)
@@ -123,15 +143,189 @@ def _docstring_ids(tree: ast.AST) -> set[int]:
     return ids
 
 
+# ---------------------------------------------------------------------------
+# Which calls build an adb argv, whatever the local code calls them
+# ---------------------------------------------------------------------------
+
+# The functions that build an `adb <operation> ...` argv. All three take
+# (operation, serial, *args), so the device-side argv starts at index 2.
+SINK_FUNCTIONS = frozenset({"run_adb", "build_adb_command", "build_command"})
+
+# The modules those live in, by tail name, so `from common import adb_exec`,
+# `from .adb_exec import run_adb` and `import common.adb_exec as ax` all resolve.
+SINK_MODULES = frozenset({"adb_exec", "device_utils"})
+
+
+class SinkLookup(NamedTuple):
+    """How one module spells the argv builders it imported."""
+
+    direct: dict[str, str]  # local name -> canonical function
+    modules: dict[str, str]  # local module alias -> module tail name
+
+    def canonical(self, node: ast.Call) -> str | None:
+        """The argv builder this call reaches, or None."""
+        func = node.func
+        if isinstance(func, ast.Name):
+            return self.direct.get(func.id)
+        if isinstance(func, ast.Attribute) and func.attr in SINK_FUNCTIONS:
+            base = func.value
+            if isinstance(base, ast.Name) and base.id in self.modules:
+                return func.attr
+            # An attribute spelled like a sink but reached through something
+            # this module did not import -- kept rather than dropped, because
+            # a missed site is a defect and a spurious one is a review comment.
+            return func.attr
+        return None
+
+
+def _sink_lookup(tree: ast.Module) -> SinkLookup:
+    """Resolve import aliases so a rename cannot walk past the guards.
+
+    ``from common.adb_exec import run_adb as adb`` was confirmed by review to
+    make the earlier version of this file report nothing at all. Four spellings
+    are in use across the skill today -- a relative ``from .adb_exec import
+    run_adb``, an absolute ``from common.adb_exec import ...``, a module import
+    ``from common import adb_exec`` used as ``adb_exec.run_adb(...)``, and
+    ``from common.device_utils import build_adb_command`` -- and all four, plus
+    any ``as`` alias of them, resolve here.
+    """
+    direct: dict[str, str] = {}
+    modules: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            tail = (node.module or "").rsplit(".", 1)[-1]
+            for alias in node.names:
+                if alias.name in SINK_FUNCTIONS and tail in SINK_MODULES:
+                    direct[alias.asname or alias.name] = alias.name
+                if alias.name in SINK_MODULES:
+                    modules[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                tail = alias.name.rsplit(".", 1)[-1]
+                if tail in SINK_MODULES:
+                    modules[alias.asname or tail] = tail
+
+    # A module that *defines* a sink calls it by bare name (adb_exec's own
+    # build_command), with no import to resolve.
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in SINK_FUNCTIONS:
+            direct.setdefault(node.name, node.name)
+
+    return SinkLookup(direct=direct, modules=modules)
+
+
+def _sink_calls(tree: ast.Module, operation: str) -> list[ast.Call]:
+    """Every call building ``adb <operation> ...``, alias-resolved."""
+    lookup = _sink_lookup(tree)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if lookup.canonical(node) is None:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and first.value == operation:
+            found.append(node)
+    return found
+
+
+def _census(operation: str) -> int:
+    total = 0
+    for path in _script_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        total += len(_sink_calls(tree, operation))
+    return total
+
+
+# Today's counts are 47 device-shell calls and 7 console calls. The floors sit
+# a little below both: the point is not to pin the number, it is that a
+# refactor which renames the builder -- or an edit to this file that breaks
+# resolution -- must not leave the guards reporting "all clear" over a corpus
+# they can no longer see.
+SHELL_CALL_FLOOR = 40
+EMU_CALL_FLOOR = 6
+
+
+def test_the_guards_still_see_the_production_code():
+    """Independent floor: a guard reading nothing passes every other test here.
+
+    The enumeration tests below assert *which* sites are reported. They cannot
+    tell "the defect was fixed" from "the detector went blind", because both
+    look like an empty result. This can: it counts the calls the resolver
+    finds, not the violations, so it stays meaningful after Inc 1 lands.
+    """
+    shell_calls = _census("shell")
+    emu_calls = _census("emu")
+
+    assert shell_calls >= SHELL_CALL_FLOOR, (
+        f"the sink resolver finds only {shell_calls} `adb shell` argv "
+        f"constructions across scripts/ (floor {SHELL_CALL_FLOOR}). Either the "
+        f"skill was restructured, or _sink_lookup stopped resolving how it "
+        f"imports run_adb / build_adb_command -- in which case the quoting "
+        f"guard is now vacuous."
+    )
+    assert emu_calls >= EMU_CALL_FLOOR, (
+        f"the sink resolver finds only {emu_calls} `adb emu` argv constructions "
+        f"across scripts/ (floor {EMU_CALL_FLOOR}); the console guard cannot "
+        f"see the code it is guarding."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Enumeration: an exact multiset, not a set of keys
+# ---------------------------------------------------------------------------
+
+
+def _reconcile(expected: tuple[Site, ...], actual: list[Site]) -> tuple[list[Site], list[Site]]:
+    """Match each expected site to one actual site; return what is left over.
+
+    A *set* comparison keyed on file and function -- what this file did before
+    review -- accepts the removal of a second finding inside an already-listed
+    function: delete the bounds regex at screen_mapper.py:270 and the function
+    finding at :268 still satisfies both entries. So each expected site
+    consumes one actual site, nearest line first, and both leftovers are
+    reported.
+    """
+    remaining = list(actual)
+    missing: list[Site] = []
+
+    for want in sorted(expected, key=lambda site: (site.file, site.function, site.line)):
+        candidates = [
+            site
+            for site in remaining
+            if site.key == want.key and abs(site.line - want.line) <= LINE_DRIFT
+        ]
+        if not candidates:
+            missing.append(want)
+            continue
+        remaining.remove(min(candidates, key=lambda site: abs(site.line - want.line)))
+
+    return missing, remaining
+
+
+def _assert_enumeration(expected: tuple[Site, ...], actual: list[Site], listname: str) -> None:
+    missing, unexpected = _reconcile(expected, actual)
+    assert not missing, (
+        f"the guard no longer reports {[str(site) for site in missing]}.\n"
+        f"Everything it did report: {[str(site) for site in actual]}.\n"
+        f"If the fix landed, delete those entries from {listname} and the xfail "
+        f"marker in the same commit. If it did not, the detector stopped seeing them."
+    )
+    assert not unexpected, (
+        f"the guard reports sites nobody has triaged: "
+        f"{[str(site) for site in unexpected]}. Read each one, then add it to "
+        f"{listname} or exempt it with a reason."
+    )
+
+
 # ===========================================================================
 # (a) Quoting — C3 / X2
 # ===========================================================================
 
-# The functions that build an `adb ... shell` argv. All three take
-# (operation, serial, *args), so the device-side argv starts at index 2.
-SHELL_SINKS = frozenset({"run_adb", "build_adb_command", "build_command"})
-
 QUOTER = "quote_for_device_shell"
+
+UNQUOTED = "unquoted"
 
 # Sites where a non-literal reaches the device shell unquoted and that is not a
 # defect, keyed by file::function so a moved line does not silently re-open one.
@@ -165,25 +359,25 @@ QUOTING_EXEMPT: dict[str, str] = {
 # at :384; app_launcher :103 is the extras list built for the call at :108), so
 # the lines below are the call sites this guard reports.
 KNOWN_UNQUOTED: tuple[Site, ...] = (
-    Site("app_launcher.py", "launch", 108, "component, *extra_args"),
-    Site("app_launcher.py", "terminate", 147, "package_name"),
-    Site("app_launcher.py", "open_url", 251, "url"),
-    Site("app_launcher.py", "get_state", 313, "package_name"),
-    Site("app_launcher.py", "_get_launcher_activity", 360, "package_name"),
-    Site("app_state_capture.py", "_get_app_info", 231, "self.package"),
-    Site("app_state_capture.py", "_get_app_info", 248, "self.package"),
-    Site("app_state_capture.py", "_capture_logs", 351, "self.package"),
-    Site("appearance.py", "build_locale_command", 141, "locale"),
-    Site("privacy_manager.py", "grant_permission", 123, "package, full_permission"),
-    Site("privacy_manager.py", "revoke_permission", 159, "package, full_permission"),
-    Site("privacy_manager.py", "confirm_permission", 199, "package"),
-    Site("privacy_manager.py", "list_app_permissions", 268, "package"),
-    Site("status_bar.py", "set_mobile_data", 247, "datatype"),
-    Site("status_bar.py", "set_time", 284, "time_str"),
-    Site("status_bar.py", "override", 342, "time"),
-    Site("status_bar.py", "override", 346, "battery"),
-    Site("status_bar.py", "override", 367, "wifi_level"),
-    Site("status_bar.py", "override", 384, "mobile_level, mobile_type"),
+    Site("app_launcher.py", "launch", 108, UNQUOTED, "component, *extra_args"),
+    Site("app_launcher.py", "terminate", 147, UNQUOTED, "package_name"),
+    Site("app_launcher.py", "open_url", 251, UNQUOTED, "url"),
+    Site("app_launcher.py", "get_state", 313, UNQUOTED, "package_name"),
+    Site("app_launcher.py", "_get_launcher_activity", 360, UNQUOTED, "package_name"),
+    Site("app_state_capture.py", "_get_app_info", 231, UNQUOTED, "self.package"),
+    Site("app_state_capture.py", "_get_app_info", 248, UNQUOTED, "self.package"),
+    Site("app_state_capture.py", "_capture_logs", 351, UNQUOTED, "self.package"),
+    Site("appearance.py", "build_locale_command", 141, UNQUOTED, "locale"),
+    Site("privacy_manager.py", "grant_permission", 123, UNQUOTED, "package, full_permission"),
+    Site("privacy_manager.py", "revoke_permission", 159, UNQUOTED, "package, full_permission"),
+    Site("privacy_manager.py", "confirm_permission", 199, UNQUOTED, "package"),
+    Site("privacy_manager.py", "list_app_permissions", 268, UNQUOTED, "package"),
+    Site("status_bar.py", "set_mobile_data", 247, UNQUOTED, "datatype"),
+    Site("status_bar.py", "set_time", 284, UNQUOTED, "time_str"),
+    Site("status_bar.py", "override", 342, UNQUOTED, "time"),
+    Site("status_bar.py", "override", 346, UNQUOTED, "battery"),
+    Site("status_bar.py", "override", 367, UNQUOTED, "wifi_level"),
+    Site("status_bar.py", "override", 384, UNQUOTED, "mobile_level, mobile_type"),
 )
 
 
@@ -267,12 +461,17 @@ def _module_literal_names(tree: ast.Module) -> set[str]:
 def _quoter_names(tree: ast.AST) -> set[str]:
     """``quote_for_device_shell`` plus any local alias that only returns it."""
     names = {QUOTER}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == QUOTER:
+                    names.add(alias.asname or alias.name)
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         returns = [n for n in ast.walk(func) if isinstance(n, ast.Return) and n.value is not None]
         if returns and all(
-            isinstance(r.value, ast.Call) and _called_name(r.value) == QUOTER for r in returns
+            isinstance(r.value, ast.Call) and _called_name(r.value) in names for r in returns
         ):
             names.add(func.name)
     return names
@@ -291,15 +490,11 @@ def scan_quoting(filename: str, source: str) -> list[Site]:
     module_literals = _module_literal_names(tree)
     quoters = _quoter_names(tree)
     enclosing = _functions_by_node(tree)
-    functions = {
-        id(node): node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
     owner: dict[int, ast.AST] = {}
-    for func in functions.values():
-        for node in ast.walk(func):
-            owner.setdefault(id(node), func)
+    for func in ast.walk(tree):
+        if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            for node in ast.walk(func):
+                owner.setdefault(id(node), func)
 
     forwarders: set[str] = set()
     sites: list[Site] = []
@@ -323,35 +518,34 @@ def scan_quoting(filename: str, source: str) -> list[Site]:
             bad.append(ast.unparse(arg))
         return bad
 
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-
-    # Direct sinks: run_adb("shell", serial, ...) and friends.
-    for node in calls:
-        if _called_name(node) not in SHELL_SINKS or not node.args:
-            continue
-        operation = node.args[0]
-        if not (isinstance(operation, ast.Constant) and operation.value == "shell"):
-            continue
-        func = owner.get(id(node))
-        bad = unsafe(node.args[2:], func)
-        if bad:
-            sites.append(
-                Site(filename, enclosing.get(id(node), "<module>"), node.lineno, ", ".join(bad))
+    def record(node: ast.Call, bad: list[str]) -> None:
+        sites.append(
+            Site(
+                filename,
+                enclosing.get(id(node), "<module>"),
+                node.lineno,
+                UNQUOTED,
+                ", ".join(bad),
             )
+        )
+
+    # Direct sinks: run_adb("shell", serial, ...) and friends, under whatever
+    # name this module imported them.
+    for node in _sink_calls(tree, "shell"):
+        bad = unsafe(node.args[2:], owner.get(id(node)))
+        if bad:
+            record(node, bad)
 
     # Call sites of the forwarders discovered above.
-    for node in calls:
-        name = _called_name(node)
-        if name not in forwarders:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _called_name(node) not in forwarders:
             continue
         func = owner.get(id(node))
         if func is not None and func.name in forwarders:
             continue  # the definition forwarding to itself
         bad = unsafe(node.args, func)
         if bad:
-            sites.append(
-                Site(filename, enclosing.get(id(node), "<module>"), node.lineno, ", ".join(bad))
-            )
+            record(node, bad)
 
     return sorted(sites, key=lambda site: site.line)
 
@@ -360,7 +554,7 @@ def unquoted_device_shell_arguments(*, apply_exemptions: bool = True) -> list[Si
     found: list[Site] = []
     for path in _script_files():
         for site in scan_quoting(_relative(path), path.read_text(encoding="utf-8")):
-            if apply_exemptions and site.key in QUOTING_EXEMPT:
+            if apply_exemptions and f"{site.file}::{site.function}" in QUOTING_EXEMPT:
                 continue
             found.append(site)
     return found
@@ -421,6 +615,24 @@ def clear(self, package):
     return self._shell("pm", "clear", package)
 """
 
+# The evasion review found: an alias the earlier version of this guard could
+# not follow, so it reported nothing at all for the whole module.
+_SYNTHETIC_ALIASED = """
+from common.adb_exec import run_adb as adb
+
+
+def wipe(serial, package):
+    return adb("shell", serial, "pm", "clear", package)
+"""
+
+_SYNTHETIC_MODULE_ALIASED = """
+from common import adb_exec as ax
+
+
+def wipe(serial, package):
+    return ax.run_adb("shell", serial, "pm", "clear", package)
+"""
+
 
 def test_the_quoting_guard_flags_a_synthetic_violation():
     """Anti-vacuity: prove the detector fires before trusting that it is quiet."""
@@ -440,38 +652,29 @@ def test_the_quoting_guard_follows_a_vararg_forwarder():
     assert [site.function for site in found] == ["clear"], found
 
 
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [("import alias", _SYNTHETIC_ALIASED), ("module alias", _SYNTHETIC_MODULE_ALIASED)],
+)
+def test_the_quoting_guard_is_not_evaded_by_renaming(label: str, source: str):
+    """Keying on the call's spelling made `run_adb as adb` invisible.
+
+    Confirmed by review against the previous version of this file: it returned
+    an empty list for a module doing exactly this, which reads as "clean".
+    """
+    found = scan_quoting("synthetic.py", source)
+    assert [site.function for site in found] == ["wipe"], f"{label} evaded the guard: {found}"
+
+
 def test_the_quoting_guard_enumerates_todays_sites():
     """The evidence that the guard is reading the real code, not agreeing with itself.
 
-    Keyed on file + function with the line as corroboration, because an edit
-    above a call moves its line without moving the defect. The fixing PR
+    Keyed on file + function + kind with the line as corroboration, and matched
+    one-for-one so the *count* inside a function is asserted too. The fixing PR
     empties ``KNOWN_UNQUOTED``; until then this is what "C3/X2" means in
     file-and-line terms.
     """
-    found = unquoted_device_shell_arguments()
-    by_key: dict[str, list[Site]] = {}
-    for site in found:
-        by_key.setdefault(site.key, []).append(site)
-
-    missing = [site for site in KNOWN_UNQUOTED if site.key not in by_key]
-    assert not missing, (
-        f"the guard no longer sees {[str(s) for s in missing]}. Either the fix "
-        f"landed -- in which case delete those entries and the xfail marker -- "
-        f"or the detector stopped working."
-    )
-
-    for site in KNOWN_UNQUOTED:
-        lines = [candidate.line for candidate in by_key[site.key]]
-        assert any(abs(line - site.line) <= LINE_DRIFT for line in lines), (
-            f"{site.key} is still reported, but at {lines} rather than near "
-            f"{site.line}. Confirm it is the same call and update KNOWN_UNQUOTED."
-        )
-
-    unexpected = sorted({site.key for site in found} - {site.key for site in KNOWN_UNQUOTED})
-    assert not unexpected, (
-        f"the guard reports sites nobody has looked at yet: {unexpected}. Read "
-        f"each one, then either add it to KNOWN_UNQUOTED or exempt it with a reason."
-    )
+    _assert_enumeration(KNOWN_UNQUOTED, unquoted_device_shell_arguments(), "KNOWN_UNQUOTED")
 
 
 def test_the_quoting_exemptions_do_not_rot():
@@ -481,7 +684,10 @@ def test_the_quoting_exemptions_do_not_rot():
     ``test_fixture_policy``: the code was fixed or deleted, the exemption
     outlived it, and it now silently blesses whatever takes that name next.
     """
-    all_keys = {site.key for site in unquoted_device_shell_arguments(apply_exemptions=False)}
+    all_keys = {
+        f"{site.file}::{site.function}"
+        for site in unquoted_device_shell_arguments(apply_exemptions=False)
+    }
     stale = sorted(set(QUOTING_EXEMPT) - all_keys)
     assert not stale, (
         f"{stale} are exempted from the quoting guard but no longer reach the "
@@ -496,17 +702,19 @@ def test_the_quoting_exemptions_do_not_rot():
 # The one module allowed to speak the console protocol.
 EMU_CONSOLE = "common/emu_console.py"
 
+EMU_ARGV = "emu-argv"
+
 # Confirmed by reading each call. Codex cites emulator_shutdown.py:66 as the
 # representative and names shutdown, boot, selector, erase and location.
 KNOWN_EMU_BYPASSES: tuple[Site, ...] = (
-    Site("emulator_boot.py", "_get_avd_name_for_serial", 211, 'run_adb("emu", ...)'),
-    Site("emulator_erase.py", "is_avd_running", 108, 'run_adb("emu", ...)'),
-    Site("emulator_selector.py", "_avd_name_for_serial", 333, 'run_adb("emu", ...)'),
-    Site("emulator_shutdown.py", "shutdown", 66, 'build_adb_command("emu", ...)'),
-    Site("emulator_shutdown.py", "get_avd_name_for_serial", 151, 'build_adb_command("emu", ...)'),
+    Site("emulator_boot.py", "_get_avd_name_for_serial", 211, EMU_ARGV, "run_adb"),
+    Site("emulator_erase.py", "is_avd_running", 108, EMU_ARGV, "run_adb"),
+    Site("emulator_selector.py", "_avd_name_for_serial", 333, EMU_ARGV, "run_adb"),
+    Site("emulator_shutdown.py", "shutdown", 66, EMU_ARGV, "build_adb_command"),
+    Site("emulator_shutdown.py", "get_avd_name_for_serial", 151, EMU_ARGV, "build_adb_command"),
     # The plan cites location.py:273; that is `_run_geo_fix`, which executes an
     # argv it does not build. The literal "emu" is in build_geo_fix_command.
-    Site("location.py", "build_geo_fix_command", 144, 'build_adb_command("emu", ...)'),
+    Site("location.py", "build_geo_fix_command", 144, EMU_ARGV, "build_adb_command"),
 )
 
 # Scripts that reach the console the sanctioned way. Named here so the guard
@@ -519,29 +727,33 @@ def scan_emu_console(filename: str, source: str) -> list[Site]:
     """Every place an ``adb emu`` argv is constructed.
 
     Two shapes, because the second is how the first gets around a guard that
-    only knows the first: the operation passed to ``run_adb`` /
-    ``build_adb_command``, and a literal argv list handed to ``subprocess``.
+    only knows the first: the operation passed to an argv builder (under
+    whatever name the module imported it), and a literal argv list handed to
+    ``subprocess``.
     """
     tree = ast.parse(source, filename=filename)
     enclosing = _functions_by_node(tree)
+    lookup = _sink_lookup(tree)
     sites: list[Site] = []
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not node.args:
             continue
-        name = _called_name(node)
         first = node.args[0]
         detail = None
 
-        if name in SHELL_SINKS and isinstance(first, ast.Constant) and first.value == "emu":
-            detail = f'{name}("emu", ...)'
-        elif name in ("run", "Popen") and isinstance(first, ast.List | ast.Tuple):
+        canonical = lookup.canonical(node)
+        if canonical and isinstance(first, ast.Constant) and first.value == "emu":
+            detail = canonical
+        elif _called_name(node) in ("run", "Popen") and isinstance(first, ast.List | ast.Tuple):
             values = [e.value for e in first.elts if isinstance(e, ast.Constant)]
             if "emu" in values and "adb" in values:
-                detail = "subprocess argv containing adb ... emu"
+                detail = "subprocess"
 
         if detail:
-            sites.append(Site(filename, enclosing.get(id(node), "<module>"), node.lineno, detail))
+            sites.append(
+                Site(filename, enclosing.get(id(node), "<module>"), node.lineno, EMU_ARGV, detail)
+            )
 
     return sorted(sites, key=lambda site: site.line)
 
@@ -591,6 +803,14 @@ def avd_name(serial):
     return run_adb("emu", serial, "avd", "name").stdout
 """
 
+_SYNTHETIC_EMU_ALIASED = """
+from common.adb_exec import run_adb as adb
+
+
+def avd_name(serial):
+    return adb("emu", serial, "avd", "name").stdout
+"""
+
 _SYNTHETIC_EMU_SUBPROCESS = """
 import subprocess
 
@@ -608,13 +828,23 @@ def avd_name(serial):
 """
 
 
-def test_the_emu_guard_flags_a_synthetic_violation():
-    """Anti-vacuity, both shapes."""
-    direct = scan_emu_console("synthetic.py", _SYNTHETIC_EMU)
-    assert [site.function for site in direct] == ["avd_name"], direct
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [
+        ("plain", _SYNTHETIC_EMU),
+        ("aliased", _SYNTHETIC_EMU_ALIASED),
+    ],
+)
+def test_the_emu_guard_flags_a_synthetic_builder_call(label: str, source: str):
+    """Anti-vacuity, and the same alias evasion the quoting guard had."""
+    found = scan_emu_console("synthetic.py", source)
+    assert [site.function for site in found] == ["avd_name"], f"{label}: {found}"
 
-    raw = scan_emu_console("synthetic.py", _SYNTHETIC_EMU_SUBPROCESS)
-    assert [site.function for site in raw] == ["kill"], raw
+
+def test_the_emu_guard_flags_a_raw_subprocess_argv():
+    """The second shape: never build the argv by hand either."""
+    found = scan_emu_console("synthetic.py", _SYNTHETIC_EMU_SUBPROCESS)
+    assert [site.function for site in found] == ["kill"], found
 
 
 def test_the_emu_guard_does_not_flag_run_emu():
@@ -624,22 +854,7 @@ def test_the_emu_guard_does_not_flag_run_emu():
 
 def test_the_emu_guard_enumerates_todays_sites():
     """The five bypassing scripts, by file, function and line."""
-    found = emu_console_bypasses()
-    by_key = {site.key: site for site in found}
-
-    missing = [site for site in KNOWN_EMU_BYPASSES if site.key not in by_key]
-    assert not missing, (
-        f"the guard no longer sees {[str(s) for s in missing]}. If they were "
-        f"routed through run_emu, delete the entries and the xfail marker."
-    )
-    for site in KNOWN_EMU_BYPASSES:
-        assert abs(by_key[site.key].line - site.line) <= LINE_DRIFT, (
-            f"{site.key} moved from {site.line} to {by_key[site.key].line}; "
-            f"confirm it is the same call and update KNOWN_EMU_BYPASSES."
-        )
-
-    unexpected = sorted(set(by_key) - {site.key for site in KNOWN_EMU_BYPASSES})
-    assert not unexpected, f"unreviewed `adb emu` sites: {unexpected}"
+    _assert_enumeration(KNOWN_EMU_BYPASSES, emu_console_bypasses(), "KNOWN_EMU_BYPASSES")
 
 
 @pytest.mark.parametrize("script", EMU_CONSOLE_CLIENTS)
@@ -658,22 +873,30 @@ def test_scripts_using_run_emu_are_not_reported(script: str):
 # this guard asserts its ABSENCE everywhere else, which is checkable today.
 HIERARCHY = "common/hierarchy.py"
 
+BOUNDS_FUNCTION = "function"
+BOUNDS_REGEX = "regex"
+
 # A regex literal that takes apart uiautomator's bounds string: an escaped
 # opening bracket, then a digit class (optionally signed) before the comma.
 # Matched against the literal's *text*, so `\[(\d+),` and `\[(-?\d+),` both
 # answer, and `flags=\[\s*(?P<flags>[^\]]*?)\]` -- the one other bracket regex
-# in the skill -- does not.
+# in the skill -- does not. This is the general net; the name rule below is
+# only the belt to its braces.
 _BOUNDS_GRAMMAR = re.compile(r"\\\[[^\]]*-?\\d")
 
-_BOUNDS_FUNCTION = re.compile(r"bounds$")
+# Exact names, not a suffix rule. `bounds$` after underscore-stripping would
+# also flag `get_bounds` and `calculate_bounds`, which read a rectangle rather
+# than parse the attribute -- and a guard that fires on correct code gets
+# repaired by weakening it.
+_BOUNDS_PARSER_NAMES = frozenset({"_parse_bounds", "_bounds"})
 
 KNOWN_BOUNDS_SITES: tuple[Site, ...] = (
-    Site("accessibility_audit.py", "_parse_bounds", 70, "function"),
-    Site("accessibility_audit.py", "_parse_bounds", 72, "regex (signed)"),
-    Site("navigator.py", "_parse_bounds", 290, "function"),
-    Site("navigator.py", "_parse_bounds", 301, "regex (unsigned)"),
-    Site("screen_mapper.py", "_bounds", 268, "function"),
-    Site("screen_mapper.py", "_bounds", 270, "regex (unsigned)"),
+    Site("accessibility_audit.py", "_parse_bounds", 70, BOUNDS_FUNCTION),
+    Site("accessibility_audit.py", "_parse_bounds", 72, BOUNDS_REGEX, "signed"),
+    Site("navigator.py", "_parse_bounds", 290, BOUNDS_FUNCTION),
+    Site("navigator.py", "_parse_bounds", 301, BOUNDS_REGEX, "unsigned"),
+    Site("screen_mapper.py", "_bounds", 268, BOUNDS_FUNCTION),
+    Site("screen_mapper.py", "_bounds", 270, BOUNDS_REGEX, "unsigned"),
 )
 
 
@@ -691,10 +914,9 @@ def scan_bounds(filename: str, source: str) -> list[Site]:
     sites: list[Site] = []
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _BOUNDS_FUNCTION.search(
-            node.name.strip("_").lower()
-        ):
-            sites.append(Site(filename, node.name, node.lineno, "function"))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            if node.name in _BOUNDS_PARSER_NAMES:
+                sites.append(Site(filename, node.name, node.lineno, BOUNDS_FUNCTION))
         if (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
@@ -707,7 +929,8 @@ def scan_bounds(filename: str, source: str) -> list[Site]:
                     filename,
                     enclosing.get(id(node), "<module>"),
                     node.lineno,
-                    f"regex {node.value!r}",
+                    BOUNDS_REGEX,
+                    "signed" if "-?" in node.value else "unsigned",
                 )
             )
 
@@ -780,12 +1003,21 @@ import re
 PERMISSION = re.compile(r"^(?P<name>\S+?):\s*granted=(?:true|false)(?:,\s*flags=\[\s*(?P<f>[^\]]*?)\s*\])?$")
 """
 
+# Reading a rectangle is not parsing the attribute. A suffix rule flagged both.
+_SYNTHETIC_BOUNDS_LOOKALIKE_NAMES = """
+def get_bounds(element):
+    return element.rect
+
+
+def calculate_bounds(nodes):
+    return [get_bounds(node) for node in nodes]
+"""
+
 
 def test_the_bounds_guard_flags_a_synthetic_violation():
     """Anti-vacuity: both the regex and the function name are reported."""
     found = scan_bounds("synthetic.py", _SYNTHETIC_BOUNDS)
-    details = [site.detail.split()[0] for site in found]
-    assert details == ["function", "regex"], found
+    assert [site.kind for site in found] == [BOUNDS_FUNCTION, BOUNDS_REGEX], found
 
 
 def test_the_bounds_guard_ignores_docstrings():
@@ -804,23 +1036,16 @@ def test_the_bounds_guard_ignores_unrelated_bracket_regexes():
     assert scan_bounds("synthetic.py", _SYNTHETIC_OTHER_BRACKET_REGEX) == []
 
 
+def test_the_bounds_guard_ignores_functions_that_only_read_a_rectangle():
+    """`get_bounds` and `calculate_bounds` are not copies of the parser."""
+    assert scan_bounds("synthetic.py", _SYNTHETIC_BOUNDS_LOOKALIKE_NAMES) == []
+
+
 def test_the_bounds_guard_enumerates_todays_sites():
-    """Three files, three grammars, listed."""
-    found = bounds_grammars_outside_hierarchy()
-    pairs = [(site.file, site.function, site.line) for site in found]
-
-    for site in KNOWN_BOUNDS_SITES:
-        near = [
-            line
-            for file, function, line in pairs
-            if file == site.file
-            and function == site.function
-            and abs(line - site.line) <= LINE_DRIFT
-        ]
-        assert near, f"{site} is no longer reported; found {pairs}"
-
-    unexpected = sorted({site.key for site in found} - {site.key for site in KNOWN_BOUNDS_SITES})
-    assert not unexpected, f"unreviewed bounds parsers: {unexpected}"
+    """Three files, three grammars, each with its function, matched one-for-one."""
+    _assert_enumeration(
+        KNOWN_BOUNDS_SITES, bounds_grammars_outside_hierarchy(), "KNOWN_BOUNDS_SITES"
+    )
 
 
 def test_the_shared_parser_home_exists():
@@ -836,6 +1061,31 @@ def test_the_shared_parser_home_exists():
 # ===========================================================================
 # Shared plumbing
 # ===========================================================================
+
+
+def test_the_enumeration_comparison_counts_rather_than_keys():
+    """The set-versus-multiset bug this file shipped with, pinned.
+
+    Deleting the regex at screen_mapper.py:270 used to leave the enumeration
+    green, because the function finding at :268 satisfied a set keyed on file
+    and function. ``_reconcile`` consumes one actual site per expected site, so
+    the survivor covers one entry and the other is reported missing.
+    """
+    expected = (
+        Site("screen_mapper.py", "_bounds", 268, BOUNDS_FUNCTION),
+        Site("screen_mapper.py", "_bounds", 270, BOUNDS_REGEX),
+    )
+    survivor = [Site("screen_mapper.py", "_bounds", 268, BOUNDS_FUNCTION)]
+
+    missing, unexpected = _reconcile(expected, survivor)
+    assert [site.kind for site in missing] == [BOUNDS_REGEX]
+    assert unexpected == []
+
+    # And an extra finding inside an already-listed function is reported too.
+    extra = [*survivor, Site("screen_mapper.py", "_bounds", 269, BOUNDS_FUNCTION)]
+    missing, unexpected = _reconcile(expected, extra)
+    assert [site.kind for site in missing] == [BOUNDS_REGEX]
+    assert [site.line for site in unexpected] == [269]
 
 
 def test_every_script_basename_is_unique_enough_to_key_on():
