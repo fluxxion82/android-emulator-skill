@@ -556,8 +556,28 @@ def format_candidates(candidates: list[dict], json_format: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    Under ``--json`` that is ``{"error": ...}`` on stdout. A caller that asked
+    for JSON and got a sentence on stderr has an empty stdout to parse, which
+    is the same "no usable answer" this increment is about -- one layer out.
+    """
+    if json_mode:
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
+        print(f"Error: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    """Main entry point: run the CLI, reporting adb failures without a traceback.
+
+    The net, not the handler: every mode is dispatched under a try that knows
+    whether ``--json`` was asked for (see :func:`_run`). This catches anything
+    raised before that is known -- and still says something rather than
+    printing a traceback.
+    """
     try:
         _run()
     except SdkToolError as error:
@@ -609,6 +629,17 @@ Examples:
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
+    try:
+        _dispatch(args)
+    except (SdkToolError, adb_exec.AdbError) as error:
+        # Caught HERE, where --json is known: main() cannot see it, so a
+        # failure reported there is a sentence on stderr and an empty stdout
+        # for whoever asked for JSON.
+        _fail(error, json_mode=args.json)
+
+
+def _dispatch(args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     selector = EmulatorSelector()
 
     # Boot mode

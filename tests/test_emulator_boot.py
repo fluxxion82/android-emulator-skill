@@ -310,18 +310,33 @@ def test_list_avds_reports_actionable_hint_when_unresolvable(monkeypatch):
     assert "$ANDROID_HOME/emulator" in message
 
 
-def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, capsys):
-    """X3, as the agent meets it: `--list-avds --json` on a host with no SDK."""
+@pytest.mark.parametrize(
+    "argv",
+    [["--list-avds", "--json"], ["--all", "--json"]],
+    ids=["list-avds", "boot-all"],
+)
+def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, capsys, argv):
+    """X3, as the agent meets it: a host with no SDK, asking for JSON.
+
+    Both modes read the same listing, so both must report the same way. The
+    failure is caught where `--json` is known -- caught in `main()` it would
+    exit 1 with an empty stdout, which is a decode error for whoever asked for
+    JSON.
+    """
     monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: None)
-    monkeypatch.setattr(emulator_boot.sys, "argv", ["emulator_boot.py", "--list-avds", "--json"])
+    monkeypatch.setattr(emulator_boot.sys, "argv", ["emulator_boot.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
         emulator_boot.main()
 
     assert exc.value.code == 1
-    payload = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    payload = json.loads(captured.out)
     assert "error" in payload, f"--json reported no error: {payload}"
+    assert "$ANDROID_HOME/emulator" in payload["error"], "the JSON error names no remedy"
     assert payload.get("avds") is None, "an empty AVD list was printed alongside the error"
+    assert payload.get("succeeded") is None, "a boot summary was printed alongside the error"
 
 
 def test_list_avds_parses_recorded_emulator_output(monkeypatch, recorded):

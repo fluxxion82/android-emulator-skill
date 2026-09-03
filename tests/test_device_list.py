@@ -356,7 +356,59 @@ def test_a_missing_avdmanager_is_a_warning_not_a_failure(monkeypatch, recorded):
     expected = [ln.strip() for ln in recorded.lines("emulator_list_avds") if ln.strip()]
     assert [a["name"] for a in data["avds"]] == expected
     assert len(data["warnings"]) == 1
-    assert "cmdline-tools" in data["warnings"][0], "the warning names no remedy"
+
+    # The condition on which this design was kept over a hard failure: the
+    # degraded listing has to say what is missing and how to get it back, not
+    # merely exit 0.
+    warning = data["warnings"][0]
+    assert "avdmanager" in warning, "the warning does not name the tool that failed"
+    assert "target/ABI" in warning, "the warning does not say what is missing from the listing"
+    assert sdk_tools.CMDLINE_TOOLS_REMEDY in warning, "the warning does not carry the remedy"
+    assert "Looked in" in warning, "the warning does not say where avdmanager was sought"
+    assert "cmdline-tools/latest/bin" in warning, "the remedy does not name the directory"
+    assert "complete" in warning, "the warning does not say the AVD names themselves are whole"
+
+
+def test_the_avdmanager_warning_reaches_both_output_modes(monkeypatch, recorded, capsys):
+    """The same warning on stderr in text mode and in the JSON body.
+
+    A warning only the object carries is a warning nobody reads. Text callers
+    get it on stderr -- not stdout, which is the listing -- and JSON callers
+    get it in `warnings`, because an agent parsing stdout never sees stderr.
+    """
+    _fake_emulator_on_path(monkeypatch)
+    served = _fake_run_factory(
+        recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:1] == ["avdmanager"]:
+            raise FileNotFoundError("avdmanager not found")
+        return served(cmd, **kwargs)
+
+    _patch_run(monkeypatch, fake_run)
+    monkeypatch.setattr(device_list.sys, "argv", ["device_list.py"])
+
+    with pytest.raises(SystemExit) as exc:
+        device_list.main()
+
+    assert exc.value.code == 0, "a degraded listing is still a listing"
+    text_mode = capsys.readouterr()
+    assert "avdmanager" in text_mode.err, "text mode reported no warning"
+    assert sdk_tools.CMDLINE_TOOLS_REMEDY in text_mode.err, "the stderr warning has no remedy"
+    assert "Android Targets" in text_mode.out, "the listing itself went missing"
+
+    _patch_run(monkeypatch, fake_run)
+    monkeypatch.setattr(device_list.sys, "argv", ["device_list.py", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        device_list.main()
+
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["warnings"], "the JSON body carried no warning"
+    assert sdk_tools.CMDLINE_TOOLS_REMEDY in payload["warnings"][0]
+    assert payload["avds"], "the AVD listing is empty in the degraded mode"
 
 
 def test_the_cli_exits_non_zero_and_says_so_in_json(monkeypatch, capsys):

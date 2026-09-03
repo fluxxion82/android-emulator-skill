@@ -295,36 +295,65 @@ def _run_emu_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def _run_emu_census() -> int:
-    """Console *calls* -- ``run_emu(...)`` -- across the skill, alias-resolved.
+CONSOLE_CALL = "run-emu-call"
 
-    The counterpart to ``_census("emu")`` after L7. Before the fix the console
-    corpus was six hand-rolled ``adb emu`` argv constructions plus one inside
-    ``emu_console``, so the argv census could stand alone as the "can the guard
-    still see the code it guards" floor. Routing the six through ``run_emu``
-    takes that census to 1 by design, and a floor of 1 would be satisfied by a
-    resolver that had gone almost entirely blind. This counts the sanctioned
-    calls instead: the console corpus did not shrink, it changed spelling.
+
+def run_emu_call_sites() -> list[Site]:
+    """Every ``run_emu(...)`` call in the skill, alias-resolved.
+
+    The positive counterpart to :func:`emu_console_bypasses`, and the reason it
+    exists: after L7 the negative guard's answer is an empty list, and an empty
+    list is also what a detector that has stopped working returns. This one
+    names the sites that must be there.
+
+    A count alone was not enough -- reviewed and rejected. Nine found against a
+    floor of six accepts three of them vanishing silently, which is exactly the
+    "a capability was migrated and then quietly dropped" case the enumeration
+    style exists for. So this is compared as an exact multiset, like the bypass
+    enumeration.
     """
-    total = 0
+    sites: list[Site] = []
     for path in _script_files():
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        relative = _relative(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         local = _run_emu_names(tree)
+        enclosing = _functions_by_node(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _called_name(node) in local:
-                total += 1
-    return total
+                sites.append(
+                    Site(relative, enclosing.get(id(node), "<module>"), node.lineno, CONSOLE_CALL)
+                )
+    return sorted(sites, key=lambda site: (site.file, site.line))
 
 
-# Today's counts are 47 device-shell calls, 1 `adb emu` argv construction (in
-# common/emu_console.py, the only file allowed one) and 9 run_emu calls. The
-# floors sit a little below each: the point is not to pin the number, it is
-# that a refactor which renames the builder -- or an edit to this file that
-# breaks resolution -- must not leave the guards reporting "all clear" over a
-# corpus they can no longer see.
+# Every console call in the skill, by file and function. The first six after
+# emu_console's own are the L7 sites -- the ones this PR migrated, and the ones
+# a later refactor could quietly drop while the bypass guard still reported
+# "all clear". sms and snapshot were already correct and are the
+# false-positive control: the fix must not look like the defect, and the
+# sanctioned call must not go missing either.
+KNOWN_CONSOLE_CALLS: tuple[Expectation, ...] = (
+    Expectation("common/emu_console.py", "console_available", CONSOLE_CALL),  # :198
+    Expectation("emulator_boot.py", "_get_avd_name_for_serial", CONSOLE_CALL),  # :226
+    Expectation("emulator_erase.py", "is_avd_running", CONSOLE_CALL),  # :112
+    Expectation("emulator_selector.py", "_avd_name_for_serial", CONSOLE_CALL),  # :341
+    Expectation("emulator_shutdown.py", "shutdown", CONSOLE_CALL),  # :94
+    Expectation("emulator_shutdown.py", "get_avd_name_for_serial", CONSOLE_CALL),  # :162
+    Expectation("location.py", "_run_geo_fix", CONSOLE_CALL),  # :261
+    Expectation("sms.py", "send", CONSOLE_CALL),  # :329
+    Expectation("snapshot.py", "_console", CONSOLE_CALL),  # :402
+)
+
+
+# Today's counts are 47 device-shell calls and 1 `adb emu` argv construction
+# (in common/emu_console.py, the only file allowed one). The shell floor sits
+# below the count: the point is not to pin the number, it is that a refactor
+# which renames the builder -- or an edit to this file that breaks resolution
+# -- must not leave the guard reporting "all clear" over a corpus it can no
+# longer see. The console side is pinned exactly instead, by
+# KNOWN_CONSOLE_CALLS above.
 SHELL_CALL_FLOOR = 40
 EMU_CALL_FLOOR = 1
-CONSOLE_CALL_FLOOR = 6
 
 
 def test_the_guards_still_see_the_production_code():
@@ -337,7 +366,6 @@ def test_the_guards_still_see_the_production_code():
     """
     shell_calls = _census("shell")
     emu_calls = _census("emu")
-    console_calls = _run_emu_census()
 
     assert shell_calls >= SHELL_CALL_FLOOR, (
         f"the sink resolver finds only {shell_calls} `adb shell` argv "
@@ -353,17 +381,22 @@ def test_the_guards_still_see_the_production_code():
         f"inside common/emu_console.py that every other caller now goes "
         f"through. Zero means the resolver stopped resolving."
     )
-    assert console_calls >= CONSOLE_CALL_FLOOR, (
-        f"only {console_calls} run_emu call sites found across scripts/ (floor "
-        f"{CONSOLE_CALL_FLOOR}). L7 routed six hand-rolled `adb emu` sites into "
-        f"run_emu; if they have gone, either the console corpus was deleted or "
-        f"the calls were re-spelled in a way this file can no longer see -- and "
-        f"an empty emu-bypass enumeration would then mean nothing."
-    )
 
 
-def test_the_console_call_census_resolves_an_alias():
-    """The blind spot this census could have: ``import run_emu as X``.
+def test_every_console_call_site_is_where_it_should_be():
+    """The positive enumeration: the nine `run_emu` calls, by file and function.
+
+    An empty bypass list means "nobody speaks the console protocol by hand". It
+    does NOT mean the console is still being spoken to -- deleting all nine
+    calls would satisfy it perfectly. This is the half that notices, and it is
+    an exact multiset rather than a floor, because a floor of six under a count
+    of nine accepts three sites disappearing without a word.
+    """
+    _assert_enumeration(KNOWN_CONSOLE_CALLS, run_emu_call_sites(), "KNOWN_CONSOLE_CALLS")
+
+
+def test_the_console_call_enumeration_resolves_an_alias():
+    """The blind spot this enumeration could have: ``import run_emu as X``.
 
     Asserted on a synthetic module rather than on production code, so it keeps
     testing the resolver after the production spelling changes.
@@ -380,6 +413,33 @@ def test_the_console_call_census_resolves_an_alias():
         if isinstance(node, ast.Call) and _called_name(node) in _run_emu_names(aliased)
     ]
     assert len(calls) == 1
+
+
+def test_every_file_that_imports_run_emu_appears_in_the_enumeration():
+    """Cross-check: importing the console entry point and calling nothing.
+
+    A site can leave KNOWN_CONSOLE_CALLS two ways: deleted from the code, or
+    spelled so the scan stops seeing it. The enumeration catches the first.
+    This catches the second -- a file that imports run_emu and contributes no
+    enumerated call is either dead code or evading the resolver.
+    """
+    importers = {
+        _relative(path)
+        for path in _script_files()
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").endswith("emu_console")
+            and any(alias.name == "run_emu" for alias in node.names)
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    }
+
+    enumerated = {item.file for item in KNOWN_CONSOLE_CALLS}
+    assert importers <= enumerated, (
+        f"{sorted(importers - enumerated)} import run_emu but contribute no "
+        f"enumerated call site; either the call was removed and the import left "
+        f"behind, or the scan cannot see how it is spelled"
+    )
 
 
 # ---------------------------------------------------------------------------

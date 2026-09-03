@@ -303,8 +303,27 @@ def list_avds() -> list:
     return avds
 
 
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
+    and got a sentence on stderr has an empty stdout to parse.
+    """
+    if json_mode:
+        import json
+
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
+        print(f"Error: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    """Main entry point: run the CLI, reporting adb failures without a traceback.
+
+    The net, not the handler: modes are dispatched under a try that knows
+    whether ``--json`` was asked for (see :func:`_run`).
+    """
     try:
         _run()
     except SdkToolError as error:
@@ -366,18 +385,20 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
     args = parser.parse_args()
+    try:
+        _dispatch(parser, args)
+    except (SdkToolError, adb_exec.AdbError) as error:
+        # Caught HERE, where --json is known: main() cannot see it, so every
+        # mode -- not just --list-avds -- reports the failure in the shape the
+        # caller asked for.
+        _fail(error, json_mode=args.json)
 
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     # List AVDs mode
     if args.list_avds:
-        try:
-            avds = list_avds()
-        except SdkToolError as error:
-            if args.json:
-                import json
-
-                print(json.dumps({"error": str(error)}, indent=2))
-                sys.exit(1)
-            raise
+        avds = list_avds()
         if args.json:
             import json
 

@@ -399,3 +399,34 @@ def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, tmp_path, 
     assert captured.err.count("emulator' binary not found") == 1
     assert "Traceback" not in captured.err
     assert "No AVDs" not in captured.out, "an empty ranking was printed as well"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--suggest", "--json"], ["--list", "--json"], ["--json"]],
+    ids=["suggest", "list", "default"],
+)
+def test_a_json_caller_gets_the_failure_in_the_json(monkeypatch, tmp_path, capsys, argv):
+    """--json means "answer on stdout in JSON", failures included.
+
+    The first version of this fix caught SdkToolError in `main()`, which cannot
+    see `args`: the exit status was right and stdout was EMPTY, so an agent
+    parsing it got a decode error rather than the remedy. Every mode is now
+    dispatched under a handler that knows what was asked for, which is why all
+    three are exercised here rather than the one that was reported.
+    """
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
+    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    monkeypatch.setattr(emulator_selector.sys, "argv", ["emulator_selector.py", *argv])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_selector.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    payload = json.loads(captured.out)
+    assert "error" in payload, f"--json reported no error: {payload}"
+    assert "$ANDROID_HOME/emulator" in payload["error"], "the JSON error names no remedy"
+    assert "candidates" not in payload, "an empty ranking was printed beside the error"

@@ -49,11 +49,13 @@ from common.adb_exec import AdbError, run_adb
 from common.env_config import env_int
 from common.sdk_tools import (
     CMDLINE_TOOLS_REMEDY,
+    CMDLINE_TOOLS_SUBDIRS,
     EMULATOR_NOT_FOUND_REMEDY,
     SdkToolError,
     get_emulator_path,
     missing_emulator_error,
     run_sdk_tool,
+    searched_locations,
 )
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -290,9 +292,9 @@ class DeviceLister:
         # because "no ABI shown" and "no ABI known" look identical otherwise.
         self.warnings: list[str] = []
 
-    def _run_optional(self, cmd: list[str]) -> str | None:
+    def _run_optional(self, cmd: list[str]) -> tuple[str | None, str]:
         """
-        Run an *enrichment* command, returning stdout or None if unavailable.
+        Run an *enrichment* command: (stdout, "") or (None, why it failed).
 
         Reserved for avdmanager, whose output only decorates AVDs that
         ``emulator -list-avds`` already named (target, ABI, device). A host
@@ -301,15 +303,20 @@ class DeviceLister:
         the run -- unlike adb and the emulator, whose absence would make the
         *answer* wrong rather than less detailed. See :meth:`get_avds`.
 
-        Every failure mode ``run_sdk_tool`` names is swallowed here, including
-        the ``OSError`` that a PATH holding the SDK *root* produces: a bare tool
+        The failure text is returned rather than dropped: a degraded listing
+        has to be able to say what went missing and why, or "no ABI shown" and
+        "no ABI known" stay indistinguishable.
+
+        Every failure mode ``run_sdk_tool`` names is caught here, including the
+        ``OSError`` that a PATH holding the SDK *root* produces: a bare tool
         name can then resolve to a directory, and execve raises
         ``PermissionError`` rather than ``FileNotFoundError``.
         """
         try:
-            return run_sdk_tool(cmd, timeout=LIST_COMMAND_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY)
-        except SdkToolError:
-            return None
+            stdout = run_sdk_tool(cmd, timeout=LIST_COMMAND_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY)
+        except SdkToolError as error:
+            return None, str(error)
+        return stdout, ""
 
     def get_devices(self) -> list[dict]:
         """
@@ -356,11 +363,12 @@ class DeviceLister:
         )
         names = parse_emulator_avds(names_output)
 
-        meta_output = self._run_optional(["avdmanager", "list", "avd"])
+        meta_output, failure = self._run_optional(["avdmanager", "list", "avd"])
         if meta_output is None:
             self.warnings.append(
-                f"avdmanager could not be run, so AVD target/ABI detail is "
-                f"missing from this listing. {CMDLINE_TOOLS_REMEDY}"
+                f"AVD target/ABI detail is missing from this listing: {failure} "
+                f"Looked in: {searched_locations('avdmanager', CMDLINE_TOOLS_SUBDIRS)}. "
+                f"The AVD names above come from `emulator -list-avds` and are complete."
             )
         metadata = parse_avdmanager_avds(meta_output) if meta_output else {}
 

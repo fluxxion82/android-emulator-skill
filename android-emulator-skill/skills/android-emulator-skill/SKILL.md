@@ -77,10 +77,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Wait for device ready with timeout
    - Batch boot operations
    - Headless mode support
-   - `--list-avds` prints nothing and exits **0** only when the emulator ran and
-     this host defines no AVDs. A missing or failing `emulator` binary is an
-     error naming where it was looked for, and exits 1 (`{"error": ...}` under
-     `--json`) — "no AVDs" and "could not look" are different answers
+   - `--list-avds` reports an empty list (`No AVDs found`, or `{"avds": []}`)
+     and exits **0** only when the emulator ran and this host defines no AVDs.
+     A missing or failing `emulator` binary is an error naming where it was
+     looked for, and exits 1 (`{"error": ...}` under `--json`) — "no AVDs" and
+     "could not look" are different answers. `--all` reports the same failure
+     the same way
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators

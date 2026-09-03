@@ -38,6 +38,8 @@ two can disagree and be caught.
 
 from __future__ import annotations
 
+import pathlib
+
 import keyboard
 import pytest
 
@@ -79,31 +81,20 @@ def ime_state_of(text: str) -> bool:
     return "mInputShown=true" in text
 
 
-def _recorded_ime(shown: bool) -> str:
-    """The recorded `dumpsys input_method` of a profile in the wanted state.
+def _ime_dump_files() -> list[pathlib.Path]:
+    """The recorded IME dumps on disk, for corpus-wide checks ONLY.
 
-    Profiles are searched by what they show rather than named, so re-recording
-    on other devices keeps these tests meaningful; if no profile is in that
-    state any more, this fails loudly instead of quietly testing one branch
-    twice.
+    Every test *input* comes through the ``recorded`` / ``any_profile``
+    fixtures. This is not an input: it is used by the one assertion that is
+    about the shape of the corpus itself -- that some profile shows a keyboard
+    and some other profile does not -- which no per-profile fixture can see,
+    since each run of a parametrised fixture knows only its own profile.
+
+    A plain glob rather than conftest's private profile list, so nothing here
+    depends on how that list is built.
     """
-    for profile in _profiles_with_the_ime_fixture():
-        text = profile.text(IME_FIXTURE)
-        if ime_state_of(text) is shown:
-            return text
-    pytest.fail(
-        f"No recorded profile has {IME_FIXTURE} with a keyboard "
-        f"{'shown' if shown else 'hidden'}. Record one: "
-        f"python tests/record_fixtures.py --only {IME_FIXTURE}"
-    )
-
-
-def _profiles_with_the_ime_fixture() -> list:
-    """Every recorded profile that captured the IME dump."""
-    from conftest import RECORDED_ROOT, RecordedFixtures, _available_profiles
-
-    accessors = [RecordedFixtures(RECORDED_ROOT / name) for name in _available_profiles()]
-    return [accessor for accessor in accessors if accessor.has(IME_FIXTURE)]
+    corpus = pathlib.Path(__file__).resolve().parent / "fixtures" / "recorded"
+    return sorted(corpus.glob(f"*/{IME_FIXTURE}.txt"))
 
 
 def _patch_run(monkeypatch, ime_state: str = IME_UNREADABLE):
@@ -235,8 +226,11 @@ def test_press_key_unknown_key_no_subprocess(monkeypatch):
     assert calls == []
 
 
-def test_dismiss_keyboard_sends_back_when_one_is_shown(monkeypatch):
-    calls = _patch_run(monkeypatch, ime_state=_recorded_ime(shown=True))
+def test_dismiss_keyboard_sends_back_when_one_is_shown(monkeypatch, recorded):
+    """The primary profile recorded a device with its keyboard up."""
+    dump = recorded.text(IME_FIXTURE)
+    assert ime_state_of(dump), f"{IME_FIXTURE} on the primary profile no longer shows a keyboard"
+    calls = _patch_run(monkeypatch, ime_state=dump)
     sim = keyboard.KeyboardSimulator(serial="emulator-5554")
 
     success, message = sim.dismiss_keyboard()
@@ -252,7 +246,7 @@ def test_dismiss_keyboard_sends_back_when_one_is_shown(monkeypatch):
 
 
 @pytest.mark.parametrize("action", ["hide_keyboard", "dismiss_keyboard"], ids=["hide", "dismiss"])
-def test_no_key_event_is_sent_when_no_keyboard_is_shown(monkeypatch, action):
+def test_the_action_matches_what_the_profile_recorded(monkeypatch, any_profile, action):
     """The finding: with no IME up, BACK pops the activity.
 
     Both spellings used to press it unconditionally and report "Keyboard
@@ -260,17 +254,27 @@ def test_no_key_event_is_sent_when_no_keyboard_is_shown(monkeypatch, action):
     away while it was actually one screen back from where it had been, and
     whatever it ran next failed somewhere unrelated.
 
-    The "no keyboard" state is a real device's, not a written one: it is the
-    profile whose recording says so.
+    Run against every recorded profile, and asserting the branch that profile's
+    own recording calls for: `emulator-api35` had a keyboard up, `pixel4xl-api33`
+    did not, so the two states come from two real devices rather than from a
+    parameter list written here. `test_the_corpus_holds_both_ime_states` is
+    what stops this quietly checking one branch twice.
     """
-    calls = _patch_run(monkeypatch, ime_state=_recorded_ime(shown=False))
+    dump = any_profile.text(IME_FIXTURE)
+    calls = _patch_run(monkeypatch, ime_state=dump)
     sim = keyboard.KeyboardSimulator(serial="emulator-5554")
 
     success, message = getattr(sim, action)()
+    pressed = [c for c in calls if "keyevent" in c]
 
-    assert success is True, "asking for a keyboard to be away is satisfied when none is up"
-    assert "No keyboard shown" in message
-    assert not [c for c in calls if "keyevent" in c], f"a key event was sent anyway: {calls}"
+    if ime_state_of(dump):
+        assert success is True
+        assert "Keyboard hidden" in message or "Dismissed keyboard" in message
+        assert pressed, f"{any_profile.name} shows a keyboard and BACK was not sent: {calls}"
+    else:
+        assert success is True, "asking for a keyboard to be away is satisfied when none is up"
+        assert "No keyboard shown" in message
+        assert not pressed, f"{any_profile.name} shows none and a key event was sent: {calls}"
 
 
 @pytest.mark.parametrize("action", ["hide_keyboard", "dismiss_keyboard"], ids=["hide", "dismiss"])
@@ -292,9 +296,9 @@ def test_an_unreadable_ime_state_does_not_press_back(monkeypatch, action):
     assert not [c for c in calls if "keyevent" in c], f"a key event was sent anyway: {calls}"
 
 
-def test_the_ime_state_is_read_before_any_key_event(monkeypatch):
+def test_the_ime_state_is_read_before_any_key_event(monkeypatch, recorded):
     """Order matters: a check after the press would be decoration."""
-    calls = _patch_run(monkeypatch, ime_state=_recorded_ime(shown=True))
+    calls = _patch_run(monkeypatch, ime_state=recorded.text(IME_FIXTURE))
     keyboard.KeyboardSimulator(serial="emulator-5554").hide_keyboard()
 
     assert calls[0][3:] == ["shell", "dumpsys", "input_method"], f"first call was {calls[0]}"
@@ -371,17 +375,20 @@ def test_the_field_the_register_suggested_is_on_no_profile(any_profile):
 
 
 def test_the_corpus_holds_both_ime_states():
-    """Anti-vacuity for the two behaviour tests above.
+    """Anti-vacuity for the behaviour test above, which is per profile.
 
-    They ask the corpus for a shown state and a hidden one. If a re-recording
-    left every profile in the same state, `_recorded_ime` would fail -- but it
-    would fail inside a test whose subject is something else, so this says it
-    plainly instead.
+    Each parametrised run asserts the branch its own recording calls for, and
+    knows nothing about the other profiles. If a re-recording left every
+    profile with its keyboard up, the "no keyboard" branch -- the finding
+    itself -- would stop being exercised and every test would stay green. This
+    is the assertion that notices, which is why it reads the corpus rather than
+    a fixture.
     """
-    states = {ime_state_of(p.text(IME_FIXTURE)) for p in _profiles_with_the_ime_fixture()}
+    states = {ime_state_of(path.read_text(encoding="utf-8")) for path in _ime_dump_files()}
     assert states == {True, False}, (
         f"the recorded profiles only show {states or 'nothing'}; C8's decision "
-        f"has two branches and the corpus must exercise both"
+        f"has two branches and the corpus must exercise both. Record the "
+        f"missing one: python tests/record_fixtures.py --only {IME_FIXTURE}"
     )
 
 
@@ -421,11 +428,11 @@ def test_at_least_one_profile_puts_other_fields_on_that_line(any_profile):
     per profile so the failure names the one that lost them.
     """
     crowded = [
-        profile.name
-        for profile in _profiles_with_the_ime_fixture()
+        path.parent.name
+        for path in _ime_dump_files()
         if any(
             keyboard.IME_SHOWN_FIELD in line and line.strip().count("=") > 1
-            for line in profile.text(IME_FIXTURE).splitlines()
+            for line in path.read_text(encoding="utf-8").splitlines()
         )
     ]
     assert crowded, (
@@ -531,14 +538,14 @@ def test_main_reports_multiple_devices_with_the_serial_remedy(monkeypatch, capsy
     assert "--serial" in capsys.readouterr().err
 
 
-def test_hide_keyboard_flag_is_accepted(monkeypatch, capsys):
+def test_hide_keyboard_flag_is_accepted(monkeypatch, capsys, recorded):
     """--hide-keyboard is documented and dispatched; it must also parse.
 
     Without the declaration, argparse produced no ``hide_keyboard`` attribute
     and every invocation reaching that branch (notably --dismiss) died with
     AttributeError.
     """
-    calls = _patch_run(monkeypatch, ime_state=_recorded_ime(shown=True))
+    calls = _patch_run(monkeypatch, ime_state=recorded.text(IME_FIXTURE))
     monkeypatch.setattr(keyboard, "resolve_device_identifier", lambda arg: arg)
     monkeypatch.setattr(
         keyboard.sys, "argv", ["keyboard.py", "--serial", "emulator-5554", "--hide-keyboard"]
@@ -552,9 +559,12 @@ def test_hide_keyboard_flag_is_accepted(monkeypatch, capsys):
     assert "Keyboard hidden" in capsys.readouterr().out
 
 
-def test_the_cli_reports_a_no_op_hide_as_success(monkeypatch, capsys):
+def test_the_cli_reports_a_no_op_hide_as_success(monkeypatch, capsys, any_profile):
     """C8 at the CLI: nothing to hide is not a failure, and issues nothing."""
-    calls = _patch_run(monkeypatch, ime_state=_recorded_ime(shown=False))
+    dump = any_profile.text(IME_FIXTURE)
+    if ime_state_of(dump):
+        pytest.skip(f"{any_profile.name} recorded a keyboard that IS up")
+    calls = _patch_run(monkeypatch, ime_state=dump)
     monkeypatch.setattr(keyboard, "resolve_device_identifier", lambda arg: arg)
     monkeypatch.setattr(
         keyboard.sys, "argv", ["keyboard.py", "--serial", "emulator-5554", "--hide-keyboard"]
@@ -568,9 +578,9 @@ def test_the_cli_reports_a_no_op_hide_as_success(monkeypatch, capsys):
     assert not [c for c in calls if "keyevent" in c], f"a key event was sent anyway: {calls}"
 
 
-def test_dismiss_does_not_crash_on_the_undeclared_flag(monkeypatch, capsys):
+def test_dismiss_does_not_crash_on_the_undeclared_flag(monkeypatch, capsys, recorded):
     """--dismiss falls through the --hide-keyboard branch on its way down."""
-    _patch_run(monkeypatch, ime_state=_recorded_ime(shown=True))
+    _patch_run(monkeypatch, ime_state=recorded.text(IME_FIXTURE))
     monkeypatch.setattr(keyboard, "resolve_device_identifier", lambda arg: arg)
     monkeypatch.setattr(
         keyboard.sys, "argv", ["keyboard.py", "--serial", "emulator-5554", "--dismiss"]
