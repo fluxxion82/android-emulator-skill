@@ -126,37 +126,60 @@ def test_requested_format_and_parsed_format_agree(recorded):
 
 _PHYSICAL_SIZE_RE = re.compile(r"Physical size: (\d+)x(\d+)")
 _OVERRIDE_SIZE_RE = re.compile(r"Override size: (\d+)x(\d+)")
+_PHYSICAL_DENSITY_RE = re.compile(r"Physical density: (\d+)")
+_OVERRIDE_DENSITY_RE = re.compile(r"Override density: (\d+)")
 
 
-def test_override_fixture_actually_captured_an_override(recorded):
+def test_override_fixture_actually_captured_an_override(any_profile):
     """Guard the guard: without a real override the S9 test proves nothing."""
-    text = recorded.text("wm_size_override")
+    if not any_profile.has("wm_size_override"):
+        pytest.skip(f"{any_profile.name} did not record wm_size_override")
+    text = any_profile.text("wm_size_override")
     assert _PHYSICAL_SIZE_RE.search(text), "no Physical line in override fixture"
     assert _OVERRIDE_SIZE_RE.search(
         text
     ), "override fixture has no 'Override size:' line — re-record it"
 
 
-def test_physical_fixture_has_no_override(recorded):
-    """The physical fixture must be recorded from a clean slate."""
+def test_physical_fixture_has_no_override(any_profile):
+    """The physical fixture must be recorded from a clean slate.
+
+    Also the receipt for the override teardown: an override left behind on the
+    recording device shows up here as a polluted "physical" capture. That
+    matters most on the profiles recorded from a real handset, where the
+    override is a change to somebody's phone.
+    """
+    if not any_profile.has("wm_size_physical"):
+        pytest.skip(f"{any_profile.name} did not record wm_size_physical")
     assert not _OVERRIDE_SIZE_RE.search(
-        recorded.text("wm_size_physical")
+        any_profile.text("wm_size_physical")
     ), "physical fixture is polluted by a leftover override — re-record it"
 
 
-def test_effective_screen_size_prefers_override(recorded):
+def test_effective_screen_size_prefers_override(any_profile):
     """The size a tap is computed against must be the effective one.
 
     With an override active, uiautomator reports element bounds in the OVERRIDE
     resolution while a parser reading only "Physical size:" scales taps against
     the physical one, so every coordinate is wrong by the ratio.
+
+    Runs on every profile that recorded the override (T14). One device could
+    only ever show that the parser prefers one of two lines *on that device*;
+    two different physical resolutions show it is the Override line being
+    chosen and not, say, the larger or the second of the pair.
     """
+    if not any_profile.has("wm_size_override"):
+        pytest.skip(f"{any_profile.name} did not record wm_size_override")
     from common.device_utils import parse_display_size
 
-    text = recorded.text("wm_size_override")
+    text = any_profile.text("wm_size_override")
     physical = tuple(int(g) for g in _PHYSICAL_SIZE_RE.search(text).groups())
     override = tuple(int(g) for g in _OVERRIDE_SIZE_RE.search(text).groups())
-    assert physical != override, "fixture needs distinct values to prove anything"
+    assert physical != override, (
+        f"{any_profile.name}: the override equals the physical size, so this "
+        f"capture cannot show which line was read. Re-record with a value that "
+        f"differs from this device's physical resolution."
+    )
 
     assert parse_display_size(text) == override
 
@@ -170,12 +193,32 @@ def test_physical_size_is_used_when_no_override_is_set(recorded):
     assert parse_display_size(text) == expected
 
 
-def test_effective_density_prefers_override(recorded):
-    """Same defect, same shape, for the density the dp conversion needs."""
+def test_effective_density_prefers_override(any_profile):
+    """Same defect, same shape, for the density the dp conversion needs.
+
+    The expected values are read out of the fixture rather than written here.
+    They used to be the literals 560 and 420, which is what made this a
+    single-device test: 560 is the Pixel 4 XL's PHYSICAL density, so the same
+    assertion on that profile passed for the wrong reason.
+    """
+    if not any_profile.has("wm_density_override"):
+        pytest.skip(f"{any_profile.name} did not record wm_density_override")
     from common.device_utils import parse_display_density
 
-    assert parse_display_density(recorded.text("wm_density_override")) == 560
-    assert parse_display_density(recorded.text("wm_density_physical")) == 420
+    override_text = any_profile.text("wm_density_override")
+    physical = int(_PHYSICAL_DENSITY_RE.search(override_text).group(1))
+    override = int(_OVERRIDE_DENSITY_RE.search(override_text).group(1))
+    assert physical != override, (
+        f"{any_profile.name}: override density equals physical density "
+        f"({physical}), so this capture cannot show which line was read"
+    )
+    assert parse_display_density(override_text) == override
+
+    physical_text = any_profile.text("wm_density_physical")
+    assert _OVERRIDE_DENSITY_RE.search(physical_text) is None
+    assert parse_display_density(physical_text) == int(
+        _PHYSICAL_DENSITY_RE.search(physical_text).group(1)
+    )
 
 
 # ---------------------------------------------------------------------------
