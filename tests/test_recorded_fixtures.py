@@ -16,6 +16,7 @@ When you fix a defect, delete its ``xfail`` marker in the same commit.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -399,6 +400,20 @@ def test_the_invented_anr_pull_parses_nothing(any_profile):
     lines = [ln for ln in any_profile.lines("dumpsys_activity_anr") if ln.strip()]
     assert lines, "fixture is empty"
     assert [parse_logcat_anr(ln) for ln in lines] == [None] * len(lines)
+
+
+def test_anr_watcher_no_longer_issues_the_invented_command():
+    """The call, its helper and its timeout constant are gone from the source."""
+    import anr_watcher
+
+    source = Path(anr_watcher.__file__).read_text(encoding="utf-8")
+    assert "_pull_dumpsys_anr" not in source
+    assert "DUMPSYS_TIMEOUT_SECONDS" not in source
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        args = [a.value for a in node.args if isinstance(a, ast.Constant)]
+        assert not ("dumpsys" in args and "anr" in args), f"invented ANR pull is back: {args}"
 
 
 # ---------------------------------------------------------------------------

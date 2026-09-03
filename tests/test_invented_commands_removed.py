@@ -11,6 +11,12 @@ S11  `show_keyboard()` broadcast `INPUT_METHOD_CHANGED`, which does not show the
      IME and needs system privileges, then returned (True, "Keyboard shown")
      regardless. A no-op that reports success is worse than an absent feature.
 
+T5   `anr_watcher` pulled `adb shell dumpsys activity anr` on every session
+     start. There is no `anr` subcommand: ActivityManager answers
+     "Unknown command: anr" and **exits 0** on both API 33 and API 35, so the
+     `returncode != 0` guard around the pull never fired and three lines of
+     usage text were fed to a logcat-line parser that matches none of them.
+
 Also: `press_button("recent_apps")` was documented while KEYCODE_APP_SWITCH was
 missing from the key map, so the call always errored.
 """
@@ -104,6 +110,59 @@ def test_no_invented_statusbar_subcommand_is_issued(subcommand):
             f"status_bar still issues `cmd statusbar {subcommand}`, which does "
             f"not exist: {args}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The whole register of invented commands, checked across every script.
+#
+# The statusbar check above is keyed to one module. This one is not: an
+# invented command can come back anywhere, and `dumpsys activity anr` was in a
+# different file entirely from the one the S12 test guards.
+# ---------------------------------------------------------------------------
+
+SCRIPTS_DIR = Path(status_bar.__file__).resolve().parent
+
+# Each entry is the token sequence of a command that does not exist. Recorded
+# proof lives in tests/fixtures/recorded/*/ — see the fixture named alongside.
+INVENTED_COMMANDS = [
+    (("cmd", "statusbar", "battery-level"), "cmd_statusbar_help"),
+    (("cmd", "statusbar", "wifi-enabled"), "cmd_statusbar_help"),
+    (("cmd", "statusbar", "mobile-datatype"), "cmd_statusbar_help"),
+    (("cmd", "notification", "list", "channels"), "cmd_notification_help"),
+    (("dumpsys", "activity", "anr"), "dumpsys_activity_anr"),
+]
+
+
+def _constant_arg_sets(source: str) -> list[list[str]]:
+    """Constant string arguments of every call in a module.
+
+    Parsed rather than grepped, for the reason the S12 helper gives: the
+    docstrings now *explain* these commands, and a substring search cannot tell
+    an explanation from a call.
+    """
+    return [
+        [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "fixture_name"),
+    INVENTED_COMMANDS,
+    ids=[" ".join(t) for t, _ in INVENTED_COMMANDS],
+)
+def test_no_script_issues_an_invented_command(tokens, fixture_name):
+    """None of these exist on any recorded profile, so nothing may issue them."""
+    offenders = []
+    for path in sorted(SCRIPTS_DIR.rglob("*.py")):
+        for args in _constant_arg_sets(path.read_text(encoding="utf-8")):
+            if all(token in args for token in tokens):
+                offenders.append(f"{path.name}: {args}")
+    assert not offenders, (
+        f"`{' '.join(tokens)}` does not exist -- see the recorded "
+        f"{fixture_name} fixture -- but it is still issued by: {offenders}"
+    )
 
 
 def test_battery_uses_the_demo_mode_broadcast(capture_adb):
