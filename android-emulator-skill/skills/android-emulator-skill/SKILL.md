@@ -164,7 +164,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       buttons (`--button back`); `--keys a,b` presses a sequence. `--key` and
       `--button` share one name table, so either accepts either name.
     - `--clear N` deletes N characters; `--hide-keyboard` / `--dismiss` put the
-      soft keyboard away.
+      soft keyboard away. Both read `dumpsys input_method` first and press BACK
+      only when an IME is actually shown — BACK is not a "hide keyboard" key,
+      and with no keyboard up it leaves the current screen. With none shown they
+      report "No keyboard shown", send no key event and exit 0; if the IME state
+      cannot be read they exit 1 rather than guess. To press BACK regardless,
+      ask for it: `--button back`.
     - Options: `--type`, `--delay`, `--key`, `--count`, `--keys`, `--button`,
       `--clear`, `--hide-keyboard`, `--dismiss`, `--serial`/`-s`, `--json`
 
