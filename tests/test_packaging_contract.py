@@ -553,29 +553,128 @@ def test_every_flag_documented_in_skill_md_exists():
     )
 
 
-def test_the_required_emulator_lane_has_no_path_filter():
+# The status checks REQUIRED by branch protection on main, as
+# workflow file -> the job `name:` that becomes the check's context.
+#
+# Hand-maintained on purpose: branch protection lives in GitHub's settings,
+# which a test cannot read, so this is the local mirror of it. Change one and
+# change the other. A job renamed here without renaming the protection rule
+# leaves a required context that no workflow ever reports -- the same deadlock
+# a path filter causes.
+REQUIRED_CHECKS = {
+    "lint.yml": "Run Black and Ruff",
+    "test.yml": "Run pytest (mocked, no device required)",
+    "emulator.yml": "pytest -m emulator (real AVD)",
+}
+
+# The same three contexts frozen as a set, so deleting an entry from the mirror
+# above cannot silently shrink what is checked: an emptied REQUIRED_CHECKS
+# makes the loop below iterate nothing and pass.
+BRANCH_PROTECTION_CONTEXTS = frozenset(
+    {
+        "Run Black and Ruff",
+        "Run pytest (mocked, no device required)",
+        "pytest -m emulator (real AVD)",
+    }
+)
+
+# Both spellings deadlock a required check, so neither may appear.
+PATH_FILTER_KEYS = ("paths", "paths-ignore")
+
+
+def _triggers(workflow: dict) -> dict:
+    """The `on:` block. PyYAML parses a bare `on:` key as the boolean True."""
+    return workflow.get("on", workflow.get(True))
+
+
+def _path_filter_offenders(filename: str, workflow: dict) -> list[str]:
+    """Path-filter keys under the PR/push triggers, as ``file: on.event.key``.
+
+    Takes the parsed workflow rather than a path, so the detector can be
+    exercised against a synthetic one with no file on disk.
+    """
+    triggers = _triggers(workflow)
+    offenders: list[str] = []
+    for event in ("pull_request", "push"):
+        config = triggers.get(event) or {}
+        offenders += [f"{filename}: on.{event}.{key}" for key in PATH_FILTER_KEYS if key in config]
+    return offenders
+
+
+def test_no_required_check_filters_by_path():
     """A REQUIRED status check must run on every PR, or it blocks them forever.
 
     GitHub does not report a filtered-out workflow as skipped: the required
     check stays "Expected" and the pull request is permanently BLOCKED. The
-    v0.6.0 release PR, which touched only version manifests, hit exactly this.
+    v0.6.0 release PR, which touched only version manifests, hit exactly this
+    on the emulator lane -- and then a docs-only PR hit it again on the other
+    two, which kept their filters after the lane dropped its own. A PR touching
+    only SKILL.md or a manifest matches neither `lint.yml`'s nor `test.yml`'s
+    filter, so two of the three required checks never report.
 
-    So the pull_request trigger must have no `paths:` filter for as long as
-    this check is required by branch protection on main. The tempting
+    A path filter therefore does not save work on a required check, it
+    deadlocks pull requests; these jobs take about thirty seconds, so runner
+    cost is not an argument against running them always. The tempting
     alternative -- a companion job reporting the same check as passed when the
-    paths do not match -- is a green result from something that ran nothing,
-    which is precisely what `.github/scripts/run-emulator-lane.sh` refuses to
-    let happen inside the lane.
+    paths do not match -- is worse: a green result from something that ran
+    nothing, which is precisely what the lane script refuses to let happen
+    inside the lane.
+
+    Also guarded: the job `name:` still matches the required context. Renaming
+    a job silently produces the same deadlock as filtering it out.
     """
     import yaml
 
-    emulator = yaml.safe_load((WORKFLOWS / "emulator.yml").read_text(encoding="utf-8"))
-    # PyYAML parses a bare `on:` key as the boolean True.
-    triggers = emulator.get("on", emulator.get(True))
-    pull_request = triggers.get("pull_request")
-
-    assert pull_request is not None, "the lane no longer runs on pull requests"
-    assert "paths" not in (pull_request or {}), (
-        "emulator.yml filters pull requests by path while branch protection "
-        "requires it; any PR outside the filter can never be merged"
+    # Coverage first: this test iterates REQUIRED_CHECKS, so emptying it would
+    # make everything below pass without inspecting a single workflow.
+    assert set(REQUIRED_CHECKS.values()) == BRANCH_PROTECTION_CONTEXTS, (
+        f"REQUIRED_CHECKS no longer mirrors branch protection; the difference "
+        f"is {sorted(set(REQUIRED_CHECKS.values()) ^ BRANCH_PROTECTION_CONTEXTS)}. "
+        f"Dropping an entry here shrinks this test's coverage silently."
     )
+
+    offenders: list[str] = []
+    for filename, job_name in REQUIRED_CHECKS.items():
+        workflow = yaml.safe_load((WORKFLOWS / filename).read_text(encoding="utf-8"))
+
+        # Membership, not truthiness: a bare `pull_request:` parses to None
+        # and means "every pull request", which is the ideal state here.
+        assert "pull_request" in _triggers(workflow), (
+            f"{filename} no longer runs on pull requests, so the required "
+            f"check '{job_name}' can never report"
+        )
+        assert job_name in {job.get("name") for job in workflow["jobs"].values()}, (
+            f"no job in {filename} is named '{job_name}'; branch protection "
+            f"requires that context and nothing would ever report it"
+        )
+
+        offenders += _path_filter_offenders(filename, workflow)
+
+    assert not offenders, (
+        f"required checks filter by path: {offenders}. A PR that matches "
+        f"neither filter -- docs, manifests -- leaves those checks at "
+        f"'Expected' forever and can never be merged."
+    )
+
+
+def test_the_path_filter_detector_actually_detects():
+    """Guard the guard: the test above is vacuous if the detector finds nothing.
+
+    A detector that returns no offenders makes
+    ``test_no_required_check_filters_by_path`` pass while inspecting nothing --
+    the exact shape behind three capabilities that shipped inert here. So it is
+    run against workflows written in this file, where the answer is known and
+    no file on disk can change it.
+    """
+    filtered_pr = {"on": {"pull_request": {"branches": ["main"], "paths": ["scripts/**"]}}}
+    assert _path_filter_offenders("lint.yml", filtered_pr) == ["lint.yml: on.pull_request.paths"]
+
+    # A bare `on:` parses to the boolean True, and `paths-ignore` deadlocks a
+    # required check exactly as `paths` does.
+    ignored_push = {True: {"push": {"branches": ["main"], "paths-ignore": ["docs/**"]}}}
+    assert _path_filter_offenders("test.yml", ignored_push) == ["test.yml: on.push.paths-ignore"]
+
+    # An unfiltered workflow reports nothing, so the detector is not simply
+    # always-on -- which would fail the guard above for the wrong reason.
+    unfiltered = {"on": {"pull_request": {"branches": ["main"]}, "push": {"branches": ["main"]}}}
+    assert _path_filter_offenders("emulator.yml", unfiltered) == []
