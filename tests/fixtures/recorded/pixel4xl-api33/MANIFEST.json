@@ -1,6 +1,6 @@
 {
   "profile": "pixel4xl-api33",
-  "recorded_at": "2026-09-03T07:26:41Z",
+  "recorded_at": "2026-09-03T08:04:10Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "Pixel 4 XL",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/coral/coral:13/TP1A.221005.002.B2/9382335:user/release-keys"
   },
-  "redacted_package_count": 393,
+  "redacted_package_count": 0,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -72,7 +72,9 @@
       ],
       "bytes": 88,
       "exit_status": 0,
-      "stream": "stdout"
+      "stream": "stdout",
+      "stdout_bytes": 88,
+      "stderr_bytes": 0
     },
     {
       "name": "dumpsys_input_method_shown",
@@ -96,7 +98,9 @@
       ],
       "bytes": 0,
       "exit_status": 1,
-      "stream": "empty"
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0
     },
     {
       "name": "resolve_activity_launcher",
@@ -107,6 +111,19 @@
         "S10"
       ],
       "bytes": 106
+    },
+    {
+      "name": "wm_density_after_reset",
+      "file": "wm_density_after_reset.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` read back after an override was set and then reset. Only a Physical line remains. Same receipt, for the density the dp conversion depends on.",
+      "catches": [
+        "S7",
+        "S9"
+      ],
+      "bytes": 22,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "wm_density_override",
@@ -128,6 +145,18 @@
       "description": "`wm density` with no override set \u2014 only a 'Physical density:' line.",
       "catches": [],
       "bytes": 22
+    },
+    {
+      "name": "wm_size_after_reset",
+      "file": "wm_size_after_reset.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` read back after an override was set and then reset. Only a Physical line remains. This is the receipt for the teardown: `wm size reset` prints nothing whether or not it worked, so its silence proves nothing and this capture is what does.",
+      "catches": [
+        "S9"
+      ],
+      "bytes": 25,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "wm_size_override",

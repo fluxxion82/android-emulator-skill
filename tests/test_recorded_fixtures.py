@@ -143,18 +143,46 @@ def test_override_fixture_actually_captured_an_override(any_profile):
 
 
 def test_physical_fixture_has_no_override(any_profile):
-    """The physical fixture must be recorded from a clean slate.
-
-    Also the receipt for the override teardown: an override left behind on the
-    recording device shows up here as a polluted "physical" capture. That
-    matters most on the profiles recorded from a real handset, where the
-    override is a change to somebody's phone.
-    """
+    """The physical fixture must be recorded from a clean slate."""
     if not any_profile.has("wm_size_physical"):
         pytest.skip(f"{any_profile.name} did not record wm_size_physical")
     assert not _OVERRIDE_SIZE_RE.search(
         any_profile.text("wm_size_physical")
     ), "physical fixture is polluted by a leftover override — re-record it"
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "override_re", "physical_re"),
+    [
+        ("wm_size_after_reset", _OVERRIDE_SIZE_RE, _PHYSICAL_SIZE_RE),
+        ("wm_density_after_reset", _OVERRIDE_DENSITY_RE, _PHYSICAL_DENSITY_RE),
+    ],
+)
+def test_the_override_reset_is_verified_after_an_override(
+    any_profile, fixture_name, override_re, physical_re
+):
+    """The receipt for the teardown, from a device that HAD an override.
+
+    ``wm_size_physical`` cannot serve as this receipt, which is what it was
+    doing: it is captured from a device that never had an override set, so it
+    shows only that a clean device is clean, and it passes just as happily when
+    a teardown failed on some later fixture.
+
+    These two are captured after an override was applied and then reset, so
+    what they record is the reset actually taking effect. That matters because
+    ``wm size reset`` prints nothing whether or not it worked, and on a real
+    handset a failed reset leaves somebody's phone at the wrong resolution.
+    """
+    if not any_profile.has(fixture_name):
+        pytest.skip(f"{any_profile.name} did not record {fixture_name}")
+    text = any_profile.text(fixture_name)
+
+    assert physical_re.search(text), f"{fixture_name} has no Physical line at all"
+    assert not override_re.search(text), (
+        f"{any_profile.name}: {fixture_name} still shows an override, so the "
+        f"reset did not take and the recording device was left altered: "
+        f"{text.strip()!r}"
+    )
 
 
 def test_effective_screen_size_prefers_override(any_profile):
@@ -369,21 +397,36 @@ def test_dumpsys_activity_anr_is_not_a_subcommand(any_profile):
     assert "ANR in " not in text, "this command returned actual ANR data; re-check T5"
 
 
-def test_dumpsys_activity_anr_exits_zero(any_profile):
+def test_dumpsys_activity_anr_exits_zero_with_nothing_on_stderr(any_profile):
     """T5, the load-bearing half: the failure is invisible to a returncode check.
 
     ``_pull_dumpsys_anr`` bailed out on ``result.returncode != 0``. The command
     exits **0**, so that guard never fired and three lines of usage text went
     into ``parse_logcat_anr`` on every single session start.
+
+    All three facts are asserted, because the argument needs all three: the
+    usage text is on **stdout**, **stderr is empty**, and the **exit status is
+    0**. The fixture file can only ever carry one stream, so "stderr said
+    nothing" is recorded as a measured byte count in MANIFEST.json rather than
+    left as something nobody checked.
     """
     if not any_profile.has("dumpsys_activity_anr"):
         pytest.skip(f"{any_profile.name} did not record dumpsys_activity_anr")
     entry = _manifest_entry(any_profile, "dumpsys_activity_anr")
+
     assert entry["exit_status"] == 0, (
         f"{any_profile.name}: the recording shows exit {entry['exit_status']}. "
         f"If this command now fails loudly, a returncode guard would have been "
         f"enough and T5's reasoning needs revisiting."
     )
+    assert entry["stream"] == "stdout", "the usage text came back on stdout"
+    assert "Unknown command: anr" in any_profile.text("dumpsys_activity_anr")
+    assert entry["stderr_bytes"] == 0, (
+        f"{any_profile.name}: stderr carried {entry['stderr_bytes']} bytes. "
+        f"A diagnostic there would have given a caller something to detect; "
+        f"the point of T5 is that there was none."
+    )
+    assert entry["stdout_bytes"] > 0
 
 
 def test_the_invented_anr_pull_parses_nothing(any_profile):
@@ -403,17 +446,64 @@ def test_the_invented_anr_pull_parses_nothing(any_profile):
 
 
 def test_anr_watcher_no_longer_issues_the_invented_command():
-    """The call, its helper and its timeout constant are gone from the source."""
+    """The call, its helper and its timeout constant are gone from the source.
+
+    Checked by parsing, not by substring search. This file's own docstrings now
+    *explain* `_pull_dumpsys_anr` and why it went, and a `not in source` test
+    would fire on the explanation -- the repo rule is that guards parse rather
+    than grep, for exactly that reason.
+    """
     import anr_watcher
 
-    source = Path(anr_watcher.__file__).read_text(encoding="utf-8")
-    assert "_pull_dumpsys_anr" not in source
-    assert "DUMPSYS_TIMEOUT_SECONDS" not in source
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(Path(anr_watcher.__file__).read_text(encoding="utf-8"))
+
+    defined = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    assert "_pull_dumpsys_anr" not in defined, "the invented ANR pull is defined again"
+
+    referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    assert "_pull_dumpsys_anr" not in referenced, "something calls the invented ANR pull"
+
+    assigned = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "DUMPSYS_TIMEOUT_SECONDS" not in assigned
+    assert "DUMPSYS_TIMEOUT_SECONDS" not in referenced
+
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         args = [a.value for a in node.args if isinstance(a, ast.Constant)]
         assert not ("dumpsys" in args and "anr" in args), f"invented ANR pull is back: {args}"
+
+
+def test_the_anr_guard_is_not_fooled_by_a_docstring():
+    """Guard the guard: prose naming the removed helper must not count.
+
+    The test above would be worthless in reverse -- passing because the symbol
+    is absent while a substring check would have failed on the comment that
+    explains its absence. This pins the distinction.
+    """
+    prose = ast.parse('"""We deleted _pull_dumpsys_anr and DUMPSYS_TIMEOUT_SECONDS."""\n')
+    defined = {
+        node.name
+        for node in ast.walk(prose)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    assert "_pull_dumpsys_anr" not in defined
+
+    real = ast.parse("def _pull_dumpsys_anr(self):\n    pass\n")
+    defined_real = {node.name for node in ast.walk(real) if isinstance(node, ast.FunctionDef)}
+    assert "_pull_dumpsys_anr" in defined_real, "the check cannot see a real definition"
 
 
 # ---------------------------------------------------------------------------
@@ -522,11 +612,81 @@ def test_demo_mode_clock_captures_are_a_usable_pair(recorded):
         "the two demo-mode captures are byte-identical, so they cannot show "
         "different clocks; re-record them"
     )
-    for entry in (
-        _manifest_entry(recorded, "demo_mode_clock_941"),
-        _manifest_entry(recorded, "demo_mode_clock_0941"),
-    ):
+
+    unpadded_entry = _manifest_entry(recorded, "demo_mode_clock_941")
+    padded_entry = _manifest_entry(recorded, "demo_mode_clock_0941")
+    for entry in (unpadded_entry, padded_entry):
         assert entry["bytes"] <= 50 * 1024, "status-bar strip is over the size budget"
+
+    # What each image SHOWS, recorded at capture time rather than written from
+    # memory. The manifest once claimed the unpadded crop read 12:16 while the
+    # committed PNG read 12:25 -- a false observed value in the evidence, which
+    # is the failure this corpus exists to prevent, reintroduced in the prose.
+    assert padded_entry["clock_reads"] == "9:41", (
+        "the padded capture must record the time SystemUI rendered; "
+        f"got {padded_entry.get('clock_reads')!r}"
+    )
+    assert unpadded_entry["clock_reads"] == unpadded_entry["device_clock_at_capture"], (
+        "the unpadded capture shows the device's own clock, because SystemUI "
+        "dropped the 3-digit hhmm; those two fields must therefore agree"
+    )
+    assert unpadded_entry["clock_reads"] != "9:41", (
+        "the unpadded capture reads 9:41, so it cannot show that the broadcast "
+        "was ignored; re-record it (the recorder refuses this, so this means "
+        "the manifest was edited by hand)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# E1 — `am start -W` ground truth. app_launcher --launch parses this and was
+# written with nothing to read; these two recordings are what it should be
+# tested against.
+# ---------------------------------------------------------------------------
+
+
+def test_am_start_wait_reports_a_different_activity_than_it_was_asked_for(recorded):
+    """E1: success cannot be confirmed by comparing the component strings.
+
+    `.Settings` is an activity-alias, so a launch of
+    `com.android.settings/.Settings` reports
+    `com.android.settings/.homepage.SettingsHomepageActivity`. A parser that
+    decides "did my activity start" by matching the requested component against
+    the Activity: line concludes the launch went somewhere else.
+    """
+    text = recorded.text("am_start_wait_settings")
+    requested = "com.android.settings/.Settings"
+    assert f"cmp={requested}" in text, "fixture did not request the component it should have"
+
+    activity = next(ln for ln in text.splitlines() if ln.startswith("Activity:"))
+    reported = activity.split(":", 1)[1].strip()
+    assert reported != requested, (
+        "the recording no longer shows the alias indirection this test pins; " "re-check E1"
+    )
+    assert reported.startswith("com.android.settings/")
+
+    assert "Status: ok" in text
+    assert "LaunchState: COLD" in text, "the capture is not a cold start; force-stop first"
+    assert _manifest_entry(recorded, "am_start_wait_settings")["exit_status"] == 0
+
+
+def test_am_start_wait_failure_is_on_stdout_with_no_status_line(recorded):
+    """E1: the failure has no Status: line and writes nothing to stderr.
+
+    Both halves matter for a parser. Keying on `Status:` to find the outcome
+    finds nothing here, and keying on stderr to find the error finds nothing
+    either -- the whole diagnostic is on stdout, at exit 1.
+    """
+    text = recorded.text("am_start_wait_missing")
+    assert "Error type 3" in text
+    assert "does not exist" in text
+    assert "Status:" not in text, (
+        "a Status: line now appears on the failure path, which changes what a " "parser can key on"
+    )
+
+    entry = _manifest_entry(recorded, "am_start_wait_missing")
+    assert entry["exit_status"] == 1
+    assert entry["stderr_bytes"] == 0, "the diagnostic is on stdout, not stderr"
+    assert entry["stdout_bytes"] > 0
 
 
 # ---------------------------------------------------------------------------

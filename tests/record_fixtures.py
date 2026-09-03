@@ -136,9 +136,25 @@ class Fixture:
             pulls the database and runs the host's sqlite3 against it. Use
             ``setup`` to pull the file first.
         capture_bytes: Optional callable returning the fixture's bytes, given
-            the serial. For artifacts that are not text at all — the status-bar
-            PNGs — where adb's ``text=True`` decoding would corrupt the payload.
-            Mutually exclusive with ``args`` / ``host_argv``.
+            the serial and a metadata dict it may add provenance to. For
+            artifacts that are not text at all — the status-bar PNGs — where
+            adb's ``text=True`` decoding would corrupt the payload. Mutually
+            exclusive with ``args`` / ``host_argv``.
+        record_both_streams: Persist the SIZE of both streams in MANIFEST.json,
+            not just the one the file holds. The file can only ever carry one
+            stream, so "stdout said this" and "stderr said nothing" are two
+            different claims and only the first is provable from the file.
+            ``dumpsys activity anr`` is the case that matters: the T5 argument
+            is that it printed usage text on stdout, printed NOTHING on stderr,
+            and still exited 0. Without the stderr size that middle claim rests
+            on nobody having looked.
+        teardown_verify: Optional callable given the serial, run after teardown
+            and required not to raise. For fixtures whose setup CHANGES THE
+            DEVICE: a teardown that silently failed leaves a real phone in the
+            altered state, and nothing else in this file would notice.
+        metadata: Optional callable given the serial, returning extra manifest
+            fields. For provenance that has to be measured at capture time
+            rather than written from memory.
     """
 
     name: str
@@ -152,7 +168,10 @@ class Fixture:
     post: Callable[[str], str] | None = None
     prepare: Callable[[Path, str | None], None] | None = None
     host_argv: list[str] | None = None
-    capture_bytes: Callable[[str | None], bytes] | None = None
+    capture_bytes: Callable[[str | None, dict], bytes] | None = None
+    record_both_streams: bool = False
+    teardown_verify: Callable[[str | None], None] | None = None
+    metadata: Callable[[str | None], dict] | None = None
 
 
 class CaptureError(RuntimeError):
@@ -488,7 +507,7 @@ STATUS_BAR_STRIP_PX = 120
 MAX_PNG_BYTES = 50 * 1024
 
 
-def _status_bar_strip(serial: str | None) -> bytes:
+def _status_bar_strip(serial: str | None, extra: dict) -> bytes:
     """Screencap the device and return the top strip as a PNG.
 
     Cropped rather than recorded whole for two reasons: a full 1080x2424
@@ -520,6 +539,116 @@ def _status_bar_strip(serial: str | None) -> bytes:
             f"makes the PNG large."
         )
     return payload
+
+
+def _display_restored(*, size: bool = False, density: bool = False) -> Callable[[str | None], None]:
+    """Read the display state back and refuse to believe an unverified reset.
+
+    `wm size reset` prints nothing whether it worked or not, so the recorder
+    used to take its silence as success. It is the only thing standing between
+    a recording run and leaving somebody's phone at 1080x2400 -- the override
+    survives the process exiting, and no other check in this file would notice.
+
+    So the reset is verified the way a person would verify it: read `wm size`
+    back and require the Override line to be gone.
+    """
+
+    def verify(serial: str | None) -> None:
+        for enabled, subcommand in ((size, "size"), (density, "density")):
+            if not enabled:
+                continue
+            readback = _run(["shell", "wm", subcommand], serial, timeout=15)
+            if readback.returncode != 0:
+                raise CaptureError(
+                    f"could not read `wm {subcommand}` back to confirm the "
+                    f"reset (exit {readback.returncode})"
+                )
+            if "Override" in readback.text:
+                raise CaptureError(
+                    f"`wm {subcommand} reset` did not take -- the device still "
+                    f"reports an override: {readback.text.strip()!r}"
+                )
+
+    return verify
+
+
+DEMO_CLOCK_RENDERED = "9:41"
+
+
+def _device_clock(serial: str | None) -> str:
+    """The device's own wall-clock time, in the form SystemUI renders.
+
+    `%I:%M` is the 12-hour form the status bar uses (measured: the bar reads
+    "12:25" where `date +%H:%M` says "00:25"), with the leading zero stripped
+    the way the bar strips it.
+
+    Read twice and required to agree, so a value recorded across a minute
+    boundary is refused rather than written -- the manifest once claimed the
+    unpadded capture showed 12:16 when the committed PNG showed 12:25, and a
+    wrong observed value in the evidence is worse than none.
+    """
+
+    def now() -> str:
+        result = _run(["shell", "date", "+%I:%M"], serial, timeout=15)
+        if result.returncode != 0 or not result.text.strip():
+            raise CaptureError("could not read the device clock")
+        return result.text.strip().lstrip("0")
+
+    before = now()
+    if before != now():
+        raise CaptureError(
+            "the device clock ticked while the status bar was being captured, "
+            "so the observed time cannot be pinned to the image; re-run"
+        )
+    return before
+
+
+def _status_bar_strip_showing(demo_clock_applied: bool) -> Callable[[str | None, dict], bytes]:
+    """Screencap the status bar and record, measured, what its clock reads.
+
+    Neither `dumpsys` nor `uiautomator` exposes the rendered status-bar clock
+    (checked: the SystemUI dump carries only the keyguard clock, and the status
+    bar is not in a uiautomator dump at all), so the value cannot be read back
+    out of the device directly. What CAN be measured is the device's own clock
+    at the moment of capture, and that is enough to make each image unambiguous:
+
+    * unpadded (`hhmm 941`): SystemUI ignored the argument, so the bar is
+      showing the device clock, and that is what gets recorded.
+    * padded (`hhmm 0941`): the bar is showing 9:41. Recorded together with the
+      device clock at capture, and the capture is REFUSED if the device clock
+      happens to be 9:41 too -- because then the image could not distinguish a
+      broadcast that worked from one that was ignored.
+
+    The same refusal guards the unpadded case, so neither PNG can be recorded
+    at the one minute of the day that would make the pair meaningless.
+    """
+
+    def capture(serial: str | None, extra: dict) -> bytes:
+        device_clock = _device_clock(serial)
+        if device_clock == DEMO_CLOCK_RENDERED:
+            raise CaptureError(
+                f"the device clock reads {device_clock}, which is exactly the "
+                f"time the demo broadcast sets. Neither capture could then show "
+                f"whether the broadcast was applied. Wait a minute and re-run."
+            )
+        extra["device_clock_at_capture"] = device_clock
+        if demo_clock_applied:
+            extra["clock_reads"] = DEMO_CLOCK_RENDERED
+            extra["clock_source"] = (
+                "the hhmm argument SystemUI accepted and rendered; the device "
+                "clock at capture was different (see device_clock_at_capture), "
+                "so the bar cannot be showing real time by coincidence"
+            )
+        else:
+            extra["clock_reads"] = device_clock
+            extra["clock_source"] = (
+                "adb shell date +%I:%M, read either side of the screencap: "
+                "SystemUI dropped the 3-digit hhmm, so the bar is still showing "
+                "the device's own time"
+            )
+        return _status_bar_strip(serial, extra)
+
+    return capture
 
 
 def _anr_for(package: str) -> Callable[[str], str]:
@@ -746,6 +875,7 @@ FIXTURES: list[Fixture] = [
         catches=("S9",),
         setup=[["shell", "wm", "size", "1080x2400"]],
         teardown=[["shell", "wm", "size", "reset"]],
+        teardown_verify=_display_restored(size=True),
     ),
     Fixture(
         name="wm_density_override",
@@ -762,6 +892,41 @@ FIXTURES: list[Fixture] = [
         catches=("S7", "S9"),
         setup=[["shell", "wm", "density", "480"]],
         teardown=[["shell", "wm", "density", "reset"]],
+        teardown_verify=_display_restored(density=True),
+    ),
+    # --- the reset receipt ------------------------------------------------
+    # wm_size_physical is captured from a device that never had an override, so
+    # it can only show that a clean device is clean. These two apply the
+    # override and then reset it, so what they record is the RESET working --
+    # the one thing the recorder has to get right on a device somebody owns.
+    Fixture(
+        name="wm_size_after_reset",
+        args=["shell", "wm", "size"],
+        description=(
+            "`wm size` read back after an override was set and then reset. Only "
+            "a Physical line remains. This is the receipt for the teardown: "
+            "`wm size reset` prints nothing whether or not it worked, so its "
+            "silence proves nothing and this capture is what does."
+        ),
+        catches=("S9",),
+        setup=[["shell", "wm", "size", "1080x2400"], ["shell", "wm", "size", "reset"]],
+        teardown=[["shell", "wm", "size", "reset"]],
+        teardown_verify=_display_restored(size=True),
+        post=_requires("Physical size:", absent=("Override",)),
+    ),
+    Fixture(
+        name="wm_density_after_reset",
+        args=["shell", "wm", "density"],
+        description=(
+            "`wm density` read back after an override was set and then reset. "
+            "Only a Physical line remains. Same receipt, for the density the dp "
+            "conversion depends on."
+        ),
+        catches=("S7", "S9"),
+        setup=[["shell", "wm", "density", "480"], ["shell", "wm", "density", "reset"]],
+        teardown=[["shell", "wm", "density", "reset"]],
+        teardown_verify=_display_restored(density=True),
+        post=_requires("Physical density:", absent=("Override",)),
     ),
     # --- invented commands: proof they do not do what the code assumes ----
     Fixture(
@@ -789,6 +954,7 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="dumpsys_activity_anr",
+        record_both_streams=True,
         args=["shell", "dumpsys", "activity", "anr"],
         description=(
             "There is no `anr` subcommand of `dumpsys activity`. ActivityManager "
@@ -1826,9 +1992,67 @@ FIXTURES: list[Fixture] = [
         teardown=[["shell", "am", "force-stop", DIALER_PACKAGE]],
         post=_screen_of(DIALER_PACKAGE, require=("555-1234",), scrollable=False),
     ),
+    # --- am start -W: what a launch actually reports -----------------------
+    # app_launcher --launch parses this and was written with no recording to
+    # read; its own docstring says so. Both halves are captured because the
+    # failure half is where the surprises are.
+    Fixture(
+        name="am_start_wait_settings",
+        args=["shell", "am", "start", "-W", "-n", f"{SETTINGS_PACKAGE}/.Settings"],
+        description=(
+            "A successful `am start -W`, cold. Six lines on stdout, exit 0: "
+            "'Starting: Intent { cmp=... }', 'Status: ok', "
+            "'LaunchState: COLD', 'Activity: ...', 'TotalTime: <ms>', "
+            "'WaitTime: <ms>', 'Complete'. Two traps for a parser written from "
+            "memory. First, the **Activity: line does not name the component "
+            "that was requested** -- asking for com.android.settings/.Settings "
+            "reports com.android.settings/.homepage.SettingsHomepageActivity, "
+            "because .Settings is an alias, so 'did the thing I asked for "
+            "launch' cannot be answered by comparing those two strings. "
+            "Second, when the activity is ALREADY foreground the command still "
+            "exits 0 and still says 'Status: ok', but inserts "
+            "'Warning: Activity not started, intent has been delivered to "
+            "currently running top-most instance.' and reports TotalTime: 0 -- "
+            "so a caller cannot tell a fresh launch from a no-op by the status "
+            "line. The setup here force-stops first to make the capture a "
+            "genuine cold start (LaunchState: COLD, TotalTime in the hundreds "
+            "of ms)."
+        ),
+        catches=("E1",),
+        record_both_streams=True,
+        setup=[
+            ["shell", "input", "keyevent", "KEYCODE_HOME"],
+            ["shell", "am", "force-stop", SETTINGS_PACKAGE],
+            ["shell", "am", "force-stop", "com.google.android.settings.intelligence"],
+            ["shell", "sleep", "3"],
+        ],
+        teardown=[["shell", "am", "force-stop", SETTINGS_PACKAGE]],
+        post=_requires("Status: ok", "LaunchState:", "TotalTime:", "Complete"),
+    ),
+    Fixture(
+        name="am_start_wait_missing",
+        args=["shell", "am", "start", "-W", "-n", f"{SETTINGS_PACKAGE}/.NoSuchActivity"],
+        description=(
+            "`am start -W` naming an activity class that does not exist. Exit "
+            "**1**, and -- the part a parser has to know -- the whole "
+            "diagnostic is on **stdout**, with stderr completely empty (see "
+            "stderr_bytes). The shape: 'Starting: Intent { cmp=... }', then "
+            "'Error type 3', then 'Error: Activity class {pkg/fully.qualified."
+            "Class} does not exist.'. Note there is no 'Status:' line at all, "
+            "so a parser looking for 'Status: ok' to decide success gets a "
+            "correct answer here only by accident, and one keying on stderr to "
+            "find the error finds nothing. Note too that the component in the "
+            "message is EXPANDED to its fully-qualified form, which is not the "
+            "string that was passed in."
+        ),
+        catches=("E1",),
+        record_both_streams=True,
+        post=_requires("Error type 3", "does not exist"),
+    ),
     # --- process liveness: the empty answer that is not an error -----------
     Fixture(
         name="pidof_not_running",
+        record_both_streams=True,
         args=["shell", "pidof", "com.example.definitely.not.installed"],
         description=(
             "`pidof` for a package that is not running: **no output at all**, on "
@@ -1864,6 +2088,7 @@ FIXTURES: list[Fixture] = [
     # --- `input text` is ASCII-only, and says so by crashing ---------------
     Fixture(
         name="input_text_nonascii",
+        record_both_streams=True,
         args=["shell", "input", "text", "héllo"],
         description=(
             "`input text` with one non-ASCII character. It does not type a "
@@ -1900,7 +2125,8 @@ FIXTURES: list[Fixture] = [
         # What capture_bytes runs; the crop to the top strip happens on the host.
         args=["exec-out", "screencap", "-p"],
         ext="png",
-        capture_bytes=_status_bar_strip,
+        capture_bytes=_status_bar_strip_showing(demo_clock_applied=False),
+        # clock_reads in MANIFEST.json is measured, not remembered.
         description=(
             "Status bar after `-e command clock -e hhmm 941`. The clock reads "
             "**the device's own wall-clock time, unchanged** -- not 9:41. (The "
@@ -1934,7 +2160,8 @@ FIXTURES: list[Fixture] = [
         # What capture_bytes runs; the crop to the top strip happens on the host.
         args=["exec-out", "screencap", "-p"],
         ext="png",
-        capture_bytes=_status_bar_strip,
+        capture_bytes=_status_bar_strip_showing(demo_clock_applied=True),
+        # clock_reads in MANIFEST.json is measured, not remembered.
         description=(
             "The same broadcast with the hour zero-padded: `-e hhmm 0941`. The "
             "clock reads **9:41**. This is the control that makes "
@@ -2048,6 +2275,10 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
 
     entries: list[dict] = []
     failures: list[tuple[str, str]] = []
+    # Failures to put the DEVICE back as it was found. Tracked separately from
+    # capture failures and reported last, because a fixture that recorded fine
+    # while leaving an override on somebody's phone is the worse outcome.
+    restore_failures: list[str] = []
     redactions: dict[str, str] = {}
 
     def _record_one(
@@ -2059,6 +2290,8 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         *,
         ext: str = "txt",
         capture: Capture | None = None,
+        both_streams: bool = False,
+        extra: dict | None = None,
     ):
         path = recorded_dir / f"{name}.{ext}"
         if isinstance(payload, bytes):
@@ -2083,21 +2316,34 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             # while printing nothing.
             entry["exit_status"] = capture.returncode
             entry["stream"] = capture.stream
+            if both_streams:
+                # The file holds one stream. These make the OTHER one a
+                # recorded fact instead of an assumption -- "stderr was empty"
+                # is a claim the file itself can never carry.
+                entry["stdout_bytes"] = len(capture.stdout.encode("utf-8"))
+                entry["stderr_bytes"] = len(capture.stderr.encode("utf-8"))
+        if extra:
+            entry.update(extra)
         entries.append(entry)
         print(f"  ok    {path.name} ({size} bytes)")
 
     scratch = Path(tempfile.mkdtemp(prefix="android_emu_record_"))
 
     for fixture in selected:
-        for cmd in fixture.setup:
-            _run([a.format(tmp=scratch) for a in cmd], serial)
-        if fixture.prepare is not None:
-            fixture.prepare(scratch, serial)
         capture: Capture | None = None
         payload: str | bytes
+        extra: dict = {}
+        # Setup runs INSIDE the try. It used to run before it, so a timeout in
+        # `wm size 1080x2400` -- or in anything else between the override and
+        # the capture -- skipped the `finally` entirely and left a real phone
+        # at the overridden resolution.
         try:
+            for cmd in fixture.setup:
+                _run([a.format(tmp=scratch) for a in cmd], serial)
+            if fixture.prepare is not None:
+                fixture.prepare(scratch, serial)
             if fixture.capture_bytes is not None:
-                payload = fixture.capture_bytes(serial)
+                payload = fixture.capture_bytes(serial, extra)
             elif fixture.host_argv is not None:
                 capture = _run_host(
                     [
@@ -2125,8 +2371,28 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             print(f"  FAIL  {fixture.name}: {exc}", file=sys.stderr)
             continue
         finally:
+            # A teardown that fails is not cosmetic: these restore a device
+            # somebody owns. Its exit status is checked, and `teardown_verify`
+            # reads the state back rather than trusting the command's word.
             for cmd in fixture.teardown:
-                _run(cmd, serial)
+                result = _run(cmd, serial)
+                if result.returncode != 0:
+                    restore_failures.append(
+                        f"{fixture.name}: `adb {' '.join(cmd)}` exited "
+                        f"{result.returncode}: {result.text.strip()[:200]!r}"
+                    )
+            if fixture.teardown_verify is not None:
+                try:
+                    fixture.teardown_verify(serial)
+                except CaptureError as exc:
+                    restore_failures.append(f"{fixture.name}: {exc}")
+        if fixture.metadata is not None:
+            try:
+                extra.update(fixture.metadata(serial))
+            except CaptureError as exc:
+                failures.append((fixture.name, f"metadata: {exc}"))
+                print(f"  FAIL  {fixture.name}: metadata: {exc}", file=sys.stderr)
+                continue
         _record_one(
             fixture.name,
             (
@@ -2139,6 +2405,8 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             payload,
             ext=fixture.ext,
             capture=capture,
+            both_streams=fixture.record_both_streams,
+            extra=extra,
         )
 
     if only is None or HIERARCHY_FIXTURE in only:
@@ -2187,6 +2455,20 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
 
     print(f"\n{len(entries)} fixture(s) -> {recorded_dir}")
     print(f"Device: {device.get('model')} API {device.get('api_level')} ({device.get('abi')})")
+    if restore_failures:
+        print(
+            f"\n{len(restore_failures)} DEVICE STATE NOT RESTORED -- fix this "
+            f"before unplugging:",
+            file=sys.stderr,
+        )
+        for line in restore_failures:
+            print(f"  {line}", file=sys.stderr)
+        print(
+            "\nA display override survives the recorder exiting. Reset it by "
+            "hand:\n  adb -s <serial> shell wm size reset\n"
+            "  adb -s <serial> shell wm density reset",
+            file=sys.stderr,
+        )
     if failures:
         print(f"\n{len(failures)} fixture(s) NOT recorded:", file=sys.stderr)
         for name, reason in failures:
@@ -2194,7 +2476,7 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         print("\nNothing was written for these. Re-run with --only once the", file=sys.stderr)
         print("device is healthy; a placeholder fixture is worse than none.", file=sys.stderr)
         return 1
-    return 0
+    return 1 if restore_failures else 0
 
 
 def main() -> None:

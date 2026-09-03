@@ -1,0 +1,7 @@
+Starting: Intent { cmp=com.android.settings/.Settings }
+Status: ok
+LaunchState: COLD
+Activity: com.android.settings/.homepage.SettingsHomepageActivity
+TotalTime: 575
+WaitTime: 582
+Complete

@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-03T07:26:22Z",
+  "recorded_at": "2026-09-03T08:08:44Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -55,6 +55,34 @@
         "S4"
       ],
       "bytes": 146
+    },
+    {
+      "name": "am_start_wait_missing",
+      "file": "am_start_wait_missing.txt",
+      "command": "adb shell am start -W -n com.android.settings/.NoSuchActivity",
+      "description": "`am start -W` naming an activity class that does not exist. Exit **1**, and -- the part a parser has to know -- the whole diagnostic is on **stdout**, with stderr completely empty (see stderr_bytes). The shape: 'Starting: Intent { cmp=... }', then 'Error type 3', then 'Error: Activity class {pkg/fully.qualified.Class} does not exist.'. Note there is no 'Status:' line at all, so a parser looking for 'Status: ok' to decide success gets a correct answer here only by accident, and one keying on stderr to find the error finds nothing. Note too that the component in the message is EXPANDED to its fully-qualified form, which is not the string that was passed in.",
+      "catches": [
+        "E1"
+      ],
+      "bytes": 172,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 172,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "am_start_wait_settings",
+      "file": "am_start_wait_settings.txt",
+      "command": "adb shell am start -W -n com.android.settings/.Settings",
+      "description": "A successful `am start -W`, cold. Six lines on stdout, exit 0: 'Starting: Intent { cmp=... }', 'Status: ok', 'LaunchState: COLD', 'Activity: ...', 'TotalTime: <ms>', 'WaitTime: <ms>', 'Complete'. Two traps for a parser written from memory. First, the **Activity: line does not name the component that was requested** -- asking for com.android.settings/.Settings reports com.android.settings/.homepage.SettingsHomepageActivity, because .Settings is an alias, so 'did the thing I asked for launch' cannot be answered by comparing those two strings. Second, when the activity is ALREADY foreground the command still exits 0 and still says 'Status: ok', but inserts 'Warning: Activity not started, intent has been delivered to currently running top-most instance.' and reports TotalTime: 0 -- so a caller cannot tell a fresh launch from a no-op by the status line. The setup here force-stops first to make the capture a genuine cold start (LaunchState: COLD, TotalTime in the hundreds of ms).",
+      "catches": [
+        "E1"
+      ],
+      "bytes": 189,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 189,
+      "stderr_bytes": 0
     },
     {
       "name": "avdmanager_list_avd",
@@ -172,7 +200,10 @@
       "catches": [
         "L2"
       ],
-      "bytes": 5186
+      "bytes": 5186,
+      "device_clock_at_capture": "1:03",
+      "clock_reads": "9:41",
+      "clock_source": "the hhmm argument SystemUI accepted and rendered; the device clock at capture was different (see device_clock_at_capture), so the bar cannot be showing real time by coincidence"
     },
     {
       "name": "demo_mode_clock_941",
@@ -182,7 +213,10 @@
       "catches": [
         "L2"
       ],
-      "bytes": 5285
+      "bytes": 5321,
+      "device_clock_at_capture": "1:03",
+      "clock_reads": "1:03",
+      "clock_source": "adb shell date +%I:%M, read either side of the screencap: SystemUI dropped the 3-digit hhmm, so the bar is still showing the device's own time"
     },
     {
       "name": "dumpsys_activity_anr",
@@ -194,7 +228,9 @@
       ],
       "bytes": 88,
       "exit_status": 0,
-      "stream": "stdout"
+      "stream": "stdout",
+      "stdout_bytes": 88,
+      "stderr_bytes": 0
     },
     {
       "name": "dumpsys_gfxinfo",
@@ -356,7 +392,9 @@
       ],
       "bytes": 908,
       "exit_status": 255,
-      "stream": "stderr"
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 908
     },
     {
       "name": "logcat_anr_broadcast",
@@ -436,7 +474,9 @@
       ],
       "bytes": 0,
       "exit_status": 1,
-      "stream": "empty"
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0
     },
     {
       "name": "pm_grant_not_changeable",
@@ -609,6 +649,19 @@
       "bytes": 23466
     },
     {
+      "name": "wm_density_after_reset",
+      "file": "wm_density_after_reset.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` read back after an override was set and then reset. Only a Physical line remains. Same receipt, for the density the dp conversion depends on.",
+      "catches": [
+        "S7",
+        "S9"
+      ],
+      "bytes": 22,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "wm_density_override",
       "file": "wm_density_override.txt",
       "command": "adb shell wm density",
@@ -630,6 +683,18 @@
       "bytes": 22
     },
     {
+      "name": "wm_size_after_reset",
+      "file": "wm_size_after_reset.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` read back after an override was set and then reset. Only a Physical line remains. This is the receipt for the teardown: `wm size reset` prints nothing whether or not it worked, so its silence proves nothing and this capture is what does.",
+      "catches": [
+        "S9"
+      ],
+      "bytes": 25,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "wm_size_override",
       "file": "wm_size_override.txt",
       "command": "adb shell wm size",
@@ -637,7 +702,9 @@
       "catches": [
         "S9"
       ],
-      "bytes": 50
+      "bytes": 50,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "wm_size_physical",
