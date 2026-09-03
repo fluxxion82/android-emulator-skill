@@ -7,9 +7,10 @@ verified that any of them worked as documented.
 The v0.6.0 e2e test looked like it did. It reads `screen_mapper --json`, checks
 that "Submit Order" is among the labels, then acts with `--find-type EditText`,
 which is Quick Start step 4. Steps 3 and 5 -- `navigator --find-text --tap` and
-`accessibility_audit.py` -- were never invoked, and both are broken on a Compose
-screen (C1: the tap lands on the caption beside the control; L3: the audit's
-`critical` gate cannot fire on any recorded screen). "Implemented but
+`accessibility_audit.py` -- were never invoked, and both were broken on a
+Compose screen (C1: the tap landed on the caption beside the control; L3: the
+audit's `critical` gate could not fire on any recorded screen). Inc 1 fixed
+both, and the e2e now walks all five. "Implemented but
 unreachable" is the second failure mode the review named, and this is its
 guard: **a capability counts only when SKILL.md tells the agent how to reach it
 and a test reaches it that way.**

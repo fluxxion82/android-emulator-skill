@@ -685,9 +685,10 @@ Earlier releases checked that a fix existed at a given line. This one checks
 that the loop closes: a test reads what `screen_mapper` prints and feeds each
 printed name back into `navigator`, so "implemented but unreachable" fails.
 
-- **`screen_mapper` names every control on the screen, and `navigator` finds and
-  taps every name it printed** — including Jetpack Compose captions, which the
-  dump leaves anonymous and which are resolved to the control that owns them. A
+- **`screen_mapper` names up to 15 controls per bucket in the default report
+  (the full inventory is in `--json`), and `navigator` finds and taps every
+  name it printed** — including Jetpack Compose captions, which the dump leaves
+  anonymous and which are resolved to the control that owns them. A
   caption whose only enclosing "owner" is a scroll container is *refused*, not
   tapped at that container's centre.
 - **A bare `--tap` is refused.** A tap lands inside the rectangle the name
@@ -712,14 +713,19 @@ printed name back into `navigator`, so "implemented but unreachable" fails.
   under `--json`, while `status_bar`, `appearance`, `privacy_manager`,
   `keyboard`, `gesture`, `location`, `emulator_create` and `build_and_test`
   still answer `{"success": false, "message": ...}`.
-- **A missing SDK tool says so** — naming where it was looked for and the
-  `cmdline-tools` remedy — instead of returning an empty list. A tool that ran
-  and genuinely found nothing still exits 0.
+- **A missing SDK tool says so in the lifecycle scripts** — `device_list`,
+  `emulator_boot`, `emulator_delete`, `emulator_erase` and `emulator_selector`
+  route through `common/sdk_tools.py`, which names where the tool was looked
+  for and gives the `cmdline-tools` remedy instead of returning an empty list.
+  A tool that ran and genuinely found nothing still exits 0. (`device_list`
+  keeps a missing `avdmanager` as a *warning*: it only decorates AVDs the
+  emulator already listed.)
 
 The correction remains fixture-driven: `tests/fixtures/recorded/` holds verbatim
 output captured from real devices on two API levels, parser tests consume it,
-and a known defect is pinned with `xfail(strict=True)` so fixing it forces the
-marker's removal. See `CLAUDE.md` in the source repository.
+and a known defect, when one exists, is pinned with `xfail(strict=True)` so
+fixing it forces the marker's removal. None is pinned in v0.7.0. See
+`CLAUDE.md` in the source repository.
 
 **Known gaps, for the next release:**
 
@@ -735,14 +741,22 @@ marker's removal. See `CLAUDE.md` in the source repository.
 - `status_bar --time` must be given zero-padded — `09:41`, not `9:41`. The value
   reaches SystemUI's demo mode as `hhmm`; an unpadded one is ignored while the
   script still reports success.
-- `accessibility_audit` has no contrast check, despite the script's own
-  description mentioning one. Contrast needs pixel sampling from a screenshot,
-  which is not implemented.
+- `accessibility_audit` has no contrast check. Contrast needs pixel sampling
+  from a screenshot, which is not implemented.
 - `privacy_manager` acts on the default user only. It passes no `--user`, so a
   work profile or a secondary user is out of reach.
+- `emulator_create` still returns an empty list when `avdmanager` or
+  `sdkmanager` is missing or fails, so `--list-devices` and `--list-images`
+  print nothing and exit 0 — the shape the lifecycle scripts above no longer
+  have.
 - The JSON failure shape is `{"error": ...}` only for the scripts reworked in
-  this release. The rest still answer `{"success": false, "message": ...}`, and
-  a few emit both keys at once. Unifying them is next.
+  this release. Two groups remain: `status_bar`, `appearance`,
+  `privacy_manager`, `keyboard`, `gesture`, `location`, `emulator_create` and
+  `build_and_test` answer `{"success": false, "message": ...}` (`snapshot`,
+  `sms` and `container` emit both keys at once), and `navigator`,
+  `log_monitor`, `crash_triage` and `status_bar` refuse an unreachable device
+  before any JSON is built, printing prose on stderr and no JSON at all.
+  Unifying them is next.
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

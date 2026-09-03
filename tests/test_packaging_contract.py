@@ -456,6 +456,24 @@ def _skill_md_version() -> str:
     return match.group(1)
 
 
+def _skill_md_scripts_heading_version() -> str:
+    """The version in SKILL.md's ``## Scripts (vX.Y.Z)`` heading.
+
+    A second place the version is written by hand, and the one nothing was
+    watching: `_skill_md_version` above reads the frontmatter, and so do
+    `validate-version.yml` and the `version` job in `release.yml`. The heading
+    could therefore drift a whole release behind while every guard stayed
+    green -- and it is the line a reader actually sees above the script table.
+    """
+    match = re.search(
+        r"^##\s+Scripts\s+\(v(\S+?)\)\s*$",
+        SKILL_MD.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match, "SKILL.md has no `## Scripts (vX.Y.Z)` heading"
+    return match.group(1)
+
+
 def _pyproject_version() -> str:
     match = re.search(
         r'^version\s*=\s*"([^"]+)"',
@@ -482,11 +500,17 @@ def _pyproject_version() -> str:
             )["plugins"][0].get("version"),
         ),
         ("SKILL.md", _skill_md_version),
+        ("SKILL.md `## Scripts` heading", _skill_md_scripts_heading_version),
     ],
 )
 def test_every_manifest_declares_the_same_version_as_pyproject(label, getter):
     """Both plugin manifests previously had no version at all, so CI could not
-    detect drift -- it only checked pyproject.toml and *warned* on SKILL.md."""
+    detect drift -- it only checked pyproject.toml and *warned* on SKILL.md.
+
+    The `## Scripts (vX.Y.Z)` heading is here for the same reason one step on:
+    every automated check reads SKILL.md's FRONTMATTER, so the heading was a
+    hand-maintained version nothing verified.
+    """
     declared = getter()
     assert declared, f"{label} declares no version"
     assert (

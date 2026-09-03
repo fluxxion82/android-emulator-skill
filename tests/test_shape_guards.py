@@ -361,9 +361,11 @@ KNOWN_CONSOLE_CALLS: tuple[Expectation, ...] = (
 )
 
 
-# Today's counts are 47 device-shell calls and 1 `adb emu` argv construction
-# (in common/emu_console.py, the only file allowed one). The shell floor sits
-# below the count: the point is not to pin the number, it is that a refactor
+# Measured today: 45 device-shell calls and 1 `adb emu` argv construction (in
+# common/emu_console.py, the only file allowed one). That 45 is an observation,
+# not a contract -- only the floors below are asserted, and the count moves
+# whenever a call is added or removed. The shell floor sits well below it: the
+# point is not to pin the number, it is that a refactor
 # which renames the builder -- or an edit to this file that breaks resolution
 # -- must not leave the guard reporting "all clear" over a corpus it can no
 # longer see. The console side is pinned exactly instead, by
@@ -1162,7 +1164,12 @@ def test_the_emu_guard_does_not_flag_run_emu():
 
 
 def test_the_emu_guard_enumerates_todays_sites():
-    """The five bypassing scripts, by file, function and which builder they call."""
+    """Nobody bypasses `run_emu` today: KNOWN_EMU_BYPASSES is empty.
+
+    It listed five scripts, each with its own partial handling of the console
+    protocol, until L7 routed them all through `run_emu`. The enumeration stays
+    so a new bypass has to be added here deliberately rather than appearing.
+    """
     _assert_enumeration(KNOWN_EMU_BYPASSES, emu_console_bypasses(), "KNOWN_EMU_BYPASSES")
 
 
@@ -1374,7 +1381,12 @@ def test_the_bounds_guard_ignores_functions_that_only_read_a_rectangle():
 
 
 def test_the_bounds_guard_enumerates_todays_sites():
-    """Three files, three grammars, each with its function, matched one-for-one."""
+    """No bounds grammar outside the shared module: KNOWN_BOUNDS_SITES is empty.
+
+    It held three files with three grammars until C5/C7 collapsed them into
+    `common/hierarchy.py`. The companion test below is what stops "none out
+    here" from being satisfied by a skill with no parser at all.
+    """
     _assert_enumeration(
         KNOWN_BOUNDS_SITES, bounds_grammars_outside_hierarchy(), "KNOWN_BOUNDS_SITES"
     )
