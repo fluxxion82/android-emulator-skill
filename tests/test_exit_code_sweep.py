@@ -34,12 +34,15 @@ Each mode also asserts that a fake tool was *invoked*, so a script that answers
 without ever looking cannot pass the sweep vacuously. The two modes that
 legitimately touch no tool say so in the table.
 
-Each mode is checked by three separate tests, and only one of them carries
-the ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
+Each mode is checked by three separate tests, and only one of them can carry
+an ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
 unexpected *pass*, never an unexpected reason for failing, so a single combined
 test would accept a hang, a fresh Python traceback or a vanished marker file as
-"the expected failure" for the six red modes -- the sweep would go on
-reporting the defect it already knows about while a new one hid behind it. So:
+"the expected failure" for any mode still pinned red -- the sweep would go on
+reporting the defect it already knows about while a new one hid behind it.
+Every mode is green today -- v0.7.0 closed the eight that were red -- so no
+mode sets ``defect`` and nothing is marked; the split stands for the next one.
+So:
 completion and the absence of a traceback are asserted unmarked for all
 twenty-three modes, the tool-invocation floor is asserted unmarked for the
 twenty-one that touch a tool, and the ``xfail`` covers exactly one assertion,

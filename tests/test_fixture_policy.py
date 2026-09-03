@@ -151,7 +151,7 @@ RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
 #     screen" were outside the policy: four hand-written `<hierarchy>` blocks
 #     in one, and a single fifteen-line imagined dump in the other, which was
 #     shaped to make the checks it was written beside pass. Recording it found
-#     L3 (see the xfail in test_accessibility_audit.py).
+#     L3, which Inc 1 then fixed (see test_accessibility_audit.py).
 #
 # STILL OUTSTANDING — one line each, and what would retire it:
 KNOWN_VIOLATIONS = frozenset(
