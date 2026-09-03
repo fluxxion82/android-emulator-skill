@@ -62,6 +62,37 @@ def parse_extras(pairs: list[str] | None) -> dict[str, str]:
     return extras
 
 
+def parse_am_start(output: str) -> dict[str, str]:
+    """Read the ``Key: value`` report ``am start -W`` prints when it returns.
+
+    The keys of interest are ``Status`` (``ok`` when the activity was displayed),
+    ``Activity`` (the component that ended up in front, which is not always the
+    one that was asked for) and ``TotalTime`` (milliseconds to first frame).
+    Keys are lowercased; anything else in the output is ignored.
+
+    NOT YET BACKED BY A RECORDING. No profile under ``tests/fixtures/recorded/``
+    has ``am start -W`` output, so this parser is written to be inert rather
+    than confident: an output with no ``Status:`` line yields ``{}``, and the
+    caller then behaves exactly as it did before ``-W`` was passed. Record it
+    before making any of these keys required.
+
+    Args:
+        output: stdout from ``am start -W``.
+
+    Returns:
+        The recognised keys, lowercased, mapped to their values.
+    """
+    report: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.strip().partition(":")
+        if not separator:
+            continue
+        name = key.strip().lower()
+        if name in ("status", "activity", "totaltime", "waittime", "launchstate"):
+            report[name] = value.strip()
+    return report
+
+
 class AppLauncher:
     """Manage Android app lifecycle."""
 
@@ -114,12 +145,21 @@ class AppLauncher:
                 for part in ("--es", key, value)
             ]
 
-            # Launch activity
+            # Launch the activity and WAIT for it to be displayed.
+            #
+            # `-W` is the whole of E1. Without it `am start` returns as soon as
+            # the intent is dispatched, so a caller that maps the screen next
+            # dumps whatever is still in front -- the launcher, or a splash. On
+            # a hosted emulator that is a coin flip: the e2e test saw 2
+            # interactive elements on a 7-control Compose screen and blamed the
+            # mapper. The wait is bounded by run_adb's own timeout, so a launch
+            # that never completes still returns rather than hanging.
             result = adb_exec.run_adb(
                 "shell",
                 self.serial,
                 "am",
                 "start",
+                "-W",
                 "-n",
                 quote_for_device_shell(component),
                 "-a",
@@ -131,7 +171,18 @@ class AppLauncher:
             if "Error" in result.stdout or "error" in result.stderr.lower():
                 return False, f"Launch failed: {result.stdout or result.stderr}"
 
-            return True, f"Launched: {package_name}"
+            report = parse_am_start(result.stdout)
+            status = report.get("status")
+            if status is not None and status.lower() != "ok":
+                return False, (
+                    f"Launch failed: am start reported Status: {status} for {component}. "
+                    f"The activity did not come to the front -- check that it is exported "
+                    f"and that the device is unlocked."
+                )
+
+            displayed = report.get("activity") or component
+            timing = f" in {report['totaltime']}ms" if "totaltime" in report else ""
+            return True, f"Launched: {package_name} ({displayed} displayed{timing})"
 
         except adb_exec.AdbCommandError as e:
             return False, f"Launch failed: {e}"

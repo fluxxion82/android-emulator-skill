@@ -5,10 +5,17 @@ loop the skill exists to serve:
 
     see the screen -> act on it -> verify the act landed -> read diagnostics
 
-It runs the scripts as an agent would — as subprocesses, parsing their `--json`
-output — rather than importing them, because the CLI contract is what an agent
+It runs the scripts as an agent would — as subprocesses, reading what they
+print — rather than importing them, because the CLI contract is what an agent
 actually consumes. A script that works when imported but not when invoked is
 still broken.
+
+Every command in SKILL.md's Quick Start block is walked here, literally, in
+order, and `test_quick_start_contract.py` enforces that: the documented path and
+the verified path have to be the same path. In particular step 3 takes its
+target from what step 2 *printed* in its default output, not from `--json` and
+not from a literal in this file — that is the loop, and it is the one the agent
+is told to run.
 
 The target is the Compose fixture app (`tests/fixtures/scaffold/compose/`),
 deliberately: Jetpack Compose is the default Android UI toolkit, and until R11
@@ -23,11 +30,15 @@ Marked `emulator`, so it is deselected unless run with `-m emulator`.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
+
+from common.device_utils import parse_focused_activity
 
 pytestmark = pytest.mark.emulator
 
@@ -42,6 +53,17 @@ SCRIPTS = (
 APP = "com.example.composefixture"
 ACTIVITY = f"{APP}/.DefaultActivity"
 STEP_TIMEOUT = 120
+
+# How long to wait for the launched activity to actually reach the front.
+# `app_launcher --launch` now waits for it (E1, via `am start -W`), so this
+# should return on the first poll; it stays because "displayed" and "focused"
+# are not the same instant, and because a lane that mislabels a timing race as a
+# regression in the mapper costs more to diagnose than this loop costs to run.
+FOCUS_TIMEOUT = 30
+FOCUS_POLL_SECONDS = 0.5
+
+# Names the screen report prints are quoted; the header line carries counts.
+_QUOTED = re.compile(r'"([^"]*)"')
 
 
 @pytest.fixture(scope="session")
@@ -98,57 +120,142 @@ def run_skill(compose_device: str):
     return _run
 
 
+def _focused_activity(adb: str, serial: str) -> str | None:
+    """What the device says is in front, read through the shared parser.
+
+    `dumpsys window` is asked directly rather than through a skill script
+    because this is the test's own instrument: if the mapper is blind, the
+    diagnosis needs a source the mapper does not touch.
+    """
+    dumped = subprocess.run(
+        [adb, "-s", serial, "shell", "dumpsys", "window"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return parse_focused_activity(dumped.stdout)
+
+
 @pytest.fixture
-def compose_app(run_skill):
-    """Launch the fixture app on the device that has it."""
+def compose_app(run_skill, adb: str, compose_device: str):
+    """Launch the fixture app and wait until it is the focused activity.
+
+    `--launch` waits for the activity to be displayed, and this polls until the
+    window manager agrees it is focused. Without the wait, `screen_mapper` ran
+    against whatever was still in front -- on a slow hosted runner, the launcher
+    or a splash -- and the failure was reported as "R11 has regressed", a
+    diagnosis the evidence did not support (E1).
+
+    Returns the package, and the focused activity as the test last saw it, so a
+    shortfall can say which screen was actually mapped.
+    """
     launched = run_skill("app_launcher.py", "--launch", ACTIVITY)
     assert launched.returncode == 0, f"could not launch: {launched.stderr}"
-    return APP
+
+    deadline = time.monotonic() + FOCUS_TIMEOUT
+    focused = _focused_activity(adb, compose_device)
+    while not (focused or "").startswith(APP) and time.monotonic() < deadline:
+        time.sleep(FOCUS_POLL_SECONDS)
+        focused = _focused_activity(adb, compose_device)
+
+    assert (focused or "").startswith(APP), (
+        f"{ACTIVITY} was launched but {focused!r} is still focused after "
+        f"{FOCUS_TIMEOUT}s. Nothing below this point would be measuring the "
+        f"fixture app."
+    )
+    return focused
+
+
+def _names_printed(report: str) -> list[str]:
+    """The control names the default screen report puts in front of the agent.
+
+    The report's grammar is ``Section: "name", "name"``; the header line carries
+    counts rather than names, so it is excluded. This is deliberately a parser
+    over the DEFAULT output and not a read of ``--json``: Quick Start step 2
+    passes no flags, and a test that seeds step 3 from JSON certifies a path the
+    agent was never told to take.
+    """
+    return [
+        name
+        for line in report.splitlines()
+        if not line.startswith("Screen:")
+        for name in _QUOTED.findall(line)
+        if name and not name.startswith("...")
+    ]
 
 
 def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app):
-    """The whole loop, in the order an agent would perform it.
+    """Quick Start, run as written, in the order an agent would run it.
 
     Each step asserts on what the previous one produced, so a break anywhere is
     attributed to the step that caused it rather than surfacing as a vague
-    end-of-test failure.
+    end-of-test failure. Step 3 in particular consumes a name step 2 printed:
+    that hand-off is the loop, and it is where C1 and C2 lived through a green
+    suite.
     """
-    # --- 1. See the screen -------------------------------------------------
-    mapped = run_skill("screen_mapper.py", "--json")
+    focused = compose_app
+
+    # --- 2. See the screen (Quick Start step 2: no flags) ------------------
+    mapped = run_skill("screen_mapper.py")
     assert mapped.returncode == 0, f"screen_mapper failed: {mapped.stderr}"
 
-    screen = json.loads(mapped.stdout)
-    assert "error" not in screen, screen.get("error")
-    assert screen["interactive_elements"] >= 6, (
-        f"only {screen['interactive_elements']} interactive elements on a Compose "
-        f"screen with 7 controls -- R11 has regressed and the agent is blind"
+    printed = _names_printed(mapped.stdout)
+    assert len(printed) >= 6, (
+        f"the default screen report names {len(printed)} controls on a Compose "
+        f"screen with 7. Focused activity: {focused!r} -- if that is not "
+        f"{ACTIVITY} the wrong screen was in front and this is a launch race "
+        f"(E1), not the mapper. Report was:\n{mapped.stdout.strip()}"
     )
 
-    # The agent picks its target from the labels the mapper reported.
-    labels = [
-        label
-        for cls, values in screen["elements_by_type"].items()
-        if cls != "TextView"
-        for label in values
-    ]
-    assert any(
-        "Submit Order" in label for label in labels
-    ), f"the button an agent would tap is not among the reported controls: {labels}"
+    target = next((name for name in printed if "Submit Order" in name), None)
+    assert target is not None, (
+        f"the button an agent would tap is not among the names the report " f"printed: {printed}"
+    )
 
-    # --- 2. Act on it ------------------------------------------------------
+    # --- 3. Tap what the report named (Quick Start step 3) -----------------
+    #
+    # The name goes back in verbatim. Nothing here knows the control's
+    # rectangle; the point is that the name the agent was shown is a name the
+    # navigator can act on, and that it reports acting on that same control.
+    tapped = run_skill("navigator.py", "--find-text", target, "--tap")
+    assert tapped.returncode == 0, (
+        f"a name the screen report printed could not be tapped: {target!r}\n"
+        f"  stdout: {tapped.stdout.strip()}\n  stderr: {tapped.stderr.strip()}"
+    )
+    assert tapped.stdout.startswith("Tapped:"), tapped.stdout
+    assert target in tapped.stdout, (
+        f"the tap reported a different control than the one named: "
+        f"asked for {target!r}, got {tapped.stdout.strip()!r}"
+    )
+
+    # --- 4. Enter text (Quick Start step 4) --------------------------------
     typed = run_skill(
         "navigator.py", "--find-type", "EditText", "--enter-text", "agent@example.com"
     )
     assert typed.returncode == 0, f"could not type into the field: {typed.stderr}"
 
-    # --- 3. Verify the act landed ------------------------------------------
+    # --- Verify the act landed ---------------------------------------------
     after = json.loads(run_skill("screen_mapper.py", "--json").stdout)
     filled = [field for field in after["edit_texts"] if field["filled"]]
     assert (
         filled
     ), f"typed into the field but no EditText reports being filled: {after['edit_texts']}"
 
-    # --- 4. Read diagnostics -----------------------------------------------
+    # --- 5. Accessibility audit (Quick Start step 5) -----------------------
+    #
+    # Exit 1 is the documented CI gate for "there are criticals", so the floor
+    # here is a usable verdict rather than a zero status. A Compose screen used
+    # to produce zero criticals structurally, because the check gated on widget
+    # class names that Compose never emits (L3); now the number means something,
+    # whichever number it is.
+    audited = run_skill("accessibility_audit.py")
+    combined = audited.stdout + audited.stderr
+    assert "Traceback" not in combined, f"a stack trace is not an audit:\n{combined}"
+    assert audited.returncode in (0, 1), f"unexpected exit {audited.returncode}: {combined}"
+    assert "Accessibility:" in audited.stdout, f"no audit verdict was printed:\n{combined}"
+
+    # --- 6. Read diagnostics -----------------------------------------------
     logs = run_skill("log_monitor.py", "--duration", "3s", "--json")
     assert logs.returncode == 0, f"log_monitor failed: {logs.stderr}"
 
