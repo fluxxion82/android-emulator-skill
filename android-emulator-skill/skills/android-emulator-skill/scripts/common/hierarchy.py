@@ -76,10 +76,19 @@ _TRANSIENT_ERRORS = (_IDLE_ERROR, _NO_ROOT_ERROR)
 # a rectangle whose centre is a real, tappable pixel (C5).
 _BOUNDS_PATTERN = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
-# The four properties by which uiautomator says an element can be operated.
-# `focusable` is deliberately absent: focusable containers are everywhere, and
-# including it reports the whole screen as interactive.
+# The properties by which uiautomator says an element can be OPERATED AT ALL --
+# the eligibility question, used for enumeration. `focusable` is deliberately
+# absent: focusable containers are everywhere, and including it reports the
+# whole screen as interactive.
 INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollable")
+
+# The subset that answers a narrower question: can this element be operated by a
+# TAP. `scrollable` is the difference, and it matters in one place -- resolving a
+# caption to the control it names. A ScrollView or RecyclerView is legitimately
+# interactive (an agent scrolls it), but it is not what any caption inside it
+# describes, and treating it as one turns "tap the row labelled Battery" into a
+# tap on the middle of the screen, reported as a success naming the row.
+ACTION_ATTRIBUTES = ("clickable", "long-clickable", "checkable")
 
 
 def _is_transient(payload: str) -> bool:
@@ -153,6 +162,55 @@ def node_attributes(node: ET.Element | Mapping) -> Mapping[str, str]:
     raise TypeError(f"not a hierarchy node: {type(node).__name__}")
 
 
+def _operable(node: ET.Element | Mapping, properties: tuple[str, ...]) -> bool:
+    """The one eligibility rule, asked about one set of properties.
+
+    Both public predicates below are this function; they differ only in which
+    properties count as operating the element. Keeping the enabled check and the
+    rectangle check in a single place is the point -- they are the two conditions
+    that were answered differently in three files (C7).
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+        properties: The attributes that count as "can be operated".
+
+    Returns:
+        True when the node is enabled, has a readable rectangle with positive
+        area, and advertises at least one of ``properties``.
+    """
+    attributes = node_attributes(node)
+    if attributes.get("enabled", "true") != "true":
+        return False
+
+    box = parse_bounds(attributes.get("bounds"))
+    if box is None or box[2] <= box[0] or box[3] <= box[1]:
+        return False
+
+    return any(attributes.get(name, "false") == "true" for name in properties)
+
+
+def is_actionable(node: ET.Element | Mapping) -> bool:
+    """Whether this node can be operated BY A TAP.
+
+    :func:`is_interactive` minus ``scrollable``. The distinction exists for one
+    caller -- ``navigator._owning_control``, which turns a caption into the
+    control that caption names. Scroll containers enclose most of a screen, so
+    the first interactive ancestor of a passive label is very often a
+    ScrollView or a RecyclerView; resolving to it sends the tap to the centre of
+    the screen and reports it as a success naming the label. A container is
+    something the agent acts on by scrolling, never something a caption inside
+    it stands for.
+
+    Args:
+        node: An element, a hierarchy dict, or an attribute mapping.
+
+    Returns:
+        True when the node is enabled, has a usable rectangle, and advertises
+        one of :data:`ACTION_ATTRIBUTES`.
+    """
+    return _operable(node, ACTION_ATTRIBUTES)
+
+
 def is_interactive(node: ET.Element | Mapping) -> bool:
     """Whether an agent can operate this node.
 
@@ -174,21 +232,18 @@ def is_interactive(node: ET.Element | Mapping) -> bool:
       tappable in the first place.
     - at least one of :data:`INTERACTIVE_ATTRIBUTES`.
 
+    This is the ELIGIBILITY question -- what gets enumerated, counted and listed
+    -- and it includes ``scrollable``, because a list an agent can scroll is
+    something an agent can act on. See :func:`is_actionable` for the narrower
+    question a tap has to ask.
+
     Args:
         node: An element, a hierarchy dict, or an attribute mapping.
 
     Returns:
         True when the node is a control an agent can act on.
     """
-    attributes = node_attributes(node)
-    if attributes.get("enabled", "true") != "true":
-        return False
-
-    box = parse_bounds(attributes.get("bounds"))
-    if box is None or box[2] <= box[0] or box[3] <= box[1]:
-        return False
-
-    return any(attributes.get(name, "false") == "true" for name in INTERACTIVE_ATTRIBUTES)
+    return _operable(node, INTERACTIVE_ATTRIBUTES)
 
 
 def bare_resource_id(value: str | None) -> str | None:
@@ -337,6 +392,7 @@ def capture_hierarchy_dict(serial: str | None = None, **kwargs) -> dict:
 
 
 __all__ = [
+    "ACTION_ATTRIBUTES",
     "INTERACTIVE_ATTRIBUTES",
     "AdbError",
     "HierarchyError",
@@ -344,6 +400,7 @@ __all__ = [
     "capture_hierarchy",
     "capture_hierarchy_dict",
     "element_to_dict",
+    "is_actionable",
     "is_interactive",
     "node_attributes",
     "parse_bounds",

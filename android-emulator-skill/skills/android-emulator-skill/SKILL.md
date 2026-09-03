@@ -158,8 +158,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       or a resource id (bare or fully qualified, matched whole). A match on a
       caption resolves to the control that owns it -- the control it sits
       inside, or the one beside it in the same row -- so the tap lands on the
-      checkbox rather than 143px to its right. A name that matches only a
-      passive label with no control is refused, not tapped.
+      checkbox rather than 143px to its right. The owner must be **tappable**
+      (clickable / long-clickable / checkable): a scrolling container is
+      interactive, but it is not what a caption inside it names, and resolving
+      to it would tap the middle of the screen. A name that matches only a
+      passive label with no such control is refused, not tapped.
     - `--tap` and `--enter-text` **require a target**: one of `--find-text`,
       `--find-exact`, `--find-type`, `--find-id`, or explicit `--tap-at x,y`.
       Without one it is a usage error (exit 2) and nothing is sent to the device.

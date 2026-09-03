@@ -20,7 +20,7 @@ import navigator
 import pytest
 from navigator import Element, Navigator
 
-from common import adb_exec
+from common import adb_exec, hierarchy
 
 
 def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -377,6 +377,128 @@ def test_a_caption_inside_a_control_with_an_id_still_resolves(monkeypatch, recor
         assert found is not None
         assert found.bounds == (42, 605, 1038, 742), f"fuzzy={fuzzy}: {found}"
         assert found.label == "search_action_bar", f"fuzzy={fuzzy}: {found.label}"
+
+
+# --- A scroll container is not what a caption inside it names ---------------
+
+
+# The recorded Battery row: a clickable LinearLayout wrapping its two captions.
+BATTERY_ROW_BOUNDS = "[0,1708][1080,1939]"
+
+# The scrollable container that encloses every row on that screen. It is the
+# first INTERACTIVE ancestor of any caption once its row stops being clickable,
+# and its centre is the middle of the screen.
+SCROLL_CONTAINER_BOUNDS = "[0,784][1080,2361]"
+
+
+def _settings_with_an_unclickable_row(xml: str) -> ET.Element:
+    """The recorded Settings screen with ONE attribute cleared: the row's `clickable`.
+
+    Derived, and the reason is the same as for the unreadable-bounds case: this
+    is a layout, not a device state, so no dump of this screen can be recorded
+    in which the Battery row is not clickable. What it stands in for is real and
+    common -- a list whose rows are not themselves clickable, where the only
+    interactive ancestor a caption has is the scrolling container around it.
+    Every other byte is the device's.
+    """
+    screen = ET.fromstring(xml)
+    row = next(node for node in screen.iter() if node.get("bounds") == BATTERY_ROW_BOUNDS)
+    assert row.get("clickable") == "true", "the fixture moved; re-derive from the recording"
+    row.set("clickable", "false")
+    return screen
+
+
+def test_a_caption_resolves_to_its_row_when_the_row_is_tappable(monkeypatch, recorded):
+    """The control case, unmodified: the caption belongs to the row, and lands on it."""
+    nav = Navigator()
+    screen = ET.fromstring(recorded.text(SETTINGS))
+    monkeypatch.setattr(nav, "get_ui_hierarchy", lambda force_refresh=False: screen)
+
+    found = nav.find_element(text="Battery")
+
+    assert found is not None
+    assert found.bounds == (0, 1708, 1080, 1939), f"resolved to {found}"
+
+
+def test_a_caption_owned_only_by_a_scroll_container_is_refused(monkeypatch, recorded, capsys):
+    """A ScrollView is interactive, but it is not what a caption inside it names.
+
+    `is_interactive` counts `scrollable`, and a scroll container encloses nearly
+    the whole screen -- so with the row's `clickable` gone it becomes the first
+    interactive ancestor of the "Battery" caption. Resolving to it taps
+    (540, 1572), the middle of the screen, and reports `Tapped: ... "Battery"`:
+    a success naming a control that was never touched, which is the same shape
+    as C2's tap at (0, 0).
+
+    An owner must be tappable (`is_actionable`: clickable / long-clickable /
+    checkable), so the container is passed over, nothing else owns the caption,
+    and the lookup refuses.
+    """
+    monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
+    issued: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        issued.append(list(cmd))
+        return _fake_result()
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    monkeypatch.setattr(
+        navigator,
+        "capture_hierarchy",
+        lambda serial=None, **kwargs: _settings_with_an_unclickable_row(recorded.text(SETTINGS)),
+    )
+    _stub_resolve(monkeypatch)
+    monkeypatch.setattr(
+        navigator.sys, "argv", ["navigator.py", "--find-text", "Battery", "--tap", "--json"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        navigator.main()
+
+    assert exc.value.code != 0, "a caption owned by nothing tappable reported success"
+    assert not [cmd for cmd in issued if "tap" in cmd], f"the screen was tapped anyway: {issued}"
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "error" in payload, f"the failure contract moved: {payload}"
+    assert "passive label" in payload["error"], payload["error"]
+    assert "screen_mapper.py" in payload["error"], "the refusal does not say where to look"
+
+
+def test_the_scroll_container_is_still_interactive_and_still_findable(monkeypatch, recorded):
+    """The narrowing is for ownership only; a container is still something to act on.
+
+    It is enumerated (`is_interactive` keeps `scrollable`) and it is still
+    reachable by its own name, because an agent scrolls it. What it cannot be is
+    the answer to a caption that merely sits inside it.
+    """
+    screen = _settings_with_an_unclickable_row(recorded.text(SETTINGS))
+    container = next(
+        node for node in screen.iter() if node.get("bounds") == SCROLL_CONTAINER_BOUNDS
+    )
+    assert hierarchy.is_interactive(container), "the container stopped being enumerable"
+    assert not hierarchy.is_actionable(container), "a scroll container is not a tap target"
+
+    nav = Navigator()
+    monkeypatch.setattr(nav, "get_ui_hierarchy", lambda force_refresh=False: screen)
+    found = nav.find_element(text="main_content_scrollable_container")
+    assert found is not None, "the container is no longer findable by its own name"
+    assert found.bounds == (0, 784, 1080, 2361)
+
+
+def test_the_compose_sibling_captions_are_unaffected(monkeypatch, recorded):
+    """Checkbox and Switch resolve through the row rule, which is unchanged.
+
+    Both controls are `checkable`, so they are tappable owners; the narrowing
+    touches neither. Restated here because they are the cases the sibling rule
+    exists for, and a change to ownership is exactly what would break them.
+    """
+    nav = Navigator()
+    screen = ET.fromstring(recorded.text(COMPOSE))
+    monkeypatch.setattr(nav, "get_ui_hierarchy", lambda force_refresh=False: screen)
+
+    assert nav.find_element(text="Remember me").bounds == (33, 754, 159, 880)
+    assert nav.find_element(text="Dark theme").bounds == (32, 890, 169, 1016)
+    assert nav.find_element(text="Company logo").bounds == (33, 1028, 159, 1154)
 
 
 # --- Device errors reach the agent with a remedy, not a traceback ----------

@@ -105,6 +105,7 @@ from common.hierarchy import (
     HierarchyError,
     bare_resource_id,
     capture_hierarchy,
+    is_actionable,
     is_interactive,
     parse_bounds,
 )
@@ -657,16 +658,24 @@ class Navigator:
 
         - **An ancestor.** A Compose Button's "Submit Order" and a Settings
           row's "Battery 100%" sit *inside* the control, so the nearest
-          interactive ancestor owns them.
+          TAPPABLE ancestor owns them.
         - **A row-adjacent sibling.** A Compose Checkbox's "Remember me" and a
           Switch's "Dark theme" are siblings of the control, not ancestors of
-          it -- so a "nearest interactive ancestor" rule alone taps the caption
-          and misses the Checkbox by 143px, which is exactly what v0.6.0 did.
-          The row is established by overlapping vertical bounds, not by
-          parentage; the NEXT sibling is tried before the previous one, because
-          a caption follows its control in both Compose layouts recorded here
-          and the reverse order would make "Dark theme" resolve to the Checkbox
-          above it.
+          it -- so a "nearest ancestor" rule alone taps the caption and misses
+          the Checkbox by 143px, which is exactly what v0.6.0 did. The row is
+          established by overlapping vertical bounds, not by parentage; the NEXT
+          sibling is tried before the previous one, because a caption follows
+          its control in both Compose layouts recorded here and the reverse
+          order would make "Dark theme" resolve to the Checkbox above it.
+
+        An owner must be **tappable**, not merely interactive: `is_actionable`,
+        so `scrollable` alone does not qualify. A scroll container encloses most
+        of a screen, so it is very often the first interactive ancestor of a
+        passive label -- and resolving to it moves the tap to the centre of the
+        screen while the message still names the label, which is the "success
+        that is indistinguishable from a miss" this whole increment is about. A
+        scrollable-only ancestor is therefore passed over: the search continues
+        upward, then tries the row, and failing both the caller refuses.
 
         The owner does NOT have to answer to the caption's name. It did in the
         first version of this, and that requirement silently un-fixed C1 for
@@ -674,12 +683,12 @@ class Navigator:
         carries an id, so it recovers no caption, so it "did not answer to"
         `Search settings` and the tap went back to the passive TextView inside
         it. What keeps the structural rule safe is the other end -- a match that
-        resolves to nothing operable is refused rather than tapped.
+        resolves to nothing tappable is refused rather than tapped.
         """
         ancestor = parent_of.get(id(caption.node))
         while ancestor is not None:
             owner = by_node.get(id(ancestor))
-            if owner is not None and owner.interactive:
+            if owner is not None and is_actionable(owner.attributes):
                 return owner
             ancestor = parent_of.get(id(ancestor))
 
@@ -699,7 +708,9 @@ class Navigator:
             if not 0 <= neighbour < len(siblings):
                 continue
             candidate = by_node.get(id(siblings[neighbour]))
-            if candidate is None or not candidate.interactive or candidate.bounds is None:
+            if candidate is None or candidate.bounds is None:
+                continue
+            if not is_actionable(candidate.attributes):
                 continue
             # Same row: the vertical spans must overlap.
             if not (caption_top < candidate.bounds[3] and candidate.bounds[1] < caption_bottom):
@@ -1348,10 +1359,11 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     # A name that matched only a passive label is not an answer.
     #
     # Ownership is structural (`_owning_control`), so a caption inside or beside
-    # a control resolves to that control. When nothing owns it, the match is a
-    # label and nothing else: tapping it does nothing, and reporting it as found
-    # invites exactly that tap. This is the safety catch that lets ownership
-    # ignore what the caption says (INC1-04).
+    # a control resolves to that control. When nothing tappable owns it, the
+    # match is a label and nothing else: tapping it does nothing, and reporting
+    # it as found invites exactly that tap. This is the safety catch that lets
+    # ownership ignore what the caption says (INC1-04) -- and the reason a
+    # scrollable-only ancestor is not allowed to stand in for one.
     if search_text and not (args.find_type or args.find_id) and not element.interactive:
         _fail(
             args,
