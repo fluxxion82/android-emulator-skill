@@ -17,17 +17,22 @@ Tunables (env, ANDROID_EMU_ prefix):
 """
 
 import argparse
-import subprocess
 import sys
 import time
 
 from common import adb_exec
-from common.device_utils import build_adb_command, get_connected_devices
+from common.device_utils import get_connected_devices
+from common.emu_console import run_emu
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_SHUTDOWN_TIMEOUT", 30)
 POLL_INTERVAL_SECONDS = env_float("ANDROID_EMU_SHUTDOWN_POLL_INTERVAL", 0.5, min_value=0.05)
+# Console-call budgets, unchanged from the hand-rolled subprocess calls these
+# replaced. Both are far below emu_console's own 120s default, which is sized
+# for a snapshot save rather than for a kill or a name lookup.
+CONSOLE_KILL_TIMEOUT = env_int("ANDROID_EMU_SHUTDOWN_KILL_TIMEOUT", 10, min_value=1)
+CONSOLE_NAME_TIMEOUT = env_int("ANDROID_EMU_SHUTDOWN_NAME_TIMEOUT", 5, min_value=1)
 
 
 class EmulatorShutdown:
@@ -77,17 +82,16 @@ class EmulatorShutdown:
         # graceful stop. There is deliberately no fallback -- the only device
         # that rejects the console kill is one that has no console, i.e. not an
         # emulator, and that case is refused above.
+        #
+        # Through run_emu, which owns the three traps of this protocol: a `KO`
+        # arrives at exit status 0, replies are framed with a trailing `OK`, and
+        # a physical device answers nothing at all. A kill adb itself reports as
+        # failed raises AdbCommandError, which is the check this call used to
+        # spell by hand.
         try:
-            cmd = build_adb_command("emu", self.serial, "kill")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
-
-            if result.returncode != 0:
-                error = (result.stderr or result.stdout or "").strip()
-                detail = f": {error}" if error else ""
-                return False, f"Shutdown failed: {self.serial}{detail}"
-
-        except subprocess.TimeoutExpired:
-            return False, "Shutdown command timed out"
+            run_emu("kill", serial=self.serial, timeout=CONSOLE_KILL_TIMEOUT)
+        except adb_exec.AdbError as error:
+            return False, f"Shutdown failed: {self.serial}: {error}"
         except Exception as e:
             return False, f"Shutdown error: {e}"
 
@@ -153,21 +157,18 @@ def get_avd_name_for_serial(serial: str) -> str | None:
         AVD name, or None if it cannot be determined.
     """
     try:
-        cmd = build_adb_command("emu", serial, "avd", "name")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+        reply = run_emu("avd", "name", serial=serial, timeout=CONSOLE_NAME_TIMEOUT)
     except Exception:
+        # Unchanged from the hand-rolled version: a serial that cannot be
+        # resolved to a name is "unknown", not an error -- the caller is
+        # matching --name against every attached emulator, and one that will
+        # not answer simply does not match.
         return None
 
-    if result.returncode != 0:
-        return None
-
-    # `emu avd name` prints the AVD name followed by an "OK" status line; the
-    # first non-empty, non-status line is the name.
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line and line != "OK":
-            return line
-    return None
+    # run_emu has already removed the trailing "OK" the console frames its
+    # replies with; the first payload line is the name.
+    lines = reply.lines
+    return lines[0] if lines else None
 
 
 def resolve_serial_by_avd_name(avd_name: str) -> str | None:

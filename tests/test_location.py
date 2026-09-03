@@ -46,16 +46,22 @@ import pytest
 from location import (
     CITY_PRESETS,
     LocationManager,
-    build_geo_fix_command,
+    build_geo_fix_args,
     list_cities,
     parse_gpx,
     resolve_city,
     validate_coordinate,
 )
 
+from common import adb_exec
+
 
 class _FakeCompleted:
-    """Minimal stand-in for subprocess.CompletedProcess (success)."""
+    """Minimal stand-in for subprocess.CompletedProcess (success).
+
+    ``stdout`` is the console's bare acknowledgement, which is what
+    ``adb emu geo fix`` answers with; ``run_emu`` strips it.
+    """
 
     returncode = 0
     stdout = "OK"
@@ -177,30 +183,38 @@ def test_list_cities_sorted():
     assert list_cities() == sorted(list_cities())
 
 
-# === emu geo fix command construction (LON before LAT!) ===
+# === geo fix console arguments (LON before LAT!) ===
+#
+# L7: the `adb ... emu` prefix is no longer built here. It belongs to
+# common.emu_console.run_emu, which is the only place in the skill that speaks
+# the console protocol; this module builds the console-side arguments only. The
+# full argv is still asserted below, at the subprocess boundary under adb_exec,
+# so the prefix is checked where it is now built rather than not at all.
 
 
 def test_build_geo_fix_lon_before_lat():
-    cmd = build_geo_fix_command("emulator-5554", lat=51.5074, lng=-0.1278)
-    # Structure: adb -s <serial> emu geo fix <LON> <LAT>
-    assert cmd[:6] == ["adb", "-s", "emulator-5554", "emu", "geo", "fix"]
-    lon_str, lat_str = cmd[6], cmd[7]
+    args = build_geo_fix_args(lat=51.5074, lng=-0.1278)
+    assert args[:2] == ["geo", "fix"]
+    lon_str, lat_str = args[2], args[3]
     assert float(lon_str) == -0.1278  # longitude FIRST
     assert float(lat_str) == 51.5074  # latitude SECOND
 
 
-def test_build_geo_fix_no_serial_omits_flag():
-    cmd = build_geo_fix_command(None, lat=10.0, lng=20.0)
-    assert cmd[:4] == ["adb", "emu", "geo", "fix"]
-    assert "-s" not in cmd
-    assert float(cmd[4]) == 20.0  # lon
-    assert float(cmd[5]) == 10.0  # lat
+def test_build_geo_fix_builds_no_adb_argv():
+    """The console prefix is emu_console's to build, and only its.
+
+    Re-adding `adb`/`-s`/`emu` here would be the L7 defect coming back in the
+    one file whose finding named a *builder* rather than a call site.
+    """
+    args = build_geo_fix_args(lat=10.0, lng=20.0)
+    assert args == ["geo", "fix", repr(20.0), repr(10.0)]
+    assert not {"adb", "-s", "emu"} & set(args)
 
 
 def test_build_geo_fix_negative_coords_roundtrip():
-    cmd = build_geo_fix_command("emulator-5556", lat=-23.5505, lng=-46.6333)
-    assert float(cmd[-2]) == -46.6333  # lon
-    assert float(cmd[-1]) == -23.5505  # lat
+    args = build_geo_fix_args(lat=-23.5505, lng=-46.6333)
+    assert float(args[-2]) == -46.6333  # lon
+    assert float(args[-1]) == -23.5505  # lat
 
 
 # === validation helper ===
@@ -243,14 +257,21 @@ def test_geo_interval_env_override(monkeypatch):
 
 @pytest.fixture
 def captured_cmds(monkeypatch):
-    """Capture every command passed to the module's subprocess.run."""
+    """Capture every argv issued, at the subprocess boundary under adb_exec.
+
+    Patched one layer lower than before L7: the geo call goes out through
+    ``common.emu_console.run_emu`` now, so ``location.subprocess`` is no longer
+    on the path. Patching the boundary every adb caller shares keeps these
+    assertions on the real argv -- `adb -s <serial> emu geo fix <lon> <lat>` --
+    instead of on a mock of the wrapper.
+    """
     cmds: list[list[str]] = []
 
     def fake_run(cmd, *_args, **_kwargs):
         cmds.append(list(cmd))
         return _FakeCompleted()
 
-    monkeypatch.setattr(location.subprocess, "run", fake_run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
     return cmds
 
 
@@ -309,6 +330,41 @@ def test_replay_gpx_empty_makes_no_call(captured_cmds):
     assert captured_cmds == []
 
 
+def test_a_ko_reply_fails_the_geo_fix(monkeypatch):
+    """L7: the console rejects at exit status 0, and this path must fail on it.
+
+    `_run_geo_fix` used to test `"KO" in result.stdout` itself. Routing it
+    through `run_emu` moves that check to the one module that owns the console
+    protocol -- and the point of the routing is that the answer does not change.
+    """
+
+    class _Ko:
+        returncode = 0
+        stdout = "KO: bad coordinates\r\nOK\r\n"
+        stderr = ""
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", lambda *_a, **_k: _Ko())
+
+    ok, msg = LocationManager(serial="emulator-5554").set_coordinate(51.5074, -0.1278)
+    assert ok is False
+    assert "KO: bad coordinates" in msg
+
+
+def test_a_failing_adb_exit_fails_the_geo_fix(monkeypatch):
+    """The other half: adb itself reporting failure is not a fix that landed."""
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "some console complaint"
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", lambda *_a, **_k: _Failed())
+
+    ok, msg = LocationManager(serial="emulator-5554").set_coordinate(51.5074, -0.1278)
+    assert ok is False
+    assert "some console complaint" in msg
+
+
 def test_physical_device_is_refused(monkeypatch):
     # A non-emulator serial that resolves to a physical device must be refused
     # before any geo fix call, not silently no-op'd.
@@ -319,7 +375,7 @@ def test_physical_device_is_refused(monkeypatch):
     )
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        location.subprocess, "run", lambda cmd, *a, **k: calls.append(list(cmd)) or _FakeCompleted()
+        adb_exec.subprocess, "run", lambda cmd, *a, **k: calls.append(list(cmd)) or _FakeCompleted()
     )
     ok, msg = LocationManager(serial="ABC123").set_coordinate(1.0, 2.0)
     assert ok is False

@@ -45,6 +45,7 @@ from pathlib import Path
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
+from common.emu_console import EmuConsoleError, run_emu
 from common.env_config import env_int
 from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
 
@@ -329,14 +330,23 @@ class EmulatorSelector:
         swallowed: the serial came straight from ``adb devices``, so one that can
         no longer be reached means the running check went unanswered, and ranking
         a live AVD as idle is how a second copy of it gets booted.
+
+        The console is spoken to through :func:`common.emu_console.run_emu`,
+        which strips the trailing ``OK`` the console frames its replies with and
+        turns a ``KO`` -- delivered at exit status 0 -- into an exception rather
+        than a plausible-looking AVD name.
         """
-        result = adb_exec.run_adb("emu", serial, "avd", "name", timeout=PROBE_TIMEOUT_SECONDS)
-        # `adb emu avd name` prints the name then an "OK" line.
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line and line != "OK":
-                return line
-        return None
+        try:
+            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
+        except EmuConsoleError:
+            # "The console declined to answer", which the ranking treats as no
+            # bonus rather than as a failure: an emulator part-way through boot
+            # is in `adb devices` before its console is up. Only the console
+            # protocol is absorbed here -- a device-level AdbError still
+            # propagates, because that one means the check never ran.
+            return None
+        lines = reply.lines
+        return lines[0] if lines else None
 
     def load_recent(self) -> list[str]:
         """Load the recent-use AVD history (most-recent first); [] on miss."""

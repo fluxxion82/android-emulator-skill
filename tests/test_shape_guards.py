@@ -279,13 +279,52 @@ def _census(operation: str) -> int:
     return total
 
 
-# Today's counts are 47 device-shell calls and 7 console calls. The floors sit
-# a little below both: the point is not to pin the number, it is that a
-# refactor which renames the builder -- or an edit to this file that breaks
-# resolution -- must not leave the guards reporting "all clear" over a corpus
-# they can no longer see.
+def _run_emu_names(tree: ast.Module) -> set[str]:
+    """Every local spelling of ``run_emu`` in one module, ``as`` aliases included.
+
+    Keying on the terminal name alone is the evasion the sink resolver was
+    reviewed for: ``from common.emu_console import run_emu as console`` walks
+    straight past a census that only looks for the word.
+    """
+    names = {"run_emu"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("emu_console"):
+            for alias in node.names:
+                if alias.name == "run_emu":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _run_emu_census() -> int:
+    """Console *calls* -- ``run_emu(...)`` -- across the skill, alias-resolved.
+
+    The counterpart to ``_census("emu")`` after L7. Before the fix the console
+    corpus was six hand-rolled ``adb emu`` argv constructions plus one inside
+    ``emu_console``, so the argv census could stand alone as the "can the guard
+    still see the code it guards" floor. Routing the six through ``run_emu``
+    takes that census to 1 by design, and a floor of 1 would be satisfied by a
+    resolver that had gone almost entirely blind. This counts the sanctioned
+    calls instead: the console corpus did not shrink, it changed spelling.
+    """
+    total = 0
+    for path in _script_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        local = _run_emu_names(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _called_name(node) in local:
+                total += 1
+    return total
+
+
+# Today's counts are 47 device-shell calls, 1 `adb emu` argv construction (in
+# common/emu_console.py, the only file allowed one) and 9 run_emu calls. The
+# floors sit a little below each: the point is not to pin the number, it is
+# that a refactor which renames the builder -- or an edit to this file that
+# breaks resolution -- must not leave the guards reporting "all clear" over a
+# corpus they can no longer see.
 SHELL_CALL_FLOOR = 40
-EMU_CALL_FLOOR = 6
+EMU_CALL_FLOOR = 1
+CONSOLE_CALL_FLOOR = 6
 
 
 def test_the_guards_still_see_the_production_code():
@@ -298,6 +337,7 @@ def test_the_guards_still_see_the_production_code():
     """
     shell_calls = _census("shell")
     emu_calls = _census("emu")
+    console_calls = _run_emu_census()
 
     assert shell_calls >= SHELL_CALL_FLOOR, (
         f"the sink resolver finds only {shell_calls} `adb shell` argv "
@@ -309,8 +349,37 @@ def test_the_guards_still_see_the_production_code():
     assert emu_calls >= EMU_CALL_FLOOR, (
         f"the sink resolver finds only {emu_calls} `adb emu` argv constructions "
         f"across scripts/ (floor {EMU_CALL_FLOOR}); the console guard cannot "
-        f"see the code it is guarding."
+        f"see the code it is guarding. One is expected and required -- the call "
+        f"inside common/emu_console.py that every other caller now goes "
+        f"through. Zero means the resolver stopped resolving."
     )
+    assert console_calls >= CONSOLE_CALL_FLOOR, (
+        f"only {console_calls} run_emu call sites found across scripts/ (floor "
+        f"{CONSOLE_CALL_FLOOR}). L7 routed six hand-rolled `adb emu` sites into "
+        f"run_emu; if they have gone, either the console corpus was deleted or "
+        f"the calls were re-spelled in a way this file can no longer see -- and "
+        f"an empty emu-bypass enumeration would then mean nothing."
+    )
+
+
+def test_the_console_call_census_resolves_an_alias():
+    """The blind spot this census could have: ``import run_emu as X``.
+
+    Asserted on a synthetic module rather than on production code, so it keeps
+    testing the resolver after the production spelling changes.
+    """
+    aliased = ast.parse(
+        "from common.emu_console import run_emu as console\n"
+        "def kill(serial):\n"
+        "    return console('kill', serial=serial)\n"
+    )
+    assert _run_emu_names(aliased) == {"run_emu", "console"}
+    calls = [
+        node
+        for node in ast.walk(aliased)
+        if isinstance(node, ast.Call) and _called_name(node) in _run_emu_names(aliased)
+    ]
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -866,23 +935,27 @@ EMU_CONSOLE = "common/emu_console.py"
 
 EMU_ARGV = "emu-argv"
 
-# Confirmed by reading each call. Codex cites emulator_shutdown.py:66 as the
-# representative and names shutdown, boot, selector, erase and location.
-KNOWN_EMU_BYPASSES: tuple[Expectation, ...] = (
-    Expectation("emulator_boot.py", "_get_avd_name_for_serial", EMU_ARGV, "run_adb"),  # :211
-    Expectation("emulator_erase.py", "is_avd_running", EMU_ARGV, "run_adb"),  # :108
-    Expectation("emulator_selector.py", "_avd_name_for_serial", EMU_ARGV, "run_adb"),  # :333
-    # The line comments here are why lines are not matched data: PR #8 landed
-    # the L1 physical-device refusal above this call and moved it from :66 to
-    # :81, which failed the enumeration in CI while passing on the branch.
-    Expectation("emulator_shutdown.py", "shutdown", EMU_ARGV, "build_adb_command"),  # :81
-    Expectation(
-        "emulator_shutdown.py", "get_avd_name_for_serial", EMU_ARGV, "build_adb_command"
-    ),  # :156
-    # The plan cites location.py:273; that is `_run_geo_fix`, which executes an
-    # argv it does not build. The literal "emu" is in build_geo_fix_command.
-    Expectation("location.py", "build_geo_fix_command", EMU_ARGV, "build_adb_command"),  # :144
-)
+# Empty since L7: every one of the six sites below now calls
+# common.emu_console.run_emu, and the guard reports nothing outside
+# common/emu_console.py. Kept as a comment rather than deleted, because the
+# list is the record of what the fix had to reach -- three of the six were in
+# files nobody had connected to the finding, which is the whole reason the
+# guard enumerates rather than spot-checks:
+#
+#   emulator_boot.py      _get_avd_name_for_serial   run_adb            (:211)
+#   emulator_erase.py     is_avd_running             run_adb            (:108)
+#   emulator_selector.py  _avd_name_for_serial       run_adb            (:333)
+#   emulator_shutdown.py  shutdown                   build_adb_command  (:81)
+#   emulator_shutdown.py  get_avd_name_for_serial    build_adb_command  (:156)
+#   location.py           build_geo_fix_command      build_adb_command  (:144)
+#
+# The line numbers are why lines are not matched data: PR #8 landed the L1
+# physical-device refusal above the shutdown call and moved it from :66 to :81,
+# which failed the enumeration in CI while passing on the branch. The plan cites
+# location.py:273, which is `_run_geo_fix` -- it executed an argv it did not
+# build; the literal "emu" was in `build_geo_fix_command`, now
+# `build_geo_fix_args`, which builds console arguments and no adb argv at all.
+KNOWN_EMU_BYPASSES: tuple[Expectation, ...] = ()
 
 # Scripts that reach the console the sanctioned way. Named here so the guard
 # is checked for false positives as well as false negatives: run_emu() must
@@ -935,13 +1008,6 @@ def emu_console_bypasses() -> list[Site]:
     return found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "L7: five scripts still build their own `adb emu` argv instead of "
-        "going through common/emu_console.run_emu. Inc 2 routes them."
-    ),
-)
 def test_only_emu_console_speaks_to_the_emulator_console():
     """``adb emu`` is not an adb command; it is a protocol with three traps.
 

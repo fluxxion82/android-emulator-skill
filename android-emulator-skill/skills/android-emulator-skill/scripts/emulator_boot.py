@@ -20,6 +20,7 @@ import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
+from common.emu_console import run_emu
 from common.env_config import env_float, env_int
 from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
 
@@ -208,18 +209,21 @@ class EmulatorBooter:
             AVD name, or None if not found
         """
         try:
-            result = adb_exec.run_adb("emu", serial, "avd", "name", timeout=PROBE_TIMEOUT_SECONDS)
-            # The emulator console terminates every reply with its own "OK"
-            # line, so the raw response is "Pixel_9\r\nOK\r\n". Stripping alone
-            # leaves "Pixel_9\nOK", which never equalled the AVD name -- so the
-            # already-booted short-circuit was dead and a second emulator got
-            # spawned for an AVD that was already running.
-            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            payload = [line for line in lines if line not in ("OK", "KO")]
-            return payload[0] if payload else None
+            # Through run_emu, not a hand-rolled `adb emu`: the console
+            # terminates every reply with its own "OK" line, so the raw response
+            # is "Pixel_9\r\nOK\r\n". Stripping alone leaves "Pixel_9\nOK",
+            # which never equalled the AVD name -- so the already-booted
+            # short-circuit was dead and a second emulator got spawned for an
+            # AVD that was already running (defect S5). run_emu removes the
+            # framing, and answers a `KO` with an exception instead of a name.
+            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
+            lines = reply.lines
+            return lines[0] if lines else None
         except adb_exec.AdbError:
             # Same reasoning as _is_boot_completed: an emulator that has not
-            # finished booting cannot answer its console yet.
+            # finished booting cannot answer its console yet. EmuConsoleError
+            # subclasses AdbError, so a `KO` and a no-console device land here
+            # too -- both mean "no name to be had", which is what None says.
             return None
 
     @staticmethod

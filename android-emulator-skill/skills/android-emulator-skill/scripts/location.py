@@ -40,12 +40,13 @@ Usage examples:
 
 import argparse
 import json
-import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 
-from common.device_utils import build_adb_command, get_connected_devices, resolve_device_identifier
+from common.adb_exec import AdbError
+from common.device_utils import get_connected_devices, resolve_device_identifier
+from common.emu_console import run_emu
 from common.env_config import env_float
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -122,9 +123,9 @@ def validate_coordinate(lat: float, lng: float) -> str | None:
     return None
 
 
-def build_geo_fix_command(serial: str | None, lat: float, lng: float) -> list[str]:
+def build_geo_fix_args(lat: float, lng: float) -> list[str]:
     """
-    Build the emulator-console ``emu geo fix`` command for a coordinate.
+    Build the ``geo fix`` console command for a coordinate.
 
     The emulator console expects LONGITUDE FIRST, then latitude:
         adb [-s <serial>] emu geo fix <LON> <LAT>
@@ -132,16 +133,21 @@ def build_geo_fix_command(serial: str | None, lat: float, lng: float) -> list[st
     We accept human-friendly (lat, lng) and emit them in the console's
     (lon, lat) order here so callers never have to remember the reversal.
 
+    Only the console-side arguments are built here. The ``adb ... emu`` prefix
+    belongs to :func:`common.emu_console.run_emu`, which is the one place in
+    this skill that speaks the console protocol -- it strips the ``OK`` framing
+    and raises on a ``KO``, which this module used to check for by hand and
+    only in one of its two failure branches.
+
     Args:
-        serial: Target device serial (omits -s when None).
         lat: Latitude in decimal degrees.
         lng: Longitude in decimal degrees.
 
     Returns:
-        Complete adb command list ready for subprocess.run().
+        Console command arguments, ready for ``run_emu(*args)``.
     """
     # NOTE: longitude precedes latitude — this ordering is load-bearing.
-    return build_adb_command("emu", serial, "geo", "fix", repr(lng), repr(lat))
+    return ["geo", "fix", repr(lng), repr(lat)]
 
 
 def parse_gpx(xml_text: str) -> list[tuple[float, float]]:
@@ -250,28 +256,19 @@ class LocationManager:
     def _run_geo_fix(self, lat: float, lng: float) -> tuple[bool, str]:
         """
         Issue a single ``emu geo fix`` call. Returns (success, error_message)."""
-        cmd = build_geo_fix_command(self.serial, lat, lng)
+        args = build_geo_fix_args(lat, lng)
         try:
-            result = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=DEFAULT_GEO_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "emu geo fix timed out"
-        except FileNotFoundError:
-            return False, "adb not found; ensure Android SDK platform-tools are on PATH"
+            run_emu(*args, serial=self.serial, timeout=int(DEFAULT_GEO_TIMEOUT))
+        except AdbError as error:
+            # Covers what the three hand-rolled branches here used to cover, and
+            # one they did not: a timeout, adb missing, a non-zero adb exit, and
+            # a `KO` reply -- which the console delivers at exit status 0, and
+            # which EmuConsoleError carries with the rejection text in it.
+            # Every one of these messages names its own remedy.
+            return False, str(error)
         except Exception as e:  # top-level safety net
             return False, str(e)
 
-        if result.returncode != 0:
-            return False, result.stderr.strip() or "unknown error"
-        # The emulator console echoes "OK" on success but also exits 0; some
-        # builds print "KO" with a 0 exit, so flag that explicitly.
-        if "KO" in result.stdout:
-            return False, result.stdout.strip()
         return True, ""
 
     def set_coordinate(self, lat: float, lng: float, verbose: bool = False) -> tuple[bool, str]:
