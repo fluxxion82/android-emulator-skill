@@ -691,7 +691,9 @@ printed name back into `navigator`, so "implemented but unreachable" fails.
   caption whose only enclosing "owner" is a scroll container is *refused*, not
   tapped at that container's centre.
 - **A bare `--tap` is refused.** A tap lands inside the rectangle the name
-  describes, checked against bounds resolved independently of the hierarchy.
+  describes — the test resolves that rectangle from the dump with its own
+  parser, so navigator is checked against the screen rather than against
+  itself.
 - **`--launch` and `--open-url` wait for the activity** — `am start -W`, with
   `Status: ok` required — instead of returning as soon as `am start` exits.
 - **`emulator_shutdown` cannot power off a handset.** `reboot -p` is gone and a
@@ -701,9 +703,15 @@ printed name back into `navigator`, so "implemented but unreachable" fails.
 - **Every value crossing the device shell is quoted** — all 19 sites, each
   enumerated positively by a guard, so "zero unquoted sites" cannot come from a
   blind detector.
-- **Every failing mode exits non-zero and prints `{"error": ...}` under
-  `--json`.** A runtime sweep drives the modes and asserts the exit status, not
-  just the message.
+- **Every failing mode exits non-zero.** A runtime sweep drives 23 documented
+  invocations across 16 scripts against a toolchain where every tool fails, and
+  asserts the exit status rather than the message. The JSON failure *shape* is
+  not yet uniform, and the sweep does not assert it: `app_launcher`,
+  `screen_mapper`, `navigator`, `anr_watcher`, `app_state_capture`,
+  `device_list` and the `emulator_*` lifecycle scripts answer `{"error": ...}`
+  under `--json`, while `status_bar`, `appearance`, `privacy_manager`,
+  `keyboard`, `gesture`, `location`, `emulator_create` and `build_and_test`
+  still answer `{"success": false, "message": ...}`.
 - **A missing SDK tool says so** — naming where it was looked for and the
   `cmdline-tools` remedy — instead of returning an empty list. A tool that ran
   and genuinely found nothing still exits 0.
@@ -732,6 +740,9 @@ marker's removal. See `CLAUDE.md` in the source repository.
   which is not implemented.
 - `privacy_manager` acts on the default user only. It passes no `--user`, so a
   work profile or a secondary user is out of reach.
+- The JSON failure shape is `{"error": ...}` only for the scripts reworked in
+  this release. The rest still answer `{"success": false, "message": ...}`, and
+  a few emit both keys at once. Unifying them is next.
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 
