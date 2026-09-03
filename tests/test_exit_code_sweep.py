@@ -133,14 +133,12 @@ MODES: tuple[Mode, ...] = (
         ("--get-details", "no-such-session", "--json"),
         None,
         "reads the on-disk session store under $HOME; no device is involved",
-        defect="X5",
     ),
     Mode(
         "anr_watcher.py",
         ("--diff", "a", "b", "--json"),
         None,
         "reads the on-disk session store under $HOME; no device is involved",
-        defect="X5",
     ),
     # --- X8: app_state_capture ----------------------------------------------
     # Exits 1 here because the whole capture fails at the device level. X8 is

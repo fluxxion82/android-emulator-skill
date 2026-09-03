@@ -119,7 +119,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Filter by app package
     - Filter by severity (error/warning/info/debug)
     - Smart deduplication
-    - Duration-based or follow mode
+    - Duration-based or follow mode. `--duration` / `--last` need a unit
+      (`30s`, `5m`, `1h`); a bare number is rejected as a usage error (exit 2)
     - Save logs to file
     - Options: `--app`, `--serial`, `--severity`, `--follow`, `--duration`, `--output`, `--clear`, `--verbose`, `--json`
 
@@ -284,6 +285,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
     - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
+    - An unknown session, a session with no summary yet, or a `--cluster` past
+      the end exits 1 and says what to run instead (`{"error": ...}` under
+      `--json`) — it does not print the sentence and exit 0
+    - `--older-than` takes `30s`/`5m`/`24h`/`7d` and a session id is
+      `anr-YYYYMMDD-HHMMSS-XXXX`; either malformed is a usage error (exit 2),
+      and `--clear-sessions` deletes nothing when it rejects one
     - Legacy: `--watch [--duration N]`, `--since 5m`
     - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
       `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,

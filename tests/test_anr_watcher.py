@@ -17,6 +17,7 @@ import json
 import re
 
 import anr_watcher
+import pytest
 
 from common.anr_pipeline import build_normalised_event, event_to_jsonl, parse_logcat_anr
 from common.anr_sessions import SessionStore
@@ -259,3 +260,164 @@ def test_worker_drops_subthreshold_and_keeps_anr(tmp_path, monkeypatch):
     assert len(events) == 2
     kinds = sorted(e.kind for e in events)
     assert kinds == ["anr", "jank"]
+
+
+# ---------------------------------------------------------------------------
+# X5: an unreadable session is a failure, not a printed sentence at exit 0
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    """A session store rooted in tmp_path, so nothing reads the real home.
+
+    The env override is set as well as the constructor argument, because the
+    CLI tests below run ``main()``, which builds its own ``AnrBuster`` -- and a
+    stubbed-out class would be a test of the stub. ``ANDROID_EMU_ANR_HOME``
+    exists for exactly this, and is read per call rather than at import.
+    """
+    monkeypatch.setenv("ANDROID_EMU_ANR_HOME", str(tmp_path))
+    return SessionStore(base_dir=tmp_path / "anr-sessions")
+
+
+def _buster(store):
+    return anr_watcher.AnrBuster(store=store)
+
+
+def test_get_details_on_an_unknown_session_raises_with_a_remedy(store):
+    """It returned the sentence as the answer, and main printed it and exited 0."""
+    with pytest.raises(anr_watcher.SessionError) as excinfo:
+        _buster(store).get_details("anr-20260101-000000-dead")
+
+    message = str(excinfo.value)
+    assert "Unknown session" in message
+    assert "--list-sessions" in message, "the failure names no remedy"
+
+
+def test_get_details_without_a_summary_raises_with_a_remedy(store):
+    """A session that was started and never stopped has no summary to drill into."""
+    meta = store.create({"package": "com.example.app"})
+
+    with pytest.raises(anr_watcher.SessionError) as excinfo:
+        _buster(store).get_details(meta.session_id)
+
+    assert "--stop" in str(excinfo.value), "the failure names no remedy"
+
+
+def test_diff_without_summaries_raises_and_names_both_sessions(store):
+    with pytest.raises(anr_watcher.SessionError) as excinfo:
+        _buster(store).diff("anr-20260101-000000-aaaa", "anr-20260101-000000-bbbb")
+
+    message = str(excinfo.value)
+    assert "anr-20260101-000000-aaaa" in message
+    assert "anr-20260101-000000-bbbb" in message
+    assert "--stop" in str(excinfo.value), "the failure names no remedy"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--get-details", "anr-20260101-000000-dead", "--json"],
+        ["--diff", "anr-20260101-000000-aaaa", "anr-20260101-000000-bbbb", "--json"],
+    ],
+    ids=["get-details", "diff"],
+)
+def test_the_cli_exits_non_zero_and_puts_the_error_in_the_json(monkeypatch, capsys, argv, store):
+    """The shape the contract asks for: exit != 0, and {"error": ...} on stdout.
+
+    Printing the message on stderr instead would leave a caller that asked for
+    JSON parsing an empty stdout; printing it on stdout at exit 0, which is
+    what X5 was, leaves it parsing prose and calling it success.
+    """
+    monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", *argv])
+
+    with pytest.raises(SystemExit) as exc:
+        anr_watcher.main()
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    payload = json.loads(captured.out)
+    assert "error" in payload, f"--json reported no error: {payload}"
+
+
+def test_a_cluster_index_past_the_end_is_an_error(store, monkeypatch):
+    """`--cluster 9` on a two-cluster session answered with a sentence at exit 0."""
+    meta = store.create({"package": "com.example.app"})
+    summary = store.build_summary(meta.session_id)
+    store.stop(meta.session_id, summary)
+
+    with pytest.raises(anr_watcher.SessionError) as excinfo:
+        _buster(store).get_details(meta.session_id, cluster=9)
+
+    assert "--cluster" in str(excinfo.value), "the failure names no remedy"
+
+
+# ---------------------------------------------------------------------------
+# D7: malformed arguments are usage errors (exit 2), not tracebacks
+# ---------------------------------------------------------------------------
+
+
+def test_a_bad_older_than_exits_two_and_names_the_accepted_forms(monkeypatch, capsys, store):
+    """`--clear-sessions --older-than 24hours` raised out of the store.
+
+    The plural is the natural thing to type and the one thing the grammar does
+    not take. Nothing is deleted on the way to the error: the cutoff is
+    resolved before the store walks the directory.
+    """
+    monkeypatch.setattr(
+        anr_watcher.sys,
+        "argv",
+        ["anr_watcher.py", "--clear-sessions", "--older-than", "24hours"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        anr_watcher.main()
+
+    assert exc.value.code == 2, "a bad flag value is a usage error"
+    stderr = capsys.readouterr().err
+    assert "Traceback" not in stderr
+    assert "24h" in stderr, "the message does not name an accepted form"
+
+
+def test_a_bad_older_than_deletes_nothing(monkeypatch, store):
+    """The exit status is not the only thing at stake: this flag removes files."""
+    meta = store.create({"package": "com.example.app"})
+    monkeypatch.setattr(
+        anr_watcher.sys,
+        "argv",
+        ["anr_watcher.py", "--clear-sessions", "--older-than", "24hours"],
+    )
+
+    with pytest.raises(SystemExit):
+        anr_watcher.main()
+
+    assert store.session_dir(meta.session_id).exists(), "a session was deleted before the error"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--diff", "a/b", "c"],
+        ["--diff", "ok-id", "../escape"],
+        ["--get-details", "a/b"],
+    ],
+    ids=["diff-first", "diff-second", "get-details"],
+)
+def test_a_malformed_session_id_exits_two_and_shows_the_shape(monkeypatch, capsys, argv, store):
+    """`--diff a/b c` reached the terminal as a ValueError traceback (D7).
+
+    A session id is also a path segment, so the store refuses anything that
+    could leave its directory. That refusal already spells out the accepted
+    shape; it just had no boundary to be reported at.
+    """
+    monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", *argv])
+
+    with pytest.raises(SystemExit) as exc:
+        anr_watcher.main()
+
+    assert exc.value.code == 2, "a malformed id is a usage error"
+    stderr = capsys.readouterr().err
+    assert "Traceback" not in stderr
+    assert "Invalid session id" in stderr
+    assert "anr-" in stderr, "the message does not show the accepted shape"

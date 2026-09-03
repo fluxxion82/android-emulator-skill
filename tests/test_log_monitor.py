@@ -14,6 +14,7 @@ import io
 from datetime import datetime
 
 import log_monitor
+import pytest
 
 
 def _monitor(**kwargs) -> log_monitor.LogMonitor:
@@ -205,3 +206,49 @@ def test_json_output_respects_json_cap(monkeypatch):
     out = monitor.get_json_output()
     assert out["errors"] == ["e1", "e2"]
     assert out["warnings"] == ["w1", "w2"]
+
+
+# --- D7: a bad duration is a usage error, not a traceback -----------------------
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [("--duration", "30"), ("--last", "5"), ("--duration", "half an hour")],
+    ids=["duration-no-unit", "last-no-unit", "duration-prose"],
+)
+def test_a_bad_duration_exits_two_and_names_the_accepted_forms(monkeypatch, capsys, flag, value):
+    """`--duration 30` reached the terminal as a ValueError traceback.
+
+    The unit is not optional, and forgetting it is the obvious mistake -- `30`
+    reads as seconds to everyone who has not read common/logcat.py. The reply
+    has to say what it does accept, and it has to be argparse's exit status (2,
+    "you called it wrong"), not 1, which this script uses for "the device
+    said no".
+    """
+    monkeypatch.setattr(log_monitor.sys, "argv", ["log_monitor.py", flag, value])
+
+    with pytest.raises(SystemExit) as exc:
+        log_monitor.main()
+
+    assert exc.value.code == 2, "a bad flag value is a usage error"
+    stderr = capsys.readouterr().err
+    assert "Traceback" not in stderr
+    assert flag in stderr, "the message does not say which flag was wrong"
+    for accepted in ("30s", "5m", "1h"):
+        assert accepted in stderr, f"the message does not name {accepted} as accepted"
+
+
+def test_a_bad_duration_never_reaches_the_device(monkeypatch):
+    """Rejected before anything is spawned: argparse exits, adb is never called."""
+
+    def unexpected(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("a subprocess was started for an invalid duration")
+
+    monkeypatch.setattr(log_monitor.subprocess, "Popen", unexpected)
+    monkeypatch.setattr(log_monitor.subprocess, "run", unexpected)
+    monkeypatch.setattr(log_monitor.sys, "argv", ["log_monitor.py", "--duration", "30"])
+
+    with pytest.raises(SystemExit) as exc:
+        log_monitor.main()
+
+    assert exc.value.code == 2

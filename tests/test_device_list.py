@@ -15,6 +15,7 @@ import subprocess
 
 import device_list
 import pytest
+
 from common import adb_exec, sdk_tools
 
 # ---------------------------------------------------------------------------
