@@ -164,10 +164,6 @@ KNOWN_VIOLATIONS = frozenset(
         # is deliberately MALFORMED (`lat="north"`), which by definition
         # nothing produces. See the module docstring of test_location.py.
         "test_location.py::parse_gpx",
-        # No recorded JUnit XML exists. Inc 0's recording PR captures one from
-        # the scaffold whose @Before throws (with ignoreFailures = true) and
-        # MUST delete this entry when it lands.
-        "test_gradle.py::parse_junit_xml",
         # No AVD `config.ini` is recorded. Same PR should capture one; until
         # then the hand-written key/value block stands.
         "test_emulator_selector.py::parse_config_ini",

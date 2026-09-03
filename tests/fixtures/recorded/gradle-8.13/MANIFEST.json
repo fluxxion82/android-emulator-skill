@@ -1,6 +1,6 @@
 {
   "profile": "gradle-8.13",
-  "recorded_at": "2026-09-03T07:30:47Z",
+  "recorded_at": "2026-09-03T08:07:08Z",
   "gradle_version": "8.13",
   "scaffolds": [
     "tests/fixtures/scaffold/flavored",
@@ -101,12 +101,12 @@
       "command": "gradle --console=plain --rerun-tasks :junit-error:test",
       "scaffold": "tests/fixtures/scaffold/compile",
       "produced_artifact": null,
-      "description": "A test run with two erroring tests and one passing one, under `test { ignoreFailures = true }`. The log says '3 tests completed, 2 failed' and then **BUILD SUCCESSFUL**, and gradle exits 0. That pairing is the fixture's point: a caller that reads the exit status, or greps for 'BUILD FAILED', concludes the suite passed. Only the JUnit XML (junit_xml_error_case.xml, recorded from the same run) carries the truth.",
+      "description": "A test run with three failing tests, one skipped and one passing, under `test { ignoreFailures = true }`. The log says '5 tests completed, 3 failed, 1 skipped' and then **BUILD SUCCESSFUL**, and gradle exits 0. That pairing is the fixture's point: a caller that reads the exit status, or greps for 'BUILD FAILED', concludes the suite passed. Only the JUnit XML (junit_xml_error_case.xml, recorded from the same run) carries the truth.",
       "catches": [
         "X7",
         "D2"
       ],
-      "bytes": 1289
+      "bytes": 1494
     },
     {
       "name": "junit_xml_error_case",
@@ -120,6 +120,32 @@
         "D2"
       ],
       "bytes": 8302
+    },
+    {
+      "name": "junit_xml_passing_case",
+      "file": "junit_xml_passing_case.xml",
+      "command": "gradle --console=plain --rerun-tasks :junit-error:test",
+      "scaffold": "tests/fixtures/scaffold/compile",
+      "produced_artifact": "junit-error/build/test-results/test/TEST-com.example.PassingTest.xml",
+      "description": "The green half of the same run: tests=\"1\" skipped=\"0\" failures=\"0\" errors=\"0\" and a bare self-closing <testcase>. Recorded because a parser that reports everything as failed and a parser that reports nothing at all look identical against a corpus in which everything failed. Also the second document that aggregate_test_results merges.",
+      "catches": [
+        "X7",
+        "D2"
+      ],
+      "bytes": 378
+    },
+    {
+      "name": "junit_xml_skipped_case",
+      "file": "junit_xml_skipped_case.xml",
+      "command": "gradle --console=plain --rerun-tasks :junit-error:test",
+      "scaffold": "tests/fixtures/scaffold/compile",
+      "produced_artifact": "junit-error/build/test-results/test/TEST-com.example.SkippedAndErrorTest.xml",
+      "description": "A real <skipped/> child, from an @Ignore'd test -- the only way a Gradle report gets one, and parse_junit_xml counts them. The suite reads tests=\"2\" skipped=\"1\" failures=\"1\" errors=\"0\". The second method exists to answer the obvious question about the <error> element and settles it: it throws an UnsupportedOperationException, which is NOT an AssertionError, and Gradle still writes <failure type=\"...\">. Taken with junit_xml_error_case (an exception from @Before, also <failure>), no route tried here makes Gradle's writer emit <error> at all.",
+      "catches": [
+        "X7",
+        "D2"
+      ],
+      "bytes": 4425
     },
     {
       "name": "gradle_where_block",

@@ -24,6 +24,11 @@ BeforeThrowsTest > erroredBySetup FAILED
 BeforeThrowsTest > alsoErroredBySetup FAILED
     java.lang.IllegalStateException at BeforeThrowsTest.java:32
 
+SkippedAndErrorTest > throwsSomethingThatIsNotAnAssertionError FAILED
+    java.lang.UnsupportedOperationException at SkippedAndErrorTest.java:29
+
+SkippedAndErrorTest > ignoredOnPurpose SKIPPED
+
 PassingTest > passes PASSED
 There were failing tests. See the report at: file:///scaffold/junit-error/build/reports/tests/test/index.html
 
@@ -32,4 +37,4 @@ There were failing tests. See the report at: file:///scaffold/junit-error/build/
 BUILD SUCCESSFUL in 0s
 1 actionable tasks: 2 executed
 
-3 tests completed, 2 failed
+5 tests completed, 3 failed, 1 skipped

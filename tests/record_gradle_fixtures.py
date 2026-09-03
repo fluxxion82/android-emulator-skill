@@ -35,9 +35,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +73,11 @@ class GradleFixture:
             log. Needed because the JUnit XML a results parser consumes is
             written to disk by the test runner and never printed, so no amount
             of capturing stdout can reach it.
+        requires_in_log: Text that must appear in the build output for the
+            capture to count. For an artifact fixture this is the proof the
+            producing task actually ran: without it, a build that failed during
+            configuration leaves the PREVIOUS run's file on disk and the
+            recorder would happily publish it as this run's output.
         ext: Extension for the recorded file. ``xml`` for produced artifacts.
     """
 
@@ -81,6 +88,7 @@ class GradleFixture:
     scaffold: Path = FLAVORED
     rerun: bool = False
     artifact: str | None = None
+    requires_in_log: str | None = None
     ext: str = "txt"
 
 
@@ -194,13 +202,15 @@ FIXTURES: list[GradleFixture] = [
     ),
     GradleFixture(
         name="gradle_junit_error_ignorefailures",
+        requires_in_log="> Task :junit-error:test",
         args=[":junit-error:test"],
         scaffold=COMPILE,
         rerun=True,
         description=(
-            "A test run with two erroring tests and one passing one, under "
-            "`test { ignoreFailures = true }`. The log says "
-            "'3 tests completed, 2 failed' and then **BUILD SUCCESSFUL**, and "
+            "A test run with three failing tests, one skipped and one passing, "
+            "under `test { ignoreFailures = true }`. The log says "
+            "'5 tests completed, 3 failed, 1 skipped' and then "
+            "**BUILD SUCCESSFUL**, and "
             "gradle exits 0. That pairing is the fixture's point: a caller that "
             "reads the exit status, or greps for 'BUILD FAILED', concludes the "
             "suite passed. Only the JUnit XML (junit_xml_error_case.xml, "
@@ -210,6 +220,7 @@ FIXTURES: list[GradleFixture] = [
     ),
     GradleFixture(
         name="junit_xml_error_case",
+        requires_in_log="> Task :junit-error:test",
         args=[":junit-error:test"],
         scaffold=COMPILE,
         rerun=True,
@@ -227,6 +238,45 @@ FIXTURES: list[GradleFixture] = [
             "stack trace rooted at setUp. hostname/timestamp/time are normalised "
             "by the recorder (see _scrub): Gradle writes the recording machine's "
             "hostname into every testsuite element."
+        ),
+        catches=("X7", "D2"),
+    ),
+    GradleFixture(
+        name="junit_xml_passing_case",
+        requires_in_log="> Task :junit-error:test",
+        args=[":junit-error:test"],
+        scaffold=COMPILE,
+        rerun=True,
+        artifact="junit-error/build/test-results/test/TEST-com.example.PassingTest.xml",
+        ext="xml",
+        description=(
+            'The green half of the same run: tests="1" skipped="0" '
+            'failures="0" errors="0" and a bare self-closing <testcase>. '
+            "Recorded because a parser that reports everything as failed and a "
+            "parser that reports nothing at all look identical against a corpus "
+            "in which everything failed. Also the second document that "
+            "aggregate_test_results merges."
+        ),
+        catches=("X7", "D2"),
+    ),
+    GradleFixture(
+        name="junit_xml_skipped_case",
+        requires_in_log="> Task :junit-error:test",
+        args=[":junit-error:test"],
+        scaffold=COMPILE,
+        rerun=True,
+        artifact="junit-error/build/test-results/test/TEST-com.example.SkippedAndErrorTest.xml",
+        ext="xml",
+        description=(
+            "A real <skipped/> child, from an @Ignore'd test -- the only way a "
+            "Gradle report gets one, and parse_junit_xml counts them. The suite "
+            'reads tests="2" skipped="1" failures="1" errors="0". '
+            "The second method exists to answer the obvious question about the "
+            "<error> element and settles it: it throws an "
+            "UnsupportedOperationException, which is NOT an AssertionError, and "
+            'Gradle still writes <failure type="...">. Taken with '
+            "junit_xml_error_case (an exception from @Before, also <failure>), "
+            "no route tried here makes Gradle's writer emit <error> at all."
         ),
         catches=("X7", "D2"),
     ),
@@ -258,6 +308,11 @@ def _gradle_version(gradle: str) -> str:
     if not match:
         raise RuntimeError(f"could not determine Gradle version from: {result.stdout[:200]!r}")
     return match.group(1)
+
+
+def _artifact_path(fixture: GradleFixture) -> pathlib.Path | None:
+    """Absolute path of the file this fixture records, if it records one."""
+    return None if fixture.artifact is None else fixture.scaffold / fixture.artifact
 
 
 def _run(gradle: str, fixture: GradleFixture) -> str:
@@ -321,17 +376,44 @@ def record(gradle: str) -> int:
 
     entries = []
     for fixture in FIXTURES:
+        produced = _artifact_path(fixture)
+        # Delete the target BEFORE the build. Otherwise a build that dies during
+        # configuration leaves the previous run's file in place and this
+        # recorder publishes stale bytes as if the run had just written them --
+        # a fixture that looks like ground truth and is not, which is the one
+        # thing this tool exists to prevent.
+        if produced is not None and produced.exists():
+            produced.unlink()
+        started_at = time.time()
         log = _run(gradle, fixture)
-        if fixture.artifact is None:
+
+        if fixture.requires_in_log is not None and fixture.requires_in_log not in log:
+            print(
+                f"  FAIL  {fixture.name}: the build output does not contain "
+                f"{fixture.requires_in_log!r}, so the producing task did not "
+                f"run. The build printed:\n{log[-2000:]}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if produced is None:
             text = _scrub(log)
         else:
             # The build had to run to produce it, but what gets recorded is the
             # file the build WROTE, not what it printed.
-            produced = fixture.scaffold / fixture.artifact
             if not produced.exists():
                 print(
                     f"  FAIL  {fixture.name}: {fixture.artifact} was not "
                     f"produced. The build printed:\n{log[-2000:]}",
+                    file=sys.stderr,
+                )
+                return 1
+            # Belt and braces after the pre-delete: the file must also be newer
+            # than the invocation that was supposed to create it.
+            if produced.stat().st_mtime < started_at:
+                print(
+                    f"  FAIL  {fixture.name}: {fixture.artifact} predates this "
+                    f"build, so it is a leftover rather than this run's output.",
                     file=sys.stderr,
                 )
                 return 1
