@@ -45,8 +45,16 @@ from pathlib import Path
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
+from common.emu_console import EmuConsoleError, run_emu
 from common.env_config import env_int
-from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
+from common.sdk_tools import (
+    EMULATOR_NOT_FOUND_MESSAGE,
+    EMULATOR_NOT_FOUND_REMEDY,
+    SdkToolError,
+    get_emulator_path,
+    missing_emulator_error,
+    run_sdk_tool,
+)
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_SUGGEST_COUNT = env_int("ANDROID_EMU_SELECTOR_COUNT", 4, min_value=1)
@@ -226,8 +234,6 @@ class EmulatorSelector:
                 falling back to ``~/.android-emulator-skill/config.json``.
         """
         self.config_path = config_path or self._default_config_path()
-        # One "emulator not found" line per run, not one per AVD lookup.
-        self._emulator_warned = False
 
     @staticmethod
     def _default_config_path() -> Path:
@@ -268,32 +274,28 @@ class EmulatorSelector:
 
     def _list_avd_names(self) -> list[str]:
         """
-        Return AVD names via ``emulator -list-avds`` (empty on any failure).
+        Return AVD names via ``emulator -list-avds``.
 
         The binary is resolved explicitly (see :mod:`common.sdk_tools`); exec'ing
         the bare name raises ``PermissionError`` when PATH holds the SDK root.
+
+        An empty list means the emulator ran and reported no AVDs, which is a
+        legitimate answer and ranks nothing. A missing or failing emulator
+        raises (X3): ``--suggest`` used to print "No AVDs found" and exit 0 on a
+        host with no SDK, which reads exactly like a host with no AVDs.
+
+        Raises:
+            SdkToolError: The emulator binary is absent, or it ran and failed.
         """
         emulator = get_emulator_path()
         if not emulator:
-            if not self._emulator_warned:
-                print(EMULATOR_NOT_FOUND_MESSAGE, file=sys.stderr)
-                self._emulator_warned = True
-            return []
-
-        try:
-            result = subprocess.run(
-                [emulator, "-list-avds"],
-                capture_output=True,
-                text=True,
-                timeout=EMULATOR_TOOL_TIMEOUT,
-                check=True,
-            )
-        except OSError as e:
-            print(f"Error: could not run {emulator!r}: {e}", file=sys.stderr)
-            return []
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return []
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            raise missing_emulator_error()
+        stdout = run_sdk_tool(
+            [emulator, "-list-avds"],
+            timeout=EMULATOR_TOOL_TIMEOUT,
+            remedy=EMULATOR_NOT_FOUND_REMEDY,
+        )
+        return [line.strip() for line in stdout.splitlines() if line.strip()]
 
     def running_avd_names(self) -> set[str]:
         """
@@ -329,14 +331,23 @@ class EmulatorSelector:
         swallowed: the serial came straight from ``adb devices``, so one that can
         no longer be reached means the running check went unanswered, and ranking
         a live AVD as idle is how a second copy of it gets booted.
+
+        The console is spoken to through :func:`common.emu_console.run_emu`,
+        which strips the trailing ``OK`` the console frames its replies with and
+        turns a ``KO`` -- delivered at exit status 0 -- into an exception rather
+        than a plausible-looking AVD name.
         """
-        result = adb_exec.run_adb("emu", serial, "avd", "name", timeout=PROBE_TIMEOUT_SECONDS)
-        # `adb emu avd name` prints the name then an "OK" line.
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line and line != "OK":
-                return line
-        return None
+        try:
+            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
+        except EmuConsoleError:
+            # "The console declined to answer", which the ranking treats as no
+            # bonus rather than as a failure: an emulator part-way through boot
+            # is in `adb devices` before its console is up. Only the console
+            # protocol is absorbed here -- a device-level AdbError still
+            # propagates, because that one means the check never ran.
+            return None
+        lines = reply.lines
+        return lines[0] if lines else None
 
     def load_recent(self) -> list[str]:
         """Load the recent-use AVD history (most-recent first); [] on miss."""
@@ -545,10 +556,35 @@ def format_candidates(candidates: list[dict], json_format: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    Under ``--json`` that is ``{"error": ...}`` on stdout. A caller that asked
+    for JSON and got a sentence on stderr has an empty stdout to parse, which
+    is the same "no usable answer" this increment is about -- one layer out.
+    """
+    if json_mode:
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
+        print(f"Error: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    """Main entry point: run the CLI, reporting adb failures without a traceback.
+
+    The net, not the handler: every mode is dispatched under a try that knows
+    whether ``--json`` was asked for (see :func:`_run`). This catches anything
+    raised before that is known -- and still says something rather than
+    printing a traceback.
+    """
     try:
         _run()
+    except SdkToolError as error:
+        # AVD discovery could not run. An empty ranking would be indistinguishable
+        # from "this host defines no AVDs", so this is a failure with a remedy (X3).
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy. Print it
         # rather than a traceback -- for an agent, stderr is the retry prompt.
@@ -593,6 +629,17 @@ Examples:
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
+    try:
+        _dispatch(args)
+    except (SdkToolError, adb_exec.AdbError) as error:
+        # Caught HERE, where --json is known: main() cannot see it, so a
+        # failure reported there is a sentence on stderr and an empty stdout
+        # for whoever asked for JSON.
+        _fail(error, json_mode=args.json)
+
+
+def _dispatch(args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     selector = EmulatorSelector()
 
     # Boot mode

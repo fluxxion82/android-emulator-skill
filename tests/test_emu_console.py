@@ -37,7 +37,7 @@ import subprocess
 import pytest
 
 from common import adb_exec
-from common.adb_exec import AdbError
+from common.adb_exec import AdbCommandError, AdbError
 from common.emu_console import EmuConsoleError, console_available, run_emu
 
 
@@ -209,6 +209,49 @@ def test_console_available_is_false_rather_than_raising(console):
 def test_console_available_is_true_for_an_emulator(console, recorded):
     console(recorded.text("emu_avd_name"))
     assert console_available() is True
+
+
+# ---------------------------------------------------------------------------
+# adb's own exit status still counts (L7).
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_zero_adb_exit_with_output_is_a_failure(console):
+    """A console command adb reports as failed has no reply to read.
+
+    Added when L7 routed `emulator_shutdown` and `location` through here. Both
+    tested `returncode` themselves before -- shutdown reported "Shutdown
+    failed: <serial>: <stderr>", location returned the stderr -- and this is
+    the check they were relying on. Without it, routing them would have turned
+    a failed `emu kill` into "Emulator shutdown initiated".
+
+    Distinct from the `KO` rule above, which is about a rejection arriving at
+    exit status *0*, and it fires whatever `check` says: `check` governs the
+    console protocol, not whether adb ran.
+    """
+    console("partial\r\n", returncode=1)
+
+    with pytest.raises(AdbCommandError) as excinfo:
+        run_emu("kill", serial="emulator-5554", check=False)
+
+    assert "exited 1" in str(excinfo.value)
+    assert "emu" in str(excinfo.value), "the failing command is not named"
+
+
+def test_the_no_console_answer_still_wins_over_the_exit_status(console):
+    """Ordering: a phone answers non-zero with two empty streams.
+
+    If the plain non-zero rule ran first, a physical device would get
+    "`adb ... emu avd name` exited 1: no output" instead of the sentence that
+    tells the user why -- which is the failure mode that branch was written,
+    measured, and rewritten once already to avoid.
+    """
+    console("", returncode=1)
+
+    with pytest.raises(EmuConsoleError) as excinfo:
+        run_emu("avd", "name", serial="1A2B3C4D")
+
+    assert "physical device" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

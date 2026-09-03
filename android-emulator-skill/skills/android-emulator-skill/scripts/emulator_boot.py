@@ -20,8 +20,16 @@ import time
 
 from common import adb_exec
 from common.device_utils import get_connected_devices
+from common.emu_console import run_emu
 from common.env_config import env_float, env_int
-from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
+from common.sdk_tools import (
+    EMULATOR_NOT_FOUND_MESSAGE,
+    EMULATOR_NOT_FOUND_REMEDY,
+    SdkToolError,
+    get_emulator_path,
+    missing_emulator_error,
+    run_sdk_tool,
+)
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_BOOT_TIMEOUT = env_int("ANDROID_EMU_BOOT_TIMEOUT", 300)
@@ -208,18 +216,21 @@ class EmulatorBooter:
             AVD name, or None if not found
         """
         try:
-            result = adb_exec.run_adb("emu", serial, "avd", "name", timeout=PROBE_TIMEOUT_SECONDS)
-            # The emulator console terminates every reply with its own "OK"
-            # line, so the raw response is "Pixel_9\r\nOK\r\n". Stripping alone
-            # leaves "Pixel_9\nOK", which never equalled the AVD name -- so the
-            # already-booted short-circuit was dead and a second emulator got
-            # spawned for an AVD that was already running.
-            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            payload = [line for line in lines if line not in ("OK", "KO")]
-            return payload[0] if payload else None
+            # Through run_emu, not a hand-rolled `adb emu`: the console
+            # terminates every reply with its own "OK" line, so the raw response
+            # is "Pixel_9\r\nOK\r\n". Stripping alone leaves "Pixel_9\nOK",
+            # which never equalled the AVD name -- so the already-booted
+            # short-circuit was dead and a second emulator got spawned for an
+            # AVD that was already running (defect S5). run_emu removes the
+            # framing, and answers a `KO` with an exception instead of a name.
+            reply = run_emu("avd", "name", serial=serial, timeout=PROBE_TIMEOUT_SECONDS)
+            lines = reply.lines
+            return lines[0] if lines else None
         except adb_exec.AdbError:
             # Same reasoning as _is_boot_completed: an emulator that has not
-            # finished booting cannot answer its console yet.
+            # finished booting cannot answer its console yet. EmuConsoleError
+            # subclasses AdbError, so a `KO` and a no-console device land here
+            # too -- both mean "no name to be had", which is what None says.
             return None
 
     @staticmethod
@@ -263,27 +274,28 @@ def list_avds() -> list:
     rather than exec'd by bare name, which raises ``PermissionError`` when PATH
     holds the SDK root instead of ``$ANDROID_HOME/emulator``.
 
+    An empty list means the emulator ran and reported no AVDs. A missing or
+    failing emulator raises instead (X3): the two used to be the same answer,
+    so ``--list-avds`` printed "No AVDs found" and exited 0 on a host with no
+    Android SDK at all, and nothing an agent could read said otherwise.
+
     Returns:
-        List of AVD dicts with name and target info
+        List of AVD dicts with name and target info. Empty means no AVDs exist.
+
+    Raises:
+        SdkToolError: The emulator binary is absent, or it ran and failed.
     """
     emulator = get_emulator_path()
     if not emulator:
-        print(EMULATOR_NOT_FOUND_MESSAGE, file=sys.stderr)
-        return []
-
-    try:
-        cmd = [emulator, "-list-avds"]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=EMULATOR_TOOL_TIMEOUT, check=True
-        )
-    except OSError as e:
-        print(f"Error: could not run {emulator!r}: {e}", file=sys.stderr)
-        return []
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return []
+        raise missing_emulator_error()
+    stdout = run_sdk_tool(
+        [emulator, "-list-avds"],
+        timeout=EMULATOR_TOOL_TIMEOUT,
+        remedy=EMULATOR_NOT_FOUND_REMEDY,
+    )
 
     avds = []
-    for line in result.stdout.split("\n"):
+    for line in stdout.split("\n"):
         name = line.strip()
         if name:
             avds.append({"name": name})
@@ -291,10 +303,35 @@ def list_avds() -> list:
     return avds
 
 
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
+    and got a sentence on stderr has an empty stdout to parse.
+    """
+    if json_mode:
+        import json
+
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
+        print(f"Error: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+    """Main entry point: run the CLI, reporting adb failures without a traceback.
+
+    The net, not the handler: modes are dispatched under a try that knows
+    whether ``--json`` was asked for (see :func:`_run`).
+    """
     try:
         _run()
+    except SdkToolError as error:
+        # AVD discovery could not run. Reported as a failure, never as an empty
+        # listing: an agent reading "No AVDs found" cannot tell that from a
+        # host where the SDK is not installed (X3).
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy ("pass
         # --serial ...", "start an emulator ..."). That message is the point.
@@ -348,7 +385,17 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
     args = parser.parse_args()
+    try:
+        _dispatch(parser, args)
+    except (SdkToolError, adb_exec.AdbError) as error:
+        # Caught HERE, where --json is known: main() cannot see it, so every
+        # mode -- not just --list-avds -- reports the failure in the shape the
+        # caller asked for.
+        _fail(error, json_mode=args.json)
 
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     # List AVDs mode
     if args.list_avds:
         avds = list_avds()

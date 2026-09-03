@@ -70,7 +70,13 @@ def _real_device_query(monkeypatch, recorded) -> None:
 
 
 def _recording_run(calls: list[list[str]], result: _FakeResult | None = None):
-    """A ``subprocess.run`` double that records every argv it is handed."""
+    """A ``subprocess.run`` double that records every argv it is handed.
+
+    Installed on ``common.adb_exec.subprocess``: since L7 the console kill goes
+    through ``common.emu_console.run_emu``, so patching this module's own
+    ``subprocess`` would patch nothing and every assertion below about which
+    argv reached the device would pass vacuously.
+    """
 
     def fake_run(cmd, **_kwargs):
         calls.append(list(cmd))
@@ -107,7 +113,7 @@ def test_shutdown_uses_emu_kill_command(monkeypatch):
         calls.append(cmd)
         return _FakeResult(returncode=0)
 
-    monkeypatch.setattr(emulator_shutdown.subprocess, "run", fake_run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
 
     shutdown = emulator_shutdown.EmulatorShutdown("emulator-5554")
     success, _message = shutdown.shutdown(verify=False)
@@ -130,7 +136,7 @@ def test_shutdown_refuses_a_physical_device_serial(monkeypatch, recorded):
     _real_device_query(monkeypatch, recorded)
 
     calls: list[list[str]] = []
-    monkeypatch.setattr(emulator_shutdown.subprocess, "run", _recording_run(calls))
+    monkeypatch.setattr(adb_exec.subprocess, "run", _recording_run(calls))
 
     shutdown = emulator_shutdown.EmulatorShutdown(PHYSICAL_SERIAL)
     success, message = shutdown.shutdown(verify=False)
@@ -154,7 +160,7 @@ def test_cli_exits_non_zero_when_refusing_a_physical_device(monkeypatch, capsys,
     _real_device_query(monkeypatch, recorded)
 
     calls: list[list[str]] = []
-    monkeypatch.setattr(emulator_shutdown.subprocess, "run", _recording_run(calls))
+    monkeypatch.setattr(adb_exec.subprocess, "run", _recording_run(calls))
     monkeypatch.setattr(
         emulator_shutdown.sys, "argv", ["emulator_shutdown.py", "--serial", PHYSICAL_SERIAL]
     )
@@ -178,7 +184,7 @@ def test_emu_kill_failure_on_an_emulator_is_reported_not_worked_around(monkeypat
 
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        emulator_shutdown.subprocess,
+        adb_exec.subprocess,
         "run",
         _recording_run(calls, _FakeResult(returncode=1, stderr="console refused")),
     )
@@ -191,6 +197,28 @@ def test_emu_kill_failure_on_an_emulator_is_reported_not_worked_around(monkeypat
     assert calls == [
         ["adb", "-s", "emulator-5554", "emu", "kill"]
     ], f"a second command was issued after the console kill failed: {calls}"
+
+
+def test_a_console_kill_rejected_with_ko_is_a_failed_shutdown(monkeypatch, recorded):
+    """L7: `adb emu` answers a refusal with `KO` at exit status 0.
+
+    The hand-rolled call this replaced read ``returncode`` and nothing else, so
+    a rejected kill was reported as "Emulator shutdown initiated" and whatever
+    ran next ran against a live emulator. ``run_emu`` raises on the ``KO``; the
+    shutdown path has to keep reporting that as a failure.
+    """
+    _real_device_query(monkeypatch, recorded)
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda *_a, **_k: _FakeResult(returncode=0, stdout="KO: cannot kill\r\n"),
+    )
+
+    shutdown = emulator_shutdown.EmulatorShutdown("emulator-5554")
+    success, message = shutdown.shutdown(verify=False)
+
+    assert success is False, "a KO reply was read as a successful kill"
+    assert "KO: cannot kill" in message
 
 
 def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
@@ -208,7 +236,7 @@ def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
         names = {"emulator-5554": "Pixel_5_API_33", "emulator-5556": "Pixel_7_API_34"}
         return _FakeResult(returncode=0, stdout=f"{names[serial]}\nOK\n")
 
-    monkeypatch.setattr(emulator_shutdown.subprocess, "run", fake_run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
 
     assert emulator_shutdown.resolve_serial_by_avd_name("Pixel_7_API_34") == "emulator-5556"
     assert emulator_shutdown.resolve_serial_by_avd_name("No_Such_AVD") is None
@@ -216,7 +244,7 @@ def test_resolve_serial_by_avd_name_matches_running_emulator(monkeypatch):
 
 def test_get_avd_name_skips_ok_status_line(monkeypatch):
     monkeypatch.setattr(
-        emulator_shutdown.subprocess,
+        adb_exec.subprocess,
         "run",
         lambda *_a, **_k: _FakeResult(returncode=0, stdout="\nPixel_5_API_33\nOK\n"),
     )
@@ -225,7 +253,7 @@ def test_get_avd_name_skips_ok_status_line(monkeypatch):
 
 def test_get_avd_name_returns_none_on_error(monkeypatch):
     monkeypatch.setattr(
-        emulator_shutdown.subprocess,
+        adb_exec.subprocess,
         "run",
         lambda *_a, **_k: _FakeResult(returncode=1, stderr="no console"),
     )

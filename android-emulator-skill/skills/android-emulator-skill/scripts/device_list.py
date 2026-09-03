@@ -43,11 +43,20 @@ Technical Details:
 
 import argparse
 import json
-import subprocess
 import sys
 
+from common.adb_exec import AdbError, run_adb
 from common.env_config import env_int
-from common.sdk_tools import get_emulator_path
+from common.sdk_tools import (
+    CMDLINE_TOOLS_REMEDY,
+    CMDLINE_TOOLS_SUBDIRS,
+    EMULATOR_NOT_FOUND_REMEDY,
+    SdkToolError,
+    get_emulator_path,
+    missing_emulator_error,
+    run_sdk_tool,
+    searched_locations,
+)
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 # How many online devices to echo inline under the concise summary.
@@ -278,35 +287,48 @@ class DeviceLister:
                 both connected devices and defined AVDs.
         """
         self.name_filter = name_filter
+        # Enrichment that could not be read on the last get_avds() call. Not a
+        # failure -- the listing is still complete -- but the agent is told,
+        # because "no ABI shown" and "no ABI known" look identical otherwise.
+        self.warnings: list[str] = []
 
-    def _run(self, cmd: list[str]) -> str | None:
+    def _run_optional(self, cmd: list[str]) -> tuple[str | None, str]:
         """
-        Run a discovery command, returning stdout or None if unavailable.
+        Run an *enrichment* command: (stdout, "") or (None, why it failed).
 
-        Unusable tools and nonzero exits are treated as "nothing to report"
-        rather than hard failures, so the listing degrades gracefully (e.g. AVDs
-        still show if adb is absent). The catch is ``OSError``, not just
-        ``FileNotFoundError``: when PATH holds the Android SDK root, a bare tool
-        name can resolve to a *directory* and execve raises ``PermissionError``.
+        Reserved for avdmanager, whose output only decorates AVDs that
+        ``emulator -list-avds`` already named (target, ABI, device). A host
+        without the command-line tools still gets a complete and correct
+        listing, so its absence is reported as a warning rather than failing
+        the run -- unlike adb and the emulator, whose absence would make the
+        *answer* wrong rather than less detailed. See :meth:`get_avds`.
+
+        The failure text is returned rather than dropped: a degraded listing
+        has to be able to say what went missing and why, or "no ABI shown" and
+        "no ABI known" stay indistinguishable.
+
+        Every failure mode ``run_sdk_tool`` names is caught here, including the
+        ``OSError`` that a PATH holding the SDK *root* produces: a bare tool
+        name can then resolve to a directory, and execve raises
+        ``PermissionError`` rather than ``FileNotFoundError``.
         """
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=LIST_COMMAND_TIMEOUT,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if result.returncode != 0:
-            return None
-        return result.stdout
+            stdout = run_sdk_tool(cmd, timeout=LIST_COMMAND_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY)
+        except SdkToolError as error:
+            return None, str(error)
+        return stdout, ""
 
     def get_devices(self) -> list[dict]:
-        """Get connected devices via ``adb devices -l`` (filtered)."""
-        output = self._run(["adb", "devices", "-l"])
-        devices = parse_adb_devices(output) if output else []
+        """
+        Get connected devices via ``adb devices -l`` (filtered).
+
+        Raises:
+            AdbError: adb is missing or the listing failed. An empty list means
+                adb ran and nothing is attached -- the two used to be the same
+                answer, and "Total: 0" is what an agent saw either way (X3).
+        """
+        result = run_adb("devices", None, "-l", timeout=LIST_COMMAND_TIMEOUT, check=True)
+        devices = parse_adb_devices(result.stdout)
         if self.name_filter:
             devices = [d for d in devices if matches_filter(d, self.name_filter)]
         return devices
@@ -317,13 +339,37 @@ class DeviceLister:
 
         The emulator binary is resolved explicitly rather than exec'd by bare
         name, which is unsafe when PATH holds the SDK root (see
-        :mod:`common.sdk_tools`). An unresolvable emulator yields no names.
-        """
-        emulator = get_emulator_path()
-        names_output = self._run([emulator, "-list-avds"]) if emulator else None
-        names = parse_emulator_avds(names_output) if names_output else []
+        :mod:`common.sdk_tools`).
 
-        meta_output = self._run(["avdmanager", "list", "avd"])
+        Any *enrichment* that could not be read is appended to
+        :attr:`warnings` -- today only avdmanager, which supplies target/ABI
+        detail for AVDs the emulator has already named.
+
+        Returns:
+            The AVD records, filtered. Empty means no AVDs are defined.
+
+        Raises:
+            SdkToolError: The emulator is absent or failed, so the AVD list
+                would be empty for a reason that is not "no AVDs exist".
+        """
+        self.warnings = []
+        emulator = get_emulator_path()
+        if not emulator:
+            raise missing_emulator_error()
+        names_output = run_sdk_tool(
+            [emulator, "-list-avds"],
+            timeout=LIST_COMMAND_TIMEOUT,
+            remedy=EMULATOR_NOT_FOUND_REMEDY,
+        )
+        names = parse_emulator_avds(names_output)
+
+        meta_output, failure = self._run_optional(["avdmanager", "list", "avd"])
+        if meta_output is None:
+            self.warnings.append(
+                f"AVD target/ABI detail is missing from this listing: {failure} "
+                f"Looked in: {searched_locations('avdmanager', CMDLINE_TOOLS_SUBDIRS)}. "
+                f"The AVD names above come from `emulator -list-avds` and are complete."
+            )
         metadata = parse_avdmanager_avds(meta_output) if meta_output else {}
 
         avds = merge_avds(names, metadata)
@@ -336,8 +382,14 @@ class DeviceLister:
         Collect devices + AVDs and compute the summary counts.
 
         Returns:
-            Dict with "devices", "avds", and a "summary" of counts
+            Dict with "devices", "avds", "warnings" and a "summary" of counts
             (total / online / offline / avds).
+
+        Raises:
+            AdbError, SdkToolError: A discovery tool is missing or failed. This
+                is deliberately not an empty listing: the caller is asking what
+                is on this machine, and "nothing" and "I could not look" are
+                different answers with the same shape (X3).
         """
         devices = self.get_devices()
         avds = self.get_avds()
@@ -348,6 +400,7 @@ class DeviceLister:
         return {
             "devices": devices,
             "avds": avds,
+            "warnings": list(self.warnings),
             "summary": {
                 "total": len(devices) + len(avds),
                 "online": len(online),
@@ -459,7 +512,16 @@ Examples:
     args = parser.parse_args()
 
     lister = DeviceLister(name_filter=args.name_filter)
-    data = lister.collect()
+    try:
+        data = lister.collect()
+    except (AdbError, SdkToolError) as error:
+        # The listing could not be taken. Reported as a failure with the
+        # remedy, never as "Total: 0" at exit 0 (X3).
+        if args.json:
+            print(json.dumps({"error": str(error)}, indent=2))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
     if args.json:
         print(json.dumps(data, indent=2))
@@ -467,6 +529,9 @@ Examples:
         _print_details(data)
     else:
         _print_summary(data)
+
+    for warning in data["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
 
     sys.exit(0)
 

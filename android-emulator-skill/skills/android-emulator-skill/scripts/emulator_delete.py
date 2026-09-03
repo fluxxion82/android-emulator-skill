@@ -30,6 +30,13 @@ import sys
 from pathlib import Path
 
 from common.env_config import env_int
+from common.sdk_tools import (
+    CMDLINE_TOOLS_REMEDY,
+    CMDLINE_TOOLS_SUBDIRS,
+    SdkToolError,
+    run_sdk_tool,
+    searched_locations,
+)
 
 # Default number of newest AVDs to keep when --old is given without a value.
 DEFAULT_KEEP_COUNT = env_int("ANDROID_EMU_DELETE_KEEP", 3)
@@ -73,6 +80,27 @@ class EmulatorDeleter:
 
         return None
 
+    def require_avdmanager(self) -> str:
+        """
+        Resolved avdmanager, or :class:`SdkToolError` naming where it was sought.
+
+        One message for every caller. ``--name`` reported a missing avdmanager
+        and exited 1 while ``--all`` and ``--old`` turned the same condition
+        into ``(0, 0, [])`` -- printed as "No AVDs deleted", exit 0, which reads
+        as "there was nothing to delete" (L8).
+
+        Raises:
+            SdkToolError: avdmanager is not installed or not reachable.
+        """
+        path = self.get_avdmanager_path()
+        if path:
+            return path
+        raise SdkToolError(
+            f"avdmanager not found. Looked in: "
+            f"{searched_locations('avdmanager', CMDLINE_TOOLS_SUBDIRS)}. "
+            f"{CMDLINE_TOOLS_REMEDY}"
+        )
+
     def get_avd_home(self) -> Path:
         """
         Get the AVD home directory.
@@ -90,25 +118,20 @@ class EmulatorDeleter:
         List available AVDs.
 
         Returns:
-            List of AVD names
+            List of AVD names. Empty means avdmanager ran and reported none.
+
+        Raises:
+            SdkToolError: avdmanager is absent, or it ran and failed. An empty
+                list on failure is how a batch delete came to report "No AVDs
+                deleted" and exit 0 on a host with no command-line tools (L8).
         """
-        avdmanager = self.get_avdmanager_path()
-        if not avdmanager:
-            return []
-
-        try:
-            result = subprocess.run(
-                [avdmanager, "list", "avd", "-c"],
-                capture_output=True,
-                text=True,
-                timeout=SDK_TOOL_TIMEOUT,
-                check=True,
-            )
-
-            return [line.strip() for line in result.stdout.split("\n") if line.strip()]
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return []
+        avdmanager = self.require_avdmanager()
+        stdout = run_sdk_tool(
+            [avdmanager, "list", "avd", "-c"],
+            timeout=SDK_TOOL_TIMEOUT,
+            remedy=CMDLINE_TOOLS_REMEDY,
+        )
+        return [line.strip() for line in stdout.split("\n") if line.strip()]
 
     def list_avds_by_recency(self) -> list:
         """
@@ -187,13 +210,11 @@ class EmulatorDeleter:
 
         Returns:
             (success, message) tuple
+
+        Raises:
+            SdkToolError: avdmanager is absent or failed.
         """
-        avdmanager = self.get_avdmanager_path()
-        if not avdmanager:
-            return (
-                False,
-                "avdmanager not found. Ensure Android SDK is installed and ANDROID_HOME is set.",
-            )
+        avdmanager = self.require_avdmanager()
 
         # Check if AVD exists
         avds = self.list_avds()
@@ -215,10 +236,12 @@ class EmulatorDeleter:
         Returns:
             (succeeded, failed, results) tuple where ``results`` is a list of
             ``{"name", "success", "message"}`` dicts
+
+        Raises:
+            SdkToolError: avdmanager is absent or failed -- the same error the
+                single-name path gives, rather than an empty batch (L8).
         """
-        avdmanager = self.get_avdmanager_path()
-        if not avdmanager:
-            return 0, 0, []
+        avdmanager = self.require_avdmanager()
 
         names = self.list_avds()
         return self._delete_many(
@@ -237,10 +260,11 @@ class EmulatorDeleter:
 
         Returns:
             (succeeded, failed, results) tuple
+
+        Raises:
+            SdkToolError: avdmanager is absent or failed.
         """
-        avdmanager = self.get_avdmanager_path()
-        if not avdmanager:
-            return 0, 0, []
+        avdmanager = self.require_avdmanager()
 
         keep_count = max(keep_count, 0)
         ordered = self.list_avds_by_recency()
@@ -332,7 +356,20 @@ Examples:
     args = parser.parse_args()
 
     deleter = EmulatorDeleter()
+    try:
+        _dispatch(parser, deleter, args)
+    except SdkToolError as error:
+        # Every path reports a broken avdmanager the same way: the batch modes
+        # used to answer "No AVDs deleted" and exit 0 here (L8).
+        if args.json:
+            print(json.dumps({"error": str(error)}, indent=2))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
 
+
+def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args) -> None:
+    """Run the requested mode. Exits the process; never returns normally."""
     # List operation
     if args.list:
         avds = deleter.list_avds()

@@ -308,6 +308,17 @@ class AnrWatcher:
 # === ANRBUSTER (session mode) ===
 
 
+class SessionError(RuntimeError):
+    """A stored ANR session could not be read the way it was asked for.
+
+    Unknown session, no summary yet, a cluster index past the end. All three
+    used to be *returned as ordinary strings*, which ``main`` printed on stdout
+    before exiting 0 (X5) -- so `--get-details $SID --json` answered
+    ``Unknown session: ...`` where the caller was parsing JSON, and the exit
+    status said it had worked.
+    """
+
+
 class AnrBuster:
     """Session-mode façade.
 
@@ -405,22 +416,39 @@ class AnrBuster:
         raw: bool = False,
         json_mode: bool = False,
     ) -> str:
-        """Drill into a stored session. ``cluster`` is 1-indexed for human use."""
+        """Drill into a stored session. ``cluster`` is 1-indexed for human use.
+
+        Raises:
+            SessionError: The session is unknown, has no summary yet, or the
+                requested cluster index does not exist. Each message names what
+                to run instead.
+            ValueError: ``session_id`` is not a well-formed session id. Raised
+                by the store, which owns that grammar; the CLI rejects it as a
+                usage error before reaching here.
+        """
         try:
             self.store.load_meta(session_id)
-        except ValueError as error:
-            return f"{error}"
-        except FileNotFoundError:
-            return f"Unknown session: {session_id}"
+        except FileNotFoundError as error:
+            raise SessionError(
+                f"Unknown session: {session_id}. Run --list-sessions to see the "
+                f"sessions this host has stored."
+            ) from error
         summary = self.store.load_summary(session_id)
         if summary is None:
-            return f"No summary for {session_id}. Run --stop first."
+            raise SessionError(
+                f"No summary for {session_id}. Run --stop {session_id} first; a "
+                f"session has no summary until it is stopped."
+            )
         if raw:
             return self._dump_raw_events(session_id)
         if cluster is not None:
             index = cluster - 1
             if index < 0 or index >= len(summary.clusters):
-                return f"Cluster {cluster} out of range (1..{len(summary.clusters)})"
+                raise SessionError(
+                    f"Cluster {cluster} out of range: this session has "
+                    f"{len(summary.clusters)} cluster(s). Pass --cluster between "
+                    f"1 and {len(summary.clusters)}, or omit it for the summary."
+                )
             target = summary.clusters[index]
             events = [
                 e for e in self.store.read_events(session_id) if e.fingerprint == target.fingerprint
@@ -466,11 +494,22 @@ class AnrBuster:
         return f"Cleared {deleted} session(s){suffix}."
 
     def diff(self, session_a: str, session_b: str, json_mode: bool = False) -> str:
+        """Compare two stopped sessions.
+
+        Raises:
+            SessionError: Either session has no summary -- it was never stopped,
+                or the id does not exist. Returned as text at exit 0 before X5,
+                which is indistinguishable from a diff that found no changes.
+        """
         summary_a = self.store.load_summary(session_a)
         summary_b = self.store.load_summary(session_b)
         if summary_a is None or summary_b is None:
             missing = [s for s, x in [(session_a, summary_a), (session_b, summary_b)] if x is None]
-            return f"Missing summary.json for: {', '.join(missing)}"
+            raise SessionError(
+                f"No summary.json for: {', '.join(missing)}. Run --stop <id> for "
+                f"each session before --diff, and --list-sessions to see which "
+                f"ids exist."
+            )
         result = diff_sessions(summary_a, summary_b)
         if json_mode:
             return json.dumps(result, indent=2)
@@ -802,6 +841,37 @@ Environment variables:
     return parser
 
 
+def _fail(error: object, *, json_mode: bool) -> None:
+    """Report a failure the way the caller asked to be spoken to, and exit 1.
+
+    Under ``--json`` that is ``{"error": ...}`` on stdout, because a caller
+    parsing stdout gets nothing at all from a line on stderr -- and before X5 it
+    got the message on stdout with an exit status of 0, which is worse than
+    either.
+    """
+    if json_mode:
+        print(json.dumps({"error": str(error)}, indent=2))
+    else:
+        print(f"Error: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _require_valid_session_ids(parser, store, session_ids) -> None:
+    """Reject a malformed session id as a usage error (exit 2).
+
+    The grammar belongs to ``SessionStore.session_dir``, which is where the
+    path is built and where the traceback came from: `--diff a/b c` raised
+    ValueError out of the store, through main, to the terminal (D7). Asking the
+    store keeps one rule rather than a copy of it here; ``session_dir`` only
+    validates and joins, it touches no filesystem.
+    """
+    for session_id in session_ids:
+        try:
+            store.session_dir(session_id)
+        except ValueError as error:
+            parser.error(str(error))
+
+
 def main():
     """Main entry point — supports legacy + ANRBuster modes from one parser."""
     parser = _build_parser()
@@ -826,8 +896,7 @@ def main():
         try:
             session_id = buster.start(start_args, serial=args.serial)
         except RuntimeError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            sys.exit(1)
+            _fail(error, json_mode=args.json)
         print(session_id)
         sys.exit(0)
 
@@ -844,22 +913,24 @@ def main():
                 json_mode=args.json,
             )
         except ValueError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            sys.exit(1)
+            _fail(error, json_mode=args.json)
         except FileNotFoundError:
-            print(f"Error: unknown session {args.stop}", file=sys.stderr)
-            sys.exit(1)
+            _fail(f"unknown session {args.stop}", json_mode=args.json)
         print(out)
         sys.exit(0)
 
     if args.get_details:
         buster = AnrBuster()
-        out = buster.get_details(
-            args.get_details,
-            cluster=args.cluster,
-            raw=args.raw,
-            json_mode=args.json,
-        )
+        _require_valid_session_ids(parser, buster.store, [args.get_details])
+        try:
+            out = buster.get_details(
+                args.get_details,
+                cluster=args.cluster,
+                raw=args.raw,
+                json_mode=args.json,
+            )
+        except SessionError as error:
+            _fail(error, json_mode=args.json)
         print(out)
         sys.exit(0)
 
@@ -870,12 +941,25 @@ def main():
 
     if args.clear_sessions:
         buster = AnrBuster()
-        print(buster.clear_sessions(older_than=args.older_than, json_mode=args.json))
+        try:
+            out = buster.clear_sessions(older_than=args.older_than, json_mode=args.json)
+        except ValueError as error:
+            # `--older-than 24hours` reached the terminal as a ValueError
+            # traceback (D7). The duration grammar is the store's, and it is
+            # resolved before anything is deleted, so this is a usage error and
+            # nothing has been removed by the time it is raised.
+            parser.error(str(error))
+        print(out)
         sys.exit(0)
 
     if args.diff:
         buster = AnrBuster()
-        print(buster.diff(args.diff[0], args.diff[1], json_mode=args.json))
+        _require_valid_session_ids(parser, buster.store, args.diff)
+        try:
+            out = buster.diff(args.diff[0], args.diff[1], json_mode=args.json)
+        except SessionError as error:
+            _fail(error, json_mode=args.json)
+        print(out)
         sys.exit(0)
 
     # === Legacy modes ===

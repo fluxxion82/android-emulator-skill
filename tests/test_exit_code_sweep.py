@@ -133,14 +133,12 @@ MODES: tuple[Mode, ...] = (
         ("--get-details", "no-such-session", "--json"),
         None,
         "reads the on-disk session store under $HOME; no device is involved",
-        defect="X5",
     ),
     Mode(
         "anr_watcher.py",
         ("--diff", "a", "b", "--json"),
         None,
         "reads the on-disk session store under $HOME; no device is involved",
-        defect="X5",
     ),
     # --- X8: app_state_capture ----------------------------------------------
     # Exits 1 here because the whole capture fails at the device level. X8 is
@@ -156,21 +154,14 @@ MODES: tuple[Mode, ...] = (
         "whole-capture failure; the partial-capture case (X8) is out of reach here",
     ),
     # --- X3 / L8: the lifecycle scripts with no SDK -------------------------
-    Mode("device_list.py", ("--json",), "adb", "device and AVD inventory", defect="X3"),
-    Mode("emulator_boot.py", ("--list-avds", "--json"), "emulator", "AVD listing", defect="X3"),
-    Mode(
-        "emulator_selector.py",
-        ("--suggest", "--json"),
-        "emulator",
-        "AVD suggestion",
-        defect="X3",
-    ),
+    Mode("device_list.py", ("--json",), "adb", "device and AVD inventory"),
+    Mode("emulator_boot.py", ("--list-avds", "--json"), "emulator", "AVD listing"),
+    Mode("emulator_selector.py", ("--suggest", "--json"), "emulator", "AVD suggestion"),
     Mode(
         "emulator_delete.py",
         ("--all", "--yes", "--json"),
         "avdmanager",
         "batch delete with no avdmanager",
-        defect="L8",
     ),
     # --- diagnostics --------------------------------------------------------
     Mode("log_monitor.py", ("--last", "1m", "--json"), "adb", "historical log window"),

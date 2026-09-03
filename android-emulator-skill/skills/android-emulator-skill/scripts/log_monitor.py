@@ -712,15 +712,24 @@ Examples:
         severity_filter=severity_filter,
     )
 
-    # Parse duration
+    # Parse duration. `--duration 30` (no unit) raised ValueError out of
+    # parse_duration and reached the terminal as a traceback (D7); it is a bad
+    # argument, so it is argparse's to report -- exit 2, with the accepted
+    # forms in the message, which the parser's own error already names.
     duration = None
     if args.duration:
-        duration = monitor.parse_time_duration(args.duration)
+        try:
+            duration = monitor.parse_time_duration(args.duration)
+        except ValueError as error:
+            parser.error(f"--duration: {error}")
 
     # Parse historical window (--last); convert seconds -> minutes for logcat -t
     last_minutes = None
     if args.last_window:
-        last_minutes = monitor.parse_time_duration(args.last_window) / 60
+        try:
+            last_minutes = monitor.parse_time_duration(args.last_window) / 60
+        except ValueError as error:
+            parser.error(f"--last: {error}")
 
     # Stream logs
     if last_minutes is not None:

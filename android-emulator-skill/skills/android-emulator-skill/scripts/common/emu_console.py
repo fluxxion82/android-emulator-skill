@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .adb_exec import AdbError, run_adb
+from .adb_exec import AdbCommandError, AdbError, run_adb
 from .env_config import env_int
 
 # Snapshot save/load moves hundreds of MB of guest RAM: measured at ~3s for a
@@ -123,6 +123,12 @@ def run_emu(
     Raises:
         EmuConsoleError: The console answered ``KO`` (and ``check`` is True), or
             the target has no console because it is a physical device.
+        AdbCommandError: adb ran and exited non-zero. Raised regardless of
+            ``check``, which governs the console protocol (``KO`` at exit 0),
+            not adb's own status: a caller reading the reply of a command adb
+            says failed is reading nothing. ``emulator_shutdown`` and
+            ``location`` both hand-rolled this check before they were routed
+            here, and it has to survive the routing.
         AdbError: adb itself failed -- no device, timeout, adb missing.
 
     Example:
@@ -153,6 +159,18 @@ def run_emu(
             f"means it is a physical device (adb exits {result.returncode} here "
             f"and prints nothing at all). `adb emu` commands -- sms, snapshot, "
             f"gsm, geo -- work only on emulators; use a booted emulator instead."
+        )
+
+    # adb ran and failed. Not the console's ``KO`` -- that arrives at exit 0 --
+    # but the transport underneath it, e.g. a console kill the emulator
+    # refused. The two sites routed here in L7 each tested ``returncode`` by
+    # hand and reported the stderr; keeping that here is what let them stop.
+    if result.returncode != 0:
+        detail = result.stderr.strip() or raw.strip() or "no output"
+        raise AdbCommandError(
+            f"`{' '.join(result.command)}` exited {result.returncode}: {detail}",
+            command=result.command,
+            result=result,
         )
 
     failures = _failures(raw)

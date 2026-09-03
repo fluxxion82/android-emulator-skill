@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from common import adb_exec
+from common.emu_console import run_emu
 from common.env_config import env_float, env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -104,9 +105,12 @@ class EmulatorEraser:
                 if "emulator" in line and "device" in line:
                     # Get emulator serial
                     serial = line.split()[0]
-                    # Query AVD name
-                    avd_result = adb_exec.run_adb("emu", serial, "avd", "name", check=True)
-                    if name in avd_result.stdout:
+                    # Query AVD name through the console wrapper: it strips the
+                    # trailing "OK" the console frames every reply with, and a
+                    # `KO` -- which arrives at exit status 0 -- raises instead
+                    # of being read as a name.
+                    reply = run_emu("avd", "name", serial=serial)
+                    if name in reply.payload:
                         return True
 
             return False

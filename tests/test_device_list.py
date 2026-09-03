@@ -3,15 +3,20 @@
 These exercise the PURE parsing/merging/filtering logic (no subprocess, no
 device): ``adb devices -l`` parsing, ``emulator -list-avds`` parsing,
 ``avdmanager list avd`` metadata parsing, AVD merge, substring filtering, and
-the summary-count aggregation. The one collect() test monkeypatches the
-module's ``subprocess.run`` so no real adb/emulator is touched.
+the summary-count aggregation. The collect() tests monkeypatch
+``subprocess.run`` so no real adb/emulator is touched.
 """
 
 from __future__ import annotations
 
 import importlib
+import json
+import subprocess
 
 import device_list
+import pytest
+
+from common import adb_exec, sdk_tools
 
 # ---------------------------------------------------------------------------
 # parse_adb_devices
@@ -206,9 +211,23 @@ def test_matches_filter_empty_needle_matches_all():
 # DeviceLister.collect (subprocess mocked)
 # ---------------------------------------------------------------------------
 class _FakeResult:
-    def __init__(self, stdout: str, returncode: int = 0):
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = ""):
         self.stdout = stdout
+        self.stderr = stderr
         self.returncode = returncode
+
+
+def _patch_run(monkeypatch, fake):
+    """Install one ``subprocess.run`` double for every runner in the chain.
+
+    ``common.adb_exec`` (adb) and ``common.sdk_tools`` (emulator, avdmanager)
+    each ``import subprocess``, which is the same module object -- so this is
+    one patch, not three, and patching a script's own ``subprocess`` attribute
+    never was more specific than this. device_list no longer imports the module
+    at all: its tool calls go through those two, which is where X3's "a tool
+    that failed is not an empty list" policy now lives.
+    """
+    monkeypatch.setattr(subprocess, "run", fake)
 
 
 def _fake_emulator_on_path(monkeypatch):
@@ -232,9 +251,8 @@ def _fake_run_factory(adb_out: str, emulator_out: str, avdmanager_out: str):
 def _recorded_run(recorded, monkeypatch):
     """Serve all three tools their own recorded output."""
     _fake_emulator_on_path(monkeypatch)
-    monkeypatch.setattr(
-        device_list.subprocess,
-        "run",
+    _patch_run(
+        monkeypatch,
         _fake_run_factory(
             recorded.text("adb_devices_multiple"),
             recorded.text("emulator_list_avds"),
@@ -256,6 +274,7 @@ def test_collect_aggregates_counts(monkeypatch, recorded):
     # AVDs enriched from avdmanager.
     avd = next(a for a in data["avds"] if a["name"] == "Pixel_9")
     assert avd["abi"] == "page_size_16kb/arm64-v8a"
+    assert data["warnings"] == [], "a complete listing reported a warning"
 
 
 def test_collect_filter_narrows_avds(monkeypatch, recorded):
@@ -274,16 +293,140 @@ def test_collect_filter_narrows_devices(monkeypatch, recorded):
     assert data["avds"] == []
 
 
-def test_collect_handles_missing_tools(monkeypatch):
+def test_a_missing_adb_is_an_error_not_an_empty_inventory(monkeypatch):
+    """X3: "nothing is attached" and "I could not look" are different answers.
+
+    This test asserted the defect before Inc 1: with every tool absent it
+    expected devices == [], avds == [] and a summary of zeroes -- which is
+    exactly what an agent was shown on a machine with no Android SDK, at exit
+    status 0, with no other signal to consult.
+    """
+
     def boom(_cmd, **_kwargs):
         raise FileNotFoundError("adb not found")
 
-    monkeypatch.setattr(device_list.subprocess, "run", boom)
+    _patch_run(monkeypatch, boom)
+
+    with pytest.raises(adb_exec.AdbNotInstalledError) as excinfo:
+        device_list.DeviceLister().collect()
+
+    assert "platform-tools" in str(excinfo.value), "the failure names no remedy"
+
+
+def test_a_missing_emulator_is_an_error_not_an_empty_avd_list(monkeypatch, recorded):
+    """The AVD half of the same finding, with adb answering normally."""
+    monkeypatch.setattr(device_list, "get_emulator_path", lambda: None)
+    _patch_run(
+        monkeypatch,
+        _fake_run_factory(recorded.text("adb_devices_multiple"), "", ""),
+    )
+
+    with pytest.raises(sdk_tools.SdkToolError) as excinfo:
+        device_list.DeviceLister().collect()
+
+    message = str(excinfo.value)
+    assert "Looked in" in message, "the failure does not say where it looked"
+    assert "$ANDROID_HOME/emulator" in message, "the failure names no remedy"
+
+
+def test_a_missing_avdmanager_is_a_warning_not_a_failure(monkeypatch, recorded):
+    """The deliberate exception: avdmanager only decorates the answer.
+
+    ``emulator -list-avds`` names the AVDs; avdmanager adds target/ABI detail.
+    A host without the command-line tools -- the common case, since Android
+    Studio does not install them by default -- still gets a complete and
+    correct listing, so this one degrades with a warning instead of failing.
+    The warning is in the output, because "no ABI shown" and "no ABI known"
+    look identical without it.
+    """
+    _fake_emulator_on_path(monkeypatch)
+    served = _fake_run_factory(
+        recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:1] == ["avdmanager"]:
+            raise FileNotFoundError("avdmanager not found")
+        return served(cmd, **kwargs)
+
+    _patch_run(monkeypatch, fake_run)
 
     data = device_list.DeviceLister().collect()
-    assert data["devices"] == []
-    assert data["avds"] == []
-    assert data["summary"] == {"total": 0, "online": 0, "offline": 0, "avds": 0}
+
+    expected = [ln.strip() for ln in recorded.lines("emulator_list_avds") if ln.strip()]
+    assert [a["name"] for a in data["avds"]] == expected
+    assert len(data["warnings"]) == 1
+
+    # The condition on which this design was kept over a hard failure: the
+    # degraded listing has to say what is missing and how to get it back, not
+    # merely exit 0.
+    warning = data["warnings"][0]
+    assert "avdmanager" in warning, "the warning does not name the tool that failed"
+    assert "target/ABI" in warning, "the warning does not say what is missing from the listing"
+    assert sdk_tools.CMDLINE_TOOLS_REMEDY in warning, "the warning does not carry the remedy"
+    assert "Looked in" in warning, "the warning does not say where avdmanager was sought"
+    assert "cmdline-tools/latest/bin" in warning, "the remedy does not name the directory"
+    assert "complete" in warning, "the warning does not say the AVD names themselves are whole"
+
+
+def test_the_avdmanager_warning_reaches_both_output_modes(monkeypatch, recorded, capsys):
+    """The same warning on stderr in text mode and in the JSON body.
+
+    A warning only the object carries is a warning nobody reads. Text callers
+    get it on stderr -- not stdout, which is the listing -- and JSON callers
+    get it in `warnings`, because an agent parsing stdout never sees stderr.
+    """
+    _fake_emulator_on_path(monkeypatch)
+    served = _fake_run_factory(
+        recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:1] == ["avdmanager"]:
+            raise FileNotFoundError("avdmanager not found")
+        return served(cmd, **kwargs)
+
+    _patch_run(monkeypatch, fake_run)
+    monkeypatch.setattr(device_list.sys, "argv", ["device_list.py"])
+
+    with pytest.raises(SystemExit) as exc:
+        device_list.main()
+
+    assert exc.value.code == 0, "a degraded listing is still a listing"
+    text_mode = capsys.readouterr()
+    assert "avdmanager" in text_mode.err, "text mode reported no warning"
+    assert sdk_tools.CMDLINE_TOOLS_REMEDY in text_mode.err, "the stderr warning has no remedy"
+    assert "Android Targets" in text_mode.out, "the listing itself went missing"
+
+    _patch_run(monkeypatch, fake_run)
+    monkeypatch.setattr(device_list.sys, "argv", ["device_list.py", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        device_list.main()
+
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["warnings"], "the JSON body carried no warning"
+    assert sdk_tools.CMDLINE_TOOLS_REMEDY in payload["warnings"][0]
+    assert payload["avds"], "the AVD listing is empty in the degraded mode"
+
+
+def test_the_cli_exits_non_zero_and_says_so_in_json(monkeypatch, capsys):
+    """The agent-visible half of X3: exit status, and an error in the JSON body."""
+
+    def boom(_cmd, **_kwargs):
+        raise FileNotFoundError("adb not found")
+
+    _patch_run(monkeypatch, boom)
+    monkeypatch.setattr(device_list.sys, "argv", ["device_list.py", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        device_list.main()
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "error" in payload, f"--json reported no error: {payload}"
+    assert "devices" not in payload, "an empty inventory was printed alongside the error"
 
 
 # ---------------------------------------------------------------------------
@@ -310,26 +453,28 @@ def test_tunables_env_override(monkeypatch):
 # ---------------------------------------------------------------------------
 # Emulator resolution (SDK-root-on-PATH regression)
 # ---------------------------------------------------------------------------
-def test_collect_survives_permission_error_from_a_directory_argv0(monkeypatch):
-    """An unresolvable `emulator` must degrade to "no AVDs", not traceback.
+def test_collect_reports_a_permission_error_from_a_directory_argv0(monkeypatch):
+    """An unresolvable `emulator` is a reported failure, not "no AVDs".
 
     With the SDK root on PATH the bare name `emulator` resolves to the
     <sdk>/emulator *directory* and execve raises PermissionError, which is an
-    OSError but not a FileNotFoundError.
+    OSError but not a FileNotFoundError. It must not become a traceback -- and
+    since X3, it must not become an empty listing either.
     """
 
     def boom(_cmd, **_kwargs):
         raise PermissionError(13, "Permission denied", "emulator")
 
-    monkeypatch.setattr(device_list.subprocess, "run", boom)
+    _patch_run(monkeypatch, boom)
 
-    data = device_list.DeviceLister().collect()
-    assert data["devices"] == []
-    assert data["avds"] == []
+    with pytest.raises((adb_exec.AdbError, sdk_tools.SdkToolError)) as excinfo:
+        device_list.DeviceLister().collect()
+
+    assert "PATH" in str(excinfo.value), "the failure names no remedy"
 
 
-def test_get_avds_skips_emulator_when_binary_is_unresolvable(monkeypatch):
-    """No resolved emulator -> no exec attempt at all."""
+def test_get_avds_does_not_exec_an_unresolved_emulator(monkeypatch):
+    """No resolved emulator -> no exec attempt, and an error rather than []."""
     monkeypatch.setattr(device_list, "get_emulator_path", lambda: None)
 
     attempted: list[list[str]] = []
@@ -338,9 +483,10 @@ def test_get_avds_skips_emulator_when_binary_is_unresolvable(monkeypatch):
         attempted.append(cmd)
         return _FakeResult("", returncode=1)
 
-    monkeypatch.setattr(device_list.subprocess, "run", record)
+    _patch_run(monkeypatch, record)
 
-    assert device_list.DeviceLister().get_avds() == []
+    with pytest.raises(sdk_tools.SdkToolError):
+        device_list.DeviceLister().get_avds()
     assert all(cmd[0] != "emulator" for cmd in attempted)
 
 
@@ -356,7 +502,7 @@ def test_get_avds_uses_the_resolved_emulator_path(monkeypatch, recorded):
             return _FakeResult(recorded.text("emulator_list_avds"))
         return _FakeResult("", returncode=1)
 
-    monkeypatch.setattr(device_list.subprocess, "run", fake_run)
+    _patch_run(monkeypatch, fake_run)
 
     avds = device_list.DeviceLister().get_avds()
 

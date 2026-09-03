@@ -25,7 +25,8 @@ Usage Examples:
     # Clear text (5 deletes)
     python scripts/keyboard.py --clear 5
 
-    # Hide keyboard
+    # Hide keyboard (checks `dumpsys input_method` first; BACK would otherwise
+    # leave the screen when no keyboard is up)
     python scripts/keyboard.py --hide-keyboard
 
 Output Format:
@@ -35,6 +36,7 @@ Output Format:
 """
 
 import argparse
+import re
 import sys
 import time
 
@@ -47,6 +49,53 @@ DEFAULT_TYPE_DELAY = env_float("ANDROID_EMU_KEYBOARD_TYPE_DELAY", 0.0)
 DEFAULT_KEY_COUNT = env_int("ANDROID_EMU_KEYBOARD_KEY_COUNT", 1)
 # Small pause between repeated keyevents so the IME/app can register each one.
 KEY_REPEAT_DELAY = env_float("ANDROID_EMU_KEYBOARD_KEY_REPEAT_DELAY", 0.05)
+
+# The fields in `dumpsys input_method` that say whether the IME is on screen,
+# in the order they are consulted. Both were measured on API 33 and API 35 (see
+# tests/fixtures/recorded/*/dumpsys_input_method_shown.txt); `mInputShown` is
+# the one the finding named and the one InputMethodManagerService sets when the
+# IME is showing for a client, so it is asked first.
+#
+# `mImeWindowVis` is NOT here on purpose: it appears on neither recorded
+# profile, so code keying on it reads nothing at all and every keyboard looks
+# absent. That is the same shape as this repo's founding bug -- a field name
+# that was plausible rather than observed -- and the recordings are what settle
+# it. Do not add it back without a profile that shows it.
+IME_SHOWN_FIELD = "mInputShown"
+IME_VIEW_SHOWN_FIELD = "mIsInputViewShown"
+IME_SHOWN_FIELDS = (IME_SHOWN_FIELD, IME_VIEW_SHOWN_FIELD)
+
+# Anchored on the field name, not on line position: API 33 prints
+# `mShowRequested=false mShowExplicitlyRequested=false mShowForced=false
+# mInputShown=false` on one line, so anything that read the first token, or
+# split the line on whitespace and took field 0, would answer with
+# `mShowRequested` -- a different question with a frequently different answer.
+# API 35 prints `mInputShown` alone on its line. The second field shares a line
+# with `mStatusIcon` on both.
+_IME_FIELD_RES = {
+    field: re.compile(rf"\b{field}\s*=\s*(true|false)\b", re.IGNORECASE)
+    for field in IME_SHOWN_FIELDS
+}
+
+
+def parse_ime_shown(dumpsys_output: str) -> bool | None:
+    """Whether an IME is currently shown, from ``dumpsys input_method``.
+
+    Args:
+        dumpsys_output: Raw output of ``adb shell dumpsys input_method``.
+
+    Returns:
+        True or False, read from ``mInputShown`` or -- if that field is absent
+        -- from ``mIsInputViewShown``. None when neither field is there, which
+        is not the same as False and must not be collapsed into it: "there is
+        no keyboard up" and "I could not tell" lead to different actions, and
+        only one of them may press BACK.
+    """
+    for field in IME_SHOWN_FIELDS:
+        match = _IME_FIELD_RES[field].search(dumpsys_output)
+        if match is not None:
+            return match.group(1).lower() == "true"
+    return None
 
 
 class KeyboardSimulator:
@@ -203,15 +252,57 @@ class KeyboardSimulator:
 
         return True, f"Cleared: {count} characters"
 
-    def hide_keyboard(self) -> tuple:
+    def keyboard_is_shown(self) -> bool | None:
         """
-        Hide soft keyboard.
+        Whether the soft keyboard is currently up, per ``dumpsys input_method``.
 
         Returns:
-            (success, message) tuple
+            True, False, or None when the service did not report the field at
+            all -- "I could not tell", which is not "no".
+
+        Raises:
+            AdbError: The device could not be reached.
+        """
+        result = adb_exec.run_adb("shell", self.serial, "dumpsys", "input_method", check=True)
+        return parse_ime_shown(result.stdout)
+
+    def hide_keyboard(self) -> tuple:
+        """
+        Hide the soft keyboard, pressing BACK only if one is actually up.
+
+        BACK is not a "hide keyboard" key. It closes an open IME, and with no
+        IME open it is the *navigation* Back: it pops the activity. So the old
+        unconditional press navigated the caller off the screen it was working
+        on and reported "Keyboard hidden" (C8) -- a wrong answer that also
+        moved the device, so the next step failed somewhere else entirely.
+
+        Returns:
+            (success, message) tuple. Reporting "no keyboard shown" is a
+            success: the caller asked for the keyboard to be away, and it is.
         """
         try:
-            # Press back to hide keyboard
+            shown = self.keyboard_is_shown()
+        except adb_exec.AdbCommandError as e:
+            return False, (
+                f"Could not read the IME state from `dumpsys input_method`: {e}. "
+                f"BACK was not pressed, because with no keyboard up it leaves "
+                f"the current screen; press it deliberately with "
+                f"`keyboard.py --button back` if that is what you want."
+            )
+
+        if shown is None:
+            return False, (
+                f"Could not tell whether a keyboard is shown: `dumpsys "
+                f"input_method` reported neither "
+                f"{' nor '.join(IME_SHOWN_FIELDS)}. BACK was not pressed, "
+                f"because with no keyboard up it leaves the current screen; "
+                f"press it deliberately with `keyboard.py --button back` if "
+                f"that is what you want."
+            )
+        if not shown:
+            return True, "No keyboard shown; nothing to hide"
+
+        try:
             adb_exec.run_adb("shell", self.serial, "input", "keyevent", "KEYCODE_BACK", check=True)
             return True, "Keyboard hidden"
         except adb_exec.AdbCommandError as e:
@@ -219,18 +310,19 @@ class KeyboardSimulator:
 
     def dismiss_keyboard(self) -> tuple:
         """
-        Dismiss the soft keyboard by pressing the BACK key.
+        Dismiss the soft keyboard.
 
-        On Android, BACK closes an open IME without leaving the current screen,
-        which is the native equivalent of dismissing the keyboard.
+        The same operation as :meth:`hide_keyboard`, under the name the CLI's
+        ``--dismiss`` uses, and gated the same way -- two spellings of one
+        action must not disagree about whether they check first.
 
         Returns:
             (success, message) tuple
         """
-        success, message = self.press_key("back")
+        success, message = self.hide_keyboard()
         if not success:
-            return False, f"Dismiss keyboard failed: {message}"
-        return True, "Dismissed keyboard"
+            return False, message
+        return True, message.replace("Keyboard hidden", "Dismissed keyboard")
 
     def key_combination(self, keys: list) -> tuple:
         """
@@ -316,9 +408,15 @@ Available Keys:
     # but never declared -- so any invocation that fell through to it (notably
     # --dismiss) died with AttributeError instead of running.
     parser.add_argument(
-        "--hide-keyboard", action="store_true", help="Hide the soft keyboard (press BACK)"
+        "--hide-keyboard",
+        action="store_true",
+        help="Hide the soft keyboard (presses BACK only if an IME is shown)",
     )
-    parser.add_argument("--dismiss", action="store_true", help="Dismiss the keyboard (press BACK)")
+    parser.add_argument(
+        "--dismiss",
+        action="store_true",
+        help="Dismiss the keyboard (presses BACK only if an IME is shown)",
+    )
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
     args = parser.parse_args()

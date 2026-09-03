@@ -77,6 +77,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Wait for device ready with timeout
    - Batch boot operations
    - Headless mode support
+   - `--list-avds` reports an empty list (`No AVDs found`, or `{"avds": []}`)
+     and exits **0** only when the emulator ran and this host defines no AVDs.
+     A missing or failing `emulator` binary is an error naming where it was
+     looked for, and exits 1 (`{"error": ...}` under `--json`) — "no AVDs" and
+     "could not look" are different answers. `--all` reports the same failure
+     the same way
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
@@ -94,9 +100,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Options: `--device`, `--api`, `--name`, `--abi`, `--variant`, `--list-devices`, `--list-images`, `--json`
 
 8. **emulator_delete.py** ⭐ NEW - Delete AVDs permanently
-   - Delete by AVD name
+   - Delete by AVD name, or in batch with `--all` / `--old N` (`--yes` skips the prompt)
    - List available AVDs
-   - Options: `--name`, `--list`, `--json`
+   - Every mode reports a missing or failing `avdmanager` the same way: exit 1
+     with the `cmdline-tools` remedy, never "No AVDs deleted" at exit 0
+   - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
 
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
    - Wipe user data without deleting AVD
@@ -113,7 +121,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Filter by app package
     - Filter by severity (error/warning/info/debug)
     - Smart deduplication
-    - Duration-based or follow mode
+    - Duration-based or follow mode. `--duration` / `--last` need a unit
+      (`30s`, `5m`, `1h`); a bare number is rejected as a usage error (exit 2)
     - Save logs to file
     - Options: `--app`, `--serial`, `--severity`, `--follow`, `--duration`, `--output`, `--clear`, `--verbose`, `--json`
 
@@ -157,7 +166,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       buttons (`--button back`); `--keys a,b` presses a sequence. `--key` and
       `--button` share one name table, so either accepts either name.
     - `--clear N` deletes N characters; `--hide-keyboard` / `--dismiss` put the
-      soft keyboard away.
+      soft keyboard away. Both read `dumpsys input_method` first and press BACK
+      only when an IME is actually shown — BACK is not a "hide keyboard" key,
+      and with no keyboard up it leaves the current screen. With none shown they
+      report "No keyboard shown", send no key event and exit 0; if the IME state
+      cannot be read they exit 1 rather than guess. To press BACK regardless,
+      ask for it: `--button back`. (The state is read from `mInputShown`, with
+      `mIsInputViewShown` as a backup — both measured on API 33 and API 35.)
     - Options: `--type`, `--delay`, `--key`, `--count`, `--keys`, `--button`,
       `--clear`, `--hide-keyboard`, `--dismiss`, `--serial`/`-s`, `--json`
 
@@ -248,9 +263,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
 
 24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
+    - An empty inventory at exit 0 means the tools ran and found nothing. A
+      missing or failing `adb` or `emulator` exits 1 with the remedy
+      (`{"error": ...}` under `--json`). `avdmanager` is the exception: it only
+      adds target/ABI detail, so its absence is a warning on stderr (and in
+      `warnings` in the JSON) rather than a failure
     - Options: `--get-details`, `--device-type`/`--name`, `--json`
 
 25. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
+    - A host with no AVDs ranks nothing and exits 0; a missing or failing
+      `emulator` binary exits 1 with the remedy instead of an empty ranking
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
@@ -271,6 +293,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
     - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
+    - An unknown session, a session with no summary yet, or a `--cluster` past
+      the end exits 1 and says what to run instead (`{"error": ...}` under
+      `--json`) — it does not print the sentence and exit 0
+    - `--older-than` takes `30s`/`5m`/`24h`/`7d` and a session id is
+      `anr-YYYYMMDD-HHMMSS-XXXX`; either malformed is a usage error (exit 2),
+      and `--clear-sessions` deletes nothing when it rejects one
     - Legacy: `--watch [--duration N]`, `--since 5m`
     - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
       `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,

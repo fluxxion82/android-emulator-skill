@@ -279,13 +279,81 @@ def _census(operation: str) -> int:
     return total
 
 
-# Today's counts are 47 device-shell calls and 7 console calls. The floors sit
-# a little below both: the point is not to pin the number, it is that a
-# refactor which renames the builder -- or an edit to this file that breaks
-# resolution -- must not leave the guards reporting "all clear" over a corpus
-# they can no longer see.
+def _run_emu_names(tree: ast.Module) -> set[str]:
+    """Every local spelling of ``run_emu`` in one module, ``as`` aliases included.
+
+    Keying on the terminal name alone is the evasion the sink resolver was
+    reviewed for: ``from common.emu_console import run_emu as console`` walks
+    straight past a census that only looks for the word.
+    """
+    names = {"run_emu"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("emu_console"):
+            for alias in node.names:
+                if alias.name == "run_emu":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+CONSOLE_CALL = "run-emu-call"
+
+
+def run_emu_call_sites() -> list[Site]:
+    """Every ``run_emu(...)`` call in the skill, alias-resolved.
+
+    The positive counterpart to :func:`emu_console_bypasses`, and the reason it
+    exists: after L7 the negative guard's answer is an empty list, and an empty
+    list is also what a detector that has stopped working returns. This one
+    names the sites that must be there.
+
+    A count alone was not enough -- reviewed and rejected. Nine found against a
+    floor of six accepts three of them vanishing silently, which is exactly the
+    "a capability was migrated and then quietly dropped" case the enumeration
+    style exists for. So this is compared as an exact multiset, like the bypass
+    enumeration.
+    """
+    sites: list[Site] = []
+    for path in _script_files():
+        relative = _relative(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        local = _run_emu_names(tree)
+        enclosing = _functions_by_node(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _called_name(node) in local:
+                sites.append(
+                    Site(relative, enclosing.get(id(node), "<module>"), node.lineno, CONSOLE_CALL)
+                )
+    return sorted(sites, key=lambda site: (site.file, site.line))
+
+
+# Every console call in the skill, by file and function. The first six after
+# emu_console's own are the L7 sites -- the ones this PR migrated, and the ones
+# a later refactor could quietly drop while the bypass guard still reported
+# "all clear". sms and snapshot were already correct and are the
+# false-positive control: the fix must not look like the defect, and the
+# sanctioned call must not go missing either.
+KNOWN_CONSOLE_CALLS: tuple[Expectation, ...] = (
+    Expectation("common/emu_console.py", "console_available", CONSOLE_CALL),  # :198
+    Expectation("emulator_boot.py", "_get_avd_name_for_serial", CONSOLE_CALL),  # :226
+    Expectation("emulator_erase.py", "is_avd_running", CONSOLE_CALL),  # :112
+    Expectation("emulator_selector.py", "_avd_name_for_serial", CONSOLE_CALL),  # :341
+    Expectation("emulator_shutdown.py", "shutdown", CONSOLE_CALL),  # :94
+    Expectation("emulator_shutdown.py", "get_avd_name_for_serial", CONSOLE_CALL),  # :162
+    Expectation("location.py", "_run_geo_fix", CONSOLE_CALL),  # :261
+    Expectation("sms.py", "send", CONSOLE_CALL),  # :329
+    Expectation("snapshot.py", "_console", CONSOLE_CALL),  # :402
+)
+
+
+# Today's counts are 47 device-shell calls and 1 `adb emu` argv construction
+# (in common/emu_console.py, the only file allowed one). The shell floor sits
+# below the count: the point is not to pin the number, it is that a refactor
+# which renames the builder -- or an edit to this file that breaks resolution
+# -- must not leave the guard reporting "all clear" over a corpus it can no
+# longer see. The console side is pinned exactly instead, by
+# KNOWN_CONSOLE_CALLS above.
 SHELL_CALL_FLOOR = 40
-EMU_CALL_FLOOR = 6
+EMU_CALL_FLOOR = 1
 
 
 def test_the_guards_still_see_the_production_code():
@@ -309,7 +377,68 @@ def test_the_guards_still_see_the_production_code():
     assert emu_calls >= EMU_CALL_FLOOR, (
         f"the sink resolver finds only {emu_calls} `adb emu` argv constructions "
         f"across scripts/ (floor {EMU_CALL_FLOOR}); the console guard cannot "
-        f"see the code it is guarding."
+        f"see the code it is guarding. One is expected and required -- the call "
+        f"inside common/emu_console.py that every other caller now goes "
+        f"through. Zero means the resolver stopped resolving."
+    )
+
+
+def test_every_console_call_site_is_where_it_should_be():
+    """The positive enumeration: the nine `run_emu` calls, by file and function.
+
+    An empty bypass list means "nobody speaks the console protocol by hand". It
+    does NOT mean the console is still being spoken to -- deleting all nine
+    calls would satisfy it perfectly. This is the half that notices, and it is
+    an exact multiset rather than a floor, because a floor of six under a count
+    of nine accepts three sites disappearing without a word.
+    """
+    _assert_enumeration(KNOWN_CONSOLE_CALLS, run_emu_call_sites(), "KNOWN_CONSOLE_CALLS")
+
+
+def test_the_console_call_enumeration_resolves_an_alias():
+    """The blind spot this enumeration could have: ``import run_emu as X``.
+
+    Asserted on a synthetic module rather than on production code, so it keeps
+    testing the resolver after the production spelling changes.
+    """
+    aliased = ast.parse(
+        "from common.emu_console import run_emu as console\n"
+        "def kill(serial):\n"
+        "    return console('kill', serial=serial)\n"
+    )
+    assert _run_emu_names(aliased) == {"run_emu", "console"}
+    calls = [
+        node
+        for node in ast.walk(aliased)
+        if isinstance(node, ast.Call) and _called_name(node) in _run_emu_names(aliased)
+    ]
+    assert len(calls) == 1
+
+
+def test_every_file_that_imports_run_emu_appears_in_the_enumeration():
+    """Cross-check: importing the console entry point and calling nothing.
+
+    A site can leave KNOWN_CONSOLE_CALLS two ways: deleted from the code, or
+    spelled so the scan stops seeing it. The enumeration catches the first.
+    This catches the second -- a file that imports run_emu and contributes no
+    enumerated call is either dead code or evading the resolver.
+    """
+    importers = {
+        _relative(path)
+        for path in _script_files()
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").endswith("emu_console")
+            and any(alias.name == "run_emu" for alias in node.names)
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    }
+
+    enumerated = {item.file for item in KNOWN_CONSOLE_CALLS}
+    assert importers <= enumerated, (
+        f"{sorted(importers - enumerated)} import run_emu but contribute no "
+        f"enumerated call site; either the call was removed and the import left "
+        f"behind, or the scan cannot see how it is spelled"
     )
 
 
@@ -866,23 +995,27 @@ EMU_CONSOLE = "common/emu_console.py"
 
 EMU_ARGV = "emu-argv"
 
-# Confirmed by reading each call. Codex cites emulator_shutdown.py:66 as the
-# representative and names shutdown, boot, selector, erase and location.
-KNOWN_EMU_BYPASSES: tuple[Expectation, ...] = (
-    Expectation("emulator_boot.py", "_get_avd_name_for_serial", EMU_ARGV, "run_adb"),  # :211
-    Expectation("emulator_erase.py", "is_avd_running", EMU_ARGV, "run_adb"),  # :108
-    Expectation("emulator_selector.py", "_avd_name_for_serial", EMU_ARGV, "run_adb"),  # :333
-    # The line comments here are why lines are not matched data: PR #8 landed
-    # the L1 physical-device refusal above this call and moved it from :66 to
-    # :81, which failed the enumeration in CI while passing on the branch.
-    Expectation("emulator_shutdown.py", "shutdown", EMU_ARGV, "build_adb_command"),  # :81
-    Expectation(
-        "emulator_shutdown.py", "get_avd_name_for_serial", EMU_ARGV, "build_adb_command"
-    ),  # :156
-    # The plan cites location.py:273; that is `_run_geo_fix`, which executes an
-    # argv it does not build. The literal "emu" is in build_geo_fix_command.
-    Expectation("location.py", "build_geo_fix_command", EMU_ARGV, "build_adb_command"),  # :144
-)
+# Empty since L7: every one of the six sites below now calls
+# common.emu_console.run_emu, and the guard reports nothing outside
+# common/emu_console.py. Kept as a comment rather than deleted, because the
+# list is the record of what the fix had to reach -- three of the six were in
+# files nobody had connected to the finding, which is the whole reason the
+# guard enumerates rather than spot-checks:
+#
+#   emulator_boot.py      _get_avd_name_for_serial   run_adb            (:211)
+#   emulator_erase.py     is_avd_running             run_adb            (:108)
+#   emulator_selector.py  _avd_name_for_serial       run_adb            (:333)
+#   emulator_shutdown.py  shutdown                   build_adb_command  (:81)
+#   emulator_shutdown.py  get_avd_name_for_serial    build_adb_command  (:156)
+#   location.py           build_geo_fix_command      build_adb_command  (:144)
+#
+# The line numbers are why lines are not matched data: PR #8 landed the L1
+# physical-device refusal above the shutdown call and moved it from :66 to :81,
+# which failed the enumeration in CI while passing on the branch. The plan cites
+# location.py:273, which is `_run_geo_fix` -- it executed an argv it did not
+# build; the literal "emu" was in `build_geo_fix_command`, now
+# `build_geo_fix_args`, which builds console arguments and no adb argv at all.
+KNOWN_EMU_BYPASSES: tuple[Expectation, ...] = ()
 
 # Scripts that reach the console the sanctioned way. Named here so the guard
 # is checked for false positives as well as false negatives: run_emu() must
@@ -935,13 +1068,6 @@ def emu_console_bypasses() -> list[Site]:
     return found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "L7: five scripts still build their own `adb emu` argv instead of "
-        "going through common/emu_console.run_emu. Inc 2 routes them."
-    ),
-)
 def test_only_emu_console_speaks_to_the_emulator_console():
     """``adb emu`` is not an adb command; it is a protocol with three traps.
 
