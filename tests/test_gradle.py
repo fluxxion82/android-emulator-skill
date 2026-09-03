@@ -23,62 +23,154 @@ from gradle import (
 from gradle.config import Config
 
 # --- JUnit XML parsing -------------------------------------------------------
-
-JUNIT_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.example.CalculatorTest" tests="4" failures="1" errors="1" skipped="1">
-  <testcase classname="com.example.CalculatorTest" name="testAdd" time="0.01"/>
-  <testcase classname="com.example.CalculatorTest" name="testSubtract" time="0.02">
-    <failure message="expected:&lt;5&gt; but was:&lt;4&gt;">java.lang.AssertionError</failure>
-  </testcase>
-  <testcase classname="com.example.CalculatorTest" name="testDivide" time="0.0">
-    <error message="ArithmeticException: / by zero">stack trace here</error>
-  </testcase>
-  <testcase classname="com.example.CalculatorTest" name="testIgnored" time="0.0">
-    <skipped/>
-  </testcase>
-</testsuite>
-"""
-
-JUNIT_XML_TESTSUITES = """<?xml version="1.0" encoding="UTF-8"?>
-<testsuites>
-  <testsuite name="SuiteA">
-    <testcase classname="a.A" name="passes"/>
-  </testsuite>
-  <testsuite name="SuiteB">
-    <testcase classname="b.B" name="fails">
-      <failure message="boom">trace</failure>
-    </testcase>
-  </testsuite>
-</testsuites>
-"""
+#
+# Every input here is a RECORDED Gradle report, written by a real `test` task
+# run against tests/fixtures/scaffold/compile/junit-error. Three suites come out
+# of that one run, each carrying a different shape:
+#
+#   junit_xml_error_case    2 tests, both failed -- their @Before threw
+#   junit_xml_passing_case  1 test, green, a bare self-closing <testcase>
+#   junit_xml_skipped_case  2 tests, 1 skipped via @Ignore, 1 failed
+#
+# They replace two hand-written literals (JUNIT_XML, JUNIT_XML_TESTSUITES), and
+# recording them corrected an assumption both encoded: the literal modelled a
+# non-assertion exception as `<error message="ArithmeticException: / by zero">`
+# and asserted `errors == 1`. Gradle's XML writer does not produce that element.
+# Measured on 8.13 by two independent routes -- an IllegalStateException thrown
+# from @Before, and an UnsupportedOperationException thrown from a test body,
+# neither an AssertionError -- and both are written as `<failure type="...">`
+# with `errors="0"` on the suite. No route tried here makes Gradle emit an
+# `<error>` element at all.
 
 
-def test_parse_junit_xml_counts():
-    result = parse_junit_xml(JUNIT_XML)
-    assert result["total"] == 4
+def test_parse_junit_xml_counts(recorded_gradle):
+    """Counts, against a suite whose every test failed in setup."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_error_case"))
+    assert result["total"] == 2
+    assert result["passed"] == 0
+    assert result["failed"] == 2
+    assert result["skipped"] == 0
+    # Not a stand-in for "untested": Gradle wrote errors="0" here, and the test
+    # below shows it does so even for a throw that is not an assertion failure.
+    assert result["errors"] == 0
+
+
+def test_parse_junit_xml_counts_a_green_suite(recorded_gradle):
+    """A parser that called everything failed would pass the tests above."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_passing_case"))
+    assert result["total"] == 1
     assert result["passed"] == 1
-    assert result["failed"] == 1
-    assert result["errors"] == 1
+    assert result["failed"] == 0
+    assert result["failed_tests"] == []
+
+
+def test_parse_junit_xml_counts_a_skipped_test(recorded_gradle):
+    """A real <skipped/>, from an @Ignore'd test rather than a typed tag."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_skipped_case"))
+    assert result["total"] == 2
     assert result["skipped"] == 1
+    assert result["failed"] == 1
+    assert result["passed"] == 0
 
 
-def test_parse_junit_xml_failed_names_and_messages():
-    result = parse_junit_xml(JUNIT_XML)
+def test_gradle_writes_failure_even_for_a_non_assertion_exception(recorded_gradle):
+    """The assumption the deleted literal encoded, corrected against reality.
+
+    `JUNIT_XML` modelled an ArithmeticException as an `<error>` element and
+    asserted the parser counted one error. The recorded suite throws an
+    UnsupportedOperationException straight out of a test body -- as clearly
+    "not an assertion failure" as the literal's case was -- and Gradle writes a
+    `<failure>`, leaving `errors="0"` on the suite.
+    """
+    xml = recorded_gradle("junit_xml_skipped_case")
+    assert "UnsupportedOperationException" in xml
+    assert "<failure" in xml
+    assert "<error" not in xml
+    assert 'errors="0"' in xml
+
+
+def test_parse_junit_xml_failed_names_and_messages(recorded_gradle):
+    """Failed-test names are class-qualified and carry the exception message."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_error_case"))
     names = {t["test_name"] for t in result["failed_tests"]}
-    assert "com.example.CalculatorTest.testSubtract" in names
-    assert "com.example.CalculatorTest.testDivide" in names
+    assert names == {
+        "com.example.BeforeThrowsTest.erroredBySetup",
+        "com.example.BeforeThrowsTest.alsoErroredBySetup",
+    }
 
     by_name = {t["test_name"]: t["failure_message"] for t in result["failed_tests"]}
-    assert by_name["com.example.CalculatorTest.testSubtract"] == "expected:<5> but was:<4>"
-    assert "ArithmeticException" in by_name["com.example.CalculatorTest.testDivide"]
+    assert (
+        by_name["com.example.BeforeThrowsTest.erroredBySetup"]
+        == "java.lang.IllegalStateException: fixture setup failed on purpose"
+    )
 
 
-def test_parse_junit_xml_testsuites_root():
-    result = parse_junit_xml(JUNIT_XML_TESTSUITES)
-    assert result["total"] == 2
+def test_parse_junit_xml_testsuites_root(recorded_gradle):
+    """The multi-suite root, built by wrapping two RECORDED suites.
+
+    Gradle writes one `<testsuite>` document per test class and never emits a
+    `<testsuites>` wrapper, so this root cannot be recorded from it. The branch
+    still needs covering -- `parse_junit_xml` handles the shape, which other
+    runners and CI aggregators do emit.
+
+    So the two suite elements are real, lifted verbatim out of the recordings;
+    only the wrapper tag is added, and its spelling comes from the JUnit schema
+    rather than from a guess about what some tool prints. This is CLAUDE.md's
+    documented "text built by transforming recorded lines", not a transcript
+    somebody typed.
+    """
+
+    def _suite(name: str) -> str:
+        body = recorded_gradle(name)
+        return body[body.index("<testsuite ") :]
+
+    # Only the wrapper tags are written here, and they are deliberately the
+    # whole of what is written: 12 and 13 characters, well under the ratchet's
+    # transcript threshold, because nothing longer than a tag name is being
+    # asserted about. The XML declaration is dropped rather than retyped --
+    # ElementTree does not need one, and reproducing it would have meant
+    # hand-writing a line no tool emitted in this position.
+    document = (
+        "<testsuites>"
+        + _suite("junit_xml_passing_case")
+        + _suite("junit_xml_error_case")
+        + "</testsuites>"
+    )
+
+    result = parse_junit_xml(document)
+    assert result["total"] == 3, "both suites must be walked, not just the first"
     assert result["passed"] == 1
-    assert result["failed"] == 1
-    assert result["failed_tests"][0]["test_name"] == "b.B.fails"
+    assert result["failed"] == 2
+    assert {t["test_name"] for t in result["failed_tests"]} == {
+        "com.example.BeforeThrowsTest.erroredBySetup",
+        "com.example.BeforeThrowsTest.alsoErroredBySetup",
+    }
+
+
+def test_the_error_branch_works_for_xml_gradle_does_not_write(recorded_gradle):
+    """`parse_junit_xml` counts <error> elements. Nothing here produces one.
+
+    Gradle's writer represents both a throwing @Before and a non-assertion
+    exception as `<failure>`, leaving `errors="0"` (the two tests above measure
+    that). So the parser's `errors` branch describes JUnit XML from some OTHER
+    producer, and no recording in this repo can exercise it.
+
+    Rather than leave the branch untested or hand-write a whole document, the
+    element is grafted onto a REAL recorded suite: everything around it is
+    Gradle's own output, and the single substituted tag is the thing under test.
+    The distinction matters for anyone reading this later -- an `<error>` in the
+    corpus would otherwise look like evidence that Gradle emits one.
+    """
+    recorded = recorded_gradle("junit_xml_skipped_case")
+    assert "<error" not in recorded, "Gradle started emitting <error>; re-check F8"
+
+    foreign = recorded.replace("<failure ", "<error ").replace("</failure>", "</error>")
+    result = parse_junit_xml(foreign)
+
+    assert result["errors"] == 1, "the <error> branch does not count what it claims to"
+    assert result["total"] == 2
+    assert result["skipped"] == 1
+    assert len(result["failed_tests"]) == 1, "an errored test is still a failed test"
 
 
 def test_parse_junit_xml_empty_and_malformed():
@@ -86,22 +178,113 @@ def test_parse_junit_xml_empty_and_malformed():
     assert parse_junit_xml("not xml <<<")["total"] == 0
 
 
-def test_find_and_aggregate_test_results(tmp_path: Path):
-    # Standard Gradle layout: <module>/build/test-results/<task>/TEST-*.xml
+# --- the same parser, against XML a real Gradle run produced -----------------
+#
+# The literals above are hand-written, and recording the real thing showed one
+# of their assumptions to be wrong: they model a setup exception as an
+# `<error>` element, and Gradle does not emit one. See
+# tests/fixtures/scaffold/compile/junit-error, whose @Before throws.
+
+
+def test_parse_junit_xml_reads_a_real_gradle_report(recorded_gradle):
+    """The counts must come out right on XML nobody wrote by hand."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_error_case"))
+
+    assert result["total"] == 2, "both testcases are listed even though neither body ran"
+    assert result["failed"] == 2
+    assert result["passed"] == 0
+
+
+def test_a_throwing_setup_is_reported_as_failure_not_error(recorded_gradle):
+    """MEASURED: Gradle writes <failure> for a @Before that throws.
+
+    The obvious guess — that an exception outside an assertion becomes
+    `<error>` — is wrong, and the hand-written sample in this file encodes the
+    guess. A parser that located setup failures by looking for `<error>` would
+    find none here and report the class as green.
+    """
+    xml = recorded_gradle("junit_xml_error_case")
+    assert 'errors="0"' in xml, "the recording no longer supports this claim"
+    assert "<failure" in xml
+    assert "<error" not in xml
+
+    result = parse_junit_xml(xml)
+    assert result["errors"] == 0
+    names = {t["test_name"] for t in result["failed_tests"]}
+    assert names == {
+        "com.example.BeforeThrowsTest.erroredBySetup",
+        "com.example.BeforeThrowsTest.alsoErroredBySetup",
+    }
+    for test in result["failed_tests"]:
+        assert "fixture setup failed on purpose" in test["failure_message"]
+
+
+def test_ignore_failures_makes_the_build_log_claim_success(recorded_gradle):
+    """Why the XML has to be read at all: the log says the build succeeded.
+
+    With `ignoreFailures = true` the same run that produced three failing tests
+    prints BUILD SUCCESSFUL and exits 0. Anything deciding test outcome from
+    the build log or the exit status is told everything passed.
+    """
+    log = recorded_gradle("gradle_junit_error_ignorefailures")
+    assert "BUILD SUCCESSFUL" in log
+    assert "5 tests completed, 3 failed, 1 skipped" in log
+    assert "BUILD FAILED" not in log
+
+    # Two tests failed, and the build-output parser reports no failed task and
+    # no error, because from the log's point of view nothing went wrong. The
+    # test outcome is recoverable only from the JUnit XML.
+    parsed = parse_build_output(log, "")
+    assert parsed["failed_tasks"] == []
+    assert parsed["errors"] == []
+
+
+def test_a_configuration_failure_reports_a_file_and_line(recorded_gradle):
+    """D8: `* Where:` is the only Gradle failure block that carries a location.
+
+    Every other recorded failure has no `* Where:` section at all, so a parser
+    that only knows `* What went wrong:` discards file and line on exactly the
+    failures that have them.
+    """
+    log = recorded_gradle("gradle_where_block")
+    assert "* Where:" in log
+    assert "build.gradle' line: 11" in log
+    assert "Could not find method implementaion()" in log
+
+    for other in ("gradle_javac_compile_error", "gradle_task_not_found"):
+        assert "* Where:" not in recorded_gradle(other), (
+            f"{other} now has a `* Where:` block too, which changes what this "
+            f"fixture is contrasting against"
+        )
+
+
+def test_find_and_aggregate_test_results(tmp_path: Path, recorded_gradle):
+    """Aggregation across the three suites one real `test` task produced.
+
+    The files are laid out in the standard Gradle location and their CONTENT is
+    verbatim recorded output, so the totals below are the run's real totals:
+    5 tests, 1 passed, 3 failed, 1 skipped.
+    """
     results_dir = tmp_path / "app" / "build" / "test-results" / "testDebugUnitTest"
     results_dir.mkdir(parents=True)
-    (results_dir / "TEST-com.example.CalculatorTest.xml").write_text(JUNIT_XML, encoding="utf-8")
-    (results_dir / "TEST-Suites.xml").write_text(JUNIT_XML_TESTSUITES, encoding="utf-8")
+    for class_name, fixture in (
+        ("com.example.BeforeThrowsTest", "junit_xml_error_case"),
+        ("com.example.PassingTest", "junit_xml_passing_case"),
+        ("com.example.SkippedAndErrorTest", "junit_xml_skipped_case"),
+    ):
+        (results_dir / f"TEST-{class_name}.xml").write_text(
+            recorded_gradle(fixture), encoding="utf-8"
+        )
 
     files = find_test_result_files(tmp_path)
-    assert len(files) == 2
+    assert len(files) == 3
 
     aggregate = aggregate_test_results(files)
-    assert aggregate["total"] == 6  # 4 + 2
-    assert aggregate["passed"] == 2  # 1 + 1
-    assert aggregate["failed"] == 2  # 1 + 1
+    assert aggregate["total"] == 5
+    assert aggregate["passed"] == 1
+    assert aggregate["failed"] == 3
     assert aggregate["skipped"] == 1
-    assert aggregate["errors"] == 1
+    assert aggregate["errors"] == 0
     assert len(aggregate["failed_tests"]) == 3
 
 

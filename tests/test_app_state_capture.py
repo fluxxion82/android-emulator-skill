@@ -15,6 +15,7 @@ default carry their own budget instead of raising it for the whole skill.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -325,6 +326,14 @@ def test_device_info_records_the_effective_density_not_the_physical_one(monkeypa
     capture = app_state_capture.AppStateCapture("com.example.app", serial="emulator-5554")
     info = capture._get_device_info()
 
+    # Read out of the fixture rather than written here. The literal used to be
+    # 560, which silently tied this test to one recording of one device: 560 is
+    # also the Pixel 4 XL's *physical* density, so the same assertion would
+    # have passed against that profile for exactly the wrong reason.
+    physical = int(re.search(r"Physical density: (\d+)", override).group(1))
+    effective = int(re.search(r"Override density: (\d+)", override).group(1))
+    assert physical != effective, "fixture needs distinct values to prove anything"
+
     assert (
-        info["density"] == 560
+        info["density"] == effective
     ), f"recorded the physical density instead of the effective one: {info}"

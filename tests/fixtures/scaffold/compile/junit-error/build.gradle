@@ -1,0 +1,15 @@
+plugins { id 'java' }
+
+repositories { mavenCentral() }
+
+dependencies { testImplementation 'junit:junit:4.13.2' }
+
+// ignoreFailures is what makes this scaffold recordable at all, and the
+// combination it produces is itself worth recording: measured, the build
+// prints "3 tests completed, 2 failed" and then **BUILD SUCCESSFUL**, exiting
+// 0. Any caller deciding test outcome from the exit status is told everything
+// passed. The truth is only in the XML.
+test {
+    ignoreFailures = true
+    testLogging { events 'passed', 'failed', 'skipped' }
+}

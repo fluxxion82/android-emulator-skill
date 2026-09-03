@@ -67,7 +67,7 @@ from common.anr_pipeline import (  # noqa: E402
     summary_to_json,
 )
 from common.anr_sessions import SessionStore  # noqa: E402
-from common.device_utils import build_adb_command, resolve_device_identifier  # noqa: E402
+from common.device_utils import resolve_device_identifier  # noqa: E402
 from common.env_config import env_int  # noqa: E402
 
 # === CONSTANTS ===
@@ -79,8 +79,6 @@ DEFAULT_MIN_FRAMES = 30
 DEFAULT_MAX_STREAM_RESTARTS = 3
 # Backoff between restart attempts. Short — logcat usually recovers fast.
 RESTART_BACKOFF_SECONDS = 2.0
-# Best-effort dumpsys pull on --start, as an extra (historical) ANR source.
-DUMPSYS_TIMEOUT_SECONDS = 15
 
 
 def _compute_start_timestamp(duration_str: str) -> str:
@@ -330,8 +328,6 @@ class AnrBuster:
             self.store.prune_to_aggregate_cap(aggregate_cap_mb * 1024 * 1024)
         resolved_serial = self._resolve_serial(serial)
         meta = self.store.create({**args, "serial": resolved_serial})
-        # Best-effort historical pull via dumpsys, recorded as an extra source.
-        self._pull_dumpsys_anr(meta.session_id, resolved_serial)
         cmd = [
             sys.executable,
             __file__,
@@ -660,41 +656,6 @@ class AnrBuster:
         return proc.poll()
 
     # === PRIVATE ===
-
-    def _pull_dumpsys_anr(self, session_id: str, serial: str | None) -> None:
-        """Best-effort one-shot ``adb shell dumpsys activity anr`` pull.
-
-        Captures any ANR state already on the device at session start as an extra
-        source. Parsed lines that describe ANR/jank are normalised into
-        events.jsonl alongside the live stream. Failures are silent — this is a
-        bonus source, never a hard dependency.
-        """
-        cmd = build_adb_command("shell", serial, "dumpsys", "activity", "anr")
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=DUMPSYS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return
-        if result.returncode != 0 or not result.stdout.strip():
-            return
-        meta = self.store.load_meta(session_id)
-        events_path = self.store.events_path(session_id)
-        now_ms = int(time.time() * 1000)
-        with open(events_path, "a", buffering=1) as handle:
-            for raw_line in result.stdout.splitlines():
-                event = parse_logcat_anr(raw_line.rstrip())
-                if event is None:
-                    continue
-                normalised = build_normalised_event(
-                    event, session_start_ms=meta.started_at_ms, current_ms=now_ms
-                )
-                if normalised is not None:
-                    handle.write(event_to_jsonl(normalised) + "\n")
 
     def _wait_for_worker_exit(self, session_id: str, timeout_seconds: float) -> None:
         meta = self.store.load_meta(session_id)

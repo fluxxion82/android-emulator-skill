@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-02T04:55:22Z",
+  "recorded_at": "2026-09-03T08:08:44Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 2,
+  "redacted_package_count": 0,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -55,6 +55,34 @@
         "S4"
       ],
       "bytes": 146
+    },
+    {
+      "name": "am_start_wait_missing",
+      "file": "am_start_wait_missing.txt",
+      "command": "adb shell am start -W -n com.android.settings/.NoSuchActivity",
+      "description": "`am start -W` naming an activity class that does not exist. Exit **1**, and -- the part a parser has to know -- the whole diagnostic is on **stdout**, with stderr completely empty (see stderr_bytes). The shape: 'Starting: Intent { cmp=... }', then 'Error type 3', then 'Error: Activity class {pkg/fully.qualified.Class} does not exist.'. Note there is no 'Status:' line at all, so a parser looking for 'Status: ok' to decide success gets a correct answer here only by accident, and one keying on stderr to find the error finds nothing. Note too that the component in the message is EXPANDED to its fully-qualified form, which is not the string that was passed in.",
+      "catches": [
+        "E1"
+      ],
+      "bytes": 172,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 172,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "am_start_wait_settings",
+      "file": "am_start_wait_settings.txt",
+      "command": "adb shell am start -W -n com.android.settings/.Settings",
+      "description": "A successful `am start -W`, cold. Six lines on stdout, exit 0: 'Starting: Intent { cmp=... }', 'Status: ok', 'LaunchState: COLD', 'Activity: ...', 'TotalTime: <ms>', 'WaitTime: <ms>', 'Complete'. Two traps for a parser written from memory. First, the **Activity: line does not name the component that was requested** -- asking for com.android.settings/.Settings reports com.android.settings/.homepage.SettingsHomepageActivity, because .Settings is an alias, so 'did the thing I asked for launch' cannot be answered by comparing those two strings. Second, when the activity is ALREADY foreground the command still exits 0 and still says 'Status: ok', but inserts 'Warning: Activity not started, intent has been delivered to currently running top-most instance.' and reports TotalTime: 0 -- so a caller cannot tell a fresh launch from a no-op by the status line. The setup here force-stops first to make the capture a genuine cold start (LaunchState: COLD, TotalTime in the hundreds of ms).",
+      "catches": [
+        "E1"
+      ],
+      "bytes": 189,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 189,
+      "stderr_bytes": 0
     },
     {
       "name": "avdmanager_list_avd",
@@ -165,12 +193,64 @@
       "bytes": 574
     },
     {
+      "name": "demo_mode_clock_0941",
+      "file": "demo_mode_clock_0941.png",
+      "command": "adb exec-out screencap -p",
+      "description": "The same broadcast with the hour zero-padded: `-e hhmm 0941`. The clock reads **9:41**. This is the control that makes demo_mode_clock_941 mean something -- the mechanism works, the broadcast reaches SystemUI, and the only difference between the two captures is the width of the hhmm argument.",
+      "catches": [
+        "L2"
+      ],
+      "bytes": 5186,
+      "device_clock_at_capture": "1:03",
+      "clock_reads": "9:41",
+      "clock_source": "the hhmm argument SystemUI accepted and rendered; the device clock at capture was different (see device_clock_at_capture), so the bar cannot be showing real time by coincidence"
+    },
+    {
+      "name": "demo_mode_clock_941",
+      "file": "demo_mode_clock_941.png",
+      "command": "adb exec-out screencap -p",
+      "description": "Status bar after `-e command clock -e hhmm 941`. The clock reads **the device's own wall-clock time, unchanged** -- not 9:41. (The exact time is whatever it was at capture; open the PNG and compare it with demo_mode_clock_0941.png, which is the same status bar one broadcast later.) SystemUI requires a 4-digit HHMM and silently drops anything else: no error, no log line, exit 0, `Broadcast completed: result=0`. A caller formatting '9:41' as '941' therefore gets a status bar that still shows the real time while every success check it can make passes. Demo mode is re-entered in setup precisely so this is unambiguous: a fresh `enter` resets the clock to real time, so 12:16 here proves 941 did nothing rather than merely leaving an earlier value.",
+      "catches": [
+        "L2"
+      ],
+      "bytes": 5321,
+      "device_clock_at_capture": "1:03",
+      "clock_reads": "1:03",
+      "clock_source": "adb shell date +%I:%M, read either side of the screencap: SystemUI dropped the 3-digit hhmm, so the bar is still showing the device's own time"
+    },
+    {
+      "name": "dumpsys_activity_anr",
+      "file": "dumpsys_activity_anr.txt",
+      "command": "adb shell dumpsys activity anr",
+      "description": "There is no `anr` subcommand of `dumpsys activity`. ActivityManager answers 'Unknown command: anr' / 'Bad activity command, or no activities match: anr' / 'Use -h for help.' -- and **exits 0**, which is the part that matters (see exit_status in this entry). anr_watcher._pull_dumpsys_anr guarded on `returncode != 0`, so the guard never fired; it then fed these three usage lines to a logcat-line parser, which matched none of them. The 'historical ANR pull' the docstring advertised has always been three lines of help text going into a parser that discards them.",
+      "catches": [
+        "T5"
+      ],
+      "bytes": 88,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 88,
+      "stderr_bytes": 0
+    },
+    {
       "name": "dumpsys_gfxinfo",
       "file": "dumpsys_gfxinfo.txt",
       "command": "adb shell dumpsys gfxinfo com.android.settings",
       "description": "Frame statistics: 'Total frames rendered', 'Janky frames', and the percentile block. Real jank accounting, versus anr_watcher's inference from Choreographer's 'Skipped N frames' log line.",
       "catches": [],
       "bytes": 3812
+    },
+    {
+      "name": "dumpsys_input_method_shown",
+      "file": "dumpsys_input_method_shown.txt",
+      "command": "adb shell dumpsys input_method",
+      "description": "IME visibility flags, filtered out of `dumpsys input_method` to the lines matching mInputShown|mIsInputViewShown|mImeWindowVis. Measured on API 33 and API 35: `mInputShown` and `mIsInputViewShown` both exist; **`mImeWindowVis` does not appear on either**, so code keying on it reads nothing. Note the second key shares its line with `mStatusIcon`, so a parser splitting the line on whitespace gets two fields, not one. The full dump is 7000+ lines and names the user's IME, keyboard app and open windows, so it is filtered BEFORE anything is written -- package redaction does not catch free text.",
+      "catches": [
+        "C8"
+      ],
+      "bytes": 58,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "dumpsys_meminfo",
@@ -303,6 +383,20 @@
       "bytes": 8
     },
     {
+      "name": "input_text_nonascii",
+      "file": "input_text_nonascii.txt",
+      "command": "adb shell input text h\u00e9llo",
+      "description": "`input text` with one non-ASCII character. It does not type a mangled string and it does not report a friendly error: it throws `java.lang.NullPointerException: Attempt to get length of null array` out of InputShellCommand.sendText, prints the Java stack trace to **stderr**, and exits **255**. Nothing is typed -- measured against a focused EditText that still held its previous ASCII value afterwards. The ASCII control (`input text hello`) exits 0 with both streams empty and the field updated. The crash happens in the shell command before any injection, so it does not depend on which field has focus.",
+      "catches": [
+        "C12"
+      ],
+      "bytes": 908,
+      "exit_status": 255,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 908
+    },
+    {
       "name": "logcat_anr_broadcast",
       "file": "logcat_anr_broadcast.txt",
       "command": "adb shell logcat -d -v threadtime | grep -A 3 'ActivityManager: ANR in '",
@@ -369,6 +463,20 @@
         "A1"
       ],
       "bytes": 23514
+    },
+    {
+      "name": "pidof_not_running",
+      "file": "pidof_not_running.txt",
+      "command": "adb shell pidof com.example.definitely.not.installed",
+      "description": "`pidof` for a package that is not running: **no output at all**, on either stream, and exit status 1. The file is deliberately zero bytes -- that emptiness IS the recording, and the exit_status field in this entry is what distinguishes it from a capture that failed. Any caller that decides liveness by parsing stdout sees the same empty string it would get from a device that is not responding at all; only the exit status separates the two.",
+      "catches": [
+        "D4"
+      ],
+      "bytes": 0,
+      "exit_status": 1,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0
     },
     {
       "name": "pm_grant_not_changeable",
@@ -541,15 +649,30 @@
       "bytes": 23466
     },
     {
-      "name": "wm_density_override",
-      "file": "wm_density_override.txt",
+      "name": "wm_density_after_reset",
+      "file": "wm_density_after_reset.txt",
       "command": "adb shell wm density",
-      "description": "`wm density` with an override active \u2014 emits BOTH 'Physical density:' and 'Override density:'. Needed for a correct px->dp conversion.",
+      "description": "`wm density` read back after an override was set and then reset. Only a Physical line remains. Same receipt, for the density the dp conversion depends on.",
       "catches": [
         "S7",
         "S9"
       ],
-      "bytes": 44
+      "bytes": 22,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "wm_density_override",
+      "file": "wm_density_override.txt",
+      "command": "adb shell wm density",
+      "description": "`wm density` with an override active \u2014 emits BOTH 'Physical density:' and 'Override density:'. Needed for a correct px->dp conversion. The override is 480 because it has to differ from the PHYSICAL density of every profile this is recorded on: it used to be 560, which is exactly the Pixel 4 XL's physical density, so the same capture on that device produced Physical 560 / Override 560 and could not show which of the two lines a parser had read.",
+      "catches": [
+        "S7",
+        "S9"
+      ],
+      "bytes": 44,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "wm_density_physical",
@@ -560,6 +683,18 @@
       "bytes": 22
     },
     {
+      "name": "wm_size_after_reset",
+      "file": "wm_size_after_reset.txt",
+      "command": "adb shell wm size",
+      "description": "`wm size` read back after an override was set and then reset. Only a Physical line remains. This is the receipt for the teardown: `wm size reset` prints nothing whether or not it worked, so its silence proves nothing and this capture is what does.",
+      "catches": [
+        "S9"
+      ],
+      "bytes": 25,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "wm_size_override",
       "file": "wm_size_override.txt",
       "command": "adb shell wm size",
@@ -567,7 +702,9 @@
       "catches": [
         "S9"
       ],
-      "bytes": 50
+      "bytes": 50,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "wm_size_physical",

@@ -64,6 +64,51 @@ HIERARCHY_FIXTURE = "uiautomator_current_screen"
 
 
 @dataclass(frozen=True)
+class Capture:
+    """One command's full result: both streams and the exit status.
+
+    The recorder used to keep only ``stdout or stderr``. That sufficed while
+    every fixture's evidence was its text, but two of them carry their meaning
+    in the exit status instead: ``dumpsys activity anr`` prints
+    "Unknown command: anr" and still **exits 0**, and ``pidof`` for a package
+    that is not running prints nothing at all and **exits 1**. Collapsing a
+    command to its text throws that fact away — and in the ANR case the
+    discarded fact is precisely the one that let a nonexistent subcommand look
+    like a working data source for three releases.
+
+    The exit status is recorded in MANIFEST.json rather than in the fixture
+    file, so the file stays byte-for-byte what the tool emitted and a parser
+    under test still sees exactly what it would see from the real tool.
+    """
+
+    stdout: str
+    stderr: str
+    returncode: int
+
+    @property
+    def text(self) -> str:
+        """The stream a caller reads: stdout, or stderr when stdout is empty.
+
+        Mirrors what the skill's own ``adb_exec`` does. Some tools (am
+        broadcast, avdmanager, and ``input text`` when it throws) put the
+        interesting part on stderr.
+        """
+        return self.stdout if self.stdout.strip() else self.stderr
+
+    @property
+    def stream(self) -> str:
+        """Which stream the recorded file holds, for the manifest.
+
+        "empty" is a distinct answer from "stderr": ``pidof`` for a package
+        that is not running writes to neither stream, and recording that as
+        "stderr" would imply a diagnostic that was never printed.
+        """
+        if self.stdout.strip():
+            return "stdout"
+        return "stderr" if self.stderr.strip() else "empty"
+
+
+@dataclass(frozen=True)
 class Fixture:
     """One recorded artifact.
 
@@ -71,7 +116,8 @@ class Fixture:
         name: Basename written under ``recorded/`` (extension appended).
         args: Arguments after ``adb [-s SERIAL]``.
         description: What a parser test uses this for.
-        ext: File extension; ``xml`` for hierarchy dumps, else ``txt``.
+        ext: File extension; ``xml`` for hierarchy dumps, ``png`` for the
+            screen captures, else ``txt``.
         catches: Defect IDs this fixture would have caught. Empty for context.
         setup: Optional adb argument lists run before capture.
         teardown: Optional adb argument lists run after capture, always.
@@ -89,6 +135,26 @@ class Fixture:
             was removed from user builds, so `model_inspector`'s real path
             pulls the database and runs the host's sqlite3 against it. Use
             ``setup`` to pull the file first.
+        capture_bytes: Optional callable returning the fixture's bytes, given
+            the serial and a metadata dict it may add provenance to. For
+            artifacts that are not text at all — the status-bar PNGs — where
+            adb's ``text=True`` decoding would corrupt the payload. Mutually
+            exclusive with ``args`` / ``host_argv``.
+        record_both_streams: Persist the SIZE of both streams in MANIFEST.json,
+            not just the one the file holds. The file can only ever carry one
+            stream, so "stdout said this" and "stderr said nothing" are two
+            different claims and only the first is provable from the file.
+            ``dumpsys activity anr`` is the case that matters: the T5 argument
+            is that it printed usage text on stdout, printed NOTHING on stderr,
+            and still exited 0. Without the stderr size that middle claim rests
+            on nobody having looked.
+        teardown_verify: Optional callable given the serial, run after teardown
+            and required not to raise. For fixtures whose setup CHANGES THE
+            DEVICE: a teardown that silently failed leaves a real phone in the
+            altered state, and nothing else in this file would notice.
+        metadata: Optional callable given the serial, returning extra manifest
+            fields. For provenance that has to be measured at capture time
+            rather than written from memory.
     """
 
     name: str
@@ -102,6 +168,10 @@ class Fixture:
     post: Callable[[str], str] | None = None
     prepare: Callable[[Path, str | None], None] | None = None
     host_argv: list[str] | None = None
+    capture_bytes: Callable[[str | None, dict], bytes] | None = None
+    record_both_streams: bool = False
+    teardown_verify: Callable[[str | None], None] | None = None
+    metadata: Callable[[str | None], dict] | None = None
 
 
 class CaptureError(RuntimeError):
@@ -114,8 +184,8 @@ class CaptureError(RuntimeError):
     """
 
 
-def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> str:
-    """Run one adb command and return its output.
+def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> Capture:
+    """Run one adb command and return both streams plus its exit status.
 
     Raises:
         CaptureError: on timeout, or when the device reports a dump timeout.
@@ -133,13 +203,34 @@ def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) ->
     except subprocess.TimeoutExpired as exc:
         raise CaptureError(f"timed out after {timeout}s") from exc
 
-    # Some tools (am broadcast, avdmanager) write the interesting part to stderr.
-    text = result.stdout if result.stdout.strip() else result.stderr
+    capture = Capture(result.stdout, result.stderr, result.returncode)
 
     # dumpsys reports its own internal timeout in-band and still exits 0.
-    if "DUMP TIMEOUT" in text:
+    if "DUMP TIMEOUT" in capture.text:
         raise CaptureError("device-side dumpsys timeout (device is loaded or unhealthy)")
-    return text
+    return capture
+
+
+def _run_bytes(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> bytes:
+    """Run one adb command and return its stdout as raw bytes.
+
+    ``_run`` decodes with ``text=True``, which mangles a PNG beyond repair.
+    Used only by the screencap fixtures.
+    """
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += args
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise CaptureError(f"timed out after {timeout}s") from exc
+    if result.returncode != 0 or not result.stdout:
+        raise CaptureError(
+            f"{' '.join(args)} produced no bytes "
+            f"(exit {result.returncode}): {result.stderr[:200]!r}"
+        )
+    return result.stdout
 
 
 def _sdk_tool(name: str) -> str:
@@ -222,7 +313,7 @@ def _pull_app_database(scratch: Path, serial: str | None) -> None:
     (scratch / "fx.db").write_bytes(result.stdout)
 
 
-def _run_host(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> str:
+def _run_host(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> Capture:
     """Run a command on the HOST and return its output.
 
     For the one case where the text a parser consumes is not produced by adb:
@@ -238,10 +329,10 @@ def _run_host(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> str:
     except subprocess.TimeoutExpired as exc:
         raise CaptureError(f"timed out after {timeout}s") from exc
 
-    text = result.stdout if result.stdout.strip() else result.stderr
-    if not text.strip():
+    capture = Capture(result.stdout, result.stderr, result.returncode)
+    if not capture.text.strip():
         raise CaptureError(f"{' '.join(argv)} produced no output")
-    return text
+    return capture
 
 
 def _strip_cr(text: str) -> str:
@@ -353,6 +444,211 @@ def _requires(*needles: str, absent: tuple[str, ...] = ()) -> Callable[[str], st
         return text
 
     return check
+
+
+def _requires_empty() -> Callable[[str], str]:
+    """Refuse a capture that produced any output at all.
+
+    The mirror image of :func:`_requires`, and it exists because one fixture's
+    whole content is nothing: ``pidof`` for a package that is not running
+    prints no bytes and exits 1. A zero-byte file is indistinguishable from a
+    capture that failed, which is exactly the ambiguity this recorder refuses
+    to commit — so the emptiness is *asserted* here, and the exit status that
+    gives it meaning is written to MANIFEST.json alongside.
+    """
+
+    def check(text: str) -> str:
+        if text.strip():
+            raise CaptureError(
+                f"expected no output, got {text.strip()[:120]!r}. This fixture "
+                f"records an empty result; a non-empty one means the premise "
+                f"changed and the test built on it is now wrong"
+            )
+        return text
+
+    return check
+
+
+def _grep_lines(pattern: str, *, minimum: int = 1) -> Callable[[str], str]:
+    """Keep only the lines matching ``pattern``, and require at least ``minimum``.
+
+    Filtering happens **before** anything reaches disk, which is the point:
+    ``dumpsys input_method`` is 7000+ lines on a real device and names the
+    user's IME, their keyboard app and every window they have open. Package
+    redaction does not catch free text, so the whole dump must never be
+    written — only the handful of state flags a parser needs.
+
+    The minimum guards the other failure: a filter that matches nothing yields
+    a valid, empty, worthless file that looks like ground truth.
+    """
+    compiled = re.compile(pattern)
+
+    def keep(text: str) -> str:
+        lines = [line for line in text.splitlines() if compiled.search(line)]
+        if len(lines) < minimum:
+            raise CaptureError(
+                f"filter {pattern!r} matched {len(lines)} line(s), need at "
+                f"least {minimum}; the keys this fixture records are not in "
+                f"this dump"
+            )
+        return "\n".join(lines) + "\n"
+
+    return keep
+
+
+# Height in pixels of the strip kept from a screencap. The status bar is ~100px
+# tall at 420dpi; 120 keeps it whole with a margin, and cropping is what keeps
+# these fixtures small enough to commit AND removes the app content below,
+# which on a real device is the user's own screen.
+STATUS_BAR_STRIP_PX = 120
+
+# A fixture that has to be looked at is worthless if it is too big to open in a
+# diff. Both status-bar strips come in around 5KB against a flat background.
+MAX_PNG_BYTES = 50 * 1024
+
+
+def _status_bar_strip(serial: str | None, extra: dict) -> bytes:
+    """Screencap the device and return the top strip as a PNG.
+
+    Cropped rather than recorded whole for two reasons: a full 1080x2424
+    screenshot is 1.4MB, and everything below the status bar is whatever
+    happened to be on screen.
+    """
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - depends on the host
+        raise CaptureError(
+            "Pillow is required to record the status-bar PNGs. Run the "
+            "recorder with it available, e.g.\n"
+            "  uv run --python 3.12 --with pillow python tests/record_fixtures.py ..."
+        ) from exc
+
+    import io
+
+    raw = _run_bytes(["exec-out", "screencap", "-p"], serial, timeout=60)
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    strip = image.crop((0, 0, image.width, STATUS_BAR_STRIP_PX))
+    buffer = io.BytesIO()
+    strip.save(buffer, format="PNG", optimize=True)
+    payload = buffer.getvalue()
+    if len(payload) > MAX_PNG_BYTES:
+        raise CaptureError(
+            f"status-bar strip is {len(payload)} bytes, over the "
+            f"{MAX_PNG_BYTES}-byte budget. Record it over a flat background "
+            f"(Settings), not the home-screen wallpaper: the gradient is what "
+            f"makes the PNG large."
+        )
+    return payload
+
+
+def _display_restored(*, size: bool = False, density: bool = False) -> Callable[[str | None], None]:
+    """Read the display state back and refuse to believe an unverified reset.
+
+    `wm size reset` prints nothing whether it worked or not, so the recorder
+    used to take its silence as success. It is the only thing standing between
+    a recording run and leaving somebody's phone at 1080x2400 -- the override
+    survives the process exiting, and no other check in this file would notice.
+
+    So the reset is verified the way a person would verify it: read `wm size`
+    back and require the Override line to be gone.
+    """
+
+    def verify(serial: str | None) -> None:
+        for enabled, subcommand in ((size, "size"), (density, "density")):
+            if not enabled:
+                continue
+            readback = _run(["shell", "wm", subcommand], serial, timeout=15)
+            if readback.returncode != 0:
+                raise CaptureError(
+                    f"could not read `wm {subcommand}` back to confirm the "
+                    f"reset (exit {readback.returncode})"
+                )
+            if "Override" in readback.text:
+                raise CaptureError(
+                    f"`wm {subcommand} reset` did not take -- the device still "
+                    f"reports an override: {readback.text.strip()!r}"
+                )
+
+    return verify
+
+
+DEMO_CLOCK_RENDERED = "9:41"
+
+
+def _device_clock(serial: str | None) -> str:
+    """The device's own wall-clock time, in the form SystemUI renders.
+
+    `%I:%M` is the 12-hour form the status bar uses (measured: the bar reads
+    "12:25" where `date +%H:%M` says "00:25"), with the leading zero stripped
+    the way the bar strips it.
+
+    Read twice and required to agree, so a value recorded across a minute
+    boundary is refused rather than written -- the manifest once claimed the
+    unpadded capture showed 12:16 when the committed PNG showed 12:25, and a
+    wrong observed value in the evidence is worse than none.
+    """
+
+    def now() -> str:
+        result = _run(["shell", "date", "+%I:%M"], serial, timeout=15)
+        if result.returncode != 0 or not result.text.strip():
+            raise CaptureError("could not read the device clock")
+        return result.text.strip().lstrip("0")
+
+    before = now()
+    if before != now():
+        raise CaptureError(
+            "the device clock ticked while the status bar was being captured, "
+            "so the observed time cannot be pinned to the image; re-run"
+        )
+    return before
+
+
+def _status_bar_strip_showing(demo_clock_applied: bool) -> Callable[[str | None, dict], bytes]:
+    """Screencap the status bar and record, measured, what its clock reads.
+
+    Neither `dumpsys` nor `uiautomator` exposes the rendered status-bar clock
+    (checked: the SystemUI dump carries only the keyguard clock, and the status
+    bar is not in a uiautomator dump at all), so the value cannot be read back
+    out of the device directly. What CAN be measured is the device's own clock
+    at the moment of capture, and that is enough to make each image unambiguous:
+
+    * unpadded (`hhmm 941`): SystemUI ignored the argument, so the bar is
+      showing the device clock, and that is what gets recorded.
+    * padded (`hhmm 0941`): the bar is showing 9:41. Recorded together with the
+      device clock at capture, and the capture is REFUSED if the device clock
+      happens to be 9:41 too -- because then the image could not distinguish a
+      broadcast that worked from one that was ignored.
+
+    The same refusal guards the unpadded case, so neither PNG can be recorded
+    at the one minute of the day that would make the pair meaningless.
+    """
+
+    def capture(serial: str | None, extra: dict) -> bytes:
+        device_clock = _device_clock(serial)
+        if device_clock == DEMO_CLOCK_RENDERED:
+            raise CaptureError(
+                f"the device clock reads {device_clock}, which is exactly the "
+                f"time the demo broadcast sets. Neither capture could then show "
+                f"whether the broadcast was applied. Wait a minute and re-run."
+            )
+        extra["device_clock_at_capture"] = device_clock
+        if demo_clock_applied:
+            extra["clock_reads"] = DEMO_CLOCK_RENDERED
+            extra["clock_source"] = (
+                "the hhmm argument SystemUI accepted and rendered; the device "
+                "clock at capture was different (see device_clock_at_capture), "
+                "so the bar cannot be showing real time by coincidence"
+            )
+        else:
+            extra["clock_reads"] = device_clock
+            extra["clock_source"] = (
+                "adb shell date +%I:%M, read either side of the screencap: "
+                "SystemUI dropped the 3-digit hhmm, so the bar is still showing "
+                "the device's own time"
+            )
+        return _status_bar_strip(serial, extra)
+
+    return capture
 
 
 def _anr_for(package: str) -> Callable[[str], str]:
@@ -472,6 +768,31 @@ DIALER_PACKAGE = "com.google.android.dialer"
 # must be recomputed before recording a differently sized device.
 _SCROLL_DOWN = ["shell", "input", "swipe", "540", "1939", "540", "484", "300"]
 _SETTLE = ["shell", "sleep", "1"]
+# SystemUI's demo-mode broadcast. The status-bar setters that matter are extras
+# on this action, not `cmd statusbar` subcommands (see cmd_statusbar_help).
+DEMO_ACTION = "com.android.systemui.demo"
+
+
+def _demo_clock(hhmm: str) -> list[list[str]]:
+    """Setup steps that set the demo-mode clock and let SystemUI redraw."""
+    return [
+        [
+            "shell",
+            "am",
+            "broadcast",
+            "-a",
+            DEMO_ACTION,
+            "-e",
+            "command",
+            "clock",
+            "-e",
+            "hhmm",
+            hhmm,
+        ],
+        ["shell", "sleep", "2"],
+    ]
+
+
 _OPEN_SETTINGS = [
     ["shell", "am", "force-stop", SETTINGS_PACKAGE],
     ["shell", "am", "start", "-a", "android.settings.SETTINGS"],
@@ -554,17 +875,58 @@ FIXTURES: list[Fixture] = [
         catches=("S9",),
         setup=[["shell", "wm", "size", "1080x2400"]],
         teardown=[["shell", "wm", "size", "reset"]],
+        teardown_verify=_display_restored(size=True),
     ),
     Fixture(
         name="wm_density_override",
         args=["shell", "wm", "density"],
         description=(
             "`wm density` with an override active — emits BOTH 'Physical density:' "
-            "and 'Override density:'. Needed for a correct px->dp conversion."
+            "and 'Override density:'. Needed for a correct px->dp conversion. "
+            "The override is 480 because it has to differ from the PHYSICAL "
+            "density of every profile this is recorded on: it used to be 560, "
+            "which is exactly the Pixel 4 XL's physical density, so the same "
+            "capture on that device produced Physical 560 / Override 560 and "
+            "could not show which of the two lines a parser had read."
         ),
         catches=("S7", "S9"),
-        setup=[["shell", "wm", "density", "560"]],
+        setup=[["shell", "wm", "density", "480"]],
         teardown=[["shell", "wm", "density", "reset"]],
+        teardown_verify=_display_restored(density=True),
+    ),
+    # --- the reset receipt ------------------------------------------------
+    # wm_size_physical is captured from a device that never had an override, so
+    # it can only show that a clean device is clean. These two apply the
+    # override and then reset it, so what they record is the RESET working --
+    # the one thing the recorder has to get right on a device somebody owns.
+    Fixture(
+        name="wm_size_after_reset",
+        args=["shell", "wm", "size"],
+        description=(
+            "`wm size` read back after an override was set and then reset. Only "
+            "a Physical line remains. This is the receipt for the teardown: "
+            "`wm size reset` prints nothing whether or not it worked, so its "
+            "silence proves nothing and this capture is what does."
+        ),
+        catches=("S9",),
+        setup=[["shell", "wm", "size", "1080x2400"], ["shell", "wm", "size", "reset"]],
+        teardown=[["shell", "wm", "size", "reset"]],
+        teardown_verify=_display_restored(size=True),
+        post=_requires("Physical size:", absent=("Override",)),
+    ),
+    Fixture(
+        name="wm_density_after_reset",
+        args=["shell", "wm", "density"],
+        description=(
+            "`wm density` read back after an override was set and then reset. "
+            "Only a Physical line remains. Same receipt, for the density the dp "
+            "conversion depends on."
+        ),
+        catches=("S7", "S9"),
+        setup=[["shell", "wm", "density", "480"], ["shell", "wm", "density", "reset"]],
+        teardown=[["shell", "wm", "density", "reset"]],
+        teardown_verify=_display_restored(density=True),
+        post=_requires("Physical density:", absent=("Override",)),
     ),
     # --- invented commands: proof they do not do what the code assumes ----
     Fixture(
@@ -589,6 +951,23 @@ FIXTURES: list[Fixture] = [
             "which is why push_notification always reports 'no channels found'."
         ),
         catches=("S14",),
+    ),
+    Fixture(
+        name="dumpsys_activity_anr",
+        record_both_streams=True,
+        args=["shell", "dumpsys", "activity", "anr"],
+        description=(
+            "There is no `anr` subcommand of `dumpsys activity`. ActivityManager "
+            "answers 'Unknown command: anr' / 'Bad activity command, or no "
+            "activities match: anr' / 'Use -h for help.' -- and **exits 0**, "
+            "which is the part that matters (see exit_status in this entry). "
+            "anr_watcher._pull_dumpsys_anr guarded on `returncode != 0`, so the "
+            "guard never fired; it then fed these three usage lines to a "
+            "logcat-line parser, which matched none of them. The 'historical ANR "
+            "pull' the docstring advertised has always been three lines of help "
+            "text going into a parser that discards them."
+        ),
+        catches=("T5",),
     ),
     Fixture(
         name="am_broadcast_missing_receiver",
@@ -1196,7 +1575,14 @@ FIXTURES: list[Fixture] = [
     Fixture(
         name="uiautomator_dump_raw",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
-        ext="txt",
+        # Declared "xml" to match the file already on disk, not because it is
+        # one -- this capture is the raw stream WITH uiautomator's trailing
+        # status line, so it is not a parseable document. It had declared
+        # ext="txt" while being written as .xml, because _record_one derived
+        # the extension from the name prefix and ignored this field entirely.
+        # Honouring the field exposed the contradiction; renaming the fixture
+        # to .txt is a separate change from the one this commit is making.
+        ext="xml",
         description=(
             "The dump exactly as `exec-out` delivers it, status line included. "
             "The existing uiautomator_* fixtures hold only the XML, so the "
@@ -1450,6 +1836,7 @@ FIXTURES: list[Fixture] = [
     # first; the post-processor refuses the capture if the app is not on top.
     Fixture(
         name="uiautomator_compose_default",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "A Jetpack Compose screen with NO testTagsAsResourceId -- what a new "
@@ -1477,6 +1864,7 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="uiautomator_compose_testtags",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "The same Compose screen from an activity whose root adds "
@@ -1501,6 +1889,7 @@ FIXTURES: list[Fixture] = [
     # --- below the fold: successive states of one scrolling list ------------
     Fixture(
         name="uiautomator_settings_top",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "Settings home as it opens. 'Notifications' is on it; 'About "
@@ -1522,6 +1911,7 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="uiautomator_settings_scrolled",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "The same list after ONE scroll-down swipe. 'About emulated device' "
@@ -1540,6 +1930,7 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="uiautomator_settings_half",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "The state BETWEEN settings_top and settings_scrolled, reached with "
@@ -1566,6 +1957,7 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="uiautomator_settings_scrolled_again",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "A SECOND scroll-down swipe on a list already at its end, dumped "
@@ -1582,6 +1974,7 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="uiautomator_dialer_keypad",
+        ext="xml",
         args=["exec-out", "uiautomator", "dump", "/dev/tty"],
         description=(
             "A screen with NO scrollable node: the dialer keypad, opened on a "
@@ -1598,6 +1991,197 @@ FIXTURES: list[Fixture] = [
         ],
         teardown=[["shell", "am", "force-stop", DIALER_PACKAGE]],
         post=_screen_of(DIALER_PACKAGE, require=("555-1234",), scrollable=False),
+    ),
+    # --- am start -W: what a launch actually reports -----------------------
+    # app_launcher --launch parses this and was written with no recording to
+    # read; its own docstring says so. Both halves are captured because the
+    # failure half is where the surprises are.
+    Fixture(
+        name="am_start_wait_settings",
+        args=["shell", "am", "start", "-W", "-n", f"{SETTINGS_PACKAGE}/.Settings"],
+        description=(
+            "A successful `am start -W`, cold. Six lines on stdout, exit 0: "
+            "'Starting: Intent { cmp=... }', 'Status: ok', "
+            "'LaunchState: COLD', 'Activity: ...', 'TotalTime: <ms>', "
+            "'WaitTime: <ms>', 'Complete'. Two traps for a parser written from "
+            "memory. First, the **Activity: line does not name the component "
+            "that was requested** -- asking for com.android.settings/.Settings "
+            "reports com.android.settings/.homepage.SettingsHomepageActivity, "
+            "because .Settings is an alias, so 'did the thing I asked for "
+            "launch' cannot be answered by comparing those two strings. "
+            "Second, when the activity is ALREADY foreground the command still "
+            "exits 0 and still says 'Status: ok', but inserts "
+            "'Warning: Activity not started, intent has been delivered to "
+            "currently running top-most instance.' and reports TotalTime: 0 -- "
+            "so a caller cannot tell a fresh launch from a no-op by the status "
+            "line. The setup here force-stops first to make the capture a "
+            "genuine cold start (LaunchState: COLD, TotalTime in the hundreds "
+            "of ms)."
+        ),
+        catches=("E1",),
+        record_both_streams=True,
+        setup=[
+            ["shell", "input", "keyevent", "KEYCODE_HOME"],
+            ["shell", "am", "force-stop", SETTINGS_PACKAGE],
+            ["shell", "am", "force-stop", "com.google.android.settings.intelligence"],
+            ["shell", "sleep", "3"],
+        ],
+        teardown=[["shell", "am", "force-stop", SETTINGS_PACKAGE]],
+        post=_requires("Status: ok", "LaunchState:", "TotalTime:", "Complete"),
+    ),
+    Fixture(
+        name="am_start_wait_missing",
+        args=["shell", "am", "start", "-W", "-n", f"{SETTINGS_PACKAGE}/.NoSuchActivity"],
+        description=(
+            "`am start -W` naming an activity class that does not exist. Exit "
+            "**1**, and -- the part a parser has to know -- the whole "
+            "diagnostic is on **stdout**, with stderr completely empty (see "
+            "stderr_bytes). The shape: 'Starting: Intent { cmp=... }', then "
+            "'Error type 3', then 'Error: Activity class {pkg/fully.qualified."
+            "Class} does not exist.'. Note there is no 'Status:' line at all, "
+            "so a parser looking for 'Status: ok' to decide success gets a "
+            "correct answer here only by accident, and one keying on stderr to "
+            "find the error finds nothing. Note too that the component in the "
+            "message is EXPANDED to its fully-qualified form, which is not the "
+            "string that was passed in."
+        ),
+        catches=("E1",),
+        record_both_streams=True,
+        post=_requires("Error type 3", "does not exist"),
+    ),
+    # --- process liveness: the empty answer that is not an error -----------
+    Fixture(
+        name="pidof_not_running",
+        record_both_streams=True,
+        args=["shell", "pidof", "com.example.definitely.not.installed"],
+        description=(
+            "`pidof` for a package that is not running: **no output at all**, on "
+            "either stream, and exit status 1. The file is deliberately zero "
+            "bytes -- that emptiness IS the recording, and the exit_status field "
+            "in this entry is what distinguishes it from a capture that failed. "
+            "Any caller that decides liveness by parsing stdout sees the same "
+            "empty string it would get from a device that is not responding at "
+            "all; only the exit status separates the two."
+        ),
+        catches=("D4",),
+        post=_requires_empty(),
+    ),
+    # --- IME visibility: which key actually exists ------------------------
+    Fixture(
+        name="dumpsys_input_method_shown",
+        args=["shell", "dumpsys", "input_method"],
+        description=(
+            "IME visibility flags, filtered out of `dumpsys input_method` to the "
+            "lines matching mInputShown|mIsInputViewShown|mImeWindowVis. "
+            "Measured on API 33 and API 35: `mInputShown` and "
+            "`mIsInputViewShown` both exist; **`mImeWindowVis` does not appear "
+            "on either**, so code keying on it reads nothing. Note the second "
+            "key shares its line with `mStatusIcon`, so a parser splitting the "
+            "line on whitespace gets two fields, not one. "
+            "The full dump is 7000+ lines and names the user's IME, keyboard app "
+            "and open windows, so it is filtered BEFORE anything is written -- "
+            "package redaction does not catch free text."
+        ),
+        catches=("C8",),
+        post=_grep_lines(r"mInputShown|mIsInputViewShown|mImeWindowVis"),
+    ),
+    # --- `input text` is ASCII-only, and says so by crashing ---------------
+    Fixture(
+        name="input_text_nonascii",
+        record_both_streams=True,
+        args=["shell", "input", "text", "héllo"],
+        description=(
+            "`input text` with one non-ASCII character. It does not type a "
+            "mangled string and it does not report a friendly error: it throws "
+            "`java.lang.NullPointerException: Attempt to get length of null "
+            "array` out of InputShellCommand.sendText, prints the Java stack "
+            "trace to **stderr**, and exits **255**. Nothing is typed -- "
+            "measured against a focused EditText that still held its previous "
+            "ASCII value afterwards. The ASCII control (`input text hello`) "
+            "exits 0 with both streams empty and the field updated. "
+            "The crash happens in the shell command before any injection, so it "
+            "does not depend on which field has focus."
+        ),
+        catches=("C12",),
+        setup=[
+            ["shell", "am", "force-stop", SETTINGS_PACKAGE],
+            ["shell", "am", "start", "-n", f"{SETTINGS_PACKAGE}/.Settings"],
+            ["shell", "sleep", "3"],
+            # Centre of the Settings search bar on this profile's 1080x2424
+            # screen; recompute before recording a differently sized device,
+            # as with _SCROLL_DOWN above.
+            ["shell", "input", "tap", "540", "673"],
+            ["shell", "sleep", "2"],
+        ],
+        teardown=[["shell", "am", "force-stop", SETTINGS_PACKAGE]],
+        post=_requires("NullPointerException", "InputShellCommand.sendText"),
+    ),
+    # --- demo mode clock: 3-digit hhmm is silently ignored -----------------
+    # Both are recorded over Settings rather than the launcher: the home-screen
+    # wallpaper is a gradient that PNG cannot compress, and it put the strip
+    # over the size budget (measured 64KB vs 5KB).
+    Fixture(
+        name="demo_mode_clock_941",
+        # What capture_bytes runs; the crop to the top strip happens on the host.
+        args=["exec-out", "screencap", "-p"],
+        ext="png",
+        capture_bytes=_status_bar_strip_showing(demo_clock_applied=False),
+        # clock_reads in MANIFEST.json is measured, not remembered.
+        description=(
+            "Status bar after `-e command clock -e hhmm 941`. The clock reads "
+            "**the device's own wall-clock time, unchanged** -- not 9:41. (The "
+            "exact time is whatever it was at capture; open the PNG and compare "
+            "it with demo_mode_clock_0941.png, which is the same status bar one "
+            "broadcast later.) SystemUI "
+            "requires a 4-digit HHMM and silently drops anything else: no error, "
+            "no log line, exit 0, `Broadcast completed: result=0`. A caller "
+            "formatting '9:41' as '941' therefore gets a status bar that still "
+            "shows the real time while every success check it can make passes. "
+            "Demo mode is re-entered in setup precisely so this is unambiguous: "
+            "a fresh `enter` resets the clock to real time, so 12:16 here proves "
+            "941 did nothing rather than merely leaving an earlier value."
+        ),
+        catches=("L2",),
+        setup=[
+            ["shell", "am", "force-stop", SETTINGS_PACKAGE],
+            ["shell", "am", "start", "-n", f"{SETTINGS_PACKAGE}/.Settings"],
+            ["shell", "sleep", "3"],
+            ["shell", "settings", "put", "global", "sysui_demo_allowed", "1"],
+            ["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "exit"],
+            ["shell", "sleep", "2"],
+            ["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "enter"],
+            ["shell", "sleep", "1"],
+            *_demo_clock("941"),
+        ],
+        teardown=[["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "exit"]],
+    ),
+    Fixture(
+        name="demo_mode_clock_0941",
+        # What capture_bytes runs; the crop to the top strip happens on the host.
+        args=["exec-out", "screencap", "-p"],
+        ext="png",
+        capture_bytes=_status_bar_strip_showing(demo_clock_applied=True),
+        # clock_reads in MANIFEST.json is measured, not remembered.
+        description=(
+            "The same broadcast with the hour zero-padded: `-e hhmm 0941`. The "
+            "clock reads **9:41**. This is the control that makes "
+            "demo_mode_clock_941 mean something -- the mechanism works, the "
+            "broadcast reaches SystemUI, and the only difference between the "
+            "two captures is the width of the hhmm argument."
+        ),
+        catches=("L2",),
+        setup=[
+            ["shell", "am", "force-stop", SETTINGS_PACKAGE],
+            ["shell", "am", "start", "-n", f"{SETTINGS_PACKAGE}/.Settings"],
+            ["shell", "sleep", "3"],
+            ["shell", "settings", "put", "global", "sysui_demo_allowed", "1"],
+            ["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "exit"],
+            ["shell", "sleep", "2"],
+            ["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "enter"],
+            ["shell", "sleep", "1"],
+            *_demo_clock("0941"),
+        ],
+        teardown=[["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "exit"]],
     ),
 ]
 
@@ -1619,7 +2203,7 @@ def _capture_hierarchy(serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> st
     for the fixed-path collision the skill's three hierarchy implementations
     currently share (R4): no device-side file means no file to collide on.
     """
-    raw = _run(["exec-out", "uiautomator", "dump", "/dev/tty"], serial, timeout)
+    raw = _run(["exec-out", "uiautomator", "dump", "/dev/tty"], serial, timeout).text
     start = raw.find("<?xml")
     if start == -1:
         raise CaptureError(f"no XML in uiautomator output: {raw.strip()[:120]!r}")
@@ -1640,7 +2224,7 @@ def _device_metadata(serial: str | None) -> dict[str, str]:
     }
     meta: dict[str, str] = {}
     for key, prop in props.items():
-        meta[key] = _strip_cr(_run(["shell", "getprop", prop], serial, timeout=15)).strip()
+        meta[key] = _strip_cr(_run(["shell", "getprop", prop], serial, timeout=15).text).strip()
     return meta
 
 
@@ -1691,35 +2275,77 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
 
     entries: list[dict] = []
     failures: list[tuple[str, str]] = []
+    # Failures to put the DEVICE back as it was found. Tracked separately from
+    # capture failures and reported last, because a fixture that recorded fine
+    # while leaving an override on somebody's phone is the worse outcome.
+    restore_failures: list[str] = []
     redactions: dict[str, str] = {}
 
-    def _record_one(name: str, command: str, description: str, catches: list[str], text: str):
-        ext = "xml" if name.startswith("uiautomator") else "txt"
+    def _record_one(
+        name: str,
+        command: str,
+        description: str,
+        catches: list[str],
+        payload: str | bytes,
+        *,
+        ext: str = "txt",
+        capture: Capture | None = None,
+        both_streams: bool = False,
+        extra: dict | None = None,
+    ):
         path = recorded_dir / f"{name}.{ext}"
-        path.write_text(text, encoding="utf-8")
-        size = len(text.encode("utf-8"))
-        entries.append(
-            {
-                "name": name,
-                "file": path.name,
-                "command": command,
-                "description": description,
-                "catches": catches,
-                "bytes": size,
-            }
-        )
+        if isinstance(payload, bytes):
+            path.write_bytes(payload)
+            size = len(payload)
+        else:
+            path.write_text(payload, encoding="utf-8")
+            size = len(payload.encode("utf-8"))
+        entry = {
+            "name": name,
+            "file": path.name,
+            "command": command,
+            "description": description,
+            "catches": catches,
+            "bytes": size,
+        }
+        if capture is not None:
+            # The exit status lives here rather than in the file so the file
+            # stays byte-for-byte what the tool emitted. For two fixtures the
+            # status *is* the evidence: `dumpsys activity anr` exits 0 while
+            # printing "Unknown command", and `pidof <not running>` exits 1
+            # while printing nothing.
+            entry["exit_status"] = capture.returncode
+            entry["stream"] = capture.stream
+            if both_streams:
+                # The file holds one stream. These make the OTHER one a
+                # recorded fact instead of an assumption -- "stderr was empty"
+                # is a claim the file itself can never carry.
+                entry["stdout_bytes"] = len(capture.stdout.encode("utf-8"))
+                entry["stderr_bytes"] = len(capture.stderr.encode("utf-8"))
+        if extra:
+            entry.update(extra)
+        entries.append(entry)
         print(f"  ok    {path.name} ({size} bytes)")
 
     scratch = Path(tempfile.mkdtemp(prefix="android_emu_record_"))
 
     for fixture in selected:
-        for cmd in fixture.setup:
-            _run([a.format(tmp=scratch) for a in cmd], serial)
-        if fixture.prepare is not None:
-            fixture.prepare(scratch, serial)
+        capture: Capture | None = None
+        payload: str | bytes
+        extra: dict = {}
+        # Setup runs INSIDE the try. It used to run before it, so a timeout in
+        # `wm size 1080x2400` -- or in anything else between the override and
+        # the capture -- skipped the `finally` entirely and left a real phone
+        # at the overridden resolution.
         try:
-            if fixture.host_argv is not None:
-                raw = _run_host(
+            for cmd in fixture.setup:
+                _run([a.format(tmp=scratch) for a in cmd], serial)
+            if fixture.prepare is not None:
+                fixture.prepare(scratch, serial)
+            if fixture.capture_bytes is not None:
+                payload = fixture.capture_bytes(serial, extra)
+            elif fixture.host_argv is not None:
+                capture = _run_host(
                     [
                         (
                             _emulator_tool()
@@ -1735,17 +2361,38 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                     fixture.timeout,
                 )
             else:
-                raw = _run(fixture.args, serial, fixture.timeout)
-            text = _redact_private_packages(_strip_cr(raw), redactions)
-            if fixture.post is not None:
-                text = fixture.post(text)
+                capture = _run(fixture.args, serial, fixture.timeout)
+            if capture is not None:
+                payload = _redact_private_packages(_strip_cr(capture.text), redactions)
+                if fixture.post is not None:
+                    payload = fixture.post(payload)
         except CaptureError as exc:
             failures.append((fixture.name, str(exc)))
             print(f"  FAIL  {fixture.name}: {exc}", file=sys.stderr)
             continue
         finally:
+            # A teardown that fails is not cosmetic: these restore a device
+            # somebody owns. Its exit status is checked, and `teardown_verify`
+            # reads the state back rather than trusting the command's word.
             for cmd in fixture.teardown:
-                _run(cmd, serial)
+                result = _run(cmd, serial)
+                if result.returncode != 0:
+                    restore_failures.append(
+                        f"{fixture.name}: `adb {' '.join(cmd)}` exited "
+                        f"{result.returncode}: {result.text.strip()[:200]!r}"
+                    )
+            if fixture.teardown_verify is not None:
+                try:
+                    fixture.teardown_verify(serial)
+                except CaptureError as exc:
+                    restore_failures.append(f"{fixture.name}: {exc}")
+        if fixture.metadata is not None:
+            try:
+                extra.update(fixture.metadata(serial))
+            except CaptureError as exc:
+                failures.append((fixture.name, f"metadata: {exc}"))
+                print(f"  FAIL  {fixture.name}: metadata: {exc}", file=sys.stderr)
+                continue
         _record_one(
             fixture.name,
             (
@@ -1755,7 +2402,11 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             ),
             fixture.description,
             list(fixture.catches),
-            text,
+            payload,
+            ext=fixture.ext,
+            capture=capture,
+            both_streams=fixture.record_both_streams,
+            extra=extra,
         )
 
     if only is None or HIERARCHY_FIXTURE in only:
@@ -1775,6 +2426,7 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                 ),
                 ["S7"],
                 hierarchy,
+                ext="xml",
             )
 
     manifest = {
@@ -1803,6 +2455,20 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
 
     print(f"\n{len(entries)} fixture(s) -> {recorded_dir}")
     print(f"Device: {device.get('model')} API {device.get('api_level')} ({device.get('abi')})")
+    if restore_failures:
+        print(
+            f"\n{len(restore_failures)} DEVICE STATE NOT RESTORED -- fix this "
+            f"before unplugging:",
+            file=sys.stderr,
+        )
+        for line in restore_failures:
+            print(f"  {line}", file=sys.stderr)
+        print(
+            "\nA display override survives the recorder exiting. Reset it by "
+            "hand:\n  adb -s <serial> shell wm size reset\n"
+            "  adb -s <serial> shell wm density reset",
+            file=sys.stderr,
+        )
     if failures:
         print(f"\n{len(failures)} fixture(s) NOT recorded:", file=sys.stderr)
         for name, reason in failures:
@@ -1810,7 +2476,7 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         print("\nNothing was written for these. Re-run with --only once the", file=sys.stderr)
         print("device is healthy; a placeholder fixture is worse than none.", file=sys.stderr)
         return 1
-    return 0
+    return 1 if restore_failures else 0
 
 
 def main() -> None:

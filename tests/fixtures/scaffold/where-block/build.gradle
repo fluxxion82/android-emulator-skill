@@ -1,0 +1,12 @@
+plugins { id 'java' }
+
+repositories { mavenCentral() }
+
+dependencies {
+    // Deliberate typo: the configuration is `implementation`. Gradle cannot
+    // resolve the method, and the resulting failure carries a `* Where:`
+    // section naming THIS FILE and THIS LINE — the only Gradle failure shape
+    // that reports a location, and one nothing in gradle/results.py reads.
+    // Do not "fix" this: the typo is the fixture.
+    implementaion 'junit:junit:4.13.2'
+}

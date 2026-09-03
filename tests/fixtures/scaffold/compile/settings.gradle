@@ -10,8 +10,13 @@
 // Why not Android: AGP runs these same two compilers, so the diagnostic text is
 // identical, and plain Gradle keeps the scaffold buildable with no SDK, no
 // emulator and no AGP download.
+// :junit-error is the one subproject here that is not about a compiler
+// diagnostic. It exists because the JUnit XML a results parser consumes is
+// written by the test runner, not printed to the log, so it cannot be recorded
+// from stdout at all — see junit_xml_error_case.xml.
 rootProject.name = 'compile-scaffold'
 include ':kotlin-error'
 include ':kotlin-warning'
 include ':java-error'
 include ':java-warning'
+include ':junit-error'
