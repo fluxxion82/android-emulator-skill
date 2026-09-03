@@ -872,7 +872,17 @@ class Navigator:
             adb_exec.run_adb("shell", self.serial, "input", "text", escaped_text, check=True)
             return True, f"Typed: {text}"
         except adb_exec.AdbCommandError as e:
-            return False, f"Type failed: {e}"
+            message = f"Type failed: {e}"
+            if not text.isascii():
+                # Measured on API 35: `input text 'héllo'` throws a
+                # NullPointerException and exits 255 with nothing typed. The
+                # failure is real, but the cause is not visible in the stack
+                # trace adb hands back, so name it here.
+                message += (
+                    " -- `input text` accepts ASCII only, and this string is not ASCII. "
+                    "Set the text through the app, or use an IME that accepts it."
+                )
+            return False, message
 
     def list_elements(self, interactive_only: bool = True) -> list:
         """

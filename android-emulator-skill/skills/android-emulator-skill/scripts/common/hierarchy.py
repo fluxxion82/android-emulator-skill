@@ -63,10 +63,16 @@ _NO_ROOT_ERROR = "null root node"
 
 _TRANSIENT_ERRORS = (_IDLE_ERROR, _NO_ROOT_ERROR)
 
-# `bounds="[left,top][right,bottom]"`. The coordinates are SIGNED: a view scrolled
-# half off the left edge, or one laid out above the status bar, reports a
-# negative left or top. The two grammars this replaces used `\d+`, so they did
-# not match such a node at all and their callers fell back to `(0, 0, 0, 0)` --
+# `bounds="[left,top][right,bottom]"`, with SIGNED coordinates.
+#
+# Not because a negative bound was observed: on API 35 uiautomator clips every
+# node's rectangle to the display, and eight recipes aimed at producing one
+# (mid-fling dumps, a half-pulled shade, the task switcher mid-animation)
+# returned min_left=0 and max_right=1080 every time. The grammar is signed
+# because `accessibility_audit`'s already was, because older API levels are not
+# known to clip, and because it costs nothing -- what matters is the other half:
+# an unparseable value yields None instead of `(0, 0, 0, 0)`, which the two
+# `\d+` grammars this replaces returned for anything they did not match. That is
 # a rectangle whose centre is a real, tappable pixel (C5).
 _BOUNDS_PATTERN = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
@@ -93,10 +99,10 @@ class HierarchyError(RuntimeError):
 def parse_bounds(value: str | None) -> tuple[int, int, int, int] | None:
     """Parse a uiautomator ``bounds`` string into ``(left, top, right, bottom)``.
 
-    The one grammar. Signed, because a partially off-screen view reports a
-    negative coordinate, and returning None rather than a zero rectangle,
-    because ``(0, 0, 0, 0)`` is indistinguishable from a real element in the
-    corner: every caller that treated it as one issued ``input tap 0 0``.
+    The one grammar. Signed (see :data:`_BOUNDS_PATTERN` for why that is
+    precaution rather than observation), and returning None rather than a zero
+    rectangle, because ``(0, 0, 0, 0)`` is indistinguishable from a real element
+    in the corner: every caller that treated it as one issued ``input tap 0 0``.
 
     Args:
         value: The raw ``bounds`` attribute, e.g. ``"[0,142][1080,2361]"``.

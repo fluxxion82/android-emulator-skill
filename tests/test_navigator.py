@@ -245,6 +245,75 @@ def test_list_json_reports_total_and_truncation(monkeypatch, capsys):
     assert len(payload["elements"]) == 3
 
 
+# --- An element the skill cannot locate is not acted on --------------------
+
+
+COMPOSE = "uiautomator_compose_default.xml"
+
+# The recorded CheckBox, whose caption "Remember me" is its next sibling.
+CHECKBOX_BOUNDS = "[33,754][159,880]"
+
+
+def _screen_with_unreadable_bounds(xml: str) -> ET.Element:
+    """A recorded screen with ONE attribute corrupted: the CheckBox's bounds.
+
+    Derived rather than recorded, and deliberately so. uiautomator on API 35
+    clips every node's rectangle to the display -- the recording unit tried eight
+    recipes for an off-screen node (a half-row swipe, a mid-fling dump, a
+    half-pulled shade, the task switcher mid-animation) and got min_left=0 /
+    max_right=1080 / max_bottom=2424 every time -- so there is no recorded dump
+    on this API level in which `bounds` cannot be read, and inventing a whole
+    one would be exactly the imagined-tool-output bug this suite exists to
+    prevent. What IS real is that `bounds` is a string this skill parses, and
+    that a value it cannot parse must not become a tap. One attribute of a real
+    dump is changed; every other byte is the device's.
+    """
+    screen = ET.fromstring(xml)
+    checkbox = next(node for node in screen.iter() if node.get("bounds") == CHECKBOX_BOUNDS)
+    checkbox.set("bounds", "[33,754]")  # truncated: no second corner
+    return screen
+
+
+def test_an_element_whose_bounds_will_not_parse_is_refused_not_tapped(
+    monkeypatch, recorded, capsys
+):
+    """C5: the fallback for unreadable bounds used to be a tap at (0, 0).
+
+    `_parse_bounds` returned `(0, 0, 0, 0)` for anything its grammar missed, and
+    the centre of that rectangle is the top-left pixel of the screen -- a real,
+    tappable point, in whatever happens to occupy the corner. The refusal has to
+    name the element and a way forward, because "cannot act" that does not say
+    what to do next is only marginally better than tapping the wrong thing.
+    """
+    monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
+    issued: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        issued.append(list(cmd))
+        return _fake_result()
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    monkeypatch.setattr(
+        navigator,
+        "capture_hierarchy",
+        lambda serial=None, **kwargs: _screen_with_unreadable_bounds(recorded.text(COMPOSE)),
+    )
+    _stub_resolve(monkeypatch)
+    monkeypatch.setattr(
+        navigator.sys, "argv", ["navigator.py", "--find-text", "Remember me", "--tap"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        navigator.main()
+
+    assert exc.value.code != 0, "acting on an element of unknown position reported success"
+    assert not [cmd for cmd in issued if "tap" in cmd], f"a tap was issued anyway: {issued}"
+
+    out = capsys.readouterr().out
+    assert "no usable bounds" in out, out
+    assert "--tap-at" in out, f"the refusal does not say what to do instead: {out}"
+
+
 # --- Device errors reach the agent with a remedy, not a traceback ----------
 
 
