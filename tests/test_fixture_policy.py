@@ -59,6 +59,19 @@ TESTS = Path(__file__).resolve().parent
 # transcript of what a tool printed.
 TOOL_OUTPUT_MIN_LENGTH = 40
 
+# Ceiling for a literal sitting BESIDE a recording inside a transformation --
+# a substitution pattern, a replacement or an index. The legitimate cases are
+# small: a fully-qualified symbol name being substituted into a real crash
+# ("com.example.composefixture.SyncService.onHandleWork", 51 characters) and
+# an f-string replacement like f"Skipped {n} frames". A 200-character single
+# line is a transcript wherever it sits, so the exemption stops here.
+DERIVATION_ARG_MAX = 120
+
+# `"-" * 500` is a literal too. Repetitions are folded so their real length is
+# measured rather than the one-character operand's, and capped so a pathological
+# count cannot allocate: any cap above both thresholds gives the same verdict.
+STATIC_REPEAT_CAP = 10_000
+
 # Keyword arguments that hand fabricated output to a test double.
 OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
 
@@ -399,6 +412,49 @@ def _recorded_subject(
     return None
 
 
+def _static_string(
+    node: ast.AST, scope: dict[str, ast.AST], resolving: frozenset[str] = frozenset()
+) -> str | None:
+    """The string this expression evaluates to, when that is knowable statically.
+
+    Constants, concatenations, repetitions and names bound to any of those.
+    Folding them means the LENGTH being judged is the length the parser would
+    receive: `"x" * 200` is a 200-character transcript, not the one-character
+    operand the recursive rule would otherwise see on each side.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        if node.id in resolving or node.id not in scope:
+            return None
+        return _static_string(scope[node.id], scope, resolving | {node.id})
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Add):
+            left = _static_string(node.left, scope, resolving)
+            right = _static_string(node.right, scope, resolving)
+            return None if left is None or right is None else left + right
+        if isinstance(node.op, ast.Mult):
+            for text_node, count_node in ((node.left, node.right), (node.right, node.left)):
+                text = _static_string(text_node, scope, resolving)
+                if text is None or not isinstance(count_node, ast.Constant):
+                    continue
+                count = count_node.value
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    return text * min(count, STATIC_REPEAT_CAP)
+    return None
+
+
+def _judge_literal(text: str, beside_a_recording: bool) -> bool:
+    """Whether a known string is a transcript somebody made up."""
+    if len(text) < TOOL_OUTPUT_MIN_LENGTH:
+        return False
+    if not beside_a_recording:
+        return True
+    # Bounded exemption: beside a recording, a literal is a substitution
+    # pattern or value only while it stays on one line AND stays short.
+    return "\n" in text or len(text) >= DERIVATION_ARG_MAX
+
+
 def _is_tool_output_literal(
     node: ast.AST,
     scope: dict[str, ast.AST] | None = None,
@@ -439,10 +495,9 @@ def _is_tool_output_literal(
     ) -> bool:
         return _is_tool_output_literal(child, scope, resolving, _helpers, beside_a_recording)
 
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        if len(node.value) < TOOL_OUTPUT_MIN_LENGTH:
-            return False
-        return "\n" in node.value if _beside_a_recording else True
+    folded = _static_string(node, scope, _resolving)
+    if folded is not None:
+        return _judge_literal(folded, _beside_a_recording)
     if isinstance(node, ast.JoinedStr):
         # An f-string assembling output is still assembled output.
         return any(recurse(value) for value in node.values) if _beside_a_recording else True
@@ -904,6 +959,85 @@ def test_a_derivation_helper_does_not_launder_a_transcript_beside_it():
         f"    PARSER(_rename_frame(crash, 0, {INVENTED_TRANSCRIPT!r}))\n"
     )
     assert found == {_a_parser()}
+
+
+# The transformation exemption is bounded at both ends, and both ends are
+# pinned. Newlines are not the test -- a 200-character single line is a
+# transcript wherever it sits -- and length is not the whole test either, or
+# the substitutions the corpus documents would become debt.
+A_SYMBOL_NAME = "com.example.composefixture.SyncService.onHandleWork"
+A_LONG_SINGLE_LINE = "x" * 200
+
+
+def test_a_long_single_line_beside_a_recording_is_still_a_transcript():
+    """The residual hole after the first narrowing: length was not bounded.
+
+    Exempting every single-line argument of a transformation let a
+    200-character blob through, in both shapes the allowlist admits.
+    """
+    via_helper = _synthetic(
+        "def _derive(blob, text):\n"
+        "    return text\n"
+        "def test_x(recorded):\n"
+        f"    PARSER(_derive({A_LONG_SINGLE_LINE!r}, recorded.text('adb_devices_single')))\n"
+    )
+    assert via_helper == {_a_parser()}, "a helper laundered a 200-character single line"
+
+    via_re_sub = _synthetic(
+        "def test_x(recorded):\n"
+        f"    PARSER(re.sub('a', {A_LONG_SINGLE_LINE!r}, recorded.text('adb_devices_single')))\n"
+    )
+    assert via_re_sub == {_a_parser()}, "re.sub's replacement laundered a 200-character line"
+
+
+def test_a_short_single_line_replacement_beside_a_recording_is_not():
+    """The other end: the substitutions the corpus documents stay clean.
+
+    A fully-qualified symbol name is 51 characters -- over the transcript
+    threshold, under the derivation ceiling -- and is a value being substituted
+    INTO recorded output, not output.
+    """
+    assert TOOL_OUTPUT_MIN_LENGTH < len(A_SYMBOL_NAME) < DERIVATION_ARG_MAX
+
+    via_re_sub = _synthetic(
+        "def test_x(recorded):\n"
+        f"    PARSER(re.sub('a', {A_SYMBOL_NAME!r}, recorded.text('logcat_crash_java')))\n"
+    )
+    assert via_re_sub == set()
+
+    via_helper = _synthetic(
+        "def _rename_frame(text, index, symbol):\n"
+        "    return text\n"
+        "def test_x(recorded):\n"
+        "    crash = recorded.text('logcat_crash_java')\n"
+        f"    PARSER(_rename_frame(crash, 0, {A_SYMBOL_NAME!r}))\n"
+    )
+    assert via_helper == set()
+
+
+def test_a_repetition_is_measured_at_its_real_length():
+    """`"x" * 200` is a 200-character literal, not a one-character one.
+
+    The recursive rule judged each operand of a BinOp separately, so a
+    repetition read as a single character. Statically-known strings are folded
+    before the length rule runs.
+    """
+    assert _synthetic(f"PARSER({A_LONG_SINGLE_LINE!r})") == {_a_parser()}
+    assert _synthetic("PARSER('x' * 200)") == {_a_parser()}
+    assert _synthetic("BLOB = 'x' * 200\nPARSER(BLOB)\n") == {_a_parser()}
+
+
+def test_the_documented_derivations_are_not_debt():
+    """test_crash_triage and test_anr_watcher reshape recorded lines by design.
+
+    Named here because the bound above is what keeps them out: their
+    substitution arguments are symbol names and frame counts, and a rule
+    tightened without a ceiling would have turned the corpus's own documented
+    practice into two more KNOWN_VIOLATIONS entries.
+    """
+    offenders = {entry.split("::")[0] for entry in _violations()}
+    assert "test_crash_triage.py" not in offenders
+    assert "test_anr_watcher.py" not in offenders
 
 
 def test_recorded_fixtures_are_actually_consumed():
