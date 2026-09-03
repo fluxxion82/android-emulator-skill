@@ -40,7 +40,11 @@ import json
 import sys
 
 from common import adb_exec
-from common.device_utils import build_adb_command, resolve_device_identifier
+from common.device_utils import (
+    build_adb_command,
+    quote_for_device_shell,
+    resolve_device_identifier,
+)
 from common.env_config import env_float
 
 # Tunable default font scales for friendly text-size aliases (overridable via
@@ -138,7 +142,13 @@ class AppearanceController:
         Returns:
             Complete adb command list ready for subprocess.run()
         """
-        return build_adb_command("shell", self.serial, "setprop", "persist.sys.locale", locale)
+        return build_adb_command(
+            "shell",
+            self.serial,
+            "setprop",
+            "persist.sys.locale",
+            quote_for_device_shell(locale),
+        )
 
     # === DEVICE OPERATIONS ===
 

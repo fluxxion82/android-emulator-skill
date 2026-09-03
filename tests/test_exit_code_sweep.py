@@ -2,10 +2,11 @@
 
 The finding this pins (C6, X5, X8, X3, L8) is one shape in four places: a
 failure converted into an empty result, printed calmly, and reported as
-success. ``app_launcher --list`` answers ``Installed packages (0)`` when adb
-never ran; ``device_list --json`` answers ``{"devices": [], "avds": []}`` when
-the SDK is not installed. An agent cannot tell "nothing is there" from "I could
-not look", and it has no second signal to consult -- exit status is the signal.
+success. ``app_launcher --list`` answered ``Installed packages (0)`` when adb
+never ran -- fixed in Inc 1, and green here unmarked since; ``device_list
+--json`` still answers ``{"devices": [], "avds": []}`` when the SDK is not
+installed. An agent cannot tell "nothing is there" from "I could not look", and
+it has no second signal to consult -- exit status is the signal.
 
 **Why this is a runtime sweep and not another AST guard.** The obvious static
 rule -- "a function that builds a dict with an ``error`` key must not fall
@@ -37,7 +38,7 @@ Each mode is checked by three separate tests, and only one of them carries
 the ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
 unexpected *pass*, never an unexpected reason for failing, so a single combined
 test would accept a hang, a fresh Python traceback or a vanished marker file as
-"the expected failure" for the eight red modes -- the sweep would go on
+"the expected failure" for the six red modes -- the sweep would go on
 reporting the defect it already knows about while a new one hid behind it. So:
 completion and the absence of a traceback are asserted unmarked for all
 twenty-three modes, the tool-invocation floor is asserted unmarked for the
@@ -106,12 +107,14 @@ class Mode(NamedTuple):
 
 
 # The sweep table. `defect` is filled from an unmarked run, not from a guess:
-# every entry below was observed, and the eight marked ones printed a zero exit
+# every entry below was observed, and the six marked ones printed a zero exit
 # status with an empty-looking answer.
 MODES: tuple[Mode, ...] = (
     # --- C6: app_launcher ---------------------------------------------------
-    Mode("app_launcher.py", ("--list",), "adb", "package listing", defect="C6"),
-    Mode("app_launcher.py", ("--list", "--json"), "adb", "package listing", defect="C6"),
+    # Green since Inc 1: list_packages no longer answers a failed lookup with
+    # an empty list, and main() reports the failure in both output modes.
+    Mode("app_launcher.py", ("--list",), "adb", "package listing"),
+    Mode("app_launcher.py", ("--list", "--json"), "adb", "package listing"),
     # --state and --launch already exit 1 here: the injected failure is a
     # device error, which main() maps before the state path can swallow it.
     # C6's second half (an adb call that RAN and failed) needs a recorded
@@ -143,7 +146,9 @@ MODES: tuple[Mode, ...] = (
     # Exits 1 here because the whole capture fails at the device level. X8 is
     # the PARTIAL capture -- a snapshot that succeeded except for the logs it
     # was asked for -- which needs a device that answers. Named so the gap is
-    # visible rather than assumed covered.
+    # visible rather than assumed covered; Inc 1 fixed it and asserts the exit
+    # status by injecting the component failure directly, in
+    # test_app_state_capture.py ("X8: a component that was asked for").
     Mode(
         "app_state_capture.py",
         ("--package", "com.example.app", "--output", f"{WORKDIR}/snapshots", "--json"),

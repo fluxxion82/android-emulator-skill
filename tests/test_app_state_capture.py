@@ -15,6 +15,7 @@ default carry their own budget instead of raising it for the whole skill.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -295,6 +296,91 @@ def test_unknown_serial_exits_one_with_an_actionable_message(
     assert "no-such-serial-xyz" in captured.err
     assert "adb devices" in captured.err, "the error does not say how to see what is attached"
     assert "Traceback" not in captured.err
+
+
+# === X8: a component that was asked for and did not arrive =================
+#
+# The runtime sweep cannot reach this: it breaks adb entirely, so the whole
+# capture fails at the device level and main() maps that before the partial
+# path runs. These inject the component failure directly, which is the only
+# way to assert the exit status the sweep's app_state_capture mode is silent
+# about.
+
+
+def _snapshot_cli(monkeypatch, tmp_path, argv: list[str]):
+    """Run main() over a device that answers, with everything but logs stubbed."""
+    monkeypatch.setattr(
+        app_state_capture,
+        "capture_screenshot",
+        lambda *_a, **_k: {"mode": "file", "file_path": "screenshot.png", "size_bytes": 10},
+    )
+    monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["app_state_capture.py", "--package", "com.example.app", "--output", str(tmp_path), *argv],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        app_state_capture.main()
+    return excinfo.value.code
+
+
+def test_an_invalid_log_window_fails_the_snapshot(monkeypatch, tmp_path, capsys):
+    """`--logs 1x` wrote "Invalid log duration" into the summary and exited 0.
+
+    The logs were explicitly requested, so their absence is the answer to the
+    question the agent asked -- not a footnote under "State captured".
+    """
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--logs", "1x"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "State captured" not in captured.out + captured.err
+    assert "Traceback" not in captured.err
+    assert "--logs" in captured.err, "the error does not name its remedy"
+
+
+def test_a_failed_log_capture_fails_the_snapshot(monkeypatch, tmp_path, capsys):
+    """The other half of X8: the window parsed, the capture itself failed."""
+    monkeypatch.setattr(
+        app_state_capture.AppStateCapture,
+        "_capture_logs",
+        lambda self, path, duration, log_lines=200: {"captured": False, "error": "logcat exited 1"},
+    )
+
+    code = _snapshot_cli(monkeypatch, tmp_path, [])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "State captured" not in captured.out + captured.err
+    assert "logcat exited 1" in captured.err
+
+
+def test_a_partial_snapshot_reports_json_as_an_error_with_what_it_kept(
+    monkeypatch, tmp_path, capsys
+):
+    """`--json` on failure is `{"error": ..., "partial": ...}` -- and the
+    partial half is what makes keeping the artifacts worth anything."""
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--logs", "1x", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert set(payload) == {"error", "partial"}, payload
+    assert "screenshot.png" in payload["partial"]["artifacts"]
+    assert payload["partial"]["logs"]["captured"] is False
+
+
+def test_a_snapshot_that_was_not_asked_for_logs_still_succeeds(monkeypatch, tmp_path, capsys):
+    """The negative control: --no-logs must not read as a missing component."""
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--no-logs"])
+
+    assert code == 0
+    assert "State captured" in capsys.readouterr().out
 
 
 def test_device_info_records_the_effective_density_not_the_physical_one(monkeypatch, recorded):

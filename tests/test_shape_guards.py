@@ -374,6 +374,8 @@ QUOTER = "quote_for_device_shell"
 
 UNQUOTED = "unquoted"
 
+QUOTED = "quoted"
+
 # Sites where a non-literal reaches the device shell unquoted and that is not a
 # defect, keyed by file::function so a moved line does not silently re-open one.
 # Every entry names the reason the value cannot carry a shell metacharacter.
@@ -396,42 +398,101 @@ QUOTING_EXEMPT: dict[str, str] = {
     ),
 }
 
-# What the guard reports today, confirmed by reading each call. The fixing PR
-# empties this list. Codex's evidence for the finding cited, per file:
+# What the guard reports today. Empty since Inc 1 wrapped all nineteen sites
+# C3 and X2 named; a site appearing here again is reported as untriaged rather
+# than silently accepted. Codex's evidence for the finding cited, per file:
 #   C3  app_launcher.py:103,147,251 · app_state_capture.py:231-260,351
 #   X2  privacy_manager.py:123,159,199,268 · status_bar.py:284,341,395
 #       · appearance.py:128-162
 # Two of those citations name the line of the *argument* rather than of the
-# call that carries it (status_bar :395 is `mobile_type` inside the call opened
-# at :384; app_launcher :103 is the extras list built for the call at :108).
-# The trailing comments below are the call lines this guard reports today --
-# a reading aid, not matched data.
-KNOWN_UNQUOTED: tuple[Expectation, ...] = (
-    Expectation("app_launcher.py", "launch", UNQUOTED, "component, *extra_args"),  # :108
-    Expectation("app_launcher.py", "terminate", UNQUOTED, "package_name"),  # :147
-    Expectation("app_launcher.py", "open_url", UNQUOTED, "url"),  # :251
-    Expectation("app_launcher.py", "get_state", UNQUOTED, "package_name"),  # :313
-    Expectation("app_launcher.py", "_get_launcher_activity", UNQUOTED, "package_name"),  # :360
+# call that carries it (status_bar :395 was `mobile_type` inside the call
+# opened at :384; app_launcher :103 was the extras list built for the call at
+# :108). The nineteen are now enumerated positively in KNOWN_QUOTED below --
+# an empty negative list on its own would be satisfied by a detector that had
+# gone blind, and by a fix that deleted the calls instead of quoting them.
+KNOWN_UNQUOTED: tuple[Expectation, ...] = ()
+
+# The five files C3/X2 named, enumerated the other way round: every argument
+# that now *is* wrapped, as an exact multiset. Scoped to those five so a
+# concurrent change to navigator or container -- other people's files, other
+# findings -- cannot fail this test; the whole corpus is still covered by
+# KNOWN_UNQUOTED and by the call-count floor above.
+QUOTED_ENUMERATION_FILES = frozenset(
+    {
+        "app_launcher.py",
+        "app_state_capture.py",
+        "appearance.py",
+        "privacy_manager.py",
+        "status_bar.py",
+    }
+)
+
+# Read off the fixed tree, one entry per call. `str(level)` and friends are
+# wrapped alongside the free-text argument they travel with: the exemption
+# mechanism is per file::function, so exempting the number would have exempted
+# `datatype` and `mobile_type` in the same call -- which is the user-supplied
+# text this finding is about. status_bar's set_battery / set_wifi keep their
+# numeric exemptions; nothing about them changed.
+KNOWN_QUOTED: tuple[Expectation, ...] = (
+    Expectation(
+        "app_launcher.py", "launch", QUOTED, "quote_for_device_shell(component), *extra_args"
+    ),
+    Expectation("app_launcher.py", "terminate", QUOTED, "quote_for_device_shell(package_name)"),
+    Expectation("app_launcher.py", "open_url", QUOTED, "quote_for_device_shell(url)"),
+    Expectation("app_launcher.py", "get_state", QUOTED, "quote_for_device_shell(package_name)"),
+    Expectation(
+        "app_launcher.py", "_get_launcher_activity", QUOTED, "quote_for_device_shell(package_name)"
+    ),
     # Twice in one function -- `dumpsys package <pkg>` and `pidof <pkg>`. The
     # comparison counts, so losing one of the pair is still reported.
-    Expectation("app_state_capture.py", "_get_app_info", UNQUOTED, "self.package"),  # :231
-    Expectation("app_state_capture.py", "_get_app_info", UNQUOTED, "self.package"),  # :248
-    Expectation("app_state_capture.py", "_capture_logs", UNQUOTED, "self.package"),  # :351
-    Expectation("appearance.py", "build_locale_command", UNQUOTED, "locale"),  # :141
     Expectation(
-        "privacy_manager.py", "grant_permission", UNQUOTED, "package, full_permission"
-    ),  # :123
+        "app_state_capture.py", "_get_app_info", QUOTED, "quote_for_device_shell(self.package)"
+    ),
     Expectation(
-        "privacy_manager.py", "revoke_permission", UNQUOTED, "package, full_permission"
-    ),  # :159
-    Expectation("privacy_manager.py", "confirm_permission", UNQUOTED, "package"),  # :199
-    Expectation("privacy_manager.py", "list_app_permissions", UNQUOTED, "package"),  # :268
-    Expectation("status_bar.py", "set_mobile_data", UNQUOTED, "str(level), datatype"),  # :247
-    Expectation("status_bar.py", "set_time", UNQUOTED, "time_str.replace(':', '')"),  # :284
-    Expectation("status_bar.py", "override", UNQUOTED, "time.replace(':', '')"),  # :342
-    Expectation("status_bar.py", "override", UNQUOTED, "str(battery)"),  # :346
-    Expectation("status_bar.py", "override", UNQUOTED, "str(wifi_level)"),  # :367
-    Expectation("status_bar.py", "override", UNQUOTED, "str(mobile_level), mobile_type"),  # :384
+        "app_state_capture.py", "_get_app_info", QUOTED, "quote_for_device_shell(self.package)"
+    ),
+    Expectation(
+        "app_state_capture.py", "_capture_logs", QUOTED, "quote_for_device_shell(self.package)"
+    ),
+    Expectation("appearance.py", "build_locale_command", QUOTED, "quote_for_device_shell(locale)"),
+    Expectation(
+        "privacy_manager.py",
+        "grant_permission",
+        QUOTED,
+        "quote_for_device_shell(package), quote_for_device_shell(full_permission)",
+    ),
+    Expectation(
+        "privacy_manager.py",
+        "revoke_permission",
+        QUOTED,
+        "quote_for_device_shell(package), quote_for_device_shell(full_permission)",
+    ),
+    Expectation(
+        "privacy_manager.py", "confirm_permission", QUOTED, "quote_for_device_shell(package)"
+    ),
+    Expectation(
+        "privacy_manager.py", "list_app_permissions", QUOTED, "quote_for_device_shell(package)"
+    ),
+    Expectation(
+        "status_bar.py",
+        "set_mobile_data",
+        QUOTED,
+        "quote_for_device_shell(str(level)), quote_for_device_shell(datatype)",
+    ),
+    Expectation(
+        "status_bar.py", "set_time", QUOTED, "quote_for_device_shell(time_str.replace(':', ''))"
+    ),
+    Expectation(
+        "status_bar.py", "override", QUOTED, "quote_for_device_shell(time.replace(':', ''))"
+    ),
+    Expectation("status_bar.py", "override", QUOTED, "quote_for_device_shell(str(battery))"),
+    Expectation("status_bar.py", "override", QUOTED, "quote_for_device_shell(str(wifi_level))"),
+    Expectation(
+        "status_bar.py",
+        "override",
+        QUOTED,
+        "quote_for_device_shell(str(mobile_level)), quote_for_device_shell(mobile_type)",
+    ),
 )
 
 
@@ -497,11 +558,21 @@ class _QuotingScope:
             return locals_too and node.id in self._local_literals
         return False
 
-    def is_safe(self, node: ast.AST) -> bool:
-        """Whether this argument may cross the device shell as it stands."""
-        if self._is_literal(node) or self._is_quoter_call(node):
+    def is_quoted(self, node: ast.AST) -> bool:
+        """Whether this argument was *deliberately wrapped* for the device shell.
+
+        Narrower than :meth:`is_safe` on purpose. A string literal is safe and
+        is not quoted, and the difference is what lets the positive
+        enumeration below say "this call still wraps its package name" rather
+        than the far weaker "this call has nothing wrong with it".
+        """
+        if self._is_quoter_call(node):
             return True
         return isinstance(node, ast.Name) and node.id in self._local_quoted
+
+    def is_safe(self, node: ast.AST) -> bool:
+        """Whether this argument may cross the device shell as it stands."""
+        return self._is_literal(node) or self.is_quoted(node)
 
 
 def _module_literal_names(tree: ast.Module) -> set[str]:
@@ -531,7 +602,7 @@ def _quoter_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def scan_quoting(filename: str, source: str) -> list[Site]:
+def scan_quoting(filename: str, source: str, *, report: str = UNQUOTED) -> list[Site]:
     """Device-shell arguments that are neither literal nor quoted.
 
     A ``*args`` splat is a forwarder, not an interpolation: the values came
@@ -539,6 +610,12 @@ def scan_quoting(filename: str, source: str) -> list[Site]:
     a sink (``status_bar._demo_broadcast``, ``push_notification._shell``) is
     resolved one level out and its *call sites* are checked instead. Without
     that, three quarters of the status-bar defect is invisible.
+
+    With ``report=QUOTED`` the same walk reports the opposite population: the
+    arguments that *are* wrapped. One traversal answers both questions, so the
+    two enumerations below cannot drift into disagreeing about which calls
+    reach the device shell at all -- and removing a wrapper moves a site from
+    one list to the other, failing both.
     """
     tree = ast.parse(source, filename=filename)
     module_literals = _module_literal_names(tree)
@@ -553,42 +630,42 @@ def scan_quoting(filename: str, source: str) -> list[Site]:
     forwarders: set[str] = set()
     sites: list[Site] = []
 
-    def unsafe(args: list[ast.expr], func: ast.AST | None) -> list[str]:
+    def classify(args: list[ast.expr], func: ast.AST | None) -> list[str]:
+        """The arguments of one call that fall into the population asked for."""
         scope = _QuotingScope(module_literals, quoters, func)
-        bad: list[str] = []
+        found: list[str] = []
         for arg in args:
+            value = arg.value if isinstance(arg, ast.Starred) else arg
             if isinstance(arg, ast.Starred):
-                value = arg.value
                 vararg = getattr(getattr(func, "args", None), "vararg", None)
                 if isinstance(value, ast.Name) and vararg is not None and value.id == vararg.arg:
                     forwarders.add(func.name)
                     continue
-                if scope.is_safe(value):
-                    continue
-                bad.append(ast.unparse(arg))
+            if report == QUOTED:
+                if scope.is_quoted(value):
+                    found.append(ast.unparse(arg))
                 continue
-            if scope.is_safe(arg):
-                continue
-            bad.append(ast.unparse(arg))
-        return bad
+            if not scope.is_safe(value):
+                found.append(ast.unparse(arg))
+        return found
 
-    def record(node: ast.Call, bad: list[str]) -> None:
+    def record(node: ast.Call, detail: list[str]) -> None:
         sites.append(
             Site(
                 filename,
                 enclosing.get(id(node), "<module>"),
                 node.lineno,
-                UNQUOTED,
-                ", ".join(bad),
+                report,
+                ", ".join(detail),
             )
         )
 
     # Direct sinks: run_adb("shell", serial, ...) and friends, under whatever
     # name this module imported them.
     for node in _sink_calls(tree, "shell"):
-        bad = unsafe(node.args[2:], owner.get(id(node)))
-        if bad:
-            record(node, bad)
+        detail = classify(node.args[2:], owner.get(id(node)))
+        if detail:
+            record(node, detail)
 
     # Call sites of the forwarders discovered above.
     for node in ast.walk(tree):
@@ -597,9 +674,9 @@ def scan_quoting(filename: str, source: str) -> list[Site]:
         func = owner.get(id(node))
         if func is not None and func.name in forwarders:
             continue  # the definition forwarding to itself
-        bad = unsafe(node.args, func)
-        if bad:
-            record(node, bad)
+        detail = classify(node.args, func)
+        if detail:
+            record(node, detail)
 
     return sorted(sites, key=lambda site: site.line)
 
@@ -614,13 +691,17 @@ def unquoted_device_shell_arguments(*, apply_exemptions: bool = True) -> list[Si
     return found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C3/X2: package names, URLs, locales and permissions still reach the "
-        "device shell unquoted in five files. Inc 1 wraps them."
-    ),
-)
+def quoted_device_shell_arguments() -> list[Site]:
+    """The wrapped arguments in the five files C3/X2 named."""
+    found: list[Site] = []
+    for path in _script_files():
+        name = _relative(path)
+        if name not in QUOTED_ENUMERATION_FILES:
+            continue
+        found.extend(scan_quoting(name, path.read_text(encoding="utf-8"), report=QUOTED))
+    return found
+
+
 def test_every_device_shell_argument_is_quoted():
     """A value crossing into ``sh -c`` on the device must be quoted for it.
 
@@ -726,10 +807,24 @@ def test_the_quoting_guard_enumerates_todays_sites():
     Matched as a multiset of (file, function, kind, argument text), so the
     *count* inside a function is asserted too and a rename cannot pass as the
     same site. Lines appear in the failure message and in the comments beside
-    each entry; they are not compared. The fixing PR empties
-    ``KNOWN_UNQUOTED``.
+    each entry; they are not compared. ``KNOWN_UNQUOTED`` is empty since Inc 1,
+    so this now says "nothing untriaged reaches the device shell"; the claim
+    that the nineteen were *fixed* rather than *lost* is the next test.
     """
     _assert_enumeration(KNOWN_UNQUOTED, unquoted_device_shell_arguments(), "KNOWN_UNQUOTED")
+
+
+def test_the_five_named_files_wrap_every_value_they_interpolate():
+    """The positive half, and the one an emptied negative list cannot supply.
+
+    "No unquoted arguments" is satisfied three ways: the values are wrapped,
+    the detector went blind, or the calls were deleted. Only the first is the
+    fix, so the nineteen sites are enumerated again from the other side --
+    same traversal, same multiset comparison, reporting the arguments that
+    *are* wrapped. Deleting one ``quote_for_device_shell`` makes this test
+    report it missing and the test above report it untriaged.
+    """
+    _assert_enumeration(KNOWN_QUOTED, quoted_device_shell_arguments(), "KNOWN_QUOTED")
 
 
 def test_the_quoting_exemptions_do_not_rot():

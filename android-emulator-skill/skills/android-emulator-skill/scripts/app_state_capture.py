@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from common import adb_exec, logcat
-from common.device_utils import get_ui_hierarchy, parse_display_density
+from common.device_utils import get_ui_hierarchy, parse_display_density, quote_for_device_shell
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
 
@@ -120,6 +120,15 @@ class AppStateCapture:
         """
         Capture complete app state.
 
+        A component the caller *asked for* and did not get makes the snapshot a
+        failure (X8). Logs are the reachable case: ``--logs 1x`` is not a
+        duration and a log capture can fail on a device that is otherwise
+        answering, and both used to be written into the summary as
+        ``captured: false`` underneath the words "State captured" and an exit
+        status of 0. The artifacts that were collected are still written and
+        still returned -- a partial snapshot is worth keeping, it is just not a
+        success.
+
         Args:
             output_dir: Directory to save artifacts
             include_logs: Include app logs
@@ -128,7 +137,8 @@ class AppStateCapture:
             screenshot_size: Screenshot size (full, half, quarter)
 
         Returns:
-            (success, message, output_path) tuple
+            ``(success, message, output_path, partial)``. ``partial`` is the
+            snapshot summary as far as it got, empty when nothing was written.
         """
         # Create output directory with timestamp
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -202,10 +212,27 @@ class AppStateCapture:
             # 7. Human-readable markdown summary
             self._write_summary_md(snapshot_dir, summary)
 
+            # 8. A component that was requested and did not arrive is a failed
+            #    snapshot, not a footnote inside a successful one.
+            if log_stats is not None and not log_stats.get("captured"):
+                reason = log_stats.get("reason") or log_stats.get("error") or "log capture failed"
+                return (
+                    False,
+                    (
+                        f"Snapshot incomplete: logs were requested and {reason}. "
+                        f"Everything else was written to {snapshot_dir}/. "
+                        f"Re-run with a valid --logs window (e.g. --logs 30s) "
+                        f"or --no-logs to skip log capture."
+                    ),
+                    str(snapshot_dir),
+                    summary,
+                )
+
             return (
                 True,
                 f"State captured: {snapshot_dir}/",
                 str(snapshot_dir),
+                summary,
             )
 
         except adb_exec.AdbError:
@@ -214,7 +241,7 @@ class AppStateCapture:
             # error already names.
             raise
         except Exception as e:
-            return False, f"Failed to capture state: {e}", None
+            return False, f"Failed to capture state: {e}", None, {}
 
     def _get_app_info(self) -> dict:
         """
@@ -233,7 +260,7 @@ class AppStateCapture:
             self.serial,
             "dumpsys",
             "package",
-            self.package,
+            quote_for_device_shell(self.package),
             "|",
             "grep",
             "versionName",
@@ -245,7 +272,9 @@ class AppStateCapture:
                 break
 
         # Get PID. `pidof` exits non-zero when the app is not running.
-        result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
+        result = adb_exec.run_adb(
+            "shell", self.serial, "pidof", quote_for_device_shell(self.package)
+        )
         info["pid"] = result.stdout.strip() if result.ok else None
 
         # Get current activity
@@ -348,7 +377,9 @@ class AppStateCapture:
 
         # Add package filter if PID available. `pidof` exits non-zero when the
         # app is not running; the snapshot then keeps the unfiltered window.
-        pid_result = adb_exec.run_adb("shell", self.serial, "pidof", self.package)
+        pid_result = adb_exec.run_adb(
+            "shell", self.serial, "pidof", quote_for_device_shell(self.package)
+        )
         pid = pid_result.stdout.strip() if pid_result.ok else ""
 
         try:
@@ -488,7 +519,7 @@ Examples:
     # offline, unauthorized) means no command ever ran. Print the remedy the
     # error already carries rather than letting a traceback reach the user.
     try:
-        success, message, snapshot_path = capturer.capture(
+        success, message, snapshot_path, partial = capturer.capture(
             output_dir=args.output,
             include_logs=not args.no_logs,
             log_duration=args.logs,
@@ -497,6 +528,16 @@ Examples:
         )
     except adb_exec.AdbError as error:
         print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    if not success:
+        # X8: a missing component used to be reported under "State captured"
+        # with exit 0. What WAS captured is still handed over, under `partial`,
+        # so the agent can use the screenshot it did get -- but the run failed.
+        if args.json:
+            print(json.dumps({"error": message, "partial": partial}, indent=2))
+        else:
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
 
     if args.json:
@@ -509,7 +550,7 @@ Examples:
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

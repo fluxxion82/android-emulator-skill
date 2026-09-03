@@ -33,6 +33,7 @@ import json
 import sys
 
 from common import adb_exec
+from common.device_utils import quote_for_device_shell
 from common.env_config import env_int
 
 # Tunable battery levels for presets (overridable via ANDROID_EMU_* env vars).
@@ -107,6 +108,16 @@ class StatusBarController:
     def _demo_broadcast(self, *extras: str) -> adb_exec.AdbResult:
         """
         Send a SystemUI demo-mode broadcast.
+
+        The extras are forwarded to the device shell as they arrive, so each
+        caller quotes its own non-literal values (``quote_for_device_shell``)
+        before handing them over -- adb joins the host argv into one string and
+        the device's ``sh -c`` re-parses it, which is what let a mobile
+        ``--datatype`` or a ``--time`` string carrying ``;`` run a second
+        command. Callers wrap the numeric levels travelling in the same argv
+        too: ``shlex.quote("4")`` is ``4``, and quoting the whole group keeps
+        the rule "wrap what you interpolate" instead of asking each reader to
+        re-derive which of two adjacent values can hold a metacharacter.
 
         Args:
             *extras: Additional ``-e key value`` arguments for the broadcast
@@ -253,10 +264,10 @@ class StatusBarController:
                 "show" if enabled else "hide",
                 "-e",
                 "level",
-                str(level),
+                quote_for_device_shell(str(level)),
                 "-e",
                 "datatype",
-                datatype,
+                quote_for_device_shell(datatype),
             )
             state = f"shown at level {level} ({datatype})" if enabled else "hidden"
             return True, f"Mobile data {state}"
@@ -287,7 +298,7 @@ class StatusBarController:
                 "clock",
                 "-e",
                 "hhmm",
-                time_str.replace(":", ""),
+                quote_for_device_shell(time_str.replace(":", "")),
             )
 
             return True, f"Time set to {time_str} (demo mode)"
@@ -339,7 +350,14 @@ class StatusBarController:
             applied = []
 
             if time:
-                self._demo_broadcast("-e", "command", "clock", "-e", "hhmm", time.replace(":", ""))
+                self._demo_broadcast(
+                    "-e",
+                    "command",
+                    "clock",
+                    "-e",
+                    "hhmm",
+                    quote_for_device_shell(time.replace(":", "")),
+                )
                 applied.append(f"time={time}")
 
             if battery is not None:
@@ -349,7 +367,7 @@ class StatusBarController:
                     "battery",
                     "-e",
                     "level",
-                    str(battery),
+                    quote_for_device_shell(str(battery)),
                     "-e",
                     "plugged",
                     "true" if charging else "false",
@@ -373,7 +391,7 @@ class StatusBarController:
                         "show",
                         "-e",
                         "level",
-                        str(wifi_level),
+                        quote_for_device_shell(str(wifi_level)),
                     )
                 else:
                     self._demo_broadcast("-e", "command", "network", "-e", "wifi", "hide")
@@ -390,10 +408,10 @@ class StatusBarController:
                         "show",
                         "-e",
                         "level",
-                        str(mobile_level),
+                        quote_for_device_shell(str(mobile_level)),
                         "-e",
                         "datatype",
-                        mobile_type,
+                        quote_for_device_shell(mobile_type),
                     )
                 else:
                     self._demo_broadcast(

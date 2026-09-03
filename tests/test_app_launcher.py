@@ -9,6 +9,7 @@ itself rather than for a per-module ``subprocess``.
 
 from __future__ import annotations
 
+import json as json_lib
 import subprocess
 import sys
 
@@ -307,3 +308,127 @@ def test_ambiguous_device_tells_the_agent_which_flag_to_pass(monkeypatch, capsys
 
     assert excinfo.value.code == 1
     assert "--serial" in capsys.readouterr().err
+
+
+# --- C6: a failed lookup is not an empty answer ----------------------------
+#
+# `--list` used to catch every exception, answer `[]`, print
+# "Installed packages (0):" and exit 0. "Nothing is installed" and "I could
+# not look" are different answers and the agent has no second signal.
+
+
+def _run_cli(monkeypatch, argv: list[str]):
+    """Run main() with argv, returning the SystemExit code."""
+    monkeypatch.setattr(app_launcher, "resolve_device_identifier", lambda value: value)
+    monkeypatch.setattr(sys, "argv", ["app_launcher.py", *argv])
+    with pytest.raises(SystemExit) as excinfo:
+        app_launcher.main()
+    return excinfo.value.code
+
+
+def test_list_packages_raises_rather_than_answering_with_an_empty_list(monkeypatch):
+    """The method-level half of C6: the failure must reach the caller."""
+
+    def boom(_serial):
+        raise app_launcher.adb_exec.DeviceNotFoundError("adb: device 'x' not found")
+
+    monkeypatch.setattr(app_launcher, "list_installed_packages", boom)
+
+    with pytest.raises(app_launcher.adb_exec.DeviceNotFoundError):
+        AppLauncher(serial="emulator-5554").list_packages()
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_list_exits_non_zero_when_the_device_cannot_be_reached(monkeypatch, capsys, json_mode):
+    """Both output modes, because C6 was one contract kept in neither."""
+
+    def boom(_serial):
+        raise app_launcher.adb_exec.DeviceNotFoundError(
+            "device 'no-such-serial-xyz' not found; run `adb devices` to see what is attached"
+        )
+
+    monkeypatch.setattr(app_launcher, "list_installed_packages", boom)
+
+    code = _run_cli(monkeypatch, ["--list", *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert "Installed packages" not in captured.out, "a failed lookup printed an answer"
+    if json_mode:
+        payload = json_lib.loads(captured.out)
+        assert set(payload) == {"error"}, payload
+        assert "adb devices" in payload["error"], "the error does not name its remedy"
+    else:
+        assert "adb devices" in captured.err, "the error does not name its remedy"
+
+
+def test_a_failed_pm_list_is_not_a_traceback(monkeypatch, capsys):
+    """`list_installed_packages` re-raises a non-zero `pm list packages` as a
+    plain RuntimeError, not an AdbError.
+
+    Catching only ``adb_exec.AdbError`` at the CLI boundary was survivable
+    while ``list_packages`` swallowed everything; the moment it stopped, this
+    became the traceback path.
+    """
+
+    def boom(_serial):
+        raise RuntimeError("Failed to list packages: pm exited 1; check the device is unlocked")
+
+    monkeypatch.setattr(app_launcher, "list_installed_packages", boom)
+
+    code = _run_cli(monkeypatch, ["--list"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert captured.err.startswith("Error: ")
+    assert "pm exited 1" in captured.err
+
+
+def test_state_text_mode_does_not_index_an_error_dict(monkeypatch, capsys):
+    """`--state` printed `state['package']` on whatever get_state returned.
+
+    Reported as a failure, that dict has no ``package`` key, so the CLI died
+    with a KeyError traceback. get_state now raises instead of returning one,
+    and this pins the branch that keeps a future failure return off the
+    indexing path.
+    """
+    monkeypatch.setattr(
+        AppLauncher,
+        "get_state",
+        lambda self, package: (False, {"error": "could not read app state; run `adb devices`"}),
+    )
+
+    code = _run_cli(monkeypatch, ["--state", "com.example.app"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert "adb devices" in captured.err
+
+
+def test_state_json_mode_reports_the_error_and_exits_non_zero(monkeypatch, capsys):
+    """The other half: `--state --json` printed the error dict and exited 0."""
+    monkeypatch.setattr(
+        AppLauncher,
+        "get_state",
+        lambda self, package: (False, {"error": "could not read app state; run `adb devices`"}),
+    )
+
+    code = _run_cli(monkeypatch, ["--state", "com.example.app", "--json"])
+    payload = json_lib.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert set(payload) == {"error"}, payload
+
+
+def test_state_still_answers_for_an_uninstalled_package(monkeypatch, capsys):
+    """The negative control: "not installed" is an answer, not a failure."""
+    monkeypatch.setattr(app_launcher, "list_installed_packages", lambda _serial: ["com.other"])
+
+    code = _run_cli(monkeypatch, ["--state", "com.example.app"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "Installed: No" in captured.out
