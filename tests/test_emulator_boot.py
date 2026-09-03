@@ -11,12 +11,14 @@ user as a remedy rather than a traceback.
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 
 import emulator_boot
 import pytest
 
 from common import adb_exec
+from common.sdk_tools import SdkToolError
 
 
 class _FakeProcess:
@@ -237,14 +239,21 @@ def test_avd_listing_is_bounded(monkeypatch):
     assert calls[0]["kwargs"].get("timeout"), "`emulator -list-avds` went out unbounded"
 
 
-def test_avd_listing_survives_its_own_timeout(monkeypatch):
-    """A bounded call raises TimeoutExpired, which must not become a traceback."""
+def test_avd_listing_reports_its_own_timeout(monkeypatch):
+    """A bounded call raises TimeoutExpired: a remedy, not a traceback, and not [].
+
+    X3: the empty list this used to assert is the answer for "this host defines
+    no AVDs", so returning it for "the listing timed out" left `--list-avds`
+    saying "No AVDs found" at exit 0.
+    """
     _fake_emulator_on_path(monkeypatch)
     _fake_adb(
         monkeypatch,
         {("emulator",): subprocess.TimeoutExpired(cmd="emulator", timeout=30)},
     )
-    assert emulator_boot.list_avds() == []
+    with pytest.raises(SdkToolError) as excinfo:
+        emulator_boot.list_avds()
+    assert "retry" in str(excinfo.value), "the timeout names no remedy"
 
 
 def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
@@ -272,7 +281,7 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # Emulator resolution (SDK-root-on-PATH regression)
 # ---------------------------------------------------------------------------
-def test_list_avds_survives_permission_error_from_a_directory_argv0(monkeypatch, capsys):
+def test_list_avds_reports_a_permission_error_from_a_directory_argv0(monkeypatch):
     """`emulator` resolving to a directory raises PermissionError, not ENOENT."""
     monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: "/sdk/emulator/emulator")
 
@@ -281,11 +290,12 @@ def test_list_avds_survives_permission_error_from_a_directory_argv0(monkeypatch,
 
     monkeypatch.setattr(emulator_boot.subprocess, "run", boom)
 
-    assert emulator_boot.list_avds() == []
-    assert "Permission denied" not in capsys.readouterr().out
+    with pytest.raises(SdkToolError) as excinfo:
+        emulator_boot.list_avds()
+    assert "$ANDROID_HOME/emulator" in str(excinfo.value), "no remedy for the SDK-root PATH"
 
 
-def test_list_avds_reports_actionable_hint_when_unresolvable(monkeypatch, capsys):
+def test_list_avds_reports_actionable_hint_when_unresolvable(monkeypatch):
     monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: None)
 
     def unexpected(_cmd, **_kwargs):  # pragma: no cover - must not run
@@ -293,8 +303,25 @@ def test_list_avds_reports_actionable_hint_when_unresolvable(monkeypatch, capsys
 
     monkeypatch.setattr(emulator_boot.subprocess, "run", unexpected)
 
-    assert emulator_boot.list_avds() == []
-    assert "$ANDROID_HOME/emulator" in capsys.readouterr().err
+    with pytest.raises(SdkToolError) as excinfo:
+        emulator_boot.list_avds()
+    message = str(excinfo.value)
+    assert "Looked in" in message, "the failure does not say where it looked"
+    assert "$ANDROID_HOME/emulator" in message
+
+
+def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, capsys):
+    """X3, as the agent meets it: `--list-avds --json` on a host with no SDK."""
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: None)
+    monkeypatch.setattr(emulator_boot.sys, "argv", ["emulator_boot.py", "--list-avds", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        emulator_boot.main()
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "error" in payload, f"--json reported no error: {payload}"
+    assert payload.get("avds") is None, "an empty AVD list was printed alongside the error"
 
 
 def test_list_avds_parses_recorded_emulator_output(monkeypatch, recorded):
@@ -304,6 +331,8 @@ def test_list_avds_parses_recorded_emulator_output(monkeypatch, recorded):
 
     class _Result:
         stdout = recorded.text("emulator_list_avds")
+        stderr = ""
+        returncode = 0
 
     def fake_run(cmd, **_kwargs):
         seen.append(cmd)

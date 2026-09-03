@@ -47,7 +47,14 @@ from common import adb_exec
 from common.device_utils import get_connected_devices
 from common.emu_console import EmuConsoleError, run_emu
 from common.env_config import env_int
-from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
+from common.sdk_tools import (
+    EMULATOR_NOT_FOUND_MESSAGE,
+    EMULATOR_NOT_FOUND_REMEDY,
+    SdkToolError,
+    get_emulator_path,
+    missing_emulator_error,
+    run_sdk_tool,
+)
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_SUGGEST_COUNT = env_int("ANDROID_EMU_SELECTOR_COUNT", 4, min_value=1)
@@ -227,8 +234,6 @@ class EmulatorSelector:
                 falling back to ``~/.android-emulator-skill/config.json``.
         """
         self.config_path = config_path or self._default_config_path()
-        # One "emulator not found" line per run, not one per AVD lookup.
-        self._emulator_warned = False
 
     @staticmethod
     def _default_config_path() -> Path:
@@ -269,32 +274,28 @@ class EmulatorSelector:
 
     def _list_avd_names(self) -> list[str]:
         """
-        Return AVD names via ``emulator -list-avds`` (empty on any failure).
+        Return AVD names via ``emulator -list-avds``.
 
         The binary is resolved explicitly (see :mod:`common.sdk_tools`); exec'ing
         the bare name raises ``PermissionError`` when PATH holds the SDK root.
+
+        An empty list means the emulator ran and reported no AVDs, which is a
+        legitimate answer and ranks nothing. A missing or failing emulator
+        raises (X3): ``--suggest`` used to print "No AVDs found" and exit 0 on a
+        host with no SDK, which reads exactly like a host with no AVDs.
+
+        Raises:
+            SdkToolError: The emulator binary is absent, or it ran and failed.
         """
         emulator = get_emulator_path()
         if not emulator:
-            if not self._emulator_warned:
-                print(EMULATOR_NOT_FOUND_MESSAGE, file=sys.stderr)
-                self._emulator_warned = True
-            return []
-
-        try:
-            result = subprocess.run(
-                [emulator, "-list-avds"],
-                capture_output=True,
-                text=True,
-                timeout=EMULATOR_TOOL_TIMEOUT,
-                check=True,
-            )
-        except OSError as e:
-            print(f"Error: could not run {emulator!r}: {e}", file=sys.stderr)
-            return []
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return []
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            raise missing_emulator_error()
+        stdout = run_sdk_tool(
+            [emulator, "-list-avds"],
+            timeout=EMULATOR_TOOL_TIMEOUT,
+            remedy=EMULATOR_NOT_FOUND_REMEDY,
+        )
+        return [line.strip() for line in stdout.splitlines() if line.strip()]
 
     def running_avd_names(self) -> set[str]:
         """
@@ -559,6 +560,11 @@ def main():
     """Main entry point: run the CLI, reporting adb failures without a traceback."""
     try:
         _run()
+    except SdkToolError as error:
+        # AVD discovery could not run. An empty ranking would be indistinguishable
+        # from "this host defines no AVDs", so this is a failure with a remedy (X3).
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
     except adb_exec.AdbError as error:
         # run_adb raises errors whose message already names a remedy. Print it
         # rather than a traceback -- for an agent, stderr is the retry prompt.

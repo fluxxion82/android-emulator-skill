@@ -16,6 +16,7 @@ import emulator_selector
 import pytest
 
 from common import adb_exec
+from common.sdk_tools import SdkToolError
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +296,7 @@ def test_tunables_env_override(monkeypatch):
 # ---------------------------------------------------------------------------
 # Emulator resolution (SDK-root-on-PATH regression)
 # ---------------------------------------------------------------------------
-def test_list_avd_names_survives_permission_error_from_a_directory_argv0(monkeypatch, tmp_path):
+def test_list_avd_names_reports_a_permission_error_from_a_directory_argv0(monkeypatch, tmp_path):
     """`emulator` resolving to a directory raises PermissionError, not ENOENT."""
     monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: "/sdk/emulator/emulator")
 
@@ -305,10 +306,12 @@ def test_list_avd_names_survives_permission_error_from_a_directory_argv0(monkeyp
     monkeypatch.setattr(emulator_selector.subprocess, "run", boom)
 
     selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
-    assert selector._list_avd_names() == []
+    with pytest.raises(SdkToolError) as excinfo:
+        selector._list_avd_names()
+    assert "$ANDROID_HOME/emulator" in str(excinfo.value), "no remedy for the SDK-root PATH"
 
 
-def test_list_avd_names_reports_actionable_hint_when_unresolvable(monkeypatch, tmp_path, capsys):
+def test_list_avd_names_reports_actionable_hint_when_unresolvable(monkeypatch, tmp_path):
     monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
 
     def unexpected(_cmd, **_kwargs):  # pragma: no cover - must not run
@@ -317,8 +320,11 @@ def test_list_avd_names_reports_actionable_hint_when_unresolvable(monkeypatch, t
     monkeypatch.setattr(emulator_selector.subprocess, "run", unexpected)
 
     selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
-    assert selector._list_avd_names() == []
-    assert "$ANDROID_HOME/emulator" in capsys.readouterr().err
+    with pytest.raises(SdkToolError) as excinfo:
+        selector._list_avd_names()
+    message = str(excinfo.value)
+    assert "Looked in" in message, "the failure does not say where it looked"
+    assert "$ANDROID_HOME/emulator" in message
 
 
 def test_list_avd_names_parses_recorded_emulator_output(monkeypatch, tmp_path, recorded):
@@ -328,6 +334,8 @@ def test_list_avd_names_parses_recorded_emulator_output(monkeypatch, tmp_path, r
 
     class _Result:
         stdout = recorded.text("emulator_list_avds")
+        stderr = ""
+        returncode = 0
 
     def fake_run(cmd, **_kwargs):
         seen.append(cmd)
@@ -370,12 +378,24 @@ def test_boot_via_cli_reports_actionable_hint_when_unresolvable(monkeypatch):
     assert "$ANDROID_HOME/emulator" in message
 
 
-def test_missing_emulator_is_reported_once_per_selector(monkeypatch, tmp_path, capsys):
-    """`--list` calls _list_avd_names twice; the hint should not double up."""
+def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, tmp_path, capsys):
+    """X3, as the agent meets it: `--suggest` on a host with no emulator binary.
+
+    This replaces a test that asserted the hint was printed only once per run --
+    a print-and-carry-on shape that only makes sense while a broken SDK still
+    produces a ranking. It does not: `--suggest` now fails, once, with the
+    remedy, and ranks nothing.
+    """
     monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
-    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    monkeypatch.setattr(emulator_selector.sys, "argv", ["emulator_selector.py", "--suggest"])
 
-    selector._list_avd_names()
-    selector._list_avd_names()
+    with pytest.raises(SystemExit) as exc:
+        emulator_selector.main()
 
-    assert capsys.readouterr().err.count("emulator' binary not found") == 1
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.count("emulator' binary not found") == 1
+    assert "Traceback" not in captured.err
+    assert "No AVDs" not in captured.out, "an empty ranking was printed as well"

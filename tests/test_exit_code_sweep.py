@@ -156,21 +156,14 @@ MODES: tuple[Mode, ...] = (
         "whole-capture failure; the partial-capture case (X8) is out of reach here",
     ),
     # --- X3 / L8: the lifecycle scripts with no SDK -------------------------
-    Mode("device_list.py", ("--json",), "adb", "device and AVD inventory", defect="X3"),
-    Mode("emulator_boot.py", ("--list-avds", "--json"), "emulator", "AVD listing", defect="X3"),
-    Mode(
-        "emulator_selector.py",
-        ("--suggest", "--json"),
-        "emulator",
-        "AVD suggestion",
-        defect="X3",
-    ),
+    Mode("device_list.py", ("--json",), "adb", "device and AVD inventory"),
+    Mode("emulator_boot.py", ("--list-avds", "--json"), "emulator", "AVD listing"),
+    Mode("emulator_selector.py", ("--suggest", "--json"), "emulator", "AVD suggestion"),
     Mode(
         "emulator_delete.py",
         ("--all", "--yes", "--json"),
         "avdmanager",
         "batch delete with no avdmanager",
-        defect="L8",
     ),
     # --- diagnostics --------------------------------------------------------
     Mode("log_monitor.py", ("--last", "1m", "--json"), "adb", "historical log window"),

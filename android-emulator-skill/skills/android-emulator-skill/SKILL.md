@@ -77,6 +77,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Wait for device ready with timeout
    - Batch boot operations
    - Headless mode support
+   - `--list-avds` prints nothing and exits **0** only when the emulator ran and
+     this host defines no AVDs. A missing or failing `emulator` binary is an
+     error naming where it was looked for, and exits 1 (`{"error": ...}` under
+     `--json`) — "no AVDs" and "could not look" are different answers
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
@@ -94,9 +98,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Options: `--device`, `--api`, `--name`, `--abi`, `--variant`, `--list-devices`, `--list-images`, `--json`
 
 8. **emulator_delete.py** ⭐ NEW - Delete AVDs permanently
-   - Delete by AVD name
+   - Delete by AVD name, or in batch with `--all` / `--old N` (`--yes` skips the prompt)
    - List available AVDs
-   - Options: `--name`, `--list`, `--json`
+   - Every mode reports a missing or failing `avdmanager` the same way: exit 1
+     with the `cmdline-tools` remedy, never "No AVDs deleted" at exit 0
+   - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
 
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
    - Wipe user data without deleting AVD
@@ -248,9 +254,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
 
 24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
+    - An empty inventory at exit 0 means the tools ran and found nothing. A
+      missing or failing `adb` or `emulator` exits 1 with the remedy
+      (`{"error": ...}` under `--json`). `avdmanager` is the exception: it only
+      adds target/ABI detail, so its absence is a warning on stderr (and in
+      `warnings` in the JSON) rather than a failure
     - Options: `--get-details`, `--device-type`/`--name`, `--json`
 
 25. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
+    - A host with no AVDs ranks nothing and exits 0; a missing or failing
+      `emulator` binary exits 1 with the remedy instead of an empty ranking
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.

@@ -29,10 +29,13 @@ import emulator_erase
 import emulator_selector
 import pytest
 
+from common import sdk_tools
+
 
 class _Result:
     def __init__(self, stdout: str, returncode: int = 0):
         self.stdout = stdout
+        self.stderr = ""
         self.returncode = returncode
 
 
@@ -42,14 +45,32 @@ def avd_names(recorded) -> list[str]:
     return [line.strip() for line in recorded.lines("emulator_list_avds") if line.strip()]
 
 
+def _sdk_tools(monkeypatch, recorded):
+    """Answer every SDK tool at the one boundary they now share.
+
+    X3 moved the "ran and failed is not an empty list" policy into
+    ``common.sdk_tools.run_sdk_tool``, so the subprocess call these three
+    scripts make is no longer in the scripts. One fake, dispatching on the
+    argv, replaces the per-module fakes -- which also removes a hazard the old
+    shape had: the agreement test installs the emulator source and the
+    avdmanager source together, and two fakes on one module would have meant
+    the second silently replacing the first.
+    """
+
+    def fake_run(cmd, **_kwargs):
+        if "-list-avds" in cmd:
+            return _Result(recorded.text("emulator_list_avds"))
+        if "avd" in cmd and "-c" in cmd:
+            return _Result(recorded.text("avdmanager_list_avd_compact"))
+        return _Result("", returncode=1)
+
+    monkeypatch.setattr(sdk_tools.subprocess, "run", fake_run)
+
+
 def _emulator_source(monkeypatch, module, recorded):
     """Point ``module`` at a resolved emulator that emits the recorded output."""
     monkeypatch.setattr(module, "get_emulator_path", lambda: "/sdk/emulator/emulator")
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda _cmd, **_kw: _Result(recorded.text("emulator_list_avds")),
-    )
+    _sdk_tools(monkeypatch, recorded)
 
 
 def _avdmanager_source(monkeypatch, recorded):
@@ -58,11 +79,7 @@ def _avdmanager_source(monkeypatch, recorded):
         "get_avdmanager_path",
         lambda _self: "/sdk/cmdline-tools/latest/bin/avdmanager",
     )
-    monkeypatch.setattr(
-        emulator_delete.subprocess,
-        "run",
-        lambda _cmd, **_kw: _Result(recorded.text("avdmanager_list_avd_compact")),
-    )
+    _sdk_tools(monkeypatch, recorded)
 
 
 def _avd_home(monkeypatch, tmp_path, names):
