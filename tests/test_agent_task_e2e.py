@@ -24,7 +24,11 @@ was impossible to complete. The app must be installed:
 
     cd tests/fixtures/scaffold/compose && gradle :app:installDebug
 
-Marked `emulator`, so it is deselected unless run with `-m emulator`.
+The device-backed tests are marked `emulator`, so they are deselected unless
+run with `-m emulator`. The mark is per test rather than on the module, so the
+one piece of judgement in the fixture -- how two spellings of one component are
+compared -- is checked by the mocked lane, where a mistake in it is cheap to
+find.
 """
 
 from __future__ import annotations
@@ -47,8 +51,6 @@ from test_agent_loop_from_output import _expected_rect
 
 from common.device_utils import parse_focused_activity
 from common.hierarchy import capture_hierarchy
-
-pytestmark = pytest.mark.emulator
 
 SCRIPTS = (
     Path(__file__).resolve().parents[1]
@@ -128,6 +130,28 @@ def run_skill(compose_device: str):
     return _run
 
 
+def _expand_component(component: str | None) -> str | None:
+    """A ``package/class`` string with the class spelled in full.
+
+    The two sources disagree about how to write the same component, measured on
+    the lane: ``am start -W`` echoes the class as it was passed --
+    ``com.example.composefixture/.DefaultActivity`` -- while ``dumpsys window``
+    prints ``com.example.composefixture/com.example.composefixture.DefaultActivity``.
+    A leading dot is Android's shorthand for "in this package", and a name with
+    no dot at all is the same shorthand written without it, so both are expanded
+    before anything is compared. Comparing the raw strings would report a
+    correctly launched activity as the wrong screen.
+    """
+    if not component or "/" not in component:
+        return component
+    package, _, class_name = component.partition("/")
+    if class_name.startswith("."):
+        class_name = package + class_name
+    elif "." not in class_name:
+        class_name = f"{package}.{class_name}"
+    return f"{package}/{class_name}"
+
+
 def _focused_activity(adb: str, serial: str) -> str | None:
     """What the device says is in front, read through the shared parser.
 
@@ -177,13 +201,14 @@ def compose_app(run_skill, adb: str, compose_device: str):
     resolved = started.get("activity")
     assert resolved, f"--launch --json did not report the activity it started: {started}"
 
+    wanted = _expand_component(resolved)
     deadline = time.monotonic() + FOCUS_TIMEOUT
     focused = _focused_activity(adb, compose_device)
-    while focused != resolved and time.monotonic() < deadline:
+    while _expand_component(focused) != wanted and time.monotonic() < deadline:
         time.sleep(FOCUS_POLL_SECONDS)
         focused = _focused_activity(adb, compose_device)
 
-    assert focused == resolved, (
+    assert _expand_component(focused) == wanted, (
         f"am start reported {resolved!r} as displayed, but {focused!r} is focused "
         f"after {FOCUS_TIMEOUT}s. Nothing below this point would be measuring the "
         f"fixture app."
@@ -209,6 +234,7 @@ def _names_printed(report: str) -> list[str]:
     ]
 
 
+@pytest.mark.emulator
 def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app):
     """Quick Start, run as written, in the order an agent would run it.
 
@@ -311,6 +337,24 @@ def test_an_agent_can_complete_a_task_on_a_compose_screen(run_skill, compose_app
     ), f"lines were read but none classified, which is the A1 signature: {statistics}"
 
 
+def test_the_two_spellings_of_one_component_compare_equal():
+    """The comparison above, held to the pair the lane produced.
+
+    Not a device test: it is the one line of judgement in the fixture, and it
+    got the lane wrong once already by comparing the strings as written.
+    """
+    reported = "com.example.composefixture/.DefaultActivity"
+    focused = "com.example.composefixture/com.example.composefixture.DefaultActivity"
+    assert _expand_component(reported) == _expand_component(focused)
+
+    # An alias resolves to a genuinely different class, and must NOT compare
+    # equal to the name that was requested -- that is what the wait is for.
+    assert _expand_component("com.android.settings/.Settings") != _expand_component(
+        "com.android.settings/.homepage.SettingsHomepageActivity"
+    )
+
+
+@pytest.mark.emulator
 def test_the_agent_gets_an_actionable_error_when_it_targets_nothing(run_skill):
     """The other half of usable: failing in a way the agent can act on."""
     result = subprocess.run(
