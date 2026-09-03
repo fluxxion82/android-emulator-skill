@@ -103,18 +103,16 @@ def test_device_info_builds_expected_adb_commands(monkeypatch):
     assert any(c == "adb -s emulator-5554 shell wm density" for c in joined), joined
 
 
-def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path):
-    """--log-lines caps retained lines (keeping the newest) and stats reflect the cap."""
-    # 5 numbered lines; line 0 is an ERROR, line 1 a WARNING.
-    log_text = "\n".join(
-        [
-            "06-17 10:00:00.000 1 1 E Tag: line0 error",
-            "06-17 10:00:01.000 1 1 W Tag: line1 warning",
-            "06-17 10:00:02.000 1 1 I Tag: line2",
-            "06-17 10:00:03.000 1 1 I Tag: line3",
-            "06-17 10:00:04.000 1 1 I Tag: line4",
-        ]
-    )
+def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path, recorded):
+    """--log-lines caps retained lines (keeping the newest) and stats reflect the cap.
+
+    Driven by a real logcat window rather than five invented numbered lines:
+    the recording's errors and warnings all sit outside its tail, so capping
+    demonstrably drops them instead of a hand-placed `E Tag: line0 error`
+    doing so by construction.
+    """
+    log_text = recorded.text("logcat_threadtime")
+    tail = log_text.split("\n")[-3:]
 
     def fake_run(cmd, *args, **kwargs):
         if "pidof" in cmd:
@@ -126,14 +124,17 @@ def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path):
     monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
 
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
-    out_path = tmp_path / "app-logs.txt"
-    stats = capturer._capture_logs(out_path, "30s", log_lines=2)
+    uncapped = capturer._capture_logs(tmp_path / "all.txt", "30s", log_lines=0)
+    stats = capturer._capture_logs(tmp_path / "app-logs.txt", "30s", log_lines=3)
 
-    # Only the last 2 lines retained -> the early error/warning are dropped.
-    written = out_path.read_text().split("\n")
-    assert written == ["06-17 10:00:03.000 1 1 I Tag: line3", "06-17 10:00:04.000 1 1 I Tag: line4"]
+    # The newest lines are the ones kept.
+    assert (tmp_path / "app-logs.txt").read_text().split("\n") == tail
     assert stats["captured"] is True
-    assert stats["lines"] == 2
+    assert stats["lines"] < uncapped["lines"]
+
+    # And the counts follow the cap rather than the whole window: every error
+    # and warning in this recording is older than the retained tail.
+    assert uncapped["errors"] > 0 and uncapped["warnings"] > 0
     assert stats["errors"] == 0
     assert stats["warnings"] == 0
 

@@ -27,32 +27,56 @@ from container import (
 # === parse_ls_output ===
 
 
-def test_parse_ls_basic_entries():
-    output = (
-        "total 24\n"
-        "drwx------ 4 u0_a123 u0_a123 4096 2024-01-02 03:04 shared_prefs\n"
-        "-rw------- 1 u0_a123 u0_a123  220 2024-01-02 03:04 prefs.xml\n"
-    )
-    entries = parse_ls_output(output)
-    assert len(entries) == 2
+def test_parse_ls_basic_entries(recorded):
+    """Kinds, sizes and owners off a real `run-as ls -la`.
 
-    by_name = {e["name"]: e for e in entries}
-    assert by_name["shared_prefs"]["kind"] == "dir"
-    assert by_name["prefs.xml"]["kind"] == "file"
-    assert by_name["prefs.xml"]["size_bytes"] == 220
-    assert by_name["prefs.xml"]["owner"] == "u0_a123"
+    The listing this replaced was hand-written: single-spaced columns, owner
+    equal to group, no `total` header. The recording differs in all three, and
+    the cache dirs have a group (u0_a205_cache) that is not the owner.
+    """
+    entries = {e["name"]: e for e in parse_ls_output(recorded.text("run_as_ls_data_dir"))}
+    assert set(entries) == {"cache", "code_cache", "files"}
+    assert entries["cache"]["kind"] == "dir"
+    assert entries["cache"]["size_bytes"] == 4096
+    assert entries["cache"]["owner"] == "u0_a205"
+    assert entries["cache"]["group"] == "u0_a205_cache"
+
+    files = {e["name"]: e for e in parse_ls_output(recorded.text("run_as_ls_databases"))}
+    assert files["fixture.db"]["kind"] == "file"
+    assert files["fixture.db"]["size_bytes"] == 32768
+    assert files["fixture.db"]["owner"] == "u0_a205"
 
 
-def test_parse_ls_skips_total_and_dot_entries():
-    output = (
-        "total 8\n"
-        "drwx------ 2 u0_a1 u0_a1 4096 2024-01-02 03:04 .\n"
-        "drwx------ 9 u0_a1 u0_a1 4096 2024-01-02 03:04 ..\n"
-        "-rw------- 1 u0_a1 u0_a1   10 2024-01-02 03:04 file.txt\n"
-    )
-    entries = parse_ls_output(output)
-    names = [e["name"] for e in entries]
-    assert names == ["file.txt"]
+def test_parse_ls_skips_total_and_dot_entries(recorded):
+    listing = recorded.text("run_as_ls_data_dir")
+    assert listing.startswith("total "), "fixture no longer exercises the header case"
+
+    names = [e["name"] for e in parse_ls_output(listing)]
+    assert names == ["cache", "code_cache", "files"]
+
+
+def test_parse_ls_ignores_garbage_lines():
+    output = "this is not an ls line\nrandom junk\n"
+    assert parse_ls_output(output) == []
+
+
+# ---------------------------------------------------------------------------
+# FROZEN DEBT, not exceptions. The three cases below are real `ls -la` output
+# the parser's own docstring promises to handle -- a symlink with its `->`
+# target, a filename containing a space, and the coreutils month/day/year
+# column layout. None of them appears in any recording: the fixture app's data
+# directory holds neither a symlink nor a spaced filename, so nothing was
+# captured to read.
+#
+# They are literals, and `test_container.py::parse_ls_output` is frozen in
+# KNOWN_VIOLATIONS to say so. Deleting them instead would drop coverage of
+# behaviour the code still advertises, which is a worse trade than admitting
+# the debt. To pay it off:
+#
+#     adb shell run-as com.example.composefixture sh -c \
+#         'cd files && ln -s /data/app/lib lib && : > "my file.txt"'
+#     python tests/record_fixtures.py --only run_as_ls_symlink_and_spaces
+# ---------------------------------------------------------------------------
 
 
 def test_parse_ls_symlink_target():
@@ -72,62 +96,30 @@ def test_parse_ls_name_with_spaces():
 
 
 def test_parse_ls_coreutils_layout_with_year():
-    # GNU coreutils ls: month, day, year/time as separate tokens.
+    # GNU coreutils ls: month, day, year/time as separate tokens. `parse_ls_output`
+    # claims both layouts, and container.py's export path reads host listings too.
     output = "-rw-r--r-- 1 user group 1024 Jan  2  2024 data.bin\n"
     entries = parse_ls_output(output)
     assert entries[0]["name"] == "data.bin"
     assert entries[0]["size_bytes"] == 1024
 
 
-def test_parse_ls_ignores_garbage_lines():
-    output = "this is not an ls line\nrandom junk\n"
-    assert parse_ls_output(output) == []
-
-
 # === parse_shared_prefs_xml ===
+#
+# The typed round-trip lives at the bottom of this file, against
+# `shared_prefs_settings_xml` — a real file the fixture app writes, carrying
+# one value of every type Android encodes differently.
 
 
-PREFS_XML = """<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
-<map>
-    <string name="username">alice</string>
-    <int name="launch_count" value="7" />
-    <long name="last_seen" value="1700000000000" />
-    <float name="volume" value="0.8" />
-    <boolean name="dark_mode" value="true" />
-    <boolean name="notifications" value="false" />
-    <set name="tags">
-        <string>red</string>
-        <string>green</string>
-    </set>
-    <string name="empty"></string>
-</map>
-"""
-
-
-def test_parse_prefs_types():
-    prefs = parse_shared_prefs_xml(PREFS_XML)
-    assert prefs["username"] == "alice"
-    assert prefs["launch_count"] == 7
-    assert isinstance(prefs["launch_count"], int)
-    assert prefs["last_seen"] == 1700000000000
-    assert prefs["volume"] == 0.8
-    assert prefs["dark_mode"] is True
-    assert prefs["notifications"] is False
-    assert prefs["tags"] == ["red", "green"]
-    assert prefs["empty"] == ""
-
-
-def test_parse_prefs_keys_complete():
-    prefs = parse_shared_prefs_xml(PREFS_XML)
+def test_parse_prefs_keys_complete(recorded):
+    prefs = parse_shared_prefs_xml(recorded.text("shared_prefs_settings_xml"))
     assert set(prefs) == {
-        "username",
+        "display_name",
         "launch_count",
-        "last_seen",
-        "volume",
-        "dark_mode",
-        "notifications",
-        "tags",
-        "empty",
+        "last_sync_epoch_ms",
+        "playback_speed",
+        "dark_theme",
+        "enabled_flags",
     }
 
 
@@ -138,52 +130,49 @@ def test_parse_prefs_malformed_raises():
         parse_shared_prefs_xml("<map><string name='x'>unclosed")
 
 
-def test_parse_prefs_bad_numeric_defaults_to_zero():
-    xml = '<map><int name="n" value="notanumber" /></map>'
-    assert parse_shared_prefs_xml(xml)["n"] == 0
+def test_parse_prefs_bad_numeric_defaults_to_zero(recorded):
+    """Coercion must not raise on a value that will not convert.
+
+    The document is the recorded prefs file with one attribute changed, so the
+    surrounding shape is still what Android writes -- only the thing under test
+    is substituted.
+    """
+    xml = recorded.text("shared_prefs_settings_xml").replace('value="7"', 'value="notanumber"')
+    assert parse_shared_prefs_xml(xml)["launch_count"] == 0
 
 
 # === parse_sqlite_schema ===
 
 
-SCHEMA = """CREATE TABLE android_metadata (locale TEXT);
-CREATE TABLE `users` (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT,
-    created_at INTEGER DEFAULT 0,
-    FOREIGN KEY (team_id) REFERENCES teams(id)
-);
-CREATE INDEX idx_users_email ON users(email);
-CREATE TABLE IF NOT EXISTS "notes" (
-    note_id INTEGER PRIMARY KEY,
-    body TEXT,
-    user_id INTEGER
-);
-"""
+def test_parse_schema_table_names(recorded):
+    """Including the two tables SQLite adds that a hand-written schema omits."""
+    names = [t["name"] for t in parse_sqlite_schema(recorded.text("sqlite_schema_host"))]
+    assert names == ["android_metadata", "orders", "sqlite_sequence", "order_items"]
 
 
-def test_parse_schema_table_names():
-    tables = parse_sqlite_schema(SCHEMA)
-    names = [t["name"] for t in tables]
-    assert names == ["android_metadata", "users", "notes"]
+def test_parse_schema_columns_and_types(recorded):
+    tables = {t["name"]: t for t in parse_sqlite_schema(recorded.text("sqlite_schema_host"))}
 
+    order_cols = {c["name"]: c["type"] for c in tables["orders"]["columns"]}
+    assert order_cols["id"] == "INTEGER"
+    assert order_cols["reference"] == "TEXT"
+    assert order_cols["total_cents"] == "INTEGER"
+    assert order_cols["placed_at"] == "INTEGER"
 
-def test_parse_schema_columns_and_types():
-    tables = {t["name"]: t for t in parse_sqlite_schema(SCHEMA)}
-    user_cols = {c["name"]: c["type"] for c in tables["users"]["columns"]}
-    assert user_cols["id"] == "INTEGER"
-    assert user_cols["name"] == "TEXT"
-    assert user_cols["email"] == "TEXT"
-    assert user_cols["created_at"] == "INTEGER"
+    item_cols = {c["name"]: c["type"] for c in tables["order_items"]["columns"]}
+    assert item_cols["quantity"] == "INTEGER"
     # The FOREIGN KEY table-level constraint is not a column.
-    assert "team_id" not in user_cols
-    assert "FOREIGN" not in user_cols
+    assert "FOREIGN" not in item_cols
 
 
-def test_parse_schema_skips_indexes():
-    tables = parse_sqlite_schema(SCHEMA)
-    assert all(t["name"] != "idx_users_email" for t in tables)
+def test_parse_schema_skips_indexes(recorded):
+    schema = recorded.text("sqlite_schema_host")
+    assert "CREATE INDEX index_order_items_order_id" in schema
+    assert "CREATE UNIQUE INDEX index_orders_reference" in schema
+
+    names = {t["name"] for t in parse_sqlite_schema(schema)}
+    assert "index_order_items_order_id" not in names
+    assert "index_orders_reference" not in names
 
 
 def test_parse_schema_empty():
@@ -300,19 +289,20 @@ def test_raise_if_denied_helper():
     container._raise_if_denied("com.x", "is not debuggable", 0)
 
 
-def test_shared_prefs_dump_builds_exec_out_cat(monkeypatch):
+def test_shared_prefs_dump_builds_exec_out_cat(monkeypatch, recorded):
     captured: list[list[str]] = []
+    prefs_xml = recorded.text("shared_prefs_settings_xml").encode("utf-8")
 
     def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout=PREFS_XML.encode("utf-8"), stderr=b"")
+        return subprocess.CompletedProcess(cmd, 0, stdout=prefs_xml, stderr=b"")
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
     ok, result = ContainerInspector().shared_prefs("com.example.app", name="settings")
     assert ok is True
     assert result["file"] == "settings.xml"
-    assert result["preferences"]["username"] == "alice"
+    assert result["preferences"]["display_name"] == "Fixture User"
 
     cmd = captured[0]
     assert "exec-out" in cmd
@@ -338,13 +328,14 @@ def test_cat_truncates_large_file(monkeypatch):
     assert "capped" in result["note"]
 
 
-def test_databases_list_separates_sidecars(monkeypatch):
-    listing = (
-        "total 48\n"
-        "-rw------- 1 u0_a1 u0_a1 16384 2024-01-02 03:04 app.db\n"
-        "-rw------- 1 u0_a1 u0_a1  8192 2024-01-02 03:04 app.db-wal\n"
-        "-rw------- 1 u0_a1 u0_a1 32768 2024-01-02 03:04 app.db-shm\n"
-    )
+def test_databases_list_separates_sidecars(monkeypatch, recorded):
+    """The journal beside the database is not a database.
+
+    The listing this replaced invented `-wal` and `-shm` companions. What the
+    fixture app actually leaves in databases/ is a `-journal` file at zero
+    bytes, which is the case a caller most often hits.
+    """
+    listing = recorded.text("run_as_ls_databases")
 
     def fake_run(cmd, *args, **kwargs):
         return _completed(cmd, stdout=listing)
@@ -354,36 +345,50 @@ def test_databases_list_separates_sidecars(monkeypatch):
     ok, result = ContainerInspector().databases("com.example.app")
     assert ok is True
     assert result["total_databases"] == 1
-    assert result["databases"][0]["name"] == "app.db"
-    assert set(result["sidecars"]) == {"app.db-wal", "app.db-shm"}
+    assert result["databases"][0]["name"] == "fixture.db"
+    assert result["databases"][0]["size_bytes"] == 32768
+    assert set(result["sidecars"]) == {"fixture.db-journal"}
 
 
-def test_databases_schema_via_device_sqlite3(monkeypatch):
+def test_databases_schema_via_device_sqlite3(monkeypatch, recorded):
     captured: list[list[str]] = []
+    schema = recorded.text("sqlite_schema_host")
 
     def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
-        return _completed(cmd, stdout=SCHEMA)
+        return _completed(cmd, stdout=schema)
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
-    ok, result = ContainerInspector().databases("com.example.app", name="app.db")
+    ok, result = ContainerInspector().databases("com.example.app", name="fixture.db")
     assert ok is True
     assert result["method"] == "device-sqlite3"
-    assert result["total_tables"] == 3
+    # android_metadata and sqlite_sequence are tables too -- a hand-written
+    # schema leaves them out, and the count then looks like the app's own.
+    assert result["total_tables"] == 4
     # The on-device sqlite3 strategy must be attempted.
     assert any("sqlite3" in c and ".schema" in c for c in captured)
 
 
-def test_export_writes_snapshot(monkeypatch, tmp_path):
-    ls_root = (
-        "total 12\n"
-        "drwx------ 2 u0_a1 u0_a1 4096 2024-01-02 03:04 shared_prefs\n"
-        "drwx------ 2 u0_a1 u0_a1 4096 2024-01-02 03:04 databases\n"
-        "-rw------- 1 u0_a1 u0_a1  220 2024-01-02 03:04 a.txt\n"
-    )
-    ls_prefs = "-rw------- 1 u0_a1 u0_a1 100 2024-01-02 03:04 settings.xml\n"
-    ls_dbs = "-rw------- 1 u0_a1 u0_a1 4096 2024-01-02 03:04 app.db\n"
+def test_export_writes_snapshot(monkeypatch, tmp_path, recorded):
+    """Every listing served here is recorded output, with ONE substitution.
+
+    `export` issues its own `ls -la` against shared_prefs/ and databases/
+    whatever the data-dir listing contains, so the recorded data-dir and
+    databases listings are served verbatim -- no synthesised topology.
+
+    The single derivation is the prefs directory, because no `ls -la` of a
+    shared_prefs/ directory was captured: the recorded databases listing has
+    its `fixture.db-journal` entry renamed to `fixture_settings.xml`, the
+    prefs file the recorder actually read. That leaves a directory holding one
+    `.xml` and one file that is not one, which is what `shared_prefs()` has to
+    filter. Column widths, the `total` header and the `.`/`..` entries are
+    exactly as the device printed them.
+    """
+    ls_root = recorded.text("run_as_ls_data_dir")
+    ls_dbs = recorded.text("run_as_ls_databases")
+    ls_prefs = ls_dbs.replace("fixture.db-journal", "fixture_settings.xml")
+    prefs_xml = recorded.text("shared_prefs_settings_xml").encode("utf-8")
 
     def fake_text_run(cmd, *args, **kwargs):
         joined = " ".join(cmd)
@@ -395,7 +400,7 @@ def test_export_writes_snapshot(monkeypatch, tmp_path):
                 return _completed(cmd, stdout=ls_dbs)
             return _completed(cmd, stdout=ls_root)
         # exec-out cat returns bytes (prefs files dumped during export)
-        return subprocess.CompletedProcess(cmd, 0, stdout=PREFS_XML.encode("utf-8"), stderr=b"")
+        return subprocess.CompletedProcess(cmd, 0, stdout=prefs_xml, stderr=b"")
 
     monkeypatch.setattr(container.subprocess, "run", fake_text_run)
 
@@ -405,7 +410,7 @@ def test_export_writes_snapshot(monkeypatch, tmp_path):
     dest = tmp_path / "com.example.app"
     assert (dest / "file_tree.txt").exists()
     assert (dest / "databases.json").exists()
-    assert (dest / "shared_prefs" / "settings.xml").exists()
+    assert (dest / "shared_prefs" / "fixture_settings.xml").exists()
 
 
 def test_export_refuses_existing_destination(monkeypatch, tmp_path, recorded):

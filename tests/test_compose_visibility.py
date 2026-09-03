@@ -186,16 +186,27 @@ def test_control_labels_are_recovered_from_the_tree(expected: str):
     )
 
 
-def test_bounds_are_required_so_zero_size_nodes_are_not_offered():
-    """A zero-area node cannot be tapped, whatever its flags say."""
+def test_bounds_are_required_so_zero_size_nodes_are_not_offered(recorded):
+    """A zero-area node cannot be tapped, whatever its flags say.
+
+    No recorded dump has one -- uiautomator reports no visibility attribute, so
+    a collapsed control is exactly what cannot be captured on demand. The
+    scenario is therefore the recorded Compose screen with the CheckBox's
+    `bounds` collapsed and nothing else touched: one fewer interactive element,
+    and it is the checkbox that goes.
+    """
     from screen_mapper import ScreenMapper
 
-    zero = ET.fromstring(
-        '<hierarchy><node class="android.view.View" clickable="true" enabled="true" '
-        'text="" content-desc="" resource-id="" bounds="[0,0][0,0]" /></hierarchy>'
-    )
-    analysis = ScreenMapper().analyze_tree(zero)
-    assert analysis["interactive_elements"] == 0
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    before = ScreenMapper().analyze_tree(root)
+    assert "CheckBox" in before["elements_by_type"]
+
+    checkbox = next(n for n in root.iter("node") if n.get("class", "").endswith(".CheckBox"))
+    checkbox.set("bounds", "[0,0][0,0]")
+
+    after = ScreenMapper().analyze_tree(root)
+    assert after["interactive_elements"] == before["interactive_elements"] - 1
+    assert "CheckBox" not in after["elements_by_type"]
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +214,7 @@ def test_bounds_are_required_so_zero_size_nodes_are_not_offered():
 # ---------------------------------------------------------------------------
 
 
-def test_a_field_described_by_a_child_label_is_not_flagged():
+def test_a_field_described_by_a_child_label_is_not_flagged(recorded):
     """`hint` is not an attribute uiautomator emits, so it was always absent.
 
     The check read `attrs.get("hint", "")`, which is empty on every node in
@@ -217,7 +228,7 @@ def test_a_field_described_by_a_child_label_is_not_flagged():
 
     auditor = AccessibilityAuditor()
     auditor.density = 420
-    auditor.audit_tree(_xml_to_dict(_root("uiautomator_compose_default")))
+    auditor.audit_tree(_xml_to_dict(ET.fromstring(recorded.text("uiautomator_compose_default"))))
 
     flagged = [i for i in auditor.issues if i["type"] == "edittext_missing_hint"]
     assert (
@@ -225,19 +236,29 @@ def test_a_field_described_by_a_child_label_is_not_flagged():
     ), f"a field labelled 'Email address' by its child was flagged as unlabelled: {flagged}"
 
 
-def test_a_genuinely_unlabelled_field_is_still_flagged():
-    """Guard against deleting the check rather than fixing it."""
+def test_a_genuinely_unlabelled_field_is_still_flagged(recorded):
+    """Guard against deleting the check rather than fixing it.
+
+    Derived from the same recorded dump as the test above, with the caption
+    text cleared from beneath the EditText and nothing else touched -- so the
+    pair differs by exactly the thing under test. It used to be a one-node
+    hand-written hierarchy, which `audit_tree` being outside the fixture policy
+    is what allowed.
+    """
     from accessibility_audit import AccessibilityAuditor
 
     from common.device_utils import _xml_to_dict
 
-    bare = ET.fromstring(
-        '<hierarchy><node class="android.widget.EditText" clickable="true" enabled="true" '
-        'text="" content-desc="" resource-id="" bounds="[0,0][400,120]" /></hierarchy>'
-    )
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
+    field = next(n for n in root.iter("node") if n.get("class", "").endswith(".EditText"))
+    for descendant in field.iter("node"):
+        if descendant is not field:
+            descendant.set("text", "")
+            descendant.set("content-desc", "")
+
     auditor = AccessibilityAuditor()
     auditor.density = 420
-    auditor.audit_tree(_xml_to_dict(bare))
+    auditor.audit_tree(_xml_to_dict(root))
 
     assert any(i["type"] == "edittext_missing_hint" for i in auditor.issues)
 
