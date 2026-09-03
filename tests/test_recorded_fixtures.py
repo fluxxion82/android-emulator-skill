@@ -333,6 +333,188 @@ def test_cmd_notification_has_no_list_channels_subcommand(any_profile):
 
 
 # ---------------------------------------------------------------------------
+# T5 — `dumpsys activity anr` is not a command. anr_watcher pulled it on every
+# --start, guarded on a non-zero exit that never came, and fed the resulting
+# usage text to a logcat-line parser.
+# ---------------------------------------------------------------------------
+
+
+def _manifest_entry(profile, name: str) -> dict:
+    """The manifest entry for one fixture, or fail naming what is missing."""
+    for entry in profile.manifest["fixtures"]:
+        if entry["name"] == name:
+            return entry
+    pytest.fail(f"{profile.name} has no manifest entry for {name!r}")
+
+
+def test_dumpsys_activity_anr_is_not_a_subcommand(any_profile):
+    """T5: ActivityManager rejects `anr` outright, on every profile recorded.
+
+    Same shape as the `cmd statusbar` / `cmd notification` pins above. The
+    token is not treated as a package filter and no ANR data is printed:
+    ActivityManager answers with its "Unknown command" line and the generic
+    "Bad activity command" line, then points at -h.
+    """
+    if not any_profile.has("dumpsys_activity_anr"):
+        pytest.skip(f"{any_profile.name} did not record dumpsys_activity_anr")
+    text = any_profile.text("dumpsys_activity_anr")
+
+    assert "Unknown command: anr" in text, (
+        f"{any_profile.name}: `dumpsys activity anr` no longer reports an "
+        f"unknown command — re-check T5 on this API level"
+    )
+    assert "Bad activity command" in text
+    # The point of the pin: no ANR data of any kind comes back.
+    assert "ANR in " not in text, "this command returned actual ANR data; re-check T5"
+
+
+def test_dumpsys_activity_anr_exits_zero(any_profile):
+    """T5, the load-bearing half: the failure is invisible to a returncode check.
+
+    ``_pull_dumpsys_anr`` bailed out on ``result.returncode != 0``. The command
+    exits **0**, so that guard never fired and three lines of usage text went
+    into ``parse_logcat_anr`` on every single session start.
+    """
+    if not any_profile.has("dumpsys_activity_anr"):
+        pytest.skip(f"{any_profile.name} did not record dumpsys_activity_anr")
+    entry = _manifest_entry(any_profile, "dumpsys_activity_anr")
+    assert entry["exit_status"] == 0, (
+        f"{any_profile.name}: the recording shows exit {entry['exit_status']}. "
+        f"If this command now fails loudly, a returncode guard would have been "
+        f"enough and T5's reasoning needs revisiting."
+    )
+
+
+def test_the_invented_anr_pull_parses_nothing(any_profile):
+    """What the deleted code actually achieved, measured rather than asserted.
+
+    Every line of the real output is fed to the real parser. None of them
+    produce an event, so the "historical ANR source" contributed exactly
+    nothing to a session while looking like a feature.
+    """
+    if not any_profile.has("dumpsys_activity_anr"):
+        pytest.skip(f"{any_profile.name} did not record dumpsys_activity_anr")
+    from common.anr_pipeline import parse_logcat_anr
+
+    lines = [ln for ln in any_profile.lines("dumpsys_activity_anr") if ln.strip()]
+    assert lines, "fixture is empty"
+    assert [parse_logcat_anr(ln) for ln in lines] == [None] * len(lines)
+
+
+# ---------------------------------------------------------------------------
+# D4 — `pidof` answers "not running" with silence, not with a message.
+# ---------------------------------------------------------------------------
+
+
+def test_pidof_of_a_dead_process_prints_nothing_and_exits_one(any_profile):
+    """D4: liveness is in the exit status; stdout cannot express the answer.
+
+    The recorded file is deliberately zero bytes. A caller that decides "is it
+    running" by reading stdout gets the empty string — indistinguishable from a
+    device that never answered.
+    """
+    if not any_profile.has("pidof_not_running"):
+        pytest.skip(f"{any_profile.name} did not record pidof_not_running")
+    assert any_profile.text("pidof_not_running") == ""
+
+    entry = _manifest_entry(any_profile, "pidof_not_running")
+    assert entry["exit_status"] == 1
+    assert entry["stream"] == "empty", (
+        "nothing was written to stderr either, so there is no diagnostic to "
+        "parse and no way to tell this apart from an unreachable device"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C8 — which IME visibility key actually exists.
+# ---------------------------------------------------------------------------
+
+
+def test_ime_visibility_keys_that_exist(any_profile):
+    """C8: `mInputShown` and `mIsInputViewShown` are real; `mImeWindowVis` is not.
+
+    Recorded on API 33 and API 35. Neither carries an `mImeWindowVis` key, so
+    code keying on it reads nothing on every version we have evidence for.
+    """
+    if not any_profile.has("dumpsys_input_method_shown"):
+        pytest.skip(f"{any_profile.name} did not record dumpsys_input_method_shown")
+    text = any_profile.text("dumpsys_input_method_shown")
+
+    assert "mInputShown=" in text, f"{any_profile.name}: mInputShown is gone — re-check C8"
+    assert "mIsInputViewShown=" in text
+    assert "mImeWindowVis" not in text, (
+        f"{any_profile.name}: mImeWindowVis now exists on this API level; "
+        f"C8's premise no longer holds everywhere"
+    )
+
+
+def test_ime_visibility_line_carries_more_than_one_field(any_profile):
+    """The parsing hazard, recorded: `mIsInputViewShown` shares its line.
+
+    Measured: `  mIsInputViewShown=false mStatusIcon=0`. A parser that splits
+    the line on whitespace and takes the remainder gets two key=value pairs,
+    not one value.
+    """
+    if not any_profile.has("dumpsys_input_method_shown"):
+        pytest.skip(f"{any_profile.name} did not record dumpsys_input_method_shown")
+    line = next(
+        ln for ln in any_profile.lines("dumpsys_input_method_shown") if "mIsInputViewShown=" in ln
+    )
+    assert len(line.split()) > 1, "the shared-line hazard this test pins is gone"
+
+
+# ---------------------------------------------------------------------------
+# C12 — `input text` is ASCII-only, and reports that by crashing.
+# ---------------------------------------------------------------------------
+
+
+def test_input_text_with_a_non_ascii_character_throws(recorded):
+    """C12: not a mangled string — an uncaught NullPointerException, exit 255.
+
+    The failure arrives on stderr as a Java stack trace, so a caller reading
+    stdout sees nothing at all and a caller checking for a friendly error
+    message finds none.
+    """
+    text = recorded.text("input_text_nonascii")
+    assert "java.lang.NullPointerException" in text
+    assert "InputShellCommand.sendText" in text
+
+    entry = _manifest_entry(recorded, "input_text_nonascii")
+    assert entry["exit_status"] == 255, "the crash is what makes this detectable at all"
+    assert entry["stream"] == "stderr", "nothing was written to stdout"
+
+
+# ---------------------------------------------------------------------------
+# L2 — demo mode's clock takes HHMM and silently ignores anything shorter.
+# ---------------------------------------------------------------------------
+
+
+def test_demo_mode_clock_captures_are_a_usable_pair(recorded):
+    """L2: two status bars, one broadcast apart, differing only in hhmm width.
+
+    The images are the evidence and have to be looked at (941 shows the
+    device's real time, 0941 shows 9:41). What is asserted here is that the
+    pair is intact and genuinely different — a re-record that captured the same
+    screen twice would leave the L2 claim resting on nothing.
+    """
+    ours = RECORDED_DIR / "demo_mode_clock_941.png"
+    padded = RECORDED_DIR / "demo_mode_clock_0941.png"
+    assert ours.exists() and padded.exists()
+
+    ours_bytes = ours.read_bytes()
+    assert ours_bytes[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    assert ours_bytes != padded.read_bytes(), (
+        "the two demo-mode captures are byte-identical, so they cannot show "
+        "different clocks; re-record them"
+    )
+    for entry in (
+        _manifest_entry(recorded, "demo_mode_clock_941"),
+        _manifest_entry(recorded, "demo_mode_clock_0941"),
+    ):
+        assert entry["bytes"] <= 50 * 1024, "status-bar strip is over the size budget"
+
+
+# ---------------------------------------------------------------------------
 # S4 — a broadcast to a receiver that does not exist still exits 0.
 # ---------------------------------------------------------------------------
 

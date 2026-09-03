@@ -1,0 +1,14 @@
+
+Exception occurred while executing 'text':
+java.lang.NullPointerException: Attempt to get length of null array
+	at com.android.server.input.InputShellCommand.sendText(InputShellCommand.java:390)
+	at com.android.server.input.InputShellCommand.runText(InputShellCommand.java:362)
+	at com.android.server.input.InputShellCommand.onCommand(InputShellCommand.java:287)
+	at com.android.modules.utils.BasicShellCommandHandler.exec(BasicShellCommandHandler.java:97)
+	at android.os.ShellCommand.exec(ShellCommand.java:38)
+	at com.android.server.input.InputManagerService.onShellCommand(InputManagerService.java:3193)
+	at android.os.Binder.shellCommand(Binder.java:1230)
+	at android.os.Binder.onTransact(Binder.java:1043)
+	at android.hardware.input.IInputManager$Stub.onTransact(IInputManager.java:1306)
+	at android.os.Binder.execTransactInternal(Binder.java:1505)
+	at android.os.Binder.execTransact(Binder.java:1444)
