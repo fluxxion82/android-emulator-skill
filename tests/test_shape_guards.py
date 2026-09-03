@@ -30,7 +30,7 @@ finding: the guard states the defect without blocking the PR, and the fix must
 delete the marker. What is *not* xfail is the evidence that each guard works --
 every one has a self-test that injects a synthetic violation and a self-test
 that enumerates the real sites as an exact multiset of file, function, kind and
-line. A guard nobody has seen fail is a guard nobody has seen.
+what was found there. A guard nobody has seen fail is a guard nobody has seen.
 
 Two failure modes of a guard like this are specifically defended against, both
 found by review rather than by imagination:
@@ -43,6 +43,10 @@ found by review rather than by imagination:
 * **Evasion by counting.** Comparing sets keyed on file and function lets a
   second finding inside an already-listed function disappear silently. The
   enumerations are multisets, matched one-for-one.
+* **False alarms from unrelated edits.** Line numbers are reported and never
+  matched. A PR merging ahead of this one moved a console call fifteen lines
+  and turned the enumeration red in CI while it was green on the branch --
+  which says nothing about the code and trains people to loosen the guard.
 
 **These guards parse; they do not grep.** That rule is written down because the
 repo has been bitten by its opposite five times: a substring guard flags the
@@ -57,6 +61,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
@@ -65,15 +70,17 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "scripts"
 
-# How far a recorded line number may drift before the enumeration self-tests
-# stop believing they are looking at the same call. The sites are keyed on
-# file + function + kind, which survives an edit above them; the line is
-# carried as corroboration, not as identity.
-LINE_DRIFT = 10
-
 
 class Site(NamedTuple):
-    """One place a shape occurs, keyed on something more stable than a line."""
+    """One place a shape occurs, as the guard found it.
+
+    ``line`` is reported, never matched. It moved out of the identity after a
+    PR that merged ahead of this one shifted ``emulator_shutdown``'s console
+    call by fifteen lines: the guard reported the same call at a new line and
+    the enumeration called it both missing and untriaged, which is a false
+    alarm about the *test*, not a finding about the code. Line numbers are for
+    the human reading the failure.
+    """
 
     file: str
     function: str
@@ -82,12 +89,34 @@ class Site(NamedTuple):
     detail: str = ""
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return (self.file, self.function, self.kind)
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.file, self.function, self.kind, self.detail)
 
     def __str__(self) -> str:
         suffix = f" {self.detail}" if self.detail else ""
         return f"{self.file}:{self.line} ({self.function}) [{self.kind}]{suffix}"
+
+
+class Expectation(NamedTuple):
+    """One site the guard is known to report, with no line number in it.
+
+    Same four fields as :attr:`Site.key`. The line each one sits at today is
+    kept as a trailing comment in the lists below -- useful when reading, and
+    unable to break a build when an unrelated edit moves it.
+    """
+
+    file: str
+    function: str
+    kind: str
+    detail: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.file, self.function, self.kind, self.detail)
+
+    def __str__(self) -> str:
+        suffix = f" {self.detail}" if self.detail else ""
+        return f"{self.file} ({self.function}) [{self.kind}]{suffix}"
 
 
 def _script_files() -> list[Path]:
@@ -277,38 +306,56 @@ def test_the_guards_still_see_the_production_code():
 # ---------------------------------------------------------------------------
 
 
-def _reconcile(expected: tuple[Site, ...], actual: list[Site]) -> tuple[list[Site], list[Site]]:
-    """Match each expected site to one actual site; return what is left over.
+def _reconcile(
+    expected: tuple[Expectation, ...], actual: list[Site]
+) -> tuple[list[Expectation], list[Site]]:
+    """Compare the two as multisets of (file, function, kind, detail).
 
-    A *set* comparison keyed on file and function -- what this file did before
-    review -- accepts the removal of a second finding inside an already-listed
-    function: delete the bounds regex at screen_mapper.py:270 and the function
-    finding at :268 still satisfies both entries. So each expected site
-    consumes one actual site, nearest line first, and both leftovers are
-    reported.
+    Counting, not set membership. A *set* comparison keyed on file and function
+    -- what this file did before review -- accepts the removal of a second
+    finding inside an already-listed function: delete the bounds regex in
+    ``screen_mapper._bounds`` and the function finding in the same place still
+    satisfies both entries. Here the count for
+    ``(screen_mapper.py, _bounds, regex, unsigned)`` drops from one to zero and
+    the entry is reported missing, whatever line anything sits at.
+
+    Duplicates are the reason this counts rather than sets: two of the quoting
+    sites are the same interpolation in the same function
+    (``app_state_capture._get_app_info`` reads ``self.package`` twice), and
+    losing one of them must be visible.
     """
-    remaining = list(actual)
-    missing: list[Site] = []
+    wanted = Counter(item.key for item in expected)
 
-    for want in sorted(expected, key=lambda site: (site.file, site.function, site.line)):
-        candidates = [
-            site
-            for site in remaining
-            if site.key == want.key and abs(site.line - want.line) <= LINE_DRIFT
-        ]
-        if not candidates:
-            missing.append(want)
-            continue
-        remaining.remove(min(candidates, key=lambda site: abs(site.line - want.line)))
+    # Expected more copies of a key than the guard found: report the shortfall,
+    # one entry per missing copy.
+    deficit = Counter(wanted)
+    deficit.subtract(site.key for site in actual)
+    missing: list[Expectation] = []
+    for item in expected:
+        if deficit[item.key] > 0:
+            missing.append(item)
+            deficit[item.key] -= 1
 
-    return missing, remaining
+    # Found more copies of a key than expected: the first N are the matched
+    # ones, anything after that is untriaged.
+    seen: Counter[tuple[str, str, str, str]] = Counter()
+    unexpected: list[Site] = []
+    for site in actual:
+        seen[site.key] += 1
+        if seen[site.key] > wanted[site.key]:
+            unexpected.append(site)
+
+    return missing, unexpected
 
 
-def _assert_enumeration(expected: tuple[Site, ...], actual: list[Site], listname: str) -> None:
+def _assert_enumeration(
+    expected: tuple[Expectation, ...], actual: list[Site], listname: str
+) -> None:
     missing, unexpected = _reconcile(expected, actual)
     assert not missing, (
-        f"the guard no longer reports {[str(site) for site in missing]}.\n"
-        f"Everything it did report: {[str(site) for site in actual]}.\n"
+        f"the guard no longer reports {[str(item) for item in missing]}.\n"
+        f"Everything it did report, with the line it is on now: "
+        f"{[str(site) for site in actual]}.\n"
         f"If the fix landed, delete those entries from {listname} and the xfail "
         f"marker in the same commit. If it did not, the detector stopped seeing them."
     )
@@ -356,28 +403,35 @@ QUOTING_EXEMPT: dict[str, str] = {
 #       · appearance.py:128-162
 # Two of those citations name the line of the *argument* rather than of the
 # call that carries it (status_bar :395 is `mobile_type` inside the call opened
-# at :384; app_launcher :103 is the extras list built for the call at :108), so
-# the lines below are the call sites this guard reports.
-KNOWN_UNQUOTED: tuple[Site, ...] = (
-    Site("app_launcher.py", "launch", 108, UNQUOTED, "component, *extra_args"),
-    Site("app_launcher.py", "terminate", 147, UNQUOTED, "package_name"),
-    Site("app_launcher.py", "open_url", 251, UNQUOTED, "url"),
-    Site("app_launcher.py", "get_state", 313, UNQUOTED, "package_name"),
-    Site("app_launcher.py", "_get_launcher_activity", 360, UNQUOTED, "package_name"),
-    Site("app_state_capture.py", "_get_app_info", 231, UNQUOTED, "self.package"),
-    Site("app_state_capture.py", "_get_app_info", 248, UNQUOTED, "self.package"),
-    Site("app_state_capture.py", "_capture_logs", 351, UNQUOTED, "self.package"),
-    Site("appearance.py", "build_locale_command", 141, UNQUOTED, "locale"),
-    Site("privacy_manager.py", "grant_permission", 123, UNQUOTED, "package, full_permission"),
-    Site("privacy_manager.py", "revoke_permission", 159, UNQUOTED, "package, full_permission"),
-    Site("privacy_manager.py", "confirm_permission", 199, UNQUOTED, "package"),
-    Site("privacy_manager.py", "list_app_permissions", 268, UNQUOTED, "package"),
-    Site("status_bar.py", "set_mobile_data", 247, UNQUOTED, "datatype"),
-    Site("status_bar.py", "set_time", 284, UNQUOTED, "time_str"),
-    Site("status_bar.py", "override", 342, UNQUOTED, "time"),
-    Site("status_bar.py", "override", 346, UNQUOTED, "battery"),
-    Site("status_bar.py", "override", 367, UNQUOTED, "wifi_level"),
-    Site("status_bar.py", "override", 384, UNQUOTED, "mobile_level, mobile_type"),
+# at :384; app_launcher :103 is the extras list built for the call at :108).
+# The trailing comments below are the call lines this guard reports today --
+# a reading aid, not matched data.
+KNOWN_UNQUOTED: tuple[Expectation, ...] = (
+    Expectation("app_launcher.py", "launch", UNQUOTED, "component, *extra_args"),  # :108
+    Expectation("app_launcher.py", "terminate", UNQUOTED, "package_name"),  # :147
+    Expectation("app_launcher.py", "open_url", UNQUOTED, "url"),  # :251
+    Expectation("app_launcher.py", "get_state", UNQUOTED, "package_name"),  # :313
+    Expectation("app_launcher.py", "_get_launcher_activity", UNQUOTED, "package_name"),  # :360
+    # Twice in one function -- `dumpsys package <pkg>` and `pidof <pkg>`. The
+    # comparison counts, so losing one of the pair is still reported.
+    Expectation("app_state_capture.py", "_get_app_info", UNQUOTED, "self.package"),  # :231
+    Expectation("app_state_capture.py", "_get_app_info", UNQUOTED, "self.package"),  # :248
+    Expectation("app_state_capture.py", "_capture_logs", UNQUOTED, "self.package"),  # :351
+    Expectation("appearance.py", "build_locale_command", UNQUOTED, "locale"),  # :141
+    Expectation(
+        "privacy_manager.py", "grant_permission", UNQUOTED, "package, full_permission"
+    ),  # :123
+    Expectation(
+        "privacy_manager.py", "revoke_permission", UNQUOTED, "package, full_permission"
+    ),  # :159
+    Expectation("privacy_manager.py", "confirm_permission", UNQUOTED, "package"),  # :199
+    Expectation("privacy_manager.py", "list_app_permissions", UNQUOTED, "package"),  # :268
+    Expectation("status_bar.py", "set_mobile_data", UNQUOTED, "str(level), datatype"),  # :247
+    Expectation("status_bar.py", "set_time", UNQUOTED, "time_str.replace(':', '')"),  # :284
+    Expectation("status_bar.py", "override", UNQUOTED, "time.replace(':', '')"),  # :342
+    Expectation("status_bar.py", "override", UNQUOTED, "str(battery)"),  # :346
+    Expectation("status_bar.py", "override", UNQUOTED, "str(wifi_level)"),  # :367
+    Expectation("status_bar.py", "override", UNQUOTED, "str(mobile_level), mobile_type"),  # :384
 )
 
 
@@ -669,10 +723,11 @@ def test_the_quoting_guard_is_not_evaded_by_renaming(label: str, source: str):
 def test_the_quoting_guard_enumerates_todays_sites():
     """The evidence that the guard is reading the real code, not agreeing with itself.
 
-    Keyed on file + function + kind with the line as corroboration, and matched
-    one-for-one so the *count* inside a function is asserted too. The fixing PR
-    empties ``KNOWN_UNQUOTED``; until then this is what "C3/X2" means in
-    file-and-line terms.
+    Matched as a multiset of (file, function, kind, argument text), so the
+    *count* inside a function is asserted too and a rename cannot pass as the
+    same site. Lines appear in the failure message and in the comments beside
+    each entry; they are not compared. The fixing PR empties
+    ``KNOWN_UNQUOTED``.
     """
     _assert_enumeration(KNOWN_UNQUOTED, unquoted_device_shell_arguments(), "KNOWN_UNQUOTED")
 
@@ -706,15 +761,20 @@ EMU_ARGV = "emu-argv"
 
 # Confirmed by reading each call. Codex cites emulator_shutdown.py:66 as the
 # representative and names shutdown, boot, selector, erase and location.
-KNOWN_EMU_BYPASSES: tuple[Site, ...] = (
-    Site("emulator_boot.py", "_get_avd_name_for_serial", 211, EMU_ARGV, "run_adb"),
-    Site("emulator_erase.py", "is_avd_running", 108, EMU_ARGV, "run_adb"),
-    Site("emulator_selector.py", "_avd_name_for_serial", 333, EMU_ARGV, "run_adb"),
-    Site("emulator_shutdown.py", "shutdown", 66, EMU_ARGV, "build_adb_command"),
-    Site("emulator_shutdown.py", "get_avd_name_for_serial", 151, EMU_ARGV, "build_adb_command"),
+KNOWN_EMU_BYPASSES: tuple[Expectation, ...] = (
+    Expectation("emulator_boot.py", "_get_avd_name_for_serial", EMU_ARGV, "run_adb"),  # :211
+    Expectation("emulator_erase.py", "is_avd_running", EMU_ARGV, "run_adb"),  # :108
+    Expectation("emulator_selector.py", "_avd_name_for_serial", EMU_ARGV, "run_adb"),  # :333
+    # The line comments here are why lines are not matched data: PR #8 landed
+    # the L1 physical-device refusal above this call and moved it from :66 to
+    # :81, which failed the enumeration in CI while passing on the branch.
+    Expectation("emulator_shutdown.py", "shutdown", EMU_ARGV, "build_adb_command"),  # :81
+    Expectation(
+        "emulator_shutdown.py", "get_avd_name_for_serial", EMU_ARGV, "build_adb_command"
+    ),  # :156
     # The plan cites location.py:273; that is `_run_geo_fix`, which executes an
     # argv it does not build. The literal "emu" is in build_geo_fix_command.
-    Site("location.py", "build_geo_fix_command", 144, EMU_ARGV, "build_adb_command"),
+    Expectation("location.py", "build_geo_fix_command", EMU_ARGV, "build_adb_command"),  # :144
 )
 
 # Scripts that reach the console the sanctioned way. Named here so the guard
@@ -853,7 +913,7 @@ def test_the_emu_guard_does_not_flag_run_emu():
 
 
 def test_the_emu_guard_enumerates_todays_sites():
-    """The five bypassing scripts, by file, function and line."""
+    """The five bypassing scripts, by file, function and which builder they call."""
     _assert_enumeration(KNOWN_EMU_BYPASSES, emu_console_bypasses(), "KNOWN_EMU_BYPASSES")
 
 
@@ -890,13 +950,13 @@ _BOUNDS_GRAMMAR = re.compile(r"\\\[[^\]]*-?\\d")
 # repaired by weakening it.
 _BOUNDS_PARSER_NAMES = frozenset({"_parse_bounds", "_bounds"})
 
-KNOWN_BOUNDS_SITES: tuple[Site, ...] = (
-    Site("accessibility_audit.py", "_parse_bounds", 70, BOUNDS_FUNCTION),
-    Site("accessibility_audit.py", "_parse_bounds", 72, BOUNDS_REGEX, "signed"),
-    Site("navigator.py", "_parse_bounds", 290, BOUNDS_FUNCTION),
-    Site("navigator.py", "_parse_bounds", 301, BOUNDS_REGEX, "unsigned"),
-    Site("screen_mapper.py", "_bounds", 268, BOUNDS_FUNCTION),
-    Site("screen_mapper.py", "_bounds", 270, BOUNDS_REGEX, "unsigned"),
+KNOWN_BOUNDS_SITES: tuple[Expectation, ...] = (
+    Expectation("accessibility_audit.py", "_parse_bounds", BOUNDS_FUNCTION),  # :70
+    Expectation("accessibility_audit.py", "_parse_bounds", BOUNDS_REGEX, "signed"),  # :72
+    Expectation("navigator.py", "_parse_bounds", BOUNDS_FUNCTION),  # :290
+    Expectation("navigator.py", "_parse_bounds", BOUNDS_REGEX, "unsigned"),  # :301
+    Expectation("screen_mapper.py", "_bounds", BOUNDS_FUNCTION),  # :268
+    Expectation("screen_mapper.py", "_bounds", BOUNDS_REGEX, "unsigned"),  # :270
 )
 
 
@@ -1064,28 +1124,72 @@ def test_the_shared_parser_home_exists():
 
 
 def test_the_enumeration_comparison_counts_rather_than_keys():
-    """The set-versus-multiset bug this file shipped with, pinned.
+    """The set-versus-multiset bug this file shipped with, pinned -- without lines.
 
-    Deleting the regex at screen_mapper.py:270 used to leave the enumeration
-    green, because the function finding at :268 satisfied a set keyed on file
-    and function. ``_reconcile`` consumes one actual site per expected site, so
-    the survivor covers one entry and the other is reported missing.
+    Deleting the bounds regex from ``screen_mapper._bounds`` used to leave the
+    enumeration green, because the function finding in the same place satisfied
+    a set keyed on file and function. ``_reconcile`` compares counts per
+    (file, function, kind, detail), so the regex entry has nothing to match and
+    is reported missing. No line number takes part: the survivor is placed at a
+    line neither expected entry ever carried, and the answer is the same.
     """
     expected = (
-        Site("screen_mapper.py", "_bounds", 268, BOUNDS_FUNCTION),
-        Site("screen_mapper.py", "_bounds", 270, BOUNDS_REGEX),
+        Expectation("screen_mapper.py", "_bounds", BOUNDS_FUNCTION),
+        Expectation("screen_mapper.py", "_bounds", BOUNDS_REGEX, "unsigned"),
     )
-    survivor = [Site("screen_mapper.py", "_bounds", 268, BOUNDS_FUNCTION)]
 
+    survivor = [Site("screen_mapper.py", "_bounds", 999, BOUNDS_FUNCTION)]
     missing, unexpected = _reconcile(expected, survivor)
-    assert [site.kind for site in missing] == [BOUNDS_REGEX]
+    assert [item.kind for item in missing] == [BOUNDS_REGEX]
     assert unexpected == []
 
-    # And an extra finding inside an already-listed function is reported too.
-    extra = [*survivor, Site("screen_mapper.py", "_bounds", 269, BOUNDS_FUNCTION)]
+    # An extra finding of an already-listed kind is reported, again regardless
+    # of where it sits.
+    extra = [*survivor, Site("screen_mapper.py", "_bounds", 12, BOUNDS_FUNCTION)]
     missing, unexpected = _reconcile(expected, extra)
-    assert [site.kind for site in missing] == [BOUNDS_REGEX]
-    assert [site.line for site in unexpected] == [269]
+    assert [item.kind for item in missing] == [BOUNDS_REGEX]
+    assert [site.line for site in unexpected] == [12]
+
+    # Both present, at lines nothing predicted: clean.
+    complete = [
+        Site("screen_mapper.py", "_bounds", 1, BOUNDS_FUNCTION),
+        Site("screen_mapper.py", "_bounds", 2, BOUNDS_REGEX, "unsigned"),
+    ]
+    assert _reconcile(expected, complete) == ([], [])
+
+
+def test_the_enumeration_counts_duplicate_findings_in_one_function():
+    """Two identical interpolations in one function are two entries, not one.
+
+    ``app_state_capture._get_app_info`` reads ``self.package`` into two separate
+    device-shell commands. A comparison that deduplicated would accept a fix to
+    one of them as a fix to both.
+    """
+    expected = (
+        Expectation("app_state_capture.py", "_get_app_info", UNQUOTED, "self.package"),
+        Expectation("app_state_capture.py", "_get_app_info", UNQUOTED, "self.package"),
+    )
+    one_fixed = [Site("app_state_capture.py", "_get_app_info", 248, UNQUOTED, "self.package")]
+
+    missing, unexpected = _reconcile(expected, one_fixed)
+    assert len(missing) == 1
+    assert unexpected == []
+
+
+def test_a_moved_call_is_not_reported_as_a_change():
+    """The CI failure that produced this design, as a test.
+
+    PR #8 inserted the physical-device refusal above ``emulator_shutdown``'s
+    console call and moved it from line 66 to line 81. The guard reported the
+    same call in the same function; only the line differed. That must be
+    silent.
+    """
+    expected = (Expectation("emulator_shutdown.py", "shutdown", EMU_ARGV, "build_adb_command"),)
+    before = [Site("emulator_shutdown.py", "shutdown", 66, EMU_ARGV, "build_adb_command")]
+    after = [Site("emulator_shutdown.py", "shutdown", 81, EMU_ARGV, "build_adb_command")]
+
+    assert _reconcile(expected, before) == ([], [])
+    assert _reconcile(expected, after) == ([], [])
 
 
 def test_every_script_basename_is_unique_enough_to_key_on():
