@@ -38,7 +38,9 @@ dump with ElementTree, and says so. The base is always ground truth.
 
 from __future__ import annotations
 
+import copy
 import json as json_lib
+import re
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -67,34 +69,81 @@ def _analyze(xml: str) -> dict:
 
 
 def _compose_with_a_password_field(recorded) -> str:
-    """The recorded Compose screen with its EditText marked ``password="true"``.
+    """The recorded Compose screen, given a SECOND field that is secure.
 
     No recorded dump has a password field -- the fixture app has no password
-    input -- and the attribute is what the delta reads, so it is the one thing
-    substituted. Everything else (the unmerged semantics tree, the empty
-    resource-ids, the label living in a child TextView) is as the device
-    dumped it.
+    input -- so the login screen it needs is derived from the recorded one.
+    Two edits, both on a copy of the recorded EditText node so the whole
+    subtree (the caption TextView inside it, the empty resource-id, the
+    unmerged semantics wrapper) is what the device dumped:
+
+    1. ``password="true"`` on the copy -- the attribute the delta reads;
+    2. the copy's caption changed to "Password" and its bounds moved down by
+       its own height, because two fields cannot occupy one rectangle.
+
+    A second field matters: with one field, ``secure_fields`` and
+    ``len(edit_texts)`` are both 1, so `secure_fields = len(edit_texts)` would
+    pass. Two fields and one secure count makes the two independently
+    observable, which is what the original hand-written hierarchy was for.
     """
     root = ET.fromstring(recorded.text("uiautomator_compose_default"))
-    fields = [n for n in root.iter("node") if n.get("class", "").endswith(".EditText")]
+    parent = next(node for node in root.iter("node") if _edit_texts(node))
+    fields = _edit_texts(parent)
     assert len(fields) == 1, f"fixture no longer has exactly one EditText: {len(fields)}"
-    fields[0].set("password", "true")
+
+    plain = fields[0]
+    secure = copy.deepcopy(plain)
+    secure.set("password", "true")
+
+    left, top, right, bottom = _bounds(plain)
+    height = bottom - top
+    _set_bounds(secure, (left, top + height, right, bottom + height))
+    for caption in secure.iter("node"):
+        if caption.get("text"):
+            caption.set("text", "Password")
+            _set_bounds(caption, _shifted(_bounds(caption), height))
+
+    parent.insert(list(parent).index(plain) + 1, secure)
     return ET.tostring(root, encoding="unicode")
+
+
+def _edit_texts(node: ET.Element) -> list[ET.Element]:
+    return [child for child in node if child.get("class", "").endswith(".EditText")]
+
+
+def _bounds(node: ET.Element) -> tuple[int, int, int, int]:
+    left, top, right, bottom = re.findall(r"-?\d+", node.get("bounds", ""))
+    return int(left), int(top), int(right), int(bottom)
+
+
+def _shifted(box: tuple[int, int, int, int], dy: int) -> tuple[int, int, int, int]:
+    left, top, right, bottom = box
+    return left, top + dy, right, bottom + dy
+
+
+def _set_bounds(node: ET.Element, box: tuple[int, int, int, int]) -> None:
+    left, top, right, bottom = box
+    node.set("bounds", f"[{left},{top}][{right},{bottom}]")
 
 
 # --- Delta 2: secure/password field tracking -------------------------------
 
 
 def test_secure_field_counted_separately(recorded):
+    """Two fields, exactly one secure -- so the counts cannot be the same number."""
     analysis = _analyze(_compose_with_a_password_field(recorded))
 
-    assert len(analysis["edit_texts"]) == 1
+    assert len(analysis["edit_texts"]) == 2
     assert analysis["secure_fields"] == 1
+
     secure = [et for et in analysis["edit_texts"] if et["secure"]]
-    assert len(secure) == 1
-    # Compose emits no resource-id, so the label is recovered from the field's
-    # own subtree -- the caption TextView sitting inside it.
-    assert secure[0]["label"] == "Email address"
+    plain = [et for et in analysis["edit_texts"] if not et["secure"]]
+    assert len(secure) == 1 and len(plain) == 1
+
+    # Compose emits no resource-id, so each label is recovered from that
+    # field's own subtree -- the caption TextView sitting inside it.
+    assert plain[0]["label"] == "Email address"
+    assert secure[0]["label"] == "Password"
 
 
 def test_no_secure_fields_when_none_marked(recorded):
@@ -108,7 +157,7 @@ def test_no_secure_fields_when_none_marked(recorded):
 def test_summary_reports_secure_count(recorded):
     analysis = _analyze(_compose_with_a_password_field(recorded))
     summary = ScreenMapper().format_summary(analysis)
-    assert "EditTexts: 1 (0 filled) [1 secure]" in summary
+    assert "EditTexts: 2 (0 filled) [1 secure]" in summary
 
 
 def test_summary_omits_secure_marker_when_zero(recorded):

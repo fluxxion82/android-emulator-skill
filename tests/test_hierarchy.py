@@ -205,14 +205,14 @@ def test_capture_gives_up_with_an_actionable_error(fake_dump):
 # ---------------------------------------------------------------------------
 
 
-def test_element_to_dict_matches_the_documented_contract():
+def test_element_to_dict_matches_the_documented_contract(recorded):
     """CLAUDE.md: {"tag", "attributes": {...}, "children": [...]}, all strings.
 
     Read off a recorded dump rather than a two-node sample: the contract is
     about what a real screen converts to, and the recorded EditText carries its
     caption in a child, which is the nesting the shape has to survive.
     """
-    root = ET.fromstring(_recorded("uiautomator_compose_default"))
+    root = ET.fromstring(recorded.text("uiautomator_compose_default"))
     converted = hierarchy.element_to_dict(root)
 
     assert set(converted) == {"tag", "attributes", "children"}

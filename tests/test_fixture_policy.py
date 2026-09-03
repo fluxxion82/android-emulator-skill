@@ -69,6 +69,10 @@ OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
 # Choreographer line, renaming a stack frame in a real crash).
 RECORDED_SOURCES = frozenset({"recorded", "recorded_anywhere", "recorded_gradle", "any_profile"})
 
+# Substitution helpers whose SUBJECT -- the text being reshaped -- is the third
+# positional argument rather than the receiver.
+RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
+
 # --- The debt ---------------------------------------------------------------
 #
 # Every entry is a test asserting a parser's behaviour against output nobody
@@ -117,6 +121,10 @@ RECORDED_SOURCES = frozenset({"recorded", "recorded_anywhere", "recorded_gradle"
 #     database carries android_metadata and sqlite_sequence, so a table count
 #     taken from a hand-written schema is short by two.
 #
+#     PARTLY: test_container.py and test_device_list.py each keep ONE literal,
+#     for platform behaviour the parsers document and no recording covers --
+#     see their entries below. Everything else in both files reads recordings.
+#
 #   test_screen_mapper.py, test_accessibility_audit.py, test_hierarchy.py,
 #     test_compose_visibility.py — paid off when parser detection stopped
 #     depending on the function's NAME (T2). `analyze_tree` and `_audit_node`
@@ -150,53 +158,133 @@ KNOWN_VIOLATIONS = frozenset(
         # No AVD `config.ini` is recorded. Same PR should capture one; until
         # then the hand-written key/value block stands.
         "test_emulator_selector.py::parse_config_ini",
+        # A symlink line, a filename containing a space, and the coreutils
+        # month/day/year layout -- all documented by parse_ls_output, none in
+        # any recording. Record `run-as ... ls -la` in a directory containing
+        # a symlink and a spaced filename.
+        "test_container.py::parse_ls_output",
+        # `offline` and `unauthorized` device states, which parse_adb_devices
+        # reports and no recording has. Record `adb devices -l` with a device
+        # in each state (a second emulator killed mid-boot gives `offline`).
+        "test_device_list.py::parse_adb_devices",
     }
 )
 
 # `_build_parser` is argparse, not a tool-output parser.
 NOT_A_TOOL_PARSER = {"_build_parser"}
 
-# Annotations that say "this takes a uiautomator hierarchy".
+# Annotations that say "this takes a uiautomator hierarchy" -- but only when
+# they came from xml.etree. `navigator.py` defines its own `Element` dataclass,
+# and `tap(element: Element)` is a tap, not a parser, so the name alone is not
+# enough: provenance is resolved per module from its imports.
 HIERARCHY_ANNOTATIONS = frozenset({"Element", "ElementTree"})
+XML_ETREE_MODULES = frozenset({"xml.etree.ElementTree", "xml.etree"})
 
-# The key `get_ui_hierarchy()` nests every UI field under (see CLAUDE.md's
-# hierarchy contract). A function reading it consumes a dumped screen, whatever
-# it is called.
-HIERARCHY_ATTRS_KEY = "attributes"
+# The dict shape `get_ui_hierarchy()` returns (CLAUDE.md's hierarchy contract):
+# {"tag": str, "attributes": {...}, "children": [...]}. A function reading or
+# building it consumes a dumped screen, whatever it is called. "tag" alone is
+# too generic to key on; the other two are not.
+HIERARCHY_KEYS = frozenset({"attributes", "children"})
+HIERARCHY_SHAPE = frozenset({"tag", "attributes", "children"})
 
 
-def _takes_a_hierarchy(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """Whether any parameter is annotated as an XML element."""
+def _xml_element_names(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:
+    """(module aliases, bare names) through which this file reaches ET.Element."""
+    aliases: set[str] = set()
+    bare: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in XML_ETREE_MODULES:
+                    aliases.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module not in XML_ETREE_MODULES:
+                continue
+            for alias in node.names:
+                if alias.name in HIERARCHY_ANNOTATIONS:
+                    bare.add(alias.asname or alias.name)
+                if alias.name == "ElementTree":
+                    aliases.add(alias.asname or alias.name)
+    return frozenset(aliases), frozenset(bare)
+
+
+def _takes_a_hierarchy(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    aliases: frozenset[str],
+    bare: frozenset[str],
+) -> bool:
+    """Whether any parameter is annotated as an *xml.etree* element."""
     args = func.args
     for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
         if arg is None or arg.annotation is None:
             continue
         for sub in ast.walk(arg.annotation):
-            if isinstance(sub, ast.Name) and sub.id in HIERARCHY_ANNOTATIONS:
+            if isinstance(sub, ast.Name) and sub.id in bare:
                 return True
-            if isinstance(sub, ast.Attribute) and sub.attr in HIERARCHY_ANNOTATIONS:
+            if (
+                isinstance(sub, ast.Attribute)
+                and sub.attr in HIERARCHY_ANNOTATIONS
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id in aliases
+            ):
                 return True
     return False
 
 
-def _reads_hierarchy_nodes(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """Whether the body reads ``node["attributes"]`` / ``node.get("attributes")``."""
+def _handles_hierarchy_nodes(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether the body reads or builds the documented hierarchy-node shape."""
     for sub in ast.walk(func):
+        # node.get("attributes") / node.get("children")
         if (
             isinstance(sub, ast.Call)
             and isinstance(sub.func, ast.Attribute)
             and sub.func.attr == "get"
             and sub.args
             and isinstance(sub.args[0], ast.Constant)
-            and sub.args[0].value == HIERARCHY_ATTRS_KEY
+            and sub.args[0].value in HIERARCHY_KEYS
         ):
             return True
+        # node["attributes"] / node["children"]
         if (
             isinstance(sub, ast.Subscript)
             and isinstance(sub.slice, ast.Constant)
-            and sub.slice.value == HIERARCHY_ATTRS_KEY
+            and sub.slice.value in HIERARCHY_KEYS
         ):
             return True
+        # {"tag": ..., "attributes": ..., "children": []} -- building one.
+        if isinstance(sub, ast.Dict):
+            keys = {k.value for k in sub.keys if isinstance(k, ast.Constant)}
+            if len(keys & HIERARCHY_SHAPE) >= 2:
+                return True
+    return False
+
+
+def _passes_a_parameter_to(func: ast.FunctionDef | ast.AsyncFunctionDef, known: set[str]) -> bool:
+    """Whether ``func`` hands one of its own parameters to a known parser.
+
+    `accessibility_audit.audit_tree(hierarchy: dict)` touches no key itself --
+    it calls `_audit_node(hierarchy)`. A wrapper around a hierarchy parser is
+    still a hierarchy consumer, and a test feeding it a literal is still
+    inventing a screen.
+    """
+    args = func.args
+    parameters = {
+        arg.arg
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+        if arg is not None
+    }
+    for sub in ast.walk(func):
+        if not isinstance(sub, ast.Call):
+            continue
+        if isinstance(sub.func, ast.Attribute):
+            callee = sub.func.attr
+        else:
+            callee = getattr(sub.func, "id", None)
+        if callee not in known or callee == func.name:
+            continue
+        for argument in [*sub.args, *(k.value for k in sub.keywords)]:
+            if isinstance(argument, ast.Name) and argument.id in parameters:
+                return True
     return False
 
 
@@ -213,21 +301,37 @@ def _parser_names() -> set[str]:
     parser regardless of what it is called.
     """
     names: set[str] = set()
+    hierarchy: set[str] = set()
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+
     for path in SCRIPTS.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        aliases, bare = _xml_element_names(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             if node.name in NOT_A_TOOL_PARSER:
                 continue
-            if (
-                "parse" in node.name
-                or node.name.startswith("scan_")
-                or _takes_a_hierarchy(node)
-                or _reads_hierarchy_nodes(node)
-            ):
+            functions.append(node)
+            if _takes_a_hierarchy(node, aliases, bare) or _handles_hierarchy_nodes(node):
+                hierarchy.add(node.name)
+            elif "parse" in node.name or node.name.startswith("scan_"):
                 names.add(node.name)
-    return names
+
+    # Closure over the HIERARCHY set only: a function handing one of its own
+    # parameters to a hierarchy parser is one too. Deliberately not applied to
+    # the name-matched set -- `grant_permission(package, ...)` passes its
+    # parameter to `parse_package_permissions`, and a package name is an
+    # argument, not a screen.
+    while True:
+        grown = {
+            node.name
+            for node in functions
+            if node.name not in hierarchy and _passes_a_parameter_to(node, hierarchy)
+        }
+        if not grown:
+            return names | hierarchy
+        hierarchy |= grown
 
 
 def _reads_a_recording(
@@ -247,10 +351,60 @@ def _reads_a_recording(
     return False
 
 
+def _recorded_subject(
+    call: ast.Call,
+    scope: dict[str, ast.AST],
+    resolving: frozenset[str],
+    helpers: frozenset[str],
+) -> ast.AST | None:
+    """The ground-truth argument of an allowlisted transformation, or None.
+
+    Only two shapes qualify, and in both the recording must be the SUBJECT --
+    the thing being reshaped -- not merely somewhere in the argument list:
+
+      * a method call on a recorded receiver: ``recorded.text(...)``,
+        ``<recorded>.replace(a, b)``, ``<recorded>.encode("utf-8")``;
+      * ``re.sub`` / ``re.subn``, whose subject is the third positional
+        argument (or ``string=``);
+      * a derivation helper defined in the same test file, called with a
+        recording among its arguments -- ``_repeat_of`` and ``_rename_frame``
+        in test_crash_triage.py, the substitutions its module docstring
+        describes.
+
+    Anything else -- an arbitrary ``wrapper(<invented blob>, recorded.text(...))``
+    -- is not a transformation of the recording, and its other arguments are
+    scanned normally. Exempting a whole call because a recording appeared
+    ANYWHERE inside it is how the first version of this rule let a 200-character
+    invented transcript through untouched.
+    """
+    if isinstance(call.func, ast.Attribute):
+        if _reads_a_recording(call.func.value, scope, resolving):
+            return call.func.value
+        if call.func.attr in RE_SUBSTITUTIONS:
+            if len(call.args) >= 3:
+                subject = call.args[2]
+            else:
+                subject = next((k.value for k in call.keywords if k.arg == "string"), None)
+            if subject is not None and _reads_a_recording(subject, scope, resolving):
+                return subject
+        return None
+
+    # A derivation helper defined in the same test file, over a recording:
+    # `_rename_frame(recorded_crash, 0, "com.example.App.render")`. The file
+    # has to define it -- an unknown `wrapper(...)` is not a transformation,
+    # it is a call that happens to have a recording somewhere in it.
+    if isinstance(call.func, ast.Name) and call.func.id in helpers:
+        arguments = [*call.args, *(k.value for k in call.keywords)]
+        return next((a for a in arguments if _reads_a_recording(a, scope, resolving)), None)
+    return None
+
+
 def _is_tool_output_literal(
     node: ast.AST,
     scope: dict[str, ast.AST] | None = None,
     _resolving: frozenset[str] = frozenset(),
+    _helpers: frozenset[str] = frozenset(),
+    _beside_a_recording: bool = False,
 ) -> bool:
     """Whether this expression *is* a hand-written transcript.
 
@@ -264,17 +418,36 @@ def _is_tool_output_literal(
     a one-line refactor turned the whole rule off. Wrapping calls, attribute
     access and containers are seen through for the same reason: what a parser
     receives is the literal, whatever it was passed through on the way.
+
+    ``_helpers`` names the functions the scanned file defines, so a derivation
+    helper over a recording can be told from an arbitrary call.
+
+    ``_beside_a_recording`` is True only for the non-subject arguments of an
+    allowlisted transformation, where a literal is a substitution pattern or
+    value rather than a transcript. There, only a MULTI-LINE literal counts:
+    `re.sub(r"Skipped \\d+ frames", f"Skipped {n} frames", recorded_line)` and
+    `_rename_frame(recorded_crash, 0, "com.example.App.render")` are the
+    documented derivations, and both would otherwise be flagged for a pattern
+    or a symbol name.
     """
     scope = scope or {}
 
-    def recurse(child: ast.AST, resolving: frozenset[str] = _resolving) -> bool:
-        return _is_tool_output_literal(child, scope, resolving)
+    def recurse(
+        child: ast.AST,
+        resolving: frozenset[str] = _resolving,
+        beside_a_recording: bool = _beside_a_recording,
+    ) -> bool:
+        return _is_tool_output_literal(child, scope, resolving, _helpers, beside_a_recording)
 
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return len(node.value) >= TOOL_OUTPUT_MIN_LENGTH
+        if len(node.value) < TOOL_OUTPUT_MIN_LENGTH:
+            return False
+        return "\n" in node.value if _beside_a_recording else True
     if isinstance(node, ast.JoinedStr):
         # An f-string assembling output is still assembled output.
-        return True
+        return any(recurse(value) for value in node.values) if _beside_a_recording else True
+    if isinstance(node, ast.FormattedValue):
+        return recurse(node.value)
     if isinstance(node, ast.BinOp):
         # Concatenation, `%` formatting, `*` repetition: all still the literal.
         return recurse(node.left) or recurse(node.right)
@@ -289,18 +462,23 @@ def _is_tool_output_literal(
     if isinstance(node, ast.Call):
         # `ET.fromstring(HIERARCHY)`, `dedent(OUTPUT)`, `X.encode("utf-8")`:
         # a conversion in front of the parser is not a recording.
-        if _reads_a_recording(node, scope, _resolving):
-            # ...but `re.sub(pattern, replacement, recorded_line)` is. The
-            # pattern is a literal and the subject is ground truth; flagging it
-            # would forbid the one reshaping CLAUDE.md explicitly permits.
-            return False
-        return (
-            recurse(node.func)
-            or any(recurse(a) for a in node.args)
-            or any(recurse(k.value) for k in node.keywords)
-        )
+        subject = _recorded_subject(node, scope, _resolving, _helpers)
+
+        parts: list[ast.AST] = []
+        if isinstance(node.func, ast.Attribute):
+            if node.func.value is not subject:
+                parts.append(node.func.value)
+        else:
+            parts.append(node.func)
+        parts += [a for a in node.args if a is not subject]
+        parts += [k.value for k in node.keywords if k.value is not subject]
+
+        # Inside a transformation the recording is ground truth and the pattern
+        # and replacement are not transcripts -- but a long literal sitting
+        # beside them still is.
+        return any(recurse(part, beside_a_recording=subject is not None) for part in parts)
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        return any(recurse(e) for e in node.elts)
+        return any(recurse(element) for element in node.elts)
     return False
 
 
@@ -355,17 +533,27 @@ def _calls_with_scope(node: ast.AST, inherited: dict[str, ast.AST]):
 
 def _scan_source(source: str, parsers: set[str]) -> set[str]:
     """Names of the calls in one module that are fed invented tool output."""
+    tree = ast.parse(source)
+    helpers = frozenset(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
     found: set[str] = set()
-    for node, scope in _calls_with_scope(ast.parse(source), {}):
+    for node, scope in _calls_with_scope(tree, {}):
         name = _called_name(node)
 
         # Shape 1: straight into a parser.
-        if name in parsers and any(_is_tool_output_literal(a, scope) for a in node.args):
+        if name in parsers and any(
+            _is_tool_output_literal(a, scope, frozenset(), helpers) for a in node.args
+        ):
             found.add(name)
 
         # Shape 2: through a double's stdout.
         for keyword in node.keywords:
-            if keyword.arg in OUTPUT_KEYWORDS and _is_tool_output_literal(keyword.value, scope):
+            if keyword.arg in OUTPUT_KEYWORDS and _is_tool_output_literal(
+                keyword.value, scope, frozenset(), helpers
+            ):
                 found.add(name or "?")
 
     return found
@@ -413,43 +601,114 @@ def test_the_debt_list_does_not_rot():
     )
 
 
-def test_the_two_hierarchy_parsers_are_in_policy():
-    """T2, named rather than implied.
+# Every function in the skill that consumes a dumped screen. Named rather than
+# implied, so the coverage cannot regress silently when the detection rules are
+# next edited. The first two are T2 -- `analyze_tree` and `_audit_node` are the
+# whole of "see the screen" and matched neither name rule; the rest were found
+# afterwards, when only `attributes` was keyed on and a wrapper that delegates
+# was invisible.
+HIERARCHY_CONSUMERS = (
+    "analyze_tree",  # screen_mapper
+    "_audit_node",  # accessibility_audit
+    "_descendants",  # accessibility_audit, walks "children"
+    "audit_tree",  # accessibility_audit, delegates to _audit_node
+    "count_ui_elements",  # app_state_capture, walks "children"
+    "_xml_to_dict",  # common/device_utils, builds the node shape
+)
 
-    `screen_mapper.analyze_tree` and `accessibility_audit._audit_node` are the
-    whole of "see the screen", and matched neither name rule, so the files
-    testing them were outside the ratchet. Naming them here means the coverage
-    cannot regress silently when the detection rules are next edited.
+# Not parsers, however they are annotated: navigator defines its own `Element`
+# dataclass, and tapping one is not reading a screen.
+NOT_HIERARCHY_CONSUMERS = ("tap", "enter_text")
+
+
+def test_every_hierarchy_consumer_is_in_policy():
+    """T2 and its follow-up, named rather than implied."""
+    parsers = _parser_names()
+    missing = [name for name in HIERARCHY_CONSUMERS if name not in parsers]
+    assert not missing, (
+        f"{missing} consume a UI hierarchy but are not detected as parsers, so "
+        f"tests feeding them hand-written screens are outside the fixture policy"
+    )
+
+
+def test_navigators_own_element_type_is_not_mistaken_for_xml():
+    """Provenance, not the bare name.
+
+    `navigator.py` has `@dataclass class Element` and `def tap(element: Element)`.
+    Matching on the annotation's name alone made every tap a parser, which is
+    both wrong and the kind of slack that makes an explicit-membership test
+    look green for the wrong reason.
     """
     parsers = _parser_names()
-    for name in ("analyze_tree", "_audit_node"):
-        assert name in parsers, (
-            f"{name} is not detected as a parser, so the tests feeding it "
-            f"hierarchies are outside the fixture policy again"
-        )
+    wrong = [name for name in NOT_HIERARCHY_CONSUMERS if name in parsers]
+    assert not wrong, f"{wrong} are typed with navigator's own Element, not xml.etree's"
+
+
+def test_only_xml_etree_element_annotations_count():
+    tree = ast.parse(
+        "import xml.etree.ElementTree as ET\n" "def reads(root: ET.Element):\n" "    return root\n"
+    )
+    aliases, bare = _xml_element_names(tree)
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    assert [f.name for f in functions if _takes_a_hierarchy(f, aliases, bare)] == ["reads"]
+
+    local = ast.parse(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class Element:\n"
+        "    text: str\n"
+        "def tap(element: Element):\n"
+        "    return element\n"
+    )
+    aliases, bare = _xml_element_names(local)
+    functions = [n for n in ast.walk(local) if isinstance(n, ast.FunctionDef)]
+    assert [f.name for f in functions if _takes_a_hierarchy(f, aliases, bare)] == []
+
+
+def test_a_wrapper_that_delegates_to_a_hierarchy_parser_is_one_too():
+    """`audit_tree(hierarchy)` touches no key itself; it calls `_audit_node`."""
+    tree = ast.parse(
+        "def _audit_node(node):\n"
+        '    return node.get("attributes", {})\n'
+        "def audit_tree(hierarchy):\n"
+        "    return _audit_node(hierarchy)\n"
+        "def unrelated(value):\n"
+        "    return _audit_node({})\n"
+    )
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    seeded = {f.name for f in functions if _handles_hierarchy_nodes(f)}
+    assert seeded == {"_audit_node"}
+
+    grown = {f.name for f in functions if _passes_a_parameter_to(f, seeded)}
+    assert grown == {"audit_tree"}, "a delegating wrapper is still a hierarchy consumer"
 
 
 def test_a_function_taking_an_element_is_a_parser():
     """Structural rule 1: the annotation says it consumes a dumped screen."""
     tree = ast.parse(
+        "import xml.etree.ElementTree as ET\n"
+        "from xml.etree.ElementTree import Element\n"
         "def render(root: ET.Element) -> dict:\n"
         "    return {}\n"
         "def render_maybe(node: Element | None):\n"
         "    return None\n"
     )
+    aliases, bare = _xml_element_names(tree)
     found = {
         node.name
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and _takes_a_hierarchy(node)
+        if isinstance(node, ast.FunctionDef) and _takes_a_hierarchy(node, aliases, bare)
     }
     assert found == {"render", "render_maybe"}
 
 
-def test_a_function_reading_the_attributes_key_is_a_parser():
+def test_a_function_handling_the_node_shape_is_a_parser():
     """Structural rule 2: `_audit_node` is annotated `dict`, not `ET.Element`.
 
-    What identifies it is the hierarchy contract it reads -- every UI field
-    nested under ``node["attributes"]`` -- so that is what the rule looks for.
+    What identifies it is the hierarchy contract it touches. Keying on
+    `attributes` alone missed `_descendants` and `count_ui_elements` (which
+    walk `children`) and `_xml_to_dict` (which BUILDS the shape rather than
+    reading it), so all three are covered.
     """
     tree = ast.parse(
         "def audit(node: dict):\n"
@@ -457,15 +716,19 @@ def test_a_function_reading_the_attributes_key_is_a_parser():
         "    return attrs\n"
         "def subscripted(node):\n"
         '    return node["attributes"]\n'
-        "def unrelated(node):\n"
+        "def walker(node):\n"
         '    return node.get("children", [])\n'
+        "def builder(element):\n"
+        '    return {"tag": element.tag, "attributes": {}, "children": []}\n'
+        "def unrelated(node):\n"
+        '    return node.get("serial", "")\n'
     )
     found = {
         node.name
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and _reads_hierarchy_nodes(node)
+        if isinstance(node, ast.FunctionDef) and _handles_hierarchy_nodes(node)
     }
-    assert found == {"audit", "subscripted"}
+    assert found == {"audit", "subscripted", "walker", "builder"}
 
 
 def test_a_hand_written_hierarchy_fed_to_a_hierarchy_parser_is_caught():
@@ -585,6 +848,62 @@ def test_a_recorded_line_reshaped_in_the_test_is_not_flagged():
         '    PARSER(re.sub(r"Skipped \\d+ frames", f"Skipped {n} frames", template))\n'
     )
     assert found == set()
+
+
+# A transcript nobody recorded, in the shape a fabricated `adb devices -l`
+# actually has: a header and repeated device lines.
+INVENTED_TRANSCRIPT = "List of devices attached\n" + (
+    "emulator-5554          device product:sdk_gphone16k_arm64 model:sdk\n" * 3
+)
+
+
+def test_a_recording_elsewhere_in_the_call_does_not_launder_the_literal():
+    """F1: the first version of the exemption short-circuited the whole call.
+
+    `_reads_a_recording` was asked about the call node, so ANY argument being
+    a recording excused every other argument -- and Codex demonstrated it:
+    `parse(wrapper(<200 invented chars>, recorded.text("adb_devices_single")))`
+    scanned clean. `wrapper` is not a transformation of that recording; the
+    recording merely sits beside the invention.
+    """
+    found = _synthetic(f"PARSER(wrapper({INVENTED_TRANSCRIPT!r}, recorded.text('x')))")
+    assert found == {_a_parser()}, "a recorded sibling still launders an invented literal"
+
+
+def test_a_single_line_invented_blob_is_caught_too():
+    """The same probe without newlines: length alone is the rule outside a
+    transformation, so nothing here turns on the blob being multi-line."""
+    found = _synthetic(f"PARSER(wrapper({'x y ' * 50!r}, recorded.text('x')))")
+    assert found == {_a_parser()}
+
+
+def test_a_local_derivation_helper_over_a_recording_is_not_flagged():
+    """test_crash_triage's documented substitutions must stay clean.
+
+    `_rename_frame(recorded_crash, 0, "com.example.App.render")` reshapes a real
+    crash; the symbol is a value being substituted IN, not a transcript. The
+    file has to define the helper -- that is what separates it from `wrapper`.
+    """
+    found = _synthetic(
+        "def _rename_frame(text, index, symbol):\n"
+        "    return text\n"
+        "def test_x(recorded):\n"
+        "    crash = recorded.text('logcat_crash_java')\n"
+        "    PARSER(_rename_frame(crash, 0, 'com.example.composefixture.HomeScreen.render'))\n"
+    )
+    assert found == set()
+
+
+def test_a_derivation_helper_does_not_launder_a_transcript_beside_it():
+    """The exemption covers substitution values, not a second invented dump."""
+    found = _synthetic(
+        "def _rename_frame(text, index, symbol):\n"
+        "    return text\n"
+        "def test_x(recorded):\n"
+        "    crash = recorded.text('logcat_crash_java')\n"
+        f"    PARSER(_rename_frame(crash, 0, {INVENTED_TRANSCRIPT!r}))\n"
+    )
+    assert found == {_a_parser()}
 
 
 def test_recorded_fixtures_are_actually_consumed():

@@ -56,6 +56,49 @@ def test_parse_adb_devices_skips_the_header(recorded):
     assert len(device_list.parse_adb_devices(listing)) == 1
 
 
+def test_parse_adb_devices_skips_daemon_noise(recorded):
+    """adb prefixes its own chatter with `*`; those lines are not devices.
+
+    The banner is short enough not to be a transcript by the fixture policy's
+    own measure, and it is prepended to a real listing rather than replacing
+    one, so the device lines being parsed are still the device's.
+    """
+    noisy = "* daemon started successfully *\n" + recorded.text("adb_devices_single")
+    devices = device_list.parse_adb_devices(noisy)
+    assert len(devices) == 1
+    assert devices[0]["serial"] == "emulator-5554"
+
+
+# ---------------------------------------------------------------------------
+# FROZEN DEBT, not an exception. `offline` and `unauthorized` are real adb
+# states that `parse_adb_devices` documents and reports (`online` is False for
+# both), and no recording has either: capturing `unauthorized` needs a handset
+# with the RSA prompt pending, and this lane must never drive one.
+#
+# `test_device_list.py::parse_adb_devices` is frozen in KNOWN_VIOLATIONS for
+# this literal. To pay it off, record `adb devices -l` with a device in each
+# state -- a second emulator killed mid-boot gives `offline` -- as
+# `adb_devices_offline` / `adb_devices_unauthorized`.
+# ---------------------------------------------------------------------------
+
+ADB_OUTPUT_WITH_BAD_STATES = """List of devices attached
+emulator-5554          device product:sdk_gphone16k_arm64 model:sdk_gphone16k_arm64 device:emu64a16k
+99887766               offline
+77665544               unauthorized
+"""
+
+
+def test_parse_adb_devices_offline_and_unauthorized_not_online():
+    devices = device_list.parse_adb_devices(ADB_OUTPUT_WITH_BAD_STATES)
+    by_serial = {d["serial"]: d for d in devices}
+
+    assert by_serial["emulator-5554"]["online"] is True
+    assert by_serial["99887766"]["online"] is False
+    assert by_serial["99887766"]["state"] == "offline"
+    assert by_serial["77665544"]["online"] is False
+    assert by_serial["77665544"]["state"] == "unauthorized"
+
+
 def test_parse_adb_devices_empty():
     assert device_list.parse_adb_devices("List of devices attached\n") == []
     assert device_list.parse_adb_devices("") == []
@@ -74,6 +117,16 @@ def test_parse_emulator_avds_names(recorded):
     avds = device_list.parse_emulator_avds(recorded.text("emulator_list_avds"))
     assert [a["name"] for a in avds] == ["Pixel_9"]
     assert all(a["kind"] == "avd" and a["online"] is False for a in avds)
+
+
+def test_parse_emulator_avds_skips_banner_lines_with_spaces(recorded):
+    """`emulator` writes INFO chatter to the same stream; an AVD name has no space.
+
+    Prepended to the recorded listing rather than replacing it, and short
+    enough not to be a transcript by the policy's own measure.
+    """
+    noisy = "INFO | Storing crashdata in: /tmp/x\n" + recorded.text("emulator_list_avds")
+    assert [a["name"] for a in device_list.parse_emulator_avds(noisy)] == ["Pixel_9"]
 
 
 def test_parse_emulator_avds_empty():

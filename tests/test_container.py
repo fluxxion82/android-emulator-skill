@@ -60,6 +60,50 @@ def test_parse_ls_ignores_garbage_lines():
     assert parse_ls_output(output) == []
 
 
+# ---------------------------------------------------------------------------
+# FROZEN DEBT, not exceptions. The three cases below are real `ls -la` output
+# the parser's own docstring promises to handle -- a symlink with its `->`
+# target, a filename containing a space, and the coreutils month/day/year
+# column layout. None of them appears in any recording: the fixture app's data
+# directory holds neither a symlink nor a spaced filename, so nothing was
+# captured to read.
+#
+# They are literals, and `test_container.py::parse_ls_output` is frozen in
+# KNOWN_VIOLATIONS to say so. Deleting them instead would drop coverage of
+# behaviour the code still advertises, which is a worse trade than admitting
+# the debt. To pay it off:
+#
+#     adb shell run-as com.example.composefixture sh -c \
+#         'cd files && ln -s /data/app/lib lib && : > "my file.txt"'
+#     python tests/record_fixtures.py --only run_as_ls_symlink_and_spaces
+# ---------------------------------------------------------------------------
+
+
+def test_parse_ls_symlink_target():
+    output = "lrwxrwxrwx 1 root root 11 2024-01-02 03:04 lib -> /data/app/lib\n"
+    entries = parse_ls_output(output)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["kind"] == "symlink"
+    assert entry["name"] == "lib"
+    assert entry["symlink_target"] == "/data/app/lib"
+
+
+def test_parse_ls_name_with_spaces():
+    output = "-rw------- 1 u0_a1 u0_a1 5 2024-01-02 03:04 my file.txt\n"
+    entries = parse_ls_output(output)
+    assert entries[0]["name"] == "my file.txt"
+
+
+def test_parse_ls_coreutils_layout_with_year():
+    # GNU coreutils ls: month, day, year/time as separate tokens. `parse_ls_output`
+    # claims both layouts, and container.py's export path reads host listings too.
+    output = "-rw-r--r-- 1 user group 1024 Jan  2  2024 data.bin\n"
+    entries = parse_ls_output(output)
+    assert entries[0]["name"] == "data.bin"
+    assert entries[0]["size_bytes"] == 1024
+
+
 # === parse_shared_prefs_xml ===
 #
 # The typed round-trip lives at the bottom of this file, against
@@ -327,21 +371,23 @@ def test_databases_schema_via_device_sqlite3(monkeypatch, recorded):
 
 
 def test_export_writes_snapshot(monkeypatch, tmp_path, recorded):
-    """Every listing served here is recorded output.
+    """Every listing served here is recorded output, with ONE substitution.
 
-    Two substitutions on recorded lines, because no `ls -la` of a shared_prefs
-    directory was captured: the data-dir listing gains the two subdirectories
-    export descends into (by renaming recorded entries), and the prefs
-    directory is the recorded databases listing with the file renamed to the
-    prefs file the recorder actually read. Column widths, the `total` header
-    and the `.`/`..` entries stay exactly as the device printed them.
+    `export` issues its own `ls -la` against shared_prefs/ and databases/
+    whatever the data-dir listing contains, so the recorded data-dir and
+    databases listings are served verbatim -- no synthesised topology.
+
+    The single derivation is the prefs directory, because no `ls -la` of a
+    shared_prefs/ directory was captured: the recorded databases listing has
+    its `fixture.db-journal` entry renamed to `fixture_settings.xml`, the
+    prefs file the recorder actually read. That leaves a directory holding one
+    `.xml` and one file that is not one, which is what `shared_prefs()` has to
+    filter. Column widths, the `total` header and the `.`/`..` entries are
+    exactly as the device printed them.
     """
-    ls_root = recorded.text("run_as_ls_data_dir").replace("code_cache", "shared_prefs")
-    ls_root = ls_root.replace(" cache\n", " databases\n")
+    ls_root = recorded.text("run_as_ls_data_dir")
     ls_dbs = recorded.text("run_as_ls_databases")
-    ls_prefs = ls_dbs.replace("fixture.db-journal", "notes.txt").replace(
-        "fixture.db", "fixture_settings.xml"
-    )
+    ls_prefs = ls_dbs.replace("fixture.db-journal", "fixture_settings.xml")
     prefs_xml = recorded.text("shared_prefs_settings_xml").encode("utf-8")
 
     def fake_text_run(cmd, *args, **kwargs):
