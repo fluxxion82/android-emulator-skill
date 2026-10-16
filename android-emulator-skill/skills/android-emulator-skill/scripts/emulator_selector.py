@@ -276,13 +276,21 @@ class EmulatorSelector:
         return [self._build_candidate(name) for name in names]
 
     def _build_candidate(self, name: str) -> dict:
-        """Assemble a candidate dict for ``name`` from its config.ini."""
+        """Assemble a candidate dict for ``name`` from its config.ini.
+
+        ``display_name`` falls back to the AVD's own name, the one its
+        ``<name>.avd`` directory carries. ``avd.ini.displayname`` is written by
+        Android Studio but not by ``avdmanager create avd`` (recorded:
+        avd_config_ini), so every AVD this skill creates had an empty display
+        name (N17). The config's ``avd.id`` / ``avd.name`` are no substitute:
+        avdmanager leaves them as the literal placeholder ``<build>``.
+        """
         config = read_avd_config(name)
         return {
             "name": name,
             "api_level": parse_api_level(config),
             "device": config.get("hw.device.name", ""),
-            "display_name": config.get("avd.ini.displayname", ""),
+            "display_name": config.get("avd.ini.displayname") or name,
         }
 
     def _list_avd_names(self) -> list[str]:

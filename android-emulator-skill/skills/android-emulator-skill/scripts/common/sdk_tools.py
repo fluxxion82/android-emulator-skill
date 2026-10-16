@@ -23,8 +23,9 @@ raise-with-a-remedy policy lives in :class:`SdkToolError` and
 how one finding came to exist in three files at once.
 
 Used by:
-- device_list.py - ``emulator -list-avds`` for defined AVDs
+- device_list.py - ``emulator -list-avds`` for defined AVDs, ``avdmanager list avd``
 - emulator_boot.py - booting and listing AVDs
+- emulator_create.py - ``avdmanager`` / ``sdkmanager`` listings before a create
 - emulator_selector.py - candidate AVD enumeration and CLI boot fallback
 - emulator_delete.py - ``avdmanager list avd`` before a destructive delete
 """
@@ -215,6 +216,47 @@ def missing_emulator_error() -> SdkToolError:
     )
 
 
+def missing_cmdline_tool_error(tool: str) -> SdkToolError:
+    """The error for an ``avdmanager`` / ``sdkmanager`` that does not resolve.
+
+    The command-line-tools counterpart of :func:`missing_emulator_error`. The
+    "Looked in" list is :func:`searched_locations` over the same
+    :data:`CMDLINE_TOOLS_SUBDIRS` that :func:`resolve_sdk_tool` probes, so it
+    names exactly the places that were tried -- a hand-written list once named
+    two that nothing had looked in (N2).
+
+    Args:
+        tool: ``"avdmanager"`` or ``"sdkmanager"``.
+
+    Returns:
+        The :class:`SdkToolError` to raise.
+    """
+    return SdkToolError(
+        f"{tool} not found. Looked in: {searched_locations(tool, CMDLINE_TOOLS_SUBDIRS)}. "
+        f"{CMDLINE_TOOLS_REMEDY}",
+        remedy=CMDLINE_TOOLS_REMEDY,
+    )
+
+
+def without_null_lines(text: str) -> str:
+    """``text`` without the lines that read only ``null``, stripped.
+
+    ``avdmanager`` ends a failure with a second stderr line reading just
+    ``null`` -- a Java exception message printed without a null check
+    (recorded: ``avdmanager_delete_missing``, exit 1, "Error: There is no
+    Android Virtual Device named '...'." then ``null``). Handed on verbatim,
+    every such failure message ended in a word that says nothing (N13). Only a
+    whole line goes; a ``null`` inside a sentence belongs to that sentence.
+
+    Args:
+        text: A tool's stderr (or stdout).
+
+    Returns:
+        The same text minus bare ``null`` lines; "" when nothing else was said.
+    """
+    return "\n".join(line for line in text.splitlines() if line.strip() != "null").strip()
+
+
 def run_sdk_tool(argv: list[str], *, timeout: float, remedy: str) -> str:
     """Run one SDK tool, bounded, and turn every failure into a remedy.
 
@@ -251,7 +293,9 @@ def run_sdk_tool(argv: list[str], *, timeout: float, remedy: str) -> str:
         raise SdkToolError(f"`{argv[0]}` could not be run: {exc}. {remedy}", remedy=remedy) from exc
 
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        detail = (
+            without_null_lines(result.stderr) or without_null_lines(result.stdout) or "no output"
+        )
         raise SdkToolError(
             f"`{' '.join(argv)}` exited {result.returncode}: {detail}. {remedy}", remedy=remedy
         )

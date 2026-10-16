@@ -42,18 +42,62 @@ def test_parse_config_ini_basic(recorded):
 
 
 def test_the_recorded_config_has_no_display_name_and_a_placeholder_id(recorded):
-    """Facts about this recording, not a verdict on what the selector should do.
+    """Facts about this recording, which the N17 fallback below depends on.
 
     `_build_candidate` reads `display_name` from `avd.ini.displayname`, which
     this avdmanager-created config does not have (the Studio-made AVD on the
     recording host does); and the id keys a reader might reach for instead hold
-    `<build>`, not the AVD's name. What display_name SHOULD be for such an AVD
-    is undecided, so nothing here asserts the empty string is right.
+    `<build>`, not the AVD's name.
     """
     config = emulator_selector.parse_config_ini(recorded.text("avd_config_ini"))
     assert "avd.ini.displayname" not in config
     assert "AvdId" not in config
     assert config["avd.id"] == config["avd.name"] == "<build>"
+
+
+# The AVD the recorded config belongs to: the manifest's `cat <avd home>/
+# aes_fixture_tmp.avd/config.ini`, captured between its create and its delete.
+RECORDED_CONFIG_AVD = "aes_fixture_tmp"
+
+
+def _avd_home_with(monkeypatch, tmp_path, name: str, config_text: str):
+    avd_home = tmp_path / "avds"
+    (avd_home / f"{name}.avd").mkdir(parents=True)
+    (avd_home / f"{name}.avd" / "config.ini").write_text(config_text)
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(avd_home))
+
+
+def test_an_avdmanager_made_avd_is_displayed_by_its_own_name(monkeypatch, tmp_path, recorded):
+    """N17: the recorded config has no `avd.ini.displayname`, and display_name was "".
+
+    Every AVD `emulator_create` makes is written by avdmanager, so every one of
+    them had an empty display name. It falls back to the AVD's name -- never to
+    `avd.id` / `avd.name`, which hold the placeholder `<build>`.
+    """
+    _avd_home_with(monkeypatch, tmp_path, RECORDED_CONFIG_AVD, recorded.text("avd_config_ini"))
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+    candidate = selector._build_candidate(RECORDED_CONFIG_AVD)
+
+    assert candidate["display_name"] == RECORDED_CONFIG_AVD
+    assert "<build>" not in candidate.values()
+    # The rest of the candidate still comes from the recorded config.
+    assert candidate["api_level"] == 34
+    assert candidate["device"] == "pixel_9"
+
+
+def test_a_display_name_the_config_carries_is_kept(monkeypatch, tmp_path, recorded):
+    """Control: the fallback is a fallback. Android Studio writes the key, and it wins.
+
+    The value is the Studio-made Pixel_9's on the recording host, appended to
+    the recorded avdmanager config -- the one key that config lacks.
+    """
+    config = recorded.text("avd_config_ini") + "avd.ini.displayname=Pixel 9\n"
+    _avd_home_with(monkeypatch, tmp_path, "Pixel_9", config)
+
+    selector = emulator_selector.EmulatorSelector(config_path=tmp_path / "config.json")
+
+    assert selector._build_candidate("Pixel_9")["display_name"] == "Pixel 9"
 
 
 def test_parse_api_level_from_the_recorded_config(recorded):

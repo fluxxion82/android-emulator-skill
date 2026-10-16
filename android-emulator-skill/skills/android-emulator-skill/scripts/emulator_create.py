@@ -34,13 +34,22 @@ Tunables (env, ANDROID_EMU_ prefix):
 import argparse
 import difflib
 import json
+import platform
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 from common import cli
 from common.env_config import env_int
+from common.sdk_tools import (
+    CMDLINE_TOOLS_REMEDY,
+    CMDLINE_TOOLS_SUBDIRS,
+    SdkToolError,
+    missing_cmdline_tool_error,
+    resolve_sdk_tool,
+    run_sdk_tool,
+    without_null_lines,
+)
 
 # Tunables (overridable via ANDROID_EMU_* env vars; see module docstring).
 # Cutoff is expressed 0-100 for a friendly CLI/env surface and normalised to the
@@ -54,6 +63,30 @@ DEVICE_MATCH_SUGGEST = env_int("ANDROID_EMU_DEVICE_MATCH_SUGGEST", 5, min_value=
 # index, so it gets the longer budget; every other call here is local.
 SDK_TOOL_TIMEOUT = 120
 SDK_LIST_TIMEOUT = 300
+
+# What platform.machine() calls a 64-bit ARM host: macOS says `arm64`, Linux
+# `aarch64`. The emulator on such a host boots only arm64-v8a images, so an
+# x86_64 default asks for an image it cannot run (L11).
+ARM64_MACHINES = frozenset({"arm64", "aarch64"})
+ARM64_ABI = "arm64-v8a"
+X86_64_ABI = "x86_64"
+
+# The API level the "nothing installed" remedy suggests downloading. A
+# suggestion only -- the ABI in it is this host's, which is what L11 was about.
+SUGGESTED_API_LEVEL = 34
+
+
+def host_abi() -> str:
+    """The system-image ABI this host's emulator runs: arm64-v8a on ARM, else x86_64.
+
+    Asked of ``platform.machine()`` on every call rather than fixed at import.
+    The default was the constant ``x86_64``, so on an arm64 Mac -- where this
+    skill is developed, and the first command of the documented CI flow --
+    every create without ``--abi`` asked for an image the host cannot boot, and
+    both remedies told the user to install one (L11). x86_64 stays the answer
+    everywhere else, which is what CI's x86_64 runners need.
+    """
+    return ARM64_ABI if platform.machine().lower() in ARM64_MACHINES else X86_64_ABI
 
 
 def _normalize_device_token(value: str) -> str:
@@ -257,118 +290,93 @@ class EmulatorCreator:
 
     def __init__(self):
         """Initialize emulator creator."""
-        pass
+        # What the last listing could not include, said rather than dropped:
+        # a degraded `--list-images` must not read as a complete one.
+        self.warnings: list[str] = []
 
     def get_avdmanager_path(self) -> str | None:
         """
-        Find avdmanager command.
+        Find avdmanager: PATH, then the SDK's command-line-tools directories.
 
         Returns:
-            Path to avdmanager or None if not found
+            Path to an executable avdmanager, or None if not found.
         """
-        # Try common locations
-        import shutil
-
-        avdmanager = shutil.which("avdmanager")
-        if avdmanager:
-            return avdmanager
-
-        # Try ANDROID_HOME
-        import os
-
-        android_home = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
-        if android_home:
-            possible_paths = [
-                Path(android_home) / "cmdline-tools" / "latest" / "bin" / "avdmanager",
-                Path(android_home) / "tools" / "bin" / "avdmanager",
-            ]
-            for path in possible_paths:
-                if path.exists():
-                    return str(path)
-
-        return None
+        return resolve_sdk_tool("avdmanager", CMDLINE_TOOLS_SUBDIRS)
 
     def get_sdkmanager_path(self) -> str | None:
         """
-        Find sdkmanager command.
+        Find sdkmanager: PATH, then the SDK's command-line-tools directories.
 
         Returns:
-            Path to sdkmanager or None if not found
+            Path to an executable sdkmanager, or None if not found.
         """
-        import shutil
+        return resolve_sdk_tool("sdkmanager", CMDLINE_TOOLS_SUBDIRS)
 
-        sdkmanager = shutil.which("sdkmanager")
-        if sdkmanager:
-            return sdkmanager
+    def require_avdmanager(self) -> str:
+        """avdmanager's path, or :class:`SdkToolError` naming where it was looked for."""
+        path = self.get_avdmanager_path()
+        if not path:
+            raise missing_cmdline_tool_error("avdmanager")
+        return path
 
-        # Try ANDROID_HOME
-        import os
-
-        android_home = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
-        if android_home:
-            possible_paths = [
-                Path(android_home) / "cmdline-tools" / "latest" / "bin" / "sdkmanager",
-                Path(android_home) / "tools" / "bin" / "sdkmanager",
-            ]
-            for path in possible_paths:
-                if path.exists():
-                    return str(path)
-
-        return None
+    def require_sdkmanager(self) -> str:
+        """sdkmanager's path, or :class:`SdkToolError` naming where it was looked for."""
+        path = self.get_sdkmanager_path()
+        if not path:
+            raise missing_cmdline_tool_error("sdkmanager")
+        return path
 
     def list_device_definitions(self) -> list:
         """
         List available device definitions.
 
+        Every one of the listings here used to answer a missing or failing
+        tool with ``[]`` at exit 0 -- ``--list-devices`` printed nothing, and
+        a create reported its ``--device`` "not found" when the truth was that
+        nothing had been asked (X3). An empty list now means avdmanager ran
+        and defines no devices.
+
         Returns:
-            List of device definition dicts
+            List of device definition dicts.
+
+        Raises:
+            SdkToolError: avdmanager is absent, timed out, or exited non-zero.
         """
-        avdmanager = self.get_avdmanager_path()
-        if not avdmanager:
-            return []
+        avdmanager = self.require_avdmanager()
+        stdout = run_sdk_tool(
+            [avdmanager, "list", "device"], timeout=SDK_TOOL_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY
+        )
 
-        try:
-            result = subprocess.run(
-                [avdmanager, "list", "device"],
-                capture_output=True,
-                text=True,
-                timeout=SDK_TOOL_TIMEOUT,
-                check=True,
-            )
+        devices = []
+        current_device = {}
 
-            devices = []
-            current_device = {}
+        for line in stdout.split("\n"):
+            line = line.strip()
+            if line.startswith("id:"):
+                if current_device:
+                    devices.append(current_device)
+                # `id: 53 or "pixel_9"` is TWO identifiers for one device,
+                # not one. This used to keep the whole tail as the id and
+                # pass it to `avdmanager --device`, which answered
+                # `No device found matching --device 53 or "pixel_9"` --
+                # echoing back the string it had been handed. Recorded as
+                # avdmanager_list_device.
+                raw = line.split(":", 1)[1].strip()
+                numeric, _, quoted = raw.partition(" or ")
+                current_device = {
+                    "id": quoted.strip().strip('"') or numeric.strip(),
+                    "index": numeric.strip(),
+                    "raw_id": raw,
+                }
+            elif line.startswith("Name:"):
+                current_device["name"] = line.split(":", 1)[1].strip()
+            elif line.startswith("OEM"):
+                current_device["oem"] = line.split(":", 1)[1].strip()
 
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("id:"):
-                    if current_device:
-                        devices.append(current_device)
-                    # `id: 53 or "pixel_9"` is TWO identifiers for one device,
-                    # not one. This used to keep the whole tail as the id and
-                    # pass it to `avdmanager --device`, which answered
-                    # `No device found matching --device 53 or "pixel_9"` --
-                    # echoing back the string it had been handed. Recorded as
-                    # avdmanager_list_device.
-                    raw = line.split(":", 1)[1].strip()
-                    numeric, _, quoted = raw.partition(" or ")
-                    current_device = {
-                        "id": quoted.strip().strip('"') or numeric.strip(),
-                        "index": numeric.strip(),
-                        "raw_id": raw,
-                    }
-                elif line.startswith("Name:"):
-                    current_device["name"] = line.split(":", 1)[1].strip()
-                elif line.startswith("OEM"):
-                    current_device["oem"] = line.split(":", 1)[1].strip()
+        if current_device:
+            devices.append(current_device)
 
-            if current_device:
-                devices.append(current_device)
-
-            return devices
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return []
+        return devices
 
     def list_system_images(self) -> list:
         """
@@ -383,29 +391,30 @@ class EmulatorCreator:
         at ~4s warm here, and it is the reason this call gets SDK_LIST_TIMEOUT
         rather than SDK_TOOL_TIMEOUT. When it fails -- offline, or a repository
         that will not answer -- we fall back to the purely local
-        ``--list_installed`` rather than returning nothing, because a short true
-        answer ("here is what you already have") beats an empty one that reads
-        as "no system images exist".
+        ``--list_installed``, because a short true answer ("here is what you
+        already have") beats none; the fallback is recorded in
+        :attr:`warnings`, so the short answer does not pass for the whole one.
 
         Returns:
             List of system image dicts, as parse_system_images() shapes them.
+
+        Raises:
+            SdkToolError: sdkmanager is absent, or neither listing could be read.
         """
-        sdkmanager = self.get_sdkmanager_path()
-        if not sdkmanager:
-            return []
-
+        sdkmanager = self.require_sdkmanager()
         try:
-            result = subprocess.run(
-                [sdkmanager, "--list"],
-                capture_output=True,
-                text=True,
-                timeout=SDK_LIST_TIMEOUT,
-                check=True,
+            stdout = run_sdk_tool(
+                [sdkmanager, "--list"], timeout=SDK_LIST_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return self.list_installed_system_images()
+        except SdkToolError as error:
+            images = self.list_installed_system_images()
+            self.warnings.append(
+                f"only the installed system images are listed: `sdkmanager --list` failed "
+                f"({error})"
+            )
+            return images
 
-        return parse_system_images(result.stdout)
+        return parse_system_images(stdout)
 
     def list_installed_system_images(self) -> list:
         """
@@ -413,29 +422,25 @@ class EmulatorCreator:
 
         Uses ``sdkmanager --list_installed`` so that ``--api`` inference defaults
         to a level the user can actually create an AVD with (no download needed).
-        Falls back to an empty list when sdkmanager is unavailable.
 
         Returns:
             List of system image dicts (same shape as list_system_images()).
-        """
-        sdkmanager = self.get_sdkmanager_path()
-        if not sdkmanager:
-            return []
+            Empty means sdkmanager ran and has no system image installed.
 
-        try:
-            result = subprocess.run(
-                [sdkmanager, "--list_installed"],
-                capture_output=True,
-                text=True,
-                timeout=SDK_TOOL_TIMEOUT,
-                check=True,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return []
+        Raises:
+            SdkToolError: sdkmanager is absent, timed out, or exited non-zero.
+                Not an empty list: ``create()`` checks its image against this,
+                and an empty answer from a tool that never ran is how that
+                check came to be skipped (N3).
+        """
+        sdkmanager = self.require_sdkmanager()
+        stdout = run_sdk_tool(
+            [sdkmanager, "--list_installed"], timeout=SDK_TOOL_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY
+        )
 
         # Same rows, same parser as `--list`: `--list_installed` prints only the
         # `Installed packages:` section, so everything it yields is installed.
-        return parse_system_images(result.stdout)
+        return parse_system_images(stdout)
 
     def resolve_api_level(self, requested: int | None) -> int | None:
         """
@@ -474,7 +479,7 @@ class EmulatorCreator:
         device_id: str,
         api_level: int,
         name: str,
-        abi: str = "x86_64",
+        abi: str | None = None,
         variant: str = "google_apis",
     ) -> tuple:
         """
@@ -484,22 +489,23 @@ class EmulatorCreator:
             device_id: Device definition ID (e.g., "pixel_7")
             api_level: Android API level (e.g., 33, 34)
             name: AVD name
-            abi: ABI type (x86_64, x86, arm64-v8a)
+            abi: ABI type (x86_64, x86, arm64-v8a); None means this host's,
+                as :func:`host_abi` reads it.
             variant: System image variant (google_apis, default, google_apis_playstore)
 
         Returns:
             (success, message, avd_name) tuple
+
+        Raises:
+            SdkToolError: avdmanager or sdkmanager is absent or failed. Without
+                sdkmanager nobody can say the image is installed, so there is
+                no create -- this used to skip the check and run avdmanager
+                against an image nobody had verified (N3).
         """
-        avdmanager = self.get_avdmanager_path()
-        if not avdmanager:
-            return (
-                False,
-                "avdmanager not found. Ensure Android SDK is installed and ANDROID_HOME is set.",
-                None,
-            )
+        avdmanager = self.require_avdmanager()
 
         # Build system image path
-        system_image = f"system-images;android-{api_level};{variant};{abi}"
+        system_image = f"system-images;android-{api_level};{variant};{abi or host_abi()}"
 
         # Check the image is installed, against the LOCAL package list.
         #
@@ -509,14 +515,18 @@ class EmulatorCreator:
         # ever be created -- with an error telling the user to install
         # something they already had. `--list` also reaches the network, so the
         # check was slow and failed offline for the wrong reason.
+        #
+        # Unconditional: it was `if installed and ...`, so an sdkmanager that
+        # answered nothing -- because it was missing -- skipped the check (N3).
+        # A missing one raises now, and an empty listing is a real "none".
         installed = self.list_installed_system_images()
-        if installed and system_image not in {image["id"] for image in installed}:
+        if system_image not in {image["id"] for image in installed}:
             available = sorted(image["id"] for image in installed)
             return (
                 False,
                 f"System image not installed: {system_image}\n"
                 f"Install with: sdkmanager '{system_image}'\n"
-                f"Or use one you already have: {', '.join(available)}",
+                f"Or use one you already have: {', '.join(available) or '(none installed)'}",
                 None,
             )
 
@@ -547,7 +557,7 @@ class EmulatorCreator:
             return True, f"AVD created: {name}", name
 
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
+            error_msg = without_null_lines(e.stderr or "") or str(e)
             return False, f"Failed to create AVD: {error_msg}", None
 
         except subprocess.TimeoutExpired:
@@ -584,7 +594,9 @@ class EmulatorCreator:
             return True, f"AVD deleted: {name}"
 
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
+            # avdmanager's reason, minus the bare `null` line it prints after
+            # it (recorded: avdmanager_delete_missing) -- N13.
+            error_msg = without_null_lines(e.stderr or "") or str(e)
             return False, f"Failed to delete AVD: {error_msg}"
 
         except subprocess.TimeoutExpired:
@@ -676,7 +688,16 @@ Examples:
     create_group.add_argument(
         "--name", help="AVD name. Defaults to an auto-generated name from device + API."
     )
-    create_group.add_argument("--abi", default="x86_64", help="ABI type (default: x86_64)")
+    # The default is resolved here, at run time, so `--help` states the ABI this
+    # host will actually get rather than a constant that was wrong on ARM (L11).
+    create_group.add_argument(
+        "--abi",
+        default=host_abi(),
+        help=(
+            f"System-image ABI (default: {host_abi()}, the one this "
+            f"{platform.machine() or 'unknown'} host's emulator runs)"
+        ),
+    )
     create_group.add_argument(
         "--variant", default="google_apis", help="System image variant (default: google_apis)"
     )
@@ -702,8 +723,10 @@ Examples:
     if args.list_images:
         images = creator.list_system_images()
         if args.json:
-            print(json.dumps({"system_images": images}, indent=2))
+            print(json.dumps({"system_images": images, "warnings": creator.warnings}, indent=2))
         else:
+            for warning in creator.warnings:
+                print(f"Warning: {warning}", file=sys.stderr)
             print_system_images(images)
         sys.exit(0)
 
@@ -735,9 +758,13 @@ Examples:
     # Delta 1: default --api to the latest installed system-image API level.
     api_level = creator.resolve_api_level(args.api)
     if api_level is None:
+        # The suggestion carries the ABI this create would use -- the host's
+        # unless --abi said otherwise. It was a hard-coded x86_64 image, which
+        # an arm64 host cannot boot (L11).
+        suggested = f"system-images;android-{SUGGESTED_API_LEVEL};{args.variant};{args.abi}"
         _fail(
-            "Could not determine an API level: pass --api explicitly or install a "
-            "system image (sdkmanager 'system-images;android-34;google_apis;x86_64')."
+            "Could not determine an API level: sdkmanager lists no installed system "
+            f"image with one. Pass --api explicitly or install one (sdkmanager '{suggested}')."
         )
 
     # Delta 2: auto-generate an AVD name from device + API when --name is omitted.

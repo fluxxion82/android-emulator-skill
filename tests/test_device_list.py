@@ -231,8 +231,19 @@ def _patch_run(monkeypatch, fake):
 
 
 def _fake_emulator_on_path(monkeypatch):
-    """Pin emulator resolution to the bare name so argv assertions stay stable."""
+    """Pin SDK-tool resolution to the bare names so argv assertions stay stable.
+
+    avdmanager too, since N2: it is resolved through ``resolve_sdk_tool`` now
+    rather than exec'd by bare name, so without the pin the fakes below would
+    see whatever path the machine running the suite happens to have.
+    """
     monkeypatch.setattr(device_list, "get_emulator_path", lambda: "emulator")
+    monkeypatch.setattr(device_list, "get_avdmanager_path", lambda: "avdmanager")
+
+
+def _no_avdmanager(monkeypatch):
+    """avdmanager resolves nowhere -- the command-line tools are not installed."""
+    monkeypatch.setattr(device_list, "get_avdmanager_path", lambda: None)
 
 
 def _fake_run_factory(adb_out: str, emulator_out: str, avdmanager_out: str):
@@ -340,16 +351,13 @@ def test_a_missing_avdmanager_is_a_warning_not_a_failure(monkeypatch, recorded):
     look identical without it.
     """
     _fake_emulator_on_path(monkeypatch)
-    served = _fake_run_factory(
-        recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+    _no_avdmanager(monkeypatch)
+    _patch_run(
+        monkeypatch,
+        _fake_run_factory(
+            recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+        ),
     )
-
-    def fake_run(cmd, **kwargs):
-        if cmd[:1] == ["avdmanager"]:
-            raise FileNotFoundError("avdmanager not found")
-        return served(cmd, **kwargs)
-
-    _patch_run(monkeypatch, fake_run)
 
     data = device_list.DeviceLister().collect()
 
@@ -377,16 +385,13 @@ def test_the_avdmanager_warning_reaches_both_output_modes(monkeypatch, recorded,
     get it in `warnings`, because an agent parsing stdout never sees stderr.
     """
     _fake_emulator_on_path(monkeypatch)
-    served = _fake_run_factory(
-        recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+    _no_avdmanager(monkeypatch)
+    _patch_run(
+        monkeypatch,
+        _fake_run_factory(
+            recorded.text("adb_devices_multiple"), recorded.text("emulator_list_avds"), ""
+        ),
     )
-
-    def fake_run(cmd, **kwargs):
-        if cmd[:1] == ["avdmanager"]:
-            raise FileNotFoundError("avdmanager not found")
-        return served(cmd, **kwargs)
-
-    _patch_run(monkeypatch, fake_run)
     monkeypatch.setattr(device_list.sys, "argv", ["device_list.py"])
 
     with pytest.raises(SystemExit) as exc:
@@ -398,7 +403,6 @@ def test_the_avdmanager_warning_reaches_both_output_modes(monkeypatch, recorded,
     assert sdk_tools.CMDLINE_TOOLS_REMEDY in text_mode.err, "the stderr warning has no remedy"
     assert "Android Targets" in text_mode.out, "the listing itself went missing"
 
-    _patch_run(monkeypatch, fake_run)
     monkeypatch.setattr(device_list.sys, "argv", ["device_list.py", "--json"])
 
     with pytest.raises(SystemExit) as exc:

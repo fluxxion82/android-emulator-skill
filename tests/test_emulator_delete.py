@@ -434,13 +434,6 @@ def test_delete_reports_its_own_timeout(monkeypatch, deleter):
     assert "MyTestDevice" in message
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "N13: avdmanager's trailing null line is passed through at "
-        "emulator_create.py:586 / emulator_delete.py:221"
-    ),
-)
 def test_a_failed_delete_does_not_hand_on_avdmanagers_stray_null_line(monkeypatch, recorded):
     """`_delete_one` gets avdmanager's recorded failure: exit 1, the reason, then `null`.
 

@@ -152,11 +152,6 @@ def _created_images(toolchain: FakeToolchain) -> list[str]:
 ARM_HOSTS = ["arm64", "aarch64"]  # macOS spells it one way, Linux the other
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="L11: emulator_create.py:476,678 default --abi is x86_64 on any host",
-)
 @pytest.mark.parametrize("machine", ARM_HOSTS)
 def test_l11_the_default_abi_is_the_hosts(machine, monkeypatch, capsys, toolchain, recorded):
     """L11: with no ``--abi`` an arm64 host creates an arm64-v8a AVD.
@@ -176,11 +171,6 @@ def test_l11_the_default_abi_is_the_hosts(machine, monkeypatch, capsys, toolchai
     assert code == 0, output
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="L11: emulator_create.py:511-519 remedy names an x86_64 image on arm64",
-)
 @pytest.mark.parametrize("machine", ARM_HOSTS)
 def test_l11_the_not_installed_remedy_names_an_image_the_host_can_run(
     machine, monkeypatch, capsys, toolchain, recorded
@@ -202,11 +192,6 @@ def test_l11_the_not_installed_remedy_names_an_image_the_host_can_run(
     assert not _created_images(toolchain)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="L11: emulator_create.py:737-740 API-level remedy hard-codes an x86_64 image",
-)
 def test_l11_the_no_api_level_remedy_names_an_image_the_host_can_run(
     monkeypatch, capsys, toolchain, recorded
 ):
@@ -270,11 +255,6 @@ def _without(toolchain: FakeToolchain, tool: str, how: str) -> None:
 OUTPUT = {"json": ("--json",), "text": ()}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="N3: emulator_create.py:511-512 skips the image check when sdkmanager is missing",
-)
 @pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
 def test_n3_create_does_not_skip_the_image_check_without_sdkmanager(
@@ -296,11 +276,6 @@ def test_n3_create_does_not_skip_the_image_check_without_sdkmanager(
     assert_refusal(result, json_mode=output == "json", naming=("sdkmanager",), status=1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="X3: emulator_create.py:393,404,421,432 answer {'system_images': []} at exit 0 with no sdkmanager",
-)
 @pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
 def test_x3_list_images_without_sdkmanager_is_an_error(how, output, toolchain):
@@ -315,11 +290,6 @@ def test_x3_list_images_without_sdkmanager_is_an_error(how, output, toolchain):
     assert_refusal(result, json_mode=output == "json", naming=("sdkmanager",), status=1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="X3: emulator_create.py:326,369 answer {'devices': []} at exit 0 with no avdmanager",
-)
 @pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
 def test_x3_list_devices_without_avdmanager_is_an_error(how, output, toolchain):
@@ -330,11 +300,6 @@ def test_x3_list_devices_without_avdmanager_is_an_error(how, output, toolchain):
     assert_refusal(result, json_mode=output == "json", naming=("avdmanager",), status=1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="X3: emulator_create.py:326 -- no avdmanager reads as 'device not found'",
-)
 @pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
 def test_x3_create_without_avdmanager_names_the_missing_tool(how, output, toolchain, recorded):

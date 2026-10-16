@@ -80,11 +80,6 @@ N1_NAMES = (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="N1: emulator_erase.py:92-93 answers a missing AVD home with [] at exit 0",
-)
 @pytest.mark.parametrize("argv", MODES, ids=" ".join)
 def test_n1_no_sdk_and_no_avd_home_is_an_error_not_an_empty_list(argv, no_sdk):
     """N1: with nothing to look with and nowhere to look, refuse, and say what.
