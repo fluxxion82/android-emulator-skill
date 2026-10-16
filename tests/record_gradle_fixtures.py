@@ -29,6 +29,13 @@ Usage
     python tests/record_gradle_fixtures.py --list
     python tests/record_gradle_fixtures.py
     python tests/record_gradle_fixtures.py --gradle /path/to/gradle
+    python tests/record_gradle_fixtures.py --gradle /path/to/gradle-7.5.1 \
+        --only gradle_rerun_unknown_option
+
+``--only`` records the named fixtures and merges them into that Gradle
+version's existing manifest instead of replacing it. A fixture with
+``gradle_below`` set is about an OLDER Gradle's answer; a full recording skips
+it unless the Gradle being run is older than that version.
 """
 
 from __future__ import annotations
@@ -79,6 +86,9 @@ class GradleFixture:
             configuration leaves the PREVIOUS run's file on disk and the
             recorder would happily publish it as this run's output.
         ext: Extension for the recorded file. ``xml`` for produced artifacts.
+        gradle_below: Only a Gradle older than this version produces the
+            output this fixture is about (``"7.6"`` for an option 7.6 added).
+            Skipped by a recording made with a newer Gradle.
     """
 
     name: str
@@ -90,6 +100,7 @@ class GradleFixture:
     artifact: str | None = None
     requires_in_log: str | None = None
     ext: str = "txt"
+    gradle_below: str | None = None
 
 
 FIXTURES: list[GradleFixture] = [
@@ -296,7 +307,28 @@ FIXTURES: list[GradleFixture] = [
         ),
         catches=("D8",),
     ),
+    GradleFixture(
+        name="gradle_rerun_unknown_option",
+        args=[":app:testProStagingDebugUnitTest", "--rerun"],
+        requires_in_log="Unknown command-line option '--rerun'",
+        gradle_below="7.6",
+        description=(
+            "Gradle older than 7.6 asked for a task's --rerun, which build_and_test "
+            "passes to every test task so that an UP-TO-DATE task cannot leave "
+            "an older run's reports to be read as this run's (N6). The option "
+            "arrived in 7.6; before it Gradle stops in the '* What went wrong:' "
+            "block with 'Problem configuring task ... from command line.' and "
+            "'> Unknown command-line option '--rerun'.', exit 1. Recorded so the "
+            "skill can say why, instead of a bare Build: FAILED."
+        ),
+        catches=("N6",),
+    ),
 ]
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """'7.5.1' -> (7, 5, 1); a suffix such as '-rc-1' is ignored."""
+    return tuple(int(part) for part in re.findall(r"\d+", version.split("-", maxsplit=1)[0]))
 
 
 def _gradle_version(gradle: str) -> str:
@@ -363,19 +395,42 @@ def _scrub(text: str) -> str:
     return text
 
 
-def record(gradle: str) -> int:
-    """Record every Gradle fixture and write the manifest."""
+def record(gradle: str, only: set[str] | None = None) -> int:
+    """Record the Gradle fixtures (all, or ``only`` those) and write the manifest."""
     for scaffold in ALL_SCAFFOLDS:
         if not scaffold.exists():
             print(f"scaffold missing: {scaffold}", file=sys.stderr)
             return 1
 
+    known = {fixture.name for fixture in FIXTURES}
+    if only is not None and only - known:
+        print(f"unknown fixture(s): {sorted(only - known)}", file=sys.stderr)
+        return 1
+
     version = _gradle_version(gradle)
     out_dir = RECORDED_ROOT / f"gradle-{version}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    entries = []
+    selected = []
     for fixture in FIXTURES:
+        if only is not None and fixture.name not in only:
+            continue
+        if fixture.gradle_below is not None and _version_tuple(version) >= _version_tuple(
+            fixture.gradle_below
+        ):
+            if only is not None:
+                print(
+                    f"  FAIL  {fixture.name} needs a Gradle older than "
+                    f"{fixture.gradle_below}; this is {version}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"  skip  {fixture.name} (needs Gradle < {fixture.gradle_below})")
+            continue
+        selected.append(fixture)
+
+    entries = []
+    for fixture in selected:
         produced = _artifact_path(fixture)
         # Delete the target BEFORE the build. Otherwise a build that dies during
         # configuration leaves the previous run's file in place and this
@@ -438,6 +493,17 @@ def record(gradle: str) -> int:
         )
         print(f"  ok    {path.name} ({len(text.encode('utf-8'))} bytes)")
 
+    if only is not None and (out_dir / "MANIFEST.json").exists():
+        # Merge: what was not re-recorded keeps its entry, in FIXTURES order.
+        previous = json.loads((out_dir / "MANIFEST.json").read_text(encoding="utf-8"))
+        recorded = {entry["name"]: entry for entry in previous.get("fixtures", [])}
+        recorded.update({entry["name"]: entry for entry in entries})
+        order = [fixture.name for fixture in FIXTURES]
+        entries = sorted(
+            recorded.values(),
+            key=lambda e: order.index(e["name"]) if e["name"] in order else len(order),
+        )
+
     manifest = {
         "profile": f"gradle-{version}",
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -464,6 +530,12 @@ def main() -> None:
     )
     parser.add_argument("--gradle", default="gradle", help="Gradle executable (default: gradle)")
     parser.add_argument("--list", action="store_true", help="List fixtures and exit")
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME",
+        help="Record only this fixture (repeatable); merges into the existing manifest",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -473,7 +545,7 @@ def main() -> None:
             print(f"{fixture.name:<{width}}  gradle {' '.join(fixture.args)}{catches}")
         return
 
-    sys.exit(record(args.gradle))
+    sys.exit(record(args.gradle, set(args.only) if args.only else None))
 
 
 if __name__ == "__main__":

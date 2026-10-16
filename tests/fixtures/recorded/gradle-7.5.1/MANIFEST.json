@@ -1,0 +1,25 @@
+{
+  "profile": "gradle-7.5.1",
+  "recorded_at": "2026-10-16T23:00:02Z",
+  "gradle_version": "7.5.1",
+  "scaffolds": [
+    "tests/fixtures/scaffold/flavored",
+    "tests/fixtures/scaffold/compile",
+    "tests/fixtures/scaffold/where-block"
+  ],
+  "note": "Durations and absolute paths are normalised so a re-record diffs only on real format changes. The JUnit XML additionally has its hostname, timestamp and per-test time normalised: Gradle writes the recording machine's hostname into every testsuite element.",
+  "fixtures": [
+    {
+      "name": "gradle_rerun_unknown_option",
+      "file": "gradle_rerun_unknown_option.txt",
+      "command": "gradle --console=plain :app:testProStagingDebugUnitTest --rerun",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "produced_artifact": null,
+      "description": "Gradle older than 7.6 asked for a task's --rerun, which build_and_test passes to every test task so that an UP-TO-DATE task cannot leave an older run's reports to be read as this run's (N6). The option arrived in 7.6; before it Gradle stops in the '* What went wrong:' block with 'Problem configuring task ... from command line.' and '> Unknown command-line option '--rerun'.', exit 1. Recorded so the skill can say why, instead of a bare Build: FAILED.",
+      "catches": [
+        "N6"
+      ],
+      "bytes": 493
+    }
+  ]
+}

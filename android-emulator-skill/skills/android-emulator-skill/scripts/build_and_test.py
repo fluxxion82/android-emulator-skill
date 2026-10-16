@@ -151,6 +151,9 @@ def _emit_result(args: argparse.Namespace, result, build_id: str) -> None:
                 "total": test_info.get("total", 0),
                 "passed": test_info.get("passed", 0),
                 "failed": test_info.get("failed", 0),
+                # <error> testcases fail the verdict too; without the count a
+                # `success: false` beside "0 failed" would be unexplained.
+                "errors": test_info.get("errors", 0),
                 "skipped": test_info.get("skipped", 0),
             }
         if not result.success:
@@ -267,6 +270,30 @@ Examples:
         tasks=result.tasks,
         duration=result.duration,
     )
+
+    if result.rerun_unsupported:
+        # --rerun (Gradle 7.6+) is what makes "this run's results" true; an
+        # older Gradle rejects it before any test runs. Said plainly rather
+        # than as a bare "Build: FAILED".
+        cli.fail(
+            "Gradle 7.6+ is required to run tests (the --rerun option); "
+            "this project's wrapper is older",
+            "Upgrade the wrapper (`./gradlew wrapper --gradle-version <7.6 or later>`), "
+            f"or run {result.tasks[0]} yourself with ./gradlew; the Gradle log: "
+            f"`build_and_test.py --get-log {build_id}`.",
+        )
+
+    if result.no_test_results:
+        # Gradle exited 0 and this run wrote no test result. Reporting it the
+        # usual way read "0 tests, 0 failed" -- a pass no test produced (N6).
+        # Cached first, so the remedy can point at the log that says why.
+        cli.fail(
+            f"the build produced no test results: {result.tasks[0]} exited 0 "
+            f"and wrote no JUnit XML with a test case under {result.results_dir}",
+            "Check the module has unit tests under src/test (the log says NO-SOURCE "
+            "when it has none) and that --suite matches one; read the Gradle log with "
+            f"`build_and_test.py --get-log {build_id}`.",
+        )
 
     _emit_result(args, result, build_id)
     return 0 if result.success else 1

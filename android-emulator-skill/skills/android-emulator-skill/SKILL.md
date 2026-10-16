@@ -172,6 +172,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 10. **build_and_test.py** - Gradle build/test automation with progressive disclosure (backed by the `gradle/` subpackage)
     - One-line summary + a result ID by default; drill in on demand
     - Parses JUnit XML for pass/fail counts + failed test names; extracts Gradle/Kotlin/Java errors & warnings
+    - `--test` reads only the reports *this* run wrote: it deletes the test task's old `TEST-*.xml` reports
+      first and reruns the task (`--rerun`, Gradle 7.6+; an older wrapper is refused by name). It passes only
+      if Gradle exits 0 **and** they hold no failure or error — `ignoreFailures = true` cannot turn failing
+      tests into a pass. A run that wrote no test results is a failure, not "0 tests passed"
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring
@@ -750,8 +754,6 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
 
 **Known gaps, for the next release:**
 
-- `build_and_test` takes its verdict from Gradle's exit code alone, so a project
-  built with `ignoreFailures = true` is reported as a success with failing tests.
 - `log_monitor --severity` does not validate its names. An unrecognised one
   (`warn`, say) matches nothing, so the capture silently filters to empty.
 - `anr_watcher` does not attach an ANR's `Reason:` / `PID:` continuation lines to

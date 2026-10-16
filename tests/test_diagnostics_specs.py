@@ -103,9 +103,28 @@ def _recorded_counts(recorded_gradle) -> tuple[int, int]:
 
 
 def _count(text: str, word: str) -> int | None:
-    """The first count printed for ``word``: "3 failed", "1/5 passed" or "Failed: 3"."""
-    match = re.search(rf"(\d+)(?:/\d+)?\s+{word}\b|\b{word}:\s*(\d+)", text, re.IGNORECASE)
+    """The first count printed for ``word``: "3 failed", "1/5 passed" or "Failed: 3".
+
+    Spaces and tabs only between the number and the word: with ``\\s`` the
+    match crossed a newline, and a layout printing ``Passed:  1`` on the line
+    above ``Failed:  3`` read as "1 failed" (review of PR #23).
+    """
+    match = re.search(rf"(\d+)(?:/\d+)?[ \t]+{word}\b|\b{word}:[ \t]*(\d+)", text, re.IGNORECASE)
     return int(match.group(1) or match.group(2)) if match else None
+
+
+def test_count_reads_each_line_of_a_one_count_per_line_layout(recorded_gradle):
+    """The harness, not a spec: ``_count`` must not read across a line break.
+
+    The layout is verbose's from before PR #23 -- one ``Label:  N`` per line --
+    filled with the recorded run's own counts.
+    """
+    failed, passed = _recorded_counts(recorded_gradle)
+    assert failed != passed, "the regression needs two different numbers to tell apart"
+    layout = f"Tests: FAIL\n  Passed:  {passed}\n  Failed:  {failed}\n  Skipped: 1\n"
+
+    assert _count(layout, "failed") == failed
+    assert _count(layout, "passed") == passed
 
 
 def _ignore_failures_project(toolchain, tmp_path, recorded_gradle) -> Path:
@@ -135,11 +154,6 @@ X7_MODES = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="X7: gradle/builder.py:225 -- success is Gradle's exit status, not the tests'",
-)
 @pytest.mark.parametrize("mode", list(X7_MODES))
 def test_x7_failing_tests_fail_the_build_whatever_gradle_exits(
     mode, toolchain, tmp_path, recorded_gradle
@@ -200,11 +214,6 @@ def test_x7_the_fixture_build_really_reads_three_failures(toolchain, tmp_path, r
     assert any("testDebugUnitTest" in call for call in toolchain.calls("gradlew"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="N6: gradle/results.py:43-51 -- every XML under build/test-results counts, however old",
-)
 def test_n6_a_result_file_older_than_the_run_is_not_this_runs_result(
     toolchain, tmp_path, recorded_gradle
 ):
@@ -245,14 +254,6 @@ def test_n6_a_result_file_older_than_the_run_is_not_this_runs_result(
     assert result.returncode == 0, result.stdout
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "N6: gradle/results.py:43-51 -- with no report from this run, the verdict comes "
-        "from an old one, or from nothing"
-    ),
-)
 def test_n6_a_run_that_wrote_no_results_is_not_a_pass(toolchain, tmp_path, recorded_gradle):
     """N6, the no-results case: filtering everything out must not read as a pass.
 

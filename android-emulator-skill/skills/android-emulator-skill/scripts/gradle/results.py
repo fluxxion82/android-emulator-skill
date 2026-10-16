@@ -5,8 +5,8 @@ Gradle result parsing.
 Pure functions over text and paths — no subprocess, no gradlew invocation. These
 parse two kinds of output:
 
-1. JUnit XML test reports (``build/test-results/**/*.xml``) into pass/fail/skip
-   counts plus failed-test names and messages.
+1. JUnit XML test reports (``build/test-results/<task>/TEST-*.xml``) into
+   pass/fail/skip counts plus failed-test names and messages.
 2. Gradle build stdout/stderr into structured errors and warnings (Kotlin ``e:``
    / ``w:`` lines, Java/Kotlin ``error:`` / ``warning:`` lines, and
    ``> Task ... FAILED`` markers).
@@ -20,35 +20,48 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
-def find_test_result_files(search_root: Path) -> list[Path]:
+def find_test_result_files(search_root: Path, *, task: str | None = None) -> list[Path]:
     """
-    Find JUnit XML test result files under a project or module directory.
+    Find Gradle's JUnit XML reports under a project or module directory.
 
-    Globs the standard Gradle layout ``**/build/test-results/**/*.xml`` so it
-    works whether ``search_root`` is the project root, a single module, or a
-    test-results directory itself.
+    Gradle writes one ``TEST-<class>.xml`` per test class into
+    ``<module>/build/test-results/<task>/``. Only files named that way are
+    returned: a bare ``*.xml`` glob also returned every other XML file at the
+    top of ``search_root`` (D9).
+
+    This only finds reports; it cannot tell whose they are. The directory
+    outlives the run -- measured on Gradle 8.13, an UP-TO-DATE test task exits
+    0 and leaves the previous run's reports untouched -- so a build that reads
+    these after running a task clears them first (``BuildRunner``, N6).
 
     Args:
-        search_root: Directory to search under
+        search_root: Directory to search under (a project or a module).
+        task: The test task, unqualified (``testDebugUnitTest``). Only reports
+            directly in a ``build/test-results/<task>/`` directory are
+            returned, the name compared without case: Gradle resolves a
+            miscased task name (recorded: gradle_miscased_variant_resolves) and
+            writes the directory under the task's real spelling.
 
     Returns:
-        Sorted list of XML file paths (empty if none found or path missing)
+        Sorted list of report paths (empty if none match or the path is missing).
     """
     if not search_root.exists():
         return []
 
     candidates: set[Path] = set()
+    if task is not None:
+        wanted = task.casefold()
+        candidates.update(
+            path
+            for path in search_root.glob("**/build/test-results/*/TEST-*.xml")
+            if path.parent.name.casefold() == wanted
+        )
+    else:
+        candidates.update(search_root.glob("**/test-results/**/TEST-*.xml"))
+        # search_root may itself be a task's results directory.
+        candidates.update(search_root.glob("TEST-*.xml"))
 
-    # Standard Gradle test report locations.
-    candidates.update(search_root.glob("**/build/test-results/**/*.xml"))
-    # Allow pointing directly at a test-results directory.
-    candidates.update(search_root.glob("**/test-results/**/*.xml"))
-    # Allow pointing directly at a directory full of TEST-*.xml files.
-    candidates.update(search_root.glob("TEST-*.xml"))
-    candidates.update(search_root.glob("*.xml"))
-
-    # Keep only JUnit-style report files (TEST-*.xml or anything with testsuite).
-    return sorted(p for p in candidates if p.is_file())
+    return sorted(path for path in candidates if path.is_file())
 
 
 def parse_junit_xml(xml_text: str) -> dict:
