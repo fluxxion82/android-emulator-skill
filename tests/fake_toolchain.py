@@ -291,6 +291,17 @@ class FakeToolchain:
 # case-insensitive substring from a set the spec chooses, never as a sentence.
 
 
+def _parses_as_json(text: str) -> bool:
+    """Whether ``text`` as a whole is a JSON document (any value, any layout)."""
+    if not text.strip():
+        return False
+    try:
+        json.loads(text.strip())
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
 def _json_lines(text: str) -> list[str]:
     """Lines of ``text`` that parse, on their own, as a JSON object."""
     found = []
@@ -336,7 +347,9 @@ def assert_refusal(
     names = tuple(name.lower() for name in naming)
     shown = f"\nstdout: {result.stdout[-600:]!r}\nstderr: {result.stderr[-600:]!r}"
 
-    assert "Traceback" not in result.stderr, f"refused by crashing:{shown}"
+    # Either stream: a traceback printed to stdout ahead of a well-formed last
+    # line would otherwise pass a streaming refusal (verification of PR #20).
+    assert "Traceback" not in result.stderr + result.stdout, f"refused by crashing:{shown}"
     assert result.returncode == status, f"exit {result.returncode}, not {status}{shown}"
 
     if json_mode:
@@ -368,4 +381,7 @@ def assert_refusal(
         name in stderr_lines[i].lower() for i in errors for name in names
     ), f"no `Error:` line names any of {naming}{shown}"
     assert not _json_lines(result.stdout), f"text mode printed JSON on stdout{shown}"
+    # Per line catches one-line objects; the whole of stdout catches what a
+    # line-by-line look cannot -- an indented object, `null`, an array.
+    assert not _parses_as_json(result.stdout), f"text mode printed JSON on stdout{shown}"
     return None

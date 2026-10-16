@@ -78,11 +78,33 @@ def test_json_mode_rejects(case):
         assert_refusal(REJECTED_JSON[case], json_mode=True, naming=("sdkmanager",), status=1)
 
 
+TRACEBACK_HEAD = "Traceback (most recent call last):"
+
+
+def test_a_traceback_on_stdout_is_rejected_in_streaming_mode():
+    """A traceback ahead of a well-formed last line is still a crash.
+
+    The first checker looked for tracebacks on stderr only, so this passed
+    (verification of PR #20).
+    """
+    stdout = "\n".join([TRACEBACK_HEAD, json.dumps(REFUSAL)]) + "\n"
+    with pytest.raises(AssertionError):
+        assert_refusal(
+            _run(stdout=stdout), json_mode=True, naming=("sdkmanager",), status=1, streaming=True
+        )
+
+
 REJECTED_TEXT = {
     "no Error line": _run(stderr="sdkmanager is missing\n"),
     "no Remedy line": _run(stderr="Error: sdkmanager was not found\n"),
     "JSON on stdout": _run(stdout=json.dumps(REFUSAL) + "\n", stderr=_text_refusal()),
     "an Error line naming nothing": _run(stderr="\n".join(["Error: it failed", "Remedy: retry"])),
+    # Each of these passed the first checker, which looked at stdout one line
+    # at a time and only for objects (verification of PR #20).
+    "a traceback on stdout": _run(stdout=TRACEBACK_HEAD + "\n", stderr=_text_refusal()),
+    "indented JSON on stdout": _run(stdout=json.dumps(REFUSAL, indent=2), stderr=_text_refusal()),
+    "null on stdout": _run(stdout="null\n", stderr=_text_refusal()),
+    "an array on stdout": _run(stdout=json.dumps(["sdkmanager"]), stderr=_text_refusal()),
 }
 
 
