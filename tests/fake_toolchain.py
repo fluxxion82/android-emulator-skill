@@ -47,6 +47,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "scripts"
 
@@ -66,7 +68,6 @@ import json
 import os
 import shutil
 import sys
-import time
 
 with open({spec!r}, encoding="utf-8") as handle:
     spec = json.load(handle)
@@ -77,10 +78,6 @@ with open(spec["log"], "a", encoding="utf-8") as log:
 for rule in spec["rules"]:
     if not all(token in argv for token in rule["match"]):
         continue
-    if rule["once"]:
-        if os.path.exists(rule["once"]):
-            continue
-        open(rule["once"], "w").close()
     for destination, source in rule["writes"]:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         with open(source, encoding="utf-8") as src, open(destination, "w", encoding="utf-8") as dst:
@@ -99,20 +96,12 @@ for rule in spec["rules"]:
             line for line in out.splitlines(True)
             if len(line.split()) > 2 and line.split()[2] == pid
         )
-    if rule["pace"]:
-        for line in out.splitlines(True):
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            time.sleep(rule["pace"])
-    else:
-        sys.stdout.write(out)
-        sys.stdout.flush()
+    sys.stdout.write(out)
+    sys.stdout.flush()
     if rule["stderr"]:
         with open(rule["stderr"], encoding="utf-8") as handle:
             sys.stderr.write(handle.read())
         sys.stderr.flush()
-    if rule["hold"]:
-        time.sleep(rule["hold"])
     sys.exit(rule["exit"])
 
 sys.exit(spec["default_exit"])
@@ -132,10 +121,6 @@ class Rule:
     stderr: str = ""
     exit: int = 0
     filter_pid: bool = False
-    # Seconds to keep stdout open after writing, the way a streaming
-    # `adb logcat` does -- so a reader sees the lines arrive on a live stream
-    # rather than a pipe that closed before it started reading.
-    hold: float = 0.0
     # Files the tool writes as a side effect, as (absolute path, text). Gradle
     # writes its JUnit XML during the run; a stub that did not would leave the
     # script reading whatever an earlier run left behind.
@@ -144,18 +129,6 @@ class Rule:
     # path it was given -- the recorded `screencap -p` PNG, for a capture that
     # has to succeed end to end. Copied byte for byte; nothing is generated.
     pull_from: str = ""
-    # Seconds between lines, each written and flushed on its own, the way a
-    # live `adb logcat` delivers them. Without it a whole recording lands in
-    # one pipe write, and anr_watcher's worker -- which select()s on a
-    # buffered text pipe (anr_watcher.py:659-670) -- loses the lines still in
-    # Python's buffer if the stream ends during a select timeout. That is a
-    # defect of its own; the D5/A5 specs are about classification, so the
-    # stream they read is paced and the race is out of their way.
-    pace: float = 0.0
-    # Answer only the first matching call; later calls fall through to the
-    # next rule. A logcat stream a worker re-spawns must not replay the same
-    # recording, or one ANR is counted once per restart.
-    once: bool = False
 
 
 class FakeToolchain:
@@ -184,11 +157,6 @@ class FakeToolchain:
         path.write_text(text, encoding="utf-8")
         return str(path)
 
-    def _once_marker(self) -> str:
-        """A path whose existence records that a ``once`` rule has answered."""
-        self._staged += 1
-        return str(self.root / f"answered-{self._staged}")
-
     def install(
         self,
         name: str,
@@ -213,9 +181,6 @@ class FakeToolchain:
                     "stderr": self._stage(rule.stderr),
                     "exit": rule.exit,
                     "filter_pid": rule.filter_pid,
-                    "hold": rule.hold,
-                    "pace": rule.pace,
-                    "once": self._once_marker() if rule.once else "",
                     "writes": [[str(path), self._stage(text)] for path, text in rule.writes],
                     "pull_from": rule.pull_from,
                 }
@@ -299,10 +264,13 @@ class FakeToolchain:
         path = self.env()["PATH"]
         for tool in ANDROID_TOOLS:
             found = shutil.which(tool, path=path)
-            assert found is None or Path(found).parent == self.bin, (
-                f"{tool} resolves to {found}, outside the fake bin -- a real SDK "
-                f"tool is reachable and these specs would drive a real device"
-            )
+            if found is not None and Path(found).parent != self.bin:
+                # pytest.fail, not assert: an unisolated harness must never be
+                # excused as the defect a spec pins (raises=AssertionError).
+                pytest.fail(
+                    f"{tool} resolves to {found}, outside the fake bin -- a real SDK "
+                    f"tool is reachable and these specs would drive a real device"
+                )
 
 
 # --- the refusal contract ------------------------------------------------------

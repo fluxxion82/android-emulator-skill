@@ -373,8 +373,15 @@ def _snapshot_device(toolchain, recorded, logcat: str, pid_answer: str) -> None:
 
 
 def _snapshot_artifact(output: Path, name: str) -> Path:
+    """The one ``name`` a capture left under ``output`` -- a harness prerequisite.
+
+    ``pytest.fail``, not an assertion: a capture that left no artifact is not
+    the defect a D3/D4 spec pins, and ``raises=AssertionError`` must not be
+    able to excuse it as one.
+    """
     found = sorted(output.rglob(name))
-    assert len(found) == 1, f"expected one {name} under {output}, found {found}"
+    if len(found) != 1:
+        pytest.fail(f"expected one {name} under {output}, found {found}")
     return found[0]
 
 
@@ -409,7 +416,8 @@ def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
 
     saved = _snapshot_artifact(output, "app-logs.txt").read_text(encoding="utf-8")
     expected = sum(1 for m in _threadtime_lines(saved) if m["priority"] in "EF")
-    assert expected >= 1, "the captured window holds no E line; this spec would be vacuous"
+    if expected < 1:
+        pytest.fail("the captured window holds no E line; this spec would be vacuous")
 
     summary = json.loads(_snapshot_artifact(output, "snapshot-summary.json").read_text())
     assert summary["logs"]["errors"] == expected, (
@@ -553,78 +561,59 @@ def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
 
 
 # ===========================================================================
-# D5 + A5 -- one stall is one event and one cluster (session mode).
+# D5 + A5 -- one stall is one event and one cluster.
+#
+# Checked where it is deterministic: the pipeline over recorded lines, and the
+# CLI through a FINITE mode (`--since`, a `logcat -d` dump read whole). The
+# first version drove the session worker over a paced live stream; the review
+# of PR #20 showed the worker's select()-on-a-buffered-pipe read
+# (anr_watcher.py:659-670) keeps lines back depending on timing -- stopping
+# while the writer is open retained one line of four -- so no sleep can make
+# that path isolate a classification defect. That read is its own defect.
 # ===========================================================================
 
-SESSION_TIMEOUT_SECONDS = 20
 
+def _pipeline(lines: list[str]):
+    """Recorded lines -> (events, clusters), the composition both readers use.
 
-def _session_summary(toolchain: FakeToolchain, recorded, stream: str) -> dict:
-    """``--start`` -> stream drains -> ``--stop --json``, as an agent runs it.
-
-    The stub logcat holds its stream open briefly after the recorded lines, as
-    a live ``adb logcat`` does, so ``--start`` sees its worker register; then
-    the stream ends, the worker drains it to EOF, finds no stream on its one
-    re-spawn and exits, and ``--stop`` summarises everything it read. Step N's
-    printed session id is step N+1's argument.
+    ``anr_watcher``'s ``--since``/``--watch`` reader (``_handle_line``) and its
+    session worker (``_read_stream_into_events``) both run each line through
+    ``parse_logcat_anr`` and then ``build_normalised_event``; ``--stop``
+    clusters with ``cluster_events``. If D5's fix introduces a multi-line
+    entry point, both readers must go through it, and this helper must be
+    pointed at it too -- the assertions below do not change.
     """
-    toolchain.install(
-        "adb",
-        [
-            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
-            # The recording is streamed ONCE. The worker re-spawns a stream
-            # that ends, and a re-spawn reaching the same lines would count
-            # one ANR per attempt; the re-spawn instead finds no stream at all
-            # (default exit 1, silence), so the worker gives up and exits.
-            # Paced one line per write, as a live stream arrives: unpaced,
-            # the worker's select-on-a-buffered-pipe race drops the tail of
-            # the recording on Linux, and D5 "passed" in CI for that reason.
-            Rule(("logcat",), stdout=stream, hold=1.0, once=True, pace=0.2),
-        ],
-    )
-    # 1 is the floor `env_int` allows here; 0 is clamped up to it.
-    env = {"ANDROID_EMU_ANR_MAX_RESTARTS": "1"}
-    started = toolchain.run("anr_watcher.py", "--start", **env)
-    assert started.returncode == 0, started.stderr
-    session_id = started.stdout.strip()
+    from common import anr_pipeline as p
 
-    deadline = time.time() + SESSION_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        listing = toolchain.run("anr_watcher.py", "--list-sessions", "--json", **env)
-        status = {s["session_id"]: s["status"] for s in json.loads(listing.stdout)}
-        if status.get(session_id) not in ("pending", "running"):
-            break
-        time.sleep(0.2)
-    else:
-        pytest.fail(f"worker for {session_id} never drained its stream")
-
-    stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--all", "--json", **env)
-    assert stopped.returncode == 0, stopped.stderr
-    return json.loads(stopped.stdout)
+    events = []
+    for line in lines:
+        raw = p.parse_logcat_anr(line)
+        if raw is None:
+            continue
+        event = p.build_normalised_event(raw, session_start_ms=0, current_ms=1000)
+        if event is not None:
+            events.append(event)
+    return events, p.cluster_events(events)
 
 
-def _jank_stream(recorded, frame_counts) -> str:
-    """The recorded Choreographer line, once per count, with only the count changed."""
+def _jank_lines(recorded, frame_counts, pid: str | None = None) -> list[str]:
+    """The recorded Choreographer line once per count, with only the count changed.
+
+    ``pid`` substitutes the PID and TID columns as well -- a second process
+    janking, which is a different site. Everything else stays the recording.
+    """
     template = next(
-        line for line in recorded.lines("logcat_choreographer_jank") if "Skipped" in line
+        (line for line in recorded.lines("logcat_choreographer_jank") if "Skipped" in line), None
     )
-    return "".join(
-        re.sub(r"Skipped \d+ frames", f"Skipped {n} frames", template) + "\n" for n in frame_counts
-    )
-
-
-def test_the_session_harness_neither_drops_nor_duplicates_lines(toolchain, recorded):
-    """Anti-vacuity, unmarked: N recorded lines in, N events out.
-
-    Four lines, not one: both ways this harness has gone wrong lose or
-    multiply lines, and neither shows on a single line. The first draft let
-    the worker re-spawn its stream onto the same recording and counted every
-    event twice; the second delivered the recording in one pipe write, and on
-    Linux the worker dropped all but the first line -- which made D5 pass in
-    CI for the wrong reason. Clusters are not asserted here: that is A5.
-    """
-    summary = _session_summary(toolchain, recorded, _jank_stream(recorded, (31, 45, 52, 120)))
-    assert summary["event_count"] == 4, summary
+    if template is None:
+        pytest.fail("logcat_choreographer_jank holds no Skipped line")
+    lines = []
+    for n in frame_counts:
+        line = re.sub(r"Skipped \d+ frames", f"Skipped {n} frames", template)
+        if pid is not None:
+            line = re.sub(r"^(\S+ \S+\s+)\d+(\s+)\d+", rf"\g<1>{pid}\g<2>{pid}", line)
+        lines.append(line)
+    return lines
 
 
 @pytest.mark.xfail(
@@ -632,7 +621,7 @@ def test_the_session_harness_neither_drops_nor_duplicates_lines(toolchain, recor
     raises=AssertionError,
     reason="D5: common/anr_pipeline.py:258-266 -- the Reason: line becomes a second ANR",
 )
-def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(toolchain, recorded):
+def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(recorded):
     """D5: ``common/anr_pipeline.py:258-266``.
 
     ActivityManager reports one ANR as four lines under one tag: ``ANR in``,
@@ -641,9 +630,35 @@ def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(toolchain, recorded):
     "reason:" -- and this Reason line names the intent action ``PROVOKE_ANR``
     -- so one stall arrives as two events in two clusters.
     """
-    summary = _session_summary(toolchain, recorded, recorded.text("logcat_anr_broadcast"))
-    assert summary["event_count"] == 1, [c["symbol_or_prefix"] for c in summary["clusters"]]
-    assert len(summary["clusters"]) == 1, [c["symbol_or_prefix"] for c in summary["clusters"]]
+    events, clusters = _pipeline(recorded.lines("logcat_anr_broadcast"))
+    assert len(events) == 1, [e.raw_message for e in events]
+    assert len(clusters) == 1, [c.symbol_or_prefix for c in clusters]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="D5: common/anr_pipeline.py:258-266 -- --since prints one broadcast ANR twice",
+)
+def test_d5_since_reports_a_broadcast_anr_once(toolchain, recorded):
+    """D5 through the CLI, in the finite mode: ``--since 1m --json``.
+
+    ``--since`` reads a ``logcat -d`` dump to the end and prints one JSON line
+    per event, so the count an agent sees is the count of lines.
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("logcat",), stdout=recorded.text("logcat_anr_broadcast")),
+        ],
+    )
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--json")
+    if result.returncode != 0 or not any("logcat" in c for c in toolchain.calls("adb")):
+        pytest.fail(f"--since did not read the dump:\n{result.stdout}{result.stderr}")
+
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    assert len(events) == 1, [event.get("message") for event in events]
 
 
 @pytest.mark.xfail(
@@ -651,17 +666,41 @@ def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(toolchain, recorded):
     raises=AssertionError,
     reason="A5: common/anr_pipeline.py:47 -- the frame count stays in the jank fingerprint",
 )
-def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(toolchain, recorded):
+def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(recorded):
     """A5: ``common/anr_pipeline.py:47`` redacts only integers of 4+ digits.
 
     So the frame count of ``Skipped N frames!`` stays in the normalised prefix,
-    and the same screen dropping 31, 45, 52 and 120 frames fingerprints four
+    and the same process dropping 31, 45, 52 and 120 frames fingerprints four
     ways. The lines are the recorded Choreographer line with only the count
     substituted (counts cannot be recorded to order; everything else can).
     """
-    summary = _session_summary(toolchain, recorded, _jank_stream(recorded, (31, 45, 52, 120)))
-    assert summary["event_count"] == 4, summary
-    assert len(summary["clusters"]) == 1, [c["symbol_or_prefix"] for c in summary["clusters"]]
+    events, clusters = _pipeline(_jank_lines(recorded, (31, 45, 52, 120)))
+    assert len(events) == 4, [e.raw_message for e in events]
+    assert len(clusters) == 1, [c.symbol_or_prefix for c in clusters]
+
+
+def test_a5_two_janking_processes_stay_two_sites(recorded):
+    """A5's other direction, unmarked: unrelated jank is not one cluster.
+
+    Collapsing EVERY Choreographer line into one fingerprint also satisfies
+    the spec above, and would report two apps' jank as one site (review of
+    PR #20). Here two processes -- the recorded line, and the same line with
+    its PID/TID columns substituted -- jank twice each; no fingerprint may
+    hold both. Green today only because the counts differ; the A5 fix must
+    keep it green by telling the processes apart, not by keeping the counts.
+    """
+    first = _jank_lines(recorded, (31, 45))
+    pid = first[0].split()[2]
+    other = str(int(pid) + 1)
+    events, _ = _pipeline(first + _jank_lines(recorded, (52, 120), pid=other))
+    if len(events) != 4:
+        pytest.fail(f"expected four jank events, got {len(events)}")
+
+    sites: dict[str, set[int]] = {}
+    for event in events:
+        sites.setdefault(event.fingerprint, set()).add(event.pid)
+    merged = {fp: pids for fp, pids in sites.items() if len(pids) > 1}
+    assert not merged, f"jank from different processes shares a cluster: {merged}"
 
 
 # ===========================================================================
@@ -768,17 +807,20 @@ def test_n9_a_zero_duration_cluster_diffs_to_finite_json(toolchain, recorded):
         line for line in recorded.lines("logcat_strictmode_violation") if "policy violation" in line
     )
     raw = parse_logcat_anr(header)
-    assert raw is not None and raw["duration_ms"] > 0
+    if raw is None or raw["duration_ms"] <= 0:
+        pytest.fail(f"the recorded StrictMode header no longer parses with a duration: {raw}")
     silent = build_normalised_event({**raw, "duration_ms": 0.0}, 0, current_ms=1000)
     loud = build_normalised_event(raw, 0, current_ms=1000)
-    assert silent.fingerprint == loud.fingerprint
+    if silent.fingerprint != loud.fingerprint:
+        pytest.fail("the two events no longer share a cluster; the 0 -> N case is not built")
 
     store = SessionStore(base_dir=toolchain.home / "anr-sessions")
     before = _seed_session(store, [silent])
     after = _seed_session(store, [loud])
 
     result = toolchain.run("anr_watcher.py", "--diff", before, after, "--json")
-    assert result.returncode == 0, result.stderr
+    if result.returncode != 0:
+        pytest.fail(f"--diff did not run:\n{result.stderr}")
     payload = json.loads(result.stdout, parse_constant=_never_a_constant)
 
     def numbers(node):
