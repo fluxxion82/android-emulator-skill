@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import json
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -204,18 +205,121 @@ def test_the_emulator_workflow_is_callable_as_a_gate():
     assert "workflow_call" in triggers, "emulator.yml cannot be required by release.yml"
 
 
+LANE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "run-emulator-lane.sh"
+
+# The floor the lane enforces, as the script spells it. Matched as one shell
+# word (the quoted grep pattern), not as a substring of the file.
+LANE_PASSED_PATTERN = "[0-9]+ passed"
+
+
+def _shell_commands(script: str) -> list[tuple[int, list[str]]]:
+    """``(line number, shell words)`` for every line that is not a comment.
+
+    Tokenised with ``shlex`` in POSIX mode, so a quoted pattern is one word, a
+    ``#`` comment produces nothing, and ``;`` / ``|`` are words of their own.
+    The point is that ``exit 1`` inside an ``echo "..."`` string, or the word
+    ``passed`` in a comment, is not mistaken for a command -- which is exactly
+    how the first version of this guard passed with the check deleted (N7).
+    """
+    commands = []
+    for number, line in enumerate(script.splitlines(), start=1):
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        words = list(lexer)
+        if words:
+            commands.append((number, words))
+    return commands
+
+
+def _if_block(commands: list[tuple[int, list[str]]], start: int) -> list[list[str]]:
+    """The commands directly inside the ``if`` at ``commands[start]``.
+
+    Nested ``if ... fi`` blocks are skipped over rather than flattened in: an
+    ``exit 1`` that runs only under some inner condition is not this block's
+    unconditional exit.
+    """
+    body: list[list[str]] = []
+    depth = 0
+    for _, words in commands[start:]:
+        if words[0] == "if":
+            depth += 1
+            continue
+        if words[0] == "fi":
+            depth -= 1
+            if depth == 0:
+                return body
+            continue
+        if depth == 1:
+            body.append(words)
+    raise AssertionError(f"the `if` on line {commands[start][0]} is never closed by `fi`")
+
+
 def test_the_emulator_lane_fails_when_every_test_skips():
     """A lane where everything skipped is not a lane that passed.
 
     Every emulator test skips politely when no device or fixture app is
     present -- correct on a laptop, useless as a gate. The script must notice.
+
+    N7: this guard used to assert the SUBSTRINGS "passed" and "exit 1" occur
+    somewhere in the script. Both also occur in comments, an echo and the
+    fixture-app check (run-emulator-lane.sh:47,56,67), so deleting the real
+    floor at :60-65 left it green -- confirmed by mutation. It now reads the
+    script's commands: the ``if ! grep -qE '[0-9]+ passed' <log>`` floor must
+    exist, read the log ``pytest -m emulator`` tees to, come after that
+    pytest run, and have ``exit 1`` as a direct command of its ``if ... fi``.
+
+    T11 (Inc 2) replaces this floor with "0 skipped" and a device-loss exit 3.
+    That PR must update this guard in the same change; the guard failing on
+    T11's diff is the guard working, not a reason to loosen it.
     """
-    script = (REPO_ROOT / ".github" / "scripts" / "run-emulator-lane.sh").read_text(
-        encoding="utf-8"
+    commands = _shell_commands(LANE_SCRIPT.read_text(encoding="utf-8"))
+
+    pytest_runs = [
+        (index, words)
+        for index, (_, words) in enumerate(commands)
+        if "pytest" in words
+        and any(words[i : i + 2] == ["-m", "emulator"] for i in range(len(words) - 1))
+    ]
+    assert len(pytest_runs) == 1, (
+        f"expected exactly one `pytest ... -m emulator` command in the lane, "
+        f"found {len(pytest_runs)}"
     )
-    assert (
-        "passed" in script and "exit 1" in script
-    ), "the lane script no longer fails when no test actually ran"
+    pytest_index, pytest_words = pytest_runs[0]
+    assert "tee" in pytest_words, "the lane no longer tees pytest's output to a log"
+    tee_position = pytest_words.index("tee")
+    assert tee_position + 1 < len(pytest_words), "`tee` is given no log file"
+    lane_log = pytest_words[tee_position + 1]
+
+    floors = [
+        (index, words)
+        for index, (_, words) in enumerate(commands)
+        if words[0] == "if" and "!" in words and "grep" in words and LANE_PASSED_PATTERN in words
+    ]
+    assert len(floors) == 1, (
+        f"expected one `if ! grep -qE '{LANE_PASSED_PATTERN}' <log>` floor in the "
+        f"lane, found {len(floors)}: the lane no longer fails when no test ran"
+    )
+    floor_index, floor_words = floors[0]
+    read_log = floor_words[floor_words.index(LANE_PASSED_PATTERN) + 1]
+
+    assert floor_index > pytest_index, (
+        "the passed-floor runs before `pytest -m emulator`, so it reads a log "
+        "this run has not written yet"
+    )
+    assert read_log == lane_log, (
+        f"the floor greps {read_log!r} but pytest tees to {lane_log!r}; it is "
+        f"checking a file this run did not write"
+    )
+    assert ["exit", "1"] in [words[:2] for words in _if_block(commands, floor_index)], (
+        "the passed-floor no longer exits 1 when nothing passed; the lane goes "
+        "green having exercised no device"
+    )
+
+
+def test_the_emulator_lane_asserts_the_fixture_app_installed():
+    """Without the app, the end-to-end agent test skips and the gate is empty."""
+    script = LANE_SCRIPT.read_text(encoding="utf-8")
     assert "pm list packages" in script, (
         "the lane no longer asserts the fixture app installed; the end-to-end "
         "agent test would skip and the gate would pass having tested nothing"
