@@ -481,7 +481,10 @@ def _session_summary(toolchain: FakeToolchain, recorded, stream: str) -> dict:
             # that ends, and a re-spawn reaching the same lines would count
             # one ANR per attempt; the re-spawn instead finds no stream at all
             # (default exit 1, silence), so the worker gives up and exits.
-            Rule(("logcat",), stdout=stream, hold=1.0, once=True),
+            # Paced one line per write, as a live stream arrives: unpaced,
+            # the worker's select-on-a-buffered-pipe race drops the tail of
+            # the recording on Linux, and D5 "passed" in CI for that reason.
+            Rule(("logcat",), stdout=stream, hold=1.0, once=True, pace=0.2),
         ],
     )
     # 1 is the floor `env_int` allows here; 0 is clamped up to it.
@@ -505,19 +508,28 @@ def _session_summary(toolchain: FakeToolchain, recorded, stream: str) -> dict:
     return json.loads(stopped.stdout)
 
 
-def test_the_session_harness_counts_one_recorded_line_once(toolchain, recorded):
-    """Anti-vacuity, unmarked: the session flow neither drops nor duplicates.
+def _jank_stream(recorded, frame_counts) -> str:
+    """The recorded Choreographer line, once per count, with only the count changed."""
+    template = next(
+        line for line in recorded.lines("logcat_choreographer_jank") if "Skipped" in line
+    )
+    return "".join(
+        re.sub(r"Skipped \d+ frames", f"Skipped {n} frames", template) + "\n" for n in frame_counts
+    )
 
-    The single recorded Choreographer line must come back as exactly one event
-    in one cluster. The first draft of this harness let the worker re-spawn
-    its stream onto the same recording and counted every event twice, which
-    would have made D5's "two events" a harness artefact; this is the guard
-    against that class.
+
+def test_the_session_harness_neither_drops_nor_duplicates_lines(toolchain, recorded):
+    """Anti-vacuity, unmarked: N recorded lines in, N events out.
+
+    Four lines, not one: both ways this harness has gone wrong lose or
+    multiply lines, and neither shows on a single line. The first draft let
+    the worker re-spawn its stream onto the same recording and counted every
+    event twice; the second delivered the recording in one pipe write, and on
+    Linux the worker dropped all but the first line -- which made D5 pass in
+    CI for the wrong reason. Clusters are not asserted here: that is A5.
     """
-    line = next(line for line in recorded.lines("logcat_choreographer_jank") if "Skipped" in line)
-    summary = _session_summary(toolchain, recorded, line + "\n")
-    assert summary["event_count"] == 1, summary
-    assert len(summary["clusters"]) == 1, summary["clusters"]
+    summary = _session_summary(toolchain, recorded, _jank_stream(recorded, (31, 45, 52, 120)))
+    assert summary["event_count"] == 4, summary
 
 
 @pytest.mark.xfail(
@@ -552,13 +564,7 @@ def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(toolchain, rec
     ways. The lines are the recorded Choreographer line with only the count
     substituted (counts cannot be recorded to order; everything else can).
     """
-    template = next(
-        line for line in recorded.lines("logcat_choreographer_jank") if "Skipped" in line
-    )
-    stream = "\n".join(
-        re.sub(r"Skipped \d+ frames", f"Skipped {n} frames", template) for n in (31, 45, 52, 120)
-    )
-    summary = _session_summary(toolchain, recorded, stream + "\n")
+    summary = _session_summary(toolchain, recorded, _jank_stream(recorded, (31, 45, 52, 120)))
     assert summary["event_count"] == 4, summary
     assert len(summary["clusters"]) == 1, [c["symbol_or_prefix"] for c in summary["clusters"]]
 

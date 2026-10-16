@@ -95,8 +95,14 @@ for rule in spec["rules"]:
             line for line in out.splitlines(True)
             if len(line.split()) > 2 and line.split()[2] == pid
         )
-    sys.stdout.write(out)
-    sys.stdout.flush()
+    if rule["pace"]:
+        for line in out.splitlines(True):
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            time.sleep(rule["pace"])
+    else:
+        sys.stdout.write(out)
+        sys.stdout.flush()
     if rule["stderr"]:
         with open(rule["stderr"], encoding="utf-8") as handle:
             sys.stderr.write(handle.read())
@@ -130,6 +136,14 @@ class Rule:
     # writes its JUnit XML during the run; a stub that did not would leave the
     # script reading whatever an earlier run left behind.
     writes: tuple[tuple[str, str], ...] = ()
+    # Seconds between lines, each written and flushed on its own, the way a
+    # live `adb logcat` delivers them. Without it a whole recording lands in
+    # one pipe write, and anr_watcher's worker -- which select()s on a
+    # buffered text pipe (anr_watcher.py:659-670) -- loses the lines still in
+    # Python's buffer if the stream ends during a select timeout. That is a
+    # defect of its own; the D5/A5 specs are about classification, so the
+    # stream they read is paced and the race is out of their way.
+    pace: float = 0.0
     # Answer only the first matching call; later calls fall through to the
     # next rule. A logcat stream a worker re-spawns must not replay the same
     # recording, or one ANR is counted once per restart.
@@ -192,6 +206,7 @@ class FakeToolchain:
                     "exit": rule.exit,
                     "filter_pid": rule.filter_pid,
                     "hold": rule.hold,
+                    "pace": rule.pace,
                     "once": self._once_marker() if rule.once else "",
                     "writes": [[str(path), self._stage(text)] for path, text in rule.writes],
                 }
