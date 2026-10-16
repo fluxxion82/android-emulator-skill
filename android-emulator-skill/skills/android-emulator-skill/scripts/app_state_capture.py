@@ -6,7 +6,10 @@ Captures complete app state for debugging: screenshot + UI hierarchy + logs.
 Creates a debugging snapshot that can be analyzed later.
 
 Usage Examples:
-    # Capture current state
+    # Capture current state (into ~/.android-emulator-skill/cache/app-state-snapshots/)
+    python scripts/app_state_capture.py --package com.myapp
+
+    # Capture into a directory of your choosing
     python scripts/app_state_capture.py --package com.myapp --output snapshots/
 
     # Capture with logs from last 30 seconds
@@ -25,12 +28,25 @@ from datetime import datetime
 from pathlib import Path
 
 from common import adb_exec, cli, logcat
+from common.cache_utils import default_cache_dir
 from common.device_utils import get_ui_hierarchy, parse_display_density, quote_for_device_shell
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
 
 # Tunable defaults (override via ANDROID_EMU_* env vars).
 DEFAULT_LOG_LINES = env_int("ANDROID_EMU_STATE_LOG_LINES", 200)
+
+# Where a snapshot goes when --output is not given, under the skill's cache
+# root. The default used to be the relative `app-state-snapshots`, i.e. the
+# directory the agent happened to be standing in -- a probe of this very
+# repository left one in its root, untracked and not gitignored (N12).
+SNAPSHOTS_DIRNAME = "app-state-snapshots"
+
+
+def default_snapshot_dir() -> Path:
+    """``~/.android-emulator-skill/cache/app-state-snapshots``, resolved per call."""
+    return default_cache_dir() / SNAPSHOTS_DIRNAME
+
 
 # A snapshot is several dumps back to back, and it is taken of a device that is
 # by definition in a state worth debugging. `dumpsys package` and `dumpsys
@@ -63,36 +79,96 @@ def count_ui_elements(node: dict | None) -> int:
     return total
 
 
-def analyze_logcat(text: str) -> dict:
-    """Parse logcat text for error/warning counts.
+# `logcat -v threadtime`: "MM-DD HH:MM:SS.mmm  PID  TID P Tag: message", one
+# header per line (a multi-line message is several headed lines). Only the PID
+# and priority columns are read. Recorded: logcat_threadtime.
+#
+# log_monitor, anr_pipeline and crash_triage each carry a threadtime regex of
+# their own. This one and parse_package_pids belong in common/logcat.py, which
+# log_monitor's D4 fix needs too; they live here until they move there together.
+_THREADTIME = re.compile(
+    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+(?P<pid>\d+)\s+\d+\s+(?P<priority>[VDIWEF])\s"
+)
 
-    Recognizes both the standard logcat priority column (e.g. ``E/Tag`` or
-    `` E ``) and free-text mentions of "error"/"warning" so it works across
-    brief/threadtime/raw formats.
+
+def parse_threadtime(line: str) -> tuple[str, str] | None:
+    """``(pid, priority)`` of one threadtime line; None for anything else.
+
+    "Anything else" is the reader's ``--------- beginning of main`` separator
+    in practice: in threadtime every line of a message carries its own header.
 
     Args:
-        text: Captured logcat output
+        line: One line of ``logcat -v threadtime`` output.
+    """
+    match = _THREADTIME.match(line)
+    return (match["pid"], match["priority"]) if match else None
+
+
+def parse_package_pids(text: str, package: str) -> set[str]:
+    """The pids a logcat window itself says were processes of ``package``.
+
+    ``pidof`` only knows the process alive now. A restarted app's earlier
+    process -- the one that crashed, which is usually why a snapshot is being
+    taken -- is gone, and only the log still ties its pid to the package (D4).
+    Four sentences do that, each naming a pid and the process name together.
+    Recorded in logcat_app_restart (an app crashed, force-stopped and
+    relaunched) and logcat_crash_loop::
+
+        ActivityManager: Start proc 14407:<package>/u0a205 for next-top-activity {...}
+        ActivityManager: Process <package> (pid 14407) has died: fg  TOP
+        ActivityManager: Killing 14459:<package>/u0a205 (adj 0): stop <package> due to from pid 14489
+        AndroidRuntime:  Process: <package>, PID: 14407
+
+    The package name on its own proves nothing: in that recording most lines
+    naming it are system_server's, the launcher's and the IME's. Nor does a
+    number beside it -- ``A=10205:<package>`` is a task's uid, ``from pid
+    14489`` the shell that asked for the stop, and ``Process : Sending signal.
+    PID: 14407`` has no package at all -- so only these four shapes count.
+
+    The process name must be exactly ``package``, as ``pidof`` matches it: a
+    ``<package>:remote`` process is neither found by ``pidof`` nor counted here.
+
+    Args:
+        text: ``logcat -v threadtime`` output.
+        package: The application id.
 
     Returns:
-        Dict with ``lines``, ``errors``, ``warnings``
+        The pids, as the decimal strings the PID column holds.
     """
-    lines = [ln for ln in text.split("\n") if ln.strip()]
-    error_count = 0
-    warning_count = 0
+    name = re.escape(package)
+    pattern = re.compile(
+        rf"\bStart proc (\d+):{name}/"
+        rf"|\bProcess {name} \(pid (\d+)\) has died\b"
+        rf"|\bKilling (\d+):{name}/"
+        rf"|\bProcess: {name}, PID: (\d+)\b"
+    )
+    return {next(g for g in m.groups() if g) for m in pattern.finditer(text)}
 
-    # Logcat priority column: "<date> <time> <pid> <tid> E Tag: msg" (threadtime)
-    # or "E/Tag( pid): msg" (brief). Match a standalone E/W priority token.
-    err_priority = re.compile(r"(?:^|\s)E[/\s]")
-    warn_priority = re.compile(r"(?:^|\s)W[/\s]")
 
-    for line in lines:
-        lower = line.lower()
-        if err_priority.search(line) or "error" in lower or "exception" in lower:
-            error_count += 1
-        elif warn_priority.search(line) or "warning" in lower or "warn" in lower:
-            warning_count += 1
+def analyze_logcat(text: str) -> dict:
+    """Count a threadtime log's lines, errors and warnings by PRIORITY.
 
-    return {"lines": len(lines), "errors": error_count, "warnings": warning_count}
+    Read from the priority column only. This used to count any line whose text
+    said "error" or "exception" as an error whatever its priority (D3), so a V
+    line such as ``startWCT=... errorCallbackToken=null`` (logcat_threadtime)
+    was an error, and a snapshot could report three where its own log held one.
+
+    Args:
+        text: ``logcat -v threadtime`` output -- the format ``_capture_logs``
+            asks for, so the column this reads is the column it got.
+
+    Returns:
+        Dict with ``lines`` (non-blank lines), ``errors`` (E and F: a fatal is
+        an error the agent wants to see) and ``warnings`` (W).
+    """
+    priorities = [
+        parsed[1] for parsed in map(parse_threadtime, text.splitlines()) if parsed is not None
+    ]
+    return {
+        "lines": sum(1 for line in text.splitlines() if line.strip()),
+        "errors": sum(1 for p in priorities if p in ("E", "F")),
+        "warnings": sum(1 for p in priorities if p == "W"),
+    }
 
 
 class AppStateCapture:
@@ -158,6 +234,9 @@ class AppStateCapture:
         # as though nothing had been captured at all.
         artifacts: list[str] = []
         failures: list[str] = []
+        # What to do about a failure that knows its own remedy (a cli.Failure);
+        # said ahead of the generic one.
+        remedies: list[str] = []
         element_count = 0
         app_info: dict = {}
         device_info: dict = {}
@@ -217,6 +296,11 @@ class AppStateCapture:
             try:
                 log_stats = self._capture_logs(log_path, log_duration, log_lines)
                 artifacts.append("app-logs.txt")
+            except cli.Failure as exc:
+                # A refusal (no process of the app to read): the rest of the
+                # snapshot still stands, and the refusal's remedy is kept.
+                log_stats = {"captured": False, "reason": str(exc)}
+                remedies.append(exc.remedy)
             except Exception as exc:
                 # `_capture_logs` re-raises a device error rather than writing
                 # "logs unavailable" into the summary. That is right at the
@@ -260,8 +344,9 @@ class AppStateCapture:
                 (
                     f"Snapshot incomplete: {'; '.join(failures)}. "
                     f"What was captured is in {snapshot_dir}/. "
-                    f"Check the device is reachable with `adb devices`; for logs "
-                    f"pass a valid window (e.g. --logs 30s) or --no-logs to skip them."
+                    + "".join(f"{remedy} " for remedy in remedies)
+                    + "Check the device is reachable with `adb devices`; for logs "
+                    "pass a valid window (e.g. --logs 30s) or --no-logs to skip them."
                 ),
                 str(snapshot_dir),
                 summary,
@@ -382,7 +467,11 @@ class AppStateCapture:
         self, output_path: Path, duration: str, log_lines: int = DEFAULT_LOG_LINES
     ) -> dict:
         """
-        Capture app logs and analyze them for errors/warnings.
+        Capture the app's logs over a window and count its errors/warnings.
+
+        The app's logs are the lines of every process it had in the window:
+        the one ``pidof`` finds running, and each earlier one the window ties
+        to the package (:func:`parse_package_pids`).
 
         Args:
             output_path: Path to save logs
@@ -390,8 +479,14 @@ class AppStateCapture:
             log_lines: Max number of log lines to retain
 
         Returns:
-            Dict with ``captured`` plus ``lines``/``errors``/``warnings`` on
-            success, or a ``reason``/``error`` on failure.
+            Dict with ``captured`` plus ``lines``/``errors``/``warnings`` and
+            the ``pids`` read on success, or a ``reason``/``error`` on failure.
+
+        Raises:
+            cli.Failure: The app had no process in the window -- none running
+                and none named in it. Its logs cannot be told apart from the
+                rest of the device's, and the whole device is not the answer.
+            adb_exec.DeviceError: The device could not be reached.
         """
         # `logcat -t N` means the last N LINES; a bare duration passed here
         # silently became a line count, so "--logs 1m" returned 60 lines. The
@@ -406,34 +501,33 @@ class AppStateCapture:
                 f.write(f"Invalid log duration: {duration!r}\n")
             return {"captured": False, "reason": f"Invalid log duration: {duration!r}"}
 
-        # Add package filter if PID available. `pidof` exits non-zero when the
-        # app is not running; the snapshot then keeps the unfiltered window.
+        # Which processes are the app's. `pidof` names the one alive now; it
+        # exits 1 and prints nothing when there is none (pidof_not_running).
+        # That answer used to drop the filter altogether, so a snapshot of an
+        # app that had just crashed held every process on the device; and when
+        # it did answer, `--pid=<that one>` cut away the process that crashed
+        # before the restart (D4). So the window is read whole and filtered
+        # here, to the running process and every process the window itself
+        # says was the app's.
         pid_result = adb_exec.run_adb(
             "shell", self.serial, "pidof", quote_for_device_shell(self.package)
         )
-        pid = pid_result.stdout.strip() if pid_result.ok else ""
+        running = (
+            {token for token in pid_result.stdout.split() if token.isdigit()}
+            if pid_result.ok
+            else set()
+        )
 
         try:
+            # threadtime, explicitly: the PID and priority columns read below
+            # are the ones it prints, whatever the device's default format is.
             result = adb_exec.run_adb(
                 "logcat",
                 self.serial,
-                *logcat.logcat_args(since=since, fmt=None, pid=pid),
+                *logcat.logcat_args(since=since),
                 timeout=LOGCAT_TIMEOUT_SECONDS,
                 check=True,
             )
-            lines = result.stdout.split("\n")
-
-            # Cap retained lines (keep the most recent) for token efficiency.
-            if log_lines > 0 and len(lines) > log_lines:
-                lines = lines[-log_lines:]
-
-            text = "\n".join(lines)
-            with open(output_path, "w") as f:
-                f.write(text)
-
-            stats = analyze_logcat(text)
-            stats["captured"] = True
-            return stats
         except adb_exec.DeviceError:
             # Nothing reached the device. A snapshot that merely notes "logs
             # unavailable" would hide a problem main() can state with a remedy.
@@ -442,6 +536,36 @@ class AppStateCapture:
             with open(output_path, "w") as f:
                 f.write(f"Error capturing logs: {e}\n")
             return {"captured": False, "error": str(e)}
+
+        window = result.stdout
+        pids = running | parse_package_pids(window, self.package)
+        if not pids:
+            # Not "no logs": the device's whole window is not the app's, and an
+            # empty one would read as an app that ran and logged nothing.
+            cli.fail(
+                f"{self.package} had no process in the last {duration}: `pidof` found "
+                f"none running, and no line in the window names one",
+                "Launch the app and capture again, widen the window (e.g. --logs 5m) "
+                "if it ran earlier, or pass --no-logs.",
+            )
+
+        lines = [
+            line
+            for line in window.splitlines()
+            if (parsed := parse_threadtime(line)) is not None and parsed[0] in pids
+        ]
+        # Cap retained lines (keep the most recent) for token efficiency.
+        if log_lines > 0 and len(lines) > log_lines:
+            lines = lines[-log_lines:]
+
+        text = "".join(f"{line}\n" for line in lines)
+        with open(output_path, "w") as f:
+            f.write(text)
+
+        stats = analyze_logcat(text)
+        stats["captured"] = True
+        stats["pids"] = sorted(pids, key=int)
+        return stats
 
     def _write_summary_md(self, snapshot_dir: Path, summary: dict) -> None:
         """Write a human-readable ``summary.md`` alongside the JSON artifacts."""
@@ -478,6 +602,8 @@ class AppStateCapture:
             if logs is None:
                 f.write("- Not captured\n\n")
             elif logs.get("captured"):
+                if logs.get("pids"):
+                    f.write(f"- Processes: {', '.join(logs['pids'])}\n")
                 f.write(f"- Lines: {logs.get('lines', 0)}\n")
                 f.write(f"- Errors: {logs.get('errors', 0)}\n")
                 f.write(f"- Warnings: {logs.get('warnings', 0)}\n\n")
@@ -514,7 +640,10 @@ def main(argv: list[str] | None = None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Capture current state
+  # Capture current state; the snapshot's path is printed
+  python scripts/app_state_capture.py --package com.myapp
+
+  # Capture into a directory of your choosing
   python scripts/app_state_capture.py --package com.myapp --output snapshots/
 
   # Capture with 1 minute of logs
@@ -531,8 +660,10 @@ Examples:
     parser.add_argument("--package", required=True, help="App package name")
     parser.add_argument(
         "--output",
-        default="app-state-snapshots",
-        help="Output directory (default: app-state-snapshots)",
+        help=(
+            "Directory to write the snapshot into "
+            f"(default: ~/.android-emulator-skill/cache/{SNAPSHOTS_DIRNAME})"
+        ),
     )
     parser.add_argument(
         "--serial", dest="device_serial", help="Device serial (uses default if not specified)"
@@ -570,7 +701,9 @@ Examples:
     # capture() maps every component failure to a partial result, so nothing
     # inside it is expected to raise. Anything that does reaches common.cli.
     success, message, snapshot_path, partial = capturer.capture(
-        output_dir=args.output,
+        # Never the caller's cwd by default (N12); resolved here, at run time,
+        # so it follows HOME as this process sees it.
+        output_dir=args.output or str(default_snapshot_dir()),
         include_logs=not args.no_logs,
         log_duration=args.logs,
         log_lines=args.log_lines,

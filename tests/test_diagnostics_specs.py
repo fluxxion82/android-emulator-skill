@@ -437,11 +437,6 @@ def _snapshot_artifact(output: Path, name: str) -> Path:
     return found[0]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="D3: app_state_capture.py:85-91 counts errors from prose, not the priority column",
-)
 def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
     """D3: ``app_state_capture.py:85-91`` counts errors from prose.
 
@@ -571,11 +566,6 @@ def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, tmp_
     _assert_the_apps_window(seen, pids, unrelated)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="D4: app_state_capture.py:410-414 filters to the restarted app's new pid only",
-)
 def test_d4_app_state_capture_keeps_the_crashed_pid_of_a_restarted_app(
     toolchain, tmp_path, recorded
 ):
@@ -964,11 +954,6 @@ def test_the_snapshot_device_supports_a_complete_capture(toolchain, tmp_path, re
     assert not list(cwd.iterdir())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="N12: app_state_capture.py:534 -- the default --output is the caller's cwd",
-)
 def test_n12_a_default_snapshot_succeeds_outside_the_callers_cwd(toolchain, tmp_path, recorded):
     """N12: ``app_state_capture.py:534`` (and SKILL.md:525).
 

@@ -26,6 +26,17 @@ from pathlib import Path
 _SAFE_CACHE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
+def default_cache_dir() -> Path:
+    """The skill's cache root, ``~/.android-emulator-skill/cache``.
+
+    Resolved per call, not at import, so it follows ``HOME`` as the process
+    sees it. Anything the skill writes on the caller's behalf without being
+    told where -- progressive-disclosure entries, ``app_state_capture``'s
+    snapshots -- goes under here, never into the caller's working directory.
+    """
+    return Path("~/.android-emulator-skill/cache").expanduser()
+
+
 class ProgressiveCache:
     """Cache for progressive disclosure pattern.
 
@@ -41,7 +52,7 @@ class ProgressiveCache:
             max_age_hours: Max age for cache entries before expiration (default: 1 hour)
         """
         if cache_dir is None:
-            cache_dir = str(Path("~/.android-emulator-skill/cache").expanduser())
+            cache_dir = str(default_cache_dir())
 
         self.cache_dir = Path(cache_dir)
         self.max_age_hours = max_age_hours

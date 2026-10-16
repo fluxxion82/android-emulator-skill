@@ -27,6 +27,8 @@ import json
 import pathlib
 from datetime import datetime
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # S1 — focused activity.
 # ---------------------------------------------------------------------------
@@ -238,7 +240,10 @@ def test_log_window_uses_a_timestamp_not_a_line_count(monkeypatch, tmp_path):
     monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", _run)
 
     capturer = app_state_capture.AppStateCapture(package="com.example.app")
-    capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
+    # This device answers nothing, so no process of the app is in the window
+    # and the logs refuse (D4) -- after the logcat command has gone out.
+    with pytest.raises(app_state_capture.cli.Failure):
+        capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
 
     logcat_cmds = [c for c in captured if "logcat" in c]
     assert logcat_cmds, "no logcat command issued"
@@ -268,8 +273,9 @@ def test_log_window_timestamp_reflects_the_requested_duration(monkeypatch, tmp_p
     )
 
     capturer = app_state_capture.AppStateCapture(package="com.example.app")
-    capturer._capture_logs(tmp_path / "a.txt", "30s", 200)
-    capturer._capture_logs(tmp_path / "b.txt", "5m", 200)
+    for path, window in ((tmp_path / "a.txt", "30s"), (tmp_path / "b.txt", "5m")):
+        with pytest.raises(app_state_capture.cli.Failure):  # a silent device; see above
+            capturer._capture_logs(path, window, 200)
 
     stamps = [c[c.index("-t") + 1] for c in captured if "logcat" in c and "-t" in c]
     assert len(stamps) == 2

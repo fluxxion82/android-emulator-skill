@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-16T18:57:39Z",
+  "recorded_at": "2026-10-16T22:36:53Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 0,
+  "redacted_package_count": 9,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -544,6 +544,28 @@
       "description": "The SAME stalled app, reported a second time by a different subsystem and in a completely different shape: WindowManager writes one line reading 'ANR in Window{<hash> u0 <pkg>/<Activity>}. Reason:Input dispatching timed out (... Waited 5006ms for FocusEvent(hasFocus=false)).' Three things a guess gets wrong. The token after 'ANR in' is the literal word 'Window', not a package -- _ANR_IN_RE's '([\\w.]+)' happily reports a fault in a package called 'Window'. The component is inside the braces rather than in parentheses. And 'Reason:' has no space after the colon, unlike ActivityManager's. One stall therefore reaches a logcat reader as two events under two tags.",
       "catches": [],
       "bytes": 334
+    },
+    {
+      "name": "logcat_app_restart",
+      "file": "logcat_app_restart.txt",
+      "command": "adb shell am start -W (x3, ended by am crash, then am force-stop, then left running), then adb logcat -d -v threadtime, host-filtered to the lines that name the package or come from its pids",
+      "description": "One app, three processes, one window: the fixture app launched, crashed (`am crash`), relaunched, force-stopped, relaunched. The manifest's `pids` are what `pidof` answered while each was alive, in order. This is the evidence that ties a pid to a package when the process is gone and `pidof` can no longer say: what system_server and the app itself write about a process. Note that most lines naming the package come from processes that are NOT the app (system_server, the launcher, the IME), so naming the package says nothing about which process wrote the line. Host-filtered to lines that name the package or carry one of its pids; other apps' free text is not recorded.",
+      "catches": [
+        "D4"
+      ],
+      "bytes": 47833,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": [
+        "14407",
+        "14459",
+        "14501"
+      ],
+      "pid_endings": [
+        "am crash",
+        "am force-stop",
+        "running when the window was read"
+      ]
     },
     {
       "name": "logcat_choreographer_jank",
