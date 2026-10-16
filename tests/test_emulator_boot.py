@@ -17,7 +17,7 @@ import subprocess
 import emulator_boot
 import pytest
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.sdk_tools import SdkToolError
 
 
@@ -435,7 +435,7 @@ def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, capsys, ar
     monkeypatch.setattr(emulator_boot.sys, "argv", ["emulator_boot.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_boot.main()
+        cli.run(emulator_boot.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()

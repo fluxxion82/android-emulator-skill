@@ -45,7 +45,8 @@ import argparse
 import json
 import sys
 
-from common.adb_exec import AdbError, run_adb
+from common import cli
+from common.adb_exec import run_adb
 from common.env_config import env_int
 from common.sdk_tools import (
     CMDLINE_TOOLS_REMEDY,
@@ -471,7 +472,7 @@ def _print_summary(data: dict) -> None:
     print("Use --get-details for the full list")
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="List Android targets (connected devices + defined AVDs)",
@@ -509,19 +510,12 @@ Examples:
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     lister = DeviceLister(name_filter=args.name_filter)
-    try:
-        data = lister.collect()
-    except (AdbError, SdkToolError) as error:
-        # The listing could not be taken. Reported as a failure with the
-        # remedy, never as "Total: 0" at exit 0 (X3).
-        if args.json:
-            print(json.dumps({"error": str(error)}, indent=2))
-        else:
-            print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+    # A listing that could not be taken raises (AdbError, SdkToolError), and
+    # common.cli reports it with the remedy -- never "Total: 0" at exit 0 (X3).
+    data = lister.collect()
 
     if args.json:
         print(json.dumps(data, indent=2))
@@ -537,4 +531,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

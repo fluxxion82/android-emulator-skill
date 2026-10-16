@@ -43,7 +43,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import get_connected_devices
 from common.emu_console import (
     EmulatorProbe,
@@ -627,29 +627,12 @@ def _fail(error: object, *, json_mode: bool) -> None:
     sys.exit(1)
 
 
-def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback.
-
-    The net, not the handler: every mode is dispatched under a try that knows
-    whether ``--json`` was asked for (see :func:`_run`). This catches anything
-    raised before that is known -- and still says something rather than
-    printing a traceback.
-    """
-    try:
-        _run()
-    except SdkToolError as error:
-        # AVD discovery could not run. An empty ranking would be indistinguishable
-        # from "this host defines no AVDs", so this is a failure with a remedy (X3).
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
-    except adb_exec.AdbError as error:
-        # run_adb raises errors whose message already names a remedy. Print it
-        # rather than a traceback -- for an agent, stderr is the retry prompt.
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+def main(argv: list[str] | None = None):
+    """Main entry point. Failures raised before dispatch reach common.cli."""
+    _run(argv)
 
 
-def _run():
+def _run(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Suggest, list, and boot the best Android AVD for a task",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -685,7 +668,7 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         _dispatch(args)
     except (SdkToolError, adb_exec.AdbError) as error:
@@ -747,4 +730,4 @@ def _dispatch(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

@@ -69,7 +69,7 @@ a guard nothing could check.
 import re
 import shlex
 
-from .adb_exec import AdbCommandError, AdbError, run_adb
+from .adb_exec import AdbCommandError, AdbError, DeviceNotFoundError, run_adb
 from .hierarchy import capture_hierarchy_dict
 
 # Every adb call is bounded. An unbounded one wedges the adb connection for
@@ -240,7 +240,10 @@ def resolve_device_identifier(identifier: str | None) -> str | None:
         Full device serial, or None if should use default device
 
     Raises:
-        RuntimeError: If identifier cannot be resolved
+        DeviceNotFoundError: If identifier cannot be resolved. A RuntimeError,
+            so callers that catch that keep working; typed so that "the serial
+            you named is not attached" exits 3 at the CLI boundary whether this
+            notices it or adb does one call later.
 
     Example:
         serial = resolve_device_identifier("emulator")
@@ -266,11 +269,17 @@ def resolve_device_identifier(identifier: str | None) -> str | None:
         # connected", dropping the one detail the caller supplied. For an
         # agent, whose next move depends on whether it named the wrong device
         # or has no device at all, that distinction is the whole answer.
-        raise RuntimeError(
+        # The message is the one this has always raised; only the type and the
+        # one-line remedy are new.
+        raise DeviceNotFoundError(
             f"Device '{identifier}' was requested, but no devices are connected. "
             f"Start an emulator or connect a device:\n"
             f"  emulator -avd <device-name>\n"
-            f"  adb devices"
+            f"  adb devices",
+            remedy=(
+                "Start an emulator (`emulator -avd <device-name>`) or connect a device; "
+                "`adb devices` lists what is attached."
+            ),
         )
 
     # Exact match
@@ -290,9 +299,11 @@ def resolve_device_identifier(identifier: str | None) -> str | None:
         return partial[0]["serial"]
 
     # No match found
-    raise RuntimeError(
+    remedy = "Pass --serial with one of the available devices listed."
+    raise DeviceNotFoundError(
         f"Device '{identifier}' not found. Available devices:\n"
-        + "\n".join(f"  - {d['serial']} ({d['type']})" for d in available)
+        + "\n".join(f"  - {d['serial']} ({d['type']})" for d in available),
+        remedy=remedy,
     )
 
 

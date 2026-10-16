@@ -43,7 +43,7 @@ import argparse
 import sys
 import time
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import get_device_screen_size, resolve_device_identifier
 from common.env_config import env_float, env_int
 
@@ -332,7 +332,7 @@ class GestureSimulator:
         return self.swipe_path(start_x, start_y, end_x, end_y, duration_ms)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Android touch gesture simulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -382,14 +382,10 @@ Examples:
     )
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Resolve device
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     simulator = GestureSimulator(serial)
 
@@ -402,38 +398,32 @@ Examples:
     success = False
     message = ""
 
-    try:
-        if args.swipe:
-            success, message = simulator.swipe(args.swipe, args.from_edge, duration)
-        elif args.scroll:
-            success, message = simulator.scroll(args.scroll, args.count, duration)
-        elif args.long_press:
-            try:
-                x, y = map(int, args.long_press.split(","))
-                success, message = simulator.long_press(x, y, duration)
-            except ValueError:
-                message = "Error: --long-press requires format 'x,y'"
-        elif args.swipe_path:
-            try:
-                x1, y1, x2, y2 = map(int, args.swipe_path.split(","))
-                success, message = simulator.swipe_path(x1, y1, x2, y2, duration)
-            except ValueError:
-                message = "Error: --swipe-path requires format 'x1,y1,x2,y2'"
-        elif args.drag:
-            try:
-                x1, y1, x2, y2 = map(int, args.drag.split(","))
-                success, message = simulator.drag_and_drop(x1, y1, x2, y2, duration)
-            except ValueError:
-                message = "Error: --drag requires format 'x1,y1,x2,y2'"
-        elif args.refresh:
-            success, message = simulator.refresh(refresh_duration)
-        else:
-            parser.print_help()
-            sys.exit(1)
-    except adb_exec.AdbError as error:
-        # The gesture never reached a device. The error names the remedy, so
-        # print it rather than letting a traceback bury it.
-        print(f"Error: {error}", file=sys.stderr)
+    if args.swipe:
+        success, message = simulator.swipe(args.swipe, args.from_edge, duration)
+    elif args.scroll:
+        success, message = simulator.scroll(args.scroll, args.count, duration)
+    elif args.long_press:
+        try:
+            x, y = map(int, args.long_press.split(","))
+            success, message = simulator.long_press(x, y, duration)
+        except ValueError:
+            message = "Error: --long-press requires format 'x,y'"
+    elif args.swipe_path:
+        try:
+            x1, y1, x2, y2 = map(int, args.swipe_path.split(","))
+            success, message = simulator.swipe_path(x1, y1, x2, y2, duration)
+        except ValueError:
+            message = "Error: --swipe-path requires format 'x1,y1,x2,y2'"
+    elif args.drag:
+        try:
+            x1, y1, x2, y2 = map(int, args.drag.split(","))
+            success, message = simulator.drag_and_drop(x1, y1, x2, y2, duration)
+        except ValueError:
+            message = "Error: --drag requires format 'x1,y1,x2,y2'"
+    elif args.refresh:
+        success, message = simulator.refresh(refresh_duration)
+    else:
+        parser.print_help()
         sys.exit(1)
 
     if args.json:
@@ -447,4 +437,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

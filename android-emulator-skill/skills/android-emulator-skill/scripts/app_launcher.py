@@ -19,7 +19,7 @@ import re
 import sys
 import time
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import (
     get_current_activity,
     list_installed_packages,
@@ -636,7 +636,7 @@ def _report_action(
     sys.exit(0)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Android app lifecycle management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -693,7 +693,7 @@ Examples:
     parser.add_argument("--state", help="Get app state by package name")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Parse --args KEY=VALUE intent extras, failing fast on malformed input.
     try:
@@ -703,111 +703,96 @@ Examples:
         sys.exit(1)
 
     # Resolve device
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     launcher = AppLauncher(serial)
 
-    # Execute operation.
-    #
-    # CLI boundary: a device-level adb failure (ambiguous target, wrong
-    # serial, offline, unauthorized) means the command never ran. Those
-    # errors already carry a remedy, so print it rather than letting a
-    # traceback reach the user.
-    try:
-        if args.launch:
-            success, message, report = launcher.launch(args.launch, args.activity, extras or None)
-            # The resolved component travels as data, so a caller checking that
-            # the right screen is in front compares against what the system
-            # reported rather than against the string it asked for.
-            _report_action(
+    # Execute operation. A device-level adb failure (ambiguous target, wrong
+    # serial, offline, unauthorized) and the plain RuntimeError that
+    # list_installed_packages raises for a non-zero `pm list packages` both
+    # reach common.cli, which reports them with their remedy.
+    if args.launch:
+        success, message, report = launcher.launch(args.launch, args.activity, extras or None)
+        # The resolved component travels as data, so a caller checking that
+        # the right screen is in front compares against what the system
+        # reported rather than against the string it asked for.
+        _report_action(
+            args,
+            "launch",
+            success,
+            message,
+            details={"activity": report["activity"]} if report.get("activity") else None,
+        )
+
+    elif args.restart:
+        success, message = launcher.restart(args.restart, args.activity, extras or None)
+        _report_action(args, "restart", success, message)
+
+    elif args.terminate:
+        success, message = launcher.terminate(args.terminate)
+        _report_action(args, "terminate", success, message)
+
+    elif args.install:
+        success, message = launcher.install(args.install)
+        _report_action(args, "install", success, message)
+
+    elif args.uninstall:
+        success, message = launcher.uninstall(args.uninstall)
+        _report_action(args, "uninstall", success, message)
+
+    elif args.open_url:
+        success, message = launcher.open_url(args.open_url)
+        _report_action(args, "open_url", success, message)
+
+    elif args.list:
+        success, packages = launcher.list_packages(args.filter)
+        if not success:
+            _report_failure(
                 args,
-                "launch",
-                success,
-                message,
-                details={"activity": report["activity"]} if report.get("activity") else None,
+                "could not list installed packages; run `adb devices` to check "
+                "the device is attached and unlocked",
             )
-
-        elif args.restart:
-            success, message = launcher.restart(args.restart, args.activity, extras or None)
-            _report_action(args, "restart", success, message)
-
-        elif args.terminate:
-            success, message = launcher.terminate(args.terminate)
-            _report_action(args, "terminate", success, message)
-
-        elif args.install:
-            success, message = launcher.install(args.install)
-            _report_action(args, "install", success, message)
-
-        elif args.uninstall:
-            success, message = launcher.uninstall(args.uninstall)
-            _report_action(args, "uninstall", success, message)
-
-        elif args.open_url:
-            success, message = launcher.open_url(args.open_url)
-            _report_action(args, "open_url", success, message)
-
-        elif args.list:
-            success, packages = launcher.list_packages(args.filter)
-            if not success:
-                _report_failure(
-                    args,
-                    "could not list installed packages; run `adb devices` to check "
-                    "the device is attached and unlocked",
-                )
-            if args.json:
-                print(json_lib.dumps({"packages": packages, "count": len(packages)}, indent=2))
-            else:
-                print(f"Installed packages ({len(packages)}):")
-                for pkg in packages:
-                    print(f"  - {pkg}")
-            sys.exit(0 if success else 1)
-
-        elif args.state:
-            success, state = launcher.get_state(args.state)
-            if not success:
-                # Structurally unreachable today -- get_state raises instead --
-                # and kept so that a future failure return cannot walk into the
-                # `state['package']` below, which is exactly how C6 turned a
-                # failed lookup into a KeyError traceback.
-                _report_failure(
-                    args,
-                    state.get(
-                        "error",
-                        "could not read app state; run `adb devices` to check the "
-                        "device is attached and unlocked",
-                    ),
-                )
-            elif args.json:
-                print(json_lib.dumps(state, indent=2))
-            elif state.get("installed"):
-                print(f"Package: {state['package']}")
-                print("Installed: Yes")
-                print(f"Running: {'Yes' if state.get('running') else 'No'}")
-                print(f"Foreground: {'Yes' if state.get('foreground') else 'No'}")
-                if state.get("current_activity"):
-                    print(f"Current Activity: {state['current_activity']}")
-            else:
-                print(f"Package: {state['package']}")
-                print("Installed: No")
-            sys.exit(0 if success else 1)
-
+        if args.json:
+            print(json_lib.dumps({"packages": packages, "count": len(packages)}, indent=2))
         else:
-            parser.print_help()
-            sys.exit(1)
+            print(f"Installed packages ({len(packages)}):")
+            for pkg in packages:
+                print(f"  - {pkg}")
+        sys.exit(0 if success else 1)
 
-    except RuntimeError as error:
-        # Every adb failure subclasses RuntimeError and arrives carrying its
-        # own remedy; `list_installed_packages` re-raises a non-zero `pm list
-        # packages` as a plain RuntimeError. Catching only AdbError let the
-        # second one reach the user as a traceback once list_packages stopped
-        # swallowing it.
-        _report_failure(args, str(error))
+    elif args.state:
+        success, state = launcher.get_state(args.state)
+        if not success:
+            # Structurally unreachable today -- get_state raises instead --
+            # and kept so that a future failure return cannot walk into the
+            # `state['package']` below, which is exactly how C6 turned a
+            # failed lookup into a KeyError traceback.
+            _report_failure(
+                args,
+                state.get(
+                    "error",
+                    "could not read app state; run `adb devices` to check the "
+                    "device is attached and unlocked",
+                ),
+            )
+        elif args.json:
+            print(json_lib.dumps(state, indent=2))
+        elif state.get("installed"):
+            print(f"Package: {state['package']}")
+            print("Installed: Yes")
+            print(f"Running: {'Yes' if state.get('running') else 'No'}")
+            print(f"Foreground: {'Yes' if state.get('foreground') else 'No'}")
+            if state.get("current_activity"):
+                print(f"Current Activity: {state['current_activity']}")
+        else:
+            print(f"Package: {state['package']}")
+            print("Installed: No")
+        sys.exit(0 if success else 1)
+
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .adb_exec import AdbCommandError, run_adb
+from .adb_exec import AdbCommandError, AdbError, run_adb
 
 # A screencap on a loaded device takes noticeably longer than an ordinary
 # command, and the pull moves a multi-megabyte PNG.
@@ -358,8 +358,16 @@ def capture_screenshot(
         }
 
     except AdbCommandError as e:
+        # screencap or pull ran on the device and failed: say which operation.
         raise RuntimeError(f"Failed to capture screenshot: {e.stderr}") from e
-    except Exception as e:
+    except AdbError:
+        # Not re-wrapped: this was `except Exception: raise RuntimeError(...)`,
+        # which turned a device that is gone (DeviceNotFoundError, exit 3 at the
+        # CLI boundary) into a plain RuntimeError (exit 1).
+        raise
+    except (OSError, ValueError) as e:
+        # The local half: the pulled file could not be read, resized or sized.
+        # Anything else is a bug here and keeps its own type and traceback.
         raise RuntimeError(f"Screenshot capture error: {e!s}") from e
     finally:
         # The device copy was never deleted before, so every capture leaked a

@@ -39,6 +39,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common import cli
 from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
 
@@ -1065,7 +1066,7 @@ def format_live(result: dict, *, verbose: bool) -> str:
 # === CLI ===================================================================
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Parse arguments and dispatch the selected inspection mode."""
     parser = argparse.ArgumentParser(
         description=(
@@ -1122,7 +1123,7 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Show full detail")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.source is not None:
         _run_source(args)
@@ -1168,11 +1169,7 @@ def _run_schema(args: argparse.Namespace) -> None:
 
 def _run_live(args: argparse.Namespace) -> None:
     """Dispatch LIVE mode."""
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     inspector = LiveInspector(serial=serial)
     success, result = inspector.execute(args.package, db_name=args.db)
@@ -1201,4 +1198,4 @@ def _fail(result: dict, args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

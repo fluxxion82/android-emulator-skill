@@ -17,6 +17,7 @@ from pathlib import Path
 import emulator_delete
 import pytest
 
+from common import cli
 from common.sdk_tools import SdkToolError
 
 
@@ -269,7 +270,7 @@ def test_the_cli_exits_non_zero_without_avdmanager(monkeypatch, capsys, argv):
     monkeypatch.setattr(emulator_delete.sys, "argv", ["emulator_delete.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_delete.main()
+        cli.run(emulator_delete.main)
 
     assert exc.value.code == 1
     payload = json.loads(capsys.readouterr().out)
@@ -316,7 +317,7 @@ def test_the_cli_exits_non_zero_when_the_avds_cannot_be_ranked(monkeypatch, tmp_
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_delete.main()
+        cli.run(emulator_delete.main)
 
     assert exc.value.code == 1
     assert calls == [], "a delete was issued despite the failure"

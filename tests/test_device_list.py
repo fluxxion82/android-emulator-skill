@@ -16,7 +16,7 @@ import subprocess
 import device_list
 import pytest
 
-from common import adb_exec, sdk_tools
+from common import adb_exec, cli, sdk_tools
 
 # ---------------------------------------------------------------------------
 # parse_adb_devices
@@ -421,7 +421,7 @@ def test_the_cli_exits_non_zero_and_says_so_in_json(monkeypatch, capsys):
     monkeypatch.setattr(device_list.sys, "argv", ["device_list.py", "--json"])
 
     with pytest.raises(SystemExit) as exc:
-        device_list.main()
+        cli.run(device_list.main)
 
     assert exc.value.code == 1
     payload = json.loads(capsys.readouterr().out)

@@ -23,7 +23,6 @@ construction, which is where the defect was.
 from __future__ import annotations
 
 import shlex
-import subprocess
 
 import pytest
 
@@ -320,13 +319,7 @@ def test_privacy_manager_grants_to_one_package(monkeypatch):
     """`pm grant <pkg> <permission>`, with a package that carries a separator."""
     import privacy_manager
 
-    seen: list[list[str]] = []
-
-    def _run(cmd, **_kwargs):
-        seen.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(privacy_manager.subprocess, "run", _run)
+    seen = _capture_adb(monkeypatch, privacy_manager)
 
     privacy_manager.PrivacyManager(serial="emulator-5554").grant_permission("com.foo;id", "camera")
 

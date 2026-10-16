@@ -74,7 +74,16 @@ class SdkToolError(RuntimeError):
     "this host has no AVDs" is an answer and exits 0, while "I could not look"
     is a failure and exits non-zero with a remedy. Conflating the two is X3/L8,
     and it was live in four scripts at once.
+
+    Attributes:
+        remedy: The sentence the message ends in that says what to do, when it
+            has one -- the same convention as ``common.adb_exec.AdbError``, so
+            ``common.cli`` can report it as its own field without repeating it.
     """
+
+    def __init__(self, message: str, *, remedy: str | None = None):
+        super().__init__(message)
+        self.remedy = remedy
 
 
 def get_android_sdk_root() -> str | None:
@@ -201,7 +210,8 @@ def missing_emulator_error() -> SdkToolError:
     return SdkToolError(
         f"Android SDK 'emulator' binary not found. Looked in: "
         f"{searched_locations('emulator', EMULATOR_SDK_SUBDIRS)}. "
-        f"{EMULATOR_NOT_FOUND_REMEDY}"
+        f"{EMULATOR_NOT_FOUND_REMEDY}",
+        remedy=EMULATOR_NOT_FOUND_REMEDY,
     )
 
 
@@ -230,17 +240,19 @@ def run_sdk_tool(argv: list[str], *, timeout: float, remedy: str) -> str:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        stale = f"Check for a stale {Path(argv[0]).name} process and retry."
         raise SdkToolError(
-            f"`{' '.join(argv)}` did not finish within {timeout}s. Check for a "
-            f"stale {Path(argv[0]).name} process and retry."
+            f"`{' '.join(argv)}` did not finish within {timeout}s. {stale}", remedy=stale
         ) from exc
     except OSError as exc:
         # OSError, not FileNotFoundError: with the SDK *root* on PATH the bare
         # name `emulator` resolves to a directory and execve raises
         # PermissionError or IsADirectoryError instead.
-        raise SdkToolError(f"`{argv[0]}` could not be run: {exc}. {remedy}") from exc
+        raise SdkToolError(f"`{argv[0]}` could not be run: {exc}. {remedy}", remedy=remedy) from exc
 
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        raise SdkToolError(f"`{' '.join(argv)}` exited {result.returncode}: {detail}. {remedy}")
+        raise SdkToolError(
+            f"`{' '.join(argv)}` exited {result.returncode}: {detail}. {remedy}", remedy=remedy
+        )
     return result.stdout

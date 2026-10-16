@@ -17,6 +17,8 @@ import app_launcher
 import pytest
 from app_launcher import AppLauncher, parse_extras
 
+from common import cli
+
 
 def _ok(stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
@@ -288,10 +290,9 @@ def test_device_error_is_not_reported_as_a_failed_launch(monkeypatch):
         AppLauncher().launch("com.example.app", activity=".MainActivity")
 
 
-def test_unknown_serial_exits_one_with_an_actionable_message(
-    monkeypatch, capsys, recorded_anywhere
-):
-    """A wrong --serial must yield a remedy and exit 1, never a traceback."""
+def test_unknown_serial_exits_3_with_an_actionable_message(monkeypatch, capsys, recorded_anywhere):
+    """A wrong --serial must yield a remedy and exit 3 (device unavailable), never a
+    traceback -- reported by common.cli, as for every script."""
     fixture = recorded_anywhere("adb_device_not_found")
 
     def fake_run(cmd, **kwargs):
@@ -306,9 +307,9 @@ def test_unknown_serial_exits_one_with_an_actionable_message(
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        app_launcher.main()
+        cli.run(app_launcher.main)
 
-    assert excinfo.value.code == 1
+    assert excinfo.value.code == 3
     captured = capsys.readouterr()
     assert captured.err.startswith("Error: ")
     assert "no-such-serial-xyz" in captured.err
@@ -327,10 +328,12 @@ def test_ambiguous_device_tells_the_agent_which_flag_to_pass(monkeypatch, capsys
     monkeypatch.setattr(sys, "argv", ["app_launcher.py", "--open-url", "myapp://main"])
 
     with pytest.raises(SystemExit) as excinfo:
-        app_launcher.main()
+        cli.run(app_launcher.main)
 
     assert excinfo.value.code == 1
-    assert "--serial" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith("Error: "), err
+    assert "--serial" in err
 
 
 # --- C6: every mode reports a failure the same way -------------------------
@@ -577,7 +580,7 @@ def _run_cli(monkeypatch, argv: list[str]):
     monkeypatch.setattr(app_launcher, "resolve_device_identifier", lambda value: value)
     monkeypatch.setattr(sys, "argv", ["app_launcher.py", *argv])
     with pytest.raises(SystemExit) as excinfo:
-        app_launcher.main()
+        cli.run(app_launcher.main)
     return excinfo.value.code
 
 
@@ -607,12 +610,12 @@ def test_list_exits_non_zero_when_the_device_cannot_be_reached(monkeypatch, caps
     code = _run_cli(monkeypatch, ["--list", *(["--json"] if json_mode else [])])
     captured = capsys.readouterr()
 
-    assert code == 1
+    assert code == 3, "an unavailable device is exit 3 at the boundary"
     assert "Traceback" not in captured.err
     assert "Installed packages" not in captured.out, "a failed lookup printed an answer"
     if json_mode:
         payload = json_lib.loads(captured.out)
-        assert set(payload) == {"error"}, payload
+        assert set(payload) == {"success", "error", "remedy"}, payload
         assert "adb devices" in payload["error"], "the error does not name its remedy"
     else:
         assert "adb devices" in captured.err, "the error does not name its remedy"
@@ -704,11 +707,11 @@ def test_state_fails_when_only_the_activity_lookup_cannot_reach_the_device(
     code = _run_cli(monkeypatch, [*argv, *(["--json"] if json_mode else [])])
     captured = capsys.readouterr()
 
-    assert code == 1
+    assert code == 3, "an unavailable device is exit 3 at the boundary"
     assert "Traceback" not in captured.err
     if json_mode:
         payload = json_lib.loads(captured.out)
-        assert set(payload) == {"error"}, payload
+        assert set(payload) == {"success", "error", "remedy"}, payload
         assert "no-such-serial-xyz" in payload["error"]
     else:
         assert "Foreground" not in captured.out, "reported a foreground it never read"

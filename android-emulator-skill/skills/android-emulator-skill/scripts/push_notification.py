@@ -70,6 +70,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
+from common import cli
 from common.device_utils import (
     build_adb_command,
     permission_state,
@@ -605,10 +606,10 @@ Exit status:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Parse arguments, dispatch one action, and exit with its real status."""
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.post and not (args.tag and args.text):
         parser.error("--post requires --tag and --text")
@@ -617,11 +618,7 @@ def main() -> None:
     if args.expect_package and not args.list_posted:
         parser.error("--expect-package is used with --list")
 
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     tester = NotificationTester(serial=serial)
 
@@ -640,4 +637,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

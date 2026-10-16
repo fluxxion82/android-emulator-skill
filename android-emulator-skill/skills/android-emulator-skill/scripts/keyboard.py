@@ -40,7 +40,7 @@ import re
 import sys
 import time
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_float, env_int
 
@@ -342,7 +342,7 @@ class KeyboardSimulator:
         return True, f"Pressed keys: {', '.join(keys)}"
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Android keyboard and button simulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -419,14 +419,11 @@ Available Keys:
     )
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    # Resolve device
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    # A device that cannot be resolved, or a command that never reached it,
+    # raises; common.cli reports it with its remedy.
+    serial = resolve_device_identifier(args.serial)
 
     keyboard = KeyboardSimulator(serial)
 
@@ -434,29 +431,23 @@ Available Keys:
     success = False
     message = ""
 
-    try:
-        if args.type:
-            success, message = keyboard.type_text(args.type, args.delay)
-        elif args.key:
-            success, message = keyboard.press_key(args.key, args.count)
-        elif args.button:
-            success, message = keyboard.press_button(args.button)
-        elif args.keys:
-            keys = [k.strip() for k in args.keys.split(",")]
-            success, message = keyboard.key_combination(keys)
-        elif args.clear is not None:
-            success, message = keyboard.clear_text(args.clear)
-        elif args.hide_keyboard:
-            success, message = keyboard.hide_keyboard()
-        elif args.dismiss:
-            success, message = keyboard.dismiss_keyboard()
-        else:
-            parser.print_help()
-            sys.exit(1)
-    except adb_exec.AdbError as error:
-        # The command never reached a device. The error names the remedy, so
-        # print it rather than letting a traceback bury it.
-        print(f"Error: {error}", file=sys.stderr)
+    if args.type:
+        success, message = keyboard.type_text(args.type, args.delay)
+    elif args.key:
+        success, message = keyboard.press_key(args.key, args.count)
+    elif args.button:
+        success, message = keyboard.press_button(args.button)
+    elif args.keys:
+        keys = [k.strip() for k in args.keys.split(",")]
+        success, message = keyboard.key_combination(keys)
+    elif args.clear is not None:
+        success, message = keyboard.clear_text(args.clear)
+    elif args.hide_keyboard:
+        success, message = keyboard.hide_keyboard()
+    elif args.dismiss:
+        success, message = keyboard.dismiss_keyboard()
+    else:
+        parser.print_help()
         sys.exit(1)
 
     if args.json:
@@ -470,4 +461,4 @@ Available Keys:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

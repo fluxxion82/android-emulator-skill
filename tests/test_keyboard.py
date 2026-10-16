@@ -43,7 +43,7 @@ import pathlib
 import keyboard
 import pytest
 
-from common import adb_exec
+from common import adb_exec, cli
 
 
 class _FakeCompleted:
@@ -508,7 +508,7 @@ def test_unknown_serial_raises_rather_than_reporting_a_typed_key(monkeypatch, re
 
 
 def test_main_reports_an_unknown_serial_without_a_traceback(monkeypatch, capsys, recorded_anywhere):
-    """Exit 1 with the remedy on stderr; a traceback would bury it."""
+    """Exit 3 (device unavailable) with the remedy on stderr, from common.cli."""
     _patch_failing_run(monkeypatch, stderr=recorded_anywhere("adb_device_not_found"))
     monkeypatch.setattr(keyboard, "resolve_device_identifier", lambda arg: arg)
     monkeypatch.setattr(
@@ -516,9 +516,9 @@ def test_main_reports_an_unknown_serial_without_a_traceback(monkeypatch, capsys,
     )
 
     with pytest.raises(SystemExit) as exc:
-        keyboard.main()
+        cli.run(keyboard.main)
 
-    assert exc.value.code == 1
+    assert exc.value.code == 3
     err = capsys.readouterr().err
     assert err.startswith("Error: ")
     assert "no-such-serial-xyz" in err
@@ -532,10 +532,12 @@ def test_main_reports_multiple_devices_with_the_serial_remedy(monkeypatch, capsy
     monkeypatch.setattr(keyboard.sys, "argv", ["keyboard.py", "--type", "hello"])
 
     with pytest.raises(SystemExit) as exc:
-        keyboard.main()
+        cli.run(keyboard.main)
 
     assert exc.value.code == 1
-    assert "--serial" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith("Error: "), err
+    assert "--serial" in err
 
 
 def test_hide_keyboard_flag_is_accepted(monkeypatch, capsys, recorded):

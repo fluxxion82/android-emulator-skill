@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import io
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 
 import log_monitor
 import pytest
+
+from common import adb_exec, cli
+from common.adb_exec import DeviceNotFoundError
 
 RECORDED = Path(__file__).resolve().parent / "fixtures" / "recorded" / "emulator-api35"
 
@@ -186,7 +190,10 @@ def test_duration_stops_a_stream_that_never_ends(fake_popen, monkeypatch):
 
         @classmethod
         def now(cls, tz=None):
-            cls._t = cls._t + log_monitor.timedelta(seconds=5)
+            # timedelta from the stdlib: log_monitor never imported it, and the
+            # AttributeError this raised was swallowed by the `except Exception`
+            # in stream_logs -- which is the only reason the test ever passed.
+            cls._t = cls._t + timedelta(seconds=5)
             return cls._t
 
     monkeypatch.setattr(log_monitor, "datetime", _Clock)
@@ -232,12 +239,21 @@ def test_adb_errors_are_not_counted_as_device_log_lines(fake_popen):
     )
 
 
-def test_adb_error_text_is_surfaced_on_failure(fake_popen, capsys):
-    """A failure must say what adb reported, not just that it failed."""
-    fake_popen([], returncode=1, stderr_text="adb: device 'no-such-device' not found\n")
-    log_monitor.LogMonitor().stream_logs()
+def test_adb_error_text_is_surfaced_on_failure(fake_popen, monkeypatch, recorded_anywhere):
+    """A failure must say what adb reported, not just that it failed.
 
-    assert "not found" in capsys.readouterr().err
+    adb's recorded words for an unknown serial, classified the way run_adb
+    classifies them: a streaming logcat cannot go through run_adb, but a device
+    that is not there is the same typed error -- exit 3 at the boundary.
+    """
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
+    fake_popen([], returncode=1, stderr_text=recorded_anywhere("adb_shell_device_not_found"))
+
+    with pytest.raises(DeviceNotFoundError) as raised:
+        log_monitor.LogMonitor().stream_logs()
+
+    assert "is not attached" in str(raised.value)
+    assert "adb devices" in raised.value.remedy
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +262,17 @@ def test_adb_error_text_is_surfaced_on_failure(fake_popen, capsys):
 
 
 def test_failed_logcat_is_reported_as_failure(fake_popen):
-    """`adb logcat` exiting non-zero must not read as success."""
+    """`adb logcat` exiting non-zero must not read as success.
+
+    Raised as cli.Failure, where it was printed and returned False: under
+    --json that exited 1 with nothing on stdout.
+    """
     fake_popen([], returncode=1)
-    assert log_monitor.LogMonitor().stream_logs() is False, (
-        "logcat exited 1 but stream_logs reported success, so 'no devices' is "
-        "indistinguishable from a quiet device"
-    )
+    with pytest.raises(cli.Failure) as raised:
+        log_monitor.LogMonitor().stream_logs()
+
+    assert "exited with status 1" in str(raised.value)
+    assert "--serial" in raised.value.remedy
 
 
 def test_successful_logcat_is_reported_as_success(fake_popen):
@@ -284,11 +305,13 @@ def test_unknown_serial_fails_before_streaming(monkeypatch, capsys):
     monkeypatch.setattr(log_monitor.subprocess, "Popen", _no_popen)
 
     monitor = log_monitor.LogMonitor(device_serial="no-such-device")
-    assert monitor.stream_logs(duration=1) is False
+    # Raised, not printed-and-False: an unavailable device is exit 3 at the CLI
+    # boundary, the same as in every other script.
+    with pytest.raises(DeviceNotFoundError) as raised:
+        monitor.stream_logs(duration=1)
 
-    err = capsys.readouterr().err
-    assert "not attached" in err
-    assert "emulator-5554" in err, "the error should name what IS available"
+    assert "not attached" in str(raised.value)
+    assert "emulator-5554" in str(raised.value), "the error should name what IS available"
 
 
 def test_known_serial_proceeds(monkeypatch, fake_popen):

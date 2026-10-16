@@ -35,7 +35,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from common.adb_exec import AdbError
+from common import cli
+from common.adb_exec import AdbCommandError, DeviceError
 from common.device_utils import get_device_density, get_ui_hierarchy
 from common.env_config import env_int
 from common.hierarchy import is_interactive, parse_bounds
@@ -110,14 +111,17 @@ class AccessibilityAuditor:
     def _resolve_density(self) -> int:
         """The device's effective dpi, queried once and cached.
 
-        Falls back to mdpi (1dp == 1px) when the device cannot be asked, which
-        degrades the touch-target check to its previous behaviour rather than
-        inventing a scale factor.
+        Falls back to mdpi (1dp == 1px) when `wm density` ran and failed on the
+        device, which degrades the touch-target check to its previous behaviour
+        rather than inventing a scale factor. Only then: a device that is not
+        there, a missing adb or an answer that does not parse used to land here
+        too, and the audit went on to report a result for a screen it had not
+        measured. Those reach common.cli.
         """
         if self.density is None:
             try:
                 self.density = get_device_density(self.serial)
-            except (AdbError, RuntimeError):
+            except AdbCommandError:
                 self.density = self.DEFAULT_DENSITY_DPI
         return self.density
 
@@ -216,6 +220,10 @@ class AccessibilityAuditor:
 
             return True, message, audit_data
 
+        except DeviceError:
+            # A device that is not there is not an audit failure: it reaches
+            # common.cli, which says exit 3 like every other script.
+            raise
         except Exception as e:
             return False, f"Audit failed: {e}", None
 
@@ -500,7 +508,7 @@ class AccessibilityAuditor:
             f.write("\n".join(lines))
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Audit Android screen for accessibility issues",
@@ -528,7 +536,7 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output (show all issues)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     auditor = AccessibilityAuditor(serial=args.device_serial)
 
@@ -536,13 +544,17 @@ Examples:
     success, message, audit_data = auditor.audit()
 
     if not success:
-        print(f"Error: {message}", file=sys.stderr)
-        sys.exit(1)
+        # Through common.cli: under --json this left stdout empty.
+        cli.fail(
+            message,
+            "Check the screen can be read (`screen_mapper.py`), then audit again.",
+        )
 
-    # Save report if requested
+    # Save report if requested. Under --json the line goes to stderr: it was
+    # printed ahead of the JSON object.
     if args.output:
         report_path = auditor.save_report(args.output, audit_data)
-        print(f"Report saved: {report_path}")
+        print(f"Report saved: {report_path}", file=sys.stderr if args.json else sys.stdout)
 
     # Output results
     if args.json:
@@ -589,4 +601,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

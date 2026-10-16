@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from common import cli
 from common.device_utils import (
     build_adb_command,
     get_current_activity,
@@ -972,26 +973,24 @@ def _run_clear(recorder: TestRecorder, args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Parse arguments, run one command, return the exit status."""
-    args = _build_parser().parse_args()
+    args = _build_parser().parse_args(argv)
     recorder = TestRecorder()
-    try:
-        if args.start is not None:
-            return _run_start(recorder, args)
-        if args.step is not None:
-            return _run_step(recorder, args)
-        if args.get_details is not None:
-            return _run_get_details(recorder, args)
-        if args.stop:
-            return _run_stop(recorder, args)
-        if args.list:
-            return _run_list(recorder, args)
-        return _run_clear(recorder, args)
-    except (RecorderError, RuntimeError, OSError) as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return 1
+    # RecorderError, a device RuntimeError and an OSError from the session
+    # store all reach common.cli, which reports them in the one shape.
+    if args.start is not None:
+        return _run_start(recorder, args)
+    if args.step is not None:
+        return _run_step(recorder, args)
+    if args.get_details is not None:
+        return _run_get_details(recorder, args)
+    if args.stop:
+        return _run_stop(recorder, args)
+    if args.list:
+        return _run_list(recorder, args)
+    return _run_clear(recorder, args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.run(main)

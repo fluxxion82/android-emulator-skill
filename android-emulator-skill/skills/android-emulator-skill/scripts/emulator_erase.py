@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import adb_exec
+from common import cli
 from common.emu_console import RunningVerdict, avd_running
 from common.env_config import env_float, env_int
 from common.sdk_tools import resolve_avd_home
@@ -315,21 +315,12 @@ class EmulatorEraser:
         return succeeded, failed, results
 
 
-def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+def main(argv: list[str] | None = None):
+    """Main entry point. An adb failure -- a RunningCheckError included -- raises,
+    and common.cli reports it in the shape the caller asked for."""
     parser = _build_parser()
-    args = parser.parse_args()
-    try:
-        _run(parser, args)
-    except adb_exec.AdbError as error:
-        # run_adb raises errors whose message already names a remedy. Print it
-        # rather than a traceback -- for an agent, stderr is the retry prompt.
-        #
-        # Parsed BEFORE the try so this handler knows whether --json was asked
-        # for. It did not, and a `--json` run that hit a RunningCheckError got
-        # exit 1 with prose on stderr and an EMPTY stdout -- an agent parsing
-        # stdout saw nothing at all where the contract promises {"error": ...}.
-        _fail(error, json_mode=args.json)
+    args = parser.parse_args(argv)
+    _run(parser, args)
 
 
 def _fail(error: object, *, json_mode: bool) -> None:
@@ -411,9 +402,13 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         sys.exit(0)
 
     # Erase-all operation
+    # Progress is for a reader; under --json stdout is the one object, so it
+    # goes to stderr there. (It was printed ahead of the JSON.)
+    progress = sys.stderr if args.json else sys.stdout
+
     if args.all:
         if args.verbose:
-            print("Erasing all AVDs")
+            print("Erasing all AVDs", file=progress)
         succeeded, failed, results = eraser.erase_all(
             force=args.force, verify=args.verify, timeout_seconds=args.timeout
         )
@@ -455,7 +450,7 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         )
 
     if args.verbose:
-        print(f"Erasing AVD: {args.name}")
+        print(f"Erasing AVD: {args.name}", file=progress)
 
     success, message = eraser.erase(
         args.name, force=args.force, verify=args.verify, timeout_seconds=args.timeout
@@ -479,4 +474,4 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

@@ -47,7 +47,7 @@ import pytest
 import screen_mapper
 from screen_mapper import ScreenMapper
 
-from common import adb_exec
+from common import adb_exec, cli
 
 
 def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -276,7 +276,11 @@ def test_get_ui_hierarchy_builds_adb_without_shell(monkeypatch, recorded):
 
 
 def test_main_exits_non_zero_when_the_screen_cannot_be_read(monkeypatch, capsys):
-    """R2: exiting 0 while serialising an error made the status useless."""
+    """R2: exiting 0 while serialising an error made the status useless.
+
+    The failure is now reported by common.cli like every other script's: two
+    lines on stderr, where it used to be one ``Error:`` line on stdout.
+    """
     _patch_adb(
         monkeypatch,
         result_for=lambda _cmd: _fake_result(
@@ -287,16 +291,16 @@ def test_main_exits_non_zero_when_the_screen_cannot_be_read(monkeypatch, capsys)
     monkeypatch.setattr(screen_mapper.sys, "argv", ["screen_mapper.py"])
 
     with pytest.raises(SystemExit) as exc:
-        screen_mapper.main()
+        cli.run(screen_mapper.main)
 
-    assert exc.value.code != 0, "a failed screen read still reported success"
-    out = capsys.readouterr().out
-    # Output format is unchanged: still one "Error: ..." line on stdout.
-    assert out.startswith("Error: ")
-    assert "--serial" in out, "the error does not say what to do next"
+    assert exc.value.code == 1, "several devices is a failure, not an unavailable device"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Error: ")
+    assert "--serial" in captured.err, "the error does not say what to do next"
 
 
-def test_main_json_error_payload_is_preserved_and_exits_non_zero(monkeypatch, capsys):
+def test_main_json_error_is_the_boundary_shape_and_exits_non_zero(monkeypatch, capsys):
     _patch_adb(
         monkeypatch,
         result_for=lambda _cmd: _fake_result(
@@ -307,11 +311,33 @@ def test_main_json_error_payload_is_preserved_and_exits_non_zero(monkeypatch, ca
     monkeypatch.setattr(screen_mapper.sys, "argv", ["screen_mapper.py", "--json"])
 
     with pytest.raises(SystemExit) as exc:
-        screen_mapper.main()
+        cli.run(screen_mapper.main)
 
-    assert exc.value.code != 0
+    assert exc.value.code == 1
     payload = json_lib.loads(capsys.readouterr().out)
-    assert "error" in payload, "the JSON error contract changed"
+    assert payload["success"] is False
+    assert "--serial" in payload["error"]
+    assert payload["remedy"]
+
+
+def test_main_reports_an_unavailable_device_as_exit_3(monkeypatch, capsys, recorded_anywhere):
+    """Ruling 3: screen_mapper consumed device errors and exited 1; now it is 3."""
+    _patch_adb(
+        monkeypatch,
+        result_for=lambda _cmd: _fake_result(
+            returncode=1, stderr=recorded_anywhere("adb_shell_device_not_found")
+        ),
+    )
+    monkeypatch.setattr(screen_mapper, "resolve_device_identifier", lambda arg: arg)
+    monkeypatch.setattr(
+        screen_mapper.sys, "argv", ["screen_mapper.py", "--serial", "emulator-5556", "--json"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(screen_mapper.main)
+
+    assert exc.value.code == 3
+    assert json_lib.loads(capsys.readouterr().out)["success"] is False
 
 
 def test_main_exits_zero_when_the_screen_is_read(monkeypatch, capsys, recorded):

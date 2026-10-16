@@ -44,7 +44,8 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 
-from common.adb_exec import AdbError
+from common import cli
+from common.adb_exec import AdbError, DeviceError
 from common.device_utils import get_connected_devices, resolve_device_identifier
 from common.emu_console import run_emu
 from common.env_config import env_float
@@ -259,6 +260,12 @@ class LocationManager:
         args = build_geo_fix_args(lat, lng)
         try:
             run_emu(*args, serial=self.serial, timeout=int(DEFAULT_GEO_TIMEOUT))
+        except DeviceError:
+            # A device that is not there is not this fix's failure to report: it
+            # reaches common.cli, which says exit 3 like every other script. The
+            # `--gpx` replay therefore stops at the first one -- every later
+            # point would fail the same way.
+            raise
         except AdbError as error:
             # Covers what the three hand-rolled branches here used to cover, and
             # one they did not: a timeout, adb missing, a non-zero adb exit, and
@@ -428,7 +435,7 @@ def _read_gpx_file(path: str) -> list[tuple[float, float]]:
     return parse_gpx(xml_text)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Simulate GPS location on an Android emulator (emu geo fix)",
@@ -491,7 +498,7 @@ Notes:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # --list-cities needs no device; handle it before any resolution.
     if args.list_cities:
@@ -525,11 +532,7 @@ Notes:
         interval = DEFAULT_GEO_INTERVAL
 
     # Resolve device serial (None means "use default device").
-    try:
-        serial = resolve_device_identifier(args.device_serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.device_serial)
 
     manager = LocationManager(serial=serial)
 
@@ -593,4 +596,4 @@ Notes:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

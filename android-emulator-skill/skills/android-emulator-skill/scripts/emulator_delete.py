@@ -29,6 +29,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common import cli
 from common.env_config import env_int
 from common.sdk_tools import (
     AVD_HOME_REMEDY,
@@ -334,7 +335,7 @@ class EmulatorDeleter:
         return succeeded, failed, results
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Delete Android Virtual Devices (AVDs)",
@@ -381,19 +382,12 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    deleter = EmulatorDeleter()
-    try:
-        _dispatch(parser, deleter, args)
-    except SdkToolError as error:
-        # Every path reports a broken avdmanager the same way: the batch modes
-        # used to answer "No AVDs deleted" and exit 0 here (L8).
-        if args.json:
-            print(json.dumps({"error": str(error)}, indent=2))
-        else:
-            print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+    # A broken avdmanager raises SdkToolError on every path, and common.cli
+    # reports it the same way: the batch modes used to answer "No AVDs
+    # deleted" and exit 0 here (L8).
+    _dispatch(parser, EmulatorDeleter(), args)
 
 
 def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args) -> None:
@@ -412,9 +406,13 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
         sys.exit(0)
 
     # Batch: delete all
+    # Progress is for a reader; under --json stdout is the one object, so it
+    # goes to stderr there. (It was printed ahead of the JSON.)
+    progress = sys.stderr if args.json else sys.stdout
+
     if args.all:
         if args.verbose:
-            print("Deleting all AVDs")
+            print("Deleting all AVDs", file=progress)
         succeeded, failed, results = deleter.delete_all(confirm=args.yes)
         _report_batch("delete_all", succeeded, failed, results, args)
         sys.exit(0 if failed == 0 else 1)
@@ -434,19 +432,22 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
                 f"--old N with N >= 1.",
             )
         if args.verbose:
-            print(f"Deleting older AVDs, keeping newest {args.old}")
+            print(f"Deleting older AVDs, keeping newest {args.old}", file=progress)
         succeeded, failed, results = deleter.delete_old(keep_count=args.old, confirm=args.yes)
         _report_batch("delete_old", succeeded, failed, results, args, keep_count=args.old)
         sys.exit(0 if failed == 0 else 1)
 
     # Delete operation
     if not args.name:
-        print("Error: specify --name, --all, or --old", file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
+        # Through common.cli: this printed the help text to stdout, which under
+        # --json was the answer.
+        cli.fail(
+            "no AVD named: nothing to delete",
+            "Pass --name <avd>, --all, or --old N (with --yes to skip the prompt).",
+        )
 
     if args.verbose:
-        print(f"Deleting AVD: {args.name}")
+        print(f"Deleting AVD: {args.name}", file=progress)
 
     success, message = deleter.delete(args.name, confirm=args.yes)
 
@@ -511,4 +512,4 @@ def _report_batch(
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

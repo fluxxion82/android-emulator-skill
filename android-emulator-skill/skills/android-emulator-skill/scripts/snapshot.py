@@ -52,7 +52,8 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
-from common.adb_exec import AdbError
+from common import cli
+from common.adb_exec import AdbError, DeviceError
 from common.device_utils import resolve_device_identifier
 from common.emu_console import CONSOLE_TIMEOUT, EmuReply, run_emu
 from common.env_config import env_int
@@ -400,6 +401,10 @@ class SnapshotManager:
         """
         try:
             reply = run_emu(*args, serial=self.serial, timeout=self.timeout)
+        except DeviceError:
+            # A device that is not there is not this command's failure to report:
+            # it reaches common.cli, which says exit 3 like every other script.
+            raise
         except AdbError as exc:
             return None, str(exc)
         return reply, ""
@@ -413,15 +418,31 @@ class SnapshotManager:
 
         Returns:
             (matched, last_listing_result).
+
+        Raises:
+            DeviceError: The device was unavailable on the last poll before the
+                deadline. Earlier ones are tolerated: an emulator that is busy
+                writing or dropping a snapshot can drop off adb for a moment --
+                the same tolerance boot polling has -- so a device error here
+                means "ask again", until the deadline says the device is gone
+                (exit 3 at the CLI boundary).
         """
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS
+        listing: dict = {"snapshots": []}
         while True:
-            listed, listing = self.list_snapshots()
-            if listed:
-                names = {item["name"] for item in listing["snapshots"]}
-                if (name in names) == want_present:
-                    return True, listing
+            device_error: DeviceError | None = None
+            try:
+                listed, listing = self.list_snapshots()
+            except DeviceError as error:
+                device_error = error
+            else:
+                if listed:
+                    names = {item["name"] for item in listing["snapshots"]}
+                    if (name in names) == want_present:
+                        return True, listing
             if time.monotonic() >= deadline:
+                if device_error is not None:
+                    raise device_error
                 return False, listing
             time.sleep(VERIFY_POLL_SECONDS)
 
@@ -596,16 +617,12 @@ Exit status:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Parse arguments, run one snapshot action, and exit with its real status."""
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     manager = SnapshotManager(serial=serial, timeout=args.timeout)
 
@@ -623,4 +640,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

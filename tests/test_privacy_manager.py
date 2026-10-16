@@ -16,18 +16,24 @@ S16  ``--grant`` reported success whenever ``pm grant`` exited 0. Granting a
      to answer the read-back too, which is why ``FakeAdb`` routes on the
      device-side command instead of returning one canned result.
 
-All adb calls are faked, so no device is required.
+All adb calls are faked, so no device is required. The fake sits where
+``common.adb_exec.run_adb`` reaches the host, because that is where every call
+goes now: this module used to call ``subprocess.run`` itself, four times, and
+its fake asserted ``check=True`` reached it -- the bypass, pinned as the
+contract.
 """
 
 from __future__ import annotations
 
-import subprocess
+import json
+import sys
 from types import SimpleNamespace
 
 import privacy_manager
 import pytest
 from privacy_manager import PrivacyManager, build_test_trail, print_permissions
 
+from common import adb_exec, cli
 from common.device_utils import parse_package_permissions
 
 DESKCLOCK = "com.google.android.deskclock"
@@ -62,15 +68,12 @@ class FakeAdb:
 
     def run(self, cmd, *args, **kwargs):
         self.calls.append(list(cmd))
-        # The script passes check=True and an explicit timeout; assert contract.
-        assert kwargs.get("check") is True
-        assert "timeout" in kwargs
+        # run_adb's contract with the host: bounded, never raising on status --
+        # it classifies the result itself.
+        assert kwargs.get("check") is False
+        assert kwargs.get("timeout")
         for tokens, response in self._routes:
             if _contains(list(cmd), tokens):
-                if response.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        response.returncode, cmd, response.stdout, response.stderr
-                    )
                 return response
         return self.default
 
@@ -80,9 +83,10 @@ class FakeAdb:
 
 @pytest.fixture
 def fake_adb(monkeypatch) -> FakeAdb:
-    """Patch the module's subprocess.run with a scriptable fake."""
+    """Patch the host side of run_adb with a scriptable fake."""
     fake = FakeAdb()
-    monkeypatch.setattr(privacy_manager.subprocess, "run", fake.run)
+    monkeypatch.setattr(privacy_manager.adb_exec.subprocess, "run", fake.run)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
     return fake
 
 
@@ -316,14 +320,113 @@ def test_revoking_something_the_app_never_asked_for_says_so(fake_adb, recorded):
 
 
 def test_an_unreadable_read_back_is_not_a_success(fake_adb):
-    """No evidence is not the same as evidence of success."""
+    """No evidence is not the same as evidence of success.
+
+    `dumpsys` ran and failed on the device -- a command failure, so the grant is
+    reported as unverified and a batch moves on.
+    """
     fake_adb.when("pm", "grant", returncode=0, stdout="")
-    fake_adb.when("dumpsys", "package", returncode=1, stderr="device offline")
+    fake_adb.when("dumpsys", "package", returncode=1, stderr="")
 
     ok, message = PrivacyManager(serial="emulator-5554").grant_permission(DESKCLOCK, "calendar")
 
     assert ok is False
     assert "could not read" in message
+
+
+def test_a_read_back_from_a_device_that_is_gone_raises(fake_adb, recorded_anywhere):
+    """The other kind of failure: the device is not there. Not "unverified" --
+    nothing can be verified -- so it raises, and the CLI boundary says exit 3."""
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    fake_adb.when(
+        "dumpsys", "package", returncode=1, stderr=recorded_anywhere("adb_shell_device_not_found")
+    )
+
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        PrivacyManager(serial="emulator-5554").grant_permission(DESKCLOCK, "calendar")
+
+
+# ---------------------------------------------------------------------------
+# A batch: a refusal moves on to the next permission; a lost device stops it.
+# ---------------------------------------------------------------------------
+
+
+def _cli(monkeypatch, capsys, *argv: str) -> tuple[int, str, str]:
+    monkeypatch.setattr(sys, "argv", ["privacy_manager.py", *argv])
+    with pytest.raises(SystemExit) as exc:
+        cli.run(privacy_manager.main)
+    captured = capsys.readouterr()
+    return exc.value.code, captured.out, captured.err
+
+
+def test_a_refused_permission_does_not_stop_the_batch(
+    fake_adb, recorded, deskclock_dump, monkeypatch, capsys
+):
+    """`pm` refusing one permission (recorded: INTERNET is install-time, status 255)
+    is that permission's failure; the next one in the list is still granted."""
+    fake_adb.when(
+        "android.permission.INTERNET",
+        returncode=255,
+        stderr=recorded.text("pm_grant_not_changeable"),
+    )
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    fake_adb.when("dumpsys", "package", stdout=deskclock_dump)
+
+    code, out, _ = _cli(
+        monkeypatch,
+        capsys,
+        "--grant",
+        "android.permission.INTERNET,notification",
+        "--package",
+        DESKCLOCK,
+        "--json",
+    )
+
+    assert code == 1, "one permission failed, so the batch did"
+    report = json.loads(out)  # one object: no message line printed ahead of it
+    assert [r["success"] for r in report["results"]] == [False, True]
+    assert "SecurityException" in report["results"][0]["message"]
+
+
+def test_a_device_lost_mid_batch_stops_it_with_the_boundary_shape(
+    fake_adb, deskclock_dump, recorded_anywhere, monkeypatch, capsys
+):
+    """The first grant lands; the device is gone for the second. Going on would
+    repeat the same error for every permission left, so the batch stops and
+    common.cli reports it: exit 3, the refusal object and nothing else."""
+    fake_adb.when(
+        "android.permission.READ_CALENDAR",
+        returncode=1,
+        stderr=recorded_anywhere("adb_shell_device_not_found"),
+    )
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    fake_adb.when("dumpsys", "package", stdout=deskclock_dump)
+
+    code, out, _ = _cli(
+        monkeypatch,
+        capsys,
+        "--grant",
+        "notification,calendar",
+        "--package",
+        DESKCLOCK,
+        "--json",
+    )
+
+    assert code == 3
+    payload = json.loads(out)
+    assert set(payload) == {"success", "error", "remedy"}
+    assert payload["success"] is False
+    assert len(fake_adb.commands_matching("pm", "grant")) == 2, "the batch did not stop there"
+
+
+def test_no_package_is_reported_through_the_boundary(monkeypatch, capsys):
+    """It printed the whole help text to stdout -- the answer, under --json."""
+    code, out, err = _cli(monkeypatch, capsys, "--list", "--json")
+
+    assert code == 1
+    payload = json.loads(out)
+    assert "--package" in payload["error"]
+    assert err == ""
 
 
 # ---------------------------------------------------------------------------

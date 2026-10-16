@@ -39,7 +39,7 @@ import argparse
 import json
 import sys
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import (
     build_adb_command,
     quote_for_device_shell,
@@ -282,7 +282,7 @@ class AppearanceController:
         return True, f"Appearance reset to defaults (light theme, font_scale {DEFAULT_FONT_SCALE})"
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Control Android device appearance (theme, font scale, locale)",
@@ -342,7 +342,7 @@ the property write succeeded; it does not guarantee apps re-localize.
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Guard: require at least one action.
     if not any([args.theme, args.text_size, args.font_scale is not None, args.locale, args.reset]):
@@ -364,41 +364,33 @@ the property write succeeded; it does not guarantee apps re-localize.
         sys.exit(1)
 
     # Resolve device.
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     controller = AppearanceController(serial=serial)
     results: list[dict] = []
 
-    # CLI boundary: a device-level adb failure (ambiguous target, wrong serial,
-    # offline, unauthorized) means the command never ran. Report the remedy the
-    # error already carries rather than letting a traceback reach the user.
-    try:
-        if args.reset:
-            success, message = controller.reset()
-            results.append({"operation": "reset", "success": success, "message": message})
-        else:
-            if args.theme:
-                success, message = controller.set_theme(args.theme)
-                results.append({"operation": "theme", "success": success, "message": message})
+    # A device-level adb failure (ambiguous target, wrong serial, offline,
+    # unauthorized) means the command never ran; it raises, and common.cli
+    # reports the remedy the error already carries.
+    if args.reset:
+        success, message = controller.reset()
+        results.append({"operation": "reset", "success": success, "message": message})
+    else:
+        if args.theme:
+            success, message = controller.set_theme(args.theme)
+            results.append({"operation": "theme", "success": success, "message": message})
 
-            if args.text_size:
-                success, message = controller.set_text_size(args.text_size)
-                results.append({"operation": "text_size", "success": success, "message": message})
+        if args.text_size:
+            success, message = controller.set_text_size(args.text_size)
+            results.append({"operation": "text_size", "success": success, "message": message})
 
-            if args.font_scale is not None:
-                success, message = controller.set_font_scale(args.font_scale)
-                results.append({"operation": "font_scale", "success": success, "message": message})
+        if args.font_scale is not None:
+            success, message = controller.set_font_scale(args.font_scale)
+            results.append({"operation": "font_scale", "success": success, "message": message})
 
-            if args.locale:
-                success, message = controller.set_locale(args.locale)
-                results.append({"operation": "locale", "success": success, "message": message})
-    except adb_exec.AdbError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        if args.locale:
+            success, message = controller.set_locale(args.locale)
+            results.append({"operation": "locale", "success": success, "message": message})
 
     if args.json:
         print(json.dumps({"results": results}, indent=2))
@@ -417,4 +409,4 @@ the property write succeeded; it does not guarantee apps re-localize.
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

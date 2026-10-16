@@ -15,7 +15,7 @@ import json
 import emulator_shutdown
 import pytest
 
-from common import adb_exec
+from common import adb_exec, cli
 
 
 class _FakeResult:
@@ -416,7 +416,7 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys, argv)
     monkeypatch.setattr(emulator_shutdown.sys, "argv", ["emulator_shutdown.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()
@@ -449,7 +449,7 @@ def test_cli_surfaces_a_missing_adb_rather_than_an_oserror(monkeypatch, capsys):
     monkeypatch.setattr(emulator_shutdown.sys, "argv", ["emulator_shutdown.py", "--all"])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()

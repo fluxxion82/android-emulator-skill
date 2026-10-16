@@ -39,6 +39,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common import cli
 from common.env_config import env_int
 
 # Tunables (overridable via ANDROID_EMU_* env vars; see module docstring).
@@ -629,7 +630,7 @@ def print_system_images(images: list) -> None:
             print(f"  API {api}: {detail}")
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Create Android Virtual Devices (AVDs)",
@@ -683,7 +684,7 @@ Examples:
     # Output options
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     creator = EmulatorCreator()
 
@@ -770,4 +771,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

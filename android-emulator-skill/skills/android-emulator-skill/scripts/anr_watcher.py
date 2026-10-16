@@ -53,7 +53,7 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-from common import logcat  # noqa: E402
+from common import cli, logcat  # noqa: E402
 from common.anr_pipeline import (  # noqa: E402
     build_normalised_event,
     compress_to_budget,
@@ -201,9 +201,10 @@ class AnrWatcher:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     self._process.wait(timeout=2)
             return True
-        except Exception as error:
-            print(f"Error streaming ANR events: {error}", file=sys.stderr)
-            return False
+        # No `except Exception` here any more: it printed and returned False,
+        # so a missing adb or a vanished device exited 1 with no remedy and,
+        # under --json, no refusal object after the records. Failures now reach
+        # common.cli, whose refusal is the last line of stdout.
         finally:
             if self._process and self._process.poll() is None:
                 self._process.terminate()
@@ -219,23 +220,19 @@ class AnrWatcher:
         cmd = self.build_logcat_command(since=since)
         if not json_mode:
             print(f"Showing ANR/jank since {since}", file=sys.stderr)
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
-            for raw_line in result.stdout.splitlines():
-                self._handle_line(raw_line.rstrip(), package, json_mode)
-            return True
-        except subprocess.TimeoutExpired:
-            print("Error: logcat timed out after 60s", file=sys.stderr)
-            return False
-        except Exception as error:
-            print(f"Error fetching historical ANR events: {error}", file=sys.stderr)
-            return False
+        # A timeout (TimeoutExpired) or an adb that will not run (OSError)
+        # raises and reaches common.cli; both were printed here and turned into
+        # False. Whether logcat itself exited non-zero is still unchecked (X6).
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        for raw_line in result.stdout.splitlines():
+            self._handle_line(raw_line.rstrip(), package, json_mode)
+        return True
 
     def get_summary(self) -> str:
         """Return token-efficient summary of captured events."""
@@ -716,10 +713,9 @@ class AnrBuster:
             return handle.read()
 
     def _resolve_serial(self, serial: str | None) -> str | None:
-        try:
-            return resolve_device_identifier(serial)
-        except RuntimeError as error:
-            raise RuntimeError(str(error)) from error
+        # Not re-wrapped: a bare RuntimeError lost DeviceNotFoundError, so an
+        # unavailable device exited 1 here and 3 everywhere else.
+        return resolve_device_identifier(serial)
 
 
 # === CLI ===
@@ -872,10 +868,10 @@ def _require_valid_session_ids(parser, store, session_ids) -> None:
             parser.error(str(error))
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point — supports legacy + ANRBuster modes from one parser."""
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # === ANRBuster worker entry ===
     if args.worker_session_id:
@@ -893,10 +889,7 @@ def main():
             ),
             "package": args.package,
         }
-        try:
-            session_id = buster.start(start_args, serial=args.serial)
-        except RuntimeError as error:
-            _fail(error, json_mode=args.json)
+        session_id = buster.start(start_args, serial=args.serial)
         print(session_id)
         sys.exit(0)
 
@@ -914,23 +907,25 @@ def main():
             )
         except ValueError as error:
             _fail(error, json_mode=args.json)
-        except FileNotFoundError:
-            _fail(f"unknown session {args.stop}", json_mode=args.json)
+        except FileNotFoundError as error:
+            # Re-raised typed, with the same words get_details uses, rather than
+            # reported here: common.cli is the one place a failure is printed.
+            raise SessionError(
+                f"Unknown session: {args.stop}. Run --list-sessions to see the "
+                f"sessions this host has stored."
+            ) from error
         print(out)
         sys.exit(0)
 
     if args.get_details:
         buster = AnrBuster()
         _require_valid_session_ids(parser, buster.store, [args.get_details])
-        try:
-            out = buster.get_details(
-                args.get_details,
-                cluster=args.cluster,
-                raw=args.raw,
-                json_mode=args.json,
-            )
-        except SessionError as error:
-            _fail(error, json_mode=args.json)
+        out = buster.get_details(
+            args.get_details,
+            cluster=args.cluster,
+            raw=args.raw,
+            json_mode=args.json,
+        )
         print(out)
         sys.exit(0)
 
@@ -955,10 +950,7 @@ def main():
     if args.diff:
         buster = AnrBuster()
         _require_valid_session_ids(parser, buster.store, args.diff)
-        try:
-            out = buster.diff(args.diff[0], args.diff[1], json_mode=args.json)
-        except SessionError as error:
-            _fail(error, json_mode=args.json)
+        out = buster.diff(args.diff[0], args.diff[1], json_mode=args.json)
         print(out)
         sys.exit(0)
 
@@ -990,4 +982,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

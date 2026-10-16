@@ -56,7 +56,8 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from common.adb_exec import AdbError, run_adb
+from common import cli
+from common.adb_exec import AdbError, DeviceError, run_adb
 from common.device_utils import resolve_device_identifier
 from common.emu_console import EmuConsoleError, run_emu
 from common.env_config import env_int
@@ -244,6 +245,10 @@ class SmsTester:
                 ":".join(PROJECTION),
                 timeout=QUERY_TIMEOUT,
             )
+        except DeviceError:
+            # A device that is not there is not this read's failure to report: it
+            # reaches common.cli, which says exit 3 like every other script.
+            raise
         except AdbError as exc:
             return False, {"action": "list", "error": str(exc)}
 
@@ -330,6 +335,8 @@ class SmsTester:
         except EmuConsoleError as exc:
             result["error"] = str(exc)
             return False, result
+        except DeviceError:
+            raise  # exit 3 at the boundary, as for list_inbox
         except AdbError as exc:
             result["error"] = str(exc)
             return False, result
@@ -616,21 +623,17 @@ Exit status:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Parse arguments, dispatch one action, and exit with its real status."""
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.send and not (args.to and args.body):
         parser.error("--send requires --to and --body")
     if args.limit < 1:
         parser.error("--limit must be at least 1")
 
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     tester = SmsTester(serial=serial)
 
@@ -646,4 +649,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

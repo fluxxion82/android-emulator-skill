@@ -36,21 +36,31 @@ Note on --reset:
 
 import argparse
 import json
-import subprocess
 import sys
 from datetime import datetime
 
+from common import adb_exec, cli
 from common.device_utils import (
-    build_adb_command,
     parse_package_permissions,
     permission_state,
     quote_for_device_shell,
 )
 from common.env_config import env_int
 
-# Subprocess timeout (seconds) for adb calls. Permission ops are fast; dumpsys
-# package can take longer on a busy device, so allow an override.
+# Timeout (seconds) for adb calls. Permission ops are fast; dumpsys package can
+# take longer on a busy device, so allow an override.
 ADB_TIMEOUT_SECONDS = env_int("ANDROID_EMU_PRIVACY_ADB_TIMEOUT", 30, min_value=1)
+
+# Every adb call goes through common.adb_exec.run_adb (it used to be four bare
+# subprocess.run calls). What that changes on failure, deliberately:
+#
+# - `pm` refusing (a SecurityException for an install-time permission, an
+#   unknown package) is AdbCommandError. It is caught where CalledProcessError
+#   was, reported as that permission's failure, and a batch goes on to the next.
+# - A device that is gone (not found, offline, unauthorized), several devices
+#   and no --serial, a missing adb, a timeout: these raise. A batch stops at the
+#   first one -- continuing against a device that is not there only repeats the
+#   error -- and common.cli reports it: exit 3 for an unavailable device, else 1.
 
 
 class PrivacyManager:
@@ -125,20 +135,18 @@ class PrivacyManager:
                 f"Unknown permission: {permission}. Use --list-permissions to see available.",
             )
 
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
-            "pm",
-            "grant",
-            quote_for_device_shell(package),
-            quote_for_device_shell(full_permission),
-        )
-
         try:
-            subprocess.run(
-                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "pm",
+                "grant",
+                quote_for_device_shell(package),
+                quote_for_device_shell(full_permission),
+                timeout=ADB_TIMEOUT_SECONDS,
+                check=True,
             )
-        except subprocess.CalledProcessError as e:
+        except adb_exec.AdbCommandError as e:
             error_msg = e.stderr if e.stderr else str(e)
             # Check common errors
             if "unknown package" in error_msg.lower():
@@ -168,20 +176,18 @@ class PrivacyManager:
                 f"Unknown permission: {permission}. Use --list-permissions to see available.",
             )
 
-        cmd = build_adb_command(
-            "shell",
-            self.serial,
-            "pm",
-            "revoke",
-            quote_for_device_shell(package),
-            quote_for_device_shell(full_permission),
-        )
-
         try:
-            subprocess.run(
-                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "pm",
+                "revoke",
+                quote_for_device_shell(package),
+                quote_for_device_shell(full_permission),
+                timeout=ADB_TIMEOUT_SECONDS,
+                check=True,
             )
-        except subprocess.CalledProcessError as e:
+        except adb_exec.AdbCommandError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to revoke permission: {error_msg}"
 
@@ -215,14 +221,17 @@ class PrivacyManager:
             package does not even request counts as revoked -- with a note,
             because it usually means a typo.
         """
-        cmd = build_adb_command(
-            "shell", self.serial, "dumpsys", "package", quote_for_device_shell(package)
-        )
         try:
-            dump = subprocess.run(
-                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            dump = adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "dumpsys",
+                "package",
+                quote_for_device_shell(package),
+                timeout=ADB_TIMEOUT_SECONDS,
+                check=True,
             ).stdout
-        except subprocess.CalledProcessError as e:
+        except adb_exec.AdbCommandError as e:
             return False, f"could not read {package} back to check: {e.stderr or e}"
 
         state = permission_state(dump, full_permission)
@@ -286,15 +295,17 @@ class PrivacyManager:
             ``install`` and ``runtime`` entries with their real ``granted``
             state, plus flattened ``granted`` / ``denied`` name lists.
         """
-        cmd = build_adb_command(
-            "shell", self.serial, "dumpsys", "package", quote_for_device_shell(package)
-        )
-
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, check=True, timeout=ADB_TIMEOUT_SECONDS
+            result = adb_exec.run_adb(
+                "shell",
+                self.serial,
+                "dumpsys",
+                "package",
+                quote_for_device_shell(package),
+                timeout=ADB_TIMEOUT_SECONDS,
+                check=True,
             )
-        except subprocess.CalledProcessError as e:
+        except adb_exec.AdbCommandError as e:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to list permissions: {error_msg}", None
 
@@ -375,7 +386,7 @@ def print_permissions(package: str, data: dict, verbose: bool) -> None:
             print(f"  ? {name}")
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Manage Android app permissions",
@@ -436,7 +447,7 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     manager = PrivacyManager(serial=args.device_serial)
 
@@ -450,11 +461,13 @@ Examples:
                 print(f"  {short_name:20} -> {full_name}")
         sys.exit(0)
 
-    # Require package for other operations
+    # Require package for other operations. Reported through common.cli: this
+    # printed the whole help text to stdout, which under --json was the answer.
     if not args.package:
-        print("Error: --package is required", file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
+        cli.fail(
+            "--package is required for --grant, --revoke, --reset and --list",
+            "Pass --package <application id>, e.g. --package com.example.app.",
+        )
 
     # List app permissions
     if args.list:
@@ -489,7 +502,9 @@ Examples:
             success, message = action_fn(args.package, permission)
             results.append({"permission": permission, "success": success, "message": message})
 
-            if args.verbose or not success:
+            # Not under --json: the message is in `results`, and a line printed
+            # ahead of the JSON object made stdout unparseable.
+            if not args.json and (args.verbose or not success):
                 print(message)
 
         test_trail = build_test_trail(args.scenario, args.step)
@@ -508,10 +523,15 @@ Examples:
         all_success = all(r["success"] for r in results)
         sys.exit(0 if all_success else 1)
 
-    # No operation specified
-    parser.print_help()
-    sys.exit(1)
+    # No operation specified. cli.fail rather than a usage error: argparse's
+    # exit 2 is prose on stderr and nothing on stdout, and under --json this
+    # printed the help text to stdout as the answer.
+    cli.fail(
+        "no operation given",
+        "Pass one of --grant, --revoke or --reset (each with permission names), "
+        "--list, or --list-permissions.",
+    )
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)
