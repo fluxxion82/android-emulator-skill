@@ -10,7 +10,7 @@
 # Android mechanics — ANDROID_HOME/ANDROID_SDK_ROOT, adb, emulator, avdmanager,
 # sdkmanager, and java rather than Xcode/simctl/idb.
 #
-# Usage: bash scripts/android_health_check.sh [--help]
+# Usage: bash scripts/android_health_check.sh [--help] [--json]
 #
 # Exit codes:
 #   0 - All hard requirements satisfied (warnings allowed)
@@ -36,11 +36,15 @@ else
 fi
 
 SHOW_HELP=false
+JSON_MODE=false
 
 for arg in "$@"; do
     case "$arg" in
         --help | -h)
             SHOW_HELP=true
+            ;;
+        --json)
+            JSON_MODE=true
             ;;
     esac
 done
@@ -56,6 +60,7 @@ Usage: bash scripts/android_health_check.sh [options]
 
 Options:
   --help, -h    Show this help message
+  --json        Emit one JSON object on stdout (progress goes to stderr)
 
 This script checks for:
   - ANDROID_HOME / ANDROID_SDK_ROOT environment variable
@@ -71,26 +76,59 @@ EOF
     exit 0
 fi
 
+if [ "$JSON_MODE" = true ]; then
+    exec 3>&1
+    exec 1>&2
+    JSON_RECORD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/android-health-check-json.XXXXXX")
+else
+    JSON_RECORD_DIR=""
+fi
+
 # ---------------------------------------------------------------------------
 # Counters and helpers
 # ---------------------------------------------------------------------------
 CHECKS_PASSED=0
 CHECKS_WARNED=0
 CHECKS_FAILED=0
+CURRENT_SECTION=""
+CURRENT_TITLE=""
+FIRST_FAILURE=""
+CHECKS_RECORDED=0
+
+record_check() {
+    local record_prefix
+
+    if [ "$JSON_MODE" != true ]; then
+        return
+    fi
+
+    record_prefix="$JSON_RECORD_DIR/check-$CHECKS_RECORDED"
+    printf "%s" "$CURRENT_SECTION" >"$record_prefix.section"
+    printf "%s" "$CURRENT_TITLE" >"$record_prefix.name"
+    printf "%s" "$1" >"$record_prefix.status"
+    printf "%s" "$2" >"$record_prefix.message"
+    CHECKS_RECORDED=$((CHECKS_RECORDED + 1))
+}
 
 check_passed() {
     printf "%b✓%b %s\n" "$GREEN" "$NC" "$1"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
+    record_check "passed" "$1"
 }
 
 check_warning() {
     printf "%b⚠%b %s\n" "$YELLOW" "$NC" "$1"
     CHECKS_WARNED=$((CHECKS_WARNED + 1))
+    record_check "warning" "$1"
 }
 
 check_failed() {
     printf "%b✗%b %s\n" "$RED" "$NC" "$1"
     CHECKS_FAILED=$((CHECKS_FAILED + 1))
+    if [ -z "$FIRST_FAILURE" ]; then
+        FIRST_FAILURE="$1"
+    fi
+    record_check "failed" "$1"
 }
 
 hint() {
@@ -98,7 +136,212 @@ hint() {
 }
 
 section() {
+    CURRENT_SECTION="$1"
+    CURRENT_TITLE="$2"
     printf "%b[%s]%b %s\n" "$BLUE" "$1" "$NC" "$2"
+}
+
+fallback_json_escape() {
+    local value="$1"
+    local escaped=""
+    local char
+    local char_code
+    local unicode_escape
+    local index
+    (
+        # Bash 3.2 reports bytes >= 0x80 as negative numbers. Work byte-by-byte
+        # and normalize them before emitting \u00XX. This fallback is lossy for
+        # UTF-8, but it always produces valid JSON when python3 is unavailable.
+        LC_ALL=C
+        export LC_ALL
+        for ((index = 0; index < ${#value}; index++)); do
+            char=${value:index:1}
+            case "$char" in
+                '"') escaped="${escaped}\\\"" ;;
+                \\) escaped="${escaped}\\\\" ;;
+                $'\b') escaped="${escaped}\\b" ;;
+                $'\f') escaped="${escaped}\\f" ;;
+                $'\n') escaped="${escaped}\\n" ;;
+                $'\r') escaped="${escaped}\\r" ;;
+                $'\t') escaped="${escaped}\\t" ;;
+                *)
+                    printf -v char_code '%d' "'$char"
+                    if ((char_code < 0)); then
+                        char_code=$((char_code + 256))
+                    fi
+                    if ((char_code < 32)); then
+                        printf -v unicode_escape '\\u%04X' "$char_code"
+                        escaped="${escaped}${unicode_escape}"
+                    elif ((char_code >= 128)); then
+                        printf -v unicode_escape '\\u00%02X' "$char_code"
+                        escaped="${escaped}${unicode_escape}"
+                    else
+                        escaped="${escaped}${char}"
+                    fi
+                    ;;
+            esac
+        done
+        printf "%s" "$escaped"
+    )
+}
+
+emit_json_fallback() {
+    local ok=true
+    local index
+    local section_value
+    local name_value
+    local status_value
+    local message_value
+    local record_prefix
+    local separator=""
+    if [ "$CHECKS_FAILED" -gt 0 ]; then
+        ok=false
+    fi
+
+    printf '{"ok":%s,"success":%s,"checks":[' "$ok" "$ok"
+    for ((index = 0; index < CHECKS_RECORDED; index++)); do
+        record_prefix="$JSON_RECORD_DIR/check-$index"
+        section_value=$(<"$record_prefix.section")
+        name_value=$(<"$record_prefix.name")
+        status_value=$(<"$record_prefix.status")
+        message_value=$(<"$record_prefix.message")
+        printf '%s{"section":"%s","name":"%s","status":"%s","message":"%s"}' \
+            "$separator" \
+            "$(fallback_json_escape "$section_value")" \
+            "$(fallback_json_escape "$name_value")" \
+            "$status_value" \
+            "$(fallback_json_escape "$message_value")"
+        separator=","
+    done
+    printf '],"summary":{"passed":%s,"warnings":%s,"failed":%s}' \
+        "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED"
+    if [ "$ok" = false ]; then
+        printf ',"error":"%s","remedy":"%s"' \
+            "$(fallback_json_escape "$FIRST_FAILURE")" \
+            "Fix the failed checks above, then run the health check again."
+    fi
+    printf '}\n'
+}
+
+cleanup_json_records() {
+    local index
+    local record_prefix
+
+    for ((index = 0; index < CHECKS_RECORDED; index++)); do
+        record_prefix="$JSON_RECORD_DIR/check-$index"
+        rm -f \
+            "$record_prefix.section" \
+            "$record_prefix.name" \
+            "$record_prefix.status" \
+            "$record_prefix.message"
+    done
+    rmdir "$JSON_RECORD_DIR"
+}
+
+emit_json() {
+    if command -v python3 >/dev/null 2>&1; then
+        # Read each field as UTF-8 once, replacing every invalid byte with U+FFFD.
+        # Python owns the real JSON encoding so Unicode and control characters
+        # are never interpreted by Bash's locale-sensitive character handling.
+        python3 -c '
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+count, passed, warnings, failed = map(int, sys.argv[2:])
+
+
+def read_field(index, field):
+    return (root / f"check-{index}.{field}").read_text(
+        encoding="utf-8", errors="replace"
+    )
+
+
+checks = [
+    {
+        "section": read_field(index, "section"),
+        "name": read_field(index, "name"),
+        "status": read_field(index, "status"),
+        "message": read_field(index, "message"),
+    }
+    for index in range(count)
+]
+ok = failed == 0
+payload = {
+    "ok": ok,
+    "success": ok,
+    "checks": checks,
+    "summary": {"passed": passed, "warnings": warnings, "failed": failed},
+}
+if not ok:
+    payload["error"] = next(check["message"] for check in checks if check["status"] == "failed")
+    payload["remedy"] = "Fix the failed checks above, then run the health check again."
+print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+' "$JSON_RECORD_DIR" "$CHECKS_RECORDED" "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED"
+    else
+        emit_json_fallback
+    fi
+    cleanup_json_records
+}
+
+run_bounded() {
+    local timeout_seconds="$1"
+    shift
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_seconds" "$@"
+    else
+        # macOS does not ship `timeout`; alarm survives exec and bounds the tool.
+        perl -e 'alarm shift; exec @ARGV or die "$ARGV[0]: $!\n"' "$timeout_seconds" "$@"
+    fi
+}
+
+CAPTURED_STDOUT=""
+CAPTURED_STDERR=""
+CAPTURED_STATUS=0
+
+run_captured() {
+    local stdout_file
+    local stderr_file
+
+    stdout_file=$(mktemp "${TMPDIR:-/tmp}/android-health-check-stdout.XXXXXX")
+    stderr_file=$(mktemp "${TMPDIR:-/tmp}/android-health-check-stderr.XXXXXX")
+    if run_bounded 10 "$@" >"$stdout_file" 2>"$stderr_file"; then
+        CAPTURED_STATUS=0
+    else
+        CAPTURED_STATUS=$?
+    fi
+
+    CAPTURED_STDOUT=$(<"$stdout_file")
+    CAPTURED_STDERR=""
+    IFS= read -r CAPTURED_STDERR <"$stderr_file" || true
+    if [ "$CAPTURED_STATUS" -ne 0 ] && [ -z "$CAPTURED_STDERR" ]; then
+        CAPTURED_STDERR="exited $CAPTURED_STATUS with no error output"
+    fi
+    rm -f "$stdout_file" "$stderr_file"
+    [ "$CAPTURED_STATUS" -eq 0 ]
+}
+
+CAPTURED_COMBINED=""
+
+run_combined_captured() {
+    local combined_file
+
+    combined_file=$(mktemp "${TMPDIR:-/tmp}/android-health-check-combined.XXXXXX")
+    if run_bounded 10 "$@" >"$combined_file" 2>&1; then
+        CAPTURED_STATUS=0
+    else
+        CAPTURED_STATUS=$?
+    fi
+
+    CAPTURED_COMBINED=""
+    IFS= read -r CAPTURED_COMBINED <"$combined_file" || true
+    if [ "$CAPTURED_STATUS" -ne 0 ] && [ -z "$CAPTURED_COMBINED" ]; then
+        CAPTURED_COMBINED="exited $CAPTURED_STATUS with no error output"
+    fi
+    rm -f "$combined_file"
+    [ "$CAPTURED_STATUS" -eq 0 ]
 }
 
 printf "%b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$BLUE" "$NC"
@@ -135,8 +378,12 @@ echo ""
 section "2/8" "Checking adb (Android Debug Bridge)..."
 ADB_MISSING=false
 if command -v adb >/dev/null 2>&1; then
-    ADB_VERSION=$(adb --version 2>/dev/null | head -n 1 || echo "Unknown")
-    check_passed "adb installed ($ADB_VERSION)"
+    if run_captured adb --version; then
+        ADB_VERSION=${CAPTURED_STDOUT%%$'\n'*}
+        check_passed "adb installed ($ADB_VERSION)"
+    else
+        check_failed "adb --version failed: $CAPTURED_STDERR"
+    fi
     hint "Path: $(command -v adb)"
 else
     check_failed "adb not found on PATH (required)"
@@ -152,8 +399,12 @@ echo ""
 # ---------------------------------------------------------------------------
 section "3/8" "Checking emulator..."
 if command -v emulator >/dev/null 2>&1; then
-    EMU_VERSION=$(emulator -version 2>/dev/null | head -n 1 || echo "Unknown")
-    check_passed "emulator installed ($EMU_VERSION)"
+    if run_captured emulator -version; then
+        EMU_VERSION=${CAPTURED_STDOUT%%$'\n'*}
+        check_passed "emulator installed ($EMU_VERSION)"
+    else
+        check_failed "emulator -version failed: $CAPTURED_STDERR"
+    fi
     hint "Path: $(command -v emulator)"
 else
     check_warning "emulator not found on PATH"
@@ -177,8 +428,12 @@ else
     hint "  export PATH=\$PATH:\$ANDROID_HOME/cmdline-tools/latest/bin"
 fi
 if command -v sdkmanager >/dev/null 2>&1; then
-    SDKMGR_VERSION=$(sdkmanager --version 2>/dev/null | head -n 1 || echo "Unknown")
-    check_passed "sdkmanager installed (version $SDKMGR_VERSION)"
+    if run_captured sdkmanager --version; then
+        SDKMGR_VERSION=${CAPTURED_STDOUT%%$'\n'*}
+        check_passed "sdkmanager installed (version $SDKMGR_VERSION)"
+    else
+        check_failed "sdkmanager --version failed: $CAPTURED_STDERR"
+    fi
     hint "Path: $(command -v sdkmanager)"
 else
     check_warning "sdkmanager not found on PATH"
@@ -192,9 +447,13 @@ echo ""
 # ---------------------------------------------------------------------------
 section "5/8" "Checking java..."
 if command -v java >/dev/null 2>&1; then
-    # java prints its version banner to stderr.
-    JAVA_VERSION=$(java -version 2>&1 | head -n 1 || echo "Unknown")
-    check_passed "java installed ($JAVA_VERSION)"
+    # Java normally uses stderr, but preserve the original first-combined-line behavior.
+    if run_combined_captured java -version; then
+        JAVA_VERSION=$CAPTURED_COMBINED
+        check_passed "java installed ($JAVA_VERSION)"
+    else
+        check_failed "java -version failed: $CAPTURED_COMBINED"
+    fi
     hint "Path: $(command -v java)"
 else
     check_warning "java not found on PATH"
@@ -253,35 +512,52 @@ echo ""
 section "8/8" "Checking devices and AVDs..."
 if [ "$ADB_MISSING" = false ]; then
     # adb devices -l prints a header line, then one line per device.
-    DEVICE_LINES=$(adb devices -l 2>/dev/null | sed '1d' | grep -v '^$' || true)
-    if [ -n "$DEVICE_LINES" ]; then
-        DEVICE_COUNT=$(printf "%s\n" "$DEVICE_LINES" | wc -l | tr -d ' ')
-        check_passed "$DEVICE_COUNT device(s)/emulator(s) connected"
-        printf "%s\n" "$DEVICE_LINES" | while IFS= read -r line; do
-            hint "- $line"
-        done
+    ADB_ERROR_FILE=$(mktemp "${TMPDIR:-/tmp}/android-health-check-adb.XXXXXX")
+    if ADB_DEVICES_OUTPUT=$(run_bounded 10 adb devices -l 2>"$ADB_ERROR_FILE"); then
+        DEVICE_LINES=$(printf "%s\n" "$ADB_DEVICES_OUTPUT" | sed '1d' | grep -v '^$' || true)
+        if [ -n "$DEVICE_LINES" ]; then
+            DEVICE_COUNT=$(printf "%s\n" "$DEVICE_LINES" | wc -l | tr -d ' ')
+            check_passed "$DEVICE_COUNT device(s)/emulator(s) connected"
+            printf "%s\n" "$DEVICE_LINES" | while IFS= read -r line; do
+                hint "- $line"
+            done
+        else
+            check_warning "No devices or emulators connected"
+            hint "Start an emulator or connect a device:"
+            hint "  emulator -avd <avd-name>"
+            hint "  adb devices"
+        fi
     else
-        check_warning "No devices or emulators connected"
-        hint "Start an emulator or connect a device:"
-        hint "  emulator -avd <avd-name>"
-        hint "  adb devices"
+        ADB_STATUS=$?
+        ADB_ERROR=""
+        IFS= read -r ADB_ERROR <"$ADB_ERROR_FILE" || true
+        if [ -z "$ADB_ERROR" ]; then
+            ADB_ERROR="adb devices -l exited $ADB_STATUS with no error output"
+        fi
+        check_failed "could not list devices (adb devices -l): $ADB_ERROR"
+        hint "Check that adb can start and retry: adb devices -l"
     fi
+    rm -f "$ADB_ERROR_FILE"
 else
     check_warning "Cannot list devices (adb not available)"
 fi
 
 if command -v emulator >/dev/null 2>&1; then
-    AVD_LINES=$(emulator -list-avds 2>/dev/null | grep -v '^$' || true)
-    if [ -n "$AVD_LINES" ]; then
-        AVD_COUNT=$(printf "%s\n" "$AVD_LINES" | wc -l | tr -d ' ')
-        check_passed "$AVD_COUNT AVD(s) defined"
-        printf "%s\n" "$AVD_LINES" | while IFS= read -r line; do
-            hint "- $line"
-        done
+    if run_captured emulator -list-avds; then
+        AVD_LINES=$(printf "%s\n" "$CAPTURED_STDOUT" | grep -v '^$' || true)
+        if [ -n "$AVD_LINES" ]; then
+            AVD_COUNT=$(printf "%s\n" "$AVD_LINES" | wc -l | tr -d ' ')
+            check_passed "$AVD_COUNT AVD(s) defined"
+            printf "%s\n" "$AVD_LINES" | while IFS= read -r line; do
+                hint "- $line"
+            done
+        else
+            check_warning "No AVDs defined"
+            hint "Create one with avdmanager, e.g.:"
+            hint "  avdmanager create avd -n Pixel_7_API_34 -k 'system-images;android-34;google_apis;arm64-v8a'"
+        fi
     else
-        check_warning "No AVDs defined"
-        hint "Create one with avdmanager, e.g.:"
-        hint "  avdmanager create avd -n Pixel_7_API_34 -k 'system-images;android-34;google_apis;arm64-v8a'"
+        check_failed "emulator -list-avds failed: $CAPTURED_STDERR"
     fi
 else
     check_warning "Cannot list AVDs (emulator not available)"
@@ -302,11 +578,20 @@ echo ""
 
 if [ "$CHECKS_FAILED" -gt 0 ]; then
     printf "%bFAIL%b — a hard requirement is missing. Fix the failed checks above before testing.\n" "$RED" "$NC"
+    if [ "$JSON_MODE" = true ]; then
+        emit_json >&3
+    fi
     exit 1
 elif [ "$CHECKS_WARNED" -gt 0 ]; then
     printf "%bWARN%b — environment is usable, but address the warnings above for full functionality.\n" "$YELLOW" "$NC"
+    if [ "$JSON_MODE" = true ]; then
+        emit_json >&3
+    fi
     exit 0
 else
     printf "%bPASS%b — environment is ready for Android emulator testing.\n" "$GREEN" "$NC"
+    if [ "$JSON_MODE" = true ]; then
+        emit_json >&3
+    fi
     exit 0
 fi

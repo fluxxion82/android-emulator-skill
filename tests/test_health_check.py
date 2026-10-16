@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from fake_toolchain import FakeToolchain, Rule
+from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
 SCRIPT = "android_health_check.sh"
 
@@ -61,11 +61,6 @@ def test_the_stub_really_fails_the_device_probe(broken_adb):
     assert "Traceback" not in result.stderr
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="H1: android_health_check.sh:254-263 turns a failed adb devices -l into 'No devices', exit 0",
-)
 def test_h1_a_failed_device_probe_is_named_and_fails_the_check(broken_adb):
     """H1: ``android_health_check.sh:254-263,303``.
 
@@ -80,9 +75,6 @@ def test_h1_a_failed_device_probe_is_named_and_fails_the_check(broken_adb):
     assert PROBE in output, f"the failed probe is not named:\n{output[-800:]}"
 
 
-@pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="H1: android_health_check.sh ignores --json"
-)
 def test_h1_json_is_an_object_saying_the_check_failed(broken_adb):
     """H1: ``--json`` is a flag the script does not have; it must be real.
 
@@ -104,3 +96,33 @@ def test_h1_json_is_an_object_saying_the_check_failed(broken_adb):
     verdict = payload["success"] if "success" in payload else payload.get("ok")
     assert verdict is False, f"the JSON does not say the check failed: {payload!r}"
     assert result.returncode != 0, "under --json a failed device probe exited 0"
+
+
+def test_h1_json_escapes_control_bytes_in_device_probe_error(tmp_path):
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    diagnostic = "server startup failed: \x1b[31mcontrol\x01\n"
+    chain.install(
+        "adb",
+        [
+            Rule(("--version",), exit=0),
+            Rule(("devices", "-l"), stderr=diagnostic, exit=1),
+        ],
+    )
+
+    result = chain.run(SCRIPT, "--json")
+
+    payload = assert_refusal(
+        result,
+        json_mode=True,
+        naming=("adb devices -l",),
+        status=1,
+    )
+    assert payload is not None
+    assert payload["error"] == (
+        "could not list devices (adb devices -l): server startup failed: \x1b[31mcontrol\x01"
+    )
+    assert "\x1b" in payload["error"]
+    assert "\x01" in payload["error"]
+    assert "\\u001b" in result.stdout
+    assert "\\u0001" in result.stdout
