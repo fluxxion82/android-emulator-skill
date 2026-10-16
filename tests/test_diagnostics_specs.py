@@ -264,7 +264,7 @@ def _logcat_device(toolchain: FakeToolchain, recorded, fixture: str) -> None:
     raises=AssertionError,
     reason="D1: log_monitor.py:679-681 accepts an unknown --severity and filters everything out",
 )
-@pytest.mark.parametrize("severity", ["warn", "error,warn"])
+@pytest.mark.parametrize("severity", ["warn", "error,warn", "bogus"])
 def test_d1_an_unknown_severity_name_is_a_usage_error(severity, toolchain, recorded):
     """D1: ``log_monitor.py:679-681`` / ``common/logcat.py:117-137``.
 
@@ -275,7 +275,13 @@ def test_d1_an_unknown_severity_name_is_a_usage_error(severity, toolchain, recor
     line whose severity is not literally in the list. Both report a calm,
     successful capture with the warnings silently gone. An unknown name must be
     refused as a usage error (exit 2) naming the accepted set -- and before the
-    device is asked anything.
+    device is asked for logs.
+
+    The vocabulary is the documented one: ``--help`` lists
+    ``error,warning,info,debug,verbose``, so ``warning`` is canonical and
+    ``warn`` is unknown, as the review of PR #20 confirmed. Accepting ``warn``
+    as an alias would be a deliberate change to this spec, not a way to pass
+    it. ``bogus`` is the case no vocabulary decision can rescue.
     """
     _logcat_device(toolchain, recorded, "logcat_threadtime")
     result = toolchain.run("log_monitor.py", "--severity", severity, "--last", "1m", "--json")
@@ -304,16 +310,20 @@ def test_d1_a_known_severity_list_keeps_every_warning(toolchain, recorded):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
 
-    text = recorded.text("logcat_threadtime")
-    warning_tags = {
-        line.split()[5].rstrip(":")
-        for line in text.splitlines()
-        if (m := _THREADTIME.match(line)) and m["priority"] == "W"
-    }
-    assert warning_tags, "the recording has no W lines; this floor would be vacuous"
-    reported = " ".join(payload["warnings"])
-    missing = sorted(tag for tag in warning_tags if f"[{tag}]" not in reported)
-    assert not missing, f"warnings from {missing} were dropped: {payload['warnings']}"
+    # Every recorded W line, as log_monitor prints a warning: "[Tag] message".
+    # Identical messages are deduplicated by design, so this is a set; what it
+    # must not do is drop a message (review of PR #20: tags alone let one of
+    # two messages under a tag go missing unnoticed).
+    expected = set()
+    for line in recorded.lines("logcat_threadtime"):
+        m = _THREADTIME.match(line)
+        if m and m["priority"] == "W":
+            tag, _, message = line[m.end() :].partition(":")
+            expected.add(f"[{tag.strip()}] {message.strip()}")
+    if not expected:
+        pytest.fail("the recording has no W lines; this floor would be vacuous")
+    missing = sorted(expected - set(payload["warnings"]))
+    assert not missing, f"warnings were dropped: {missing}"
 
     logcat_calls = [call for call in toolchain.calls("adb") if "logcat" in call]
     assert logcat_calls, "log_monitor never asked the device for logs"
