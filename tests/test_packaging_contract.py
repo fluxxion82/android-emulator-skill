@@ -232,15 +232,20 @@ def _shell_commands(script: str) -> list[tuple[int, list[str]]]:
     return commands
 
 
-def _if_block(commands: list[tuple[int, list[str]]], start: int) -> list[list[str]]:
-    """The commands directly inside the ``if`` at ``commands[start]``.
+def _then_branch(commands: list[tuple[int, list[str]]], start: int) -> list[list[str]]:
+    """The commands the ``if`` at ``commands[start]`` runs when its test holds.
 
-    Nested ``if ... fi`` blocks are skipped over rather than flattened in: an
-    ``exit 1`` that runs only under some inner condition is not this block's
-    unconditional exit.
+    Only the ``then`` branch, and only its direct commands. An ``else`` or
+    ``elif`` at this block's depth ends the branch -- an ``exit 1`` moved into
+    ``else`` runs when the test FAILS, which for the passed-floor means "exit 1
+    when something passed" -- and nested ``if ... fi`` blocks are skipped over,
+    because an exit under an inner condition is not this block's exit. The
+    first version of this helper treated every line before ``fi`` as the body,
+    and the ``else`` mutation passed it (review of PR #20).
     """
-    body: list[list[str]] = []
+    branch: list[list[str]] = []
     depth = 0
+    in_then = True
     for _, words in commands[start:]:
         if words[0] == "if":
             depth += 1
@@ -248,11 +253,67 @@ def _if_block(commands: list[tuple[int, list[str]]], start: int) -> list[list[st
         if words[0] == "fi":
             depth -= 1
             if depth == 0:
-                return body
+                return branch
             continue
-        if depth == 1:
-            body.append(words)
+        if depth == 1 and words[0] in ("else", "elif"):
+            in_then = False
+            continue
+        if depth == 1 and words[0] == "then":
+            continue
+        if depth == 1 and in_then:
+            branch.append(words)
     raise AssertionError(f"the `if` on line {commands[start][0]} is never closed by `fi`")
+
+
+def _lane_floor(commands: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
+    """Every ``if ! grep -qE '[0-9]+ passed' <log>`` command, with its index."""
+    return [
+        (index, words)
+        for index, (_, words) in enumerate(commands)
+        if words[0] == "if" and "!" in words and "grep" in words and LANE_PASSED_PATTERN in words
+    ]
+
+
+def _check_lane_floor(script: str) -> None:
+    """Raise AssertionError unless ``script`` fails the lane when no test passed."""
+    commands = _shell_commands(script)
+
+    pytest_runs = [
+        (index, words)
+        for index, (_, words) in enumerate(commands)
+        if "pytest" in words
+        and any(words[i : i + 2] == ["-m", "emulator"] for i in range(len(words) - 1))
+    ]
+    assert len(pytest_runs) == 1, (
+        f"expected exactly one `pytest ... -m emulator` command in the lane, "
+        f"found {len(pytest_runs)}"
+    )
+    pytest_index, pytest_words = pytest_runs[0]
+    assert "tee" in pytest_words, "the lane no longer tees pytest's output to a log"
+    tee_position = pytest_words.index("tee")
+    assert tee_position + 1 < len(pytest_words), "`tee` is given no log file"
+    lane_log = pytest_words[tee_position + 1]
+
+    floors = _lane_floor(commands)
+    assert len(floors) == 1, (
+        f"expected one `if ! grep -qE '{LANE_PASSED_PATTERN}' <log>` floor in the "
+        f"lane, found {len(floors)}: the lane no longer fails when no test ran"
+    )
+    floor_index, floor_words = floors[0]
+    read_log = floor_words[floor_words.index(LANE_PASSED_PATTERN) + 1]
+
+    assert floor_index > pytest_index, (
+        "the passed-floor runs before `pytest -m emulator`, so it reads a log "
+        "this run has not written yet"
+    )
+    assert read_log == lane_log, (
+        f"the floor greps {read_log!r} but pytest tees to {lane_log!r}; it is "
+        f"checking a file this run did not write"
+    )
+    assert ["exit", "1"] in [words[:2] for words in _then_branch(commands, floor_index)], (
+        "the passed-floor no longer exits 1 when nothing passed; the lane goes "
+        "green having exercised no device"
+    )
 
 
 def test_the_emulator_lane_fails_when_every_test_skips():
@@ -273,48 +334,79 @@ def test_the_emulator_lane_fails_when_every_test_skips():
     That PR must update this guard in the same change; the guard failing on
     T11's diff is the guard working, not a reason to loosen it.
     """
-    commands = _shell_commands(LANE_SCRIPT.read_text(encoding="utf-8"))
+    _check_lane_floor(LANE_SCRIPT.read_text(encoding="utf-8"))
 
-    pytest_runs = [
-        (index, words)
-        for index, (_, words) in enumerate(commands)
-        if "pytest" in words
-        and any(words[i : i + 2] == ["-m", "emulator"] for i in range(len(words) - 1))
+
+def _floor_block(lines: list[str]) -> tuple[int, int, int]:
+    """0-based (if, exit 1, fi) line indexes of the real script's passed-floor."""
+    commands = _shell_commands("\n".join(lines))
+    ((floor_index, _),) = _lane_floor(commands)
+    if_line = commands[floor_index][0] - 1
+    exit_line = fi_line = None
+    for number, words in commands[floor_index + 1 :]:
+        if words[:2] == ["exit", "1"] and exit_line is None:
+            exit_line = number - 1
+        if words[0] == "fi":
+            fi_line = number - 1
+            break
+    assert exit_line is not None and fi_line is not None, "the real floor has changed shape"
+    return if_line, exit_line, fi_line
+
+
+def _delete_floor(lines: list[str]) -> list[str]:
+    start, _, end = _floor_block(lines)
+    return lines[:start] + lines[end + 1 :]
+
+
+def _delete_exit(lines: list[str]) -> list[str]:
+    _, exit_line, _ = _floor_block(lines)
+    return lines[:exit_line] + lines[exit_line + 1 :]
+
+
+def _exit_into_else(lines: list[str]) -> list[str]:
+    _, exit_line, _ = _floor_block(lines)
+    return lines[:exit_line] + ["else"] + lines[exit_line:]
+
+
+def _floor_before_pytest(lines: list[str]) -> list[str]:
+    start, _, end = _floor_block(lines)
+    block = lines[start : end + 1]
+    rest = lines[:start] + lines[end + 1 :]
+    pytest_line = next(i for i, line in enumerate(rest) if line.startswith("pytest "))
+    return rest[:pytest_line] + block + rest[pytest_line:]
+
+
+def _floor_reads_another_log(lines: list[str]) -> list[str]:
+    start, _, _ = _floor_block(lines)
+    return [
+        line.replace("emulator-lane.log", "some-other.log") if i == start else line
+        for i, line in enumerate(lines)
     ]
-    assert len(pytest_runs) == 1, (
-        f"expected exactly one `pytest ... -m emulator` command in the lane, "
-        f"found {len(pytest_runs)}"
-    )
-    pytest_index, pytest_words = pytest_runs[0]
-    assert "tee" in pytest_words, "the lane no longer tees pytest's output to a log"
-    tee_position = pytest_words.index("tee")
-    assert tee_position + 1 < len(pytest_words), "`tee` is given no log file"
-    lane_log = pytest_words[tee_position + 1]
 
-    floors = [
-        (index, words)
-        for index, (_, words) in enumerate(commands)
-        if words[0] == "if" and "!" in words and "grep" in words and LANE_PASSED_PATTERN in words
-    ]
-    assert len(floors) == 1, (
-        f"expected one `if ! grep -qE '{LANE_PASSED_PATTERN}' <log>` floor in the "
-        f"lane, found {len(floors)}: the lane no longer fails when no test ran"
-    )
-    floor_index, floor_words = floors[0]
-    read_log = floor_words[floor_words.index(LANE_PASSED_PATTERN) + 1]
 
-    assert floor_index > pytest_index, (
-        "the passed-floor runs before `pytest -m emulator`, so it reads a log "
-        "this run has not written yet"
-    )
-    assert read_log == lane_log, (
-        f"the floor greps {read_log!r} but pytest tees to {lane_log!r}; it is "
-        f"checking a file this run did not write"
-    )
-    assert ["exit", "1"] in [words[:2] for words in _if_block(commands, floor_index)], (
-        "the passed-floor no longer exits 1 when nothing passed; the lane goes "
-        "green having exercised no device"
-    )
+LANE_MUTATIONS = {
+    "floor deleted": _delete_floor,
+    "exit 1 deleted": _delete_exit,
+    "exit 1 moved into else": _exit_into_else,
+    "floor moved before pytest": _floor_before_pytest,
+    "floor reads another log": _floor_reads_another_log,
+}
+
+
+@pytest.mark.parametrize("mutation", list(LANE_MUTATIONS))
+def test_the_lane_guard_rejects_each_way_of_losing_the_floor(mutation):
+    """N7's mutations, kept as regression tests rather than a one-off run.
+
+    Each is applied to the REAL script's text, so they follow the script as
+    it changes, and each must make the guard fail. The ``else`` case is the
+    review's: the first structural guard collected every line before ``fi``
+    and accepted an ``exit 1`` that only runs when tests DID pass.
+    """
+    lines = LANE_SCRIPT.read_text(encoding="utf-8").splitlines()
+    mutated = "\n".join(LANE_MUTATIONS[mutation](lines))
+    assert mutated != "\n".join(lines), f"{mutation}: the mutation changed nothing"
+    with pytest.raises(AssertionError):
+        _check_lane_floor(mutated)
 
 
 def test_the_emulator_lane_asserts_the_fixture_app_installed():
