@@ -19,6 +19,7 @@ import re
 import anr_watcher
 import pytest
 
+from common import cli
 from common.anr_pipeline import build_normalised_event, event_to_jsonl, parse_logcat_anr
 from common.anr_sessions import SessionStore
 
@@ -332,13 +333,14 @@ def test_the_cli_exits_non_zero_and_puts_the_error_in_the_json(monkeypatch, caps
     monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        anr_watcher.main()
+        cli.run(anr_watcher.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err
     payload = json.loads(captured.out)
-    assert "error" in payload, f"--json reported no error: {payload}"
+    assert payload["success"] is False, f"--json reported no failure: {payload}"
+    assert "anr-20260101-000000" in payload["error"]
 
 
 def test_a_cluster_index_past_the_end_is_an_error(store, monkeypatch):

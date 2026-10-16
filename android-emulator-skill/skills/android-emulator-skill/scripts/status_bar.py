@@ -32,7 +32,7 @@ import argparse
 import json
 import sys
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import quote_for_device_shell
 from common.env_config import env_int
 
@@ -485,7 +485,7 @@ class StatusBarController:
             return False, f"Failed to reset: {e}"
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Control Android status bar appearance",
@@ -534,54 +534,51 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     controller = StatusBarController(serial=args.device_serial)
     results = []
 
     # A device-level failure (no device, several devices, offline, unauthorized)
-    # means the command never ran at all, so it is raised rather than returned.
-    # Its message already names the remedy; a traceback would bury it.
-    try:
-        # Reset operation
-        if args.reset:
-            success, message = controller.reset()
-            results.append({"operation": "reset", "success": success, "message": message})
+    # means the command never ran at all, so it is raised rather than returned,
+    # and common.cli reports it with the remedy its message carries.
 
-        # Preset operation (atomic, coherent group via demo mode)
-        if args.preset:
-            success, message = controller.apply_preset(args.preset)
-            results.append(
-                {
-                    "operation": "preset",
-                    "preset": args.preset,
-                    "success": success,
-                    "message": message,
-                }
-            )
+    # Reset operation
+    if args.reset:
+        success, message = controller.reset()
+        results.append({"operation": "reset", "success": success, "message": message})
 
-        # Battery operation
-        if args.battery is not None:
-            success, message = controller.set_battery(args.battery, args.charging)
-            results.append({"operation": "battery", "success": success, "message": message})
+    # Preset operation (atomic, coherent group via demo mode)
+    if args.preset:
+        success, message = controller.apply_preset(args.preset)
+        results.append(
+            {
+                "operation": "preset",
+                "preset": args.preset,
+                "success": success,
+                "message": message,
+            }
+        )
 
-        # WiFi operation
-        if args.wifi:
-            success, message = controller.set_wifi(True, args.wifi_level)
-            results.append({"operation": "wifi", "success": success, "message": message})
+    # Battery operation
+    if args.battery is not None:
+        success, message = controller.set_battery(args.battery, args.charging)
+        results.append({"operation": "battery", "success": success, "message": message})
 
-        # Mobile data operation
-        if args.mobile:
-            success, message = controller.set_mobile_data(True, args.mobile_level, args.mobile_type)
-            results.append({"operation": "mobile", "success": success, "message": message})
+    # WiFi operation
+    if args.wifi:
+        success, message = controller.set_wifi(True, args.wifi_level)
+        results.append({"operation": "wifi", "success": success, "message": message})
 
-        # Time operation
-        if args.time:
-            success, message = controller.set_time(args.time)
-            results.append({"operation": "time", "success": success, "message": message})
-    except adb_exec.AdbError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+    # Mobile data operation
+    if args.mobile:
+        success, message = controller.set_mobile_data(True, args.mobile_level, args.mobile_type)
+        results.append({"operation": "mobile", "success": success, "message": message})
+
+    # Time operation
+    if args.time:
+        success, message = controller.set_time(args.time)
+        results.append({"operation": "time", "success": success, "message": message})
 
     # Output results
     if not results:
@@ -601,4 +598,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

@@ -36,6 +36,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from common import cli
 from common.env_config import env_int
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix). Caps keep default
@@ -435,9 +436,9 @@ Examples:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     res_dir: Path = args.res
     if not res_dir.is_dir():
@@ -470,4 +471,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

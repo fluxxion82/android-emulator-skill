@@ -42,12 +42,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from collections import Counter
 from dataclasses import dataclass, field
 
-from common import logcat
-from common.adb_exec import AdbError, run_adb
+from common import cli, logcat
+from common.adb_exec import run_adb
 from common.device_utils import resolve_device_identifier
 from common.env_config import env_int
 
@@ -704,10 +703,10 @@ Environment variables:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Parse args, run one mode, print the result."""
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.clear and args.package:
         parser.error(
@@ -715,18 +714,12 @@ def main() -> int:
             "so --package cannot be combined with it."
         )
 
-    try:
-        triage = CrashTriage(serial=args.serial)
-    except (RuntimeError, AdbError) as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return EXIT_ERROR
+    # A device that cannot be resolved or reached raises, and common.cli
+    # reports it: exit 3 when the device is unavailable, 1 otherwise.
+    triage = CrashTriage(serial=args.serial)
 
     if args.clear:
-        try:
-            triage.clear_buffer()
-        except AdbError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            return EXIT_ERROR
+        triage.clear_buffer()
         device = triage.serial or "default device"
         if args.json:
             print(json.dumps({"cleared": True, "device": triage.serial}, indent=2))
@@ -734,11 +727,7 @@ def main() -> int:
             print(f"Crash buffer cleared ({device})")
         return EXIT_OK
 
-    try:
-        report = triage.triage(package=args.package)
-    except AdbError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return EXIT_ERROR
+    report = triage.triage(package=args.package)
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -751,4 +740,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.run(main)

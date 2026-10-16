@@ -16,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 
+from common import cli
+
 try:
     from PIL import Image, ImageChops
 
@@ -47,16 +49,12 @@ class VisualDiffer:
         Returns:
             Dictionary with comparison results
         """
-        # Load images
-        try:
-            baseline = Image.open(baseline_path)
-            current = Image.open(current_path)
-        except FileNotFoundError as e:
-            print(f"Error: Image not found - {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error: Failed to load image - {e}")
-            sys.exit(1)
+        # Load images. A missing file (FileNotFoundError) or one that is not an
+        # image (PIL's UnidentifiedImageError, an OSError) raises, and
+        # common.cli reports it -- these printed to stdout and exited 1 from
+        # inside a library method, under --json too.
+        baseline = Image.open(baseline_path)
+        current = Image.open(current_path)
 
         # Verify dimensions match
         if baseline.size != current.size:
@@ -143,7 +141,7 @@ class VisualDiffer:
         combined.save(output_path)
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(description="Compare screenshots for visual differences")
     parser.add_argument("baseline", help="Path to baseline screenshot")
@@ -181,11 +179,10 @@ def main():
         help="Deprecated alias for --json",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not _PIL_AVAILABLE:
-        print("Error: Pillow not installed. Run: pip3 install pillow", file=sys.stderr)
-        sys.exit(1)
+        cli.fail("Pillow is not installed", "Run: pip3 install pillow")
 
     # Create output directory if needed
     output_dir = Path(args.output)
@@ -197,12 +194,15 @@ def main():
     # Perform comparison
     result = differ.compare(args.baseline, args.current)
 
-    # Handle dimension mismatch
+    # A dimension mismatch is a refusal, reported through common.cli: it was
+    # three lines on stdout, under --json too.
     if "error" in result:
-        print(f"Error: {result['error']}")
-        print(f"Baseline: {result['baseline_size']}")
-        print(f"Current: {result['current_size']}")
-        sys.exit(1)
+        cli.fail(
+            f"{result['error']}: baseline {result['baseline_size']}, "
+            f"current {result['current_size']}",
+            "Compare screenshots taken at the same resolution and orientation "
+            "(same device, same --size preset).",
+        )
 
     # Generate artifacts
     diff_image_path = output_dir / "diff.png"
@@ -212,7 +212,28 @@ def main():
         differ.generate_diff_image(args.baseline, args.current, str(diff_image_path))
         differ.generate_side_by_side(args.baseline, args.current, str(comparison_image_path))
     except Exception as e:
-        print(f"Warning: Could not generate images - {e}")
+        # The comparison stands without the pictures. To stderr under --json,
+        # where stdout is the report.
+        print(
+            f"Warning: Could not generate images - {e}",
+            file=sys.stderr if args.json_output else sys.stdout,
+        )
+
+    # Save JSON report -- BEFORE printing the result. Written after it, a
+    # report file that could not be saved appended a refusal to a success
+    # already on stdout: under --json, two objects.
+    report_path = output_dir / "diff-report.json"
+    with open(report_path, "w") as f:
+        json.dump(
+            {
+                "baseline": os.path.basename(args.baseline),
+                "current": os.path.basename(args.current),
+                "results": result,
+                "artifacts": {"diff": "diff.png", "comparison": "side-by-side.png"},
+            },
+            f,
+            indent=2,
+        )
 
     # Output results (token-optimized)
     if args.json_output:
@@ -238,23 +259,9 @@ def main():
             print(f"Changed pixels: {result['different_pixels']:,}")
         print(f"Artifacts saved to: {output_dir}/")
 
-    # Save JSON report
-    report_path = output_dir / "diff-report.json"
-    with open(report_path, "w") as f:
-        json.dump(
-            {
-                "baseline": os.path.basename(args.baseline),
-                "current": os.path.basename(args.current),
-                "results": result,
-                "artifacts": {"diff": "diff.png", "comparison": "side-by-side.png"},
-            },
-            f,
-            indent=2,
-        )
-
     # Exit with error if test failed
     sys.exit(0 if result["passed"] else 1)
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main, json_flags=("--json", "--details"))

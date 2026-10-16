@@ -35,7 +35,7 @@ from types import SimpleNamespace
 import pytest
 import snapshot
 
-from common import adb_exec
+from common import adb_exec, cli
 
 SOURCE = Path(snapshot.__file__).read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
@@ -319,6 +319,69 @@ def test_save_succeeds_only_once_the_snapshot_is_actually_listed(recorded, fake_
     success, result = snapshot.SnapshotManager().save("before_upgrade")
     assert success is True
     assert result["verified"] is True
+
+
+class _SequencedListing:
+    """`snapshot save` answers OK; `snapshot list` answers each scripted reply in
+    turn, repeating the last. Under common.adb_exec, so run_emu and adb_exec's
+    classification of adb's (recorded) words run for real."""
+
+    def __init__(self, listings: list[SimpleNamespace]) -> None:
+        self._listings = listings
+        self.list_calls = 0
+
+    def run(self, cmd, **_kwargs):
+        if _contains(list(cmd), ("snapshot", "list")):
+            reply = self._listings[min(self.list_calls, len(self._listings) - 1)]
+            self.list_calls += 1
+            return reply
+        return SimpleNamespace(returncode=0, stdout="OK\r\n", stderr="")
+
+
+def test_save_rides_out_a_device_that_drops_off_mid_verify(
+    recorded, recorded_anywhere, monkeypatch
+):
+    """The emulator is busy writing the snapshot and adb loses it for one poll.
+
+    That is "ask again", not "the device is gone": the verify poll keeps going
+    until its deadline, the same tolerance boot polling has. At 25bc47f this
+    recovered on the second poll; for a while after, the first device error ended
+    the save with exit 3.
+    """
+    monkeypatch.setattr(snapshot, "VERIFY_TIMEOUT_SECONDS", 5)
+    gone = SimpleNamespace(
+        returncode=1, stdout="", stderr=recorded_anywhere("adb_shell_device_not_found")
+    )
+    listed = SimpleNamespace(
+        returncode=0, stdout=_listing_including(recorded, "before_upgrade"), stderr=""
+    )
+    fake = _SequencedListing([gone, listed])
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake.run)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
+
+    ok, result = snapshot.SnapshotManager(serial="emulator-5554").save("before_upgrade")
+
+    assert ok is True, result
+    assert fake.list_calls == 2, "it did not poll again after the device dropped off"
+
+
+def test_save_against_a_device_that_stays_gone_exits_3(recorded_anywhere, monkeypatch, capsys):
+    """Still gone at the deadline: the last device error goes to the boundary."""
+    gone = SimpleNamespace(
+        returncode=1, stdout="", stderr=recorded_anywhere("adb_shell_device_not_found")
+    )
+    fake = _SequencedListing([gone])
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake.run)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: [])
+    monkeypatch.setattr(snapshot, "resolve_device_identifier", lambda value: value)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(snapshot.main, ["--serial", "emulator-5554", "--save", "before_upgrade", "--json"])
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 3
+    assert json.loads(captured.out)["success"] is False
+    assert "Traceback" not in captured.err
 
 
 def test_save_fails_when_the_snapshot_never_appears(recorded, fake_adb):

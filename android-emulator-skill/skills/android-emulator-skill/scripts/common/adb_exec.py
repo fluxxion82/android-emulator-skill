@@ -52,6 +52,12 @@ DEFAULT_TIMEOUT = env_int("ANDROID_EMU_ADB_TIMEOUT", 30, min_value=1)
 # Grace period for a terminated child to exit before it is killed.
 SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_ADB_SHUTDOWN_TIMEOUT", 5, min_value=1)
 
+_ADB_NOT_INSTALLED_REMEDY = (
+    "Install the Android SDK platform-tools and add them to PATH, e.g. "
+    'export PATH="$ANDROID_HOME/platform-tools:$PATH" -- note that is the '
+    "platform-tools directory, not the SDK root."
+)
+
 
 class AdbError(RuntimeError):
     """Base for every adb failure, so callers can catch the family at once.
@@ -66,12 +72,25 @@ class AdbError(RuntimeError):
     Attributes:
         command: The argv that failed, so a caller can say what was run.
         result: The :class:`AdbResult` when adb produced one, else None.
+        remedy: The sentence of the message that says what to do, when the
+            message has one. ``str(error)`` still carries it -- every caller that
+            prints the error keeps printing the remedy -- and ``common.cli``
+            uses this to report the two halves as separate fields without
+            saying the remedy twice.
     """
 
-    def __init__(self, message: str, command: list[str] | None = None, result=None):
+    def __init__(
+        self,
+        message: str,
+        command: list[str] | None = None,
+        result=None,
+        *,
+        remedy: str | None = None,
+    ):
         super().__init__(message)
         self.command = command or []
         self.result = result
+        self.remedy = remedy
 
     @property
     def stdout(self) -> str:
@@ -224,38 +243,62 @@ def _classify(stderr: str, serial: str | None) -> AdbError | None:
     text = stderr.lower()
 
     if "more than one device" in text:
+        remedy = _remedy_for_multiple_devices()
         return MultipleDevicesError(
-            f"More than one device is attached, so adb could not choose one. "
-            f"{_remedy_for_multiple_devices()}"
+            f"More than one device is attached, so adb could not choose one. {remedy}",
+            remedy=remedy,
         )
 
     if "not found" in text and "device" in text:
         attached = _attached_serials()
         listed = ", ".join(attached) if attached else "none"
+        remedy = "Run `adb devices` to see what is available."
         return DeviceNotFoundError(
-            f"Device {serial!r} is not attached. Attached: {listed}. "
-            f"Run `adb devices` to see what is available."
+            f"Device {serial!r} is not attached. Attached: {listed}. {remedy}",
+            remedy=remedy,
         )
 
     if "no devices" in text or "no emulators" in text:
+        remedy = (
+            "Start one with `emulator -avd <name>`, or connect a device and enable USB debugging."
+        )
         return DeviceNotFoundError(
-            "No devices or emulators are attached. Start one with "
-            "`emulator -avd <name>`, or connect a device and enable USB debugging."
+            f"No devices or emulators are attached. {remedy}",
+            remedy=remedy,
         )
 
     if "device offline" in text:
+        remedy = (
+            "Reconnect it, or restart the adb server with `adb kill-server && adb start-server`."
+        )
         return DeviceOfflineError(
-            f"Device {serial or ''} is attached but offline. Reconnect it, or "
-            f"restart the adb server with `adb kill-server && adb start-server`."
+            f"Device {serial or ''} is attached but offline. {remedy}",
+            remedy=remedy,
         )
 
     if "unauthorized" in text:
+        remedy = "Unlock it and accept the 'Allow USB debugging?' prompt, then retry."
         return DeviceUnauthorizedError(
-            f"Device {serial or ''} has not authorized this computer. Unlock it "
-            f"and accept the 'Allow USB debugging?' prompt, then retry."
+            f"Device {serial or ''} has not authorized this computer. {remedy}",
+            remedy=remedy,
         )
 
     return None
+
+
+def classify_device_error(stderr: str, serial: str | None = None) -> DeviceError | None:
+    """The typed device error adb's own stderr names, or None.
+
+    For the one kind of caller that cannot go through :func:`run_adb`: a
+    streaming ``adb logcat`` read line by line (``log_monitor``). Its stderr
+    gets the same classification, so a device that is not there is the same
+    error -- and the same exit status at the CLI boundary -- however adb was run.
+
+    Args:
+        stderr: What adb wrote to stderr.
+        serial: The serial the command targeted, for the message.
+    """
+    return _classify(stderr, serial)
 
 
 def run_adb(
@@ -314,16 +357,17 @@ def run_adb(
         # PermissionError escaped this function and reached the user as a
         # traceback instead of a remedy.
         raise AdbNotInstalledError(
-            "adb could not be run: it is not on PATH, or the file found is not "
-            "executable. Install the Android SDK platform-tools and add them to "
-            'PATH, e.g. export PATH="$ANDROID_HOME/platform-tools:$PATH" -- note '
-            "that is the platform-tools directory, not the SDK root."
+            f"adb could not be run: it is not on PATH, or the file found is not "
+            f"executable. {_ADB_NOT_INSTALLED_REMEDY}",
+            remedy=_ADB_NOT_INSTALLED_REMEDY,
         ) from exc
     except subprocess.TimeoutExpired as exc:
+        remedy = "try `adb kill-server` and retry."
         raise AdbTimeoutError(
             f"`{' '.join(cmd)}` did not finish within {budget}s. The device may be "
-            f"busy or the adb connection wedged; try `adb kill-server` and retry.",
+            f"busy or the adb connection wedged; {remedy}",
             command=cmd,
+            remedy=remedy,
         ) from exc
 
     result = AdbResult(

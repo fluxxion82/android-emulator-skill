@@ -63,7 +63,7 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
-from common import adb_exec
+from common import cli
 from common.device_utils import get_current_activity, resolve_device_identifier
 from common.env_config import env_int
 from common.hierarchy import INTERACTIVE_ATTRIBUTES as _INTERACTIVE_ATTRIBUTES
@@ -438,7 +438,7 @@ class ScreenMapper:
 
     def map_screen(
         self, verbose: bool = False, hints: bool = False, json_output: bool = False
-    ) -> tuple[str, bool]:
+    ) -> str:
         """
         Main entry point: Map current screen and return formatted output.
 
@@ -448,27 +448,24 @@ class ScreenMapper:
             json_output: Return JSON instead of formatted text
 
         Returns:
-            ``(output, ok)``. The output format is unchanged; ``ok`` is False
-            when the screen could not be read, so ``main()`` can exit non-zero
-            instead of reporting success while serialising an error (R2).
+            The formatted map.
+
+        Raises:
+            AdbError, HierarchyError: The screen could not be read. This used to
+                be caught here and serialised as ``Error: ...`` / ``{"error":
+                ...}`` with exit 1 -- which made "no device" (exit 3 everywhere
+                else) look like a failed read. Both now reach ``common.cli``,
+                which reports every script's failures the same way.
         """
-        try:
-            root = self.get_ui_hierarchy()
-            analysis = self.analyze_tree(root)
+        root = self.get_ui_hierarchy()
+        analysis = self.analyze_tree(root)
 
-            if json_output:
-                return json_lib.dumps(analysis, indent=2), True
-            return self.format_summary(analysis, verbose, hints), True
-
-        except RuntimeError as e:
-            # adb_exec's device errors subclass RuntimeError, so "more than one
-            # device" arrives here already carrying its remedy.
-            if json_output:
-                return json_lib.dumps({"error": str(e)}, indent=2), False
-            return f"Error: {e}", False
+        if json_output:
+            return json_lib.dumps(analysis, indent=2)
+        return self.format_summary(analysis, verbose, hints)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Analyze current Android screen for navigation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -498,32 +495,16 @@ Examples:
     parser.add_argument("--hints", action="store_true", help="Include navigation suggestions")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Resolve device
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     # Map screen
     mapper = ScreenMapper(serial)
-    try:
-        output, ok = mapper.map_screen(
-            verbose=args.verbose, hints=args.hints, json_output=args.json
-        )
-    except adb_exec.AdbError as error:
-        # Anything that escaped map_screen's own handling; the message names a
-        # remedy, so print it rather than letting a traceback bury it.
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
-
-    print(output)
-    # R2: exiting 0 after serialising an error made the status code useless to
-    # a caller that only checks it.
-    sys.exit(0 if ok else 1)
+    print(mapper.map_screen(verbose=args.verbose, hints=args.hints, json_output=args.json))
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

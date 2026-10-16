@@ -44,8 +44,13 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from common import logcat
-from common.adb_exec import AdbCommandError, AdbError, run_adb
+from common import cli, logcat
+from common.adb_exec import (
+    AdbCommandError,
+    DeviceNotFoundError,
+    classify_device_error,
+    run_adb,
+)
 from common.device_utils import get_connected_devices, quote_for_device_shell
 from common.env_config import env_int
 
@@ -113,6 +118,7 @@ class LogMonitor:
         self.log_process = None
         self.interrupted = False
         self._stderr_lines: list[str] = []
+        self._stderr_thread: threading.Thread | None = None
 
     def parse_time_duration(self, duration_str: str) -> float:
         """
@@ -351,8 +357,7 @@ class LogMonitor:
         Returns:
             True if successful
         """
-        if not self._verify_device_available():
-            return False
+        self._verify_device_available()
 
         # Clear logcat if requested (ignored for historical windows, which read
         # the existing buffer rather than streaming new lines).
@@ -434,17 +439,16 @@ class LogMonitor:
 
             return self._finish_stream(stopped_by_us)
 
-        except Exception as e:
-            print(f"Error streaming logs: {e}", file=sys.stderr)
-            return False
-
+        # No `except Exception` here any more: it printed the error and returned
+        # False, so a device that vanished mid-stream exited 1 with no remedy
+        # and no JSON. Whatever goes wrong now reaches common.cli.
         finally:
             if deadline_timer:
                 deadline_timer.cancel()
             if self.log_process and self.log_process.poll() is None:
                 self.log_process.terminate()
 
-    def _verify_device_available(self) -> bool:
+    def _verify_device_available(self) -> None:
         """Check an explicitly requested serial is actually attached.
 
         ``adb -s <serial> logcat`` does not fail when the serial is unknown --
@@ -453,31 +457,28 @@ class LogMonitor:
         capture ends on schedule and reports success with zero lines. Exit
         status cannot distinguish the two, so the check has to happen up front.
 
-        Returns:
-            True if no specific serial was requested, or it is attached.
+        Raises:
+            DeviceNotFoundError: The serial is not attached -- exit 3 at the CLI
+                boundary, like an unavailable device in every other script.
+                (This printed a line and returned False, which exited 1.)
+            RuntimeError: The device list itself could not be read.
         """
         if not self.device_serial:
-            return True
+            return
 
-        try:
-            attached = [
-                device["serial"]
-                for device in get_connected_devices()
-                if device.get("state") == "device"
-            ]
-        except (RuntimeError, subprocess.SubprocessError) as exc:
-            print(f"Could not list devices: {exc}", file=sys.stderr)
-            return False
-
+        attached = [
+            device["serial"]
+            for device in get_connected_devices()
+            if device.get("state") == "device"
+        ]
         if self.device_serial in attached:
-            return True
+            return
 
         available = ", ".join(attached) if attached else "none"
-        print(
+        raise DeviceNotFoundError(
             f"Device '{self.device_serial}' is not attached. Available: {available}.",
-            file=sys.stderr,
+            remedy="Pass --serial with one of the available devices, or start the one you named.",
         )
-        return False
 
     def _start_stderr_drain(self) -> None:
         """Continuously read the child's stderr on a daemon thread.
@@ -499,6 +500,7 @@ class LogMonitor:
 
         thread = threading.Thread(target=_drain, daemon=True)
         thread.start()
+        self._stderr_thread = thread
 
     def _finish_stream(self, stopped_by_us: bool) -> bool:
         """Reap the logcat process and decide whether the capture succeeded.
@@ -534,17 +536,24 @@ class LogMonitor:
             return True
 
         if returncode:
+            # The drain thread may still be reading what adb said on the way out.
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=STREAM_SHUTDOWN_TIMEOUT)
             detail = " ".join(self._stderr_lines).strip()
+            # adb's own words, typed as run_adb would type them: a device that
+            # is not there is exit 3 at the boundary here too.
+            device_error = classify_device_error(detail, self.device_serial)
+            if device_error is not None:
+                raise device_error
+            # Raised, not printed: under --json this exited 1 with no object.
             message = f"adb logcat exited with status {returncode}."
             if detail:
                 message += f" {detail}"
-            else:
-                message += (
-                    " Check the device is connected and, with more than one "
-                    "attached, pass --serial."
-                )
-            print(message, file=sys.stderr)
-            return False
+            cli.fail(
+                message,
+                "Check the device is connected (`adb devices`) and, with more than one "
+                "attached, pass --serial.",
+            )
         return True
 
     def get_summary(self, verbose: bool = False) -> str:
@@ -639,7 +648,7 @@ class LogMonitor:
         return str(log_file)
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Monitor and analyze Android device/emulator logs",
@@ -698,7 +707,7 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--clear", action="store_true", help="Clear logcat buffer before streaming")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Parse severity filter
     severity_filter = None
@@ -739,19 +748,15 @@ Examples:
     if args.app_package:
         print(f"App: {args.app_package}", file=sys.stderr)
 
-    try:
-        success = monitor.stream_logs(
-            follow=args.follow,
-            duration=duration,
-            clear_first=args.clear,
-            last_minutes=last_minutes,
-        )
-    except AdbError as error:
-        # Device-level failures (ambiguous serial, offline, adb missing) carry a
-        # remedy; a traceback does not.
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
-
+    # Device-level failures (ambiguous serial, offline, adb missing) raise and
+    # reach common.cli with their remedy. False is left for one case: logcat
+    # ran and exited non-zero, which _finish_stream reports on stderr.
+    success = monitor.stream_logs(
+        follow=args.follow,
+        duration=duration,
+        clear_first=args.clear,
+        last_minutes=last_minutes,
+    )
     if not success:
         sys.exit(1)
 
@@ -771,4 +776,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

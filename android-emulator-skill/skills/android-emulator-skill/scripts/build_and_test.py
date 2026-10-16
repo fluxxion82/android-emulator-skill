@@ -36,6 +36,7 @@ import argparse
 import json
 import sys
 
+from common import cli
 from common.env_config import env_int
 from gradle import BuildResultCache, BuildRunner, OutputFormatter
 
@@ -173,7 +174,7 @@ def _emit_result(args: argparse.Namespace, result, build_id: str) -> None:
         )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Build and test Android Gradle projects with progressive disclosure",
@@ -226,7 +227,7 @@ Examples:
     output_group.add_argument("--verbose", action="store_true", help="Show detailed output")
     output_group.add_argument("--json", action="store_true", help="Output as JSON")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cache = BuildResultCache()
 
@@ -240,8 +241,13 @@ Examples:
     try:
         runner = BuildRunner(args.project, module=args.module, variant=args.variant)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        # A project that is not one (no directory, no gradlew). Reported by
+        # common.cli: this printed prose to stderr and returned 1, leaving a
+        # --json caller an empty stdout.
+        cli.fail(
+            str(e),
+            "Pass --project the Android project's root -- the directory that holds gradlew.",
+        )
 
     if args.test:
         result = runner.test(clean=args.clean, suite=args.suite)
@@ -267,4 +273,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.run(main)

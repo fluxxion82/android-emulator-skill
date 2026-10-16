@@ -15,7 +15,7 @@ from __future__ import annotations
 import gesture
 import pytest
 
-from common import adb_exec
+from common import adb_exec, cli
 
 
 def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -150,7 +150,7 @@ def test_main_reports_multiple_devices_without_a_traceback(monkeypatch, capsys):
     monkeypatch.setattr(gesture.sys, "argv", ["gesture.py", "--long-press", "10,20"])
 
     with pytest.raises(SystemExit) as exc:
-        gesture.main()
+        cli.run(gesture.main)
 
     assert exc.value.code == 1
     err = capsys.readouterr().err

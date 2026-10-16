@@ -185,6 +185,42 @@ def test_cleanup_failure_does_not_replace_the_real_error(monkeypatch, tmp_path):
     ), f"the cleanup failure masked the real one: {excinfo.value}"
 
 
+def test_a_device_that_is_gone_keeps_its_type(monkeypatch, tmp_path, recorded_anywhere):
+    """Review ruling 3: `except Exception: raise RuntimeError(...)` re-wrapped
+    DeviceNotFoundError, so a screenshot of a device that is not there exited 1
+    at the CLI boundary where every other script says 3."""
+    not_found = recorded_anywhere("adb_shell_device_not_found")
+
+    def _run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", not_found)
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: [])
+
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        screenshot_utils.capture_screenshot(
+            "emulator-5556", size="full", output_path=str(tmp_path / "a.png")
+        )
+
+
+def test_a_bug_in_capture_is_not_dressed_as_an_expected_failure(monkeypatch, tmp_path):
+    """Anything outside adb and the local file keeps its type -- and so, at the
+    CLI boundary, its traceback, which is the only evidence of where it is."""
+
+    def _run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _broken(*_args, **_kwargs):
+        raise KeyError("width")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
+    monkeypatch.setattr(screenshot_utils, "png_dimensions", _broken)
+    monkeypatch.setattr(screenshot_utils, "HAS_PIL", False)
+
+    with pytest.raises(KeyError):
+        screenshot_utils.capture_screenshot(size="full", output_path=str(tmp_path / "a.png"))
+
+
 # ---------------------------------------------------------------------------
 # Dimensions are read, not invented.
 # ---------------------------------------------------------------------------

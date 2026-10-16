@@ -24,7 +24,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from common import adb_exec, logcat
+from common import adb_exec, cli, logcat
 from common.device_utils import get_ui_hierarchy, parse_display_density, quote_for_device_shell
 from common.env_config import env_int
 from common.screenshot_utils import capture_screenshot
@@ -507,7 +507,7 @@ def _report_failure(args: argparse.Namespace, message: str, partial: dict) -> No
     sys.exit(1)
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Capture complete Android app state for debugging",
@@ -556,31 +556,26 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     capturer = AppStateCapture(package=args.package, serial=args.device_serial)
 
     if args.verbose:
-        print(f"Capturing state for: {args.package}")
-
-    # CLI boundary: a device-level adb failure (ambiguous target, wrong serial,
-    # offline, unauthorized) means no command ever ran. Print the remedy the
-    # error already carries rather than letting a traceback reach the user.
-    try:
-        success, message, snapshot_path, partial = capturer.capture(
-            output_dir=args.output,
-            include_logs=not args.no_logs,
-            log_duration=args.logs,
-            log_lines=args.log_lines,
-            screenshot_size=args.screenshot_size,
+        # To stderr under --json, where stdout is the one object.
+        print(
+            f"Capturing state for: {args.package}",
+            file=sys.stderr if args.json else sys.stdout,
         )
-    except adb_exec.AdbError as error:
-        # Defensive: capture() maps every component failure to a partial
-        # result, so nothing inside it is expected to raise this. It goes
-        # through the same reporter anyway -- printing to stderr and leaving
-        # stdout empty under `--json` gave an agent parsing stdout nothing at
-        # all to read.
-        _report_failure(args, str(error), {})
+
+    # capture() maps every component failure to a partial result, so nothing
+    # inside it is expected to raise. Anything that does reaches common.cli.
+    success, message, snapshot_path, partial = capturer.capture(
+        output_dir=args.output,
+        include_logs=not args.no_logs,
+        log_duration=args.logs,
+        log_lines=args.log_lines,
+        screenshot_size=args.screenshot_size,
+    )
 
     if not success:
         # X8: a missing component used to be reported under "State captured"
@@ -602,4 +597,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

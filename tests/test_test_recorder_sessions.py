@@ -40,6 +40,7 @@ import pytest
 import test_recorder
 from test_recorder import RecorderError, RecorderSessionStore, TestRecorder
 
+from common import cli
 from common.device_utils import _xml_to_dict
 
 SCRIPTS_DIR = Path(test_recorder.__file__).resolve().parent
@@ -119,9 +120,12 @@ def _fresh() -> TestRecorder:
 
 
 def _cli(monkeypatch, *argv: str) -> int:
-    """Run the real CLI entry point with the given arguments."""
+    """Run the real CLI entry point -- through common.cli, as the script does --
+    and return its exit status."""
     monkeypatch.setattr(sys, "argv", ["test_recorder.py", *argv])
-    return test_recorder.main()
+    with pytest.raises(SystemExit) as exc:
+        cli.run(test_recorder.main)
+    return 0 if exc.value.code is None else exc.value.code
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +613,8 @@ def test_cli_stop_failed_exits_nonzero(home, device, monkeypatch, capsys):
 
 def test_cli_step_without_a_session_fails_loudly(home, device, monkeypatch, capsys):
     assert _cli(monkeypatch, "--step", "Open the app") == 1
-    assert "Error:" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith("Error: "), err
 
 
 def test_cli_step_that_captures_nothing_exits_nonzero(home, device, monkeypatch, capsys):
@@ -622,7 +627,9 @@ def test_cli_step_that_captures_nothing_exits_nonzero(home, device, monkeypatch,
     capsys.readouterr()
 
     assert _cli(monkeypatch, "--step", "Open the app") == 1
-    assert "device offline" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "Traceback" not in err, err
+    assert "device offline" in err
 
 
 def test_cli_list_and_get_details_are_machine_readable(home, device, monkeypatch, capsys):

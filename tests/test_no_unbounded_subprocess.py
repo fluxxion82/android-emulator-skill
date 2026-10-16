@@ -48,19 +48,60 @@ EXEMPT: dict[str, str] = {
 STREAMING = ["log_monitor.py", "anr_watcher.py"]
 
 
-def _unbounded_calls(path: Path) -> list[tuple[int, str]]:
-    """Line numbers of subprocess run/Popen calls with no ``timeout=``."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+SUBPROCESS_CALLEES = ("run", "Popen")
+
+
+def _subprocess_calls(tree: ast.Module) -> list[tuple[ast.Call, str]]:
+    """Every call into ``subprocess.run`` / ``subprocess.Popen``, however imported.
+
+    Bound to the module, not to the attribute name. Matching any ``.run`` or
+    ``.Popen`` -- what this file did first -- counted ``cli.run(main)`` as a
+    subprocess bypass in every script the moment the shared CLI boundary landed:
+    a guard keyed on a spelling rather than on what the spelling refers to.
+
+    Resolves ``import subprocess``, ``import subprocess as sp`` and
+    ``from subprocess import run [as r]``.
+
+    Returns:
+        ``(call, callee)`` pairs, ``callee`` being ``"run"`` or ``"Popen"``.
+    """
+    modules: set[str] = set()
+    functions: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess" and not node.level:
+            for alias in node.names:
+                if alias.name in SUBPROCESS_CALLEES:
+                    functions[alias.asname or alias.name] = alias.name
+
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        callee = getattr(node.func, "attr", None)
-        if callee not in ("run", "Popen"):
-            continue
-        if not any(keyword.arg == "timeout" for keyword in node.keywords):
-            found.append((node.lineno, callee))
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr in SUBPROCESS_CALLEES
+            and isinstance(func.value, ast.Name)
+            and func.value.id in modules
+        ):
+            found.append((node, func.attr))
+        elif isinstance(func, ast.Name) and func.id in functions:
+            found.append((node, functions[func.id]))
     return found
+
+
+def _unbounded_calls(path: Path) -> list[tuple[int, str]]:
+    """Line numbers of subprocess run/Popen calls with no ``timeout=``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        (node.lineno, callee)
+        for node, callee in _subprocess_calls(tree)
+        if not any(keyword.arg == "timeout" for keyword in node.keywords)
+    ]
 
 
 def _script_files() -> list[Path]:
@@ -126,27 +167,67 @@ def test_streaming_modules_arm_a_watchdog_timer(module: str):
     )
 
 
+# The modules allowed to call subprocess directly, by path under scripts/.
+# Exact: a new bypass fails, and so does a stale entry -- a module that moves
+# onto run_adb deletes its line here in the same change. A count (`<= 15`, what
+# this was) let two new bypasses in while it still had headroom.
+#
+# common/adb_exec.py is not listed: it is the runner everything else goes
+# through. privacy_manager.py left this list in Inc -1.
+DIRECT_SUBPROCESS_MODULES: frozenset[str] = frozenset(
+    {
+        "anr_watcher.py",  # streams `adb logcat` in a detached worker
+        "common/sdk_tools.py",  # runs SDK binaries (emulator, avdmanager), not adb
+        "container.py",  # `adb exec-out run-as`: binary-safe bytes, not text
+        "emulator_boot.py",  # launches the emulator binary detached
+        "emulator_create.py",  # avdmanager / sdkmanager
+        "emulator_delete.py",  # avdmanager
+        "emulator_selector.py",  # launches the emulator binary detached
+        "gradle/builder.py",  # the Gradle wrapper
+        "log_monitor.py",  # streams `adb logcat`
+        "model_inspector.py",  # `adb exec-out run-as`: binary-safe bytes
+        "push_notification.py",  # its own bounded _shell runner (debt)
+        "test_recorder.py",  # emits a logcat marker
+    }
+)
+
+
 def test_adb_goes_through_the_shared_runner():
-    """Scripts should not reach adb directly now that run_adb exists.
-
-    Not a hard rule for every module yet -- common/ and the streaming modules
-    still build their own commands -- so this asserts the direction of travel by
-    pinning how many modules still call subprocess directly. Ratcheting this
-    number down is the migration; it must never go up.
-    """
-    direct = []
-    for path in _script_files():
-        if path.name in ("adb_exec.py",):
-            continue
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) in ("run", "Popen"):
-                direct.append(path.name)
-                break
-
-    # Ratchet. Lower this as modules migrate; never raise it.
-    assert len(set(direct)) <= 15, (
-        f"{len(set(direct))} modules still call subprocess directly: "
-        f"{sorted(set(direct))}. Route new work through common.adb_exec.run_adb."
+    """Exactly the listed modules call subprocess directly; everything else
+    reaches adb through common.adb_exec.run_adb."""
+    direct = {
+        path.relative_to(SCRIPTS).as_posix()
+        for path in _script_files()
+        if path.name != "adb_exec.py"
+        and _subprocess_calls(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    }
+    assert direct - DIRECT_SUBPROCESS_MODULES == set(), (
+        f"{sorted(direct - DIRECT_SUBPROCESS_MODULES)} call subprocess directly. Route adb "
+        f"through common.adb_exec.run_adb; if it genuinely cannot, add it to "
+        f"DIRECT_SUBPROCESS_MODULES with the reason."
     )
+    assert DIRECT_SUBPROCESS_MODULES - direct == set(), (
+        f"{sorted(DIRECT_SUBPROCESS_MODULES - direct)} no longer call subprocess. Delete "
+        f"them from DIRECT_SUBPROCESS_MODULES -- the bypass is paid off."
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import subprocess\nsubprocess.run(['adb'])\n", [(2, "run")]),
+        ("import subprocess as sp\nsp.Popen(['adb'])\n", [(2, "Popen")]),
+        ("from subprocess import run\nrun(['adb'])\n", [(2, "run")]),
+        ("from subprocess import Popen as P\nP(['adb'])\n", [(2, "Popen")]),
+        # The shared CLI boundary, and anything else that merely has a .run:
+        ("from common import cli\ncli.run(main)\n", []),
+        ("import asyncio\nasyncio.run(main())\n", []),
+        ("import subprocess\nsubprocess.run(['adb'], timeout=5)\n", []),
+    ],
+    ids=["module", "module-alias", "from-import", "from-import-alias", "cli", "asyncio", "bounded"],
+)
+def test_the_matcher_is_bound_to_the_subprocess_module(tmp_path, source, expected):
+    """Both directions: every spelling of subprocess counts, and nothing else does."""
+    path = tmp_path / "probe.py"
+    path.write_text(source, encoding="utf-8")
+    assert _unbounded_calls(path) == expected

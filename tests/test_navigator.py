@@ -20,7 +20,7 @@ import navigator
 import pytest
 from navigator import Element, Navigator
 
-from common import adb_exec, hierarchy
+from common import adb_exec, cli, hierarchy
 
 
 def _fake_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -519,7 +519,7 @@ def test_unknown_serial_raises_rather_than_reporting_a_tap(monkeypatch, recorded
 
 
 def test_main_reports_an_unknown_serial_without_a_traceback(monkeypatch, capsys, recorded_anywhere):
-    """Exit 1 with the remedy on stderr; a traceback would bury it."""
+    """Exit 3 (device unavailable) with the remedy on stderr, from common.cli."""
     monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0.0)
 
     def _run(cmd, **kwargs):
@@ -534,9 +534,9 @@ def test_main_reports_an_unknown_serial_without_a_traceback(monkeypatch, capsys,
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
-    assert exc.value.code == 1
+    assert exc.value.code == 3
     err = capsys.readouterr().err
     assert err.startswith("Error: ")
     assert "no-such-serial-xyz" in err
@@ -554,10 +554,12 @@ def test_main_reports_multiple_devices_when_listing(monkeypatch, capsys):
     monkeypatch.setattr(navigator.sys, "argv", ["navigator.py", "--list"])
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 1
-    assert "--serial" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith("Error: "), err
+    assert "--serial" in err
 
 
 def test_typed_text_is_still_quoted_and_space_encoded(monkeypatch):

@@ -46,15 +46,17 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### Implemented (32 scripts)
 
-#### Core Utilities (11 modules in `common/`)
+#### Core Utilities (12 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
 
-   Also in `common/`: **adb_exec.py** (the one bounded entry point for every adb
-   call, with typed errors that name a remedy), **hierarchy.py** (the one way to
-   capture the UI hierarchy — no temp files, so concurrent runs cannot read each
-   other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
+   Also in `common/`: **cli.py** (the error boundary every script ends in,
+   `cli.run(main)`; its contract, and what it does not cover yet, is the
+   **Failures** entry under Known gaps below), **adb_exec.py** (the one bounded
+   entry point for every adb call, with typed errors that name a remedy),
+   **hierarchy.py** (the one way to capture the UI hierarchy — no temp files,
+   so concurrent runs cannot read each other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
    fails), **logcat.py** (the one place that builds an `adb logcat` argv and
    parses a duration, shared by all four log readers), **sdk_tools.py** (resolves
    SDK binaries; `emulator` by bare name hits the `<sdk>/emulator` *directory* on an
@@ -86,7 +88,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - `--list-avds` reports an empty list (`No AVDs found`, or `{"avds": []}`)
      and exits **0** only when the emulator ran and this host defines no AVDs.
      A missing or failing `emulator` binary is an error naming where it was
-     looked for, and exits 1 (`{"error": ...}` under `--json`) — "no AVDs" and
+     looked for, and exits 1 (`{"success": false, "error": ..., "remedy": ...}`
+     under `--json`) — "no AVDs" and
      "could not look" are different answers. `--all` reports the same failure
      the same way
    - Refuses to boot while any attached emulator cannot say which AVD it is
@@ -95,8 +98,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      instance of one AVD corrupts its userdata. The refusal names the serial,
      its state, and says to terminate the stale emulator *process* — a console
      that is not answering cannot be shut down through one
-   - Failures answer in the mode they were asked in: `{"error": ...}` under
-     `--json`, the message on stderr otherwise, always non-zero
+   - Failures answer in the mode they were asked in: a JSON object carrying
+     `error` under `--json`, the message on stderr otherwise, always non-zero
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
@@ -107,8 +110,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      queried — or the emulators could not be listed at all — that is reported
      as itself and exits non-zero, never as "No running emulator found", which
      is a confident negative over a device nobody managed to ask
-   - Failures answer in the mode they were asked in: `{"error": ...}` under
-     `--json`, the message on stderr otherwise, always non-zero
+   - Failures answer in the mode they were asked in: a JSON object carrying
+     `error` under `--json`, the message on stderr otherwise, always non-zero
    - Optional verification of shutdown completion
    - Batch shutdown operations (running emulators only)
    - Options: `--serial`, `--name`, `--verify`, `--timeout`, `--all`, `--json`
@@ -342,8 +345,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
     - An empty inventory at exit 0 means the tools ran and found nothing. A
       missing or failing `adb` or `emulator` exits 1 with the remedy
-      (`{"error": ...}` under `--json`). `avdmanager` is the exception: it only
-      adds target/ABI detail, so its absence is a warning on stderr (and in
+      (`{"success": false, "error": ..., "remedy": ...}` under `--json`).
+      `avdmanager` is the exception: it only adds target/ABI detail, so its
+      absence is a warning on stderr (and in
       `warnings` in the JSON) rather than a failure
     - Options: `--get-details`, `--device-type`/`--name`, `--json`
 
@@ -706,13 +710,8 @@ printed name back into `navigator`, so "implemented but unreachable" fails.
   blind detector.
 - **Every failing mode exits non-zero.** A runtime sweep drives 23 documented
   invocations across 16 scripts against a toolchain where every tool fails, and
-  asserts the exit status rather than the message. The JSON failure *shape* is
-  not yet uniform, and the sweep does not assert it: `app_launcher`,
-  `screen_mapper`, `navigator`, `anr_watcher`, `app_state_capture`,
-  `device_list` and the `emulator_*` lifecycle scripts answer `{"error": ...}`
-  under `--json`, while `status_bar`, `appearance`, `privacy_manager`,
-  `keyboard`, `gesture`, `location`, `emulator_create` and `build_and_test`
-  still answer `{"success": false, "message": ...}`.
+  asserts the exit status rather than the message. (The failure *shape* is now
+  `common/cli.py`'s; see **Failures** under Known gaps.)
 - **A missing SDK tool says so in the lifecycle scripts** — `device_list`,
   `emulator_boot`, `emulator_delete`, `emulator_erase` and `emulator_selector`
   route through `common/sdk_tools.py`, which names where the tool was looked
@@ -749,14 +748,41 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
   `sdkmanager` is missing or fails, so `--list-devices` and `--list-images`
   print nothing and exit 0 — the shape the lifecycle scripts above no longer
   have.
-- The JSON failure shape is `{"error": ...}` only for the scripts reworked in
-  this release. Two groups remain: `status_bar`, `appearance`,
-  `privacy_manager`, `keyboard`, `gesture`, `location`, `emulator_create` and
-  `build_and_test` answer `{"success": false, "message": ...}` (`snapshot`,
-  `sms` and `container` emit both keys at once), and `navigator`,
-  `log_monitor`, `crash_triage` and `status_bar` refuse an unreachable device
-  before any JSON is built, printing prose on stderr and no JSON at all.
-  Unifying them is next.
+- **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is
+  promised, and what is not yet:
+  - A *typed* failure — a missing `adb` or SDK tool, an adb call that failed, a
+    screen that would not dump, a timeout, or a failure a script raises with
+    `cli.fail` — answers `{"success": false, "error": ..., "remedy": ...}` on
+    one line of stdout under `--json`, `Error:` / `Remedy:` on stderr
+    otherwise, and exits **1**.
+  - A device that is **unavailable** (not found, offline, unauthorized) is the
+    same object and exits **3** — whether `--serial` resolution noticed or adb
+    did mid-run. Several devices and no `--serial` is 1.
+  - A script's own exit statuses pass through unchanged, including the ones
+    that mean a *finding*: `crash_triage --fail-on-crash` and
+    `localization_audit --strict` exit 2 when they find something, and
+    `accessibility_audit` exits 1 when a critical issue is present.
+  - A streaming mode (`log_monitor --follow`, `anr_watcher --watch`) cannot
+    take back the records it already printed: there the refusal object is the
+    **last line** of stdout, and parses on its own. Other modes keep stdout to
+    the one object under `--json`, with one known exception: `emulator_delete`
+    without `--yes` asks for confirmation, and that prompt goes to stdout (N4).
+  - Six places catch a device error on purpose, so it does not reach the
+    boundary: boot-completion polling (`emulator_boot`), the snapshot
+    save/delete verify poll (`snapshot`, which keeps asking until its deadline
+    and then reports the device as unavailable), the optional
+    foreground-activity lookup (`device_utils.get_current_activity`), the
+    emulator-console survey (`emu_console`), and the partial-capture policy of
+    `test_recorder` steps and `app_state_capture` (what arrived is kept and
+    handed over).
+  - Not in the schema yet: a usage error (exit 2 — argparse's prose on stderr,
+    or a script's own `{"error": ...}` where it answers usage errors in JSON,
+    as `navigator` and `emulator_delete` do), and failures a script still
+    reports itself — `success: false` beside a
+    `message` from `keyboard`, `gesture`, `location`, and per operation in
+    `status_bar` and `appearance`; `{"error": ...}` from `app_launcher`,
+    `navigator`, the `emulator_*` refusals and `emulator_selector` — until each
+    moves to `cli.fail(error, remedy)`.
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

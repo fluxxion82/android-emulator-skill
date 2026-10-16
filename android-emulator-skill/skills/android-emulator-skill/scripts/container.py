@@ -33,6 +33,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common import cli
 from common.cache_utils import ProgressiveCache
 from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
@@ -1023,7 +1024,7 @@ def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
 # === CLI ===
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Parse arguments and dispatch the requested inspection action."""
     parser = argparse.ArgumentParser(
         description="Inspect a DEBUGGABLE Android app's sandbox via 'adb run-as'.",
@@ -1086,13 +1087,9 @@ Examples:
         help="Write a snapshot (shared_prefs, db listing, file tree) to DIR.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    serial = resolve_device_identifier(args.serial)
 
     inspector = ContainerInspector(serial=serial)
     pkg = args.package
@@ -1120,4 +1117,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

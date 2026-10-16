@@ -27,7 +27,7 @@ import pytest
 import status_bar
 from status_bar import StatusBarController
 
-from common import adb_exec
+from common import adb_exec, cli
 
 
 class _FakeCompleted:
@@ -330,17 +330,17 @@ def test_multiple_devices_raises_from_a_setter(recorded, failing_adb):
         StatusBarController().override(time="9:41")
 
 
-def test_cli_reports_an_unknown_serial_and_exits_one(recorded, failing_adb, monkeypatch, capsys):
-    """No traceback: an actionable message on stderr and exit status 1."""
+def test_cli_reports_an_unknown_serial_and_exits_3(recorded, failing_adb, monkeypatch, capsys):
+    """No traceback: an actionable message on stderr, exit 3 (device unavailable)."""
     failing_adb(returncode=1, stderr=recorded.text("adb_shell_device_not_found"))
     monkeypatch.setattr(
         "sys.argv", ["status_bar.py", "--serial", "no-such-serial-xyz", "--battery", "50"]
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        status_bar.main()
+        cli.run(status_bar.main)
 
-    assert excinfo.value.code == 1
+    assert excinfo.value.code == 3
     captured = capsys.readouterr()
     assert captured.err.startswith("Error: ")
     assert "no-such-serial-xyz" in captured.err
@@ -354,7 +354,7 @@ def test_cli_reports_a_timeout_and_exits_one(failing_adb, monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["status_bar.py", "--preset", "clean"])
 
     with pytest.raises(SystemExit) as excinfo:
-        status_bar.main()
+        cli.run(status_bar.main)
 
     assert excinfo.value.code == 1
     captured = capsys.readouterr()
@@ -367,10 +367,12 @@ def test_cli_reports_missing_adb_and_exits_one(failing_adb, monkeypatch, capsys)
     monkeypatch.setattr("sys.argv", ["status_bar.py", "--reset"])
 
     with pytest.raises(SystemExit) as excinfo:
-        status_bar.main()
+        cli.run(status_bar.main)
 
     assert excinfo.value.code == 1
-    assert "platform-tools" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith("Error: "), err
+    assert "platform-tools" in err
 
 
 # ---------------------------------------------------------------------------

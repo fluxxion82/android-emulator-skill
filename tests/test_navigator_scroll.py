@@ -56,8 +56,9 @@ import pytest
 from app_launcher import am_start_error, parse_am_start
 from navigator import Navigator
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import parse_focused_activity
+from common.hierarchy import HierarchyError
 
 TOP = "uiautomator_settings_top"
 HALF = "uiautomator_settings_half"
@@ -385,9 +386,7 @@ def test_a_screen_that_will_not_hold_still_is_an_error_not_a_traceback(
     _harness(monkeypatch, recorded, [TOP])
 
     def _refuse(serial=None, **kwargs):
-        raise navigator.HierarchyError(
-            "uiautomator could not get an idle state; disable animations"
-        )
+        raise HierarchyError("uiautomator could not get an idle state; disable animations")
 
     monkeypatch.setattr(navigator, "capture_hierarchy", _refuse)
     monkeypatch.setattr(
@@ -395,7 +394,7 @@ def test_a_screen_that_will_not_hold_still_is_an_error_not_a_traceback(
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 1
     err = capsys.readouterr().err

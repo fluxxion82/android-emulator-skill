@@ -18,14 +18,13 @@ import subprocess
 import sys
 import time
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import get_connected_devices
 from common.emu_console import avd_name_for_serial, survey_emulators
 from common.env_config import env_float, env_int
 from common.sdk_tools import (
     EMULATOR_NOT_FOUND_MESSAGE,
     EMULATOR_NOT_FOUND_REMEDY,
-    SdkToolError,
     get_emulator_path,
     missing_emulator_error,
     run_sdk_tool,
@@ -342,29 +341,19 @@ def _fail(error: object, *, json_mode: bool) -> None:
     sys.exit(1)
 
 
-def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback.
+def main(argv: list[str] | None = None):
+    """Main entry point.
 
-    The net, not the handler: modes are dispatched under a try that knows
-    whether ``--json`` was asked for (see :func:`_run`).
+    AVD discovery that could not run (SdkToolError) is a failure, never an
+    empty listing -- an agent reading "No AVDs found" cannot tell that from a
+    host where the SDK is not installed (X3) -- and an adb error carries its
+    own remedy. Both raise, and common.cli reports them in the shape the caller
+    asked for, which is what the two handlers here and the one in ``_run``
+    each did a copy of.
     """
     parser = _build_parser()
-    args = parser.parse_args()
-    try:
-        _run(parser, args)
-    except SdkToolError as error:
-        # AVD discovery could not run. Reported as a failure, never as an empty
-        # listing: an agent reading "No AVDs found" cannot tell that from a
-        # host where the SDK is not installed (X3).
-        _fail(error, json_mode=args.json)
-    except adb_exec.AdbError as error:
-        # run_adb raises errors whose message already names a remedy ("pass
-        # --serial ...", "start an emulator ..."). That message is the point.
-        #
-        # Parsed BEFORE the try so these handlers know whether --json was asked
-        # for; they did not, and answered a --json caller with prose on stderr
-        # and an empty stdout (R1's shape, F2's instruction for this script).
-        _fail(error, json_mode=args.json)
+    args = parser.parse_args(argv)
+    _dispatch(parser, args)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -413,17 +402,6 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
 
     return parser
-
-
-def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Run the requested mode. Exits the process; never returns normally."""
-    try:
-        _dispatch(parser, args)
-    except (SdkToolError, adb_exec.AdbError) as error:
-        # Caught HERE, where --json is known: main() cannot see it, so every
-        # mode -- not just --list-avds -- reports the failure in the shape the
-        # caller asked for.
-        _fail(error, json_mode=args.json)
 
 
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -498,4 +476,4 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

@@ -25,6 +25,8 @@ import appearance
 import pytest
 from appearance import AppearanceController
 
+from common import cli
+
 
 class _FakeCompleted:
     """Minimal stand-in for subprocess.CompletedProcess."""
@@ -237,10 +239,11 @@ def test_device_error_is_raised_rather_than_reported_as_a_failed_setting(failing
         AppearanceController().set_theme("dark")
 
 
-def test_unknown_serial_exits_one_with_an_actionable_message(
+def test_unknown_serial_exits_3_with_an_actionable_message(
     monkeypatch, capsys, failing_adb, recorded_anywhere
 ):
-    """A wrong --serial must yield a remedy and exit 1, never a traceback."""
+    """A wrong --serial must yield a remedy and exit 3 (device unavailable), never a
+    traceback. Reported by common.cli, as for every script."""
     failing_adb(recorded_anywhere("adb_device_not_found"))
     monkeypatch.setattr(appearance, "resolve_device_identifier", lambda value: value)
     monkeypatch.setattr(
@@ -248,9 +251,9 @@ def test_unknown_serial_exits_one_with_an_actionable_message(
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        appearance.main()
+        cli.run(appearance.main)
 
-    assert excinfo.value.code == 1
+    assert excinfo.value.code == 3
     captured = capsys.readouterr()
     assert captured.err.startswith("Error: ")
     assert "adb devices" in captured.err, "the error does not say how to see what is attached"

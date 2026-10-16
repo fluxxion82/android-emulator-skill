@@ -94,7 +94,7 @@ from gesture import GestureSimulator
 # the screen.
 from screen_mapper import ScreenMapper
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import (
     quote_for_device_shell,
     resolve_device_identifier,
@@ -102,7 +102,6 @@ from common.device_utils import (
 from common.env_config import env_float, env_int
 from common.hierarchy import (
     CAPTURE_ATTEMPTS,
-    HierarchyError,
     bare_resource_id,
     capture_hierarchy,
     is_actionable,
@@ -1040,11 +1039,20 @@ class _JsonAwareParser(argparse.ArgumentParser):
     missing.
 
     ``--json`` is read from argv rather than from parsed arguments because the
-    error happens *during* parsing, when there are none.
+    error happens *during* parsing, when there are none -- and from the argv
+    this parser was handed, not ``sys.argv``, because ``cli.run`` hands ``main``
+    one and the two can differ.
     """
 
+    _argv: list[str] | None = None
+
+    def parse_args(self, args=None, namespace=None):
+        self._argv = list(sys.argv[1:] if args is None else args)
+        return super().parse_args(args, namespace)
+
     def error(self, message: str):
-        if "--json" in sys.argv[1:]:
+        argv = sys.argv[1:] if self._argv is None else self._argv
+        if cli.wants_json(argv):
             print(json_lib.dumps({"error": message}, indent=2))
             sys.exit(2)
         super().error(message)
@@ -1088,7 +1096,7 @@ def _scroll_budget(value: str) -> int:
         raise argparse.ArgumentTypeError(str(error).replace("--max-scrolls ", "")) from None
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = _JsonAwareParser(
         description="Android semantic element navigation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1184,7 +1192,7 @@ Environment overrides:
         help="Report each screen searched and each scroll issued",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # An action needs a target (C2).
     #
@@ -1204,33 +1212,16 @@ Environment overrides:
             f"screen_mapper.py) to see what is on the screen."
         )
 
-    # Resolve device
-    try:
-        serial = resolve_device_identifier(args.serial)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    navigator = Navigator(serial)
-
-    try:
-        _run_action(navigator, args)
-    except (adb_exec.AdbError, HierarchyError) as error:
-        # Either the command never reached a device, or the screen would not
-        # hold still long enough to dump. Both errors name their remedy, so
-        # print it rather than letting a traceback bury it. HierarchyError
-        # reaches here often now that a scroll search dumps the screen once per
-        # scroll, each dump landing just after a fling.
-        print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+    # A device that cannot be resolved, a command that never reached it, or a
+    # screen that would not hold still long enough to dump: all three raise, and
+    # common.cli reports them. HierarchyError reaches it often, now that a scroll
+    # search dumps the screen once per scroll, each dump landing after a fling.
+    serial = resolve_device_identifier(args.serial)
+    _run_action(Navigator(serial), args)
 
 
 def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
-    """Perform the requested action, exiting with its status.
-
-    Split out of ``main()`` only so that every adb failure raised anywhere in
-    here lands in the single ``except adb_exec.AdbError`` above.
-    """
+    """Perform the requested action, exiting with its status."""
     # List mode
     if args.list:
         elements = navigator.list_elements()
@@ -1446,4 +1437,4 @@ def _search_json(search: ScrollSearch) -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

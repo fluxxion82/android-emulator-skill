@@ -34,6 +34,7 @@ from crash_triage import (
     select_app_frame,
 )
 
+from common import adb_exec, cli
 from common.adb_exec import AdbResult
 
 FIXTURE = "logcat_crash_java"
@@ -481,15 +482,35 @@ def test_help_documents_the_exit_status_choice():
 
 
 def test_adb_failure_is_distinguishable_from_a_crash_free_device(monkeypatch, capsys):
+    """An adb failure is the boundary's typed refusal -- not a traceback.
+
+    The fake raises the real class from common.adb_exec. It used to raise
+    ``crash_triage.AdbError``, a name this module stopped importing, so it
+    raised AttributeError instead -- and the test still passed, because the
+    boundary exits 1 for a defect too and "device offline" was in the
+    traceback's echo of the fake's own source line. Hence the exact lines and
+    the absence of a traceback below.
+    """
+
     def explode(*_args, **_kwargs):
-        raise crash_triage.AdbError("device offline")
+        raise adb_exec.AdbError("device offline")
 
     monkeypatch.setattr(crash_triage, "run_adb", explode)
     monkeypatch.setattr(crash_triage, "resolve_device_identifier", lambda _i: "emulator-5554")
     monkeypatch.setattr(sys, "argv", ["crash_triage.py"])
 
-    assert crash_triage.main() == crash_triage.EXIT_ERROR
-    assert "device offline" in capsys.readouterr().err
+    # Reported by common.cli now, not by a handler in main().
+    with pytest.raises(SystemExit) as exc:
+        cli.run(crash_triage.main)
+    captured = capsys.readouterr()
+
+    assert exc.value.code == crash_triage.EXIT_ERROR
+    assert "Traceback" not in captured.err, captured.err
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "Error: device offline",
+        f"Remedy: {cli.DEFAULT_REMEDIES[adb_exec.AdbError]}",
+    ]
 
 
 # === unparsed content is named, never dropped ===

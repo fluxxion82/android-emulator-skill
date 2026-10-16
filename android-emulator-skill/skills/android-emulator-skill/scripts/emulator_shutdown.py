@@ -23,7 +23,7 @@ import json
 import sys
 import time
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.device_utils import get_connected_devices
 from common.emu_console import (
     EmulatorProbeError,
@@ -100,6 +100,10 @@ class EmulatorShutdown:
         # spell by hand.
         try:
             run_emu("kill", serial=self.serial, timeout=CONSOLE_KILL_TIMEOUT)
+        except adb_exec.DeviceError:
+            # The one emulator asked for is not there: common.cli reports it,
+            # exit 3. `--all` decides for itself whether to go on (below).
+            raise
         except adb_exec.AdbError as error:
             return False, f"Shutdown failed: {self.serial}: {error}"
         except Exception as e:
@@ -251,7 +255,13 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
 
     for emu in emulators:
         shutdown = EmulatorShutdown(emu["serial"])
-        success, _ = shutdown.shutdown(verify=verify)
+        try:
+            success, _ = shutdown.shutdown(verify=verify)
+        except adb_exec.DeviceError:
+            # One emulator went away between the survey and its kill. The batch
+            # goes on to the others: continuing is the batch's call, made here,
+            # not the single-target shutdown's.
+            success = False
         if success:
             success_count += 1
         else:
@@ -260,21 +270,12 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
     return (success_count, fail_count)
 
 
-def main():
-    """Main entry point: run the CLI, reporting adb failures without a traceback."""
+def main(argv: list[str] | None = None):
+    """Main entry point. An adb failure raises, and common.cli reports it in the
+    shape the caller asked for -- `--all --json` included (F1)."""
     parser = _build_parser()
-    args = parser.parse_args()
-    try:
-        _run(parser, args)
-    except adb_exec.AdbError as error:
-        # run_adb raises errors whose message already names a remedy ("pass
-        # --serial ...", "start an emulator ..."). That message is the point.
-        #
-        # Parsed BEFORE the try so this handler knows whether --json was asked
-        # for. It did not, so `--all --json` against a broken adb exited 1 with
-        # prose on stderr and an EMPTY stdout -- the same defect R1 fixed in
-        # emulator_erase, still live here (F1).
-        _fail(error, json_mode=args.json)
+    args = parser.parse_args(argv)
+    _run(parser, args)
 
 
 def _fail(error: object, *, json_mode: bool) -> None:
@@ -414,4 +415,4 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

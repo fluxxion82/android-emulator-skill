@@ -622,10 +622,12 @@ def test_permission_actions_require_a_package(monkeypatch, fake_adb):
 
 def test_every_subprocess_run_passes_check_and_timeout_explicitly():
     """An unbounded adb call wedges the connection for whatever runs next."""
+    # Bound to `subprocess.run`, not to any `.run`: the script's `cli.run(main)`
+    # is the CLI boundary, not a subprocess call.
     runs = [
         node
         for node in ast.walk(TREE)
-        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "run"
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.run"
     ]
     assert runs, "module no longer calls subprocess.run"
     for node in runs:

@@ -120,6 +120,8 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+from common import cli  # noqa: E402 -- needs the path set above
+
 
 @dataclass(frozen=True)
 class Route:
@@ -465,4 +467,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.run(main)
