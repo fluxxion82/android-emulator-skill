@@ -626,14 +626,22 @@ def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
 
 
 def _pipeline(lines: list[str]):
-    """Recorded lines -> (events, clusters), the composition both readers use.
+    """Recorded lines -> (events, clusters), as the session path composes them.
 
-    ``anr_watcher``'s ``--since``/``--watch`` reader (``_handle_line``) and its
-    session worker (``_read_stream_into_events``) both run each line through
-    ``parse_logcat_anr`` and then ``build_normalised_event``; ``--stop``
-    clusters with ``cluster_events``. If D5's fix introduces a multi-line
-    entry point, both readers must go through it, and this helper must be
-    pointed at it too -- the assertions below do not change.
+    What each of ``anr_watcher``'s readers actually runs:
+
+    - the legacy ``--since``/``--watch`` reader (``_handle_line``,
+      ``anr_watcher.py:265-274``) only PARSES: ``parse_logcat_anr``, then it
+      prints the raw event. Its count is pinned through the CLI below.
+    - the session worker (``_read_stream_into_events``, ``:676-694``) parses
+      and normalises (``build_normalised_event``); ``--stop`` clusters when it
+      builds the summary (``anr_sessions.py:402`` -> ``cluster_events`` via
+      ``anr_pipeline.py:909``).
+
+    This helper is the session composition, run over recorded lines without a
+    stream. The parse stage is shared, so a classification fix shows in both.
+    If D5's fix introduces a multi-line entry point, the readers and this
+    helper must go through it -- the assertions below do not change.
     """
     from common import anr_pipeline as p
 
@@ -727,7 +735,10 @@ def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(recorded):
     substituted (counts cannot be recorded to order; everything else can).
     """
     events, clusters = _pipeline(_jank_lines(recorded, (31, 45, 52, 120)))
-    assert len(events) == 4, [e.raw_message for e in events]
+    if len(events) != 4:
+        pytest.fail(
+            f"four recorded jank lines gave {len(events)} events: {[e.raw_message for e in events]}"
+        )
     assert len(clusters) == 1, [c.symbol_or_prefix for c in clusters]
 
 
@@ -889,7 +900,8 @@ def test_n9_a_zero_duration_cluster_diffs_to_finite_json(toolchain, recorded):
     assert silent.fingerprint in result.stdout, "the 0 -> N cluster vanished from the diff"
 
     text = toolchain.run("anr_watcher.py", "--diff", before, after)
-    assert text.returncode == 0, text.stderr
+    if text.returncode != 0:
+        pytest.fail(f"text-mode --diff did not run:\n{text.stderr}")
 
 
 # ===========================================================================

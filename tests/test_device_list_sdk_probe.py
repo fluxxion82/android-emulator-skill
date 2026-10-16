@@ -74,7 +74,8 @@ def test_n2_avdmanager_is_found_where_the_warning_says_it_was_looked_for(
     """
     chain = sdk_layout_toolchain
     result = chain.run(SCRIPT, "--json")
-    assert result.returncode == 0, result.stdout + result.stderr
+    if result.returncode != 0:
+        pytest.fail(f"device_list failed outright:\n{result.stdout}{result.stderr}")
     payload = json.loads(result.stdout)
 
     avdmanager_warnings = [w for w in payload.get("warnings", []) if "avdmanager" in w]
