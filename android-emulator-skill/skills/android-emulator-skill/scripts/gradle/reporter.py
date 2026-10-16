@@ -61,21 +61,7 @@ class OutputFormatter:
         dur = OutputFormatter._duration(duration)
 
         if test_info:
-            total = test_info.get("total", 0)
-            passed = test_info.get("passed", 0)
-            failed = test_info.get("failed", 0)
-            skipped = test_info.get("skipped", 0)
-            # `errors` counts <error> testcases -- anything that threw, including
-            # a crash in @Before/setUp. Omitting them from the verdict reported a
-            # suite of 10 with 5 errors as "PASS (5/10 passed, 0 failed,
-            # 0 skipped)": a pass claim, with numbers that do not sum.
-            errored = test_info.get("errors", 0)
-            not_passing = failed + errored
-            test_status = "PASS" if not_passing == 0 and status != "FAILED" else "FAIL"
-            counts = f"{passed}/{total} passed, {failed} failed"
-            if errored:
-                counts += f", {errored} errors"
-            lines.append(f"Tests: {test_status} ({counts}, {skipped} skipped) [{build_id}]")
+            lines.append(f"{OutputFormatter.test_summary(status, test_info)} [{build_id}]")
         else:
             lines.append(
                 f"Build: {status} ({error_count} errors, {warning_count} warnings) "
@@ -93,6 +79,36 @@ class OutputFormatter:
             )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def test_summary(status: str, test_info: dict) -> str:
+        """The test verdict line every text mode prints, minimal and verbose alike.
+
+        One function, so the two modes cannot disagree about one run: verbose
+        once judged by ``failed`` alone while minimal also counted ``errors``.
+
+        Args:
+            status: The run's verdict, "SUCCESS" or "FAILED".
+            test_info: Aggregated test result dict.
+
+        Returns:
+            e.g. ``Tests: FAIL (1/5 passed, 3 failed, 1 skipped)``.
+        """
+        total = test_info.get("total", 0)
+        passed = test_info.get("passed", 0)
+        failed = test_info.get("failed", 0)
+        skipped = test_info.get("skipped", 0)
+        # `errors` counts <error> testcases -- anything that threw, including
+        # a crash in @Before/setUp. Omitting them from the verdict reported a
+        # suite of 10 with 5 errors as "PASS (5/10 passed, 0 failed,
+        # 0 skipped)": a pass claim, with numbers that do not sum.
+        errored = test_info.get("errors", 0)
+        not_passing = failed + errored
+        test_status = "PASS" if not_passing == 0 and status != "FAILED" else "FAIL"
+        counts = f"{passed}/{total} passed, {failed} failed"
+        if errored:
+            counts += f", {errored} errors"
+        return f"Tests: {test_status} ({counts}, {skipped} skipped)"
 
     @staticmethod
     def format_errors(errors: list[dict], limit: int = BUILD_VERBOSE_CAP) -> str:
@@ -195,16 +211,9 @@ class OutputFormatter:
         lines: list[str] = []
 
         if test_info:
-            total = test_info.get("total", 0)
-            passed = test_info.get("passed", 0)
-            failed = test_info.get("failed", 0)
-            skipped = test_info.get("skipped", 0)
-            test_status = "PASS" if failed == 0 and status != "FAILED" else "FAIL"
-            lines.append(f"Tests: {test_status}")
-            lines.append(f"  Total:   {total}")
-            lines.append(f"  Passed:  {passed}")
-            lines.append(f"  Failed:  {failed}")
-            lines.append(f"  Skipped: {skipped}")
+            # Minimal's verdict line, counts and all; the detail verbose adds is
+            # below (failed tests, errors, warnings), not a second tally.
+            lines.append(OutputFormatter.test_summary(status, test_info))
         else:
             lines.append(f"Build: {status}")
 

@@ -194,10 +194,13 @@ def recorded_gradle():
     though: a parser test consumes these files and never a literal. Recorded by
     ``tests/record_gradle_fixtures.py`` from the checked-in scaffolds under
     ``tests/fixtures/scaffold/``.
-    """
-    root = RECORDED_ROOT / "gradle-8.13"
 
-    def _load(name: str) -> str:
+    ``version`` reaches another Gradle's corpus -- for output only an older
+    Gradle prints, such as 7.5.1 refusing ``--rerun``.
+    """
+
+    def _load(name: str, version: str = "8.13") -> str:
+        root = RECORDED_ROOT / f"gradle-{version}"
         # Not every Gradle fixture is a build log: the JUnit XML is a file the
         # build *writes*, so the corpus holds .xml as well as .txt.
         candidates = [root / name] if "." in name else [root / f"{name}.txt", root / f"{name}.xml"]

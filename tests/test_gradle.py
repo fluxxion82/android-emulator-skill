@@ -8,6 +8,10 @@ build run is involved.
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -292,6 +296,106 @@ def test_find_test_result_files_missing_path(tmp_path: Path):
     assert find_test_result_files(tmp_path / "does-not-exist") == []
 
 
+# --- Which reports are THIS run's (N6, D9) -----------------------------------
+#
+# Measured on tests/fixtures/scaffold/compose, Gradle 8.13: a second identical
+# `:app:testDebugUnitTest` run is UP-TO-DATE, exits 0 and leaves the previous
+# report's mtime untouched. The directory outlives the run, so "every XML in
+# it" is the previous run's verdict, reported as this one's.
+#
+# "This run's" is exact: BuildRunner deletes the task's reports before Gradle
+# starts, and everything in the directory afterwards was written by the run.
+# Two heuristics came first and both had holes (review of PR #23): an mtime
+# cutoff, defeated by a filesystem that rounds or lags, and an (mtime, size)
+# snapshot, which dropped a failing report Gradle rewrote byte for byte. The
+# builder tests below use exactly the inputs each of those got wrong.
+
+TASK = "testDebugUnitTest"
+
+
+def _report(directory: Path, class_name: str, text: str, mtime: float) -> Path:
+    """Write a recorded JUnit suite as Gradle names it, with a chosen mtime."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"TEST-{class_name}.xml"
+    path.write_text(text, encoding="utf-8")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_another_tasks_reports_are_not_this_tasks(tmp_path: Path, recorded_gradle):
+    """`testReleaseUnitTest` writes beside `testDebugUnitTest`; a debug run reads only its own."""
+    build = tmp_path / "app" / "build" / "test-results"
+    mine = _report(
+        build / TASK,
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        time.time(),
+    )
+    _report(
+        build / "testReleaseUnitTest",
+        "com.example.BeforeThrowsTest",
+        recorded_gradle("junit_xml_error_case"),
+        time.time(),
+    )
+
+    assert find_test_result_files(tmp_path, task=TASK) == [mine]
+
+
+def _gradles_spelling_of(requested: str, recorded_gradle) -> str:
+    """The variant as Gradle resolved ``requested`` in the recorded miscased build.
+
+    gradle_miscased_variant_resolves ran ``:app:assembleProstagingdebug``; the
+    log names the task Gradle actually ran. Read from the recording, not typed.
+    """
+    log = recorded_gradle("gradle_miscased_variant_resolves")
+    match = re.search(r"^> Task :app:assemble(\w+)$", log, re.MULTILINE)
+    if match is None:
+        pytest.fail("the recorded log no longer names the task Gradle ran")
+    resolved = match.group(1)
+    assert (
+        resolved.casefold() == requested.casefold() and resolved != requested
+    ), f"the recording no longer shows {requested!r} resolving to another spelling: {resolved!r}"
+    return resolved
+
+
+def test_the_task_directory_is_matched_in_gradles_spelling(tmp_path: Path, recorded_gradle):
+    """`--variant prostagingdebug` asks for testProstagingdebugUnitTest.
+
+    Gradle resolves that to testProStagingDebugUnitTest and writes the reports
+    under that name; an exact-case glob found nothing and refused a run that
+    had results.
+    """
+    resolved = _gradles_spelling_of("Prostagingdebug", recorded_gradle)
+    report = _report(
+        tmp_path / "app" / "build" / "test-results" / f"test{resolved}UnitTest",
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        time.time(),
+    )
+
+    found = find_test_result_files(tmp_path, task="testProstagingdebugUnitTest")
+    assert found == [report]
+
+
+def test_d9_an_xml_file_gradle_did_not_name_as_a_report_is_not_one(tmp_path: Path, recorded_gradle):
+    """D9: `*.xml` returned every top-level XML file, whatever it was.
+
+    The stray file here is a real JUnit suite, copied somewhere Gradle does not
+    write and under a name Gradle does not use -- the case where the old glob
+    did harm, inflating the count with two failures no run of this task
+    produced. Gradle names its reports ``TEST-<class>.xml``.
+    """
+    results = tmp_path / "app" / "build" / "test-results" / "testDebugUnitTest"
+    report = _report(
+        results, "com.example.PassingTest", recorded_gradle("junit_xml_passing_case"), time.time()
+    )
+    (tmp_path / "copied-report.xml").write_text(
+        recorded_gradle("junit_xml_error_case"), encoding="utf-8"
+    )
+
+    assert find_test_result_files(tmp_path) == [report]
+
+
 # --- Build output parsing ----------------------------------------------------
 #
 # Every input here is a RECORDED Gradle run (tests/record_gradle_fixtures.py
@@ -467,6 +571,61 @@ def test_format_test_failures():
     assert "expected 1 got 2" in out
 
 
+def _recorded_run_counts(tmp_path: Path, recorded_gradle) -> dict:
+    """The aggregate of the three suites one recorded `test` run wrote."""
+    results = tmp_path / "app" / "build" / "test-results" / "testDebugUnitTest"
+    for class_name, fixture in (
+        ("com.example.BeforeThrowsTest", "junit_xml_error_case"),
+        ("com.example.PassingTest", "junit_xml_passing_case"),
+        ("com.example.SkippedAndErrorTest", "junit_xml_skipped_case"),
+    ):
+        _report(results, class_name, recorded_gradle(fixture), time.time())
+    return aggregate_test_results(find_test_result_files(tmp_path))
+
+
+@pytest.mark.parametrize("status", ["SUCCESS", "FAILED"])
+def test_minimal_and_verbose_open_with_the_same_verdict_line(status, tmp_path, recorded_gradle):
+    """X7: the text modes must not disagree about one run.
+
+    Verbose judged by ``failed`` alone and printed its counts one per line;
+    minimal also counted ``errors``. Both now open with one shared line.
+    """
+    test_info = _recorded_run_counts(tmp_path, recorded_gradle)
+    common = {"error_count": 0, "warning_count": 0, "build_id": "b1", "duration": 1.0}
+    minimal = OutputFormatter.format_minimal(status=status, test_info=test_info, **common)
+    verbose = OutputFormatter.format_verbose(status=status, test_info=test_info, **common)
+
+    assert minimal.splitlines()[0] == f"{verbose.splitlines()[0]} [b1]"
+    assert verbose.splitlines()[0] == "Tests: FAIL (1/5 passed, 3 failed, 1 skipped)"
+
+
+def test_verbose_counts_errored_tests_as_not_passing(recorded_gradle):
+    """An `<error>` testcase failed the minimal verdict and passed the verbose one.
+
+    The element is grafted onto a real recorded suite, as in
+    test_the_error_branch_works_for_xml_gradle_does_not_write: Gradle itself
+    writes `<failure>` for every throw this repo could provoke.
+    """
+    foreign = (
+        recorded_gradle("junit_xml_skipped_case")
+        .replace("<failure ", "<error ")
+        .replace("</failure>", "</error>")
+    )
+    test_info = parse_junit_xml(foreign)
+    assert (test_info["failed"], test_info["errors"]) == (0, 1)
+
+    verbose = OutputFormatter.format_verbose(
+        status="SUCCESS",
+        error_count=0,
+        warning_count=0,
+        build_id="b1",
+        duration=1.0,
+        test_info=test_info,
+    )
+    assert verbose.splitlines()[0].startswith("Tests: FAIL"), verbose
+    assert "1 errors" in verbose.splitlines()[0], verbose
+
+
 # --- Config round-trip -------------------------------------------------------
 
 
@@ -617,3 +776,438 @@ def test_build_runner_test_task_and_suite(tmp_path: Path, monkeypatch):
     assert "--tests" in captured["cmd"]
     assert "com.example.MyTest" in captured["cmd"]
     assert ":app:testDebugUnitTest" in result.failed_tasks
+
+
+@pytest.mark.parametrize("suite", [None, "com.example.MyTest"])
+def test_the_test_task_is_always_rerun(suite, tmp_path: Path, monkeypatch):
+    """N6: an UP-TO-DATE test task exits 0 and writes no report.
+
+    `--rerun` is a task option and binds to the task named before it, so it has
+    to follow the test task itself -- not `--tests`' value, not the end of argv.
+    """
+    import gradle.builder as builder_mod
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    captured: dict = {}
+
+    def fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    BuildRunner(str(project), module=":app").test(suite=suite)
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index(":app:testDebugUnitTest") + 1] == "--rerun", cmd
+    if suite:
+        assert cmd[cmd.index("--tests") + 1] == suite, cmd
+
+
+def _gradle_that_writes(monkeypatch, returncode: int, log: str, writes=(), lag: float = 0.0):
+    """Mock gradlew: write ``writes`` (path, recorded text) DURING the run, then exit.
+
+    Gradle writes its JUnit XML while the test task runs, after the builder's
+    snapshot -- so a report written here is this run's result. ``lag`` stamps
+    each written report that many seconds in the past: a filesystem clock
+    behind the host's, or one that rounds.
+    """
+    import gradle.builder as builder_mod
+
+    def fake_run(cmd, **_kwargs):
+        for path, text in writes:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            if lag:
+                stamp = time.time() - lag
+                os.utime(path, (stamp, stamp))
+        return subprocess.CompletedProcess(cmd, returncode, stdout=log, stderr="")
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+
+
+def _results(project: Path, module: str = "app") -> Path:
+    return project / module / "build" / "test-results" / "testDebugUnitTest"
+
+
+def test_x7_failing_tests_fail_the_run_when_gradle_exits_zero(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """X7: `ignoreFailures = true` -- BUILD SUCCESSFUL, exit 0, two failures in the XML."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_junit_error_ignorefailures"),
+        [
+            (
+                _results(project) / "TEST-com.example.BeforeThrowsTest.xml",
+                recorded_gradle("junit_xml_error_case"),
+            )
+        ],
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.returncode == 0
+    assert result.test_results["failed"] == 2
+    assert result.success is False
+
+
+def test_x7_an_errored_test_fails_the_run_too(tmp_path: Path, monkeypatch, recorded_gradle):
+    """`<error>` counts as well as `<failure>` (grafted: Gradle writes only `<failure>`)."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    foreign = (
+        recorded_gradle("junit_xml_skipped_case")
+        .replace("<failure ", "<error ")
+        .replace("</failure>", "</error>")
+    )
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_junit_error_ignorefailures"),
+        [(_results(project) / "TEST-com.example.SkippedAndErrorTest.xml", foreign)],
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert (result.test_results["failed"], result.test_results["errors"]) == (0, 1)
+    assert result.success is False
+
+
+def test_a_green_run_still_passes(tmp_path: Path, monkeypatch, recorded_gradle):
+    """Guard against over-correcting X7 into always-FAIL."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project) / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is True
+    assert result.no_test_results is False
+    assert result.test_results["passed"] == 1
+
+
+def test_n6_no_report_from_this_run_is_not_a_pass(tmp_path: Path, monkeypatch, recorded_gradle):
+    """Gradle exited 0 and wrote nothing; an older passing report sits in the directory."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _report(
+        _results(project),
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        time.time() - 3600,
+    )
+    _gradle_that_writes(monkeypatch, 0, recorded_gradle("gradle_build_successful"))
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.test_results is None
+    assert result.no_test_results is True
+    assert result.success is False
+    assert result.results_dir == str(_results(project))
+
+
+def test_a_gradle_failure_without_reports_is_a_build_failure(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Gradle's own failure is the verdict; it is not the no-results case."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _gradle_that_writes(monkeypatch, 1, recorded_gradle("gradle_task_not_found"))
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is False
+    assert result.no_test_results is False
+    assert result.rerun_unsupported is False, "a failure that is not about --rerun"
+    assert result.test_results is None
+    assert result.errors, "the recorded failure's reason must still be reported"
+
+
+def test_a_report_left_just_before_the_run_is_not_its_result(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Half a second old and untouched by the run: a clock cutoff called this fresh."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _report(
+        _results(project),
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        time.time() - 0.5,
+    )
+    _gradle_that_writes(monkeypatch, 0, recorded_gradle("gradle_build_successful"))
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.no_test_results is True
+    assert result.success is False
+
+
+def test_a_report_the_run_wrote_counts_however_far_behind_its_clock_is(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """The run rewrote the report; the filesystem stamped it an hour ago. Still this run's."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    report = _report(
+        _results(project),
+        "com.example.BeforeThrowsTest",
+        recorded_gradle("junit_xml_error_case"),
+        time.time() - 7200,
+    )
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_junit_error_ignorefailures"),
+        [(report, recorded_gradle("junit_xml_error_case"))],
+        lag=3600,
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.no_test_results is False
+    assert result.test_results["failed"] == 2
+    assert result.success is False
+
+
+def test_the_run_reads_reports_under_gradles_spelling_of_the_task(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """`--variant prostagingdebug`: Gradle runs and writes testProStagingDebugUnitTest."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    resolved = _gradles_spelling_of("Prostagingdebug", recorded_gradle)
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_miscased_variant_resolves"),
+        [
+            (
+                project
+                / "app"
+                / "build"
+                / "test-results"
+                / f"test{resolved}UnitTest"
+                / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
+    result = BuildRunner(str(project), module=":app", variant="prostagingdebug").test()
+
+    assert result.tasks[0] == ":app:testProstagingdebugUnitTest", "the caller's spelling is sent"
+    assert result.no_test_results is False
+    assert result.test_results["passed"] == 1
+    assert result.success is True
+
+
+def test_a_gradle_older_than_7_6_is_named_as_the_cause(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Gradle 7.5.1's answer to --rerun, recorded: the run is refused for that reason."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _gradle_that_writes(
+        monkeypatch, 1, recorded_gradle("gradle_rerun_unknown_option", version="7.5.1")
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.rerun_unsupported is True
+    assert result.no_test_results is False
+    assert result.success is False
+
+
+def test_an_assemble_is_never_a_missing_test_result(tmp_path: Path, monkeypatch, recorded_gradle):
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _gradle_that_writes(monkeypatch, 0, recorded_gradle("gradle_build_successful"))
+    result = BuildRunner(str(project), module=":app").build()
+
+    assert result.success is True
+    assert result.no_test_results is False
+
+
+def test_a_module_run_reads_only_that_modules_reports(tmp_path: Path, monkeypatch, recorded_gradle):
+    """`--module :app` runs `:app:testDebugUnitTest`; a `lib/` report is not its result."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    for module in ("app", "lib"):
+        (project / module).mkdir()
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project) / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            ),
+            (
+                _results(project, "lib") / "TEST-com.example.BeforeThrowsTest.xml",
+                recorded_gradle("junit_xml_error_case"),
+            ),
+        ],
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.test_results["total"] == 1
+    assert result.success is True
+
+
+def _keep_mtime(path: Path, text: str):
+    """A write that leaves ``path`` byte-identical with its old mtime.
+
+    Gradle rewriting an unchanged report on a filesystem whose clock has not
+    moved on. The (mtime, size) snapshot could not tell this from "untouched".
+    """
+    stat = path.stat()
+
+    def write() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    return write
+
+
+def _gradle_that_runs(monkeypatch, returncode: int, log: str, actions=(), seen=None):
+    """Mock gradlew that performs ``actions`` (callables) during the run.
+
+    ``seen``, if given, receives every file under the project at the moment
+    Gradle starts -- what the builder left in place for it.
+    """
+    import gradle.builder as builder_mod
+
+    def fake_run(cmd, cwd, **_kwargs):
+        if seen is not None:
+            seen.update(p for p in Path(cwd).rglob("*") if p.is_file())
+        for action in actions:
+            action()
+        return subprocess.CompletedProcess(cmd, returncode, stdout=log, stderr="")
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+
+
+def test_a_sole_report_rewritten_byte_for_byte_is_counted(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """The run rewrote its one failing report identically, same mtime: still the result."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    text = recorded_gradle("junit_xml_error_case")
+    report = _report(_results(project), "com.example.BeforeThrowsTest", text, time.time() - 60)
+    _gradle_that_runs(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_junit_error_ignorefailures"),
+        [_keep_mtime(report, text)],
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.no_test_results is False
+    assert result.test_results["failed"] == 2
+    assert result.success is False
+
+
+def test_an_identical_failing_rewrite_beside_a_new_passing_report_fails(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """The false pass the snapshot produced: one failure rewritten identically, one new pass."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    failing = recorded_gradle("junit_xml_skipped_case")
+    report = _report(
+        _results(project), "com.example.SkippedAndErrorTest", failing, time.time() - 60
+    )
+    passing = _results(project) / "TEST-com.example.PassingTest.xml"
+    passing_text = recorded_gradle("junit_xml_passing_case")
+    _gradle_that_runs(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_junit_error_ignorefailures"),
+        [
+            _keep_mtime(report, failing),
+            lambda: passing.write_text(passing_text, encoding="utf-8"),
+        ],
+    )
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.test_results["failed"] == 1
+    assert result.test_results["passed"] == 1
+    assert result.success is False
+
+
+def test_a_report_outside_the_tasks_directory_is_neither_deleted_nor_collected(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """D9 and the delete's reach: another task's report and a stray copy are left alone."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    other_task = _report(
+        project / "app" / "build" / "test-results" / "testReleaseUnitTest",
+        "com.example.BeforeThrowsTest",
+        recorded_gradle("junit_xml_error_case"),
+        time.time() - 60,
+    )
+    stray = project / "app" / "copied-report.xml"
+    stray.write_text(recorded_gradle("junit_xml_error_case"), encoding="utf-8")
+    _gradle_that_runs(monkeypatch, 0, recorded_gradle("gradle_build_successful"))
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert other_task.exists() and stray.exists(), "a file outside the task's reports was deleted"
+    assert result.no_test_results is True, "a report outside the task's directory was collected"
+
+
+def test_the_pre_run_delete_touches_only_this_tasks_reports(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """What Gradle finds when it starts: the task's TEST-*.xml gone, everything else in place.
+
+    Including the task's own `binary/` results (measured: Gradle keeps them
+    beside the XML) and the same task's reports in a module `--module` did not
+    name.
+    """
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (project / "lib").mkdir()
+    task_dir = _results(project)
+    stale = _report(
+        task_dir, "com.example.PassingTest", recorded_gradle("junit_xml_passing_case"), 0
+    )
+    binary = task_dir / "binary" / "results.bin"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    other_module = _report(
+        _results(project, "lib"),
+        "com.example.BeforeThrowsTest",
+        recorded_gradle("junit_xml_error_case"),
+        0,
+    )
+    seen: set[Path] = set()
+    _gradle_that_runs(monkeypatch, 0, recorded_gradle("gradle_build_successful"), seen=seen)
+    BuildRunner(str(project), module=":app").test()
+
+    assert stale not in seen, "this task's old report survived into the run"
+    assert {binary, other_module, project / "gradlew"} <= seen, sorted(map(str, seen))

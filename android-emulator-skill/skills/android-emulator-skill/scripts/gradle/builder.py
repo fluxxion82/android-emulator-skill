@@ -26,6 +26,11 @@ from .results import (
     parse_build_output,
 )
 
+# What a Gradle older than 7.6 says when handed a task's --rerun (recorded:
+# gradle-7.5.1/gradle_rerun_unknown_option): "> Unknown command-line option
+# '--rerun'." in the "* What went wrong:" block, exit 1.
+RERUN_UNSUPPORTED = "Unknown command-line option '--rerun'"
+
 BUILD_TIMEOUT = env_int("ANDROID_EMU_BUILD_TIMEOUT", 1800)
 TEST_TIMEOUT = env_int("ANDROID_EMU_TEST_TIMEOUT", 2700)
 
@@ -48,6 +53,7 @@ class BuildResult:
         tasks: list[str],
         duration: float,
         returncode: int | None,
+        results_dir: str | None = None,
     ):
         self.success = success
         self.stdout = stdout
@@ -61,6 +67,26 @@ class BuildResult:
         self.tasks = tasks
         self.duration = duration
         self.returncode = returncode
+        # Where a test run's JUnit XML was looked for; None for a build.
+        self.results_dir = results_dir
+
+    @property
+    def rerun_unsupported(self) -> bool:
+        """A test run this project's Gradle refused because it predates ``--rerun`` (7.6)."""
+        return (
+            self.results_dir is not None
+            and self.returncode not in (None, 0)
+            and RERUN_UNSUPPORTED in f"{self.stdout}\n{self.stderr}"
+        )
+
+    @property
+    def no_test_results(self) -> bool:
+        """A test run Gradle called successful that left no test result of its own.
+
+        Not a pass: nothing says a test ran. ``build_and_test.py`` refuses it.
+        A run Gradle failed is not this case -- its own failure is the verdict.
+        """
+        return self.results_dir is not None and self.returncode == 0 and not self.test_results
 
 
 class BuildRunner:
@@ -152,11 +178,21 @@ class BuildRunner:
             BuildResult with parsed errors/warnings.
         """
         task = self._task_name("assemble")
-        return self._run([task], clean=clean, timeout=BUILD_TIMEOUT, is_test=False)
+        return self._run([task], clean=clean, timeout=BUILD_TIMEOUT)
 
     def test(self, clean: bool = False, suite: str | None = None) -> BuildResult:
         """
         Run unit tests (``test<Variant>UnitTest``) and parse JUnit XML.
+
+        The task is always run with ``--rerun`` (Gradle 7.6+). Without it a
+        test task whose inputs have not changed is UP-TO-DATE: Gradle exits 0
+        and writes no report, so the run has no result of its own to read.
+        Measured on the compose scaffold, Gradle 8.13: a second identical run
+        printed ``> Task :app:testDebugUnitTest UP-TO-DATE`` and left the
+        report's mtime unchanged; with ``--rerun`` only the test task executed
+        ("1 executed, 22 up-to-date") and the report was rewritten. Gradle
+        7.5.1 rejects the option (recorded: gradle_rerun_unknown_option), and
+        :attr:`BuildResult.rerun_unsupported` says so.
 
         Args:
             clean: Run a clean task first
@@ -166,18 +202,67 @@ class BuildRunner:
             BuildResult with parsed errors/warnings and aggregated test_results.
         """
         task = self._task_name("test") + "UnitTest"
-        extra = ["--tests", suite] if suite else []
-        return self._run([task, *extra], clean=clean, timeout=TEST_TIMEOUT, is_test=True)
+        # Task options bind to the task named before them, so this stays next to it.
+        extra = ["--rerun", *(["--tests", suite] if suite else [])]
+        return self._run([task, *extra], clean=clean, timeout=TEST_TIMEOUT, test_task=task)
 
-    def _run(self, tasks: list[str], *, clean: bool, timeout: int, is_test: bool) -> BuildResult:
+    def _results_root(self) -> Path:
+        """The directory a test run's reports are searched under: the module's, if it has one."""
+        if self.module:
+            module_dir = self.module.lstrip(":").replace(":", "/")
+            candidate = self.project_dir / module_dir
+            if candidate.exists():
+                return candidate
+        return self.project_dir
+
+    @staticmethod
+    def _clear_reports(root: Path, task: str) -> None:
+        """Delete the task's ``TEST-*.xml`` reports under ``root`` before Gradle runs.
+
+        After the run, everything in the task's results directory is then this
+        run's -- exactly, with no clock and no comparison. Both earlier
+        attempts were heuristics with a hole: an mtime cutoff refused fresh
+        reports on a filesystem that rounds or lags and accepted an untouched
+        one from just before the run; an (mtime, size) snapshot dropped a
+        failing report rewritten byte for byte, and a run with one new passing
+        report beside it passed (review of PR #23).
+
+        These are build outputs, and Gradle regenerates them: the test task
+        runs with ``--rerun``, and Gradle itself removes them when the task
+        has no source (measured: NO-SOURCE left no ``test-results`` behind).
+        Only ``TEST-*.xml`` directly in ``build/test-results/<task>/`` is
+        touched -- not the task's ``binary/`` results, not another task's
+        reports, not another module's when ``--module`` scopes ``root``.
+
+        Raises:
+            OSError: A report could not be deleted -- reading results then
+                would be guessing again, so the run does not start.
+        """
+        for path in find_test_result_files(root, task=task):
+            path.unlink(missing_ok=True)
+
+    def _run(
+        self,
+        tasks: list[str],
+        *,
+        clean: bool,
+        timeout: int,
+        test_task: str | None = None,
+    ) -> BuildResult:
         """
         Execute a gradlew command and assemble a BuildResult.
+
+        For a test run the verdict is Gradle's exit status AND the tests'.
+        ``test { ignoreFailures = true }`` makes Gradle print BUILD SUCCESSFUL
+        and exit 0 over failing tests (recorded: gradle_junit_error_ignorefailures),
+        so a run passes only if Gradle exited 0, this run wrote test results,
+        and they hold no ``<failure>`` and no ``<error>`` (X7).
 
         Args:
             tasks: Gradle task names (and any extra args)
             clean: Run a clean task first
             timeout: subprocess timeout in seconds
-            is_test: Whether to discover + parse JUnit XML afterwards
+            test_task: For a test run, the task whose JUnit XML this run wrote
 
         Returns:
             BuildResult.
@@ -185,6 +270,10 @@ class BuildRunner:
         import time
 
         cmd = self._build_command(tasks, clean)
+        name = test_task.rsplit(":", 1)[-1] if test_task is not None else None
+        root = self._results_root()
+        if name is not None:
+            self._clear_reports(root, name)
         start = time.time()
 
         try:
@@ -226,15 +315,27 @@ class BuildRunner:
         parsed = parse_build_output(stdout, stderr)
 
         test_results = None
-        if is_test:
-            search_root = self.project_dir
-            if self.module:
-                module_dir = self.module.lstrip(":").replace(":", "/")
-                candidate = self.project_dir / module_dir
-                if candidate.exists():
-                    search_root = candidate
-            xml_files = find_test_result_files(search_root)
-            test_results = aggregate_test_results(xml_files)
+        results_dir = None
+        if name is not None:
+            # The task's reports were cleared before the run, so whatever is
+            # in its directory now, this run wrote (N6).
+            scoped = root != self.project_dir
+            results_dir = str(
+                root / "build" / "test-results" / name
+                if scoped
+                else root / "**" / "build" / "test-results" / name
+            )
+            xml_files = find_test_result_files(root, task=name)
+            aggregate = aggregate_test_results(xml_files)
+            # A report with no test case in it (a truncated write parses to
+            # zero) is no more a result than no report at all.
+            test_results = aggregate if aggregate["total"] else None
+            success = (
+                success
+                and test_results is not None
+                and test_results["failed"] == 0
+                and test_results["errors"] == 0
+            )
 
         # Learn the module/variant on success (never let config break the build).
         if success:
@@ -258,4 +359,5 @@ class BuildRunner:
             tasks=tasks,
             duration=round(duration, 2),
             returncode=returncode,
+            results_dir=results_dir,
         )
