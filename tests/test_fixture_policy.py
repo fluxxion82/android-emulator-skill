@@ -1037,6 +1037,75 @@ def test_the_documented_derivations_are_not_debt():
     assert "test_anr_watcher.py" not in offenders
 
 
+def _string_constants(source: str) -> set[str]:
+    """Every string literal in a module, docstrings excluded.
+
+    How tests actually name a fixture, read off the corpus: as a string
+    literal -- ``recorded.text("emu_avd_name")``, a hoisted constant
+    (``CONSOLE_SMS_HELP = "emu_help_sms"``), a ``parametrize`` list, or a
+    filename with its extension (``"junit_xml_error_case.xml"``). So a fixture
+    is named when some literal IS its name, compared whole. Comments are not
+    in the AST at all, and docstrings are dropped, because prose saying a
+    fixture exists is not a test reading it.
+
+    One shape is deliberately not credited: a name assembled at runtime,
+    ``recorded.text(f"logcat_{requested}")`` in test_logs.py. Its literal part
+    is ``"logcat_"``, which names no fixture; resolving it would mean
+    evaluating the test, and under-crediting only makes this guard stricter.
+    """
+    tree = ast.parse(source)
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(id(first.value))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    }
+
+
+def _unconsumed_fixtures(fixture_files: list[str], sources: list[str]) -> list[str]:
+    """Fixture stems that no literal in ``sources`` names in full.
+
+    N8: this was ``name not in test_source`` -- a substring test over every
+    test file joined together -- so ``emu_help`` counted as read by a test that
+    only ever names ``emu_help_sms``. A name is matched as a whole literal now,
+    either bare or as the recorded file's name.
+    """
+    named: set[str] = set()
+    for source in sources:
+        named |= _string_constants(source)
+    return sorted(
+        {
+            Path(filename).stem
+            for filename in fixture_files
+            if Path(filename).stem not in named and filename not in named
+        }
+    )
+
+
+def _consumer_modules() -> list[Path]:
+    """The test modules whose literals count as reading a fixture.
+
+    This module is excluded: its own tests name fixtures as DATA for the
+    matcher (``"emu_help"`` below), and counting those would let the guard
+    satisfy itself -- the same self-reference that makes a grep guard pass on
+    its own docstring.
+    """
+    this_file = Path(__file__).resolve()
+    return [path for path in sorted(TESTS.rglob("test_*.py")) if path.resolve() != this_file]
+
+
 def test_recorded_fixtures_are_actually_consumed():
     """A fixture nothing reads is not evidence, it is a file.
 
@@ -1044,17 +1113,20 @@ def test_recorded_fixtures_are_actually_consumed():
     the discipline without its effect.
     """
     corpus = REPO_ROOT / "tests" / "fixtures" / "recorded"
-    names = {
-        path.stem
-        for profile in corpus.iterdir()
-        if profile.is_dir()
-        for path in profile.iterdir()
-        if path.name != "MANIFEST.json"
-    }
+    fixture_files = sorted(
+        {
+            path.name
+            for profile in corpus.iterdir()
+            if profile.is_dir()
+            for path in profile.iterdir()
+            if path.name != "MANIFEST.json"
+        }
+    )
+    names = {Path(filename).stem for filename in fixture_files}
     assert names, "no recorded fixtures found"
 
-    test_source = "\n".join(path.read_text(encoding="utf-8") for path in TESTS.rglob("test_*.py"))
-    unused = sorted(name for name in names if name not in test_source)
+    sources = [path.read_text(encoding="utf-8") for path in _consumer_modules()]
+    unused = _unconsumed_fixtures(fixture_files, sources)
 
     # Not an error: some fixtures are recorded as evidence for a documented
     # claim rather than as parser input. Reported so the ratio stays visible.
@@ -1062,3 +1134,35 @@ def test_recorded_fixtures_are_actually_consumed():
         f"{len(unused)} of {len(names)} recorded fixtures are referenced by no "
         f"test: {unused}. The corpus is drifting toward decoration."
     )
+
+
+def test_a_fixture_is_not_consumed_by_a_longer_name_containing_it():
+    """N8, pinned: ``emu_help`` is not read by a test naming ``emu_help_sms``.
+
+    That is the real corpus today, not a hypothetical -- test_sms.py binds
+    ``CONSOLE_SMS_HELP = "emu_help_sms"`` and nothing reads ``emu_help``, but
+    the substring rule counted it as consumed.
+    """
+    fixtures = ["emu_help.txt", "emu_help_sms.txt"]
+
+    only_the_longer_name = 'CONSOLE_SMS_HELP = "emu_help_sms"\n'
+    assert _unconsumed_fixtures(fixtures, [only_the_longer_name]) == ["emu_help"]
+
+    # Prose is not consumption: a comment is not in the AST, and a docstring
+    # that is nothing but the name is still a docstring.
+    prose = '# emu_help is recorded\ndef test_x():\n    """emu_help"""\n'
+    assert _unconsumed_fixtures(fixtures, [prose, only_the_longer_name]) == ["emu_help"]
+
+    # The negative controls: the shapes the corpus really uses still count.
+    both = 'recorded.text("emu_help")\nrecorded.lines("emu_help_sms")\n'
+    assert _unconsumed_fixtures(fixtures, [both]) == []
+    by_filename = 'recorded_gradle("junit_xml_error_case.xml")\n'
+    assert _unconsumed_fixtures(["junit_xml_error_case.xml"], [by_filename]) == []
+
+
+def test_the_consumption_guard_does_not_read_its_own_test_data():
+    """This module's literals name fixtures as matcher input, not as reads."""
+    consumers = _consumer_modules()
+    assert Path(__file__).resolve() not in {path.resolve() for path in consumers}
+    # Floor, so "this file is excluded" cannot come from an empty scan.
+    assert len(consumers) >= 40, f"only {len(consumers)} test modules found"
