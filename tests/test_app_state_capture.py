@@ -11,6 +11,12 @@ fakes below stand in for adb itself rather than for a per-module
 A snapshot is several dumps back to back, so this file also pins the bound:
 nothing goes out unbounded, and the two dumps that legitimately outlast the
 default carry their own budget instead of raising it for the whole skill.
+
+And the log window's two lies: errors counted from prose instead of the
+priority column (D3), and a window that was either the restarted app's newest
+process alone or, with the app not running, every process on the device (D4).
+Both are read against recordings -- logcat_app_restart holds three processes
+of one app in one window, with the pids `pidof` gave for each.
 """
 
 from __future__ import annotations
@@ -24,11 +30,33 @@ from types import SimpleNamespace
 
 import app_state_capture
 import pytest
-from app_state_capture import AppStateCapture, analyze_logcat, count_ui_elements
+from app_state_capture import (
+    AppStateCapture,
+    analyze_logcat,
+    count_ui_elements,
+    parse_package_pids,
+)
 
 
 def _node(tag: str, *children: dict) -> dict:
     return {"tag": tag, "attributes": {}, "children": list(children)}
+
+
+def _device(*, pidof: tuple[str, int], window: str):
+    """A stand-in for adb: ``pidof`` answers ``(stdout, status)``, ``logcat`` the window.
+
+    Both handed in by the test from the recorded corpus. Everything else
+    answers with silence, which the snapshot records as unknown.
+    """
+
+    def fake_run(cmd, *args, **kwargs):
+        if "pidof" in cmd:
+            return SimpleNamespace(stdout=pidof[0], stderr="", returncode=pidof[1])
+        if "logcat" in cmd:
+            return SimpleNamespace(stdout=window, stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    return fake_run
 
 
 def test_count_ui_elements_counts_all_nodes():
@@ -46,25 +74,50 @@ def test_count_ui_elements_handles_none_and_empty():
     assert count_ui_elements({}) == 0
 
 
-def test_analyze_logcat_counts_priority_columns():
-    text = (
-        "06-17 10:00:00.000  1000  1000 E ActivityManager: boom\n"
-        "06-17 10:00:01.000  1000  1000 W WindowManager: heads up\n"
-        "06-17 10:00:02.000  1000  1000 I MyApp: all good\n"
-        "06-17 10:00:03.000  1000  1000 D MyApp: debug\n"
-    )
-    stats = analyze_logcat(text)
-    assert stats["lines"] == 4
-    assert stats["errors"] == 1
-    assert stats["warnings"] == 1
+def _columns(text: str) -> list[list[str]]:
+    """Whitespace-split fields of each dated line: [date, time, pid, tid, priority, ...].
+
+    Deliberately not the module's regex: the oracle a parser is checked
+    against must not be the parser.
+    """
+    return [
+        fields
+        for fields in (line.split() for line in text.splitlines())
+        if len(fields) > 4 and re.fullmatch(r"\d{2}-\d{2}", fields[0])
+    ]
 
 
-def test_analyze_logcat_counts_free_text_and_brief_format():
-    text = "E/Tag( 123): fatal exception\nW/Tag( 123): a warning here\n\n"
+def test_d3_errors_are_counted_from_the_priority_column_not_the_prose(recorded):
+    """D3: a line was an error when its TEXT said "error" or "exception".
+
+    logcat_threadtime holds one E line, and V/D/I lines whose prose says
+    "error" (`errorCallbackToken=null`); the old count read three.
+    """
+    text = recorded.text("logcat_threadtime")
+    priorities = [fields[4] for fields in _columns(text)]
+    prose = [
+        fields
+        for fields in _columns(text)
+        if fields[4] not in ("E", "F") and re.search("error|exception", " ".join(fields), re.I)
+    ]
+    assert prose, "premise: the recording must hold error prose on a line that is not an error"
+
     stats = analyze_logcat(text)
-    assert stats["lines"] == 2  # blank line ignored
-    assert stats["errors"] == 1
-    assert stats["warnings"] == 1
+
+    assert stats["errors"] == sum(1 for p in priorities if p in ("E", "F")) >= 1
+    assert stats["warnings"] == priorities.count("W")
+    assert stats["lines"] == len(text.strip().splitlines())
+
+
+def test_a_fatal_crash_block_counts_every_line_and_not_the_separator(recorded):
+    """The crash buffer: a `beginning of crash` separator, then E lines only."""
+    text = recorded.text("logcat_crash_loop")
+    assert not _columns(text.splitlines()[0]), "premise: the dump opens with a separator"
+
+    stats = analyze_logcat(text)
+
+    assert stats["errors"] == len(_columns(text))
+    assert stats["warnings"] == 0
 
 
 def test_analyze_logcat_empty():
@@ -114,23 +167,22 @@ def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path, r
     doing so by construction.
     """
     log_text = recorded.text("logcat_threadtime")
-    tail = log_text.split("\n")[-3:]
-
-    def fake_run(cmd, *args, **kwargs):
-        if "pidof" in cmd:
-            return SimpleNamespace(stdout="4242\n", stderr="", returncode=0)
-        if "logcat" in cmd:
-            return SimpleNamespace(stdout=log_text, stderr="", returncode=0)
-        return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
+    # The process the snapshot is of: the one that logged the recording's E
+    # line (system_server, which also logged its W lines). Read, not typed.
+    pid = next(fields[2] for fields in _columns(log_text) if fields[4] == "E")
+    tail = [line for line in log_text.splitlines() if line.split()[2:3] == [pid]][-3:]
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        _device(pidof=(pid, 0), window=log_text),
+    )
 
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
     uncapped = capturer._capture_logs(tmp_path / "all.txt", "30s", log_lines=0)
     stats = capturer._capture_logs(tmp_path / "app-logs.txt", "30s", log_lines=3)
 
     # The newest lines are the ones kept.
-    assert (tmp_path / "app-logs.txt").read_text().split("\n") == tail
+    assert (tmp_path / "app-logs.txt").read_text().splitlines() == tail
     assert stats["captured"] is True
     assert stats["lines"] < uncapped["lines"]
 
@@ -193,7 +245,10 @@ def test_no_snapshot_probe_goes_out_unbounded(monkeypatch, tmp_path):
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
     capturer._get_app_info()
     capturer._get_device_info()
-    capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
+    # A silent device: no process of the app to read, so the logs refuse --
+    # after both of their calls have gone out.
+    with pytest.raises(app_state_capture.cli.Failure):
+        capturer._capture_logs(tmp_path / "logs.txt", "30s", 200)
 
     assert len(seen) == 8, f"expected 8 adb calls, saw {len(seen)}"
     assert all(kwargs.get("timeout") for kwargs in seen), "an adb call went out unbounded"
@@ -234,7 +289,8 @@ def test_logcat_window_carries_its_own_budget(monkeypatch, tmp_path):
     monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", fake_run)
 
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
-    capturer._capture_logs(tmp_path / "logs.txt", "5m", 200)
+    with pytest.raises(app_state_capture.cli.Failure):  # a silent device; see above
+        capturer._capture_logs(tmp_path / "logs.txt", "5m", 200)
 
     logcat = [kwargs for cmd, kwargs in seen if "logcat" in cmd]
     assert logcat, "no logcat command issued"
@@ -528,3 +584,205 @@ def test_device_info_records_the_effective_density_not_the_physical_one(monkeypa
     assert (
         info["density"] == effective
     ), f"recorded the physical density instead of the effective one: {info}"
+
+
+# === D4: the app's window is every process it had, and nothing else ========
+#
+# logcat_app_restart is one window holding three processes of the fixture app
+# -- crashed, force-stopped, running -- and its manifest entry holds the pids
+# `pidof` reported while each was alive. That is the oracle: what the device
+# said at the time, not this parser's own reading of the same text.
+
+APP = "com.example.composefixture"
+
+
+def _manifest_entry(recorded, name: str) -> dict:
+    return next(e for e in recorded.manifest["fixtures"] if e["name"] == name)
+
+
+def _app_pids(recorded) -> list[str]:
+    pids = _manifest_entry(recorded, "logcat_app_restart")["pids"]
+    if len(set(pids)) < 2:
+        pytest.fail("logcat_app_restart no longer records a restart; re-record it")
+    return pids
+
+
+def _not_running(recorded) -> tuple[str, int]:
+    """`pidof` for an app that is not running, as recorded: no output, exit 1."""
+    status = _manifest_entry(recorded, "pidof_not_running")["exit_status"]
+    return recorded.text("pidof_not_running"), status
+
+
+def test_every_process_the_window_ties_to_the_package_is_found(recorded):
+    """Started, crashed, killed: each way the device names a process of the app."""
+    assert parse_package_pids(recorded.text("logcat_app_restart"), APP) == set(_app_pids(recorded))
+
+
+def test_naming_the_package_does_not_make_a_line_the_apps(recorded):
+    """system_server, the launcher and the IME all write the package name.
+
+    Their pids sit in the same window, on lines that name the package -- and
+    some of those lines carry another number beside it (a task's uid
+    `A=10205:<pkg>`, the shell's `from pid N`). None of them is the app.
+    """
+    text = recorded.text("logcat_app_restart")
+    namers = {fields[2] for fields in _columns(text) if APP in " ".join(fields)}
+    others = namers - set(_app_pids(recorded))
+    assert others, "premise: processes other than the app name it in this window"
+
+    assert not parse_package_pids(text, APP) & others
+
+
+def test_a_package_is_matched_whole_not_as_a_prefix(recorded):
+    """`com.example.compose` is not `com.example.composefixture`."""
+    assert parse_package_pids(recorded.text("logcat_app_restart"), APP[:-7]) == set()
+
+
+def test_a_crash_loop_is_attributed_from_the_crash_lines_alone(recorded):
+    """The crash buffer has no system_server lines: AndroidRuntime's own `Process:`."""
+    text = recorded.text("logcat_crash_loop")
+    assert parse_package_pids(text, APP) == {fields[2] for fields in _columns(text)}
+
+
+@pytest.mark.parametrize("alive", ["none", "latest"])
+def test_the_saved_log_holds_every_process_of_the_app_and_no_other(
+    monkeypatch, tmp_path, recorded, alive
+):
+    """D4: the crashed process was cut away by `--pid=<the new one>`, and with
+    the app not running at all the snapshot held every process on the device.
+
+    The window is the restart recording behind logcat_threadtime (other
+    processes, nothing of the app's); `pidof` answers the live process, or
+    nothing.
+    """
+    pids = _app_pids(recorded)
+    unrelated = {fields[2] for fields in _columns(recorded.text("logcat_threadtime"))}
+    if unrelated & set(pids):
+        pytest.fail("the two recordings no longer separate the app from other processes")
+    window = recorded.text("logcat_threadtime") + recorded.text("logcat_app_restart")
+    pidof = _not_running(recorded) if alive == "none" else (pids[-1], 0)
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess, "run", _device(pidof=pidof, window=window)
+    )
+
+    capturer = AppStateCapture(package=APP, serial="emulator-5554")
+    stats = capturer._capture_logs(tmp_path / "app-logs.txt", "30s", log_lines=0)
+    saved = (tmp_path / "app-logs.txt").read_text(encoding="utf-8")
+
+    assert {fields[2] for fields in _columns(saved)} == set(pids)
+    assert stats["pids"] == sorted(pids, key=int)
+    assert stats["lines"] == len(saved.splitlines())
+
+
+def test_the_capture_asks_for_the_format_it_parses(monkeypatch, tmp_path, recorded):
+    """D3's other half: `fmt=None` inherited the device's format, unparsed."""
+    seen: list[list[str]] = []
+    fake = _device(pidof=_not_running(recorded), window=recorded.text("logcat_app_restart"))
+
+    def recording_run(cmd, *args, **kwargs):
+        seen.append(cmd)
+        return fake(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(app_state_capture.adb_exec.subprocess, "run", recording_run)
+    AppStateCapture(package=APP)._capture_logs(tmp_path / "app-logs.txt", "30s")
+
+    logcat = next(cmd for cmd in seen if "logcat" in cmd)
+    assert "-v" in logcat, f"no -v: the device's own default format gets parsed: {logcat}"
+    assert logcat[logcat.index("-v") + 1] == "threadtime"
+
+
+def test_an_app_with_no_process_in_the_window_is_refused_not_widened(
+    monkeypatch, tmp_path, recorded
+):
+    """Not running, and nowhere in the window: the old answer was the whole device."""
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        _device(pidof=_not_running(recorded), window=recorded.text("logcat_threadtime")),
+    )
+
+    with pytest.raises(app_state_capture.cli.Failure) as refused:
+        AppStateCapture(package=APP)._capture_logs(tmp_path / "app-logs.txt", "30s")
+
+    assert APP in str(refused.value)
+    assert "--no-logs" in refused.value.remedy
+    assert not (tmp_path / "app-logs.txt").exists(), "a refusal left a log behind"
+
+
+def test_the_refusal_fails_the_snapshot_and_keeps_its_remedy(
+    monkeypatch, tmp_path, capsys, recorded
+):
+    """Through the X8 partial path: exit 1, the rest of the snapshot handed over."""
+    monkeypatch.setattr(
+        app_state_capture,
+        "capture_screenshot",
+        lambda *_a, **_k: {"mode": "file", "file_path": "screenshot.png", "size_bytes": 10},
+    )
+    monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        _device(pidof=_not_running(recorded), window=recorded.text("logcat_threadtime")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["app_state_capture.py", "--package", APP, "--output", str(tmp_path), "--json"],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_state_capture.main()
+    payload = json.loads(capsys.readouterr().out)
+
+    assert excinfo.value.code == 1
+    assert set(payload) == {"error", "partial"}, payload
+    assert APP in payload["error"] and "--no-logs" in payload["error"]
+    assert payload["partial"]["logs"]["captured"] is False
+    assert "app-logs.txt" not in payload["partial"]["artifacts"]
+    assert "ui-hierarchy.json" in payload["partial"]["artifacts"]
+
+
+# === N12: by default a snapshot goes under the skill's cache, not the cwd ===
+
+
+def test_the_default_snapshot_dir_follows_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert app_state_capture.default_snapshot_dir() == (
+        tmp_path / ".android-emulator-skill" / "cache" / "app-state-snapshots"
+    )
+
+
+def test_a_default_capture_leaves_the_cwd_alone(monkeypatch, tmp_path, capsys):
+    """N12: `--output` defaulted to the relative `app-state-snapshots`."""
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+
+    code = _snapshot_cli_without_output(monkeypatch, ["--no-logs", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0, payload
+    snapshot = Path(payload["snapshot_path"])
+    assert snapshot.is_absolute(), "the path printed must not depend on the cwd"
+    assert app_state_capture.default_snapshot_dir() in snapshot.parents
+    assert (snapshot / "snapshot-summary.json").is_file()
+    assert not list(cwd.iterdir())
+
+
+def _snapshot_cli_without_output(monkeypatch, argv: list[str]):
+    monkeypatch.setattr(
+        app_state_capture,
+        "capture_screenshot",
+        lambda *_a, **_k: {"mode": "file", "file_path": "screenshot.png", "size_bytes": 10},
+    )
+    monkeypatch.setattr(app_state_capture, "get_ui_hierarchy", lambda *_a, **_k: {"tag": "root"})
+    monkeypatch.setattr(
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    monkeypatch.setattr(sys, "argv", ["app_state_capture.py", "--package", APP, *argv])
+    with pytest.raises(SystemExit) as excinfo:
+        app_state_capture.main()
+    return excinfo.value.code

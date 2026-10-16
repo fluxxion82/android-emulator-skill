@@ -306,9 +306,18 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 19. **app_state_capture.py** ⭐ NEW - Complete debugging snapshots
     - Capture screenshot + UI hierarchy + logs + app info
-    - Create timestamped snapshots
+    - Create timestamped snapshots, by default under
+      `~/.android-emulator-skill/cache/app-state-snapshots/` (never the working
+      directory); the snapshot's path is printed, and is `snapshot_path` under `--json`
+    - Logs are the app's own: the running pid plus each pid the log itself ties
+      to the package (`Start proc`, `has died`, `Killing`, and AndroidRuntime's
+      `Process: <pkg>, PID:`), so one that crashed before a restart is kept.
+      `<pkg>:remote` sub-processes and pid reuse within the window are not
+      handled. Errors and warnings are counted from the priority column. An app
+      with no process in the window fails the logs rather than returning the
+      whole device's
     - All-in-one debugging artifact
-    - Options: `--package`, `--output`, `--serial`, `--logs`, `--no-logs`, `--screenshot-size`, `--json`
+    - Options: `--package`, `--output`, `--serial`, `--logs`, `--no-logs`, `--log-lines`, `--screenshot-size`, `--json`
 
 #### Advanced Testing & Permissions (3 scripts) ✓ COMPLETE
 20. **privacy_manager.py** ⭐ NEW - App permission management
@@ -535,8 +544,8 @@ python3 "$SKILL_DIR/scripts/emulator_delete.py" --name test-device
 
 ### Debugging Flow
 ```bash
-# 1. Capture complete state
-python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --output debug-snapshots/
+# 1. Capture complete state (prints where the snapshot went)
+python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp
 
 # 2. Monitor logs in real-time
 python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --severity error,warning --follow
@@ -745,9 +754,6 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
   built with `ignoreFailures = true` is reported as a success with failing tests.
 - `log_monitor --severity` does not validate its names. An unrecognised one
   (`warn`, say) matches nothing, so the capture silently filters to empty.
-- `app_state_capture` counts a logcat line as an error when the words "error" or
-  "exception" appear anywhere in its free text, rather than reading the priority
-  column, so prose about errors inflates the count.
 - `anr_watcher` does not attach an ANR's `Reason:` / `PID:` continuation lines to
   the `ANR in` event above them, so one ANR can surface as two clusters.
 - `status_bar --time` must be given zero-padded — `09:41`, not `9:41`. The value

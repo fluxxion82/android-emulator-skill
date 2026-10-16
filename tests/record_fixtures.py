@@ -15,7 +15,7 @@ Fixtures are written with no header or annotation, so a parser under test sees
 what it would see from the real tool. Provenance lives alongside in
 ``MANIFEST.json``.
 
-Three documented departures from verbatim, all visible in the code below:
+Four documented departures from verbatim, all visible in the code below:
 
 1. CRLF is normalised to LF (``_strip_cr``). In practice the text-mode decode
    in ``_run`` / ``_run_host`` already does it, and does more: Python's
@@ -34,6 +34,11 @@ Three documented departures from verbatim, all visible in the code below:
    ``config.ini``. Fixtures are public; an account name is not theirs to
    publish. The placeholder keeps the path absolute, so a parser that splits
    or joins it exercises the same code it would on the real one.
+4. ``logcat_app_restart`` keeps only some LINES of its window
+   (``_app_restart_window``): those that name the fixture package or carry one
+   of the pids ``pidof`` reported for it, plus the reader's ``beginning of``
+   separators. A full window carries every other app's free text, which is not
+   ours to publish. Each kept line is verbatim; what is absent is whole lines.
 
 Three fixtures are written through ``capture_bytes`` and so skip (1) and (2)
 entirely; each carries its own check instead.
@@ -1435,6 +1440,72 @@ _OPEN_SETTINGS = [
 ]
 
 
+# --- one app, three processes, one logcat window ----------------------------
+
+_LAUNCH_COMPOSE = ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"]
+
+# How each of the three processes ends: a Java crash, a force-stop, and still
+# running when the window is read. A restarted app's earlier process is what a
+# pid filter taken from `pidof` loses (D4), and these are the ways it ends.
+_RESTART_ENDINGS: tuple[tuple[str, ...] | None, ...] = (("am", "crash"), ("am", "force-stop"), None)
+
+
+def _app_restart_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """Three processes of the fixture app in one logcat window, and their pids.
+
+    Each pid is measured with ``pidof`` while that process is alive and stored
+    in the manifest (``pids``), so a test can hold what a parser attributes to
+    the package against what the device said at the time -- not against the
+    parser's own reading of the same text.
+
+    The window is filtered on the HOST to the lines that name the package or
+    come from one of those pids, plus the reader's ``beginning of`` separators:
+    the full window carries every other app's free text, which is not ours to
+    publish. Every line that remains is verbatim.
+    """
+    _run(["shell", "am", "force-stop", COMPOSE_PACKAGE], serial)
+    _run(["logcat", "-c"], serial)
+    pids: list[str] = []
+    for ending in _RESTART_ENDINGS:
+        launched = _run(_LAUNCH_COMPOSE, serial, timeout=60)
+        if launched.returncode != 0:
+            raise CaptureError(
+                f"could not launch {COMPOSE_PACKAGE} (exit {launched.returncode}). Install "
+                f"the fixture app first (cd tests/fixtures/scaffold/compose && gradle "
+                f":app:installDebug)"
+            )
+        time.sleep(2)
+        pid = _run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15).text.strip()
+        if not pid.isdigit():
+            raise CaptureError(f"{COMPOSE_PACKAGE} is not running after launch: pidof {pid!r}")
+        pids.append(pid)
+        if ending:
+            _run(["shell", *ending, COMPOSE_PACKAGE], serial)
+            time.sleep(3)
+    if len(set(pids)) != len(pids):
+        raise CaptureError(f"expected a new process per launch; pidof saw {pids}")
+
+    window = _run(["logcat", "-d", "-v", "threadtime"], serial, timeout=60)
+
+    def _pid_column(line: str) -> str | None:
+        fields = line.split()
+        return fields[2] if len(fields) > 2 else None
+
+    kept = [
+        line
+        for line in window.stdout.splitlines(keepends=True)
+        if COMPOSE_PACKAGE in line
+        or line.startswith("--------- beginning of")
+        or _pid_column(line) in pids
+    ]
+    silent = [pid for pid in pids if not any(_pid_column(line) == pid for line in kept)]
+    if silent:
+        raise CaptureError(f"process(es) {silent} logged nothing in the window; re-record")
+    extra["pids"] = pids
+    extra["pid_endings"] = ["am crash", "am force-stop", "running when the window was read"]
+    return Capture("".join(kept), window.stderr, window.returncode)
+
+
 FIXTURES: list[Fixture] = [
     # --- device discovery -------------------------------------------------
     Fixture(
@@ -1705,6 +1776,32 @@ FIXTURES: list[Fixture] = [
             "the separator, and PID/timestamp must stay out of any dedup key "
             "or one crash loop becomes N separate faults."
         ),
+    ),
+    Fixture(
+        name="logcat_app_restart",
+        emulator_only=True,
+        args=["logcat", "-d", "-v", "threadtime"],
+        command=(
+            "adb shell am start -W (x3, ended by am crash, then am force-stop, then left "
+            "running), then adb logcat -d -v threadtime, host-filtered to the lines that "
+            "name the package or come from its pids"
+        ),
+        description=(
+            "One app, three processes, one window: the fixture app launched, "
+            "crashed (`am crash`), relaunched, force-stopped, relaunched. The "
+            "manifest's `pids` are what `pidof` answered while each was alive, "
+            "in order. This is the evidence that ties a pid to a package when "
+            "the process is gone and `pidof` can no longer say: what "
+            "system_server and the app itself write about a process. Note "
+            "that most lines naming the package come from processes that are "
+            "NOT the app (system_server, the launcher, the IME), so naming "
+            "the package says nothing about which process wrote the line. "
+            "Host-filtered to lines that name the package or carry one of its "
+            "pids; other apps' free text is not recorded."
+        ),
+        catches=("D4",),
+        capture_with=_app_restart_window,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
     ),
     Fixture(
         name="emu_sms_send",
