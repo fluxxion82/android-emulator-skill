@@ -64,6 +64,7 @@ _STUB = """#!{python}
 # Fake {name}: replays recorded output per subcommand. See tests/fake_toolchain.py.
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -84,6 +85,9 @@ for rule in spec["rules"]:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         with open(source, encoding="utf-8") as src, open(destination, "w", encoding="utf-8") as dst:
             dst.write(src.read())
+    if rule["pull_from"]:
+        # `adb pull <device path> <host path>`: the host path is the last argument.
+        shutil.copyfile(rule["pull_from"], argv[-1])
     out = ""
     if rule["stdout"]:
         with open(rule["stdout"], encoding="utf-8") as handle:
@@ -136,6 +140,10 @@ class Rule:
     # writes its JUnit XML during the run; a stub that did not would leave the
     # script reading whatever an earlier run left behind.
     writes: tuple[tuple[str, str], ...] = ()
+    # A RECORDED binary file (its path) that `adb pull` delivers to the host
+    # path it was given -- the recorded `screencap -p` PNG, for a capture that
+    # has to succeed end to end. Copied byte for byte; nothing is generated.
+    pull_from: str = ""
     # Seconds between lines, each written and flushed on its own, the way a
     # live `adb logcat` delivers them. Without it a whole recording lands in
     # one pipe write, and anr_watcher's worker -- which select()s on a
@@ -209,6 +217,7 @@ class FakeToolchain:
                     "pace": rule.pace,
                     "once": self._once_marker() if rule.once else "",
                     "writes": [[str(path), self._stage(text)] for path, text in rule.writes],
+                    "pull_from": rule.pull_from,
                 }
                 for rule in rules
             ],

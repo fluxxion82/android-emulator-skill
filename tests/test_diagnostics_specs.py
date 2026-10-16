@@ -295,19 +295,42 @@ def test_d1_a_known_severity_list_keeps_every_warning(toolchain, recorded):
 D3_PID = "551"
 
 
-def _snapshot_device(toolchain, recorded, logcat_fixture: str, pid_answer: str) -> None:
-    """A device that answers pidof and logcat; every other probe fails quietly.
+# The recorded `adb exec-out screencap -p` of the emulator-api35 screen, which
+# a stub `adb pull` hands back so that a snapshot can succeed end to end.
+RECORDED_SCREENSHOT = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "recorded"
+    / "emulator-api35"
+    / "demo_mode_clock_0941.png"
+)
 
-    The screenshot and hierarchy therefore fail and the run exits 1 -- that is
-    X8 working, and not what these specs read. The log component still runs,
-    and what it captured is on disk.
+
+def _snapshot_device(toolchain, recorded, logcat: str, pid_answer: str) -> None:
+    """A device on which a whole app_state_capture snapshot succeeds.
+
+    Each component is answered from the corpus: the screenshot is the recorded
+    ``screencap -p`` PNG delivered through ``pull``, the hierarchy is
+    ``uiautomator_dump_raw`` (``exec-out uiautomator dump /dev/tty`` exactly as
+    the device frames it), density is ``wm_density_physical``, and ``logcat``
+    is the transcript the spec chooses, filtered by ``--pid`` as the device
+    filters it. ``dumpsys`` and ``getprop`` get no rule and answer with
+    silence: the snapshot records those fields as unknown, which is not a
+    failure. ``pidof`` answers ``pid_answer``, a pid taken from the recording
+    the spec is reading.
     """
+    if not RECORDED_SCREENSHOT.is_file():
+        pytest.fail(f"recorded screenshot missing: {RECORDED_SCREENSHOT}")
     toolchain.install(
         "adb",
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("exec-out", "uiautomator"), stdout=recorded.text("uiautomator_dump_raw")),
+            Rule(("shell", "screencap"), exit=0),
+            Rule(("pull",), pull_from=str(RECORDED_SCREENSHOT)),
             Rule(("shell", "pidof"), stdout=pid_answer),
-            Rule(("logcat",), stdout=recorded.text(logcat_fixture), filter_pid=True),
+            Rule(("shell", "wm", "density"), stdout=recorded.text("wm_density_physical")),
+            Rule(("logcat",), stdout=logcat, filter_pid=True),
         ],
     )
 
@@ -332,7 +355,7 @@ def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
     recorded -- and the logcat request must ask for the format that count
     parses (``:420`` passes ``fmt=None``, inheriting the device's default).
     """
-    _snapshot_device(toolchain, recorded, "logcat_threadtime", pid_answer=D3_PID)
+    _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
     output = tmp_path / "snapshots"
     toolchain.run(
         "app_state_capture.py",
@@ -393,7 +416,7 @@ def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, reco
     three pids.
     """
     pids = _crash_loop_pids(recorded)
-    _snapshot_device(toolchain, recorded, "logcat_crash_loop", pid_answer=pids[-1])
+    _snapshot_device(toolchain, recorded, recorded.text("logcat_crash_loop"), pid_answer=pids[-1])
     result = toolchain.run(
         "log_monitor.py", "--app", PACKAGE, "--last", "5m", "--json", ANDROID_EMU_LOG_TAIL="500"
     )
@@ -416,7 +439,7 @@ def test_d4_app_state_capture_keeps_the_crashed_pid_of_a_restarted_app(
 ):
     """D4, the same shape in ``app_state_capture.py:410-414``."""
     pids = _crash_loop_pids(recorded)
-    _snapshot_device(toolchain, recorded, "logcat_crash_loop", pid_answer=pids[-1])
+    _snapshot_device(toolchain, recorded, recorded.text("logcat_crash_loop"), pid_answer=pids[-1])
     output = tmp_path / "snapshots"
     toolchain.run("app_state_capture.py", "--package", PACKAGE, "--output", str(output), "--json")
     saved = _snapshot_artifact(output, "app-logs.txt").read_text(encoding="utf-8")
@@ -436,7 +459,7 @@ def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
     import subprocess
 
     pids = _crash_loop_pids(recorded)
-    _snapshot_device(toolchain, recorded, "logcat_crash_loop", pid_answer=pids[-1])
+    _snapshot_device(toolchain, recorded, recorded.text("logcat_crash_loop"), pid_answer=pids[-1])
     answer = subprocess.run(
         [str(toolchain.bin / "adb"), "logcat", "-d", f"--pid={pids[-1]}"],
         env=toolchain.env(),
@@ -708,25 +731,71 @@ def test_n9_a_zero_duration_cluster_diffs_to_finite_json(toolchain, recorded):
 # ===========================================================================
 
 
+SNAPSHOT_ARTIFACTS = {"screenshot.png", "ui-hierarchy.json", "app-logs.txt"}
+
+
+def _captured_snapshot(result, cwd: Path) -> Path:
+    """The snapshot directory a successful ``--json`` capture reported, resolved."""
+    assert result.returncode == 0, f"the capture failed:\n{result.stdout}{result.stderr}"
+    payload = json.loads(result.stdout)
+    assert payload.get("success") is True, payload
+    snapshot = Path(payload["snapshot_path"])
+    return (snapshot if snapshot.is_absolute() else cwd / snapshot).resolve()
+
+
+def _assert_complete_snapshot(snapshot: Path) -> None:
+    assert snapshot.is_dir(), f"the reported snapshot path does not exist: {snapshot}"
+    summary = json.loads((snapshot / "snapshot-summary.json").read_text(encoding="utf-8"))
+    missing = [name for name in summary["artifacts"] if not (snapshot / name).is_file()]
+    assert not missing, f"artifacts listed but absent: {missing}"
+    assert set(summary["artifacts"]) >= SNAPSHOT_ARTIFACTS, summary["artifacts"]
+
+
+def test_the_snapshot_device_supports_a_complete_capture(toolchain, tmp_path, recorded):
+    """Control, unmarked: with ``--output`` given, the capture succeeds whole.
+
+    So the N12 spec below fails only on WHERE the snapshot goes. Every
+    artifact comes from the corpus; see ``_snapshot_device``.
+    """
+    _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
+    cwd = tmp_path / "agent-cwd"
+    cwd.mkdir()
+    output = tmp_path / "explicit"
+    result = toolchain.run(
+        "app_state_capture.py", "--package", PACKAGE, "--output", str(output), "--json", cwd=cwd
+    )
+    snapshot = _captured_snapshot(result, cwd)
+    _assert_complete_snapshot(snapshot)
+    assert output.resolve() in snapshot.parents
+    assert not list(cwd.iterdir())
+
+
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
     reason="N12: app_state_capture.py:534 -- the default --output is the caller's cwd",
 )
-def test_n12_app_state_capture_writes_nothing_into_the_cwd(toolchain, tmp_path, recorded):
+def test_n12_a_default_snapshot_succeeds_outside_the_callers_cwd(toolchain, tmp_path, recorded):
     """N12: ``app_state_capture.py:534`` (and SKILL.md:525).
 
     ``--output`` defaults to the relative ``app-state-snapshots``, so every run
     without it writes into whatever directory the agent happens to be in --
     the planning probe left one in this repository's root, where it is not
-    gitignored. Where the default SHOULD be is Inc 1's decision; this asserts
-    only that it is not the caller's cwd.
+    gitignored. Where the default SHOULD be is Inc 1's decision. What it must
+    be: a capture that still SUCCEEDS, reports where it went, and put its
+    artifacts there, outside the caller's cwd -- which stays empty. A fix
+    that simply refuses to capture without ``--output`` writes nothing into
+    cwd too, and must not pass (review of PR #20).
     """
-    _snapshot_device(toolchain, recorded, "logcat_threadtime", pid_answer=D3_PID)
+    _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
     cwd = tmp_path / "agent-cwd"
     cwd.mkdir()
-    toolchain.run("app_state_capture.py", "--package", PACKAGE, "--json", cwd=cwd)
+    result = toolchain.run("app_state_capture.py", "--package", PACKAGE, "--json", cwd=cwd)
 
-    assert toolchain.calls("adb"), "the capture never reached the device"
+    snapshot = _captured_snapshot(result, cwd)
+    _assert_complete_snapshot(snapshot)
+    assert (
+        cwd.resolve() not in snapshot.parents
+    ), f"the snapshot went into the caller's working directory: {snapshot}"
     left = sorted(p.name for p in cwd.iterdir())
     assert not left, f"app_state_capture wrote {left} into the caller's working directory"
