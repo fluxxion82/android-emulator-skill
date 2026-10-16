@@ -97,6 +97,28 @@ class RecordedFixtures:
             f"this directory exists to prevent."
         )
 
+    def data(self, name: str) -> bytes:
+        """Return one recorded BINARY fixture, byte for byte.
+
+        For artifacts that are not text -- ``am_profile_hang.trace`` is an ART
+        method trace whose record stream is little-endian integers -- so no
+        decoding and no newline handling may touch them.
+
+        Args:
+            name: File name including its extension, e.g. ``am_profile_hang.trace``.
+
+        Raises:
+            pytest.fail: if the fixture has not been recorded.
+        """
+        path = self._root / name
+        if path.exists():
+            return path.read_bytes()
+        pytest.fail(
+            f"Recorded fixture '{name}' is missing.\n"
+            f"Boot an emulator and run:\n"
+            f"    python tests/record_fixtures.py --only {name.split('.', maxsplit=1)[0]}"
+        )
+
     def lines(self, name: str) -> list[str]:
         """Return a recorded fixture split into lines, trailing blank removed."""
         return self.text(name).splitlines()

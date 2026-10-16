@@ -61,47 +61,55 @@ def test_parse_ls_ignores_garbage_lines():
 
 
 # ---------------------------------------------------------------------------
-# FROZEN DEBT, not exceptions. The three cases below are real `ls -la` output
-# the parser's own docstring promises to handle -- a symlink with its `->`
-# target, a filename containing a space, and the coreutils month/day/year
-# column layout. None of them appears in any recording: the fixture app's data
-# directory holds neither a symlink nor a spaced filename, so nothing was
-# captured to read.
+# A symlink, and a filename with a space -- read off `run_as_ls_symlink_space`,
+# a real `run-as ... ls -la` of a directory made in the fixture app's files/ to
+# hold exactly those, and removed after. These were hand-written literals
+# frozen in KNOWN_VIOLATIONS until the recording existed.
 #
-# They are literals, and `test_container.py::parse_ls_output` is frozen in
-# KNOWN_VIOLATIONS to say so. Deleting them instead would drop coverage of
-# behaviour the code still advertises, which is a worse trade than admitting
-# the debt. To pay it off:
-#
-#     adb shell run-as com.example.composefixture sh -c \
-#         'cd files && ln -s /data/app/lib lib && : > "my file.txt"'
-#     python tests/record_fixtures.py --only run_as_ls_symlink_and_spaces
+# The third literal frozen with them -- the GNU coreutils "Mon DD YYYY" date
+# layout -- is gone and NOT replaced: no recording can back it. Every caller
+# of parse_ls_output (container.py's list, prefs and databases paths) parses
+# `run-as ... ls -la` on the device, which is toybox, and the recording shows
+# toybox printing the ISO "YYYY-MM-DD HH:MM" layout. The coreutils branch in
+# `_extract_name` has no producer in this skill; the old test's claim that the
+# export path reads host listings is not borne out by container.py.
 # ---------------------------------------------------------------------------
 
 
-def test_parse_ls_symlink_target():
-    output = "lrwxrwxrwx 1 root root 11 2024-01-02 03:04 lib -> /data/app/lib\n"
-    entries = parse_ls_output(output)
-    assert len(entries) == 1
-    entry = entries[0]
+def _symlink_space_entries(recorded) -> dict[str, dict]:
+    return {e["name"]: e for e in parse_ls_output(recorded.text("run_as_ls_symlink_space"))}
+
+
+def test_parse_ls_symlink_target(recorded):
+    """`link -> a b.txt`: the name is `link`, the target keeps its space."""
+    entry = _symlink_space_entries(recorded)["link"]
     assert entry["kind"] == "symlink"
-    assert entry["name"] == "lib"
-    assert entry["symlink_target"] == "/data/app/lib"
+    assert entry["mode"].startswith("l")
+    assert entry["symlink_target"] == "a b.txt"
+    # toybox reports a symlink's size as the length of its target string.
+    assert entry["size_bytes"] == len("a b.txt")
 
 
-def test_parse_ls_name_with_spaces():
-    output = "-rw------- 1 u0_a1 u0_a1 5 2024-01-02 03:04 my file.txt\n"
-    entries = parse_ls_output(output)
-    assert entries[0]["name"] == "my file.txt"
+def test_parse_ls_name_with_spaces(recorded):
+    """toybox prints the spaced name bare -- unquoted, unescaped."""
+    entries = _symlink_space_entries(recorded)
+    assert set(entries) == {"a b.txt", "link"}, "dot entries or a split name leaked through"
+    spaced = entries["a b.txt"]
+    assert spaced["kind"] == "file"
+    assert spaced["symlink_target"] is None
+    assert spaced["size_bytes"] == 2, "`echo x` writes two bytes"
 
 
-def test_parse_ls_coreutils_layout_with_year():
-    # GNU coreutils ls: month, day, year/time as separate tokens. `parse_ls_output`
-    # claims both layouts, and container.py's export path reads host listings too.
-    output = "-rw-r--r-- 1 user group 1024 Jan  2  2024 data.bin\n"
-    entries = parse_ls_output(output)
-    assert entries[0]["name"] == "data.bin"
-    assert entries[0]["size_bytes"] == 1024
+def test_the_recorded_date_layout_is_toyboxs_iso_form(recorded):
+    """The layout the parser actually meets: two date tokens, ISO, not coreutils'.
+
+    Pinned so that if a device ever answers in another layout, this fails before
+    a name silently gains a date token.
+    """
+    for line in recorded.lines("run_as_ls_symlink_space")[1:]:
+        day, clock = line.split()[5:7]
+        assert len(day) == 10 and day[4] == "-" and day[7] == "-", line
+        assert len(clock) == 5 and clock[2] == ":", line
 
 
 # === parse_shared_prefs_xml ===

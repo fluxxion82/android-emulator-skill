@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-09-03T08:08:44Z",
+  "recorded_at": "2026-10-16T18:24:52Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -57,6 +57,52 @@
       "bytes": 146
     },
     {
+      "name": "am_profile_appdir_denied",
+      "file": "am_profile_appdir_denied.txt",
+      "command": "adb shell am profile start --sampling 1000 com.example.composefixture /data/data/com.example.composefixture/files/aes_denied.trace",
+      "description": "`am profile start` to a path in the profiled app's OWN data directory -- the obvious place, since the app is the one writing the trace. Refused just the same: exit **255**, stdout empty, 'Error: Unable to open file: <path>' and 'Consider using a file under /data/local/tmp/' on stderr, and no avc line this time. Unlike /sdcard it leaves nothing behind (left_behind: the app's own `run-as ls` reports No such file). Together with am_profile_sdcard_denied this pins both wrong destinations as refused, and the refusal text names the one that works.",
+      "catches": [],
+      "bytes": 134,
+      "exit_status": 255,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 134,
+      "left_behind": {
+        "command": "adb shell run-as com.example.composefixture ls -la files/aes_denied.trace",
+        "exit_status": 1,
+        "output": "ls: files/aes_denied.trace: No such file or directory"
+      }
+    },
+    {
+      "name": "am_profile_hang",
+      "file": "am_profile_hang.trace",
+      "command": "adb shell am profile start --sampling 1000 com.example.composefixture /data/local/tmp/aes_hang.trace; adb shell am broadcast -f 0x10000000 -n com.example.composefixture/.AnrReceiver -a com.example.composefixture.PROVOKE_ANR; wait until 45s after the broadcast; adb shell am profile stop com.example.composefixture; adb exec-out cat /data/local/tmp/aes_hang.trace",
+      "description": "An ART method trace of the fixture app, sampled every 1000 us by `am profile start --sampling` while AnrReceiver held its main thread in Thread.sleep for 40 s -- a hung app, seen from inside without root on a `user` build. The ground truth the v0.9.0 hang sampler is parsed against (vault: 'Sampling a Hung App Without Root'). BINARY, written byte for byte: a text header (`*version` / `3` / key=value lines including `clock=dual` / `*threads` / `*methods` / `*end`), then a little-endian body starting with the magic `SLOW`. What a parser written from memory gets wrong: the records are TRANSITIONS, not samples -- a 40 s block is one enter and one exit 40 s apart, not 40,000 rows; the stack the thread already had when profiling began is replayed as enters at the first sample; and under clock=dual each record carries the thread-CPU clock BEFORE the wall clock, so across the sleep the CPU clock moves by milliseconds and only the wall clock shows the hang. Thread.sleep appears three times nested (three overloads), so 'the frame under the sleep' is the first frame that is not a Thread.sleep. Taken 10 s after launch, so that Jetpack ProfileInstaller's one-shot worker thread has come and gone first: a thread exiting under the sampler killed the app once in three runs (see TRACE_QUIET_BEFORE_S). Note too that `am broadcast` did not return until the receiver timed out (broadcast_returned_after_s).",
+      "catches": [],
+      "bytes": 51132,
+      "broadcast_returned_after_s": 10.0,
+      "stop_issued_after_s": 45.1,
+      "device_bytes": 51132,
+      "sampling_interval_us": 1000
+    },
+    {
+      "name": "am_profile_sdcard_denied",
+      "file": "am_profile_sdcard_denied.txt",
+      "command": "adb shell am profile start --sampling 1000 com.example.composefixture /sdcard/aes_denied.trace",
+      "description": "`am profile start` to a path on shared storage. Refused: exit **255**, stdout empty, and on stderr an SELinux denial (`avc:  denied  { write } ... scontext=u:r:system_server:s0 tcontext=u:object_r:fuse:s0`) RUN TOGETHER with the next sentence on the same line, no newline between them, then 'Error: Unable to open file: <path>' and 'Consider using a file under /data/local/tmp/'. It is system_server that opens the file, not the app and not the shell, which is why /sdcard -- writable from `adb shell` -- is still refused. The refusal LEAVES A 0-BYTE FILE behind (see left_behind in this entry), so a caller that takes 'the trace file exists' as proof profiling started is fooled; the exit status is the only reliable signal.",
+      "catches": [],
+      "bytes": 345,
+      "exit_status": 255,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 345,
+      "left_behind": {
+        "command": "adb shell ls -la /sdcard/aes_denied.trace",
+        "exit_status": 0,
+        "output": "-rw-rw---- 1 u0_a187 media_rw 0 2026-10-16 11:23 /sdcard/aes_denied.trace"
+      }
+    },
+    {
       "name": "am_start_wait_missing",
       "file": "am_start_wait_missing.txt",
       "command": "adb shell am start -W -n com.android.settings/.NoSuchActivity",
@@ -83,6 +129,90 @@
       "stream": "stdout",
       "stdout_bytes": 189,
       "stderr_bytes": 0
+    },
+    {
+      "name": "am_start_wait_view_unresolved",
+      "file": "am_start_wait_view_unresolved.txt",
+      "command": "adb shell am start -W -a android.intent.action.VIEW -d aes-nothing-handles://x",
+      "description": "`am start -W -a VIEW -d <url>` for a deep link that nothing on the device handles -- the command app_launcher --open-url runs. Exit **1**, the diagnostic on **stdout** with stderr empty, like am_start_wait_missing, but a different shape: no 'Error type' line at all, just 'Starting: Intent { act=... dat=... }' and 'Error: Activity not started, unable to resolve Intent { ... }'. Note the data URI is cut to scheme and host with '/...' appended, in both lines, though this URL had no path at all -- 'aes-nothing-handles://x/...' -- so a path or query that failed cannot be read back out of the error, and a caller that wants to name the URL has to remember what it passed. A flags field (flg=0x10000000) appears in the error line that the Starting line does not carry.",
+      "catches": [
+        "E1"
+      ],
+      "bytes": 220,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 220,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "avd_config_ini",
+      "file": "avd_config_ini.txt",
+      "command": "cat <avd home>/aes_fixture_tmp.avd/config.ini  (between avdmanager_create and avdmanager_delete)",
+      "description": "The config.ini avdmanager writes for a new AVD, read from disk between the create and the delete -- what emulator_selector's read_avd_config / parse_config_ini consume. Bare `key=value` lines, sorted, no spaces around `=`, no comments and no blank lines. Three things a hand-written one gets wrong: there is no `AvdId` key and no `avd.ini.displayname` (Android Studio writes both; the command-line tool writes neither), so a display name read from it is empty for every AVD emulator_create makes; `avd.id` and `avd.name` hold the LITERAL placeholder '<build>', not the AVD's name; and the API level is only in `image.sysdir.1=system-images/android-34/...` and `target=android-34`. Recorded as bytes so the package aliaser never sees it -- its dotted keys (hw.camera.back) match the aliaser's pattern and would be rewritten.",
+      "catches": [],
+      "bytes": 3572,
+      "source": "<avd home>/aes_fixture_tmp.avd/config.ini, read after avdmanager_create and before avdmanager_delete"
+    },
+    {
+      "name": "avdmanager_create",
+      "file": "avdmanager_create.txt",
+      "command": "{avdmanager} create avd --name aes_fixture_tmp --package system-images;android-34;google_apis;arm64-v8a --device pixel_9  (stdin: no)",
+      "description": "`avdmanager create avd` exactly as emulator_create runs it (long options, --device given, `no` on stdin), for a throwaway AVD that the same run deletes. Exit 0, stdout only, and what it prints is progress, not a result: two 'Loading local repository...' repaints and 'Auto-selecting single ABI arm64-v8a'. The raw stream separates the repaints with BARE carriage returns; text-mode decoding, the recorder's and emulator_create's alike, turns each into a newline, which is what this file holds. With --device given there is NO 'Do you wish to create a custom hardware profile? [no]' prompt (measured: it is printed only when --device is omitted), so the `no` emulator_create sends is never read. Nothing here names the AVD or says it was created: success is the exit status alone.",
+      "catches": [],
+      "bytes": 198,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 198,
+      "stderr_bytes": 0,
+      "argv": [
+        "{avdmanager}",
+        "create",
+        "avd",
+        "--name",
+        "aes_fixture_tmp",
+        "--package",
+        "system-images;android-34;google_apis;arm64-v8a",
+        "--device",
+        "pixel_9"
+      ]
+    },
+    {
+      "name": "avdmanager_delete",
+      "file": "avdmanager_delete.txt",
+      "command": "{avdmanager} delete avd --name aes_fixture_tmp",
+      "description": "`avdmanager delete avd` of an AVD that exists. Exit 0, stdout only: a leading blank line, then \"AVD '<name>' deleted.\" with NO trailing newline. It names no path and lists nothing it removed, so whether the .avd directory and the .ini beside it are gone is not something this output can say -- the recorder reads the disk back to know it.",
+      "catches": [],
+      "bytes": 31,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 31,
+      "stderr_bytes": 0,
+      "argv": [
+        "{avdmanager}",
+        "delete",
+        "avd",
+        "--name",
+        "aes_fixture_tmp"
+      ]
+    },
+    {
+      "name": "avdmanager_delete_missing",
+      "file": "avdmanager_delete_missing.txt",
+      "command": "{avdmanager} delete avd --name aes_does_not_exist",
+      "description": "`avdmanager delete avd` of a name that does not exist. Exit **1**, stdout EMPTY, and on stderr \"Error: There is no Android Virtual Device named '<name>'.\" followed by a second line reading just `null` -- a Java exception message printed without a null check. emulator_create.delete() passes stderr through verbatim, so its failure message ends in 'null'.",
+      "catches": [],
+      "bytes": 75,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 75,
+      "argv": [
+        "{avdmanager}",
+        "delete",
+        "avd",
+        "--name",
+        "aes_does_not_exist"
+      ]
     },
     {
       "name": "avdmanager_list_avd",
@@ -519,6 +649,16 @@
       "description": "The databases directory. Carries the -journal file alongside the database, which anything listing databases has to not offer as a database.",
       "catches": [],
       "bytes": 252
+    },
+    {
+      "name": "run_as_ls_symlink_space",
+      "file": "run_as_ls_symlink_space.txt",
+      "command": "adb shell run-as com.example.composefixture sh -c 'mkdir -p files/aes_fx && cd files/aes_fx && echo x > \"a b.txt\" && ln -s \"a b.txt\" link && ls -la'",
+      "description": "`run-as ls -la` of a directory holding a filename with a space and a symlink to it, made for the purpose in the fixture app's files/ and removed after. The three things parse_ls_output documents and no other recording had. What the device actually prints: toybox's ISO layout ('YYYY-MM-DD HH:MM', two tokens) -- NOT the coreutils 'Mon DD YYYY' layout the parser also claims, which this device's `ls` does not produce and no caller of the parser feeds it (all three run `run-as ... ls -la` on the device); the symlink as 'link -> a b.txt', size 7 (the length of the target string), mode lrwxrwxrwx; and the spaced name printed bare, unquoted and unescaped, so the name is everything after the time column. Note the entries are mode 0666 and the directory 0777: run-as's shell has a umask of 0.",
+      "catches": [],
+      "bytes": 242,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "run_as_not_an_application",

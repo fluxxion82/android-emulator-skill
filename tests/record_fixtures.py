@@ -15,12 +15,34 @@ Fixtures are written with no header or annotation, so a parser under test sees
 what it would see from the real tool. Provenance lives alongside in
 ``MANIFEST.json``.
 
-Two documented departures from verbatim, both visible in the code below:
-CRLF is normalised to LF (``_strip_cr``), and non-AOSP package names are
-redacted. The CRLF one has a cost worth knowing: the emulator console really
-does answer ``Pixel_9\r\nOK\r\n``, and that CR is what caused defect S5, so
-no fixture can reproduce S5. ``tests/test_emu_console.py`` covers the CRLF
-framing with constructed input and records the measured bytes in its docstring.
+Three documented departures from verbatim, all visible in the code below:
+
+1. CRLF is normalised to LF (``_strip_cr``). In practice the text-mode decode
+   in ``_run`` / ``_run_host`` already does it, and does more: Python's
+   universal-newline translation turns a *bare* CR into LF as well, so
+   avdmanager's progress bar, which repaints itself with bare CRs, arrives as
+   separate lines. The scripts read these tools in text mode too, so they see
+   the same translation. The cost worth knowing: the emulator console really
+   does answer ``Pixel_9\r\nOK\r\n``, and that CR is what caused defect S5, so
+   no fixture can reproduce S5. ``tests/test_emu_console.py`` covers the CRLF
+   framing with constructed input and records the measured bytes in its
+   docstring.
+2. Non-AOSP package names are aliased (``_redact_private_packages``).
+3. The recording machine's home directory is replaced by ``/Users/<user>``
+   (``_scrub_home_paths``) wherever an SDK tool's output or a file it wrote
+   might carry it -- the avdmanager and sdkmanager fixtures and the AVD's
+   ``config.ini``. Fixtures are public; an account name is not theirs to
+   publish. The placeholder keeps the path absolute, so a parser that splits
+   or joins it exercises the same code it would on the real one.
+
+Binary fixtures are the exception to (1) and (2): the status-bar PNGs and
+``am_profile_hang.trace`` are written byte for byte, with no newline
+translation and no aliasing, because either would corrupt them -- the trace's
+record stream is little-endian integers, and a 0x0d byte in a clock value is
+not a line ending. Aliasing never sees their bytes, so each carries its own
+content check instead: the PNGs are cropped to the status bar, and the trace
+is refused unless every class it names is AOSP, Jetpack or the fixture app
+(``_check_hang_trace``).
 
 Usage
 -----
@@ -43,6 +65,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -155,6 +178,17 @@ class Fixture:
         metadata: Optional callable given the serial, returning extra manifest
             fields. For provenance that has to be measured at capture time
             rather than written from memory.
+        capture_with: Optional callable given (scratch_dir, serial, extra)
+            and returning the :class:`Capture` to record, for a fixture whose
+            evidence takes more than one command to produce. Two shapes need
+            it: the `am profile` refusals, where the state the refusal LEAVES
+            (a 0-byte file on /sdcard) has to be read before teardown deletes
+            it, and the avdmanager lifecycle, where create, config.ini and
+            delete must happen in that order in one run whatever ``--only``
+            selected. The Capture still goes through the text pipeline, so the
+            manifest's exit status and stream are the returned command's.
+        command: The manifest's ``command`` string, when the capture is not
+            one adb or host argv that could be shown instead.
     """
 
     name: str
@@ -172,6 +206,8 @@ class Fixture:
     record_both_streams: bool = False
     teardown_verify: Callable[[str | None], None] | None = None
     metadata: Callable[[str | None], dict] | None = None
+    capture_with: Callable[[Path, str | None, dict], Capture] | None = None
+    command: str | None = None
 
 
 class CaptureError(RuntimeError):
@@ -263,6 +299,17 @@ def _emulator_tool() -> str:
     which binary "emulator" means -- the disagreement that produced the
     PermissionError this fixture exists to make testable.
     """
+    _make_scripts_importable()
+    from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
+
+    resolved = get_emulator_path()
+    if not resolved:
+        raise CaptureError(EMULATOR_NOT_FOUND_MESSAGE)
+    return resolved
+
+
+def _make_scripts_importable() -> None:
+    """Put the skill's scripts directory on sys.path, for ``common.*``."""
     scripts = (
         Path(__file__).resolve().parents[1]
         / "android-emulator-skill"
@@ -272,12 +319,19 @@ def _emulator_tool() -> str:
     )
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))
-    from common.sdk_tools import EMULATOR_NOT_FOUND_MESSAGE, get_emulator_path
 
-    resolved = get_emulator_path()
-    if not resolved:
-        raise CaptureError(EMULATOR_NOT_FOUND_MESSAGE)
-    return resolved
+
+def _avd_home() -> Path:
+    """The directory holding ``<name>.avd``, resolved as the scripts resolve it.
+
+    Delegated to ``common.sdk_tools.resolve_avd_home`` for the same reason as
+    :func:`_emulator_tool`: a recorder that looked somewhere else would read a
+    config.ini the scripts never would.
+    """
+    _make_scripts_importable()
+    from common.sdk_tools import resolve_avd_home
+
+    return resolve_avd_home()
 
 
 def _scrub_home_paths(text: str) -> str:
@@ -313,7 +367,9 @@ def _pull_app_database(scratch: Path, serial: str | None) -> None:
     (scratch / "fx.db").write_bytes(result.stdout)
 
 
-def _run_host(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> Capture:
+def _run_host(
+    argv: list[str], timeout: int = DEFAULT_TIMEOUT, *, stdin: str | None = None
+) -> Capture:
     """Run a command on the HOST and return its output.
 
     For the one case where the text a parser consumes is not produced by adb:
@@ -321,9 +377,20 @@ def _run_host(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> Capture:
     so `model_inspector`'s working path pulls the database and runs the host's
     sqlite3 against it. Recording the adb call instead would capture the pull,
     not the schema the parser actually reads.
+
+    ``stdin`` is for `avdmanager create avd`, which emulator_create feeds
+    ``no\n`` in case it asks about a custom hardware profile. Without it the
+    child inherits the recorder's stdin, and a prompt would wait on a terminal.
     """
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            input=stdin,
+        )
     except FileNotFoundError as exc:
         raise CaptureError(f"{argv[0]} is not installed on this host") from exc
     except subprocess.TimeoutExpired as exc:
@@ -753,6 +820,427 @@ def _screen_of(
         return xml
 
     return check
+
+
+def _chain(*steps: Callable[[str], str]) -> Callable[[str], str]:
+    """Apply several ``post`` transforms in order: scrub first, then check."""
+
+    def run(text: str) -> str:
+        for step in steps:
+            text = step(text)
+        return text
+
+    return run
+
+
+def _device_path_absent(listing: list[str]) -> Callable[[str | None], None]:
+    """Read a teardown's deletion back instead of trusting ``rm``'s silence.
+
+    ``rm -f`` exits 0 whether or not there was anything to remove, so its
+    status says nothing. The listing must fail AND say why: a listing refused
+    for permission would also exit non-zero, and would prove nothing.
+    """
+
+    def verify(serial: str | None) -> None:
+        result = _run(listing, serial, timeout=15)
+        if result.returncode == 0 or "No such file" not in result.text:
+            raise CaptureError(
+                f"`adb {' '.join(listing)}` does not show the path gone after "
+                f"teardown (exit {result.returncode}): {result.text.strip()[:200]!r}"
+            )
+
+    return verify
+
+
+# --- am profile: sampling a hung app without root ----------------------------
+#
+# On a `user` build there is no root, no simpleperf for an app that is not
+# profileable from shell, and no Studio on a CI host. `am profile start` still
+# works for a debuggable app, and it is the one way to see what a hung main
+# thread is doing while it hangs. These recordings are the ground truth the
+# v0.9.0 sampler is parsed against, and the two destinations it must not offer.
+
+# The destination that works, measured on API 35. system_server opens the file
+# and hands the descriptor to the app, so it has to be a path system_server may
+# create (not /sdcard -- an SELinux denial -- and not the app's own data dir),
+# and the shell user has to be able to read it back.
+TRACE_DEVICE_PATH = "/data/local/tmp/aes_hang.trace"
+
+# Sample every 1000 us. Sampled rather than instrumented, so the app runs at
+# close to normal speed while it is being watched.
+TRACE_SAMPLING_US = "1000"
+
+# AnrReceiver blocks main for 40 s from dispatch. The stop must come after main
+# has unblocked, or the sleep's exit is not in the trace and its dwell cannot be
+# measured. 45 s is the margin of the original capture (48 s of trace).
+TRACE_STOP_AFTER_S = 45
+
+# Before the profiler starts, the app is left alone long enough for Jetpack
+# ProfileInstaller's one-shot worker -- posted 5-6 s after the first frame, run
+# on a pool thread with no keep-alive -- to start AND exit. A thread exiting
+# while `am profile --sampling` runs can kill the app: measured once in three
+# runs here, an ART `thread.cc:2698 Check failed: tlsPtr_.method_trace_buffer ==
+# nullptr` abort in that worker 57 ms after it started, and the trace was lost
+# with the process. (The ANR held the worker's message behind the blocked main
+# thread, so it ran the moment main unblocked, mid-trace.)
+TRACE_QUIET_BEFORE_S = "10"
+
+# Every class a committed trace may name. The trace is binary, so the package
+# aliaser never sees it; this is its privacy check instead. The four added
+# here are public runtime code a method trace reaches and text output so far
+# has not: the JDK internals ART ships (jdk.internal.misc.Unsafe,
+# sun.misc.Cleaner), libcore's DDM server (org.apache.harmony.dalvik.ddmc --
+# a debuggable app answers the host's debugger polling on it), and
+# kotlinx.coroutines, which the Compose fixture app runs on. Each was added
+# because a real capture naming it was refused, which is the check working.
+_TRACE_PUBLIC_PREFIXES = (
+    *_PUBLIC_PACKAGE_PREFIXES,
+    "jdk.",
+    "sun.",
+    "kotlinx.",
+    "org.apache.harmony.",
+)
+
+# The trace and both refusals are taken from a running, foreground app: `am
+# profile start` names a PROCESS, and a background ANR may simply kill it.
+_LAUNCH_COMPOSE = [
+    ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+    ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+    ["shell", "sleep", "2"],
+]
+
+_PROVOKE_ANR = [
+    "shell",
+    "am",
+    "broadcast",
+    "-f",
+    "0x10000000",
+    "-n",
+    f"{COMPOSE_PACKAGE}/.AnrReceiver",
+    "-a",
+    f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
+]
+
+_PROFILE_STOP = ["shell", "am", "profile", "stop", COMPOSE_PACKAGE]
+
+
+def _profile_start(destination: str) -> list[str]:
+    """The `am profile start` argv every fixture here records."""
+    return [
+        "shell",
+        "am",
+        "profile",
+        "start",
+        "--sampling",
+        TRACE_SAMPLING_US,
+        COMPOSE_PACKAGE,
+        destination,
+    ]
+
+
+def _check_hang_trace(payload: bytes) -> None:
+    """Refuse a trace that is not the hang it is meant to be, or names private code.
+
+    Checks only what makes the capture usable and publishable; what the trace
+    SAYS is the test's business (tests/test_am_profile_trace.py).
+    """
+    end = payload.find(b"\n*end\n")
+    if not payload.startswith(b"*version\n") or end == -1:
+        raise CaptureError("not an ART method trace: no `*version` ... `*end` text header")
+    body = payload[end + len(b"\n*end\n") :]
+    if not body.startswith(b"SLOW"):
+        raise CaptureError(f"no SLOW magic after *end: {body[:4]!r}")
+
+    lines = payload[:end].decode("utf-8", errors="replace").splitlines()
+    if "data-file-overflow=false" not in lines:
+        raise CaptureError("the trace buffer overflowed, so the record stream is truncated")
+    try:
+        threads = lines[lines.index("*threads") + 1 : lines.index("*methods")]
+        methods = lines[lines.index("*methods") + 1 :]
+    except ValueError as exc:
+        raise CaptureError("the text header has no *threads / *methods section") from exc
+    if not any(line.split("\t")[-1] == "main" for line in threads):
+        raise CaptureError("no `main` thread in *threads")
+
+    classes = {line.split("\t")[1] for line in methods if line.count("\t") >= 2}
+    if f"{COMPOSE_PACKAGE}.AnrReceiver" not in classes:
+        raise CaptureError(
+            "AnrReceiver is not in the trace: the broadcast did not land while the "
+            "profiler was running"
+        )
+    private = sorted(name for name in classes if not name.startswith(_TRACE_PUBLIC_PREFIXES))
+    if private:
+        raise CaptureError(
+            f"the trace names classes outside AOSP, Jetpack and the fixture app "
+            f"({private[:5]}); refusing to commit it"
+        )
+
+
+def _wait_for_complete_file(serial: str | None, path: str, *, within_s: int = 20) -> int:
+    """Wait until the app has finished writing ``path``; return its size.
+
+    `am profile stop` returns before the app has written the trace -- the stop
+    is a request to the process, which then dumps its buffer. The size has to
+    be non-zero and the same twice running before the file is taken.
+    """
+    deadline = time.monotonic() + within_s
+    previous = -1
+    while time.monotonic() < deadline:
+        result = _run(["shell", "stat", "-c", "%s", path], serial, timeout=15)
+        size = int(result.text.strip()) if result.text.strip().isdigit() else -1
+        if size > 0 and size == previous:
+            return size
+        previous = size
+        time.sleep(1)
+    raise CaptureError(f"{path} did not reach a stable non-zero size within {within_s}s")
+
+
+def _profile_hang_trace(serial: str | None, extra: dict) -> bytes:
+    """Sample the fixture app while AnrReceiver blocks its main thread for 40 s."""
+    start = _run(_profile_start(TRACE_DEVICE_PATH), serial)
+    if start.returncode != 0:
+        raise CaptureError(
+            f"am profile start exited {start.returncode}: {start.text.strip()[:200]!r}"
+        )
+
+    began = time.monotonic()
+    broadcast = _run(_PROVOKE_ANR, serial, timeout=60)
+    extra["broadcast_returned_after_s"] = round(time.monotonic() - began, 1)
+    if broadcast.returncode != 0:
+        raise CaptureError(f"the ANR broadcast exited {broadcast.returncode}")
+
+    remaining = TRACE_STOP_AFTER_S - (time.monotonic() - began)
+    if remaining > 0:
+        time.sleep(remaining)
+    # A dead process cannot answer the stop, and the file then stays 0 bytes;
+    # say why instead of timing out on the size poll.
+    alive = _run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15)
+    if alive.returncode != 0:
+        raise CaptureError(
+            f"{COMPOSE_PACKAGE} died while it was being profiled, so the trace "
+            f"went with it. Look in logcat for an ART `Check failed: "
+            f"tlsPtr_.method_trace_buffer == nullptr` abort; see "
+            f"TRACE_QUIET_BEFORE_S"
+        )
+    stop = _run(_PROFILE_STOP, serial)
+    extra["stop_issued_after_s"] = round(time.monotonic() - began, 1)
+    if stop.returncode != 0:
+        raise CaptureError(f"am profile stop exited {stop.returncode}: {stop.text.strip()!r}")
+
+    extra["device_bytes"] = _wait_for_complete_file(serial, TRACE_DEVICE_PATH)
+    payload = _run_bytes(["exec-out", "cat", TRACE_DEVICE_PATH], serial, timeout=60)
+    if len(payload) != extra["device_bytes"]:
+        raise CaptureError(
+            f"read {len(payload)} bytes of a {extra['device_bytes']}-byte trace; "
+            f"the stream was altered on the way"
+        )
+    _check_hang_trace(payload)
+    extra["sampling_interval_us"] = int(TRACE_SAMPLING_US)
+    return payload
+
+
+def _profile_refusal(
+    destination: str, listing: list[str]
+) -> Callable[[Path, str | None, dict], Capture]:
+    """`am profile start` to a destination it refuses, and what the refusal leaves.
+
+    The listing is taken here, not in teardown, because teardown deletes what it
+    would show. For /sdcard that is the point: the refusal still leaves a 0-byte
+    file behind, so "the trace file exists" is no evidence profiling started.
+    """
+
+    def capture(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+        refusal = _run(_profile_start(destination), serial)
+        if refusal.returncode == 0:
+            raise CaptureError(
+                f"am profile start to {destination} exited 0. This fixture records "
+                f"a refusal; an accepted destination means the premise changed"
+            )
+        left = _run(listing, serial, timeout=15)
+        extra["left_behind"] = {
+            "command": "adb " + " ".join(listing),
+            "exit_status": left.returncode,
+            "output": _strip_cr(left.text).strip(),
+        }
+        return refusal
+
+    return capture
+
+
+# --- avdmanager create / delete: a throwaway AVD, made and removed in one run --
+
+# Named so that nobody has one. The run refuses to start if somebody does,
+# because the lifecycle below DELETES an AVD by each of these names.
+THROWAWAY_AVD = "aes_fixture_tmp"
+MISSING_AVD = "aes_does_not_exist"
+
+# What emulator_create builds for `--api 34 --variant google_apis --abi
+# arm64-v8a --device pixel_9`, from an image installed on the recording host
+# (see sdkmanager_list_installed) and a device in avdmanager_list_device.
+THROWAWAY_AVD_PACKAGE = "system-images;android-34;google_apis;arm64-v8a"
+THROWAWAY_AVD_DEVICE = "pixel_9"
+
+# avdmanager starts a JVM and loads the local repository on every call; the
+# create measured a few seconds, so this is margin, not an estimate.
+AVD_TOOL_TIMEOUT = 120
+
+# The argv each fixture records, in the exact shape emulator_create runs --
+# long options, `--device` given -- with the tool as a placeholder so the
+# manifest carries no host path. tests/test_emulator_create.py compares the
+# script's argv against these.
+_AVD_ARGV = {
+    "avdmanager_create": [
+        "{avdmanager}",
+        "create",
+        "avd",
+        "--name",
+        THROWAWAY_AVD,
+        "--package",
+        THROWAWAY_AVD_PACKAGE,
+        "--device",
+        THROWAWAY_AVD_DEVICE,
+    ],
+    "avdmanager_delete": ["{avdmanager}", "delete", "avd", "--name", THROWAWAY_AVD],
+    "avdmanager_delete_missing": ["{avdmanager}", "delete", "avd", "--name", MISSING_AVD],
+}
+
+
+def _avd_present(home: Path, name: str) -> bool:
+    """Whether ``name`` has either half of an AVD on disk: the dir or the .ini."""
+    return (home / f"{name}.avd").exists() or (home / f"{name}.ini").exists()
+
+
+def _throwaway_avd_removed(_serial: str | None) -> None:
+    """Teardown check for the four avdmanager fixtures: nothing left on disk."""
+    home = _avd_home()
+    if _avd_present(home, THROWAWAY_AVD):
+        raise CaptureError(
+            f"the throwaway AVD is still on this host under {_scrub_home_paths(str(home))}. "
+            f"Remove it: avdmanager delete avd --name {THROWAWAY_AVD}"
+        )
+
+
+class _ThrowawayAvd:
+    """Create an AVD, read its config.ini, delete it, and prove it is gone.
+
+    Four fixtures come out of one lifecycle, and the order is the point:
+    config.ini exists only between the create and the delete. So the lifecycle
+    runs once per recorder run, the first time any of the four is asked for,
+    and each fixture takes its piece -- `--only avdmanager_delete` still
+    creates first, and `--only avdmanager_create` still deletes after. The
+    delete is in a ``finally``, and the end state is read back from disk and
+    from `avdmanager list avd -c` rather than trusted: the outcome this must
+    never have is an AVD left on somebody's machine.
+    """
+
+    def __init__(self) -> None:
+        self._captures: dict[str, Capture] | None = None
+        self._config_ini = ""
+        self._error: CaptureError | None = None
+
+    def capture(self, name: str) -> Callable[[Path, str | None, dict], Capture]:
+        """A ``capture_with`` for one of the three avdmanager commands."""
+
+        def get(_scratch: Path, _serial: str | None, extra: dict) -> Capture:
+            captures = self._run_once()
+            extra["argv"] = _AVD_ARGV[name]
+            return captures[name]
+
+        return get
+
+    def config_ini(self, _serial: str | None, extra: dict) -> bytes:
+        """A ``capture_bytes`` for the config.ini, read between create and delete.
+
+        Bytes rather than text so the package aliaser never sees it: its keys
+        are dotted lowercase names (`hw.camera.back`, `image.sysdir.1`) that the
+        aliaser's pattern takes for package names, and it would rewrite the
+        keys a parser looks up. Nothing in it is private -- avdmanager writes it
+        from the system image and the device definition -- and the home
+        directory is scrubbed all the same.
+        """
+        self._run_once()
+        extra["source"] = (
+            f"<avd home>/{THROWAWAY_AVD}.avd/config.ini, read after avdmanager_create "
+            f"and before avdmanager_delete"
+        )
+        text = _requires("image.sysdir.1=", "hw.device.name=", "abi.type=")(
+            _scrub_home_paths(self._config_ini)
+        )
+        return text.encode("utf-8")
+
+    def _run_once(self) -> dict[str, Capture]:
+        if self._error is not None:
+            raise self._error
+        if self._captures is None:
+            try:
+                self._captures = self._lifecycle()
+            except CaptureError as exc:
+                self._error = exc
+                raise
+        return self._captures
+
+    def _lifecycle(self) -> dict[str, Capture]:
+        tool = _sdk_tool("avdmanager")
+        home = _avd_home()
+        for name in (THROWAWAY_AVD, MISSING_AVD):
+            if _avd_present(home, name):
+                raise CaptureError(
+                    f"an AVD named {name!r} already exists on this host. This "
+                    f"recorder deletes AVDs by that name and will not touch one it "
+                    f"did not create; if it is a leftover from an earlier run, "
+                    f"remove it with: avdmanager delete avd --name {name}"
+                )
+
+        def run(name: str, stdin: str | None = None) -> Capture:
+            argv = [tool if arg == "{avdmanager}" else arg for arg in _AVD_ARGV[name]]
+            return _run_host(argv, AVD_TOOL_TIMEOUT, stdin=stdin)
+
+        captures: dict[str, Capture] = {}
+        try:
+            # emulator_create feeds `no` for the custom-hardware-profile prompt.
+            # With --device given the prompt is never printed (measured), but
+            # the input is part of the command the script runs, so it is here.
+            create = run("avdmanager_create", stdin="no\n")
+            captures["avdmanager_create"] = create
+            if create.returncode != 0:
+                raise CaptureError(
+                    f"avdmanager create exited {create.returncode}: {create.text.strip()[:300]!r}"
+                )
+            config_path = home / f"{THROWAWAY_AVD}.avd" / "config.ini"
+            try:
+                self._config_ini = config_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise CaptureError(
+                    f"the AVD was created but its config.ini is unreadable: {exc}"
+                ) from exc
+        finally:
+            if _avd_present(home, THROWAWAY_AVD):
+                captures["avdmanager_delete"] = run("avdmanager_delete")
+
+        captures["avdmanager_delete_missing"] = run("avdmanager_delete_missing")
+
+        # Read back both ways: the files on disk, and what avdmanager itself
+        # still lists. Not through _run_host, which refuses empty output -- a
+        # host whose only AVD was this one lists nothing, and that is success.
+        try:
+            listing = subprocess.run(
+                [tool, "list", "avd", "-c"],
+                capture_output=True,
+                text=True,
+                timeout=AVD_TOOL_TIMEOUT,
+                check=False,
+            ).stdout.split()
+        except subprocess.TimeoutExpired as exc:
+            raise CaptureError("could not list AVDs to confirm the delete") from exc
+        if _avd_present(home, THROWAWAY_AVD) or THROWAWAY_AVD in listing:
+            raise CaptureError(
+                f"{THROWAWAY_AVD} is still present after `avdmanager delete`. Remove "
+                f"it by hand: avdmanager delete avd --name {THROWAWAY_AVD}"
+            )
+        return captures
+
+
+_THROWAWAY_AVD = _ThrowawayAvd()
 
 
 # --- scroll-into-view corpus ------------------------------------------------
@@ -1595,6 +2083,119 @@ FIXTURES: list[Fixture] = [
             "never produces."
         ),
     ),
+    # --- am profile: the no-root sampling path, and the two it refuses ------
+    Fixture(
+        name="am_profile_hang",
+        args=[],
+        ext="trace",
+        command=(
+            f"adb {' '.join(_profile_start(TRACE_DEVICE_PATH))}; "
+            f"adb {' '.join(_PROVOKE_ANR)}; "
+            f"wait until {TRACE_STOP_AFTER_S}s after the broadcast; "
+            f"adb {' '.join(_PROFILE_STOP)}; "
+            f"adb exec-out cat {TRACE_DEVICE_PATH}"
+        ),
+        capture_bytes=_profile_hang_trace,
+        description=(
+            "An ART method trace of the fixture app, sampled every 1000 us by "
+            "`am profile start --sampling` while AnrReceiver held its main "
+            "thread in Thread.sleep for 40 s -- a hung app, seen from inside "
+            "without root on a `user` build. The ground truth the v0.9.0 hang "
+            "sampler is parsed against (vault: 'Sampling a Hung App Without "
+            "Root'). BINARY, written byte for byte: a text header (`*version` "
+            "/ `3` / key=value lines including `clock=dual` / `*threads` / "
+            "`*methods` / `*end`), then a little-endian body starting with "
+            "the magic `SLOW`. What a parser written from memory gets wrong: "
+            "the records are TRANSITIONS, not samples -- a 40 s block is one "
+            "enter and one exit 40 s apart, not 40,000 rows; the stack the "
+            "thread already had when profiling began is replayed as enters at "
+            "the first sample; and under clock=dual each record carries the "
+            "thread-CPU clock BEFORE the wall clock, so across the sleep the "
+            "CPU clock moves by milliseconds and only the wall clock shows the "
+            "hang. Thread.sleep appears three times nested (three overloads), "
+            "so 'the frame under the sleep' is the first frame that is not a "
+            "Thread.sleep. Taken 10 s after launch, so that Jetpack "
+            "ProfileInstaller's one-shot worker thread has come and gone "
+            "first: a thread exiting under the sampler killed the app once in "
+            "three runs (see TRACE_QUIET_BEFORE_S). Note too that `am "
+            "broadcast` did not return until the receiver timed out "
+            "(broadcast_returned_after_s)."
+        ),
+        setup=[
+            *_LAUNCH_COMPOSE,
+            ["shell", "rm", "-f", TRACE_DEVICE_PATH],
+            ["shell", "sleep", TRACE_QUIET_BEFORE_S],
+        ],
+        teardown=[
+            _PROFILE_STOP,
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "rm", "-f", TRACE_DEVICE_PATH],
+        ],
+        teardown_verify=_device_path_absent(["shell", "ls", TRACE_DEVICE_PATH]),
+    ),
+    Fixture(
+        name="am_profile_sdcard_denied",
+        args=_profile_start("/sdcard/aes_denied.trace"),
+        capture_with=_profile_refusal(
+            "/sdcard/aes_denied.trace", ["shell", "ls", "-la", "/sdcard/aes_denied.trace"]
+        ),
+        record_both_streams=True,
+        description=(
+            "`am profile start` to a path on shared storage. Refused: exit "
+            "**255**, stdout empty, and on stderr an SELinux denial "
+            "(`avc:  denied  { write } ... scontext=u:r:system_server:s0 "
+            "tcontext=u:object_r:fuse:s0`) RUN TOGETHER with the next sentence "
+            "on the same line, no newline between them, then 'Error: Unable "
+            "to open file: <path>' and 'Consider using a file under "
+            "/data/local/tmp/'. It is system_server that opens the file, not "
+            "the app and not the shell, which is why /sdcard -- writable from "
+            "`adb shell` -- is still refused. The refusal LEAVES A 0-BYTE FILE "
+            "behind (see left_behind in this entry), so a caller that takes "
+            "'the trace file exists' as proof profiling started is fooled; "
+            "the exit status is the only reliable signal."
+        ),
+        setup=[*_LAUNCH_COMPOSE, ["shell", "rm", "-f", "/sdcard/aes_denied.trace"]],
+        teardown=[
+            _PROFILE_STOP,
+            ["shell", "rm", "-f", "/sdcard/aes_denied.trace"],
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+        ],
+        teardown_verify=_device_path_absent(["shell", "ls", "/sdcard/aes_denied.trace"]),
+        post=_requires("Unable to open file", "Consider using a file under /data/local/tmp/"),
+    ),
+    Fixture(
+        name="am_profile_appdir_denied",
+        args=_profile_start(f"/data/data/{COMPOSE_PACKAGE}/files/aes_denied.trace"),
+        capture_with=_profile_refusal(
+            f"/data/data/{COMPOSE_PACKAGE}/files/aes_denied.trace",
+            ["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", "files/aes_denied.trace"],
+        ),
+        record_both_streams=True,
+        description=(
+            "`am profile start` to a path in the profiled app's OWN data "
+            "directory -- the obvious place, since the app is the one writing "
+            "the trace. Refused just the same: exit **255**, stdout empty, "
+            "'Error: Unable to open file: <path>' and 'Consider using a file "
+            "under /data/local/tmp/' on stderr, and no avc line this time. "
+            "Unlike /sdcard it leaves nothing behind (left_behind: the app's "
+            "own `run-as ls` reports No such file). Together with "
+            "am_profile_sdcard_denied this pins both wrong destinations as "
+            "refused, and the refusal text names the one that works."
+        ),
+        setup=[
+            *_LAUNCH_COMPOSE,
+            ["shell", "run-as", COMPOSE_PACKAGE, "rm", "-f", "files/aes_denied.trace"],
+        ],
+        teardown=[
+            _PROFILE_STOP,
+            ["shell", "run-as", COMPOSE_PACKAGE, "rm", "-f", "files/aes_denied.trace"],
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+        ],
+        teardown_verify=_device_path_absent(
+            ["shell", "run-as", COMPOSE_PACKAGE, "ls", "files/aes_denied.trace"]
+        ),
+        post=_requires("Unable to open file", "Consider using a file under /data/local/tmp/"),
+    ),
     # --- run-as: the container/model-inspector ground truth -----------------
     Fixture(
         name="run_as_not_an_application",
@@ -1654,6 +2255,33 @@ FIXTURES: list[Fixture] = [
             "database, which anything listing databases has to not offer as a "
             "database."
         ),
+    ),
+    Fixture(
+        name="run_as_ls_symlink_space",
+        args=[
+            "shell",
+            f"run-as {COMPOSE_PACKAGE} sh -c 'mkdir -p files/aes_fx && cd files/aes_fx "
+            f'&& echo x > "a b.txt" && ln -s "a b.txt" link && ls -la\'',
+        ],
+        description=(
+            "`run-as ls -la` of a directory holding a filename with a space and "
+            "a symlink to it, made for the purpose in the fixture app's files/ "
+            "and removed after. The three things parse_ls_output documents and "
+            "no other recording had. What the device actually prints: toybox's "
+            "ISO layout ('YYYY-MM-DD HH:MM', two tokens) -- NOT the coreutils "
+            "'Mon DD YYYY' layout the parser also claims, which this device's "
+            "`ls` does not produce and no caller of the parser feeds it (all "
+            "three run `run-as ... ls -la` on the device); the symlink as "
+            "'link -> a b.txt', size 7 (the "
+            "length of the target string), mode lrwxrwxrwx; and the spaced "
+            "name printed bare, unquoted and unescaped, so the name is "
+            "everything after the time column. Note the entries are mode 0666 "
+            "and the directory 0777: run-as's shell has a umask of 0."
+        ),
+        setup=[["shell", f"run-as {COMPOSE_PACKAGE} rm -rf files/aes_fx"]],
+        teardown=[["shell", f"run-as {COMPOSE_PACKAGE} rm -rf files/aes_fx"]],
+        teardown_verify=_device_path_absent(["shell", f"run-as {COMPOSE_PACKAGE} ls files/aes_fx"]),
+        post=_requires("link -> a b.txt", "\n-rw"),
     ),
     Fixture(
         name="sqlite_schema_host",
@@ -1729,6 +2357,94 @@ FIXTURES: list[Fixture] = [
             'offers. Entries are numbered `id: N or "name"`, which is two '
             "identifiers for one device, and the human name is on a separate "
             "`Name:` line."
+        ),
+    ),
+    # --- avdmanager create / delete: one throwaway AVD, made and removed ----
+    # All four come out of one _ThrowawayAvd lifecycle (create -> config.ini
+    # -> delete -> delete-missing -> read back), whichever of them --only asks
+    # for. See that class for why the order is not left to FIXTURES.
+    Fixture(
+        name="avdmanager_create",
+        args=[],
+        command=" ".join(_AVD_ARGV["avdmanager_create"]) + "  (stdin: no)",
+        capture_with=_THROWAWAY_AVD.capture("avdmanager_create"),
+        record_both_streams=True,
+        teardown_verify=_throwaway_avd_removed,
+        post=_chain(_scrub_home_paths, _requires("Loading local repository")),
+        description=(
+            "`avdmanager create avd` exactly as emulator_create runs it (long "
+            "options, --device given, `no` on stdin), for a throwaway AVD that "
+            "the same run deletes. Exit 0, stdout only, and what it prints is "
+            "progress, not a result: two 'Loading local repository...' "
+            "repaints and 'Auto-selecting single ABI arm64-v8a'. The raw "
+            "stream separates the repaints with BARE carriage returns; text-"
+            "mode decoding, the recorder's and emulator_create's alike, turns "
+            "each into a newline, which is what this file holds. With --device "
+            "given there is NO 'Do you wish to create a custom hardware "
+            "profile? [no]' prompt (measured: it is printed only when --device "
+            "is omitted), so the `no` emulator_create sends is never read. "
+            "Nothing here names the AVD or says it was created: success is "
+            "the exit status alone."
+        ),
+    ),
+    Fixture(
+        name="avd_config_ini",
+        args=[],
+        command=(
+            f"cat <avd home>/{THROWAWAY_AVD}.avd/config.ini  "
+            f"(between avdmanager_create and avdmanager_delete)"
+        ),
+        capture_bytes=_THROWAWAY_AVD.config_ini,
+        teardown_verify=_throwaway_avd_removed,
+        description=(
+            "The config.ini avdmanager writes for a new AVD, read from disk "
+            "between the create and the delete -- what emulator_selector's "
+            "read_avd_config / parse_config_ini consume. Bare `key=value` "
+            "lines, sorted, no spaces around `=`, no comments and no blank "
+            "lines. Three things a hand-written one gets wrong: there is no "
+            "`AvdId` key and no `avd.ini.displayname` (Android Studio writes "
+            "both; the command-line tool writes neither), so a display name "
+            "read from it is empty for every AVD emulator_create makes; "
+            "`avd.id` and `avd.name` hold the LITERAL placeholder '<build>', "
+            "not the AVD's name; and the API level is only in "
+            "`image.sysdir.1=system-images/android-34/...` and "
+            "`target=android-34`. Recorded as bytes so the package aliaser "
+            "never sees it -- its dotted keys (hw.camera.back) match the "
+            "aliaser's pattern and would be rewritten."
+        ),
+    ),
+    Fixture(
+        name="avdmanager_delete",
+        args=[],
+        command=" ".join(_AVD_ARGV["avdmanager_delete"]),
+        capture_with=_THROWAWAY_AVD.capture("avdmanager_delete"),
+        record_both_streams=True,
+        teardown_verify=_throwaway_avd_removed,
+        post=_chain(_scrub_home_paths, _requires(f"AVD '{THROWAWAY_AVD}' deleted.")),
+        description=(
+            "`avdmanager delete avd` of an AVD that exists. Exit 0, stdout "
+            "only: a leading blank line, then \"AVD '<name>' deleted.\" with "
+            "NO trailing newline. It names no path and lists nothing it "
+            "removed, so whether the .avd directory and the .ini beside it are "
+            "gone is not something this output can say -- the recorder reads "
+            "the disk back to know it."
+        ),
+    ),
+    Fixture(
+        name="avdmanager_delete_missing",
+        args=[],
+        command=" ".join(_AVD_ARGV["avdmanager_delete_missing"]),
+        capture_with=_THROWAWAY_AVD.capture("avdmanager_delete_missing"),
+        record_both_streams=True,
+        teardown_verify=_throwaway_avd_removed,
+        post=_chain(_scrub_home_paths, _requires("There is no Android Virtual Device named")),
+        description=(
+            "`avdmanager delete avd` of a name that does not exist. Exit **1**, "
+            'stdout EMPTY, and on stderr "Error: There is no Android Virtual '
+            "Device named '<name>'.\" followed by a second line reading just "
+            "`null` -- a Java exception message printed without a null check. "
+            "emulator_create.delete() passes stderr through verbatim, so its "
+            "failure message ends in 'null'."
         ),
     ),
     Fixture(
@@ -2049,6 +2765,37 @@ FIXTURES: list[Fixture] = [
         record_both_streams=True,
         post=_requires("Error type 3", "does not exist"),
     ),
+    Fixture(
+        name="am_start_wait_view_unresolved",
+        args=[
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            "aes-nothing-handles://x",
+        ],
+        description=(
+            "`am start -W -a VIEW -d <url>` for a deep link that nothing on the "
+            "device handles -- the command app_launcher --open-url runs. Exit "
+            "**1**, the diagnostic on **stdout** with stderr empty, like "
+            "am_start_wait_missing, but a different shape: no 'Error type' "
+            "line at all, just 'Starting: Intent { act=... dat=... }' and "
+            "'Error: Activity not started, unable to resolve Intent { ... }'. "
+            "Note the data URI is cut to scheme and host with '/...' "
+            "appended, in both lines, though this URL had no path at all -- "
+            "'aes-nothing-handles://x/...' -- so a path or query that failed "
+            "cannot be read back out of the error, and a caller that wants to "
+            "name the URL has to remember what it passed. A flags field "
+            "(flg=0x10000000) "
+            "appears in the error line that the Starting line does not carry."
+        ),
+        catches=("E1",),
+        record_both_streams=True,
+        post=_requires("unable to resolve Intent", absent=("Status:",)),
+    ),
     # --- process liveness: the empty answer that is not an error -----------
     Fixture(
         name="pidof_not_running",
@@ -2184,6 +2931,15 @@ FIXTURES: list[Fixture] = [
         teardown=[["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "exit"]],
     ),
 ]
+
+
+def _command_of(fixture: Fixture) -> str:
+    """What the manifest and ``--list`` say was run to produce ``fixture``."""
+    if fixture.command is not None:
+        return fixture.command
+    if fixture.host_argv is not None:
+        return " ".join(fixture.host_argv)
+    return "adb " + " ".join(fixture.args)
 
 
 def _known_names() -> set[str]:
@@ -2344,6 +3100,8 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                 fixture.prepare(scratch, serial)
             if fixture.capture_bytes is not None:
                 payload = fixture.capture_bytes(serial, extra)
+            elif fixture.capture_with is not None:
+                capture = fixture.capture_with(scratch, serial, extra)
             elif fixture.host_argv is not None:
                 capture = _run_host(
                     [
@@ -2395,11 +3153,7 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                 continue
         _record_one(
             fixture.name,
-            (
-                " ".join(fixture.host_argv)
-                if fixture.host_argv is not None
-                else "adb " + " ".join(fixture.args)
-            ),
+            _command_of(fixture),
             fixture.description,
             list(fixture.catches),
             payload,
@@ -2503,7 +3257,7 @@ def main() -> None:
         width = max(len(n) for n in _known_names())
         for fixture in FIXTURES:
             catches = f"  [catches {', '.join(fixture.catches)}]" if fixture.catches else ""
-            print(f"{fixture.name:<{width}}  adb {' '.join(fixture.args)}{catches}")
+            print(f"{fixture.name:<{width}}  {_command_of(fixture)}{catches}")
         print(
             f"{HIERARCHY_FIXTURE:<{width}}  adb exec-out uiautomator dump /dev/tty" "  [catches S7]"
         )
