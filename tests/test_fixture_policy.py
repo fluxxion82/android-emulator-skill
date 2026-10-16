@@ -73,7 +73,20 @@ DERIVATION_ARG_MAX = 120
 STATIC_REPEAT_CAP = 10_000
 
 # Keyword arguments that hand fabricated output to a test double.
-OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
+#
+# `writes` is tests/fake_toolchain.py's Rule keyword for files a stub writes as
+# a side effect -- the JUnit XML a fake gradlew leaves behind for the build
+# parser to read. That is tool output reaching a parser by another door, so it
+# is held to the same rule (review of PR #20: XML handed through `writes=` was
+# invisible to this ratchet).
+OUTPUT_KEYWORDS = ("stdout", "stderr", "output", "writes")
+
+# Test helpers that are not `test_*.py` but build test doubles, so a literal
+# moved into one is still a transcript handed to a parser. Named exactly, not
+# globbed: a glob over tests/ would also pick up conftest.py and the recorders,
+# whose literals are commands, not output. (Review of PR #20: the fake
+# toolchain was outside the scan.)
+SCANNED_HELPERS = ("fake_toolchain.py",)
 
 # Fixtures that hand back verbatim recorded output. An expression reaching one
 # of these is ground truth however much it is then reshaped -- CLAUDE.md's
@@ -601,11 +614,19 @@ def _scan_source(source: str, parsers: set[str]) -> set[str]:
     return found
 
 
+def _scanned_modules() -> list[Path]:
+    """Every module the ratchet reads: the test files, plus the named helpers."""
+    helpers = [TESTS / name for name in SCANNED_HELPERS]
+    missing = [path.name for path in helpers if not path.is_file()]
+    assert not missing, f"SCANNED_HELPERS names files that do not exist: {missing}"
+    return sorted(TESTS.rglob("test_*.py")) + helpers
+
+
 def _violations() -> set[str]:
     parsers = _parser_names()
     return {
         f"{path.name}::{name}"
-        for path in sorted(TESTS.rglob("test_*.py"))
+        for path in _scanned_modules()
         for name in _scan_source(path.read_text(encoding="utf-8"), parsers)
     }
 
@@ -1027,6 +1048,102 @@ def test_the_documented_derivations_are_not_debt():
     assert "test_anr_watcher.py" not in offenders
 
 
+def test_the_fake_toolchain_helper_is_scanned_and_conftest_is_not():
+    """The helper that builds every stub is inside the ratchet, by exact name."""
+    scanned = {path.name for path in _scanned_modules()}
+    assert "fake_toolchain.py" in scanned
+    assert "conftest.py" not in scanned
+    assert "record_fixtures.py" not in scanned
+
+
+def test_a_transcript_handed_to_writes_is_caught():
+    """``writes=`` is a door into a parser, like ``stdout=``."""
+    blob = "<testsuite>" + "x" * 200 + "</testsuite>"
+    found = _scan_source(
+        f"Rule(('testDebugUnitTest',), writes=(('/p/TEST-A.xml', {blob!r}),))\n",
+        _parser_names(),
+    )
+    assert found == {"Rule"}
+
+
+def test_a_recording_handed_to_writes_is_not_flagged():
+    found = _scan_source(
+        "def test_x(recorded_gradle):\n"
+        "    Rule(('t',), writes=(('/p/TEST-A.xml', recorded_gradle('junit_xml_error_case')),))\n",
+        _parser_names(),
+    )
+    assert found == set()
+
+
+def _string_constants(source: str) -> set[str]:
+    """Every string literal in a module, docstrings excluded.
+
+    How tests actually name a fixture, read off the corpus: as a string
+    literal -- ``recorded.text("emu_avd_name")``, a hoisted constant
+    (``CONSOLE_SMS_HELP = "emu_help_sms"``), a ``parametrize`` list, or a
+    filename with its extension (``"junit_xml_error_case.xml"``). So a fixture
+    is named when some literal IS its name, compared whole. Comments are not
+    in the AST at all, and docstrings are dropped, because prose saying a
+    fixture exists is not a test reading it.
+
+    One shape is deliberately not credited: a name assembled at runtime,
+    ``recorded.text(f"logcat_{requested}")`` in test_logs.py. Its literal part
+    is ``"logcat_"``, which names no fixture; resolving it would mean
+    evaluating the test, and under-crediting only makes this guard stricter.
+    """
+    tree = ast.parse(source)
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(id(first.value))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    }
+
+
+def _unconsumed_fixtures(fixture_files: list[str], sources: list[str]) -> list[str]:
+    """Fixture stems that no literal in ``sources`` names in full.
+
+    N8: this was ``name not in test_source`` -- a substring test over every
+    test file joined together -- so ``emu_help`` counted as read by a test that
+    only ever names ``emu_help_sms``. A name is matched as a whole literal now,
+    either bare or as the recorded file's name.
+    """
+    named: set[str] = set()
+    for source in sources:
+        named |= _string_constants(source)
+    return sorted(
+        {
+            Path(filename).stem
+            for filename in fixture_files
+            if Path(filename).stem not in named and filename not in named
+        }
+    )
+
+
+def _consumer_modules() -> list[Path]:
+    """The test modules whose literals count as reading a fixture.
+
+    This module is excluded: its own tests name fixtures as DATA for the
+    matcher (``"emu_help"`` below), and counting those would let the guard
+    satisfy itself -- the same self-reference that makes a grep guard pass on
+    its own docstring.
+    """
+    this_file = Path(__file__).resolve()
+    return [path for path in sorted(TESTS.rglob("test_*.py")) if path.resolve() != this_file]
+
+
 def test_recorded_fixtures_are_actually_consumed():
     """A fixture nothing reads is not evidence, it is a file.
 
@@ -1034,17 +1151,20 @@ def test_recorded_fixtures_are_actually_consumed():
     the discipline without its effect.
     """
     corpus = REPO_ROOT / "tests" / "fixtures" / "recorded"
-    names = {
-        path.stem
-        for profile in corpus.iterdir()
-        if profile.is_dir()
-        for path in profile.iterdir()
-        if path.name != "MANIFEST.json"
-    }
+    fixture_files = sorted(
+        {
+            path.name
+            for profile in corpus.iterdir()
+            if profile.is_dir()
+            for path in profile.iterdir()
+            if path.name != "MANIFEST.json"
+        }
+    )
+    names = {Path(filename).stem for filename in fixture_files}
     assert names, "no recorded fixtures found"
 
-    test_source = "\n".join(path.read_text(encoding="utf-8") for path in TESTS.rglob("test_*.py"))
-    unused = sorted(name for name in names if name not in test_source)
+    sources = [path.read_text(encoding="utf-8") for path in _consumer_modules()]
+    unused = _unconsumed_fixtures(fixture_files, sources)
 
     # Not an error: some fixtures are recorded as evidence for a documented
     # claim rather than as parser input. Reported so the ratio stays visible.
@@ -1052,3 +1172,35 @@ def test_recorded_fixtures_are_actually_consumed():
         f"{len(unused)} of {len(names)} recorded fixtures are referenced by no "
         f"test: {unused}. The corpus is drifting toward decoration."
     )
+
+
+def test_a_fixture_is_not_consumed_by_a_longer_name_containing_it():
+    """N8, pinned: ``emu_help`` is not read by a test naming ``emu_help_sms``.
+
+    That is the real corpus today, not a hypothetical -- test_sms.py binds
+    ``CONSOLE_SMS_HELP = "emu_help_sms"`` and nothing reads ``emu_help``, but
+    the substring rule counted it as consumed.
+    """
+    fixtures = ["emu_help.txt", "emu_help_sms.txt"]
+
+    only_the_longer_name = 'CONSOLE_SMS_HELP = "emu_help_sms"\n'
+    assert _unconsumed_fixtures(fixtures, [only_the_longer_name]) == ["emu_help"]
+
+    # Prose is not consumption: a comment is not in the AST, and a docstring
+    # that is nothing but the name is still a docstring.
+    prose = '# emu_help is recorded\ndef test_x():\n    """emu_help"""\n'
+    assert _unconsumed_fixtures(fixtures, [prose, only_the_longer_name]) == ["emu_help"]
+
+    # The negative controls: the shapes the corpus really uses still count.
+    both = 'recorded.text("emu_help")\nrecorded.lines("emu_help_sms")\n'
+    assert _unconsumed_fixtures(fixtures, [both]) == []
+    by_filename = 'recorded_gradle("junit_xml_error_case.xml")\n'
+    assert _unconsumed_fixtures(["junit_xml_error_case.xml"], [by_filename]) == []
+
+
+def test_the_consumption_guard_does_not_read_its_own_test_data():
+    """This module's literals name fixtures as matcher input, not as reads."""
+    consumers = _consumer_modules()
+    assert Path(__file__).resolve() not in {path.resolve() for path in consumers}
+    # Floor, so "this file is excluded" cannot come from an empty scan.
+    assert len(consumers) >= 40, f"only {len(consumers)} test modules found"
