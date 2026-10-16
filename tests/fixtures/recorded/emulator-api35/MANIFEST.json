@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-16T18:24:52Z",
+  "recorded_at": "2026-10-16T18:57:39Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -77,12 +77,12 @@
       "name": "am_profile_hang",
       "file": "am_profile_hang.trace",
       "command": "adb shell am profile start --sampling 1000 com.example.composefixture /data/local/tmp/aes_hang.trace; adb shell am broadcast -f 0x10000000 -n com.example.composefixture/.AnrReceiver -a com.example.composefixture.PROVOKE_ANR; wait until 45s after the broadcast; adb shell am profile stop com.example.composefixture; adb exec-out cat /data/local/tmp/aes_hang.trace",
-      "description": "An ART method trace of the fixture app, sampled every 1000 us by `am profile start --sampling` while AnrReceiver held its main thread in Thread.sleep for 40 s -- a hung app, seen from inside without root on a `user` build. The ground truth the v0.9.0 hang sampler is parsed against (vault: 'Sampling a Hung App Without Root'). BINARY, written byte for byte: a text header (`*version` / `3` / key=value lines including `clock=dual` / `*threads` / `*methods` / `*end`), then a little-endian body starting with the magic `SLOW`. What a parser written from memory gets wrong: the records are TRANSITIONS, not samples -- a 40 s block is one enter and one exit 40 s apart, not 40,000 rows; the stack the thread already had when profiling began is replayed as enters at the first sample; and under clock=dual each record carries the thread-CPU clock BEFORE the wall clock, so across the sleep the CPU clock moves by milliseconds and only the wall clock shows the hang. Thread.sleep appears three times nested (three overloads), so 'the frame under the sleep' is the first frame that is not a Thread.sleep. Taken 10 s after launch, so that Jetpack ProfileInstaller's one-shot worker thread has come and gone first: a thread exiting under the sampler killed the app once in three runs (see TRACE_QUIET_BEFORE_S). Note too that `am broadcast` did not return until the receiver timed out (broadcast_returned_after_s).",
+      "description": "An ART method trace of the fixture app, sampled every 1000 us by `am profile start --sampling` while AnrReceiver held its main thread in Thread.sleep for 40 s -- a hung app, seen from inside without root on a `user` build. The ground truth the v0.9.0 hang sampler is parsed against (vault: 'Sampling a Hung App Without Root'). BINARY, written byte for byte: a text header (`*version` / `3` / key=value lines including `clock=dual` / `*threads` / `*methods` / `*end`), then a little-endian body starting with the magic `SLOW`. What a parser written from memory gets wrong: the records are TRANSITIONS, not samples -- a 40 s block is one enter and one exit 40 s apart, not 40,000 rows; the stack the thread already had when profiling began is replayed as enters at the first sample; and under clock=dual each record carries the thread-CPU clock BEFORE the wall clock, so across the sleep the CPU clock moves by milliseconds and only the wall clock shows the hang. Thread.sleep appears three times nested (three overloads), so 'the frame under the sleep' is the first frame that is not a Thread.sleep. Taken 10 s after launch, so that Jetpack ProfileInstaller's one-shot worker thread has come and gone first: in 1 of 3 recorder runs on 2026-10-16 the app aborted (ART thread.cc:2698 CHECK) as that worker exited under the sampler (see TRACE_QUIET_BEFORE_S). Note too that `am broadcast` did not return until the receiver timed out (broadcast_returned_after_s).",
       "catches": [],
-      "bytes": 51132,
+      "bytes": 51116,
       "broadcast_returned_after_s": 10.0,
       "stop_issued_after_s": 45.1,
-      "device_bytes": 51132,
+      "device_bytes": 51116,
       "sampling_interval_us": 1000
     },
     {
@@ -148,7 +148,7 @@
       "name": "avd_config_ini",
       "file": "avd_config_ini.txt",
       "command": "cat <avd home>/aes_fixture_tmp.avd/config.ini  (between avdmanager_create and avdmanager_delete)",
-      "description": "The config.ini avdmanager writes for a new AVD, read from disk between the create and the delete -- what emulator_selector's read_avd_config / parse_config_ini consume. Bare `key=value` lines, sorted, no spaces around `=`, no comments and no blank lines. Three things a hand-written one gets wrong: there is no `AvdId` key and no `avd.ini.displayname` (Android Studio writes both; the command-line tool writes neither), so a display name read from it is empty for every AVD emulator_create makes; `avd.id` and `avd.name` hold the LITERAL placeholder '<build>', not the AVD's name; and the API level is only in `image.sysdir.1=system-images/android-34/...` and `target=android-34`. Recorded as bytes so the package aliaser never sees it -- its dotted keys (hw.camera.back) match the aliaser's pattern and would be rewritten.",
+      "description": "The config.ini avdmanager writes for a new AVD, read from disk between the create and the delete -- what emulator_selector's read_avd_config / parse_config_ini consume. Bare `key=value` lines, sorted, no spaces around `=`, no comments and no blank lines. Three things a hand-written one gets wrong: there is no `AvdId` key and no `avd.ini.displayname` (this create wrote neither; the Studio-made Pixel_9 on the recording host has both), so emulator_selector's display_name for this AVD is empty; `avd.id` and `avd.name` hold the LITERAL placeholder '<build>', not the AVD's name; and the API level is only in `image.sysdir.1=system-images/android-34/...` and `target=android-34`. Recorded as bytes so the package aliaser never sees it -- its dotted keys (hw.camera.back) match the aliaser's pattern and would be rewritten.",
       "catches": [],
       "bytes": 3572,
       "source": "<avd home>/aes_fixture_tmp.avd/config.ini, read after avdmanager_create and before avdmanager_delete"
@@ -174,7 +174,8 @@
         "system-images;android-34;google_apis;arm64-v8a",
         "--device",
         "pixel_9"
-      ]
+      ],
+      "avd_home": "<avd home>: a directory made for the run, then removed"
     },
     {
       "name": "avdmanager_delete",
@@ -193,7 +194,8 @@
         "avd",
         "--name",
         "aes_fixture_tmp"
-      ]
+      ],
+      "avd_home": "<avd home>: a directory made for the run, then removed"
     },
     {
       "name": "avdmanager_delete_missing",
@@ -212,7 +214,8 @@
         "avd",
         "--name",
         "aes_does_not_exist"
-      ]
+      ],
+      "avd_home": "<avd home>: a directory made for the run, then removed"
     },
     {
       "name": "avdmanager_list_avd",

@@ -4,13 +4,6 @@
 #    by `pre-commit install` alone)
 # Run manually: pre-commit run --all-files
 
-# Recorded fixtures are tool output kept byte for byte. "Fixing" their trailing
-# whitespace or final newline makes them something no tool printed (avdmanager
-# pads its progress lines and ends `delete avd` with no newline), and identify
-# classes am_profile_hang.trace as text because its header is, so the
-# whitespace hooks would rewrite bytes inside its binary record stream.
-exclude: ^tests/fixtures/recorded/
-
 repos:
   # Black - Code formatter
   - repo: https://github.com/psf/black
@@ -30,14 +23,26 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
         files: ^android-emulator-skill/skills/android-emulator-skill/scripts/.*\.py$
 
-  # General file checks
+  # General file checks.
+  #
+  # The three hooks that REWRITE files skip recorded fixture payloads. Those are
+  # tool output kept byte for byte, and "fixing" their whitespace makes them
+  # something no tool printed: avdmanager pads its progress lines and ends
+  # `delete avd` with no newline, and seven older fixtures carry trailing
+  # whitespace the device really sent. identify also classes
+  # am_profile_hang.trace as text (its first ~10 KB is), so these hooks would
+  # rewrite bytes inside its binary record stream. Only the payloads are
+  # excluded: MANIFEST.json, and anything else in that tree, stays under every
+  # hook, and the checking hooks still see the payloads too.
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
         name: Trim trailing whitespace
+        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png)$
       - id: end-of-file-fixer
         name: Fix end of files
+        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png)$
       - id: check-yaml
         name: Check YAML syntax
       - id: check-added-large-files
@@ -46,6 +51,7 @@ repos:
       - id: mixed-line-ending
         name: Fix mixed line endings
         args: ['--fix=lf']
+        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png)$
 
   # Commit messages end at their last content line: no Co-Authored-By, no
   # Signed-off-by, no generated-with footer. A hook rather than a note in the

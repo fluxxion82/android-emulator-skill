@@ -2,281 +2,280 @@
 3
 data-file-overflow=false
 clock=dual
-elapsed-time-usec=45085857
-num-method-calls=641
-clock-call-overhead-nsec=270
+elapsed-time-usec=45050080
+num-method-calls=861
+clock-call-overhead-nsec=267
 vm=art
-pid=11152
+pid=11793
 *threads
 1	main
-2	FinalizerDaemon
-3	FinalizerWatchdogDaemon
+2	HeapTaskDaemon
+3	FinalizerDaemon
 4	ReferenceQueueDaemon
-5	HeapTaskDaemon
+5	FinalizerWatchdogDaemon
 6	SurfaceSyncGroupTimer
-7	RenderThread
 *methods
 0x414	android.os.HandlerThread	run	()V	HandlerThread.java
-0x410	android.os.Handler	getPostMessage	(Ljava/lang/Runnable;)Landroid/os/Message;	Handler.java
-0x40c	android.os.Handler	post	(Ljava/lang/Runnable;)Z	Handler.java
-0x408	android.graphics.HardwareRendererObserver	notifyDataAvailable	()V	HardwareRendererObserver.java
-0x400	dalvik.system.VMRuntime	runHeapTasks	()V	VMRuntime.java
-0x3fc	java.lang.Daemons$HeapTaskDaemon	runInternal	()V	Daemons.java
-0x3f4	java.lang.Daemons$FinalizerWatchdogDaemon	sleepForNanos	(J)Z	Daemons.java
-0x3f0	java.lang.Daemons$FinalizerWatchdogDaemon	waitForProgress	()Ljava/util/concurrent/TimeoutException;	Daemons.java
-0x3d0	java.lang.Daemons$FinalizerDaemon	runInternal	()V	Daemons.java
-0x3cc	java.lang.Daemons$Daemon	run	()V	Daemons.java
-0x3c0	java.lang.ref.Reference	refersTo	(Ljava/lang/Object;)Z	Reference.java
-0x3bc	java.lang.ThreadLocal$ThreadLocalMap	getEntry	(Ljava/lang/ThreadLocal;)Ljava/lang/ThreadLocal$ThreadLocalMap$Entry;	ThreadLocal.java
-0x3e8	java.lang.Daemons$FinalizerWatchdogDaemon	sleepUntilNeeded	()Z	Daemons.java
-0x3b8	java.lang.ThreadLocal$ThreadLocalMap	-$$Nest$mgetEntry	(Ljava/lang/ThreadLocal$ThreadLocalMap;Ljava/lang/ThreadLocal;)Ljava/lang/ThreadLocal$ThreadLocalMap$Entry;	ThreadLocal.java
-0x3b4	java.lang.ThreadLocal	get	()Ljava/lang/Object;	ThreadLocal.java
-0x3b0	android.os.ThreadLocalWorkSource	restore	(J)V	ThreadLocalWorkSource.java
-0x3ac	android.os.BinderProxy	transactNative	(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z	BinderProxy.java
-0x3d4	java.lang.ref.ReferenceQueue	remove	()Ljava/lang/ref/Reference;	ReferenceQueue.java
-0x3a8	android.os.BinderProxy	transact	(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z	BinderProxy.java
-0x3a4	android.os.Parcel	nativeWriteStrongBinder	(JLandroid/os/IBinder;)V	Parcel.java
-0x398	android.os.Parcel	markForBinder	(Landroid/os/IBinder;)V	Parcel.java
-0x3dc	java.lang.Object	wait	(J)V	Object.java
-0x388	android.view.inputmethod.InputMethodManager	startInputInner	(ILandroid/os/IBinder;III)Z	InputMethodManager.java
-0x384	android.view.inputmethod.InputMethodManager	startInputOnWindowFocusGainInternal	(ILandroid/view/View;III)Z	InputMethodManager.java
-0x380	android.view.inputmethod.InputMethodManager	-$$Nest$mstartInputOnWindowFocusGainInternal	(Landroid/view/inputmethod/InputMethodManager;ILandroid/view/View;III)Z	InputMethodManager.java
-0x3e0	java.lang.Object	wait	(JI)V	Object.java
-0x374	android.view.ViewRootImpl	handleWindowFocusChanged	()V	ViewRootImpl.java
-0x370	android.view.ViewRootImpl	-$$Nest$mhandleWindowFocusChanged	(Landroid/view/ViewRootImpl;)V	ViewRootImpl.java
-0x36c	android.view.ViewRootImpl$ViewRootHandler	handleMessageImpl	(Landroid/os/Message;)V	ViewRootImpl.java
-0x364	android.view.SurfaceControl	nativeApplyTransaction	(JZZ)V	SurfaceControl.java
-0x360	android.view.SurfaceControl	-$$Nest$smnativeApplyTransaction	(JZZ)V	SurfaceControl.java
-0x35c	android.view.SurfaceControl$Transaction	apply	(ZZ)V	SurfaceControl.java
-0x34c	android.graphics.HardwareRenderer	nSyncAndDrawFrame	(J[JI)I	HardwareRenderer.java
-0x340	androidx.compose.ui.unit.IntSizeKt	toSize-ozmzZPI	(J)J	IntSize.kt
-0x33c	androidx.compose.ui.node.NodeCoordinator	draw	(Landroidx/compose/ui/graphics/Canvas;Landroidx/compose/ui/graphics/layer/GraphicsLayer;)V	NodeCoordinator.kt
-0x3f8	java.lang.Daemons$ReferenceQueueDaemon	runInternal	()V	Daemons.java
-0x338	androidx.compose.ui.node.LayoutModifierNodeCoordinator	performDraw	(Landroidx/compose/ui/graphics/Canvas;Landroidx/compose/ui/graphics/layer/GraphicsLayer;)V	LayoutModifierNodeCoordinator.kt
-0x334	androidx.compose.ui.node.NodeCoordinator	drawContainedDrawModifiers	(Landroidx/compose/ui/graphics/Canvas;Landroidx/compose/ui/graphics/layer/GraphicsLayer;)V	NodeCoordinator.kt
-0x394	android.os.Parcel	obtain	(Landroid/os/IBinder;)Landroid/os/Parcel;	Parcel.java
-0x32c	androidx.compose.ui.node.NodeCoordinator$drawBlock$drawBlockCallToDrawModifiers$1	invoke	()V	NodeCoordinator.kt
-0x320	androidx.compose.ui.node.NodeCoordinator$drawBlock$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	NodeCoordinator.kt
-0x31c	androidx.compose.ui.platform.GraphicsLayerOwnerLayer$recordLambda$1	invoke	(Landroidx/compose/ui/graphics/drawscope/DrawScope;)V	GraphicsLayerOwnerLayer.android.kt
-0x318	androidx.compose.ui.platform.GraphicsLayerOwnerLayer$recordLambda$1	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	GraphicsLayerOwnerLayer.android.kt
-0x314	androidx.compose.ui.graphics.layer.GraphicsLayer	drawWithChildTracking	(Landroidx/compose/ui/graphics/drawscope/DrawScope;)V	AndroidGraphicsLayer.android.kt
-0x2f8	androidx.compose.ui.platform.GraphicsLayerOwnerLayer	updateDisplayList	()V	GraphicsLayerOwnerLayer.android.kt
-0x2ec	androidx.compose.runtime.snapshots.Snapshot$Companion	getCurrent	()Landroidx/compose/runtime/snapshots/Snapshot;	Snapshot.kt
-0x2dc	androidx.compose.foundation.text.CoreTextFieldKt$CoreTextField$8$1$1$2	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Ljava/util/List;J)Landroidx/compose/ui/layout/MeasureResult;	CoreTextField.kt
-0x1a4	androidx.compose.runtime.Stack	isNotEmpty-impl	(Ljava/util/ArrayList;)Z	Stack.kt
-0x1a8	androidx.compose.runtime.Stack	isEmpty-impl	(Ljava/util/ArrayList;)Z	Stack.kt
-0x304	androidx.compose.ui.graphics.layer.GraphicsLayerV29	record	(Landroidx/compose/ui/unit/Density;Landroidx/compose/ui/unit/LayoutDirection;Landroidx/compose/ui/graphics/layer/GraphicsLayer;Lkotlin/jvm/functions/Function1;)V	GraphicsLayerV29.android.kt
-0x3c8	java.lang.Thread	run	()V	Thread.java
-0x2f0	androidx.compose.runtime.snapshots.SnapshotKt	currentSnapshot	()Landroidx/compose/runtime/snapshots/Snapshot;	Snapshot.kt
-0x2c0	androidx.compose.ui.graphics.SimpleGraphicsLayerModifier	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	GraphicsLayerModifier.kt
-0x404	android.graphics.HardwareRendererObserver	invokeDataAvailable	(Ljava/lang/ref/WeakReference;)Z	HardwareRendererObserver.java
-0x2bc	androidx.compose.foundation.layout.SizeNode	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	Size.kt
-0x2b8	androidx.compose.ui.node.LayoutModifierNodeCoordinator	measure-BRTryo0	(J)Landroidx/compose/ui/layout/Placeable;	LayoutModifierNodeCoordinator.kt
-0x28	android.app.ActivityThread	-$$Nest$mhandleReceiver	(Landroid/app/ActivityThread;Landroid/app/ActivityThread$ReceiverData;)V	ActivityThread.java
-0x2b0	androidx.compose.ui.node.MeasurePassDelegate$performMeasureBlock$1	invoke	()Ljava/lang/Object;	MeasurePassDelegate.kt
-0x2ac	androidx.compose.runtime.snapshots.SnapshotStateObserver	observeReads	(Ljava/lang/Object;Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function0;)V	SnapshotStateObserver.kt
-0x2a0	androidx.compose.ui.node.LayoutNode	remeasure-_Sx5XlM$ui$default	(Landroidx/compose/ui/node/LayoutNode;Landroidx/compose/ui/unit/Constraints;ILjava/lang/Object;)Z	LayoutNode.kt
-0x2cc	androidx.compose.foundation.text.TextFieldSizeNode	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	TextFieldSize.kt
-0x29c	androidx.compose.ui.node.MeasureAndLayoutDelegate	doRemeasure-sdFAvZA	(Landroidx/compose/ui/node/LayoutNode;Landroidx/compose/ui/unit/Constraints;)Z	MeasureAndLayoutDelegate.kt
-0x298	androidx.compose.ui.node.MeasureAndLayoutDelegate	remeasureIfNeeded	(Landroidx/compose/ui/node/LayoutNode;ZZ)Z	MeasureAndLayoutDelegate.kt
-0x290	androidx.compose.ui.node.MeasureAndLayoutDelegate	measureAndLayout	(Lkotlin/jvm/functions/Function0;)Z	MeasureAndLayoutDelegate.kt
-0x27c	android.view.ViewGroup	recreateChildDisplayList	(Landroid/view/View;)V	ViewGroup.java
-0x270	android.view.ThreadedRenderer	updateViewTreeDisplayList	(Landroid/view/View;)V	ThreadedRenderer.java
-0x268	android.view.ThreadedRenderer	draw	(Landroid/view/View;Landroid/view/View$AttachInfo;Landroid/view/ThreadedRenderer$DrawCallbacks;)V	ThreadedRenderer.java
-0x260	android.view.ViewRootImpl	performDraw	(Landroid/window/SurfaceSyncGroup;)Z	ViewRootImpl.java
-0x358	android.view.SurfaceControl$Transaction	apply	(Z)V	SurfaceControl.java
-0x310	androidx.compose.ui.graphics.layer.GraphicsLayer	access$drawWithChildTracking	(Landroidx/compose/ui/graphics/layer/GraphicsLayer;Landroidx/compose/ui/graphics/drawscope/DrawScope;)V	AndroidGraphicsLayer.android.kt
-0x238	androidx.compose.runtime.composer.gapbuffer.changelist.Operations	executeAndFlushAllPendingOperations	(Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	Operations.kt
-0x25c	android.view.ViewRootImpl	performTraversals	()V	ViewRootImpl.java
-0x264	android.view.ViewRootImpl	draw	(ZLandroid/window/SurfaceSyncGroup;Z)Z	ViewRootImpl.java
-0x258	android.view.ViewRootImpl	doTraversal	()V	ViewRootImpl.java
-0x254	android.view.ViewRootImpl$TraversalRunnable	run	()V	ViewRootImpl.java
-0x250	java.lang.Integer	<init>	(I)V	Integer.java
-0x190	androidx.compose.runtime.Updater	reconcile-impl	(Landroidx/compose/runtime/Composer;Lkotlin/jvm/functions/Function1;)V	Composer.kt
-0x2fc	androidx.compose.ui.graphics.layer.GraphicsLayer	record-mL-hObY	(Landroidx/compose/ui/unit/Density;Landroidx/compose/ui/unit/LayoutDirection;JLkotlin/jvm/functions/Function1;)V	AndroidGraphicsLayer.android.kt
-0x248	androidx.compose.runtime.composer.gapbuffer.SlotWriter	forAllDataInRememberOrder	(ILkotlin/jvm/functions/Function2;)V	SlotTable.kt
-0x198	androidx.compose.runtime.composer.gapbuffer.changelist.ComposerChangeListWriter	updateNode	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)V	ComposerChangeListWriter.kt
-0x1d8	androidx.compose.material3.TextFieldKt$TextField$3$1	invoke	(Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V	TextField.kt
-0x244	androidx.compose.runtime.ComposerKt	removeCurrentGroup	(Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;)V	Composer.kt
-0x60	android.view.InsetsController	onControlsChanged	([Landroid/view/InsetsSourceControl;)V	InsetsController.java
-0x23c	androidx.compose.runtime.composer.gapbuffer.changelist.Operation	executeWithComposeStackTrace	(Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationArgContainer;Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	Operation.kt
-0x22c	androidx.compose.runtime.CompositionImpl	applyChangesInLocked	(Landroidx/compose/runtime/Changes;)V	Composition.kt
-0x114	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2	$r8$lambda$sdKIQuFT6MpOW8QdHT9yWSawFoM	(Landroidx/compose/runtime/Recomposer;Landroidx/collection/MutableScatterSet;Landroidx/collection/MutableScatterSet;Ljava/util/List;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/Set;J)Lkotlin/Unit;	Recomposer.kt
-0x228	androidx.compose.runtime.CompositionImpl	applyChanges	()V	Composition.kt
-0x224	androidx.compose.runtime.composer.gapbuffer.changelist.Operation	getObjects	()I	Operation.kt
-0x220	androidx.compose.runtime.composer.gapbuffer.changelist.Operations$WriteScope	setObjects-EsEZvaA	(Landroidx/compose/runtime/composer/gapbuffer/changelist/Operations;ILjava/lang/Object;ILjava/lang/Object;)V	Operations.kt
-0x214	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$22$0$1	(Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Landroidx/compose/foundation/text/LegacyTextFieldState;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;ILandroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x1c0	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda16	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
-0x234	androidx.compose.runtime.composer.gapbuffer.changelist.ChangeList	executeAndFlushAllPendingChanges	(Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	ChangeList.kt
-0x210	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$GXzRm5EgoPLaRdtto5DH7NBAObc	(Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Landroidx/compose/foundation/text/LegacyTextFieldState;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;ILandroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x294	androidx.compose.ui.node.MeasureAndLayoutDelegate	access$remeasureIfNeeded	(Landroidx/compose/ui/node/MeasureAndLayoutDelegate;Landroidx/compose/ui/node/LayoutNode;ZZ)Z	MeasureAndLayoutDelegate.kt
-0x20c	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda10	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
-0x204	java.lang.System	arraycopy	(Ljava/lang/Object;ILjava/lang/Object;II)V	System.java
-0x2d0	androidx.compose.ui.node.InnerNodeCoordinator	measure-BRTryo0	(J)Landroidx/compose/ui/layout/Placeable;	InnerNodeCoordinator.kt
-0x200	java.util.Arrays	copyOf	([II)[I	Arrays.java
-0x2d4	androidx.compose.foundation.text.selection.SimpleLayoutKt$SimpleLayout$1$1	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Ljava/util/List;J)Landroidx/compose/ui/layout/MeasureResult;	SimpleLayout.kt
-0x1fc	androidx.compose.runtime.IntStack	resize	()[I	Stack.kt
-0x240	androidx.compose.runtime.composer.gapbuffer.changelist.Operation$RemoveCurrentGroup	execute	(Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationArgContainer;Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	Operation.kt
-0x48	android.app.servertransaction.TransactionExecutor	executeNonLifecycleItem	(Landroid/app/servertransaction/ClientTransaction;Landroid/app/servertransaction/ClientTransactionItem;Z)V	TransactionExecutor.java
-0x1f8	androidx.compose.runtime.IntStack	push	(I)V	Stack.kt
-0x1f4	androidx.compose.runtime.composer.gapbuffer.SlotReader	startGroup	()V	SlotTable.kt
-0x1f0	androidx.compose.runtime.GapComposer	startReplaceGroup	(I)V	GapComposer.kt
-0x2e0	androidx.compose.foundation.text.LegacyTextFieldState	getLayoutResult	()Landroidx/compose/foundation/text/TextLayoutResultProxy;	CoreTextField.kt
-0x230	androidx.compose.runtime.composer.gapbuffer.changelist.ChangeList	execute	(Landroidx/compose/runtime/SlotStorage;Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/tooling/CompositionErrorContextImpl;)V	ChangeList.kt
-0x1e8	androidx.compose.foundation.text.selection.SimpleLayoutKt	SimpleLayout	(Landroidx/compose/ui/Modifier;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;II)V	SimpleLayout.kt
-0x1e4	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$22$0	(Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0xc4	kotlinx.coroutines.CancellableContinuationKt	getOrCreateCancellableContinuation	(Lkotlin/coroutines/Continuation;)Lkotlinx/coroutines/CancellableContinuationImpl;	CancellableContinuation.kt
-0x2a4	androidx.compose.ui.node.LayoutNode	remeasure-_Sx5XlM$ui	(Landroidx/compose/ui/unit/Constraints;)Z	LayoutNode.kt
-0x1dc	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda13	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
-0x37c	android.view.inputmethod.InputMethodManager$DelegateImpl	onPostWindowGainedFocus	(Landroid/view/View;Landroid/view/WindowManager$LayoutParams;)V	InputMethodManager.java
-0x1d4	androidx.compose.material3.TextFieldKt$TextField$3$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	TextField.kt
-0xfc	android.view.Choreographer$CallbackRecord	run	(J)V	Choreographer.java
-0x1d0	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Ljava/lang/Object;Landroidx/compose/runtime/Composer;I)Ljava/lang/Object;	ComposableLambda.kt
-0x2e4	androidx.compose.runtime.SnapshotMutableStateImpl	getValue	()Ljava/lang/Object;	SnapshotState.kt
-0x1c8	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$22	(Lkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x368	android.view.ViewRootImpl$ViewRootHandler	handleMessage	(Landroid/os/Message;)V	ViewRootImpl.java
-0x1b8	androidx.compose.runtime.internal.ComposableLambdaImpl$invoke$1	invoke	(Landroidx/compose/runtime/Composer;I)V	ComposableLambda.kt
-0x38c	android.view.inputmethod.IInputMethodManagerGlobalInvoker	startInputOrWindowGainedFocusAsync	(ILcom/android/internal/inputmethod/IInputMethodClient;Landroid/os/IBinder;IIILandroid/view/inputmethod/EditorInfo;Lcom/android/internal/inputmethod/IRemoteInputConnection;Lcom/android/internal/inputmethod/IRemoteAccessibilityInputConnection;IILandroid/window/ImeOnBackInvokedDispatcher;)I	IInputMethodManagerGlobalInvoker.java
-0x1b4	androidx.compose.runtime.internal.ComposableLambdaImpl$invoke$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposableLambda.kt
-0xf8	android.view.Choreographer$CallbackRecord	run	(Landroid/view/Choreographer$FrameData;)V	Choreographer.java
-0x1ac	androidx.compose.foundation.text.ContextMenu_androidKt	ContextMenuArea	(Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V	ContextMenu.android.kt
-0x2c4	androidx.compose.ui.node.BackwardsCompatNode	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	BackwardsCompatNode.kt
-0x30c	androidx.compose.ui.graphics.layer.GraphicsLayer$clipDrawBlock$1	invoke	(Landroidx/compose/ui/graphics/drawscope/DrawScope;)V	AndroidGraphicsLayer.android.kt
-0x1a0	androidx.compose.runtime.composer.gapbuffer.changelist.ComposerChangeListWriter	pushPendingUpsAndDowns	()V	ComposerChangeListWriter.kt
-0x130	androidx.compose.runtime.GapComposer	skipCurrentGroup	()V	GapComposer.kt
-0x188	androidx.compose.foundation.gestures.ScrollableElement	<init>	(Landroidx/compose/foundation/gestures/ScrollableState;Landroidx/compose/foundation/gestures/Orientation;Landroidx/compose/foundation/OverscrollEffect;ZZLandroidx/compose/foundation/gestures/FlingBehavior;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/foundation/gestures/BringIntoViewSpec;)V	Scrollable.kt
-0x218	androidx.compose.runtime.Updater	set-impl	(Landroidx/compose/runtime/Composer;Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)V	Composer.kt
-0x328	androidx.compose.ui.node.NodeCoordinator$drawBlock$drawBlockCallToDrawModifiers$1	invoke	()Ljava/lang/Object;	NodeCoordinator.kt
-0x30	com.example.composefixture.AnrReceiver	onReceive	(Landroid/content/Context;Landroid/content/Intent;)V	AnrReceiver.kt
-0x19c	androidx.compose.runtime.composer.gapbuffer.changelist.ComposerChangeListWriter	pushApplierOperationPreamble	()V	ComposerChangeListWriter.kt
-0x2a8	androidx.compose.ui.node.MeasurePassDelegate	remeasure-BRTryo0	(J)Z	MeasurePassDelegate.kt
-0x194	androidx.compose.runtime.GapComposer	apply	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)V	GapComposer.kt
-0x378	android.view.ImeFocusController	onPostWindowFocus	(Landroid/view/View;ZLandroid/view/WindowManager$LayoutParams;)V	ImeFocusController.java
-0x28c	androidx.compose.ui.platform.AndroidComposeView	measureAndLayout	(Z)V	AndroidComposeView.android.kt
-0x90	androidx.compose.ui.platform.AndroidUiDispatcher$dispatchCallback$1	run	()V	AndroidUiDispatcher.android.kt
-0x18c	androidx.compose.ui.node.ModifierNodeElement	<init>	()V	ModifierNodeElement.kt
-0x180	androidx.compose.foundation.gestures.ScrollableKt	scrollable$default	(Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/gestures/ScrollableState;Landroidx/compose/foundation/gestures/Orientation;Landroidx/compose/foundation/OverscrollEffect;ZZLandroidx/compose/foundation/gestures/FlingBehavior;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/foundation/gestures/BringIntoViewSpec;ILjava/lang/Object;)Landroidx/compose/ui/Modifier;	Scrollable.kt
-0x1ec	androidx.compose.runtime.GapComposer	startRestartGroup	(I)Landroidx/compose/runtime/Composer;	GapComposer.kt
-0x178	androidx.compose.foundation.text.TextFieldScrollKt	$r8$lambda$h0qMoZ-YKUT3lAoGn6X8hUnvOc0	(Landroidx/compose/foundation/text/TextFieldScrollerPosition;ZLandroidx/compose/foundation/OverscrollEffect;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/Modifier;Landroidx/compose/runtime/Composer;I)Landroidx/compose/ui/Modifier;	TextFieldScroll.kt
-0x3e4	java.lang.Daemons$FinalizerWatchdogDaemon	runInternal	()V	Daemons.java
-0xe8	kotlin.jvm.internal.Intrinsics	areEqual	(Ljava/lang/Object;Ljava/lang/Object;)Z	Intrinsics.java
-0x16c	androidx.compose.ui.ComposedModifierKt$materializeImpl$result$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposedModifier.kt
-0x348	android.graphics.HardwareRenderer	syncAndDrawFrame	(Landroid/graphics/FrameInfo;)I	HardwareRenderer.java
-0x15c	androidx.compose.ui.ComposedModifierKt	materializeModifier	(Landroidx/compose/runtime/Composer;Landroidx/compose/ui/Modifier;)Landroidx/compose/ui/Modifier;	ComposedModifier.kt
-0x3a0	android.os.Parcel	writeStrongBinder	(Landroid/os/IBinder;)V	Parcel.java
-0x154	androidx.compose.foundation.text.selection.TextFieldSelectionManager_androidKt$$ExternalSyntheticLambda1	<init>	(Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlinx/coroutines/CoroutineScope;)V	D8$$SyntheticClass
-0x344	androidx.compose.ui.geometry.Size	constructor-impl	(J)J	Size.kt
-0xf0	android.view.Choreographer	doFrame	(JILandroid/view/DisplayEventReceiver$VsyncEventData;)V	Choreographer.java
-0x148	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField	(Landroidx/compose/ui/text/input/TextFieldValue;Lkotlin/jvm/functions/Function1;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/text/TextStyle;Landroidx/compose/ui/text/input/VisualTransformation;Lkotlin/jvm/functions/Function1;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/graphics/Brush;ZIILandroidx/compose/ui/text/input/ImeOptions;Landroidx/compose/foundation/text/KeyboardActions;ZZLkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/runtime/Composer;III)V	CoreTextField.kt
-0x144	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$23	(Landroidx/compose/ui/text/input/TextFieldValue;Lkotlin/jvm/functions/Function1;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/text/TextStyle;Landroidx/compose/ui/text/input/VisualTransformation;Lkotlin/jvm/functions/Function1;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/graphics/Brush;ZIILandroidx/compose/ui/text/input/ImeOptions;Landroidx/compose/foundation/text/KeyboardActions;ZZLkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/TextFieldScrollerPosition;IIILandroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x354	android.view.SurfaceControl$Transaction	apply	()V	SurfaceControl.java
-0x140	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$TtIJ9IjppJTpGOz76vdnf7AIP6w	(Landroidx/compose/ui/text/input/TextFieldValue;Lkotlin/jvm/functions/Function1;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/text/TextStyle;Landroidx/compose/ui/text/input/VisualTransformation;Lkotlin/jvm/functions/Function1;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/graphics/Brush;ZIILandroidx/compose/ui/text/input/ImeOptions;Landroidx/compose/foundation/text/KeyboardActions;ZZLkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/TextFieldScrollerPosition;IIILandroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x160	androidx.compose.ui.ComposedModifierKt	materializeImpl	(Landroidx/compose/runtime/Composer;Landroidx/compose/ui/Modifier;)Landroidx/compose/ui/Modifier;	ComposedModifier.kt
-0x134	androidx.compose.runtime.GapComposer	recomposeToGroupEnd	()V	GapComposer.kt
-0x13c	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda17	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
-0x80	libcore.util.NativeAllocationRegistry	applyFreeFunction	(JJ)V	NativeAllocationRegistry.java
-0x38	java.lang.Thread	sleep	(JI)V	Thread.java
-0x88	android.util.SparseArray	gc	()V	SparseArray.java
-0x128	androidx.compose.runtime.GapComposer	recompose-aFTiNEg$runtime	(Landroidx/collection/MutableScatterMap;Landroidx/compose/runtime/ShouldPauseCallback;)Z	GapComposer.kt
-0xac	androidx.compose.runtime.snapshots.SnapshotKt	access$advanceGlobalSnapshot	()V	Snapshot.kt
-0x9c	kotlinx.coroutines.DispatchedTask	run	()V	DispatchedTask.kt
-0x288	androidx.compose.ui.node.Owner	measureAndLayout$default	(Landroidx/compose/ui/node/Owner;ZILjava/lang/Object;)V	Owner.kt
-0x208	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposableLambda.kt
-0xbc	kotlinx.coroutines.channels.BufferedChannel$BufferedChannelIterator	hasNext	(Lkotlin/coroutines/Continuation;)Ljava/lang/Object;	BufferedChannel.kt
-0x124	androidx.compose.runtime.CompositionImpl	recompose	()Z	Composition.kt
-0x118	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2	invokeSuspend$lambda$2	(Landroidx/compose/runtime/Recomposer;Landroidx/collection/MutableScatterSet;Landroidx/collection/MutableScatterSet;Ljava/util/List;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/Set;J)Lkotlin/Unit;	Recomposer.kt
-0x138	androidx.compose.runtime.RecomposeScopeImpl	compose	(Landroidx/compose/runtime/Composer;)V	RecomposeScopeImpl.kt
-0x120	androidx.compose.runtime.Recomposer	performRecompose	(Landroidx/compose/runtime/ControlledComposition;Landroidx/collection/MutableScatterSet;)Landroidx/compose/runtime/ControlledComposition;	Recomposer.kt
-0xd8	androidx.compose.runtime.Recomposer	access$recordComposerModifications	(Landroidx/compose/runtime/Recomposer;)Z	Recomposer.kt
-0x11c	androidx.compose.runtime.Recomposer	access$performRecompose	(Landroidx/compose/runtime/Recomposer;Landroidx/compose/runtime/ControlledComposition;Landroidx/collection/MutableScatterSet;)Landroidx/compose/runtime/ControlledComposition;	Recomposer.kt
-0x2e8	androidx.compose.runtime.snapshots.SnapshotKt	readable	(Landroidx/compose/runtime/snapshots/StateRecord;Landroidx/compose/runtime/snapshots/StateObject;)Landroidx/compose/runtime/snapshots/StateRecord;	Snapshot.kt
-0xb0	androidx.compose.runtime.snapshots.SnapshotKt	advanceGlobalSnapshot	()V	Snapshot.kt
-0x10c	androidx.compose.ui.platform.AndroidUiFrameClock$withFrameNanos$2$callback$1	doFrame	(J)V	AndroidUiFrameClock.android.kt
-0x308	androidx.compose.ui.graphics.layer.GraphicsLayer$clipDrawBlock$1	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	AndroidGraphicsLayer.android.kt
-0x1e0	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$uRJCEKYN4oPy_-WzWgvYXPBRWJY	(Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x110	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2$$ExternalSyntheticLambda0	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
-0x10	android.os.Looper	loop	()V	Looper.java
-0x108	androidx.compose.ui.platform.AndroidUiDispatcher	performFrameDispatch	(J)V	AndroidUiDispatcher.android.kt
-0x8c	android.os.Handler	handleCallback	(Landroid/os/Message;)V	Handler.java
-0x330	androidx.compose.ui.node.NodeCoordinator	access$drawContainedDrawModifiers	(Landroidx/compose/ui/node/NodeCoordinator;Landroidx/compose/ui/graphics/Canvas;Landroidx/compose/ui/graphics/layer/GraphicsLayer;)V	NodeCoordinator.kt
-0x284	androidx.compose.ui.platform.AndroidComposeView	dispatchDraw	(Landroid/graphics/Canvas;)V	AndroidComposeView.android.kt
-0x21c	androidx.compose.runtime.composer.gapbuffer.changelist.ChangeList	pushUpdateNode	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)V	ChangeList.kt
-0x1bc	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Landroidx/compose/runtime/Composer;I)Ljava/lang/Object;	ComposableLambda.kt
-0xf4	android.view.Choreographer	doCallbacks	(IJ)V	Choreographer.java
+0x410	java.lang.Daemons$FinalizerWatchdogDaemon	sleepUntilNeeded	()Z	Daemons.java
+0x40c	java.lang.Thread	currentThread	()Ljava/lang/Thread;	Thread.java
+0x408	java.lang.Daemons$FinalizerWatchdogDaemon	sleepForNanos	(J)Z	Daemons.java
+0x404	java.lang.Daemons$FinalizerWatchdogDaemon	waitForProgress	()Ljava/util/concurrent/TimeoutException;	Daemons.java
+0x400	java.lang.Daemons$FinalizerWatchdogDaemon	runInternal	()V	Daemons.java
+0x3fc	java.lang.Object	wait	()V	Object.java
+0x3f4	libcore.util.NativeAllocationRegistry$CleanerThunk	run	()V	NativeAllocationRegistry.java
+0x3e8	java.lang.Daemons$ReferenceQueueDaemon	runInternal	()V	Daemons.java
+0x3e0	java.lang.Object	wait	(J)V	Object.java
+0x3d8	java.lang.ref.ReferenceQueue	remove	()Ljava/lang/ref/Reference;	ReferenceQueue.java
+0x3d4	java.lang.Daemons$FinalizerDaemon	runInternal	()V	Daemons.java
+0x3d0	java.lang.ref.ReferenceQueue	add	(Ljava/lang/ref/Reference;)V	ReferenceQueue.java
+0x3cc	dalvik.system.VMRuntime	runHeapTasks	()V	VMRuntime.java
+0x3c8	java.lang.Daemons$HeapTaskDaemon	runInternal	()V	Daemons.java
+0x3bc	androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap	clearObsoleteStateReads	(Ljava/lang/Object;)V	SnapshotStateObserver.kt
+0x3b4	androidx.compose.runtime.RecomposeScopeImpl	setRequiresRecompose	(Z)V	RecomposeScopeImpl.kt
+0x3ac	java.lang.Integer	numberOfTrailingZeros	(I)I	Integer.java
+0x3a4	androidx.collection.MutableObjectIntMap	findFirstAvailableSlot	(I)I	ObjectIntMap.kt
+0x3a0	androidx.collection.MutableObjectIntMap	findIndex	(Ljava/lang/Object;)I	ObjectIntMap.kt
+0x39c	androidx.collection.MutableObjectIntMap	put	(Ljava/lang/Object;II)I	ObjectIntMap.kt
+0x398	androidx.compose.runtime.RecomposeScopeImpl	recordRead	(Ljava/lang/Object;)Z	RecomposeScopeImpl.kt
+0x394	androidx.compose.runtime.CompositionImpl	recordReadOf	(Ljava/lang/Object;)V	Composition.kt
+0x390	androidx.compose.runtime.Recomposer	readObserverOf$lambda$0	(Landroidx/compose/runtime/ControlledComposition;Ljava/lang/Object;)Lkotlin/Unit;	Recomposer.kt
+0x38c	androidx.compose.runtime.Recomposer	$r8$lambda$_e_Px_kgytvWRSNcz9FEcNxRQ1w	(Landroidx/compose/runtime/ControlledComposition;Ljava/lang/Object;)Lkotlin/Unit;	Recomposer.kt
+0x384	androidx.compose.runtime.snapshots.SnapshotKt	readable	(Landroidx/compose/runtime/snapshots/StateRecord;Landroidx/compose/runtime/snapshots/StateObject;)Landroidx/compose/runtime/snapshots/StateRecord;	Snapshot.kt
+0x370	androidx.compose.foundation.text.TextFieldCursorKt$$ExternalSyntheticLambda1	invoke	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x368	androidx.compose.ui.ComposedModifierKt$materializeImpl$result$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposedModifier.kt
+0x364	androidx.compose.ui.Modifier$Element	foldIn	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;	Modifier.kt
+0x360	androidx.compose.ui.CombinedModifier	foldIn	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;	Modifier.kt
+0x35c	androidx.compose.ui.ComposedModifierKt	materializeImpl	(Landroidx/compose/runtime/Composer;Landroidx/compose/ui/Modifier;)Landroidx/compose/ui/Modifier;	ComposedModifier.kt
+0x350	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$22$0	(Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
+0x344	androidx.compose.material3.TextFieldKt$TextField$3$1	invoke	(Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V	TextField.kt
+0x340	androidx.compose.material3.TextFieldKt$TextField$3$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	TextField.kt
+0x338	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposableLambda.kt
+0x330	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$YGJLVTSzMiACPRcsCdN1M2VQEO4	(Lkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
+0x320	androidx.compose.runtime.internal.ComposableLambdaImpl$invoke$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposableLambda.kt
+0x31c	androidx.compose.runtime.GapComposer	skipToGroupEnd	()V	GapComposer.kt
+0x314	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextFieldRootBox	(Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V	CoreTextField.kt
+0x310	java.lang.Object	hashCode	()I	Object.java
+0x48	java.lang.Thread	sleep	(Ljava/lang/Object;JI)V	Thread.java
+0x30c	androidx.collection.ScatterSet	contains	(Ljava/lang/Object;)Z	ScatterSet.kt
+0x2ec	android.os.Handler	enqueueMessage	(Landroid/os/MessageQueue;Landroid/os/Message;J)Z	Handler.java
+0x180	androidx.compose.ui.node.NodeKindKt	autoInvalidateNodeIncludingDelegates	(Landroidx/compose/ui/Modifier$Node;II)V	NodeKind.kt
+0x2e4	android.view.Choreographer$FrameDisplayEventReceiver	onVsync	(JJILandroid/view/DisplayEventReceiver$VsyncEventData;)V	Choreographer.java
+0x2e0	android.view.DisplayEventReceiver	dispatchVsync	(JJI)V	DisplayEventReceiver.java
+0x3b0	androidx.compose.runtime.GapComposer	endRestartGroup	()Landroidx/compose/runtime/ScopeUpdateScope;	GapComposer.kt
+0x2fc	androidx.compose.runtime.Recomposer	recordComposerModifications	()Z	Recomposer.kt
+0x2d0	kotlinx.coroutines.CancellableContinuationImpl	completeResume	(Ljava/lang/Object;)V	CancellableContinuationImpl.kt
+0x148	androidx.compose.runtime.CompositionImpl	applyChangesInLocked	(Landroidx/compose/runtime/Changes;)V	Composition.kt
+0x1d0	android.view.DisplayEventReceiver	nativeScheduleVsync	(J)V	DisplayEventReceiver.java
+0x2c4	kotlinx.coroutines.channels.BufferedChannel$BufferedChannelIterator	tryResumeHasNext	(Ljava/lang/Object;)Z	BufferedChannel.kt
+0x2b8	kotlinx.coroutines.channels.BufferedChannel	access$updateCellSend	(Lkotlinx/coroutines/channels/BufferedChannel;Lkotlinx/coroutines/channels/ChannelSegment;ILjava/lang/Object;JLjava/lang/Object;Z)I	BufferedChannel.kt
+0x2cc	kotlinx.coroutines.channels.BufferedChannelKt	tryResume0	(Lkotlinx/coroutines/CancellableContinuation;Ljava/lang/Object;Lkotlin/jvm/functions/Function3;)Z	BufferedChannel.kt
+0x328	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Landroidx/compose/runtime/Composer;I)Ljava/lang/Object;	ComposableLambda.kt
+0x2b4	kotlinx.coroutines.channels.BufferedChannel	trySend-JP2dKIU	(Ljava/lang/Object;)Ljava/lang/Object;	BufferedChannel.kt
+0x2b0	androidx.compose.ui.platform.GlobalSnapshotManager$ensureStarted$2	invoke	(Ljava/lang/Object;)V	GlobalSnapshotManager.android.kt
+0x2d4	androidx.compose.ui.platform.AndroidUiDispatcher	dispatch	(Lkotlin/coroutines/CoroutineContext;Ljava/lang/Runnable;)V	AndroidUiDispatcher.android.kt
+0x120	androidx.compose.runtime.RecomposeScopeImpl	compose	(Landroidx/compose/runtime/Composer;)V	RecomposeScopeImpl.kt
+0x100	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2	invokeSuspend$lambda$2	(Landroidx/compose/runtime/Recomposer;Landroidx/collection/MutableScatterSet;Landroidx/collection/MutableScatterSet;Ljava/util/List;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/Set;J)Lkotlin/Unit;	Recomposer.kt
+0x108	androidx.compose.runtime.Recomposer	performRecompose	(Landroidx/compose/runtime/ControlledComposition;Landroidx/collection/MutableScatterSet;)Landroidx/compose/runtime/ControlledComposition;	Recomposer.kt
+0x2ac	androidx.compose.ui.platform.GlobalSnapshotManager$ensureStarted$2	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	GlobalSnapshotManager.android.kt
+0x2a0	androidx.compose.runtime.snapshots.GlobalSnapshot$$ExternalSyntheticLambda0	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x248	androidx.compose.foundation.text.VerticalScrollLayoutModifier	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	TextFieldScroll.kt
+0x29c	androidx.compose.runtime.snapshots.SnapshotKt	notifyWrite	(Landroidx/compose/runtime/snapshots/Snapshot;Landroidx/compose/runtime/snapshots/StateObject;)V	Snapshot.kt
+0x188	androidx.compose.ui.node.LayoutNode	invalidateOnPositioned$ui	()V	LayoutNode.kt
+0x294	androidx.compose.ui.platform.LazyWindowInfo	setWindowFocused	(Z)V	AndroidWindowInfo.android.kt
+0x2f8	androidx.compose.runtime.Recomposer	access$recordComposerModifications	(Landroidx/compose/runtime/Recomposer;)Z	Recomposer.kt
+0x290	androidx.compose.ui.platform.ComposeViewContext$callback$1	onWindowFocusChanged	(Z)V	ComposeViewContext.android.kt
+0x1a0	android.view.View	invalidateInternal	(IIIIZZ)V	View.java
+0x28c	android.view.ViewTreeObserver	dispatchOnWindowFocusChange	(Z)V	ViewTreeObserver.java
+0x280	android.view.ViewRootImpl	-$$Nest$mhandleWindowFocusChanged	(Landroid/view/ViewRootImpl;)V	ViewRootImpl.java
+0x27c	android.view.ViewRootImpl$ViewRootHandler	handleMessageImpl	(Landroid/os/Message;)V	ViewRootImpl.java
+0xc8	kotlin.coroutines.jvm.internal.ContinuationImpl	getContext	()Lkotlin/coroutines/CoroutineContext;	ContinuationImpl.kt
+0x130	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField	(Landroidx/compose/ui/text/input/TextFieldValue;Lkotlin/jvm/functions/Function1;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/text/TextStyle;Landroidx/compose/ui/text/input/VisualTransformation;Lkotlin/jvm/functions/Function1;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/graphics/Brush;ZIILandroidx/compose/ui/text/input/ImeOptions;Landroidx/compose/foundation/text/KeyboardActions;ZZLkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/runtime/Composer;III)V	CoreTextField.kt
+0x274	kotlinx.coroutines.channels.BufferedChannel$BufferedChannelIterator	access$setContinuation$p	(Lkotlinx/coroutines/channels/BufferedChannel$BufferedChannelIterator;Lkotlinx/coroutines/CancellableContinuationImpl;)V	BufferedChannel.kt
+0x270	kotlinx.coroutines.channels.BufferedChannel$BufferedChannelIterator	hasNextOnNoWaiterSuspend	(Lkotlinx/coroutines/channels/ChannelSegment;IJLkotlin/coroutines/Continuation;)Ljava/lang/Object;	BufferedChannel.kt
+0x268	android.graphics.HardwareRenderer	nSyncAndDrawFrame	(J[JI)I	HardwareRenderer.java
+0x358	androidx.compose.ui.ComposedModifierKt	materializeModifier	(Landroidx/compose/runtime/Composer;Landroidx/compose/ui/Modifier;)Landroidx/compose/ui/Modifier;	ComposedModifier.kt
+0x264	android.graphics.HardwareRenderer	syncAndDrawFrame	(Landroid/graphics/FrameInfo;)I	HardwareRenderer.java
+0x25c	androidx.compose.runtime.snapshots.Snapshot$Companion	notifyObjectsInitialized	()V	Snapshot.kt
+0x2e8	android.os.Handler	sendMessageAtTime	(Landroid/os/Message;J)Z	Handler.java
+0x250	androidx.compose.ui.node.InnerNodeCoordinator	measure-BRTryo0	(J)Landroidx/compose/ui/layout/Placeable;	InnerNodeCoordinator.kt
+0x244	androidx.compose.ui.node.BackwardsCompatNode	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	BackwardsCompatNode.kt
+0x8c	kotlinx.coroutines.flow.StateFlowImpl	setValue	(Ljava/lang/Object;)V	StateFlow.kt
+0x2a8	androidx.compose.runtime.snapshots.GlobalSnapshot	_init_$lambda$0	(Ljava/lang/Object;)Lkotlin/Unit;	Snapshot.kt
+0x3c0	java.lang.Thread	run	()V	Thread.java
+0x240	androidx.compose.ui.graphics.SimpleGraphicsLayerModifier	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	GraphicsLayerModifier.kt
+0x23c	androidx.compose.foundation.layout.SizeNode	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	Size.kt
+0x238	androidx.compose.ui.node.LayoutModifierNodeCoordinator	measure-BRTryo0	(J)Landroidx/compose/ui/layout/Placeable;	LayoutModifierNodeCoordinator.kt
+0x16c	androidx.compose.ui.node.LayoutNode	setModifier	(Landroidx/compose/ui/Modifier;)V	LayoutNode.kt
+0x22c	androidx.compose.runtime.snapshots.SnapshotStateObserver	observeReads	(Ljava/lang/Object;Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function0;)V	SnapshotStateObserver.kt
+0x228	androidx.compose.ui.node.MeasurePassDelegate	remeasure-BRTryo0	(J)Z	MeasurePassDelegate.kt
+0x354	androidx.compose.foundation.text.selection.SimpleLayoutKt	SimpleLayout	(Landroidx/compose/ui/Modifier;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;II)V	SimpleLayout.kt
+0x2d8	android.view.Choreographer	postFrameCallback	(Landroid/view/Choreographer$FrameCallback;)V	Choreographer.java
+0x224	androidx.compose.ui.node.LayoutNode	remeasure-_Sx5XlM$ui	(Landroidx/compose/ui/unit/Constraints;)Z	LayoutNode.kt
+0x2f0	androidx.compose.runtime.snapshots.SnapshotKt	getLock	()Ljava/lang/Object;	Snapshot.kt
+0x220	androidx.compose.ui.node.LayoutNode	remeasure-_Sx5XlM$ui$default	(Landroidx/compose/ui/node/LayoutNode;Landroidx/compose/ui/unit/Constraints;ILjava/lang/Object;)Z	LayoutNode.kt
+0x214	androidx.compose.ui.node.MeasureAndLayoutDelegate	access$remeasureIfNeeded	(Landroidx/compose/ui/node/MeasureAndLayoutDelegate;Landroidx/compose/ui/node/LayoutNode;ZZ)Z	MeasureAndLayoutDelegate.kt
+0x210	androidx.compose.ui.node.MeasureAndLayoutDelegate	measureAndLayout	(Lkotlin/jvm/functions/Function0;)Z	MeasureAndLayoutDelegate.kt
+0x20c	androidx.compose.ui.platform.AndroidComposeView	measureAndLayout	(Z)V	AndroidComposeView.android.kt
+0x200	android.view.View	draw	(Landroid/graphics/Canvas;)V	View.java
+0x298	androidx.compose.runtime.SnapshotMutableStateImpl	setValue	(Ljava/lang/Object;)V	SnapshotState.kt
+0x1fc	android.view.ViewGroup	recreateChildDisplayList	(Landroid/view/View;)V	ViewGroup.java
+0x1f0	android.view.ThreadedRenderer	updateViewTreeDisplayList	(Landroid/view/View;)V	ThreadedRenderer.java
+0x1ec	android.view.ThreadedRenderer	updateRootDisplayList	(Landroid/view/View;Landroid/view/ThreadedRenderer$DrawCallbacks;)V	ThreadedRenderer.java
+0x218	androidx.compose.ui.node.MeasureAndLayoutDelegate	remeasureIfNeeded	(Landroidx/compose/ui/node/LayoutNode;ZZ)Z	MeasureAndLayoutDelegate.kt
+0x21c	androidx.compose.ui.node.MeasureAndLayoutDelegate	doRemeasure-sdFAvZA	(Landroidx/compose/ui/node/LayoutNode;Landroidx/compose/ui/unit/Constraints;)Z	MeasureAndLayoutDelegate.kt
+0x1e8	android.view.ThreadedRenderer	draw	(Landroid/view/View;Landroid/view/View$AttachInfo;Landroid/view/ThreadedRenderer$DrawCallbacks;)V	ThreadedRenderer.java
+0x1e0	android.view.ViewRootImpl	performDraw	(Landroid/window/SurfaceSyncGroup;)Z	ViewRootImpl.java
+0x154	androidx.compose.runtime.composer.gapbuffer.changelist.Operations	executeAndFlushAllPendingOperations	(Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	Operations.kt
+0x84	androidx.compose.runtime.Recomposer	access$deriveStateLocked	(Landroidx/compose/runtime/Recomposer;)Lkotlinx/coroutines/CancellableContinuation;	Recomposer.kt
+0x1dc	android.view.ViewRootImpl	performTraversals	()V	ViewRootImpl.java
+0x1d4	android.view.ViewRootImpl$TraversalRunnable	run	()V	ViewRootImpl.java
+0x304	androidx.compose.runtime.CompositionImpl	drainPendingModificationsLocked	()V	Composition.kt
+0x234	androidx.compose.ui.node.MeasurePassDelegate$performMeasureBlock$1	invoke	()V	MeasurePassDelegate.kt
+0x1f4	android.view.View	updateDisplayListIfDirty	()Landroid/graphics/RenderNode;	View.java
+0x24c	androidx.compose.foundation.text.TextFieldSizeNode	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	TextFieldSize.kt
+0x1cc	android.view.DisplayEventReceiver	scheduleVsync	()V	DisplayEventReceiver.java
+0x260	androidx.compose.runtime.snapshots.GlobalSnapshot	notifyObjectsInitialized$runtime	()V	Snapshot.kt
+0x1b8	android.view.Choreographer	postCallback	(ILjava/lang/Runnable;Ljava/lang/Object;)V	Choreographer.java
+0x1b0	android.view.ViewRootImpl	invalidate	()V	ViewRootImpl.java
+0x388	androidx.compose.runtime.Recomposer$$ExternalSyntheticLambda1	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x1ac	android.view.ViewRootImpl	onDescendantInvalidated	(Landroid/view/View;Landroid/view/View;)V	ViewRootImpl.java
+0x60	kotlin.coroutines.jvm.internal.BaseContinuationImpl	resumeWith	(Ljava/lang/Object;)V	ContinuationImpl.kt
+0x308	androidx.compose.runtime.CompositionImpl	addPendingInvalidationsLocked	(Ljava/util/Set;Z)V	Composition.kt
+0x2c0	kotlinx.coroutines.channels.BufferedChannel	tryResumeReceiver	(Ljava/lang/Object;Ljava/lang/Object;)Z	BufferedChannel.kt
+0x1e4	android.view.ViewRootImpl	draw	(ZLandroid/window/SurfaceSyncGroup;Z)Z	ViewRootImpl.java
+0x1d8	android.view.ViewRootImpl	doTraversal	()V	ViewRootImpl.java
+0x1a4	android.view.ViewGroup	invalidateChild	(Landroid/view/View;Landroid/graphics/Rect;)V	ViewGroup.java
+0x19c	android.view.View	invalidate	(Z)V	View.java
+0x374	androidx.compose.foundation.text.TextFieldCursorKt	$r8$lambda$o3jUmm3qgHA9UrrKheMKhb8AeVQ	(Landroidx/compose/ui/graphics/Brush;Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/Modifier;Landroidx/compose/runtime/Composer;I)Landroidx/compose/ui/Modifier;	TextFieldCursor.kt
+0x1c4	android.view.Choreographer	scheduleFrameLocked	(J)V	Choreographer.java
+0x40	java.lang.Thread	sleep	(J)V	Thread.java
 0x24	android.app.ActivityThread$H	handleMessage	(Landroid/os/Message;)V	ActivityThread.java
-0x34	java.lang.Thread	sleep	(J)V	Thread.java
-0x64	android.view.InsetsSourceConsumer	setControl	(Landroid/view/InsetsSourceControl;[I[I)Z	InsetsSourceConsumer.java
-0xe0	androidx.compose.runtime.CompositionImpl	recordModificationsOf	(Ljava/util/Set;)V	Composition.kt
-0x324	androidx.compose.ui.node.NodeCoordinator$drawBlock$1	invoke	(Landroidx/compose/ui/graphics/Canvas;Landroidx/compose/ui/graphics/layer/GraphicsLayer;)V	NodeCoordinator.kt
-0x2b4	androidx.compose.ui.node.MeasurePassDelegate$performMeasureBlock$1	invoke	()V	MeasurePassDelegate.kt
-0x274	android.view.View	updateDisplayListIfDirty	()Landroid/graphics/RenderNode;	View.java
-0xe4	androidx.compose.runtime.CompositionImpl	drainPendingModificationsLocked	()V	Composition.kt
-0x2d8	androidx.compose.ui.node.MeasurePassDelegate	measure-BRTryo0	(J)Landroidx/compose/ui/layout/Placeable;	MeasurePassDelegate.kt
-0x17c	androidx.compose.foundation.text.TextFieldScrollKt	textFieldScrollable$lambda$1	(Landroidx/compose/foundation/text/TextFieldScrollerPosition;ZLandroidx/compose/foundation/OverscrollEffect;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/Modifier;Landroidx/compose/runtime/Composer;I)Landroidx/compose/ui/Modifier;	TextFieldScroll.kt
-0x1c4	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$YGJLVTSzMiACPRcsCdN1M2VQEO4	(Lkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
-0x164	androidx.compose.ui.CombinedModifier	foldIn	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;	Modifier.kt
-0x158	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextFieldRootBox	(Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V	CoreTextField.kt
-0xb4	androidx.compose.runtime.snapshots.SnapshotKt	advanceGlobalSnapshot	(Lkotlin/jvm/functions/Function1;)Ljava/lang/Object;	Snapshot.kt
-0x3c4	java.lang.ref.Reference	refersTo0	(Ljava/lang/Object;)Z	Reference.java
-0xd4	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2	invokeSuspend	(Ljava/lang/Object;)Ljava/lang/Object;	Recomposer.kt
-0x3ec	java.lang.Object	wait	()V	Object.java
-0x2f4	androidx.compose.runtime.internal.SnapshotThreadLocal	get	()Ljava/lang/Object;	SnapshotThreadLocal.kt
-0x68	android.view.InsetsSourceControl	release	(Ljava/util/function/Consumer;)V	InsetsSourceControl.java
-0xcc	androidx.concurrent.futures.AbstractResolvableFuture$SafeAtomicHelper$$ExternalSyntheticBackportWithForwarding0	m	(Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z	D8$$SyntheticClass
-0xc0	kotlinx.coroutines.channels.BufferedChannel$BufferedChannelIterator	hasNextOnNoWaiterSuspend	(Lkotlinx/coroutines/channels/ChannelSegment;IJLkotlin/coroutines/Continuation;)Ljava/lang/Object;	BufferedChannel.kt
-0x54	android.view.ViewRootImpl$W	insetsControlChanged	(Landroid/view/InsetsState;Landroid/view/InsetsSourceControl$Array;)V	ViewRootImpl.java
-0xb8	androidx.compose.runtime.internal.AtomicInt	add	(I)I	Atomic.jvmAndAndroid.kt
-0x184	androidx.compose.foundation.gestures.ScrollableKt	scrollable	(Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/gestures/ScrollableState;Landroidx/compose/foundation/gestures/Orientation;Landroidx/compose/foundation/OverscrollEffect;ZZLandroidx/compose/foundation/gestures/FlingBehavior;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/foundation/gestures/BringIntoViewSpec;)Landroidx/compose/ui/Modifier;	Scrollable.kt
-0x390	com.android.internal.view.IInputMethodManager$Stub$Proxy	startInputOrWindowGainedFocusAsync	(ILcom/android/internal/inputmethod/IInputMethodClient;Landroid/os/IBinder;IIILandroid/view/inputmethod/EditorInfo;Lcom/android/internal/inputmethod/IRemoteInputConnection;Lcom/android/internal/inputmethod/IRemoteAccessibilityInputConnection;IILandroid/window/ImeOnBackInvokedDispatcher;I)V	IInputMethodManager.java
-0x4c	android.app.servertransaction.WindowStateTransactionItem	execute	(Landroid/app/ClientTransactionHandler;Landroid/app/servertransaction/PendingTransactionActions;)V	WindowStateTransactionItem.java
-0x24c	java.lang.Integer	valueOf	(I)Ljava/lang/Integer;	Integer.java
-0x170	androidx.compose.ui.ComposedModifierKt$materializeImpl$result$1	invoke	(Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier$Element;)Landroidx/compose/ui/Modifier;	ComposedModifier.kt
+0x194	androidx.compose.ui.platform.AndroidComposeView	scheduleMeasureAndLayout	(Landroidx/compose/ui/node/LayoutNode;)V	AndroidComposeView.android.kt
+0x18c	androidx.compose.ui.platform.AndroidComposeView	requestOnPositionedCallback	(Landroidx/compose/ui/node/LayoutNode;)V	AndroidComposeView.android.kt
+0x184	androidx.compose.ui.node.NodeKindKt	autoInvalidateNodeSelf	(Landroidx/compose/ui/Modifier$Node;II)V	NodeKind.kt
+0x1bc	android.view.Choreographer	postCallbackDelayed	(ILjava/lang/Runnable;Ljava/lang/Object;J)V	Choreographer.java
+0xb0	kotlinx.coroutines.DispatchedTaskKt	resume	(Lkotlinx/coroutines/DispatchedTask;Lkotlin/coroutines/Continuation;Z)V	DispatchedTask.kt
+0x134	androidx.compose.runtime.saveable.RememberSaveableKt	rememberSaveable	([Ljava/lang/Object;Landroidx/compose/runtime/saveable/Saver;Lkotlin/jvm/functions/Function0;Landroidx/compose/runtime/Composer;I)Ljava/lang/Object;	RememberSaveable.kt
+0x6c	androidx.compose.runtime.snapshots.SnapshotKt	access$advanceGlobalSnapshot	()V	Snapshot.kt
+0x5c	kotlinx.coroutines.DispatchedTask	run	()V	DispatchedTask.kt
+0x208	androidx.compose.ui.node.Owner	measureAndLayout$default	(Landroidx/compose/ui/node/Owner;ZILjava/lang/Object;)V	Owner.kt
+0x17c	androidx.compose.ui.node.NodeKindKt	autoInvalidateUpdatedNode	(Landroidx/compose/ui/Modifier$Node;)V	NodeKind.kt
+0x3e4	java.lang.Object	wait	(JI)V	Object.java
+0x284	android.view.ViewRootImpl	handleWindowFocusChanged	()V	ViewRootImpl.java
+0x158	androidx.compose.runtime.composer.gapbuffer.changelist.Operation	executeWithComposeStackTrace	(Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationArgContainer;Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	Operation.kt
+0x14c	androidx.compose.runtime.composer.gapbuffer.changelist.ChangeList	execute	(Landroidx/compose/runtime/SlotStorage;Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/tooling/CompositionErrorContextImpl;)V	ChangeList.kt
+0xfc	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2	$r8$lambda$sdKIQuFT6MpOW8QdHT9yWSawFoM	(Landroidx/compose/runtime/Recomposer;Landroidx/collection/MutableScatterSet;Landroidx/collection/MutableScatterSet;Ljava/util/List;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/List;Landroidx/collection/MutableScatterSet;Ljava/util/Set;J)Lkotlin/Unit;	Recomposer.kt
+0x144	androidx.compose.runtime.CompositionImpl	applyChanges	()V	Composition.kt
+0x258	java.util.ArrayList	<init>	(I)V	ArrayList.java
+0x140	java.util.Arrays	equals	([Ljava/lang/Object;[Ljava/lang/Object;)Z	Arrays.java
+0x160	androidx.compose.runtime.Applier	apply	(Lkotlin/jvm/functions/Function2;Ljava/lang/Object;)V	Applier.kt
+0x13c	androidx.compose.runtime.saveable.SaveableHolder	getValueIfInputsDidntChange	([Ljava/lang/Object;)Ljava/lang/Object;	RememberSaveable.kt
+0x128	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$TtIJ9IjppJTpGOz76vdnf7AIP6w	(Landroidx/compose/ui/text/input/TextFieldValue;Lkotlin/jvm/functions/Function1;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/text/TextStyle;Landroidx/compose/ui/text/input/VisualTransformation;Lkotlin/jvm/functions/Function1;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/graphics/Brush;ZIILandroidx/compose/ui/text/input/ImeOptions;Landroidx/compose/foundation/text/KeyboardActions;ZZLkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/TextFieldScrollerPosition;IIILandroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
+0x2c	android.app.ActivityThread	handleReceiver	(Landroid/app/ActivityThread$ReceiverData;)V	ActivityThread.java
+0x2dc	android.view.Choreographer	postFrameCallbackDelayed	(Landroid/view/Choreographer$FrameCallback;J)V	Choreographer.java
+0x11c	androidx.compose.runtime.GapComposer	recomposeToGroupEnd	()V	GapComposer.kt
+0x124	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda17	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x170	androidx.compose.ui.node.LayoutNode	applyModifier	(Landroidx/compose/ui/Modifier;)V	LayoutNode.kt
+0x3f8	libcore.util.NativeAllocationRegistry	applyFreeFunction	(JJ)V	NativeAllocationRegistry.java
+0x3b8	androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap	access$clearObsoleteStateReads	(Landroidx/compose/runtime/snapshots/SnapshotStateObserver$ObservedScopeMap;Ljava/lang/Object;)V	SnapshotStateObserver.kt
+0x44	java.lang.Thread	sleep	(JI)V	Thread.java
+0x1c8	android.view.Choreographer	scheduleVsyncLocked	()V	Choreographer.java
+0xd4	android.view.Choreographer$FrameDisplayEventReceiver	run	()V	Choreographer.java
+0xb4	kotlinx.coroutines.flow.StateFlowImpl$collect$1	invokeSuspend	(Ljava/lang/Object;)Ljava/lang/Object;	StateFlow.kt
+0x3a8	java.lang.Long	numberOfTrailingZeros	(J)I	Long.java
+0xb8	kotlinx.coroutines.flow.StateFlowImpl	collect	(Lkotlinx/coroutines/flow/FlowCollector;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;	StateFlow.kt
+0x110	androidx.compose.runtime.GapComposer	recompose-aFTiNEg$runtime	(Landroidx/collection/MutableScatterMap;Landroidx/compose/runtime/ShouldPauseCallback;)Z	GapComposer.kt
+0x118	androidx.compose.runtime.GapComposer	skipCurrentGroup	()V	GapComposer.kt
+0x26c	kotlinx.coroutines.channels.BufferedChannel$BufferedChannelIterator	hasNext	(Lkotlin/coroutines/Continuation;)Ljava/lang/Object;	BufferedChannel.kt
+0x10c	androidx.compose.runtime.CompositionImpl	recompose	()Z	Composition.kt
+0x70	androidx.compose.runtime.snapshots.SnapshotKt	advanceGlobalSnapshot	()V	Snapshot.kt
+0xf4	androidx.compose.ui.platform.AndroidUiFrameClock$withFrameNanos$2$callback$1	doFrame	(J)V	AndroidUiFrameClock.android.kt
+0x34c	androidx.compose.foundation.text.CoreTextFieldKt	$r8$lambda$uRJCEKYN4oPy_-WzWgvYXPBRWJY	(Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
+0xf8	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2$$ExternalSyntheticLambda0	invoke	(Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x254	androidx.compose.foundation.text.selection.SimpleLayoutKt$SimpleLayout$1$1	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Ljava/util/List;J)Landroidx/compose/ui/layout/MeasureResult;	SimpleLayout.kt
+0x38	java.lang.Class	newInstance	()Ljava/lang/Object;	Class.java
+0x10	android.os.Looper	loop	()V	Looper.java
+0x98	kotlinx.coroutines.CancellableContinuationImpl	resumeWith	(Ljava/lang/Object;)V	CancellableContinuationImpl.kt
+0xf0	androidx.compose.ui.platform.AndroidUiDispatcher	performFrameDispatch	(J)V	AndroidUiDispatcher.android.kt
+0x4c	android.os.Handler	handleCallback	(Landroid/os/Message;)V	Handler.java
+0x33c	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Ljava/lang/Object;Landroidx/compose/runtime/Composer;I)Ljava/lang/Object;	ComposableLambda.kt
+0xe4	android.view.Choreographer$CallbackRecord	run	(J)V	Choreographer.java
+0xdc	android.view.Choreographer	doCallbacks	(IJ)V	Choreographer.java
+0xe8	androidx.compose.ui.platform.AndroidUiDispatcher$dispatchCallback$1	doFrame	(J)V	AndroidUiDispatcher.android.kt
+0x168	androidx.compose.ui.node.ComposeUiNode$Companion$SetModifier$1	invoke	(Landroidx/compose/ui/node/ComposeUiNode;Landroidx/compose/ui/Modifier;)V	ComposeUiNode.kt
+0x3c4	java.lang.Daemons$Daemon	run	()V	Daemons.java
+0x2a4	androidx.compose.runtime.snapshots.GlobalSnapshot	$r8$lambda$2aF9H59r7q_IUG7c6Is4lI6yYac	(Ljava/lang/Object;)Lkotlin/Unit;	Snapshot.kt
+0xd8	android.view.Choreographer	doFrame	(JILandroid/view/DisplayEventReceiver$VsyncEventData;)V	Choreographer.java
+0x3c	com.example.composefixture.AnrReceiver	onReceive	(Landroid/content/Context;Landroid/content/Intent;)V	AnrReceiver.kt
+0xcc	kotlin.jvm.internal.Intrinsics	checkNotNull	(Ljava/lang/Object;)V	Intrinsics.java
+0xa8	kotlinx.coroutines.DispatchedTaskKt	dispatch	(Lkotlinx/coroutines/DispatchedTask;I)V	DispatchedTask.kt
+0x164	androidx.compose.ui.node.ComposeUiNode$Companion$SetModifier$1	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposeUiNode.kt
+0xc4	kotlin.coroutines.jvm.internal.ContinuationImpl	<init>	(Lkotlin/coroutines/Continuation;)V	ContinuationImpl.kt
+0xbc	kotlinx.coroutines.flow.FlowKt__ReduceKt$first$$inlined$collectWhile$2	emit	(Ljava/lang/Object;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;	Limit.kt
+0x204	androidx.compose.ui.platform.AndroidComposeView	dispatchDraw	(Landroid/graphics/Canvas;)V	AndroidComposeView.android.kt
+0x318	androidx.compose.foundation.text.ContextMenu_androidKt	ContextMenuArea	(Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V	ContextMenu.android.kt
+0xe0	android.view.Choreographer$CallbackRecord	run	(Landroid/view/Choreographer$FrameData;)V	Choreographer.java
+0x230	androidx.compose.ui.node.MeasurePassDelegate$performMeasureBlock$1	invoke	()Ljava/lang/Object;	MeasurePassDelegate.kt
+0x28	android.app.ActivityThread	-$$Nest$mhandleReceiver	(Landroid/app/ActivityThread;Landroid/app/ActivityThread$ReceiverData;)V	ActivityThread.java
+0x114	androidx.compose.runtime.GapComposer	doCompose-aFTiNEg	(Landroidx/collection/MutableScatterMap;Lkotlin/jvm/functions/Function2;)V	GapComposer.kt
+0xa4	kotlinx.coroutines.CancellableContinuationImpl	dispatchResume	(I)V	CancellableContinuationImpl.kt
+0x9c	kotlinx.coroutines.CancellableContinuationImpl	resumeImpl$kotlinx_coroutines_core$default	(Lkotlinx/coroutines/CancellableContinuationImpl;Ljava/lang/Object;ILkotlin/jvm/functions/Function3;ILjava/lang/Object;)V	CancellableContinuationImpl.kt
+0x34	android.app.AppComponentFactory	instantiateReceiver	(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Intent;)Landroid/content/BroadcastReceiver;	AppComponentFactory.java
+0x138	androidx.compose.runtime.saveable.RememberSaveableKt	rememberSaveable	([Ljava/lang/Object;Landroidx/compose/runtime/saveable/Saver;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Landroidx/compose/runtime/Composer;II)Ljava/lang/Object;	RememberSaveable.kt
+0x80	androidx.compose.runtime.Recomposer$recompositionRunner$2	invokeSuspend$lambda$0	(Landroidx/compose/runtime/Recomposer;Ljava/util/Set;Landroidx/compose/runtime/snapshots/Snapshot;)Lkotlin/Unit;	Recomposer.kt
+0x7c	androidx.compose.runtime.Recomposer$recompositionRunner$2	$r8$lambda$jbKdzZo3bTCIHTxjeyZ3PmjzbnE	(Landroidx/compose/runtime/Recomposer;Ljava/util/Set;Landroidx/compose/runtime/snapshots/Snapshot;)Lkotlin/Unit;	Recomposer.kt
+0x90	kotlinx.coroutines.flow.StateFlowImpl	updateState	(Ljava/lang/Object;Ljava/lang/Object;)Z	StateFlow.kt
+0x37c	androidx.compose.ui.platform.LazyWindowInfo	isWindowFocused	()Z	AndroidWindowInfo.android.kt
+0x36c	androidx.compose.ui.ComposedModifierKt$materializeImpl$result$1	invoke	(Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier$Element;)Landroidx/compose/ui/Modifier;	ComposedModifier.kt
 0x20	android.os.Handler	dispatchMessage	(Landroid/os/Message;)V	Handler.java
-0x350	android.view.InsetsSourceConsumer	applyRequestedVisibilityToControl	()V	InsetsSourceConsumer.java
-0xa0	kotlin.coroutines.jvm.internal.BaseContinuationImpl	resumeWith	(Ljava/lang/Object;)V	ContinuationImpl.kt
-0xc8	kotlinx.coroutines.internal.DispatchedContinuation	claimReusableCancellableContinuation$kotlinx_coroutines_core	()Lkotlinx/coroutines/CancellableContinuationImpl;	DispatchedContinuation.kt
-0x100	androidx.compose.ui.platform.AndroidUiDispatcher$dispatchCallback$1	doFrame	(J)V	AndroidUiDispatcher.android.kt
-0x278	android.view.ViewGroup	dispatchGetDisplayList	()V	ViewGroup.java
-0xa4	androidx.compose.ui.platform.GlobalSnapshotManager$ensureStarted$1	invokeSuspend	(Ljava/lang/Object;)Ljava/lang/Object;	GlobalSnapshotManager.android.kt
+0x32c	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda16	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x150	androidx.compose.runtime.composer.gapbuffer.changelist.ChangeList	executeAndFlushAllPendingChanges	(Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	ChangeList.kt
+0xc0	kotlinx.coroutines.flow.FlowKt__ReduceKt$first$$inlined$collectWhile$2$1	<init>	(Lkotlinx/coroutines/flow/FlowKt__ReduceKt$first$$inlined$collectWhile$2;Lkotlin/coroutines/Continuation;)V	(null)
+0x174	androidx.compose.ui.node.NodeChain	updateFrom$ui	(Landroidx/compose/ui/Modifier;)V	NodeChain.kt
+0	com.android.internal.os.ZygoteInit	main	([Ljava/lang/String;)V	ZygoteInit.java
+0x348	androidx.compose.foundation.text.CoreTextFieldKt$$ExternalSyntheticLambda13	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0xd0	java.lang.ref.Reference	get	()Ljava/lang/Object;	Reference.java
+0x94	kotlinx.coroutines.flow.StateFlowSlot	makePending	()V	StateFlow.kt
+0x58	androidx.compose.ui.platform.AndroidUiDispatcher	performTrampolineDispatch	()V	AndroidUiDispatcher.android.kt
+0x12c	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$23	(Landroidx/compose/ui/text/input/TextFieldValue;Lkotlin/jvm/functions/Function1;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/text/TextStyle;Landroidx/compose/ui/text/input/VisualTransformation;Lkotlin/jvm/functions/Function1;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/ui/graphics/Brush;ZIILandroidx/compose/ui/text/input/ImeOptions;Landroidx/compose/foundation/text/KeyboardActions;ZZLkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/TextFieldScrollerPosition;IIILandroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
+0x88	androidx.compose.runtime.Recomposer	deriveStateLocked	()Lkotlinx/coroutines/CancellableContinuation;	Recomposer.kt
+0x64	androidx.compose.ui.platform.GlobalSnapshotManager$ensureStarted$1	invokeSuspend	(Ljava/lang/Object;)Ljava/lang/Object;	GlobalSnapshotManager.android.kt
+0x190	androidx.compose.ui.platform.AndroidComposeView	scheduleMeasureAndLayout$default	(Landroidx/compose/ui/platform/AndroidComposeView;Landroidx/compose/ui/node/LayoutNode;ILjava/lang/Object;)V	AndroidComposeView.android.kt
+0x1f8	android.view.ViewGroup	dispatchGetDisplayList	()V	ViewGroup.java
+0x50	androidx.compose.ui.platform.AndroidUiDispatcher$dispatchCallback$1	run	()V	AndroidUiDispatcher.android.kt
+0x15c	androidx.compose.runtime.composer.gapbuffer.changelist.Operation$UpdateNode	execute	(Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationArgContainer;Landroidx/compose/runtime/Applier;Landroidx/compose/runtime/composer/gapbuffer/SlotWriter;Landroidx/compose/runtime/composer/RememberManager;Landroidx/compose/runtime/composer/gapbuffer/changelist/OperationErrorContext;)V	Operation.kt
+0x380	androidx.compose.runtime.SnapshotMutableStateImpl	getValue	()Ljava/lang/Object;	SnapshotState.kt
+0x334	androidx.compose.foundation.text.CoreTextFieldKt	CoreTextField$lambda$22	(Lkotlin/jvm/functions/Function3;Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/TextStyle;IILandroidx/compose/foundation/text/TextFieldScrollerPosition;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/VisualTransformation;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/relocation/BringIntoViewRequester;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;ZZLkotlin/jvm/functions/Function1;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/unit/Density;Landroidx/compose/runtime/Composer;I)Lkotlin/Unit;	CoreTextField.kt
+0xa0	kotlinx.coroutines.CancellableContinuationImpl	resumeImpl$kotlinx_coroutines_core	(Ljava/lang/Object;ILkotlin/jvm/functions/Function3;)V	CancellableContinuationImpl.kt
+0x2f4	androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2	invokeSuspend	(Ljava/lang/Object;)Ljava/lang/Object;	Recomposer.kt
+0x74	androidx.compose.runtime.snapshots.SnapshotKt	advanceGlobalSnapshot	(Lkotlin/jvm/functions/Function1;)Ljava/lang/Object;	Snapshot.kt
+0x300	androidx.compose.runtime.CompositionImpl	recordModificationsOf	(Ljava/util/Set;)V	Composition.kt
 0x8	java.lang.reflect.Method	invoke	(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;	Method.java
 0x1c	android.os.MessageQueue	nativePollOnce	(JI)V	MessageQueue.java
-0x6c	android.view.InsetsController$$ExternalSyntheticLambda8	accept	(Ljava/lang/Object;)V	D8$$SyntheticClass
-0x7c	libcore.util.NativeAllocationRegistry$CleanerThunk	run	()V	NativeAllocationRegistry.java
-0x98	androidx.compose.ui.platform.AndroidUiDispatcher	performTrampolineDispatch	()V	AndroidUiDispatcher.android.kt
-0x70	android.view.SurfaceControl	release	()V	SurfaceControl.java
-0x150	androidx.compose.foundation.text.selection.TextFieldSelectionManager_androidKt	addBasicTextFieldTextContextMenuComponents	(Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlinx/coroutines/CoroutineScope;)Landroidx/compose/ui/Modifier;	TextFieldSelectionManager.android.kt
-0x12c	androidx.compose.runtime.GapComposer	doCompose-aFTiNEg	(Landroidx/collection/MutableScatterMap;Lkotlin/jvm/functions/Function2;)V	GapComposer.kt
-0x174	androidx.compose.foundation.text.TextFieldScrollKt$$ExternalSyntheticLambda1	invoke	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
-0xd0	java.util.concurrent.atomic.AtomicReferenceFieldUpdater$AtomicReferenceFieldUpdaterImpl	compareAndSet	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z	AtomicReferenceFieldUpdater.java
-0x94	androidx.compose.ui.platform.AndroidUiDispatcher	access$performTrampolineDispatch	(Landroidx/compose/ui/platform/AndroidUiDispatcher;)V	AndroidUiDispatcher.android.kt
-0xec	android.view.Choreographer$FrameDisplayEventReceiver	run	()V	Choreographer.java
-0x50	android.app.servertransaction.WindowStateInsetsControlChangeItem	execute	(Landroid/app/ClientTransactionHandler;Landroid/view/IWindow;Landroid/app/servertransaction/PendingTransactionActions;)V	WindowStateInsetsControlChangeItem.java
-0x40	android.app.servertransaction.TransactionExecutor	execute	(Landroid/app/servertransaction/ClientTransaction;)V	TransactionExecutor.java
-0x1cc	androidx.compose.runtime.internal.ComposableLambdaImpl	invoke	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	ComposableLambda.kt
-0x39c	android.os.Parcel	nativeMarkForBinder	(JLandroid/os/IBinder;)V	Parcel.java
-0x1b0	androidx.compose.runtime.GapComposer	skipToGroupEnd	()V	GapComposer.kt
-0x168	androidx.compose.ui.Modifier$Element	foldIn	(Ljava/lang/Object;Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;	Modifier.kt
-0xdc	androidx.compose.runtime.Recomposer	recordComposerModifications	()Z	Recomposer.kt
-0x78	sun.misc.Cleaner	clean	()V	Cleaner.java
-0x58	android.view.ViewRootImpl	-$$Nest$mhandleInsetsControlChanged	(Landroid/view/ViewRootImpl;Landroid/view/InsetsState;Landroid/view/InsetsSourceControl$Array;)V	ViewRootImpl.java
-0x104	androidx.compose.ui.platform.AndroidUiDispatcher	access$performFrameDispatch	(Landroidx/compose/ui/platform/AndroidUiDispatcher;J)V	AndroidUiDispatcher.android.kt
-0x2c	android.app.ActivityThread	handleReceiver	(Landroid/app/ActivityThread$ReceiverData;)V	ActivityThread.java
-0x84	android.util.SparseArray	valueAt	(I)Ljava/lang/Object;	SparseArray.java
-0xa8	androidx.compose.runtime.snapshots.Snapshot$Companion	sendApplyNotifications	()V	Snapshot.kt
-0	com.android.internal.os.ZygoteInit	main	([Ljava/lang/String;)V	ZygoteInit.java
-0x300	androidx.compose.ui.graphics.layer.GraphicsLayer	recordInternal	()V	AndroidGraphicsLayer.android.kt
-0x2c8	androidx.compose.foundation.text.VerticalScrollLayoutModifier	measure-3p2s80s	(Landroidx/compose/ui/layout/MeasureScope;Landroidx/compose/ui/layout/Measurable;J)Landroidx/compose/ui/layout/MeasureResult;	TextFieldScroll.kt
-0x14c	androidx.compose.foundation.text.CoreTextFieldKt	addContextMenuComponents	(Landroidx/compose/ui/Modifier;Landroidx/compose/foundation/text/selection/TextFieldSelectionManager;Lkotlinx/coroutines/CoroutineScope;)Landroidx/compose/ui/Modifier;	CoreTextField.kt
+0xec	androidx.compose.ui.platform.AndroidUiDispatcher	access$performFrameDispatch	(Landroidx/compose/ui/platform/AndroidUiDispatcher;J)V	AndroidUiDispatcher.android.kt
+0x1c0	android.view.Choreographer	postCallbackDelayedInternal	(ILjava/lang/Object;Ljava/lang/Object;J)V	Choreographer.java
+0x1a8	android.view.ViewGroup	onDescendantInvalidated	(Landroid/view/View;Landroid/view/View;)V	ViewGroup.java
+0x2c8	kotlinx.coroutines.channels.BufferedChannelKt	access$tryResume0	(Lkotlinx/coroutines/CancellableContinuation;Ljava/lang/Object;Lkotlin/jvm/functions/Function3;)Z	BufferedChannel.kt
+0x54	androidx.compose.ui.platform.AndroidUiDispatcher	access$performTrampolineDispatch	(Landroidx/compose/ui/platform/AndroidUiDispatcher;)V	AndroidUiDispatcher.android.kt
+0x3ec	java.lang.ref.ReferenceQueue	enqueuePending	(Ljava/lang/ref/Reference;Ljava/util/concurrent/atomic/AtomicInteger;)V	ReferenceQueue.java
+0xac	kotlinx.coroutines.DispatchedTaskKt	resumeUnconfined	(Lkotlinx/coroutines/DispatchedTask;)V	DispatchedTask.kt
+0x78	androidx.compose.runtime.Recomposer$recompositionRunner$2$$ExternalSyntheticLambda0	invoke	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	D8$$SyntheticClass
+0x68	androidx.compose.runtime.snapshots.Snapshot$Companion	sendApplyNotifications	()V	Snapshot.kt
 0x14	android.os.Looper	loopOnce	(Landroid/os/Looper;JI)Z	Looper.java
-0x18	android.os.MessageQueue	next	()Landroid/os/Message;	MessageQueue.java
-0x5c	android.view.ViewRootImpl	handleInsetsControlChanged	(Landroid/view/InsetsState;Landroid/view/InsetsSourceControl$Array;)V	ViewRootImpl.java
-0x3c	java.lang.Thread	sleep	(Ljava/lang/Object;JI)V	Thread.java
 0xc	android.app.ActivityThread	main	([Ljava/lang/String;)V	ActivityThread.java
-0x280	android.view.View	draw	(Landroid/graphics/Canvas;)V	View.java
-0x26c	android.view.ThreadedRenderer	updateRootDisplayList	(Landroid/view/View;Landroid/view/ThreadedRenderer$DrawCallbacks;)V	ThreadedRenderer.java
-0x44	android.app.servertransaction.TransactionExecutor	executeTransactionItems	(Landroid/app/servertransaction/ClientTransaction;)V	TransactionExecutor.java
-0x74	libcore.util.NativeAllocationRegistry$CleanerRunner	run	()V	NativeAllocationRegistry.java
-0x3d8	java.lang.ref.ReferenceQueue	remove	(J)Ljava/lang/ref/Reference;	ReferenceQueue.java
+0x18	android.os.MessageQueue	next	()Landroid/os/Message;	MessageQueue.java
+0x3f0	sun.misc.Cleaner	clean	()V	Cleaner.java
+0x288	android.view.ViewRootImpl	dispatchFocusEvent	(ZZ)V	ViewRootImpl.java
+0x198	android.view.View	invalidate	()V	View.java
+0x104	androidx.compose.runtime.Recomposer	access$performRecompose	(Landroidx/compose/runtime/Recomposer;Landroidx/compose/runtime/ControlledComposition;Landroidx/collection/MutableScatterSet;)Landroidx/compose/runtime/ControlledComposition;	Recomposer.kt
+0x3dc	java.lang.ref.ReferenceQueue	remove	(J)Ljava/lang/ref/Reference;	ReferenceQueue.java
 0x4	com.android.internal.os.RuntimeInit$MethodAndArgsCaller	run	()V	RuntimeInit.java
+0x1b4	android.view.ViewRootImpl	scheduleTraversals	()V	ViewRootImpl.java
+0x178	androidx.compose.ui.node.NodeChain	updateNode	(Landroidx/compose/ui/Modifier$Element;Landroidx/compose/ui/Modifier$Element;Landroidx/compose/ui/Modifier$Node;)V	NodeChain.kt
+0x2bc	kotlinx.coroutines.channels.BufferedChannel	updateCellSend	(Lkotlinx/coroutines/channels/ChannelSegment;ILjava/lang/Object;JLjava/lang/Object;Z)I	BufferedChannel.kt
+0x324	androidx.compose.runtime.internal.ComposableLambdaImpl$invoke$1	invoke	(Landroidx/compose/runtime/Composer;I)V	ComposableLambda.kt
+0x278	android.view.ViewRootImpl$ViewRootHandler	handleMessage	(Landroid/os/Message;)V	ViewRootImpl.java
+0x378	androidx.compose.foundation.text.TextFieldCursorKt	cursor$lambda$0	(Landroidx/compose/ui/graphics/Brush;Landroidx/compose/foundation/text/LegacyTextFieldState;Landroidx/compose/ui/text/input/TextFieldValue;Landroidx/compose/ui/text/input/OffsetMapping;Landroidx/compose/ui/Modifier;Landroidx/compose/runtime/Composer;I)Landroidx/compose/ui/Modifier;	TextFieldCursor.kt
+0x30	androidx.core.app.CoreComponentFactory	instantiateReceiver	(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Intent;)Landroid/content/BroadcastReceiver;	CoreComponentFactory.java
 *end
-SLOW   Y)‹                           Ø          Ø          Ø          Ø          Ø          Ø          Ø          Ø      ]   ]R      ]   ]R       ]   ]R   $   ]   ]R   (   ]   ]R   ,   ]   ]R   0   ]   ]R   4   ]   ]R   8   ]   ]R   <   ]   ]R   =   ≥  Ò∞b 9   ≥  Ò∞b 5   ≥  Ò∞b 1   ≥  Ò∞b -   ≥  Ò∞b )   ≥  Ò∞b %   ≥  Ò∞b !   ≥  Ò∞b    ≥  Ò∞b    ≥  Ò∞b    Ä  B∂b    Ä  B∂b     Ä  B∂b $   Ä  B∂b @   Ä  B∂b D   Ä  B∂b H   Ä  B∂b L   Ä  B∂b P   Ä  B∂b T   Ä  B∂b X   Ä  B∂b \   Ä  B∂b `   Ä  B∂b d   Ä  B∂b h   Ä  B∂b l   Ä  B∂b p   Ä  B∂b t   Ä  B∂b x   Ä  B∂b |   Ä  B∂b Ä   Ä  B∂b Å   	  ~ºb }   	  ~ºb y   	  ~ºb u   	  ~ºb q   	  ~ºb m   	  ~ºb i   	  ~ºb e   	  ~ºb Ñ   	  ~ºb à   	  ~ºb â   x  ©√b Ö   x  ©√b a   x  ©√b ]   x  ©√b Y   x  ©√b U   x  ©√b Q   x  ©√b M   x  ©√b I   x  ©√b E   x  ©√b A   x  ©√b %   x  ©√b å   x  ©√b ê   x  ©√b î   x  ©√b ò   x  ©√b ú   x  ©√b †   x  ©√b §   x  ©√b ®   x  ©√b ¨   x  ©√b ∞   x  ©√b ¥   x  ©√b ∏   x  ©√b π     vÀb µ     vÀb ±     vÀb ≠     vÀb ©     vÀb º     vÀb ¿     vÀb ƒ     vÀb »     vÀb Ã     vÀb –     vÀb —     Ó”b Õ     Ó”b …     Ó”b ≈     Ó”b ¡     Ó”b Ω     Ó”b •     Ó”b ‘     Ó”b ÿ     Ó”b ‹     Ó”b ‡     Ó”b ‰     Ó”b Ë     Ó”b È   π  Ï·b Â   π  Ï·b ·   π  Ï·b ›   π  Ï·b Ÿ   π  Ï·b ’   π  Ï·b °   π  Ï·b ù   π  Ï·b ô   π  Ï·b ï   π  Ï·b ë   π  Ï·b Ï   π  Ï·b    π  Ï·b Ù   π  Ï·b ¯   π  Ï·b ¸   π  Ï·b    π  Ï·b   π  Ï·b   π  Ï·b   π  Ï·b   π  Ï·b   π  Ï·b   π  Ï·b   π  Ï·b    π  Ï·b $  π  Ï·b (  π  Ï·b ,  π  Ï·b 0  π  Ï·b 4  π  Ï·b 8  π  Ï·b <  π  Ï·b @  π  Ï·b D  π  Ï·b H  π  Ï·b L  π  Ï·b P  π  Ï·b T  π  Ï·b U  ô<  e(c Q  ô<  e(c M  ô<  e(c X  ô<  e(c \  ô<  e(c `  ô<  e(c d  ô<  e(c d  ô<  e(c d  ô<  e(c d  ô<  e(c d  ô<  e(c h  ô<  e(c l  ô<  e(c p  ô<  e(c t  ô<  e(c x  ô<  e(c |  ô<  e(c Ä  ô<  e(c Ñ  ô<  e(c à  ô<  e(c å  ô<  e(c ç  CB  ò7c â  CB  ò7c Ö  CB  ò7c Å  CB  ò7c }  CB  ò7c y  CB  ò7c u  CB  ò7c q  CB  ò7c m  CB  ò7c i  CB  ò7c e  CB  ò7c e  CB  ò7c e  CB  ò7c e  CB  ò7c e  CB  ò7c a  CB  ò7c ]  CB  ò7c ê  CB  ò7c î  CB  ò7c ò  CB  ò7c ú  CB  ò7c †  CB  ò7c §  CB  ò7c ®  CB  ò7c ©  FF  A>c •  FF  A>c °  FF  A>c ù  FF  A>c ô  FF  A>c ï  FF  A>c ë  FF  A>c ¨  FF  A>c ∞  FF  A>c 4  FF  A>c 8  FF  A>c ¥  FF  A>c ∏  FF  A>c º  FF  A>c ¿  FF  A>c ƒ  FF  A>c »  FF  A>c Ã  FF  A>c –  FF  A>c ‘  FF  A>c ÿ  FF  A>c ∞  FF  A>c 4  FF  A>c 8  FF  A>c ¥  FF  A>c ∏  FF  A>c º  FF  A>c ‹  FF  A>c ‡  FF  A>c ‰  FF  A>c Ë  FF  A>c Ï  FF  A>c   FF  A>c Ù  FF  A>c ¯  FF  A>c ¸  FF  A>c    FF  A>c   FF  A>c   _G  %Cc   _G  %Cc ˝  _G  %Cc ˘  _G  %Cc ı  _G  %Cc Ò  _G  %Cc Ì  _G  %Cc   _G  %Cc º  _G  %Cc   _G  %Cc   _G  %Cc   _G  %Cc   _G  %Cc î  _G  %Cc ò  _G  %Cc   _G  %Cc    _G  %Cc $  _G  %Cc %  L  ≥Hc !  L  ≥Hc   L  ≥Hc ô  L  ≥Hc ï  L  ≥Hc   L  ≥Hc   L  ≥Hc   L  ≥Hc   L  ≥Hc Ω  L  ≥Hc 	  L  ≥Hc È  L  ≥Hc Â  L  ≥Hc ·  L  ≥Hc ›  L  ≥Hc Ω  L  ≥Hc π  L  ≥Hc µ  L  ≥Hc 9  L  ≥Hc 5  L  ≥Hc ±  L  ≥Hc Ÿ  L  ≥Hc ’  L  ≥Hc —  L  ≥Hc Õ  L  ≥Hc …  L  ≥Hc ≈  L  ≥Hc ¡  L  ≥Hc Ω  L  ≥Hc π  L  ≥Hc µ  L  ≥Hc 9  L  ≥Hc 5  L  ≥Hc ±  L  ≥Hc ≠  L  ≥Hc Y  L  ≥Hc I  L  ≥Hc E  L  ≥Hc A  L  ≥Hc =  L  ≥Hc 9  L  ≥Hc 5  L  ≥Hc 1  L  ≥Hc -  L  ≥Hc )  L  ≥Hc %  L  ≥Hc !  L  ≥Hc   L  ≥Hc (  L  ≥Hc ,  L  ≥Hc 0  L  ≥Hc 4  L  ≥Hc 8  L  ≥Hc <  L  ≥Hc @  L  ≥Hc D  L  ≥Hc H  L  ≥Hc L  L  ≥Hc P  L  ≥Hc Q  Q  Pc M  Q  Pc I  Q  Pc E  Q  Pc A  Q  Pc =  Q  Pc 9  Q  Pc 5  Q  Pc 1  Q  Pc -  Q  Pc )  Q  Pc   Q  Pc   Q  Pc   Q  Pc   Q  Pc 	  Q  Pc   Q  Pc   Q  Pc T  Q  Pc X  Q  Pc \  Q  Pc `  Q  Pc d  Q  Pc h  Q  Pc l  Q  Pc p  Q  Pc t  Q  Pc x  Q  Pc |  Q  Pc t  Q  Pc x  Q  Pc |  Q  Pc t  Q  Pc x  Q  Pc |  Q  Pc t  Q  Pc x  Q  Pc |  Q  Pc t  Q  Pc Ä  Q  Pc Ñ  Q  Pc à  Q  Pc å  Q  Pc ê  Q  Pc î  Q  Pc ò  Q  Pc ú  Q  Pc †  Q  Pc §  Q  Pc ®  Q  Pc ¨  Q  Pc ∞  Q  Pc ¥  Q  Pc ∏  Q  Pc º  Q  Pc ∏  Q  Pc ¿  Q  Pc ∏  Q  Pc ƒ  Q  Pc »  Q  Pc ∏  Q  Pc Ã  Q  Pc –  Q  Pc ‘  Q  Pc ÿ  Q  Pc ®  Q  Pc ¨  Q  Pc ∞  Q  Pc ¥  Q  Pc –  Q  Pc ‹  Q  Pc ‡  Q  Pc ‰  Q  Pc Ë  Q  Pc Ï  Q  Pc   Q  Pc Ù  Q  Pc ı  ÕV  [c Ò  ÕV  [c Ì  ÕV  [c È  ÕV  [c Â  ÕV  [c ·  ÕV  [c ›  ÕV  [c —  ÕV  [c µ  ÕV  [c ±  ÕV  [c ≠  ÕV  [c ©  ÕV  [c Ÿ  ÕV  [c ’  ÕV  [c —  ÕV  [c Õ  ÕV  [c π  ÕV  [c …  ÕV  [c ≈  ÕV  [c π  ÕV  [c ¡  ÕV  [c π  ÕV  [c Ω  ÕV  [c π  ÕV  [c µ  ÕV  [c ±  ÕV  [c ≠  ÕV  [c ©  ÕV  [c •  ÕV  [c °  ÕV  [c ù  ÕV  [c ô  ÕV  [c ï  ÕV  [c ë  ÕV  [c ç  ÕV  [c â  ÕV  [c ¯  ÕV  [c ¸  ÕV  [c    ÕV  [c   ÕV  [c   ÕV  [c   ÕV  [c   ÕV  [c   ÕV  [c   ÕV  [c   ÕV  [c    ÕV  [c $  ÕV  [c ¨  ÕV  [c (  ÕV  [c ,  ÕV  [c 0  ÕV  [c 4  ÕV  [c 8  ÕV  [c <  ÕV  [c 4  ÕV  [c @  ÕV  [c D  ÕV  [c E  #W  äπc A  #W  äπc 5  #W  äπc =  #W  äπc 9  #W  äπc 5  #W  äπc 1  #W  äπc -  #W  äπc )  #W  äπc ≠  #W  äπc %  #W  äπc !  #W  äπc   #W  äπc   #W  äπc   #W  äπc   #W  äπc   #W  äπc 	  #W  äπc   #W  äπc   #W  äπc ˝  #W  äπc ˘  #W  äπc Ö  #W  äπc Å  #W  äπc u  #W  äπc }  #W  äπc y  #W  äπc u  #W  äπc }  #W  äπc y  #W  äπc u  #W  äπc }  #W  äπc y  #W  äπc u  #W  äπc }  #W  äπc y  #W  äπc u  #W  äπc q  #W  äπc m  #W  äπc H  #W  äπc L  #W  äπc M  H_  †d I  H_  †d i  H_  †d e  H_  †d a  H_  †d ]  H_  †d Y  H_  †d U  H_  †d ˝   H_  †d ˘   H_  †d ı   H_  †d Ò   H_  †d Ì   H_  †d ç   H_  †d $   H_  †d @   H_  †d D   H_  †d H   H_  †d L   H_  †d P   H_  †d T   H_  †d X   H_  †d \   H_  †d `   H_  †d d   H_  †d P  H_  †d T  H_  †d X  H_  †d \  H_  †d `  H_  †d d  H_  †d e  -a  '1d a  -a  '1d ]  -a  '1d Y  -a  '1d U  -a  '1d Q  -a  '1d e   -a  '1d a   -a  '1d ]   -a  '1d Y   -a  '1d U   -a  '1d Q   -a  '1d M   -a  '1d I   -a  '1d E   -a  '1d A   -a  '1d %   -a  '1d h  -a  '1d l  -a  '1d p  -a  '1d t  -a  '1d x  -a  '1d |  -a  '1d Ä  -a  '1d Ñ  -a  '1d à  -a  '1d å  -a  '1d ê  -a  '1d î  -a  '1d ò  -a  '1d ú  -a  '1d ù  ;a  ’6d ô  ;a  ’6d ï  ;a  ’6d †  ;a  ’6d §  ;a  ’6d •  πa  *<d °  πa  *<d ®  πa  *<d ¨  πa  *<d ≠  Êc  ZKd ©  Êc  ZKd ë  Êc  ZKd ç  Êc  ZKd â  Êc  ZKd Ö  Êc  ZKd Å  Êc  ZKd }  Êc  ZKd y  Êc  ZKd u  Êc  ZKd q  Êc  ZKd m  Êc  ZKd i  Êc  ZKd !   Êc  ZKd    Êc  ZKd    zf  VWd    zf  VWd    zf  VWd    ís  Ø£d    ís  Ø£d ∞  ís  Ø£d ¥  ís  Ø£d ∏  ís  Ø£d º  ís  Ø£d ¿  ís  Ø£d ƒ  ís  Ø£d ≈  Ét  ÿ®d ¡  Ét  ÿ®d Ω  Ét  ÿ®d π  Ét  ÿ®d µ  Ét  ÿ®d ±  Ét  ÿ®d    Ét  ÿ®d    Ét  ÿ®d »      º   Ã      º   –      º   ‘      º   ÿ      º   ‹      º   ‡      º   »      ø   Ã      ø   ‰      ø   Ë      ø   Ï      ø   ‹      ø   ‡      ø   ·  B   ¿$   ›  B   ¿$   Ì  B   ¿$   È  B   ¿$     B   ¿$   Ù  B   ¿$   4   B   ¿$   8   B   ¿$   <   B   ¿$   =   ô   çÀò  9   ô   çÀò  5   ô   çÀò  ı  ô   çÀò  Ò  ô   çÀò  Ë  ô   çÀò  Ï  ô   çÀò  ‹  ô   çÀò  ‡  ô   çÀò  »      √   Ã      √   ¯      √   Ï      √   ‹      √   ‡      √   »      ∆   Ã      ∆   ¸      ∆          ∆     ^  Â6d   ^  Â6d   ^  Â6d   ^  Â6d   ¨^  5<d   ¨^  5<d 	  ¨^  5<d   ¨^  5<d       Ã          Ã          Ã          Ã          Ã  
+SLOW   ƒı                           &(          &(          &(          &(          &(          &(          &(          &(      ‡   œP      ‡   œP       ‡   œP   $   ‡   œP   (   ‡   œP   ,   ‡   œP   0   ‡   œP   4   ‡   œP   8   ‡   œP   9   [  ?V   5   [  ?V   1   [  ?V   <   [  ?V   @   [  ?V   D   [  ?V   H   [  ?V   I   °  µπb E   °  µπb A   °  µπb =   °  µπb -   °  µπb )   °  µπb %   °  µπb !   °  µπb    °  µπb    °  µπb    F  C b    F  C b     F  C b L   F  C b P   F  C b T   F  C b X   F  C b \   F  C b `   F  C b d   F  C b h   F  C b l   F  C b p   F  C b t   F  C b x   F  C b |   F  C b Ä   F  C b Ñ   F  C b à   F  C b å   F  C b ê   F  C b î   F  C b ò   F  C b ú   F  C b †   F  C b §   F  C b ®   F  C b ¨   F  C b ∞   F  C b `   F  C b ¥   F  C b ∏   F  C b º   F  C b ¿   F  C b ƒ   F  C b »   F  C b Ã   F  C b Õ   "  l“b …   "  l“b ≈   "  l“b ¡   "  l“b Ω   "  l“b π   "  l“b µ   "  l“b a   "  l“b ±   "  l“b ≠   "  l“b ©   "  l“b •   "  l“b °   "  l“b ù   "  l“b ô   "  l“b ï   "  l“b ë   "  l“b ç   "  l“b â   "  l“b Ö   "  l“b Å   "  l“b }   "  l“b y   "  l“b u   "  l“b q   "  l“b m   "  l“b i   "  l“b e   "  l“b a   "  l“b ]   "  l“b Y   "  l“b U   "  l“b Q   "  l“b M   "  l“b !   "  l“b    "  l“b    Ñ  jc    Ñ  jc    Ñ  jc –   Ñ  jc —   Û  ò c    Û  ò c    Û  ò c     Û  ò c L   Û  ò c ‘   Û  ò c ÿ   Û  ò c ‹   Û  ò c ‡   Û  ò c ‰   Û  ò c Ë   Û  ò c Ï   Û  ò c    Û  ò c Ù   Û  ò c ¯   Û  ò c ¸   Û  ò c    Û  ò c   Û  ò c   Û  ò c   Û  ò c   Û  ò c   Û  ò c   Û  ò c   Û  ò c    Û  ò c $  Û  ò c (  Û  ò c ,  Û  ò c 0  Û  ò c 4  Û  ò c 8  Û  ò c <  Û  ò c @  Û  ò c A  &  œ5c =  &  œ5c 9  &  œ5c 5  &  œ5c 1  &  œ5c -  &  œ5c )  &  œ5c %  &  œ5c !  &  œ5c   &  œ5c   &  œ5c   &  œ5c   &  œ5c   &  œ5c 	  &  œ5c   &  œ5c D  &  œ5c H  &  œ5c L  &  œ5c P  &  œ5c T  &  œ5c X  &  œ5c \  &  œ5c `  &  œ5c d  &  œ5c h  &  œ5c l  &  œ5c p  &  œ5c t  &  œ5c x  &  œ5c |  &  œ5c Ä  &  œ5c Ñ  &  œ5c à  &  œ5c å  &  œ5c ê  &  œ5c î  &  œ5c ò  &  œ5c ú  &  œ5c †  &  œ5c §  &  œ5c ®  &  œ5c ®  &  œ5c ®  &  œ5c ®  &  œ5c ¨  &  œ5c ∞  &  œ5c ¥  &  œ5c ∏  &  œ5c º  &  œ5c ¿  &  œ5c ƒ  &  œ5c »  &  œ5c Ã  &  œ5c –  &  œ5c —  4   Ø>c Õ  4   Ø>c …  4   Ø>c ≈  4   Ø>c ¡  4   Ø>c Ω  4   Ø>c π  4   Ø>c µ  4   Ø>c ±  4   Ø>c ≠  4   Ø>c ©  4   Ø>c ©  4   Ø>c ©  4   Ø>c ©  4   Ø>c •  4   Ø>c °  4   Ø>c ù  4   Ø>c ô  4   Ø>c ï  4   Ø>c ë  4   Ø>c ç  4   Ø>c â  4   Ø>c Ö  4   Ø>c Å  4   Ø>c }  4   Ø>c y  4   Ø>c u  4   Ø>c q  4   Ø>c m  4   Ø>c i  4   Ø>c e  4   Ø>c a  4   Ø>c ]  4   Ø>c Y  4   Ø>c U  4   Ø>c Q  4   Ø>c M  4   Ø>c I  4   Ø>c E  4   Ø>c   4   Ø>c ˝   4   Ø>c ˘   4   Ø>c ı   4   Ø>c Ò   4   Ø>c Ì   4   Ø>c È   4   Ø>c ‘  4   Ø>c ÿ  4   Ø>c ‹  4   Ø>c ‡  4   Ø>c ‰  4   Ø>c Ë  4   Ø>c Ï  4   Ø>c   4   Ø>c Ù  4   Ø>c ¯  4   Ø>c ¸  4   Ø>c Ù  4   Ø>c ¯  4   Ø>c ¸  4   Ø>c Ù  4   Ø>c ¯  4   Ø>c ¸  4   Ø>c Ù  4   Ø>c ¯  4   Ø>c ¸  4   Ø>c Ù  4   Ø>c    4   Ø>c   4   Ø>c   4   Ø>c   4   Ø>c   4   Ø>c   4   Ø>c   4   Ø>c   4   Ø>c    4   Ø>c $  4   Ø>c (  4   Ø>c ,  4   Ø>c 0  4   Ø>c 4  4   Ø>c 8  4   Ø>c <  4   Ø>c 8  4   Ø>c @  4   Ø>c 8  4   Ø>c D  4   Ø>c H  4   Ø>c 8  4   Ø>c L  4   Ø>c P  4   Ø>c T  4   Ø>c X  4   Ø>c Y  O#  $Fc U  O#  $Fc Q  O#  $Fc M  O#  $Fc 9  O#  $Fc I  O#  $Fc E  O#  $Fc 9  O#  $Fc A  O#  $Fc 9  O#  $Fc =  O#  $Fc 9  O#  $Fc 5  O#  $Fc 1  O#  $Fc -  O#  $Fc )  O#  $Fc %  O#  $Fc !  O#  $Fc   O#  $Fc   O#  $Fc   O#  $Fc   O#  $Fc   O#  $Fc 	  O#  $Fc \  O#  $Fc `  O#  $Fc l   O#  $Fc p   O#  $Fc t   O#  $Fc x   O#  $Fc |   O#  $Fc Ä   O#  $Fc Ñ   O#  $Fc à   O#  $Fc â   ß%  &Oc Ö   ß%  &Oc Å   ß%  &Oc }   ß%  &Oc y   ß%  &Oc u   ß%  &Oc q   ß%  &Oc m   ß%  &Oc a  ß%  &Oc ]  ß%  &Oc   ß%  &Oc   ß%  &Oc ı  ß%  &Oc ˝  ß%  &Oc ˘  ß%  &Oc ı  ß%  &Oc ˝  ß%  &Oc ˘  ß%  &Oc ı  ß%  &Oc ˝  ß%  &Oc ˘  ß%  &Oc ı  ß%  &Oc ˝  ß%  &Oc ˘  ß%  &Oc ı  ß%  &Oc Ò  ß%  &Oc Ì  ß%  &Oc d  ß%  &Oc h  ß%  &Oc i  ›*  y]c e  ›*  y]c È  ›*  y]c Â  ›*  y]c ·  ›*  y]c ›  ›*  y]c Ÿ  ›*  y]c ’  ›*  y]c Â   ›*  y]c ·   ›*  y]c ›   ›*  y]c Ÿ   ›*  y]c ’   ›*  y]c P   ›*  y]c T   ›*  y]c X   ›*  y]c \   ›*  y]c `   ›*  y]c d   ›*  y]c l  ›*  y]c p  ›*  y]c t  ›*  y]c u  8+  Lmc q  8+  Lmc m  8+  Lmc e   8+  Lmc a   8+  Lmc ]   8+  Lmc Y   8+  Lmc U   8+  Lmc Q   8+  Lmc M   8+  Lmc !   8+  Lmc    8+  Lmc    8+  Lmc    `,  ê£c    `,  ê£c     `,  ê£c x  `,  ê£c |  `,  ê£c Ä  `,  ê£c Ñ  `,  ê£c à  `,  ê£c å  `,  ê£c ê  `,  ê£c î  `,  ê£c ò  `,  ê£c ú  `,  ê£c †  `,  ê£c §  `,  ê£c ®  `,  ê£c ¨  `,  ê£c ∞  `,  ê£c ¥  `,  ê£c ∏  `,  ê£c º  `,  ê£c ¿  `,  ê£c ƒ  `,  ê£c »  `,  ê£c Ã  `,  ê£c –  `,  ê£c §   `,  ê£c ®   `,  ê£c ‘  `,  ê£c ÿ  `,  ê£c ‹  `,  ê£c ¿  `,  ê£c ƒ  `,  ê£c »  `,  ê£c Ã  `,  ê£c –  `,  ê£c —  Ç6  kπc Õ  Ç6  kπc …  Ç6  kπc ≈  Ç6  kπc ¡  Ç6  kπc ›  Ç6  kπc Ÿ  Ç6  kπc ’  Ç6  kπc ©   Ç6  kπc •   Ç6  kπc —  Ç6  kπc Õ  Ç6  kπc …  Ç6  kπc ≈  Ç6  kπc ¡  Ç6  kπc Ω  Ç6  kπc π  Ç6  kπc µ  Ç6  kπc ±  Ç6  kπc ≠  Ç6  kπc ©  Ç6  kπc •  Ç6  kπc °  Ç6  kπc ù  Ç6  kπc ô  Ç6  kπc ï  Ç6  kπc ë  Ç6  kπc ç  Ç6  kπc â  Ç6  kπc Ö  Ç6  kπc Å  Ç6  kπc }  Ç6  kπc y  Ç6  kπc !   Ç6  kπc    Ç6  kπc    Ç6  kπc ‡  Ç6  kπc ‰  Ç6  kπc Ë  Ç6  kπc Ï  Ç6  kπc Ì  a7  @Õc È  a7  @Õc Â  a7  @Õc ·  a7  @Õc    a7  @Õc    a7  @Õc     a7  @Õc L   a7  @Õc ‘   a7  @Õc ÿ   a7  @Õc ‹   a7  @Õc ‡   a7  @Õc ‰   a7  @Õc Ë   a7  @Õc T   a7  @Õc X   a7  @Õc \   a7  @Õc `   a7  @Õc d   a7  @Õc h   a7  @Õc   a7  @Õc Ò  ?8  "ÿc i   ?8  "ÿc e   ?8  "ÿc Ù  ?8  "ÿc ¯  ?8  "ÿc ¸  ?8  "ÿc    ?8  "ÿc   ?8  "ÿc   ?8  "ÿc   ?8  "ÿc   ?8  "ÿc   B=  8ﬁc   B=  8ﬁc 	  B=  8ﬁc   B=  8ﬁc   B=  8ﬁc ˝  B=  8ﬁc ˘  B=  8ﬁc ı  B=  8ﬁc a   B=  8ﬁc ]   B=  8ﬁc Y   B=  8ﬁc U   B=  8ﬁc Ï   B=  8ﬁc    B=  8ﬁc Ù   B=  8ﬁc ¯   B=  8ﬁc ¸   B=  8ﬁc    B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc    B=  8ﬁc $  B=  8ﬁc (  B=  8ﬁc ,  B=  8ﬁc 0  B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc   B=  8ﬁc    B=  8ﬁc    B=  8ﬁc $  B=  8ﬁc (  B=  8ﬁc ,  B=  8ﬁc 0  B=  8ﬁc 4  B=  8ﬁc 8  B=  8ﬁc <  B=  8ﬁc @  B=  8ﬁc D  B=  8ﬁc   B=  8ﬁc   B=  8ﬁc    B=  8ﬁc    B=  8ﬁc $  B=  8ﬁc (  B=  8ﬁc H  B=  8ﬁc L  B=  8ﬁc P  B=  8ﬁc T  B=  8ﬁc X  B=  8ﬁc \  B=  8ﬁc `  B=  8ﬁc `  B=  8ﬁc `  B=  8ﬁc `  B=  8ﬁc `  B=  8ﬁc d  B=  8ﬁc h  B=  8ﬁc l  B=  8ﬁc p  B=  8ﬁc t  B=  8ﬁc x  B=  8ﬁc |  B=  8ﬁc Ä  B=  8ﬁc Ñ  B=  8ﬁc à  B=  8ﬁc å  B=  8ﬁc ê  B=  8ﬁc î  B=  8ﬁc ò  B=  8ﬁc ú  B=  8ﬁc †  B=  8ﬁc §  B=  8ﬁc ®  B=  8ﬁc ¨  B=  8ﬁc ≠  ⁄?  c‰c ©  ⁄?  c‰c •  ⁄?  c‰c °  ⁄?  c‰c ù  ⁄?  c‰c ô  ⁄?  c‰c ï  ⁄?  c‰c ë  ⁄?  c‰c ç  ⁄?  c‰c â  ⁄?  c‰c Ö  ⁄?  c‰c Å  ⁄?  c‰c }  ⁄?  c‰c y  ⁄?  c‰c u  ⁄?  c‰c q  ⁄?  c‰c m  ⁄?  c‰c i  ⁄?  c‰c e  ⁄?  c‰c a  ⁄?  c‰c a  ⁄?  c‰c a  ⁄?  c‰c a  ⁄?  c‰c a  ⁄?  c‰c ]  ⁄?  c‰c Y  ⁄?  c‰c U  ⁄?  c‰c Q  ⁄?  c‰c M  ⁄?  c‰c I  ⁄?  c‰c )  ⁄?  c‰c %  ⁄?  c‰c !  ⁄?  c‰c !  ⁄?  c‰c   ⁄?  c‰c   ⁄?  c‰c E  ⁄?  c‰c A  ⁄?  c‰c =  ⁄?  c‰c 9  ⁄?  c‰c 5  ⁄?  c‰c 1  ⁄?  c‰c -  ⁄?  c‰c )  ⁄?  c‰c %  ⁄?  c‰c !  ⁄?  c‰c !  ⁄?  c‰c   ⁄?  c‰c   ⁄?  c‰c ∞  ⁄?  c‰c ¥  ⁄?  c‰c µ  B  ÿÍc ±  B  ÿÍc   B  ÿÍc   B  ÿÍc 1  B  ÿÍc -  B  ÿÍc )  B  ÿÍc %  B  ÿÍc !  B  ÿÍc   B  ÿÍc   B  ÿÍc   B  ÿÍc   B  ÿÍc   B  ÿÍc 	  B  ÿÍc   B  ÿÍc D  B  ÿÍc H  B  ÿÍc L  B  ÿÍc P  B  ÿÍc T  B  ÿÍc X  B  ÿÍc \  B  ÿÍc `  B  ÿÍc d  B  ÿÍc h  B  ÿÍc l  B  ÿÍc p  B  ÿÍc t  B  ÿÍc x  B  ÿÍc |  B  ÿÍc Ä  B  ÿÍc Ñ  B  ÿÍc à  B  ÿÍc å  B  ÿÍc ê  B  ÿÍc î  B  ÿÍc ò  B  ÿÍc ú  B  ÿÍc †  B  ÿÍc §  B  ÿÍc ®  B  ÿÍc ®  B  ÿÍc ®  B  ÿÍc ®  B  ÿÍc ¨  B  ÿÍc ∞  B  ÿÍc ¥  B  ÿÍc ∏  B  ÿÍc º  B  ÿÍc ¿  B  ÿÍc ƒ  B  ÿÍc »  B  ÿÍc Ã  B  ÿÍc –  B  ÿÍc —  F  uc Õ  F  uc …  F  uc ≈  F  uc ¡  F  uc Ω  F  uc π  F  uc µ  F  uc ±  F  uc ≠  F  uc ©  F  uc ©  F  uc ©  F  uc ©  F  uc •  F  uc °  F  uc ù  F  uc ô  F  uc ï  F  uc ë  F  uc ç  F  uc â  F  uc Ö  F  uc Å  F  uc }  F  uc y  F  uc u  F  uc q  F  uc m  F  uc i  F  uc e  F  uc a  F  uc ]  F  uc Y  F  uc U  F  uc Q  F  uc M  F  uc I  F  uc E  F  uc   F  uc ˝   F  uc ˘   F  uc ı   F  uc Ò   F  uc Ì   F  uc È   F  uc ‘  F  uc ÿ  F  uc ‹  F  uc ‡  F  uc ‰  F  uc Ë  F  uc Ï  F  uc   F  uc Ù  F  uc ¯  F  uc ¸  F  uc Ù  F  uc ¯  F  uc ¸  F  uc Ù  F  uc ¯  F  uc ¸  F  uc Ù  F  uc ¯  F  uc ¸  F  uc Ù  F  uc    F  uc   F  uc   F  uc   F  uc   F  uc   F  uc   F  uc   F  uc    F  uc $  F  uc (  F  uc ,  F  uc ∏  F  uc º  F  uc Ω  ªI  v˜c π  ªI  v˜c -  ªI  v˜c )  ªI  v˜c %  ªI  v˜c !  ªI  v˜c   ªI  v˜c   ªI  v˜c   ªI  v˜c   ªI  v˜c   ªI  v˜c 	  ªI  v˜c   ªI  v˜c   ªI  v˜c ı  ªI  v˜c ˝  ªI  v˜c ˘  ªI  v˜c ı  ªI  v˜c ˝  ªI  v˜c ˘  ªI  v˜c ı  ªI  v˜c ˝  ªI  v˜c ˘  ªI  v˜c ı  ªI  v˜c ˝  ªI  v˜c ˘  ªI  v˜c ı  ªI  v˜c Ò  ªI  v˜c Ì  ªI  v˜c È  ªI  v˜c Â  ªI  v˜c ·  ªI  v˜c ›  ªI  v˜c Ÿ  ªI  v˜c ’  ªI  v˜c Â   ªI  v˜c ·   ªI  v˜c ›   ªI  v˜c Ÿ   ªI  v˜c ’   ªI  v˜c M   ªI  v˜c !   ªI  v˜c    ªI  v˜c    ªI  v˜c ¿      0(   ƒ      0(   »      0(   Ã      0(   –      0(   —  !   µ0   ¿      2(   ƒ      2(   ‘      2(   ÿ      2(   ‹      2(   ‡      2(   ‰      2(   ¿      8(   ƒ      8(   Ë      8(   Ï      8(         8(   Ù      8(   ¯      8(   ˘  ∆   ∫0   ı  ∆   ∫0   Ò  ∆   ∫0   Ì  ∆   ∫0   ¸  ∆   ∫0   ‡  ∆   ∫0   ‰  ∆   ∫0   ¿      :(   ƒ      :(          :(         :(         :(   @       :(   D       :(         :(        ª0   H      ª0   I   j    «ò  E   j    «ò  A   j    «ò  	  j    «ò    j    «ò    j    «ò  ¸  j    «ò  ‡  j    «ò  ‰  j    «ò        @(          @(          @(          @(          @(  

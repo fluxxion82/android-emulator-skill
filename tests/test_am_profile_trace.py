@@ -50,6 +50,7 @@ enters at the first sample.
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from itertools import pairwise
@@ -335,23 +336,68 @@ def test_the_stack_main_already_had_is_replayed_at_the_first_sample(trace, main_
 
 
 # --- the recorder's privacy check on this binary file ------------------------
+#
+# The package aliaser never sees this file, so `_check_hang_trace` is the only
+# thing between a capture and a public repository. Each case below renames ONE
+# name in the committed trace to something outside the allowlists and requires
+# the check to refuse it, naming what it found. The first three are the
+# bypasses an independent review demonstrated against the earlier, looser
+# check: a `com.example.` class that is not the fixture app's, a private type
+# that appears only in a method signature, and a private thread name.
 
 
-def test_the_recorder_refuses_a_trace_that_names_code_outside_the_allowlist(recorded):
-    """The package aliaser never sees this file, so `_check_hang_trace` is its guard.
+def _header(data: bytes) -> tuple[list[list[str]], list[str]]:
+    """(method lines split on tabs, thread names) from a trace's text header."""
+    lines = data[: data.index(END_MARKER)].decode("utf-8").splitlines()
+    methods = [line.split("\t") for line in lines[lines.index("*methods") + 1 :]]
+    threads = [
+        line.partition("\t")[2]
+        for line in lines[lines.index("*threads") + 1 : lines.index("*methods")]
+    ]
+    return methods, threads
 
-    Two real captures were refused by it while this fixture was being made
-    (kotlinx.coroutines, then libcore's DDM server) before those public
-    prefixes were listed. Here a class in the committed trace is renamed to one
-    outside every listed prefix, and the check has to refuse it.
-    """
+
+def _rename(data: bytes, case: str) -> tuple[bytes, str]:
+    """The committed trace with one name made private, and that name."""
+    methods, threads = _header(data)
+    if case == "a com.example class that is not the fixture app's":
+        cls = next(m[1] for m in methods if m[1].startswith("android."))
+        name = f"com.example.secret.{cls.rsplit('.', 1)[1]}"
+        old, new = f"\t{cls}\t", f"\t{name}\t"
+    elif case == "a private type only in a signature":
+        descriptor = next(m[3] for m in methods if "Landroid/" in m[3])
+        typ = descriptor[
+            descriptor.index("Landroid/") : descriptor.index(";", descriptor.index("Landroid/")) + 1
+        ]
+        name = "com.example.secret.Token"
+        old, new = typ, "Lcom/example/secret/Token;"
+    elif case == "a private thread name":
+        thread = next(t for t in threads if t != "main")
+        name = "SecretSyncWorker"
+        old, new = f"\t{thread}\n", f"\t{name}\n"
+    else:  # a class in nobody's public namespace
+        cls = next(m[1] for m in methods if m[1].startswith("android."))
+        name = f"io.private.app.{cls.rsplit('.', 1)[1]}"
+        old, new = f"\t{cls}\t", f"\t{name}\t"
+    assert old.encode() in data, f"{case}: nothing to rename"
+    return data.replace(old.encode(), new.encode()), name
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "a com.example class that is not the fixture app's",
+        "a private type only in a signature",
+        "a private thread name",
+        "a class in nobody's public namespace",
+    ],
+)
+def test_the_recorder_refuses_a_trace_naming_anything_outside_its_allowlists(recorded, case):
     import record_fixtures
 
     data = recorded.data(TRACE)
-    record_fixtures._check_hang_trace(data)  # the committed trace is acceptable
+    record_fixtures._check_hang_trace(data)  # the committed trace itself is acceptable
 
-    public = b"\tandroid.os.Looper\t"
-    assert public in data, "the trace no longer names Looper; pick another class"
-    tampered = data.replace(public, b"\tio.private.app.Looper\t")
-    with pytest.raises(record_fixtures.CaptureError, match=r"io\.private\.app\.Looper"):
+    tampered, name = _rename(data, case)
+    with pytest.raises(record_fixtures.CaptureError, match=re.escape(name)):
         record_fixtures._check_hang_trace(tampered)

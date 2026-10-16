@@ -493,25 +493,48 @@ def test_delete_runs_the_command_that_was_recorded(monkeypatch, recorded):
     assert f"AVD '{RECORDED_AVD}' deleted." in recorded.text("avdmanager_delete")
 
 
-def test_deleting_an_avd_that_does_not_exist_reports_avdmanagers_reason(monkeypatch, recorded):
-    """Exit 1 with the reason on stderr, stdout empty -- and a stray `null` line.
-
-    avdmanager prints its error and then the message of an exception that has
-    none, so the second line of stderr is the bare word `null`. delete() passes
-    stderr through verbatim; this pins what it says today, `null` included.
-    """
+def _delete_missing(monkeypatch, recorded) -> tuple[str, bool, str]:
+    """emulator_create.delete() of the recorded missing name: (name, success, message)."""
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
     calls: list[dict] = []
     monkeypatch.setattr(emulator_create.subprocess, "run", _recorded_sdk(recorded, calls))
-
     missing = _manifest_entry(recorded, "avdmanager_delete_missing")["argv"][-1]
     success, message = creator.delete(missing)
+    return missing, success, message
+
+
+def test_deleting_an_avd_that_does_not_exist_reports_avdmanagers_reason(monkeypatch, recorded):
+    """Exit 1, stdout empty, and avdmanager's reason on stderr -- which reaches the caller.
+
+    What the recording says about the TOOL: the reason is followed by a second
+    stderr line reading just `null`. Whether delete() should pass that line on
+    is not asserted here -- it should not, and that is pinned separately as N13.
+    """
+    entry = _manifest_entry(recorded, "avdmanager_delete_missing")
+    assert entry["exit_status"] == 1
+    assert entry["stdout_bytes"] == 0
+    assert (
+        recorded.lines("avdmanager_delete_missing")[-1] == "null"
+    ), "avdmanager stopped printing it"
+
+    missing, success, message = _delete_missing(monkeypatch, recorded)
 
     assert success is False
     assert f"There is no Android Virtual Device named '{missing}'." in message, message
-    assert message.rstrip().endswith("null"), message
-    assert _manifest_entry(recorded, "avdmanager_delete_missing")["stdout_bytes"] == 0
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "N13: avdmanager's trailing null line is passed through at "
+        "emulator_create.py:586 / emulator_delete.py:221"
+    ),
+)
+def test_a_failed_delete_does_not_hand_on_avdmanagers_stray_null_line(monkeypatch, recorded):
+    """The desired behaviour: the reason, without a line that says nothing."""
+    _missing, _success, message = _delete_missing(monkeypatch, recorded)
+    assert "null" not in [line.strip() for line in message.splitlines()], message
 
 
 def test_a_listing_timeout_degrades_to_an_empty_list(monkeypatch):

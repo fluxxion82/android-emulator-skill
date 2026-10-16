@@ -42,11 +42,13 @@ def test_parse_config_ini_basic(recorded):
 
 
 def test_the_recorded_config_has_no_display_name_and_a_placeholder_id(recorded):
-    """What `_build_candidate` gets for an AVD that emulator_create made.
+    """Facts about this recording, not a verdict on what the selector should do.
 
-    `display_name` comes from `avd.ini.displayname`, which avdmanager does not
-    write, so it is empty for every CLI-created AVD; and the id keys a reader
-    might reach for instead hold `<build>`, not the AVD's name.
+    `_build_candidate` reads `display_name` from `avd.ini.displayname`, which
+    this avdmanager-created config does not have (the Studio-made AVD on the
+    recording host does); and the id keys a reader might reach for instead hold
+    `<build>`, not the AVD's name. What display_name SHOULD be for such an AVD
+    is undecided, so nothing here asserts the empty string is right.
     """
     config = emulator_selector.parse_config_ini(recorded.text("avd_config_ini"))
     assert "avd.ini.displayname" not in config
