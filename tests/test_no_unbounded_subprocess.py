@@ -132,6 +132,96 @@ def test_no_unbounded_subprocess_calls(path: Path):
     )
 
 
+def _arms_a_watchdog_timer(tree: ast.Module) -> bool:
+    """A ``threading.Timer`` (or bare ``Timer``) is constructed somewhere."""
+    return any(
+        isinstance(node, ast.Call)
+        and (
+            getattr(node.func, "attr", None) == "Timer" or getattr(node.func, "id", None) == "Timer"
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _positive_constants(tree: ast.Module) -> dict[str, float]:
+    """Module-level ``NAME = <positive int or float literal>`` bindings."""
+    constants: dict[str, float] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and type(node.value.value) in (int, float)
+            and node.value.value > 0
+        ):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _statically_bounded(node: ast.expr | None, constants: dict[str, float]) -> bool:
+    """A select timeout with a positive upper bound readable off the source.
+
+    A positive numeric literal; a module constant bound to one; or ``min(...)``
+    with such a bound among its arguments -- ``min(remaining, POLL)`` is at most
+    POLL. ``None``, a missing argument, or any other expression is not.
+    """
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant):
+        return type(node.value) in (int, float) and node.value > 0
+    if isinstance(node, ast.Name):
+        return node.id in constants
+    if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "min":
+        return any(_statically_bounded(arg, constants) for arg in node.args)
+    return False
+
+
+def _bounds_its_reads(tree: ast.Module) -> bool:
+    """Some function selects with a bounded timeout and then reads with ``os.read``.
+
+    Both halves matter, and the first version of this guard checked neither
+    (review of PR #26): ``select(..., 0.25)`` followed by ``stream.readline()``
+    blocks in readline() whenever a line is partial -- and buffers ahead of the
+    fd, which is N16 -- and ``select(..., None)`` blocks forever. The read in
+    the selecting function must be ``os.read``, which returns what the readable
+    fd holds, and no ``readline()`` may appear there at all.
+    """
+    constants = _positive_constants(tree)
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        selects = [
+            call
+            for call in calls
+            if getattr(call.func, "attr", None) == "select"
+            and getattr(getattr(call.func, "value", None), "id", None) == "select"
+        ]
+        if not selects:
+            continue
+        bounded = all(
+            _statically_bounded(
+                (
+                    call.args[3]
+                    if len(call.args) >= 4
+                    else next((k.value for k in call.keywords if k.arg == "timeout"), None)
+                ),
+                constants,
+            )
+            for call in selects
+        )
+        reads_the_fd = any(
+            getattr(call.func, "attr", None) == "read"
+            and getattr(getattr(call.func, "value", None), "id", None) == "os"
+            for call in calls
+        )
+        reads_lines = any(getattr(call.func, "attr", None) == "readline" for call in calls)
+        if bounded and reads_the_fd and not reads_lines:
+            return True
+    return False
+
+
 @pytest.mark.parametrize("module", STREAMING)
 def test_streaming_modules_arm_a_watchdog_timer(module: str):
     """A streaming exemption is only honest if a deadline is actually enforced.
@@ -145,26 +235,82 @@ def test_streaming_modules_arm_a_watchdog_timer(module: str):
     forever on a silent device -- a guard against vacuous guards that was itself
     vacuous, and it blessed a real hang.
 
-    The mechanism that actually works is a watchdog *timer*: an in-loop clock
-    check cannot fire while ``readline()`` is blocked, because the loop body
-    never runs. That is what is asserted here; the behavioural proof that
+    Two mechanisms actually work. A watchdog *timer* (log_monitor): an in-loop
+    clock check cannot fire while ``readline()`` is blocked, because the loop
+    body never runs. Or a read that cannot block: ``select()`` with a timeout
+    bounded in the source, then ``os.read`` of what the fd holds (anr_watcher
+    since PR #26, whose reader had to notice a QUIET stream anyway). See
+    :func:`_bounds_its_reads` for what counts, and the negative controls below
+    for two shapes that once passed and must not. The behavioural proof that
     ``watch()`` returns on a device emitting nothing lives in
     tests/test_review_findings.py.
     """
     tree = ast.parse((SCRIPTS / module).read_text(encoding="utf-8"), filename=module)
 
-    arms_timer = any(
-        isinstance(node, ast.Call)
-        and (
-            getattr(node.func, "attr", None) == "Timer" or getattr(node.func, "id", None) == "Timer"
-        )
-        for node in ast.walk(tree)
+    assert _arms_a_watchdog_timer(tree) or _bounds_its_reads(tree), (
+        f"{module} claims a streaming exemption but arms no watchdog timer and "
+        f"bounds no read. An in-loop duration check cannot fire while a read is "
+        f"blocked, so the stream hangs on a device that logs nothing."
     )
-    assert arms_timer, (
-        f"{module} claims a streaming exemption but arms no watchdog timer. An "
-        f"in-loop duration check cannot fire while readline() is blocked, so "
-        f"without a timer the stream hangs on a device that logs nothing."
+
+
+# Shapes the guard must refuse. Each passed the version of it that only asked
+# whether a select had a fourth argument (both demonstrated in the review of
+# PR #26). Python source, not tool output: the guard reads code.
+_READS_THAT_CAN_STILL_BLOCK = {
+    "readline-after-a-bounded-select": (
+        "import select\n"
+        "def read(stream):\n"
+        "    ready, _, _ = select.select([stream], [], [], 0.25)\n"
+        "    return stream.readline()\n"
+    ),
+    "select-with-no-timeout": (
+        "import os, select\n"
+        "def read(fd):\n"
+        "    ready, _, _ = select.select([fd], [], [], None)\n"
+        "    return os.read(fd, 65536)\n"
+    ),
+    "buffered-read-after-a-bounded-select": (
+        "import select\n"
+        "def read(stream):\n"
+        "    ready, _, _ = select.select([stream], [], [], 0.25)\n"
+        "    return stream.read(65536)\n"
+    ),
+    "os-read-beside-a-readline": (
+        "import os, select\n"
+        "def read(fd, stream):\n"
+        "    ready, _, _ = select.select([fd], [], [], 0.25)\n"
+        "    return os.read(fd, 1) + stream.readline()\n"
+    ),
+    "select-timeout-not-bounded-in-the-source": (
+        "import os, select\n"
+        "def read(fd, timeout):\n"
+        "    ready, _, _ = select.select([fd], [], [], timeout)\n"
+        "    return os.read(fd, 65536)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "source", list(_READS_THAT_CAN_STILL_BLOCK.values()), ids=list(_READS_THAT_CAN_STILL_BLOCK)
+)
+def test_the_watchdog_guard_refuses_a_read_that_can_still_block(source: str):
+    tree = ast.parse(source)
+    assert not _arms_a_watchdog_timer(tree)
+    assert not _bounds_its_reads(tree)
+
+
+def test_the_watchdog_guard_accepts_a_bounded_unbuffered_read():
+    """The positive control: the shape anr_watcher's reader has."""
+    tree = ast.parse(
+        "import os, select, time\n"
+        "POLL = 0.25\n"
+        "def read(fd, deadline):\n"
+        "    remaining = max(0.0, deadline - time.monotonic())\n"
+        "    ready, _, _ = select.select([fd], [], [], min(remaining, POLL))\n"
+        "    return os.read(fd, 65536) if ready else b''\n"
     )
+    assert _bounds_its_reads(tree)
 
 
 # The modules allowed to call subprocess directly, by path under scripts/.

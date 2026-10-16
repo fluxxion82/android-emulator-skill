@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from common.anr_pipeline import (
+    FINGERPRINT_VERSION,
     SessionSummary,
     SummaryBuilder,
     event_from_jsonl,
@@ -85,6 +86,9 @@ class SessionMeta:
     stopped_at: str | None = None
     stopped_at_ms: int | None = None
     extras: dict = field(default_factory=dict)
+    # The fingerprint version the session's events are captured under. A
+    # session recorded before this was kept is v1, the only version there was.
+    fingerprint_version: int = 1
 
     def to_json(self) -> dict:
         return {
@@ -97,6 +101,7 @@ class SessionMeta:
             "stopped_at": self.stopped_at,
             "stopped_at_ms": self.stopped_at_ms,
             "extras": self.extras,
+            "fingerprint_version": self.fingerprint_version,
         }
 
     @classmethod
@@ -111,6 +116,7 @@ class SessionMeta:
             stopped_at=payload.get("stopped_at"),
             stopped_at_ms=payload.get("stopped_at_ms"),
             extras=payload.get("extras", {}),
+            fingerprint_version=payload.get("fingerprint_version", 1),
         )
 
 
@@ -140,6 +146,9 @@ class SessionStore:
             started_at_ms=int(now.timestamp() * 1000),
             args=args,
             status=_STATUS_PENDING,
+            # The worker this session's events come from is spawned from the
+            # same code, so this is the version they are fingerprinted under.
+            fingerprint_version=FINGERPRINT_VERSION,
         )
         self._write_meta(meta)
         return meta
@@ -398,6 +407,10 @@ class SessionStore:
             total_lines=total_lines,
             dropped_below_threshold=dropped_below_threshold,
             extras=extras or {},
+            # The capture's version, not this code's: `--stop` on a session
+            # recorded before a fingerprint change must not stamp its old
+            # fingerprints with the new version (review of PR #26).
+            fingerprint_version=meta.fingerprint_version,
         )
         return builder.build(events, top_n=top_n)
 

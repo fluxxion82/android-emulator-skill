@@ -47,6 +47,32 @@ def test_create_writes_meta_and_events_file(tmp_path):
     assert store.events_path(meta.session_id).exists()
 
 
+def test_a_session_records_the_fingerprint_version_it_is_captured_under(tmp_path):
+    """Provenance survives every later write of meta.json (claim, stop, crash)."""
+    from common.anr_pipeline import FINGERPRINT_VERSION
+
+    store = _store(tmp_path)
+    meta = store.create({})
+    store.claim_worker(meta.session_id, pid=1)
+    store.stop(meta.session_id, store.build_summary(meta.session_id))
+
+    assert store.load_meta(meta.session_id).fingerprint_version == FINGERPRINT_VERSION
+    assert store.load_summary(meta.session_id).fingerprint_version == FINGERPRINT_VERSION
+
+
+def test_a_session_without_a_recorded_version_is_version_one(tmp_path):
+    """Sessions written before provenance was kept: v1 was the only version."""
+    store = _store(tmp_path)
+    meta = store.create({})
+    path = store._meta_path(meta.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["fingerprint_version"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert store.load_meta(meta.session_id).fingerprint_version == 1
+    assert store.build_summary(meta.session_id).fingerprint_version == 1
+
+
 def test_meta_atomic_write_is_valid_json(tmp_path):
     store = _store(tmp_path)
     meta = store.create({})

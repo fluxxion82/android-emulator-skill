@@ -1,0 +1,65 @@
+10-16 15:45:15.202   598  2007 I ActivityManager: Broadcasting: Intent { act=com.example.composefixture.PROVOKE_ANR flg=0x400000 cmp=com.example.composefixture/.AnrReceiver }
+10-16 15:45:15.203   598  2007 I ActivityManager: Enqueued broadcast Intent { act=com.example.composefixture.PROVOKE_ANR flg=0x400000 cmp=com.example.composefixture/.AnrReceiver }: 0
+10-16 15:45:22.265   598   721 I WindowManager: ANR in Window{681f38 u0 com.example.composefixture/com.example.composefixture.DefaultActivity}. Reason:Input dispatching timed out (681f38 com.example.composefixture/com.example.composefixture.DefaultActivity (server) is not responding. Waited 5006ms for KeyEvent).
+10-16 15:45:22.267   598 15400 D ActivityManager: created ANR temporary file:/data/anr/temp_anr_2038848239887238157.txt
+10-16 15:45:22.267   598 15400 I ActivityManager: Collecting stacks for pid 15357 into temporary file temp_anr_2038848239887238157.txt
+10-16 15:45:22.269   598 15401 I ActivityManager: dumpStackTraces pids={984=true, 1043=true, 1082=true, 1385=true, 1460=true, 1547=true, 1558=true, 1571=true, 1595=true, 2432=true, 2957=true, 4601=true, 6658=true, 9473=true, 12620=true, 13053=true, 13103=true, 13265=true, 13288=true, 13315=true, 13331=true, 13484=true, 13824=true, 13826=true, 13888=true, 14054=true}
+10-16 15:45:22.269   598 15401 I ActivityManager: Dumping to /data/anr/anr_2026-10-16-15-45-22-269
+10-16 15:45:22.307   598 15401 I ActivityManager: Collecting stacks for pid 598
+10-16 15:45:22.442   598 15401 I ActivityManager: Collecting stacks for pid 1613
+10-16 15:45:22.463   598 15401 I ActivityManager: Collecting stacks for pid 1019
+10-16 15:45:22.493   598 15402 I ActivityManager: Skipping next CPU consuming process, not a java proc: 598
+10-16 15:45:22.493   598 15402 I ActivityManager: Skipping next CPU consuming process, not a java proc: 15357
+10-16 15:45:22.493   598 15402 I ActivityManager: Skipping next CPU consuming process, not a java proc: 9
+10-16 15:45:22.493   598 15402 I ActivityManager: Skipping next CPU consuming process, not a java proc: 1613
+10-16 15:45:22.501   598 15401 I ActivityManager: Collecting stacks for pid 1006
+10-16 15:45:22.518   598 15401 I ActivityManager: Collecting stacks for pid 947
+10-16 15:45:22.540   598 15401 I ActivityManager: Collecting stacks for pid 860
+10-16 15:45:22.603   598 15401 I ActivityManager: dumpStackTraces nativepids=null
+10-16 15:45:22.603   598 15401 I ActivityManager: dumpStackTraces extraPids=[]
+10-16 15:45:22.604   598 15401 I ActivityManager: Done dumping
+10-16 15:45:22.604   598 15401 E ActivityManager: ANR in com.example.composefixture (com.example.composefixture/.DefaultActivity)
+10-16 15:45:22.604   598 15401 E ActivityManager: PID: 15357
+10-16 15:45:22.604   598 15401 E ActivityManager: Reason: Input dispatching timed out (681f38 com.example.composefixture/com.example.composefixture.DefaultActivity (server) is not responding. Waited 5006ms for KeyEvent).
+10-16 15:45:22.604   598 15401 E ActivityManager: Parent: com.example.composefixture/.DefaultActivity
+10-16 15:45:22.604   598 15401 E ActivityManager: ErrorId: 3bc0704a-9834-45f2-aacc-65201ecf72f6
+10-16 15:45:22.604   598 15401 E ActivityManager: Frozen: false
+10-16 15:45:22.604   598 15401 E ActivityManager: Load: 0.63 / 0.27 / 0.18
+10-16 15:45:22.604   598 15401 E ActivityManager: ----- Output from /proc/pressure/memory -----
+10-16 15:45:22.604   598 15401 E ActivityManager: some avg10=0.13 avg60=0.11 avg300=0.06 total=21377513
+10-16 15:45:22.604   598 15401 E ActivityManager: full avg10=0.06 avg60=0.02 avg300=0.00 total=8201564
+10-16 15:45:22.604   598 15401 E ActivityManager: ----- End output from /proc/pressure/memory -----
+10-16 15:45:22.604   598 15401 E ActivityManager: ----- Output from /proc/pressure/cpu -----
+10-16 15:45:22.604   598 15401 E ActivityManager: some avg10=3.49 avg60=2.82 avg300=1.76 total=588838894
+10-16 15:45:22.604   598 15401 E ActivityManager: full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+10-16 15:45:22.604   598 15401 E ActivityManager: ----- End output from /proc/pressure/cpu -----
+10-16 15:45:22.604   598 15401 E ActivityManager: ----- Output from /proc/pressure/io -----
+10-16 15:45:22.604   598 15401 E ActivityManager: some avg10=0.22 avg60=0.15 avg300=0.08 total=47247139
+10-16 15:45:22.604   598 15401 E ActivityManager: full avg10=0.06 avg60=0.03 avg300=0.00 total=19031634
+10-16 15:45:22.604   598 15401 E ActivityManager: ----- End output from /proc/pressure/io -----
+10-16 15:45:22.604   598 15401 E ActivityManager: 
+10-16 15:45:22.604   598 15401 E ActivityManager: CPU usage from 25786ms to 0ms ago (2026-10-16 15:44:56.481 to 2026-10-16 15:45:22.268):
+10-16 15:45:22.604   598 15401 E ActivityManager:   3.4% 398/surfaceflinger: 0.6% user + 2.7% kernel / faults: 8 minor
+10-16 15:45:22.604   598 15401 E ActivityManager:   2% 860/com.android.systemui: 0.1% user + 1.8% kernel / faults: 186 minor
+10-16 15:45:22.604   598 15401 E ActivityManager:   1.9% 1385/com.google.android.apps.nexuslauncher: 0.2% user + 1.7% kernel / faults: 218 minor
+10-16 15:45:22.604   598 15401 E ActivityManager:   1.6% 598/system_server: 0.7% user + 0.9% kernel / faults: 1833 minor 1 major
+10-16 15:45:22.604   598 15401 E ActivityManager:   1% 379/android.hardware.graphics.composer3-service.ranchu: 0.1% user + 0.8% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   0.1% 363/android.hardware.graphics.allocator@3.0-service.ranchu: 0% user + 0.1% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   0% 16/rcu_preempt: 0% user + 0% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   0% 31/migration/2: 0% user + 0% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   0% 366/android.hardware.sensors-service.multihal: 0% user + 0% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   0% 400/adbd: 0% user + 0% kernel / faults: 1844 minor
+10-16 15:45:22.604   598 15401 E ActivityManager: 6.9% TOTAL: 1.8% user + 3% kernel + 0.1% iowait + 1.8% irq + 0% softirq
+10-16 15:45:22.604   598 15401 E ActivityManager: CPU usage from 3ms to 222ms later (2026-10-16 15:45:22.271 to 2026-10-16 15:45:22.490):
+10-16 15:45:22.604   598 15401 E ActivityManager:   46% 598/system_server: 23% user + 23% kernel / faults: 749 minor 1 major
+10-16 15:45:22.604   598 15401 E ActivityManager:     32% 621/Signal Catcher: 23% user + 9.3% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:     4.6% 15402/AnrAuxiliaryTas: 0% user + 4.6% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   9.7% 15357/com.example.composefixture: 4.8% user + 4.8% kernel / faults: 281 minor
+10-16 15:45:22.604   598 15401 E ActivityManager:     4.8% 15359/Signal Catcher: 4.8% user + 0% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   4.5% 9/kworker/0:0H-kblockd: 0% user + 4.5% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager:   4.8% 1613/com.android.emulator.multidisplay: 4.8% user + 0% kernel / faults: 178 minor
+10-16 15:45:22.604   598 15401 E ActivityManager:     4.8% 1615/Signal Catcher: 4.8% user + 0% kernel
+10-16 15:45:22.604   598 15401 E ActivityManager: 26% TOTAL: 10% user + 5.9% kernel + 1.1% iowait + 8.3% irq
+10-16 15:45:22.605   598 15401 D ActivityManager: Completed ANR of com.example.composefixture in 338ms, latency 1ms
+10-16 15:45:22.607   598   636 I ActivityManager: Broadcast completed: result=0
+10-16 15:45:23.122   598   711 D ActivityManager: freezing 14054 com.google.android.googlequicksearchbox:googleapp

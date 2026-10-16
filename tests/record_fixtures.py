@@ -775,6 +775,43 @@ def _anr_for(package: str) -> Callable[[str], str]:
     return check
 
 
+def _anr_stream_for(package: str, *, requires: tuple[str, ...]) -> Callable[[str], str]:
+    """Keep one provoked ANR as the stream carries it, from the provocation on.
+
+    These captures do not clear the buffer first (``logcat -c`` would empty it
+    under anyone else reading the emulator's log), so the dump starts with
+    whatever the buffer held. It is cut at the LAST ``Broadcasting: Intent``
+    line for the provoking action -- ActivityManager logs it as the broadcast
+    is sent -- so what is kept is this provocation and what followed it.
+
+    Args:
+        package: The app that must have ANRed.
+        requires: Text the kept stream must carry: the lines the test built on
+            it reads. A capture missing one did not record what it exists for.
+    """
+    marker = f"Broadcasting: Intent {{ act={package}.PROVOKE_ANR"
+
+    def cut(text: str) -> str:
+        lines = text.splitlines(keepends=True)
+        starts = [i for i, line in enumerate(lines) if marker in line]
+        if not starts:
+            raise CaptureError(
+                f"no {marker!r} line: the broadcast was not sent, or ActivityManager no "
+                f"longer logs it -- either way the stream cannot be cut to this ANR"
+            )
+        kept = "".join(lines[starts[-1] :])
+        _anr_for(package)(kept)
+        for needle in requires:
+            if needle not in kept:
+                raise CaptureError(
+                    f"the stream after the provocation does not contain {needle!r}; "
+                    f"the ANR did not unfold the way this fixture records it"
+                )
+        return kept
+
+    return cut
+
+
 def _hierarchy_of(package: str) -> Callable[[str], str]:
     """Trim the dump and assert it is of ``package``.
 
@@ -2042,6 +2079,97 @@ FIXTURES: list[Fixture] = [
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
         post=_anr_for(COMPOSE_PACKAGE),
     ),
+    # The two fixtures above are single grepped lines. These two keep what a
+    # LIVE reader sees of one stall -- every ActivityManager and WindowManager
+    # line from the provocation on -- because "how many ANRs was that?" is a
+    # question about the stream, not about any one line of it.
+    Fixture(
+        name="logcat_anr_broadcast_stream",
+        emulator_only=True,
+        catches=("D5",),
+        args=["shell", "logcat -d -v threadtime | grep -E ' (ActivityManager|WindowManager): '"],
+        description=(
+            "One broadcast ANR, as `anr_watcher --start` reads it. ActivityManager "
+            "logs the ANR as ONE record of many lines -- 'ANR in', 'PID:', "
+            "'Reason:', 'ErrorId:', 'Frozen:', load, pressure, CPU usage -- every "
+            "line under the identical timestamp/pid/tid/priority/tag header, which "
+            "is the only thing that says they belong together. ~5 s later the ANR "
+            "dialog takes focus, the blocked window cannot answer the focus event, "
+            "and WindowManager writes 'ANR in Window{...}. Reason:Input dispatching "
+            "timed out'; ActivityManager adjudicates that report a few ms later "
+            "with 'Skipping duplicate ANR: ... Input dispatching timed out'. One "
+            "stall, three places a line-at-a-time reader finds an ANR."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+            _PROVOKE_ANR,
+            # Broadcast ANR at +10 s, WindowManager's report at ~+15 s.
+            ["shell", "sleep", "20"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_anr_stream_for(
+            COMPOSE_PACKAGE,
+            requires=(
+                "PID: ",
+                "Reason: Broadcast of Intent",
+                "ANR in Window{",
+                "Skipping duplicate ANR",
+            ),
+        ),
+    ),
+    Fixture(
+        name="logcat_anr_input_stream",
+        emulator_only=True,
+        catches=("D5",),
+        args=["shell", "logcat -d -v threadtime | grep -E ' (ActivityManager|WindowManager): '"],
+        description=(
+            "An INPUT-dispatch ANR with no broadcast ANR in it, as the stream "
+            "carries it. The receiver is sent as a BACKGROUND broadcast (60 s "
+            "timeout, longer than its 40 s block) with --async, so am returns at "
+            "once; the blocked window is then handed one key event. WindowManager "
+            "reports first ('ANR in Window{...}. Reason:Input dispatching timed "
+            "out ... for KeyEvent'), and ActivityManager follows with its own "
+            "full record -- and here, unlike a broadcast ANR, 'ANR in <pkg> "
+            "(<component>)' DOES carry the parenthesised component. Recorded to "
+            "show that WindowManager's line is a report TO ActivityManager, which "
+            "decides: a new ANR (this fixture) or a duplicate "
+            "(logcat_anr_broadcast_stream). The key is SHIFT_LEFT: it has to "
+            "reach the focused window, and it types nothing anywhere."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+            [
+                "shell",
+                "am",
+                "broadcast",
+                "--async",
+                "-n",
+                f"{COMPOSE_PACKAGE}/.AnrReceiver",
+                "-a",
+                f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
+            ],
+            ["shell", "sleep", "2"],
+            # --async: injection otherwise waits for the blocked window to
+            # finish the key, and gives up only after 30 s (measured: "Input
+            # event injection from pid N timed out" at +30 s).
+            ["shell", "input", "keyevent", "--async", "KEYCODE_SHIFT_LEFT"],
+            # Input dispatch times out after 5 s; ActivityManager's record follows.
+            ["shell", "sleep", "15"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_anr_stream_for(
+            COMPOSE_PACKAGE,
+            requires=(
+                "ANR in Window{",
+                f"ANR in {COMPOSE_PACKAGE} (",
+                "Reason: Input dispatching timed out",
+            ),
+        ),
+    ),
     Fixture(
         name="logcat_choreographer_jank",
         emulator_only=True,
@@ -3134,6 +3262,83 @@ FIXTURES: list[Fixture] = [
         ),
         catches=("D4",),
         post=_requires_empty(),
+    ),
+    # --- naming a process from its pid ------------------------------------
+    #
+    # A Choreographer "Skipped N frames!" line names no app; its pid column is
+    # the only identity it has, and a pid does not survive a restart -- it is
+    # recycled. So the ANR worker asks for the pid's current owner and that
+    # owner's AGE, and trusts the name only if the owner is older than the time
+    # since the line was read (a duration on the host's monotonic clock: no
+    # wall clock, no year, no DST). The argv below is the worker's own, after
+    # `adb shell`.
+    Fixture(
+        name="ps_lifetime",
+        args=[
+            "shell",
+            "ps",
+            "-o",
+            "PID,NAME,ELAPSED",
+            "-p",
+            "$(pidof com.android.systemui)",
+        ],
+        description=(
+            "`ps -o PID,NAME,ELAPSED -p <pid>` for a long-running app process: a "
+            "header row padded with spaces and one row -- the pid right-aligned, "
+            "NAME the full process name (not the 15-character comm, so a dotted "
+            "package comes back whole), ELAPSED the age of the pid's CURRENT owner "
+            "as HH:MM:SS. A line read longer ago than that came from a process that "
+            "has since died and left its pid to another."
+        ),
+        catches=("A5",),
+        post=_requires("PID NAME", "ELAPSED", "com.android.systemui"),
+    ),
+    Fixture(
+        name="ps_lifetime_just_started",
+        emulator_only=True,
+        args=[
+            "shell",
+            "ps",
+            "-o",
+            "PID,NAME,ELAPSED",
+            "-p",
+            f"$(pidof {COMPOSE_PACKAGE})",
+        ],
+        description=(
+            "The same query for a process started seconds ago (the fixture app, "
+            "launched by setup): ELAPSED is MM:SS here, with no hours field. "
+            "Both shapes are recorded so the parser reads what ps prints rather "
+            "than what it might; a third (days) has not been seen and is not "
+            "read -- an age the parser cannot read is no evidence of lifetime."
+        ),
+        catches=("A5",),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_requires("PID NAME", "ELAPSED", COMPOSE_PACKAGE),
+    ),
+    Fixture(
+        name="ps_lifetime_not_running",
+        record_both_streams=True,
+        args=[
+            "shell",
+            "ps",
+            "-o",
+            "PID,NAME,ELAPSED",
+            "-p",
+            "999999",
+        ],
+        description=(
+            "The same query for a pid nothing holds: the header row alone, and "
+            "exit status 1. A process that died between logging and the lookup "
+            "looks like this; the header must not be read as a process called "
+            "NAME."
+        ),
+        catches=("A5",),
+        post=_requires("PID NAME", "ELAPSED", absent=("999999",)),
     ),
     # --- IME visibility: which key actually exists ------------------------
     Fixture(

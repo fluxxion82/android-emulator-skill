@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-17T08:14:12Z",
+  "recorded_at": "2026-10-17T08:20:37Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -548,12 +548,36 @@
       "bytes": 424
     },
     {
+      "name": "logcat_anr_broadcast_stream",
+      "file": "logcat_anr_broadcast_stream.txt",
+      "command": "adb shell logcat -d -v threadtime | grep -E ' (ActivityManager|WindowManager): '",
+      "description": "One broadcast ANR, as `anr_watcher --start` reads it. ActivityManager logs the ANR as ONE record of many lines -- 'ANR in', 'PID:', 'Reason:', 'ErrorId:', 'Frozen:', load, pressure, CPU usage -- every line under the identical timestamp/pid/tid/priority/tag header, which is the only thing that says they belong together. ~5 s later the ANR dialog takes focus, the blocked window cannot answer the focus event, and WindowManager writes 'ANR in Window{...}. Reason:Input dispatching timed out'; ActivityManager adjudicates that report a few ms later with 'Skipping duplicate ANR: ... Input dispatching timed out'. One stall, three places a line-at-a-time reader finds an ANR.",
+      "catches": [
+        "D5"
+      ],
+      "bytes": 8689,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "logcat_anr_input_dispatch",
       "file": "logcat_anr_input_dispatch.txt",
       "command": "adb shell logcat -d -v threadtime | grep 'WindowManager: ANR in '",
       "description": "The SAME stalled app, reported a second time by a different subsystem and in a completely different shape: WindowManager writes one line reading 'ANR in Window{<hash> u0 <pkg>/<Activity>}. Reason:Input dispatching timed out (... Waited 5006ms for FocusEvent(hasFocus=false)).' Three things a guess gets wrong. The token after 'ANR in' is the literal word 'Window', not a package -- _ANR_IN_RE's '([\\w.]+)' happily reports a fault in a package called 'Window'. The component is inside the braces rather than in parentheses. And 'Reason:' has no space after the colon, unlike ActivityManager's. One stall therefore reaches a logcat reader as two events under two tags.",
       "catches": [],
       "bytes": 334
+    },
+    {
+      "name": "logcat_anr_input_stream",
+      "file": "logcat_anr_input_stream.txt",
+      "command": "adb shell logcat -d -v threadtime | grep -E ' (ActivityManager|WindowManager): '",
+      "description": "An INPUT-dispatch ANR with no broadcast ANR in it, as the stream carries it. The receiver is sent as a BACKGROUND broadcast (60 s timeout, longer than its 40 s block) with --async, so am returns at once; the blocked window is then handed one key event. WindowManager reports first ('ANR in Window{...}. Reason:Input dispatching timed out ... for KeyEvent'), and ActivityManager follows with its own full record -- and here, unlike a broadcast ANR, 'ANR in <pkg> (<component>)' DOES carry the parenthesised component. Recorded to show that WindowManager's line is a report TO ActivityManager, which decides: a new ANR (this fixture) or a duplicate (logcat_anr_broadcast_stream). The key is SHIFT_LEFT: it has to reach the focused window, and it types nothing anywhere.",
+      "catches": [
+        "D5"
+      ],
+      "bytes": 7458,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "logcat_app_restart",
@@ -658,6 +682,44 @@
       "description": "`pm grant` doing NOTHING and saying so with silence. The fixture app does not request POST_NOTIFICATIONS, so the permission is not granted -- and pm prints nothing at all and exits 0. (The echo is part of the recorded command because an empty file cannot show an exit status; everything before 'exit=' is pm's own output, and there is none.) This is the failure push_notification cannot detect: its check is 'exit 0 and no output means granted', which is exactly what a no-op looks like.",
       "catches": [],
       "bytes": 7
+    },
+    {
+      "name": "ps_lifetime",
+      "file": "ps_lifetime.txt",
+      "command": "adb shell ps -o PID,NAME,ELAPSED -p $(pidof com.android.systemui)",
+      "description": "`ps -o PID,NAME,ELAPSED -p <pid>` for a long-running app process: a header row padded with spaces and one row -- the pid right-aligned, NAME the full process name (not the 15-character comm, so a dotted package comes back whole), ELAPSED the age of the pid's CURRENT owner as HH:MM:SS. A line read longer ago than that came from a process that has since died and left its pid to another.",
+      "catches": [
+        "A5"
+      ],
+      "bytes": 92,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "ps_lifetime_just_started",
+      "file": "ps_lifetime_just_started.txt",
+      "command": "adb shell ps -o PID,NAME,ELAPSED -p $(pidof com.example.composefixture)",
+      "description": "The same query for a process started seconds ago (the fixture app, launched by setup): ELAPSED is MM:SS here, with no hours field. Both shapes are recorded so the parser reads what ps prints rather than what it might; a third (days) has not been seen and is not read -- an age the parser cannot read is no evidence of lifetime.",
+      "catches": [
+        "A5"
+      ],
+      "bytes": 92,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "ps_lifetime_not_running",
+      "file": "ps_lifetime_not_running.txt",
+      "command": "adb shell ps -o PID,NAME,ELAPSED -p 999999",
+      "description": "The same query for a pid nothing holds: the header row alone, and exit status 1. A process that died between logging and the lookup looks like this; the header must not be read as a process called NAME.",
+      "catches": [
+        "A5"
+      ],
+      "bytes": 46,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 46,
+      "stderr_bytes": 0
     },
     {
       "name": "resolve_activity_launcher",

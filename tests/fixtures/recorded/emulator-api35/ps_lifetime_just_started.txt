@@ -1,0 +1,2 @@
+  PID NAME                            ELAPSED
+22131 com.example.composefixture        00:06

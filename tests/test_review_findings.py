@@ -25,6 +25,7 @@ Four defects the adb_exec migration introduced or failed to close:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 
@@ -100,25 +101,23 @@ def test_screen_size_still_parses_a_normal_response(fake_adb):
 
 
 class _SilentProc:
-    """A logcat that is alive but emits nothing, so readline() blocks.
+    """A logcat that is alive but emits nothing: an open pipe nobody writes to.
 
     This is the case an emitting fake cannot reproduce: the in-loop clock check
-    only runs *after* readline() returns, so a device that logs nothing never
-    reaches it. Only a watchdog that terminates the child from outside the loop
-    can end that wait, which is what log_monitor already does.
+    only runs *after* a read returns, so a device that logs nothing never
+    reaches it -- unless the read itself is bounded. log_monitor ends that wait
+    with a watchdog that terminates the child; since PR #26 anr_watcher reads
+    the descriptor with select() and a timeout, so its loop wakes on its own.
+    A real pipe, because that reader needs a real descriptor; the write end is
+    held open until terminate(), exactly like a quiet logcat.
     """
 
     def __init__(self):
-        self._released = threading.Event()
+        read_end, self._write_end = os.pipe()
         self.terminated = False
-        self.stdout = self
+        self.stdout = os.fdopen(read_end, "rb", buffering=0)
         self.stderr = None
         self.returncode = None
-
-    def readline(self) -> str:
-        # Blocks until something terminates us, exactly like a quiet logcat.
-        self._released.wait(timeout=30)
-        return ""
 
     def poll(self):
         return self.returncode
@@ -130,7 +129,9 @@ class _SilentProc:
     def terminate(self):
         self.terminated = True
         self.returncode = 0
-        self._released.set()
+        if self._write_end is not None:
+            os.close(self._write_end)
+            self._write_end = None
 
     def kill(self):
         self.terminate()
@@ -158,8 +159,12 @@ def test_legacy_watch_stops_even_when_the_device_is_silent(monkeypatch):
     worker = threading.Thread(target=_run, daemon=True)
     worker.start()
 
-    assert finished.wait(timeout=15), (
-        "watch(duration_seconds=1) did not return on a silent device; "
-        "--duration hangs until the stream produces a line"
-    )
-    assert proc.terminated
+    try:
+        assert finished.wait(timeout=15), (
+            "watch(duration_seconds=1) did not return on a silent device; "
+            "--duration hangs until the stream produces a line"
+        )
+        assert proc.terminated
+    finally:
+        proc.terminate()
+        proc.stdout.close()

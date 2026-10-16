@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """ANR/jank filter pipeline — pure functions, no I/O.
 
-Stages: parse → normalise → threshold → bucket → cluster → aggregate → rank → format.
+Stages: parse → assemble → normalise → threshold → bucket → cluster → aggregate
+→ rank → format.
 
 Each function is independently testable; the worker and the ``--stop`` path both
 compose them. The clustering / session / formatting machinery is ported nearly
 verbatim from the iOS HangBuster pipeline (``hang_pipeline.py``); only the
-*parse* layer (``parse_logcat_anr``) and the severity bands are Android-native.
+*parse* layer (``parse_logcat_anr`` for one line, ``AnrRecordAssembler`` for
+the stream) and the severity bands are Android-native.
+
+Every reader of a log goes through ``AnrRecordAssembler`` (or
+``parse_logcat_stream`` for a finite dump), never ``parse_logcat_anr`` line by
+line: one stall is several lines in two subsystems' words, and only the
+assembler knows which of them are the same incident (D5).
 
 Token budgets are enforced via a documented char/4 heuristic
 (``estimate_tokens``) — accurate to within ~10% of real tokenizers and
@@ -20,19 +27,31 @@ import itertools
 import json
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 
 # === CONSTANTS ===
 
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 """Bump when normalise_message, compute_fingerprint, or severity boundaries change.
-``--diff`` skips structural comparison across mismatched versions.
+
+A session records the version it was CAPTURED with (``SessionMeta``), and its
+summary keeps that version however late it is stopped, because the events'
+fingerprints were computed then. ``--diff`` refuses two sessions whose versions
+differ rather than compare fingerprints computed two different ways.
 
 v1 (2026-06): initial Android ANR/jank fingerprint. compute_fingerprint() hashes
 its input with sha256[:16]; symbol (component/tag) wins when present, otherwise the
-normalised message prefix is the hash input."""
+normalised message prefix is the hash input.
+
+v2 (2026-10, A5): a jank event's identity is its PROCESS, not its frame count.
+``Skipped N frames!`` kept N in the prefix, so one janking screen fingerprinted
+once per distinct count; N is now redacted. A Choreographer line names no app,
+so the process is hashed in: by NAME when the session worker could name the pid
+(``identity: "package"``), else by the pid itself (``identity: "pid"``), which
+``--diff`` will not compare across sessions -- a restarted app has a new pid."""
 
 # Each dropped frame on a 60Hz display is ~16.7ms of main-thread stall.
 FRAME_MS = 16.7
@@ -70,6 +89,61 @@ _LOG_LINE_PATTERN = re.compile(
 
 # "Skipped 47 frames!  The application may be doing too much work..."
 _SKIPPED_FRAMES_RE = re.compile(r"Skipped\s+(\d+)\s+frames", re.IGNORECASE)
+
+# The same, for redaction: the count is a MEASUREMENT of the stall (it is kept
+# in ``frames``), not part of what stalled. _BARE_INT only takes 4+ digits, so a
+# two- or three-digit count survived into the prefix and one janking screen
+# fingerprinted once per count it happened to drop (A5).
+_FRAME_COUNT = re.compile(r"(Skipped\s+)\d+(\s+frames)", re.IGNORECASE)
+
+# ActivityManager writes one ANR as ONE log record of many lines -- "ANR in",
+# "PID:", "Reason:", "ErrorId:", "Frozen:", load, pressure, CPU usage -- and
+# logcat prints every line of a record under the identical header: timestamp,
+# pid, tid, priority and tag (recorded: logcat_anr_broadcast_stream). That
+# header is the only thing that says the lines belong together.
+_ANR_RECORD_PID_RE = re.compile(r"^PID:\s*(\d+)\s*$")
+_ANR_RECORD_REASON_RE = re.compile(r"^Reason:\s*(.+?)\s*$")
+
+# Tags whose "ANR in ..." line is a report TO ActivityManager. WindowManager
+# logs "ANR in Window{...}. Reason:Input dispatching timed out" and hands the
+# window to ActivityManager, which then either writes its own full record (a new
+# ANR: logcat_anr_input_stream, 0.35 s after WindowManager's line) or says
+# "Skipping duplicate ANR" (a stall it already recorded:
+# logcat_anr_broadcast_stream, where WindowManager reported 5.06 s AFTER the
+# broadcast ANR's record). Counting both made one stall two ANRs. But dropping
+# WindowManager's line outright made a stream cut between the two -- a stop, a
+# --since window -- ZERO ANRs, and ActivityManager has other early returns
+# (crashing, killed, shutting down) where it records nothing. So the line is
+# held as a FALLBACK: it is dropped when ActivityManager accounts for the same
+# package within ANR_CORRELATION_MS, either side, and is an event otherwise.
+_ANR_PRECURSOR_TAGS = frozenset({"WindowManager"})
+
+# How far apart, by logcat timestamp, WindowManager's report and
+# ActivityManager's record of one package's ANR may be and still be one
+# incident. Twice the 5.06 s measured for the duplicate case above.
+ANR_CORRELATION_MS = 10_000
+
+# ActivityManager's verdict on a report for a stall it already recorded.
+_ANR_DUPLICATE_PREFIX = "Skipping duplicate ANR:"
+
+# What WindowManager's line says timed out: "...}. Reason:Input dispatching ..."
+_WINDOW_REASON_RE = re.compile(r"\.\s*Reason:\s*(.+?)\s*$")
+
+# "ActivityManager: Start proc 14407:com.example.composefixture/u0a205 for ..."
+# (recorded: logcat_app_restart) -- a pid and its process name, together.
+_START_PROC_RE = re.compile(r"\bStart proc (\d+):([^/\s]+)/")
+
+# A package as a whole token followed by its component's slash -- "(62056f6
+# com.example.composefixture/com.example..." in a duplicate verdict. Bounded on
+# the left so "example.composefixture" is not found inside
+# "com.example.composefixture" (review of PR #26: a substring match let one
+# app's verdict settle another app's ANR).
+_PACKAGE_TOKEN_RE = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.\w+)+)/")
+
+# ps's ELAPSED, in the two shapes recorded: MM:SS (ps_lifetime_just_started)
+# and HH:MM:SS (ps_lifetime). toybox documents a days form too; none has been
+# seen, so it is not read -- an age that cannot be read is no evidence.
+_ELAPSED_RE = re.compile(r"^(?:(\d+):)?(\d{2}):(\d{2})$")
 
 # One stalled app is reported by TWO subsystems in two different shapes. Both
 # are recorded: logcat_anr_broadcast and logcat_anr_input_dispatch.
@@ -128,6 +202,17 @@ class NormalisedEvent:
     raw_message: str = ""
     frames: int | None = None
     kind: str = "jank"
+    # From an ActivityManager ANR record's own lines (AnrRecordAssembler): what
+    # timed out, and the stalled app's pid -- ``pid`` above is the logcat
+    # column, which for an ANR is system_server's.
+    reason: str | None = None
+    app_pid: int | None = None
+    # The process the event belongs to, by name, when known: the ANR's package,
+    # or the name the session worker found for a jank line's pid.
+    app: str | None = None
+    # How a jank event's site is keyed: "package" (by ``app``) or "pid" (no
+    # name was found). None for kinds whose text names their site.
+    identity: str | None = None
 
 
 @dataclass
@@ -142,6 +227,9 @@ class Cluster:
     severity: Severity
     symbol_or_prefix: str
     sample_event: NormalisedEvent
+    # The events' ``identity`` (they share a fingerprint, so they share it).
+    # "pid" clusters are not compared across sessions by --diff.
+    identity: str | None = None
 
 
 @dataclass
@@ -158,24 +246,34 @@ class SessionSummary:
     clusters: list[Cluster]
     aggregates: dict
     fingerprint_version: int = FINGERPRINT_VERSION
+    # True when --stop gave up waiting for the worker: whatever it wrote after
+    # that is not in here (review of PR #26 -- never a silently short summary).
+    incomplete: bool = False
 
 
 # === STAGE 1: PARSE ===
 
 
 def parse_logcat_anr(line: str) -> dict | None:
-    """Parse one ``adb logcat -v threadtime`` line into a raw ANR/jank event dict.
+    """Classify ONE ``adb logcat -v threadtime`` line as an ANR/jank signal.
 
     Recognises three Android signals:
 
     1. **Choreographer jank** — ``Skipped N frames!`` from the ``Choreographer``
        tag. Duration is estimated as ``N * 16.7ms`` (one dropped frame ≈ one
        60Hz refresh of blocked main thread).
-    2. **ActivityManager ANR** — ``ANR in <pkg> (<component>)`` plus the
-       follow-on ``Reason:`` / ``Input dispatching timed out`` lines. These are
-       hard ANRs (5s+ unresponsive), bucketed FROZEN.
+    2. **Hard ANR** — ActivityManager's ``ANR in <pkg>[ (<component>)]`` and
+       WindowManager's ``ANR in Window{... <pkg>/<component>}``. These are hard
+       ANRs (5s+ unresponsive), bucketed FROZEN.
     3. **StrictMode / slow operations** (optional, minor) — ``Slow operation``
        or StrictMode dialog lines, treated as low-severity jank hints.
+
+    This is a line classifier, not a reader. ActivityManager's ``PID:`` and
+    ``Reason:`` lines belong to the ``ANR in`` record above them and are not
+    signals on their own -- a Reason naming an action such as ``PROVOKE_ANR``
+    used to read as a second ANR (D5). Attaching them, and knowing that
+    WindowManager's line and ActivityManager's are one stall, takes the
+    stream: use :class:`AnrRecordAssembler`.
 
     Returns ``None`` for non-log lines or lines that don't describe ANR/jank.
     """
@@ -255,15 +353,13 @@ def _classify_anr(tag: str, message: str) -> dict | None:
             "anr_package": pkg,
         }
 
-    # ANR follow-on lines carry the reason/timeout but not the "ANR in" prefix.
-    if "input dispatching timed out" in lower or ("anr" in lower and "reason:" in lower):
-        return {
-            "kind": "anr",
-            "frames": None,
-            "duration_ms": 5000.0,
-            "component": None,
-            "anr_package": None,
-        }
+    # There used to be a branch here classifying "follow-on" lines -- anything
+    # holding "input dispatching timed out", or "anr" and "reason:" -- as ANRs
+    # of their own. In a recorded stream it matched nothing that was one: the
+    # Reason line of an ANR already counted (D5), and ActivityManager's
+    # "Skipping duplicate ANR: ... Input dispatching timed out", which is the
+    # system saying in words that this is NOT a new ANR
+    # (logcat_anr_broadcast_stream). AnrRecordAssembler attaches the first.
 
     # 3. StrictMode / slow operation hints (minor jank).
     #
@@ -298,6 +394,204 @@ def is_anr_message(tag: str, message: str) -> bool:
     return _classify_anr(tag, message) is not None
 
 
+# === STAGE 1b: ASSEMBLE (lines -> incidents) ===
+
+
+class AnrRecordAssembler:
+    """Turn a logcat stream into ANR/jank events, one per incident.
+
+    ``parse_logcat_anr`` answers "what does this line say"; this answers "which
+    lines are the same stall", which no single line can:
+
+    - **One ANR is one record.** ActivityManager's ``ANR in`` line opens it, and
+      every following line under the identical header (timestamp, pid, tid,
+      priority, tag) is the same log record -- ``PID:`` is the stalled app's
+      own pid (the header's pid is system_server's), ``Reason:`` is the only
+      statement of what timed out. They are attached to the event instead of
+      becoming events (D5). So an ANR is held until the header changes, or
+      until the stream goes quiet (:meth:`flush`) or ends (:meth:`close`).
+    - **WindowManager's ANR line is a fallback.** It is a report to
+      ActivityManager, which normally records the incident itself, before or
+      after it (see ``_ANR_PRECURSOR_TAGS``). It is dropped when ActivityManager
+      records -- or calls a duplicate -- an ANR of the same package within
+      ``ANR_CORRELATION_MS`` of it, by logcat time; otherwise it is the event,
+      emitted once that window has passed (later lines, or a quiet stream) or
+      the stream ends. Emitted late, so it can follow events logged after it.
+
+    Jank and StrictMode lines are single-line incidents and come straight out.
+    Every reader -- ``--watch``, ``--since`` and the session worker -- feeds its
+    lines through one of these, so they agree on what one ANR is.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict | None = None
+        self._header: tuple[str, ...] | None = None
+        # WindowManager reports waiting for ActivityManager: (logcat ms, event).
+        self._held: list[tuple[int, dict]] = []
+        # package -> logcat ms of ActivityManager's latest record for it.
+        self._recorded: dict[str, int] = {}
+
+    def feed(self, line: str) -> list[dict]:
+        """Take one line; return the events it completes (often none)."""
+        match = _LOG_LINE_PATTERN.match(line.rstrip("\r\n"))
+        header = match.groups()[:5] if match else None
+        message = match.group(6).strip() if match else ""
+        completed: list[dict] = []
+        if self._pending is not None:
+            if header == self._header and not message.startswith("ANR in "):
+                self._attach(message)
+                return completed
+            completed.extend(self._close_record())
+        if match is None:
+            return completed
+
+        at_ms = _timestamp_to_ms(match.group(1))
+        completed.extend(self._release(lambda held_ms: at_ms - held_ms > ANR_CORRELATION_MS))
+        tag = match.group(5).strip()
+        if tag == "ActivityManager" and message.startswith(_ANR_DUPLICATE_PREFIX):
+            # ActivityManager's own word that a report belongs to a stall it
+            # has already recorded. It settles a held report only for a
+            # package it names exactly, and only within the window.
+            named = set(_PACKAGE_TOKEN_RE.findall(message))
+            self._held = [
+                (ms, e)
+                for ms, e in self._held
+                if e.get("anr_package") not in named or abs(at_ms - ms) > ANR_CORRELATION_MS
+            ]
+            return completed
+
+        event = parse_logcat_anr(line)
+        if event is None:
+            return completed
+        if event["kind"] != "anr":
+            completed.append(event)
+            return completed
+        package = event.get("anr_package") or ""
+        if event["process"] in _ANR_PRECURSOR_TAGS:
+            recorded_ms = self._recorded.get(package)
+            if recorded_ms is None or abs(at_ms - recorded_ms) > ANR_CORRELATION_MS:
+                reason = _WINDOW_REASON_RE.search(message)
+                if reason:
+                    event["reason"] = reason.group(1)
+                self._held.append((at_ms, event))
+            return completed
+        self._recorded[package] = at_ms
+        self._held = [
+            (ms, e)
+            for ms, e in self._held
+            if e.get("anr_package") != package or abs(at_ms - ms) > ANR_CORRELATION_MS
+        ]
+        self._pending, self._header = event, header
+        return completed
+
+    def flush(self, quiet_seconds: float = 0.0) -> list[dict]:
+        """The stream has gone quiet: emit what quiet completes.
+
+        An open ActivityManager record is complete (it arrives as one burst).
+        A held WindowManager report is not, unless the stream has been quiet for
+        the whole correlation window -- ActivityManager logs in real time, so
+        a record that has not come by then is not coming.
+
+        Args:
+            quiet_seconds: How long the stream has delivered nothing.
+        """
+        completed = self._close_record()
+        if quiet_seconds * 1000 >= ANR_CORRELATION_MS:
+            completed.extend(self._release(lambda _held_ms: True))
+        return completed
+
+    def close(self) -> list[dict]:
+        """The stream has ended: emit everything still held."""
+        return [*self._close_record(), *self._release(lambda _held_ms: True)]
+
+    def _close_record(self) -> list[dict]:
+        if self._pending is None:
+            return []
+        event, self._pending, self._header = self._pending, None, None
+        return [event]
+
+    def _release(self, due) -> list[dict]:
+        """Emit, as events, the held WindowManager reports ``due`` says are due."""
+        released = [event for held_ms, event in self._held if due(held_ms)]
+        self._held = [(ms, event) for ms, event in self._held if not due(ms)]
+        return released
+
+    def _attach(self, message: str) -> None:
+        """Fold one line of the open ANR record into its event.
+
+        Only the fields worth carrying are kept; ``ErrorId:``, ``Frozen:``, the
+        load and CPU tables are the same record and are simply not events.
+        """
+        pending = self._pending
+        if pending is None:
+            return
+        pid = _ANR_RECORD_PID_RE.match(message)
+        if pid and "app_pid" not in pending:
+            pending["app_pid"] = int(pid.group(1))
+            return
+        reason = _ANR_RECORD_REASON_RE.match(message)
+        if reason and "reason" not in pending:
+            pending["reason"] = reason.group(1)
+
+
+def parse_logcat_stream(lines: Iterable[str]) -> list[dict]:
+    """Every ANR/jank incident in a finite run of logcat lines (a ``-d`` dump)."""
+    assembler = AnrRecordAssembler()
+    events: list[dict] = []
+    for line in lines:
+        events.extend(assembler.feed(line))
+    events.extend(assembler.close())
+    return events
+
+
+def parse_start_proc(line: str) -> tuple[int, str] | None:
+    """``(pid, process name)`` from ActivityManager's ``Start proc`` line, else None.
+
+    Recorded in logcat_app_restart: ``Start proc 14407:com.example.composefixture/
+    u0a205 for next-top-activity {...}``. The one line that names a process and
+    its pid together as the process starts, so a session sees it for every app
+    (re)started while it runs.
+    """
+    match = _LOG_LINE_PATTERN.match(line.rstrip("\r\n"))
+    if not match or match.group(5).strip() != "ActivityManager":
+        return None
+    started = _START_PROC_RE.search(match.group(6))
+    return (int(started.group(1)), started.group(2)) if started else None
+
+
+@dataclass(frozen=True)
+class ProcessAge:
+    """Who holds a pid now, and for how long they have held it."""
+
+    name: str
+    age: timedelta
+
+
+def parse_process_age(text: str, pid: int) -> ProcessAge | None:
+    """Read ``ps -o PID,NAME,ELAPSED -p <pid>``.
+
+    Recorded as ``ps_lifetime`` (ELAPSED as HH:MM:SS), ``ps_lifetime_just_started``
+    (MM:SS) and ``ps_lifetime_not_running`` (the header alone, exit 1). ELAPSED
+    is the age of the pid's CURRENT owner -- a duration, so comparing it needs
+    no clock on the device and no wall time on either side. Only a row whose
+    PID is ``pid`` counts, so the header is never a process. None when nothing
+    holds the pid, or its age is in a shape not recorded (days).
+    """
+    for row in text.splitlines():
+        fields = row.split()
+        if len(fields) < 3 or fields[0] != str(pid):
+            continue
+        elapsed = _ELAPSED_RE.match(fields[-1])
+        if elapsed is None:
+            return None
+        hours, minutes, seconds = (int(part or 0) for part in elapsed.groups())
+        return ProcessAge(
+            name=" ".join(fields[1:-1]),
+            age=timedelta(hours=hours, minutes=minutes, seconds=seconds),
+        )
+    return None
+
+
 # === STAGE 2: NORMALISE ===
 
 
@@ -309,6 +603,7 @@ def normalise_message(message: str, max_len: int = 40) -> str:
         if idx != -1:
             text = (text[:idx]).strip() or text
             break
+    text = _FRAME_COUNT.sub(r"\1<n>\2", text)
     text = _HEX_ADDR.sub("<addr>", text)
     text = _PID_REF.sub("<pid>", text)
     text = _BARE_INT.sub("<n>", text)
@@ -385,14 +680,29 @@ def build_normalised_event(
     message = raw_event.get("message", "")
     kind = raw_event.get("kind", "jank")
     frames = raw_event.get("frames")
+    pid = int(raw_event.get("pid", 0))
     # Prefer the explicit component (high signal) over a regex-scraped symbol.
     symbol = raw_event.get("component") or extract_symbol(message)
     prefix = normalise_message(message)
-    fingerprint = compute_fingerprint(symbol, prefix, kind)
+    app = raw_event.get("app") or raw_event.get("anr_package")
+    # A Choreographer line names no app: every app's jank reads "Skipped <n>
+    # frames!" under the same tag. Without a site, redacting the count (A5)
+    # would merge every app's jank into one cluster. The site is the process:
+    # its NAME when the session worker found one, which survives a restart; else
+    # the logcat pid -- the janking process itself, unlike an ANR's, which is
+    # system_server's -- which does not, and is marked so --diff will not
+    # compare it (a restarted app keyed by pid read as "1 resolved, 1 new").
+    identity: str | None = None
+    site: str | None = None
+    if kind == "jank":
+        identity = "package" if raw_event.get("app") else "pid"
+        site = f"app:{raw_event['app']}" if identity == "package" else f"pid:{pid}"
+    fingerprint = compute_fingerprint(symbol, prefix, kind, site=site)
+    app_pid = raw_event.get("app_pid")
     return NormalisedEvent(
         delta_ms=delta_ms,
         process=raw_event.get("process", "unknown"),
-        pid=int(raw_event.get("pid", 0)),
+        pid=pid,
         duration_ms=float(duration),
         severity=bucket_severity(frames, kind, float(duration)),
         symbol=symbol,
@@ -401,23 +711,31 @@ def build_normalised_event(
         raw_message=message,
         frames=frames,
         kind=kind,
+        reason=raw_event.get("reason"),
+        app_pid=int(app_pid) if app_pid is not None else None,
+        app=app,
+        identity=identity,
     )
 
 
-def compute_fingerprint(symbol: str | None, message_prefix: str, kind: str = "jank") -> str:
+def compute_fingerprint(
+    symbol: str | None, message_prefix: str, kind: str = "jank", site: str | None = None
+) -> str:
     """Stable identity hash for clustering and diff.
 
     Hashed (sha256[:16]) so distinct messages with overlapping normalised
     prefixes don't collide into the same cluster. Symbol when present (high
     signal); otherwise normalised message prefix is the hash input. The event
     ``kind`` is mixed in so a jank and an ANR for the same component stay
-    distinct clusters.
+    distinct clusters, and ``site`` (``app:<name>`` or ``pid:<n>``) -- the
+    process, for a signal whose text does not name one -- so two apps'
+    identical messages do too.
 
     The human-readable label lives in ``Cluster.symbol_or_prefix`` — the
     fingerprint is purely an identity key.
     """
     inner = f"sym:{symbol}" if symbol else f"msg:{message_prefix}"
-    key = f"{kind}|{inner}"
+    key = f"{kind}|{inner}" if site is None else f"{kind}|{site}|{inner}"
     return f"fp:{hashlib.sha256(key.encode()).hexdigest()[:16]}"
 
 
@@ -464,6 +782,7 @@ def cluster_events(events: list[NormalisedEvent]) -> list[Cluster]:
                 severity=max_severity,
                 symbol_or_prefix=sample.symbol or sample.message_prefix,
                 sample_event=sample,
+                identity=sample.identity,
             )
         )
     return clusters
@@ -627,6 +946,8 @@ def format_cluster_detail(cluster: Cluster, events: list[NormalisedEvent]) -> st
         )
         if event.raw_message:
             lines.append(f"      msg: {event.raw_message[:120]}")
+        if event.reason:
+            lines.append(f"      reason: {event.reason[:120]}")
     return "\n".join(lines)
 
 
@@ -660,9 +981,9 @@ def format_diff(diff: dict) -> str:
     if drift:
         lines.append(f"Drift ({len(drift)}):")
         for entry in drift[:5]:
-            # inf delta (0 → N) renders as "new"; finite deltas keep the % suffix.
+            # 0 → N has no percentage; see diff_sessions for the shape.
             delta = entry["delta_pct"]
-            delta_str = "new" if delta == float("inf") else f"{delta:+.0f}%"
+            delta_str = "from 0" if entry.get("from_zero") else f"{delta:+.0f}%"
             lines.append(
                 f"  ~ {entry['symbol_or_prefix']}: "
                 f"{entry['max_duration_ms_a']:.0f} → {entry['max_duration_ms_b']:.0f}ms "
@@ -670,6 +991,18 @@ def format_diff(diff: dict) -> str:
             )
     if stable:
         lines.append(f"Stable: {stable} cluster(s) unchanged")
+    not_comparable = diff.get("not_comparable", [])
+    if not_comparable:
+        lines.append(
+            f"Not comparable ({len(not_comparable)}): jank whose process was never named, "
+            f"so only its pid identifies it, and a pid does not survive a restart:"
+        )
+        for cluster in not_comparable[:5]:
+            lines.append(
+                f"  ? {cluster['session']}: {cluster['severity']} "
+                f"{cluster['max_duration_ms']:.0f}ms × {cluster['count']} — "
+                f"{cluster['symbol_or_prefix']}"
+            )
     return "\n".join(lines)
 
 
@@ -721,7 +1054,17 @@ def compress_to_budget(
 def diff_sessions(
     summary_a: SessionSummary, summary_b: SessionSummary, drift_threshold_pct: float = 20.0
 ) -> dict:
-    """Compare two SessionSummary instances. Returns a dict structured for format_diff."""
+    """Compare two SessionSummary instances. Returns a dict structured for format_diff.
+
+    Each ``drift`` entry is ``{fingerprint, symbol_or_prefix, max_duration_ms_a,
+    max_duration_ms_b, delta_pct, from_zero}``. ``delta_pct`` is a finite
+    percentage, or ``null`` exactly when ``from_zero`` is true: the cluster's
+    max duration was 0 in A, so no percentage exists. It used to be
+    ``float("inf")``, which ``json.dumps`` writes as the bare token
+    ``Infinity`` -- not JSON, so ``--diff --json`` handed a strict parser a
+    document it could not read, at precisely the moment something got worse
+    (N9). A 0 → N cluster counts as worsened.
+    """
     if summary_a.fingerprint_version != summary_b.fingerprint_version:
         return {
             "session_a": summary_a.session_id,
@@ -731,8 +1074,18 @@ def diff_sessions(
             "fingerprint_version_b": summary_b.fingerprint_version,
             "verdict": "skipped (version mismatch)",
         }
-    a_map = {c.fingerprint: c for c in summary_a.clusters}
-    b_map = {c.fingerprint: c for c in summary_b.clusters}
+    # A pid-keyed cluster has no identity outside its own session: the same
+    # app restarted gets a new pid, and an old pid can be another process.
+    # Reporting it as resolved here and new there was a regression invented by
+    # a restart, so it is listed as not comparable instead.
+    not_comparable = [
+        {**_cluster_to_dict(cluster), "session": summary.session_id}
+        for summary in (summary_a, summary_b)
+        for cluster in summary.clusters
+        if cluster.identity == "pid"
+    ]
+    a_map = {c.fingerprint: c for c in summary_a.clusters if c.identity != "pid"}
+    b_map = {c.fingerprint: c for c in summary_b.clusters if c.identity != "pid"}
     new_keys = b_map.keys() - a_map.keys()
     resolved_keys = a_map.keys() - b_map.keys()
     shared_keys = a_map.keys() & b_map.keys()
@@ -743,15 +1096,18 @@ def diff_sessions(
         if ca.max_duration_ms == 0 and cb.max_duration_ms == 0:
             stable += 1
             continue
-        if ca.max_duration_ms == 0:
-            # 0 → N: a previously-silent cluster now janks; treat as max worsening.
-            delta_pct: float = float("inf")
+        # 0 → N: a previously-silent cluster now stalls. No percentage exists,
+        # and it always counts as drift.
+        from_zero = ca.max_duration_ms == 0
+        delta_pct: float | None
+        if from_zero:
+            delta_pct = None
         elif cb.max_duration_ms == 0:
             # N → 0: cluster present in A but flat in B; fully improved.
             delta_pct = -100.0
         else:
             delta_pct = (cb.max_duration_ms - ca.max_duration_ms) / ca.max_duration_ms * 100
-        if delta_pct == float("inf") or abs(delta_pct) >= drift_threshold_pct:
+        if delta_pct is None or abs(delta_pct) >= drift_threshold_pct:
             drift.append(
                 {
                     "fingerprint": key,
@@ -759,12 +1115,30 @@ def diff_sessions(
                     "max_duration_ms_a": ca.max_duration_ms,
                     "max_duration_ms_b": cb.max_duration_ms,
                     "delta_pct": delta_pct,
+                    "from_zero": from_zero,
                 }
             )
         else:
             stable += 1
-    new_clusters = [_cluster_to_dict(b_map[k]) for k in new_keys]
-    resolved_clusters = [_cluster_to_dict(a_map[k]) for k in resolved_keys]
+    # Unequal naming coverage: a named cluster with no counterpart, while the
+    # other session holds a pid-keyed cluster of the same signature, may BE
+    # that counterpart under a pid nobody could name. Calling it resolved or
+    # new concluded absence from a failed identification -- "improvement" one
+    # way round, "regression" the other (review of PR #26).
+    unnamed_a = {_signature(c) for c in summary_a.clusters if c.identity == "pid"}
+    unnamed_b = {_signature(c) for c in summary_b.clusters if c.identity == "pid"}
+    uncertain_new = {k for k in new_keys if _signature(b_map[k]) in unnamed_a}
+    uncertain_resolved = {k for k in resolved_keys if _signature(a_map[k]) in unnamed_b}
+    not_comparable.extend(
+        {**_cluster_to_dict(cluster), "session": session}
+        for keys, cluster_map, session in (
+            (uncertain_resolved, a_map, summary_a.session_id),
+            (uncertain_new, b_map, summary_b.session_id),
+        )
+        for cluster in (cluster_map[k] for k in sorted(keys))
+    )
+    new_clusters = [_cluster_to_dict(b_map[k]) for k in new_keys - uncertain_new]
+    resolved_clusters = [_cluster_to_dict(a_map[k]) for k in resolved_keys - uncertain_resolved]
     new_critical = sum(
         1 for c in new_clusters if c["severity"] in (Severity.CRITICAL.value, Severity.FROZEN.value)
     )
@@ -775,10 +1149,30 @@ def diff_sessions(
     elif resolved_clusters and not drift:
         verdict = f"improvement: {len(resolved_clusters)} resolved"
     elif drift:
-        worsened = sum(1 for d in drift if d["delta_pct"] > 0)
+        worsened = sum(1 for d in drift if d["from_zero"] or d["delta_pct"] > 0)
         verdict = f"drift: {worsened} worsened, {len(drift) - worsened} improved"
     else:
         verdict = "no change"
+    # What the comparison could not see. "no change; 2 not comparable" read as
+    # no change while a set-aside cluster could be a new app janking -- the
+    # signature is only kind and message, and every Choreographer line reads
+    # the same (review of PR #26). A summary saved before its worker finished
+    # may be missing events the same way. Nothing else changed: inconclusive.
+    # Something did: the verdict stands, and names what it stands on.
+    caveats = [
+        f"{summary.session_id} is incomplete"
+        for summary in (summary_a, summary_b)
+        if summary.incomplete
+    ]
+    if not_comparable:
+        plural = "s" if len(not_comparable) != 1 else ""
+        caveats.insert(0, f"{len(not_comparable)} cluster{plural} could not be compared")
+    if caveats:
+        verdict = (
+            "inconclusive: " + "; ".join(dict.fromkeys(caveats))
+            if verdict == "no change"
+            else f"{verdict}; " + "; ".join(dict.fromkeys(caveats))
+        )
     return {
         "session_a": summary_a.session_id,
         "session_b": summary_b.session_id,
@@ -787,8 +1181,16 @@ def diff_sessions(
         "resolved_clusters": resolved_clusters,
         "drift": drift,
         "stable_count": stable,
+        "not_comparable": not_comparable,
+        "incomplete": [s.session_id for s in (summary_a, summary_b) if s.incomplete],
         "verdict": verdict,
     }
+
+
+def _signature(cluster: Cluster) -> str:
+    """The cluster's fingerprint with its site left out: what it is, not whose."""
+    sample = cluster.sample_event
+    return compute_fingerprint(sample.symbol, sample.message_prefix, sample.kind)
 
 
 def _cluster_to_dict(cluster: Cluster) -> dict:
@@ -800,6 +1202,7 @@ def _cluster_to_dict(cluster: Cluster) -> dict:
         "count": cluster.count,
         "max_duration_ms": cluster.max_duration_ms,
         "first_delta_ms": cluster.first_delta_ms,
+        "identity": cluster.identity,
     }
 
 
@@ -823,6 +1226,7 @@ def summary_to_json(summary: SessionSummary) -> dict:
         "matched_lines": summary.matched_lines,
         "total_lines": summary.total_lines,
         "fingerprint_version": summary.fingerprint_version,
+        "incomplete": summary.incomplete,
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
     }
@@ -842,6 +1246,7 @@ def summary_from_json(payload: dict) -> SessionSummary:
         clusters=clusters,
         aggregates=payload.get("aggregates", {}),
         fingerprint_version=payload.get("fingerprint_version", 1),
+        incomplete=payload.get("incomplete", False),
     )
 
 
@@ -856,6 +1261,7 @@ def _cluster_from_json(payload: dict) -> Cluster:
         severity=Severity(payload["severity"]),
         symbol_or_prefix=payload["symbol_or_prefix"],
         sample_event=sample,
+        identity=payload.get("identity"),
     )
 
 
@@ -872,6 +1278,10 @@ def _event_from_dict(payload: dict) -> NormalisedEvent:
         raw_message=payload.get("raw_message", ""),
         frames=payload.get("frames"),
         kind=payload.get("kind", "jank"),
+        reason=payload.get("reason"),
+        app_pid=payload.get("app_pid"),
+        app=payload.get("app"),
+        identity=payload.get("identity"),
     )
 
 
@@ -899,6 +1309,9 @@ class SummaryBuilder:
     total_lines: int = 0
     dropped_below_threshold: int = 0
     extras: dict = field(default_factory=dict)
+    # The version the events were fingerprinted under: the session's, as
+    # recorded when it was captured -- not this module's, which may be newer.
+    fingerprint_version: int = FINGERPRINT_VERSION
 
     def build(
         self,
@@ -923,4 +1336,5 @@ class SummaryBuilder:
             total_lines=self.total_lines,
             clusters=clusters,
             aggregates=aggregates,
+            fingerprint_version=self.fingerprint_version,
         )
