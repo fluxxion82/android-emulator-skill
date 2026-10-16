@@ -20,12 +20,18 @@ with two differences that the specs need:
   replayed verbatim. A stub with no rule for a question answers with silence,
   never with a plausible sentence.
 
-One behaviour is simulated rather than replayed, because ignoring it would make
-the D4 spec pass against the very bug it pins: ``logcat --pid=N`` prints only
-the lines whose PID column is N. A rule opts in with ``filter_pid=True``. That
-is documented logcat behaviour, applied to a recorded threadtime transcript;
-everything else ``logcat`` can be asked (``-t``, ``*:W``, ``-b``) is ignored,
-which only ever makes the stub answer *more* than a device would.
+Two behaviours are simulated rather than replayed, because ignoring them would
+make a spec pass against the very bug it pins. ``logcat --pid=N`` prints only
+the lines whose PID column is N; a rule opts in with ``filter_pid=True``. And a
+following ``logcat -T N`` starts at the end of what the device had already
+buffered -- its last N lines -- before what arrives after; a rule that gives
+that history as ``buffered=`` gets it whole without ``-T`` and only its tail
+with it. Both are documented logcat behaviour, applied to a recorded threadtime
+transcript; everything else ``logcat`` can be asked (``-t``, ``*:W``, ``-b``)
+is ignored, which only ever makes the stub answer *more* than a device would.
+
+Replayed text is byte-exact: a carriage return inside a recorded line stays
+inside it, as it does on the device, whose logcat ends a line only at ``\\n``.
 
 Every invocation of every stub is appended to a log, so a spec can say both
 "the script answered X" and "the script asked the device Y" -- and so a spec
@@ -85,18 +91,34 @@ for rule in spec["rules"]:
     if rule["pull_from"]:
         # `adb pull <device path> <host path>`: the host path is the last argument.
         shutil.copyfile(rule["pull_from"], argv[-1])
+    def read(path):
+        # newline="": a carriage return is replayed, not turned into a newline.
+        with open(path, encoding="utf-8", newline="") as handle:
+            return handle.read()
+
+    def lines(text):
+        # Split where logcat does -- at "\\n" only -- keeping the ends.
+        parts = text.split("\\n")
+        return [part + "\\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
     out = ""
+    if rule["buffered"]:
+        # logcat -T N: the last N lines already buffered, then what follows.
+        history = lines(read(rule["buffered"]))
+        tail = next((argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-T"), None)
+        if tail is not None:
+            history = history[-int(tail):]
+        out = "".join(history)
     if rule["stdout"]:
-        with open(rule["stdout"], encoding="utf-8") as handle:
-            out = handle.read()
+        out += read(rule["stdout"])
     pid = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("--pid=")), None)
     if rule["filter_pid"] and pid is not None:
         # logcat --pid=N: only the lines whose threadtime PID column is N.
         out = "".join(
-            line for line in out.splitlines(True)
+            line for line in lines(out)
             if len(line.split()) > 2 and line.split()[2] == pid
         )
-    sys.stdout.write(out)
+    sys.stdout.buffer.write(out.encode("utf-8"))
     sys.stdout.flush()
     if rule["stderr"]:
         with open(rule["stderr"], encoding="utf-8") as handle:
@@ -121,6 +143,10 @@ class Rule:
     stderr: str = ""
     exit: int = 0
     filter_pid: bool = False
+    # What the device had already buffered when a following `logcat` began:
+    # replayed whole before ``stdout``, or only its last N lines under `-T N`.
+    # Recorded text, like ``stdout``.
+    buffered: str = ""
     # Files the tool writes as a side effect, as (absolute path, text). Gradle
     # writes its JUnit XML during the run; a stub that did not would leave the
     # script reading whatever an earlier run left behind.
@@ -181,6 +207,7 @@ class FakeToolchain:
                     "stderr": self._stage(rule.stderr),
                     "exit": rule.exit,
                     "filter_pid": rule.filter_pid,
+                    "buffered": self._stage(rule.buffered),
                     "writes": [[str(path), self._stage(text)] for path, text in rule.writes],
                     "pull_from": rule.pull_from,
                 }
@@ -271,6 +298,46 @@ class FakeToolchain:
                     f"{tool} resolves to {found}, outside the fake bin -- a real SDK "
                     f"tool is reachable and these specs would drive a real device"
                 )
+
+
+# --- uid answers: whose process a pid is -----------------------------------------
+#
+# log_monitor --app and app_state_capture confirm a pid as the app's by its uid
+# (common.logcat.app_window): `cmd package list packages -U <package>` for the
+# package's uid, `ps -o PID,UID -p <pids>` for a process's. A fake device that
+# says "pidof <package> -> P" must also say "P's uid is the package's", or the
+# fake contradicts itself. Both answers are the RECORDED ones (package_list_uid,
+# ps_pid_uid), with only the package name or the pid substituted -- derivation
+# by substitution, as CLAUDE.md allows.
+
+
+def recorded_package_listing(recorded, package: str) -> str:
+    """package_list_uid as if ``package`` were the recorded package (its uid kept)."""
+    text = recorded.text("package_list_uid")
+    recorded_package = text.split()[0].removeprefix("package:")
+    return text.replace(f"package:{recorded_package} ", f"package:{package} ")
+
+
+def recorded_ps_answer(recorded, pid: str) -> str:
+    """ps_pid_uid with its app row's pid replaced by ``pid`` (the uid kept).
+
+    The recorded system_server row stays: a ``ps`` answer naming other pids is
+    what the device prints when asked for several.
+    """
+    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == "ps_pid_uid")
+    app = entry["pids"]["app"]
+    lines = recorded.text("ps_pid_uid").splitlines(keepends=True)
+    return "".join(
+        line.replace(app, pid, 1) if line.split()[:1] == [app] else line for line in lines
+    )
+
+
+def uid_rules(recorded, package: str, pid: str | None) -> list[Rule]:
+    """The package's uid, and -- when ``pid`` is given -- that pid's, as the package's."""
+    rules = [Rule(("cmd", "package"), stdout=recorded_package_listing(recorded, package))]
+    if pid:
+        rules.append(Rule(("shell", "ps"), stdout=recorded_ps_answer(recorded, pid)))
+    return rules
 
 
 # --- the refusal contract ------------------------------------------------------

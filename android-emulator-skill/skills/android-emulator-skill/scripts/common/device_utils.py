@@ -68,6 +68,7 @@ a guard nothing could check.
 
 import re
 import shlex
+from collections.abc import Iterable
 
 from .adb_exec import AdbCommandError, AdbError, DeviceNotFoundError, run_adb
 from .hierarchy import capture_hierarchy_dict
@@ -833,3 +834,102 @@ def transform_screenshot_coords(
     device_x = int((x / screenshot_width) * device_width)
     device_y = int((y / screenshot_height) * device_height)
     return (device_x, device_y)
+
+
+def get_system_server_pid(
+    serial: str | None = None, *, not_one_of: Iterable[str] = ()
+) -> str | None:
+    """system_server's pid, or None when the device does not name exactly one.
+
+    The process every ``ActivityManager`` sentence about an app's processes must
+    come from (``common.logcat.parse_package_pids``): any app may log under that
+    tag, but only system_server writes it with this pid. Measured on the API 35
+    emulator: ``pidof system_server`` answered 598, the PID column of every
+    ActivityManager line in the same window.
+
+    Args:
+        serial: Device serial.
+        not_one_of: Pids already known to be other processes (the app's own,
+            from ``pidof <package>``). A pid is one process, so an answer naming
+            one of these is not system_server's, and None is returned.
+
+    Returns:
+        The pid, or None when ``pidof`` fails or names none, several, or one of
+        ``not_one_of``.
+
+    Raises:
+        adb_exec.DeviceError: The device could not be reached.
+    """
+    result = run_adb("shell", serial, "pidof", "system_server")
+    pids = result.stdout.split() if result.ok else []
+    if len(pids) != 1 or not pids[0].isdigit() or pids[0] in set(not_one_of):
+        return None
+    return pids[0]
+
+
+def parse_package_uids(output: str, package: str) -> frozenset[int] | None:
+    """Every uid ``cmd package list packages -U <package>`` gives for exactly ``package``.
+
+    Recorded: ``package:<package> uid:10205`` with one user (package_list_uid),
+    and ONE row with the uids comma-separated, ``uid:10205,1110205``, with the
+    package installed for two (package_list_uid_two_users) -- not a row per
+    user. Each is the package's uid in one user, so all of them count. The
+    command filters by SUBSTRING, so other packages whose names contain
+    ``package`` are listed too; the row whose name is exactly ``package`` is
+    the one read.
+
+    Returns:
+        The uids, or None when no row names exactly ``package``.
+    """
+    for line in output.splitlines():
+        match = re.match(r"package:(\S+) uid:(\d+(?:,\d+)*)", line.strip())
+        if match and match.group(1) == package:
+            return frozenset(int(uid) for uid in match.group(2).split(","))
+    return None
+
+
+def get_package_uids(serial: str | None, package: str) -> frozenset[int] | None:
+    """The package's uids (one per user it is installed for), asked of the device.
+
+    One bounded adb call. Returns None when the device does not name the
+    package (not installed, or the command failed).
+
+    Raises:
+        adb_exec.DeviceError: The device could not be reached.
+    """
+    result = run_adb(
+        "shell", serial, "cmd", "package", "list", "packages", "-U", quote_for_device_shell(package)
+    )
+    return parse_package_uids(result.stdout, package) if result.ok else None
+
+
+def parse_ps_uids(output: str) -> dict[str, int]:
+    """``{pid: uid}`` from ``ps -o PID,UID``.
+
+    Recorded (ps_pid_uid): a ``  PID   UID`` header, then one row per pid that
+    exists, with the numeric uid. A pid that does not exist has no row.
+    """
+    uids: dict[str, int] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            uids[fields[0]] = int(fields[1])
+    return uids
+
+
+def get_pid_uids(serial: str | None, pids: Iterable[str]) -> dict[str, int]:
+    """``{pid: uid}`` for ``pids`` that exist, from one bounded ``ps`` call.
+
+    Measured: with none of the pids existing ``ps`` prints only its header and
+    exits 1, which is an answer (no rows), not a failure.
+
+    Raises:
+        adb_exec.DeviceError: The device could not be reached.
+    """
+    wanted = sorted({pid for pid in pids if pid.isdigit()}, key=int)
+    if not wanted:
+        return {}
+    result = run_adb(
+        "shell", serial, "ps", "-o", "PID,UID", "-p", quote_for_device_shell(",".join(wanted))
+    )
+    return parse_ps_uids(result.stdout)

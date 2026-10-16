@@ -189,9 +189,47 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring
-    - Filter by app package
-    - Filter by severity (error/warning/info/debug)
-    - Smart deduplication
+    - Filter by app package: the lines of each process the device vouches was
+      the app's, inside that process's life. A pid counts when its uid is the
+      package's: the one `pidof` names (its uid checked with `ps`), or one
+      system_server's `Start proc` / `Killing` line names with the package's
+      uid (`has died`, which has no uid, only ends a life). Only system_server's
+      own lines count (checked against `pidof system_server`), only as the
+      opening of a message, never a continuation line; unknown system_server
+      or uid, nothing counts. A crash's own `Process: <pkg>, PID: N` line is
+      not evidence: any app can write one. So a crash before a restart stays
+      in the window (`app_pids`, and `attribution` -- what decided it -- in the
+      JSON). A live read holds back the lines of a pid not yet named, keeps
+      them if it is (stored in input order; marked `[held back]` under
+      `--follow`), up to `ANDROID_EMU_LOG_PENDING_CAP` (2000) lines, and counts
+      what it dropped. An app with no process in the window is refused, not
+      widened to the whole device
+    - A live read (`--follow`, `--duration`) starts at the end of the device's
+      buffer (`logcat -T 1`, which first prints the one most recent line) and
+      reads what happens from then on; it used to replay the whole buffer
+      first. Use `--last` for history. A process already running when a live
+      read begins counts from the first line the read sees, so a replayed
+      buffer could hand it the older lines of another process that had the
+      same pid
+    - Lines are split at `\n` only, as logcat ends them: a `\r` inside an
+      app's message cannot start a line that looks like system_server's
+    - Identity is the uid (every user's uid for the package). A process
+      another package runs under the same shared uid, named after this
+      package, counts as this app's: the device does not tell them apart
+    - Not attributed: a process that started before a `--last` window and is
+      not running when it is read, unless system_server names it with its uid
+      (`Killing`) inside the window -- a crash's `has died` names no uid
+    - Timestamps carry microseconds (`-v usec`): it is how a continuation line
+      of a multi-line message is told from a new message. Two of
+      system_server's messages with the very same header would read as one,
+      which can only drop the second one's evidence, never add any
+    - Filter by severity: `error`, `warning`, `info`, `debug`, `verbose`; any
+      other name (`warn`) is a usage error (exit 2)
+    - Smart deduplication. In the JSON, `statistics.errors` /
+      `statistics.warnings` count LINES (E/F, W); `statistics.unique_errors` /
+      `unique_warnings` count distinct messages; the top-level `errors` /
+      `warnings` are those distinct messages as a list, capped at
+      `ANDROID_EMU_LOG_JSON_CAP` (20)
     - Duration-based or follow mode. `--duration` / `--last` need a unit
       (`30s`, `5m`, `1h`); a bare number is rejected as a usage error (exit 2)
     - Save logs to file
@@ -858,8 +896,6 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
 
 **Known gaps, for the next release:**
 
-- `log_monitor --severity` does not validate its names. An unrecognised one
-  (`warn`, say) matches nothing, so the capture silently filters to empty.
 - `status_bar --time` must be given zero-padded — `09:41`, not `9:41`. The value
   reaches SystemUI's demo mode as `hhmm`; an unpadded one is ignored while the
   script still reports success.

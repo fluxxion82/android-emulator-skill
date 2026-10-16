@@ -602,6 +602,39 @@
       ]
     },
     {
+      "name": "logcat_app_restart_usec",
+      "file": "logcat_app_restart_usec.txt",
+      "command": "adb shell am start -W (x3, ended by am crash, then am force-stop, then left running), then adb logcat -d -v threadtime -v usec, host-filtered to the lines that name the package or come from its pids",
+      "description": "One app, three processes, one window: the fixture app launched, crashed (`am crash`), relaunched, force-stopped, relaunched. The manifest's `pids` are what `pidof` answered while each was alive, in order. This is the evidence that ties a pid to a package when the process is gone and `pidof` can no longer say: what system_server and the app itself write about a process. Note that most lines naming the package come from processes that are NOT the app (system_server, the launcher, the IME), so naming the package says nothing about which process wrote the line. Host-filtered to lines that name the package or carry one of its pids; other apps' free text is not recorded. `system_server_pid` is `pidof system_server` read in the same run: the only process whose ActivityManager lines may say which pids were the app's, since any app can log under that tag. `package_uid_listing` and `ps_alive` are the uid oracles from the same run: `cmd package list packages -U` for the package, `ps -o PID,UID` for the live pid. Microsecond headers (`-v usec`): the lines of one multi-line message share their header to the microsecond; separate messages in one millisecond do not.",
+      "catches": [
+        "D4"
+      ],
+      "bytes": 44586,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": [
+        "21149",
+        "21205",
+        "21274"
+      ],
+      "pid_endings": [
+        "am crash",
+        "am force-stop",
+        "running when the window was read"
+      ],
+      "system_server_pid": "598",
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10205\n"
+      },
+      "ps_alive": {
+        "command": "adb shell ps -o PID,UID -p 21274",
+        "exit_status": 0,
+        "output": "  PID   UID\n21274 10205\n"
+      }
+    },
+    {
       "name": "logcat_choreographer_jank",
       "file": "logcat_choreographer_jank.txt",
       "command": "adb shell logcat -d -v threadtime | grep Choreographer",
@@ -652,6 +685,27 @@
         "A1"
       ],
       "bytes": 23514
+    },
+    {
+      "name": "package_list_uid",
+      "file": "package_list_uid.txt",
+      "command": "adb shell cmd package list packages -U com.example.composefixture",
+      "description": "`cmd package list packages -U <package>`: one line, 'package:<package> uid:<uid>', exit 0. The filter is a SUBSTRING match (measured: asking for 'com.example.compose' lists com.example.composefixture too), and a package that is not installed prints nothing and still exits 0 -- so a reader must pick the line whose name is exactly the package, and treat none as unknown.",
+      "catches": [],
+      "bytes": 45,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "package_list_uid_two_users",
+      "file": "package_list_uid_two_users.txt",
+      "command": "adb shell pm create-user; pm install-existing --user <id> <package>; cmd package list packages -U <package>; pm remove-user <id>",
+      "description": "`cmd package list packages -U <package>` with the package installed for two users: ONE row, the uids comma-separated ('uid:10205,1110205' for user 11), not a row per user (measured, Android 15). A reader keeping the first number rejects the second user's processes. The throwaway user is removed before the capture is accepted, and the listing is read back until it names one uid again.",
+      "catches": [],
+      "bytes": 53,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "11"
     },
     {
       "name": "pidof_not_running",
@@ -720,6 +774,29 @@
       "stream": "stdout",
       "stdout_bytes": 46,
       "stderr_bytes": 0
+    },
+    {
+      "name": "ps_pid_uid",
+      "file": "ps_pid_uid.txt",
+      "command": "adb shell ps -o PID,UID -p <fixture app pid>,<system_server pid>",
+      "description": "`ps -o PID,UID -p <pid>,<pid>`: a header, then one row per pid that exists, sorted by pid, with the NUMERIC uid (10205 for the fixture app, 1000 for system_server). Measured: `-p a -p b` answers the same; a pid that does not exist is left out, and with none existing only the header prints and the exit status is 1. The pids are under 'pids' in this entry.",
+      "catches": [],
+      "bytes": 36,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": {
+        "app": "21332",
+        "system_server": "598"
+      },
+      "argv": [
+        "adb",
+        "shell",
+        "ps",
+        "-o",
+        "PID,UID",
+        "-p",
+        "<app>,<system_server>"
+      ]
     },
     {
       "name": "resolve_activity_launcher",

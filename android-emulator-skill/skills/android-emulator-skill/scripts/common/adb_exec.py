@@ -301,12 +301,20 @@ def classify_device_error(stderr: str, serial: str | None = None) -> DeviceError
     return _classify(stderr, serial)
 
 
+def _as_text(output: bytes | str | None) -> str:
+    """Output as text; bytes decoded as UTF-8 with no newline translation."""
+    if output is None:
+        return ""
+    return output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output
+
+
 def run_adb(
     operation: str,
     serial: str | None = None,
     *args: object,
     timeout: int | None = None,
     check: bool = False,
+    raw_text: bool = False,
 ) -> AdbResult:
     """Run one adb command, bounded, with typed errors.
 
@@ -316,6 +324,11 @@ def run_adb(
         *args: Remaining arguments.
         timeout: Seconds to allow. Defaults to ``ANDROID_EMU_ADB_TIMEOUT`` (30).
         check: Raise :class:`AdbCommandError` on a non-zero exit status.
+        raw_text: Read the output as bytes and decode it WITHOUT newline
+            translation. Text mode turns a ``\\r`` into a line break; logcat
+            frames lines with ``\\n`` only and leaves an app's ``\\r`` raw, so
+            in text mode an app could start a forged "line" mid-message
+            (security review of #27). Split such output on ``\\n`` only.
 
     Returns:
         The :class:`AdbResult`.
@@ -340,7 +353,7 @@ def run_adb(
         completed = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=not raw_text,
             timeout=budget,
             check=False,
         )
@@ -372,8 +385,8 @@ def run_adb(
 
     result = AdbResult(
         returncode=completed.returncode,
-        stdout=completed.stdout or "",
-        stderr=completed.stderr or "",
+        stdout=_as_text(completed.stdout),
+        stderr=_as_text(completed.stderr),
         command=cmd,
     )
 
