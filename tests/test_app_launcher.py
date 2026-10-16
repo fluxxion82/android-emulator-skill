@@ -488,6 +488,14 @@ def test_parse_am_start_reads_the_recorded_report(recorded):
     )
 
 
+def _view_unresolved(recorded) -> tuple[str, int]:
+    """The recorded `am start -W -a VIEW -d <url>` that nothing handles, and its exit."""
+    for entry in recorded.manifest["fixtures"]:
+        if entry["name"] == "am_start_wait_view_unresolved":
+            return recorded.text("am_start_wait_view_unresolved"), entry["exit_status"]
+    pytest.fail("am_start_wait_view_unresolved has no manifest entry")
+
+
 def test_a_deep_link_that_resolves_to_nothing_is_not_reported_as_opened(monkeypatch, recorded):
     """`--open-url` was the last place inferring success from a missing error.
 
@@ -496,24 +504,53 @@ def test_a_deep_link_that_resolves_to_nothing_is_not_reported_as_opened(monkeypa
     app that does not declare the filter -- was reported as a link the agent had
     followed. It now waits (`-W`) and reads `Status: ok` like every other launch.
 
-    The stdout here is the recorded `am start -W` failure. Its *command* was
-    `-n <component>` rather than `-a VIEW -d <url>`, and what is being exercised
-    is the shape both produce and the parser keys on: an `Error:` line and no
-    `Status:` line at all. Every byte is the device's; only the command that
-    produced them differs, which is stated rather than papered over.
+    The stdout is the recording of the command `open_url` itself runs,
+    `am start -W -a android.intent.action.VIEW -d <url>`, for a scheme nothing
+    handles. It used to borrow `am_start_wait_missing` -- a `-n <component>`
+    failure -- because no deep-link failure was recorded, and the two are not
+    the same shape: this one has no `Error type` line, and its error is
+    "unable to resolve Intent", not "does not exist".
+
+    This half feeds it at exit 0, the path where the report rather than the
+    status code has to decide (the test below uses the recorded exit 1).
     """
-    failure = recorded.text("am_start_wait_missing")
+    failure, _exit = _view_unresolved(recorded)
 
     def fake_run(cmd, **kwargs):
         return _ok(failure)
 
     monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
 
-    success, message = AppLauncher(serial="emulator-5554").open_url("myapp://nowhere")
+    success, message = AppLauncher(serial="emulator-5554").open_url("aes-nothing-handles://x")
 
     assert success is False, "a link that opened nothing was reported as opened"
-    assert "does not exist" in message, message
-    assert "myapp://nowhere" in message
+    assert "unable to resolve Intent" in message, message
+    assert "aes-nothing-handles://x" in message
+    assert "intent filters" in message, f"the failure names no remedy: {message}"
+
+
+def test_a_deep_link_nothing_handles_fails_at_its_recorded_exit_status(monkeypatch, recorded):
+    """The same recording at the exit status the device really returned: 1.
+
+    With `check=True` that arrives as an `AdbCommandError`, a different branch
+    of `open_url` from the one above; the error line has to be read out of the
+    exception's stdout there, because stderr is empty (stderr_bytes: 0).
+    """
+    failure, exit_status = _view_unresolved(recorded)
+    assert exit_status == 1, "the recording no longer exits 1; this test's premise moved"
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=exit_status, stdout=failure, stderr=""
+        )
+
+    monkeypatch.setattr(app_launcher.adb_exec.subprocess, "run", fake_run)
+
+    success, message = AppLauncher(serial="emulator-5554").open_url("aes-nothing-handles://x")
+
+    assert success is False
+    assert "unable to resolve Intent" in message, message
+    assert "aes-nothing-handles://x" in message
     assert "intent filters" in message, f"the failure names no remedy: {message}"
 
 

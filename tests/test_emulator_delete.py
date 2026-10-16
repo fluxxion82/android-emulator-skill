@@ -431,3 +431,32 @@ def test_delete_reports_its_own_timeout(monkeypatch, deleter):
     assert success is False
     assert str(emulator_delete.SDK_TOOL_TIMEOUT) in message
     assert "MyTestDevice" in message
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "N13: avdmanager's trailing null line is passed through at "
+        "emulator_create.py:586 / emulator_delete.py:221"
+    ),
+)
+def test_a_failed_delete_does_not_hand_on_avdmanagers_stray_null_line(monkeypatch, recorded):
+    """`_delete_one` gets avdmanager's recorded failure: exit 1, the reason, then `null`.
+
+    `delete()` checks the name exists first, so the failure arrives here when
+    the AVD vanishes between that check and the delete -- or for any other
+    avdmanager failure that ends the same way.
+    """
+    reason = recorded.text("avdmanager_delete_missing")
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, output="", stderr=reason)
+
+    monkeypatch.setattr(emulator_delete.subprocess, "run", fake_run)
+
+    success, message = emulator_delete.EmulatorDeleter()._delete_one(
+        "aes_does_not_exist", "/fake/avdmanager"
+    )
+
+    assert success is False
+    assert "null" not in [line.strip() for line in message.splitlines()], message

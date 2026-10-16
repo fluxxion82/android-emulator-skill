@@ -1,0 +1,4 @@
+# ART method traces open with ~10 KB of text header, so git's NUL sniff (first
+# 8000 bytes) calls them text, and a CRLF conversion would rewrite 0x0a bytes
+# inside the little-endian record stream. They are binary, whatever they look like.
+*.trace binary

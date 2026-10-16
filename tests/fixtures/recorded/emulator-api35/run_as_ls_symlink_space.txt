@@ -1,0 +1,5 @@
+total 28
+drwxrwxrwx 2 u0_a205 u0_a205 4096 2026-10-16 11:23 .
+drwxrwx--x 3 u0_a205 u0_a205 4096 2026-10-16 11:23 ..
+-rw-rw-rw- 1 u0_a205 u0_a205    2 2026-10-16 11:23 a b.txt
+lrwxrwxrwx 1 u0_a205 u0_a205    7 2026-10-16 11:23 link -> a b.txt

@@ -690,6 +690,100 @@ def test_am_start_wait_failure_is_on_stdout_with_no_status_line(recorded):
     assert entry["stdout_bytes"] > 0
 
 
+def test_a_deep_link_nothing_handles_has_its_own_failure_shape(recorded):
+    """E1, `--open-url`'s half: `am start -W -a VIEW -d <url>` that resolves to nothing.
+
+    Same channel as the missing-activity failure -- exit 1, everything on
+    stdout, no `Status:` line -- but not the same lines: there is no `Error
+    type` at all, and the error is "Activity not started, unable to resolve
+    Intent". The URL is cut to scheme and host with `/...` appended, even
+    though this one had no path, so the URL that failed cannot be read back
+    out of the message.
+    """
+    text = recorded.text("am_start_wait_view_unresolved")
+    assert "Status:" not in text
+    assert "Error type" not in text, "the deep-link failure now carries an error type"
+    error = next(line for line in text.splitlines() if line.startswith("Error:"))
+    assert "unable to resolve Intent" in error
+    assert "act=android.intent.action.VIEW" in error
+    assert "dat=aes-nothing-handles://x/..." in error, "the data URI is no longer elided"
+
+    entry = _manifest_entry(recorded, "am_start_wait_view_unresolved")
+    assert entry["exit_status"] == 1
+    assert entry["stderr_bytes"] == 0, "the diagnostic is on stdout, not stderr"
+    assert entry["stdout_bytes"] > 0
+
+
+# ---------------------------------------------------------------------------
+# `am profile start` destinations. Ground truth for the v0.9.0 hang sampler
+# (see tests/test_am_profile_trace.py for the trace itself): the two places an
+# agent would reach for first are both refused, and the refusal names the one
+# that works.
+# ---------------------------------------------------------------------------
+
+PROFILE_REFUSALS = ("am_profile_sdcard_denied", "am_profile_appdir_denied")
+
+
+@pytest.mark.parametrize("name", PROFILE_REFUSALS)
+def test_am_profile_refuses_the_destination_with_255_on_stderr(recorded, name):
+    """Both refusals: exit 255, stdout empty, the reason on stderr."""
+    text = recorded.text(name)
+    assert "Error: Unable to open file: " in text
+    assert "Consider using a file under /data/local/tmp/" in text
+
+    entry = _manifest_entry(recorded, name)
+    assert entry["exit_status"] == 255
+    assert entry["stdout_bytes"] == 0
+    assert entry["stderr_bytes"] == entry["bytes"]
+
+
+def test_the_sdcard_refusal_is_selinux_and_leaves_an_empty_file(recorded):
+    """It is system_server that opens the file, and the refusal still creates it.
+
+    /sdcard is writable from `adb shell`, so the denial is not the shell's: the
+    avc line names `scontext=u:r:system_server:s0` against the FUSE label. It is
+    printed with no newline before the next sentence, so a line-wise reader
+    sees the denial and the explanation as one line. And the attempt leaves a
+    0-byte file at the destination -- "the trace file exists" is no evidence
+    that profiling started.
+    """
+    text = recorded.text("am_profile_sdcard_denied")
+    first = text.splitlines()[0]
+    assert first.startswith("avc:  denied  { write }")
+    assert "scontext=u:r:system_server:s0" in first
+    assert "permissive=0System server has no access" in first, "the two are now separated"
+
+    left = _manifest_entry(recorded, "am_profile_sdcard_denied")["left_behind"]
+    assert left["exit_status"] == 0, "the refusal left no file this time"
+    columns = left["output"].split()
+    assert columns[0].startswith("-"), "not a regular file"
+    assert columns[4] == "0", f"expected a 0-byte file, got {left['output']!r}"
+    assert columns[-1] == "/sdcard/aes_denied.trace"
+
+
+def test_the_app_dir_refusal_leaves_nothing_behind(recorded):
+    """The app's own data dir: refused without an avc line, and no file made."""
+    text = recorded.text("am_profile_appdir_denied")
+    assert "avc:" not in text
+    assert "/data/data/com.example.composefixture/files/aes_denied.trace" in text
+
+    left = _manifest_entry(recorded, "am_profile_appdir_denied")["left_behind"]
+    assert left["exit_status"] != 0
+    assert "No such file or directory" in left["output"]
+
+
+def test_the_refusal_recommends_the_destination_the_hang_trace_was_taken_to(recorded):
+    """The loop closes: the directory both refusals name is where the trace came from."""
+    recommended = "/data/local/tmp/"
+    for name in PROFILE_REFUSALS:
+        assert f"Consider using a file under {recommended}" in recorded.text(name)
+
+    command = _manifest_entry(recorded, "am_profile_hang")["command"]
+    start = command.split(";")[0].split()
+    assert start[:5] == ["adb", "shell", "am", "profile", "start"], start
+    assert start[-1].startswith(recommended), start[-1]
+
+
 # ---------------------------------------------------------------------------
 # S4 — a broadcast to a receiver that does not exist still exits 0.
 # ---------------------------------------------------------------------------

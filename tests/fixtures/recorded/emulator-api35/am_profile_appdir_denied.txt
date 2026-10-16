@@ -1,0 +1,2 @@
+Error: Unable to open file: /data/data/com.example.composefixture/files/aes_denied.trace
+Consider using a file under /data/local/tmp/

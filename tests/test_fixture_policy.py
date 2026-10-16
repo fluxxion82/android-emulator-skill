@@ -156,8 +156,6 @@ RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
 # STILL OUTSTANDING — one line each, and what would retire it:
 KNOWN_VIOLATIONS = frozenset(
     {
-        # avdmanager create/delete output is not recorded on any profile yet.
-        "test_emulator_create.py::CompletedProcess",
         # EXCEPTION, not debt: GPX is a document the USER hands to
         # `location.py --gpx` (a GPS device or mapping service writes it), so
         # there is no tool for a recorder to run, nothing in the Android SDK
@@ -165,14 +163,6 @@ KNOWN_VIOLATIONS = frozenset(
         # is deliberately MALFORMED (`lat="north"`), which by definition
         # nothing produces. See the module docstring of test_location.py.
         "test_location.py::parse_gpx",
-        # No AVD `config.ini` is recorded. Same PR should capture one; until
-        # then the hand-written key/value block stands.
-        "test_emulator_selector.py::parse_config_ini",
-        # A symlink line, a filename containing a space, and the coreutils
-        # month/day/year layout -- all documented by parse_ls_output, none in
-        # any recording. Record `run-as ... ls -la` in a directory containing
-        # a symlink and a spaced filename.
-        "test_container.py::parse_ls_output",
         # `offline` and `unauthorized` device states, which parse_adb_devices
         # reports and no recording has. Record `adb devices -l` with a device
         # in each state (a second emulator killed mid-boot gives `offline`).

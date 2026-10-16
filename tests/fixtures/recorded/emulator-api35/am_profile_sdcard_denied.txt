@@ -1,0 +1,3 @@
+avc:  denied  { write } for  scontext=u:r:system_server:s0 tcontext=u:object_r:fuse:s0 tclass=file permissive=0System server has no access to write file context u:object_r:fuse:s0 (from path /sdcard/aes_denied.trace, context u:r:system_server:s0)
+Error: Unable to open file: /sdcard/aes_denied.trace
+Consider using a file under /data/local/tmp/

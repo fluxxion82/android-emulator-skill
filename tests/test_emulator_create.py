@@ -17,6 +17,7 @@ import importlib
 import subprocess
 
 import emulator_create
+import pytest
 
 DEVICES = [
     {"id": "pixel_7", "name": "Pixel 7"},
@@ -368,32 +369,172 @@ def test_default_tunables():
 # so every call site in the module is exercised below.
 
 
-def test_every_sdk_tool_call_is_bounded(monkeypatch):
-    """Six of the AST sweep's unbounded subprocess calls lived in this file."""
+def _manifest_entry(recorded, name: str) -> dict:
+    for entry in recorded.manifest["fixtures"]:
+        if entry["name"] == name:
+            return entry
+    pytest.fail(f"no manifest entry for {name!r}")
+
+
+def _replay(recorded, name: str, cmd: list, kwargs: dict) -> subprocess.CompletedProcess:
+    """Answer ``cmd`` the way the recorded tool answered it.
+
+    The fixture file holds the stream the manifest names, and the exit status
+    is the manifest's, so a non-zero recording raises under ``check=True``
+    exactly as `subprocess.run` would.
+    """
+    entry = _manifest_entry(recorded, name)
+    text = recorded.text(name)
+    stdout, stderr = (text, "") if entry.get("stream", "stdout") == "stdout" else ("", text)
+    status = entry.get("exit_status", 0)
+    if kwargs.get("check") and status != 0:
+        raise subprocess.CalledProcessError(status, cmd, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(cmd, status, stdout=stdout, stderr=stderr)
+
+
+# The recordings come from one throwaway AVD: `avdmanager_create` made it from
+# this image and device, and `avdmanager_delete` removed it.
+RECORDED_AVD = "aes_fixture_tmp"
+RECORDED_CREATE = {
+    "device_id": "pixel_9",
+    "api_level": 34,
+    "name": RECORDED_AVD,
+    "abi": "arm64-v8a",
+    "variant": "google_apis",
+}
+
+
+def _recorded_sdk(recorded, calls: list[dict]):
+    """A fake `subprocess.run` answering every SDK-tool call from the corpus."""
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        args = cmd[1:]
+        if args == ["list", "device"]:
+            return _replay(recorded, "avdmanager_list_device", cmd, kwargs)
+        if args == ["--list"]:
+            return _replay(recorded, "sdkmanager_list", cmd, kwargs)
+        if args == ["--list_installed"]:
+            return _replay(recorded, "sdkmanager_list_installed", cmd, kwargs)
+        if args[:2] == ["create", "avd"]:
+            return _replay(recorded, "avdmanager_create", cmd, kwargs)
+        if args[:2] == ["delete", "avd"]:
+            missing = args[-1] != RECORDED_AVD
+            name = "avdmanager_delete_missing" if missing else "avdmanager_delete"
+            return _replay(recorded, name, cmd, kwargs)
+        pytest.fail(f"no recording answers {cmd}")
+
+    return fake_run
+
+
+def test_every_sdk_tool_call_is_bounded(monkeypatch, recorded):
+    """Six of the AST sweep's unbounded subprocess calls lived in this file.
+
+    Every call is answered from a recording -- including create() and delete(),
+    which used to get an invented `system-images;...` line on stdout because no
+    avdmanager create/delete output existed to replay.
+    """
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
     monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
 
     calls: list[dict] = []
+    monkeypatch.setattr(emulator_create.subprocess, "run", _recorded_sdk(recorded, calls))
 
-    def fake_run(cmd, **kwargs):
-        calls.append({"cmd": cmd, "kwargs": kwargs})
-        # create()'s pre-check looks for the image id in `sdkmanager --list`.
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout="system-images;android-34;google_apis;x86_64\n", stderr=""
-        )
-
-    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
-
-    creator.list_device_definitions()
-    creator.list_system_images()
-    creator.list_installed_system_images()
-    creator.create(device_id="pixel_7", api_level=34, name="MyAVD")
-    creator.delete("MyAVD")
+    assert creator.list_device_definitions()
+    assert creator.list_system_images()
+    assert creator.list_installed_system_images()
+    created, message, _name = creator.create(**RECORDED_CREATE)
+    assert created, message
+    deleted, message = creator.delete(RECORDED_AVD)
+    assert deleted, message
 
     assert len(calls) == 6, "a call site was missed; update this test with it"
     unbounded = [c["cmd"] for c in calls if not c["kwargs"].get("timeout")]
     assert not unbounded, f"unbounded SDK-tool calls: {unbounded}"
+
+
+def test_create_runs_the_command_that_was_recorded(monkeypatch, recorded):
+    """The recording is of the script's own argv, so replaying it means something.
+
+    `avdmanager_create` was captured with the argv in its manifest entry; the
+    script, given the same image and device, must build exactly that argv after
+    the tool path -- long options, `--device` given -- and feed `no` on stdin.
+    With `--device` the custom-hardware prompt never appears (see the fixture's
+    description), and the recorded stdout bears that out.
+    """
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+    calls: list[dict] = []
+    monkeypatch.setattr(emulator_create.subprocess, "run", _recorded_sdk(recorded, calls))
+
+    success, message, avd_name = creator.create(**RECORDED_CREATE)
+
+    assert success is True, message
+    assert avd_name == RECORDED_AVD
+    create_call = calls[-1]
+    recorded_argv = _manifest_entry(recorded, "avdmanager_create")["argv"]
+    assert create_call["cmd"][1:] == recorded_argv[1:]
+    assert create_call["kwargs"]["input"] == "no\n"
+    assert "custom hardware profile" not in recorded.text("avdmanager_create")
+
+
+def test_delete_runs_the_command_that_was_recorded(monkeypatch, recorded):
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+    calls: list[dict] = []
+    monkeypatch.setattr(emulator_create.subprocess, "run", _recorded_sdk(recorded, calls))
+
+    success, message = creator.delete(RECORDED_AVD)
+
+    assert success is True, message
+    assert calls[0]["cmd"][1:] == _manifest_entry(recorded, "avdmanager_delete")["argv"][1:]
+    assert f"AVD '{RECORDED_AVD}' deleted." in recorded.text("avdmanager_delete")
+
+
+def _delete_missing(monkeypatch, recorded) -> tuple[str, bool, str]:
+    """emulator_create.delete() of the recorded missing name: (name, success, message)."""
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+    calls: list[dict] = []
+    monkeypatch.setattr(emulator_create.subprocess, "run", _recorded_sdk(recorded, calls))
+    missing = _manifest_entry(recorded, "avdmanager_delete_missing")["argv"][-1]
+    success, message = creator.delete(missing)
+    return missing, success, message
+
+
+def test_deleting_an_avd_that_does_not_exist_reports_avdmanagers_reason(monkeypatch, recorded):
+    """Exit 1, stdout empty, and avdmanager's reason on stderr -- which reaches the caller.
+
+    What the recording says about the TOOL: the reason is followed by a second
+    stderr line reading just `null`. Whether delete() should pass that line on
+    is not asserted here -- it should not, and that is pinned separately as N13.
+    """
+    entry = _manifest_entry(recorded, "avdmanager_delete_missing")
+    assert entry["exit_status"] == 1
+    assert entry["stdout_bytes"] == 0
+    assert (
+        recorded.lines("avdmanager_delete_missing")[-1] == "null"
+    ), "avdmanager stopped printing it"
+
+    missing, success, message = _delete_missing(monkeypatch, recorded)
+
+    assert success is False
+    assert f"There is no Android Virtual Device named '{missing}'." in message, message
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "N13: avdmanager's trailing null line is passed through at "
+        "emulator_create.py:586 / emulator_delete.py:221"
+    ),
+)
+def test_a_failed_delete_does_not_hand_on_avdmanagers_stray_null_line(monkeypatch, recorded):
+    """The desired behaviour: the reason, without a line that says nothing."""
+    _missing, _success, message = _delete_missing(monkeypatch, recorded)
+    assert "null" not in [line.strip() for line in message.splitlines()], message
 
 
 def test_a_listing_timeout_degrades_to_an_empty_list(monkeypatch):

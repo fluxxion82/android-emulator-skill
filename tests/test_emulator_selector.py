@@ -21,29 +21,44 @@ from common.sdk_tools import SdkToolError
 # ---------------------------------------------------------------------------
 # config.ini parsing + API-level extraction (pure)
 # ---------------------------------------------------------------------------
-# The only config.ini text in this file, and the one `KNOWN_VIOLATIONS` already
-# freezes as `test_emulator_selector.py::parse_config_ini`. Hoisted so the
-# read-from-disk test below reuses it rather than inventing a second one (F4):
-# no AVD config.ini is recorded on any profile, and one cannot be captured here
-# -- recording it is the next candidate for `tests/record_fixtures.py`.
-CONFIG_INI = "\n".join(
-    [
-        "# a comment",
-        "AvdId=Pixel_9_Pro",
-        "abi.type = arm64-v8a",
-        "image.sysdir.1=system-images/android-36/google_apis_playstore/arm64-v8a/",
-        "",
-        "blank-without-equals",
-    ]
-)
+# The config.ini these read is `avd_config_ini`: the file avdmanager wrote for
+# a throwaway AVD, recorded between its create and its delete. It replaced a
+# hand-written block frozen in KNOWN_VIOLATIONS, and differs from it in the ways
+# that matter to a reader: there is no `AvdId` key and no `avd.ini.displayname`
+# (Android Studio writes both, the command-line tool neither), `avd.id` and
+# `avd.name` hold the literal placeholder `<build>`, and there are no comments,
+# no blank lines and no spaces around `=` -- the comment and stray-line skipping
+# the old block exercised is for a shape neither writer produces.
 
 
-def test_parse_config_ini_basic():
-    config = emulator_selector.parse_config_ini(CONFIG_INI)
-    assert config["AvdId"] == "Pixel_9_Pro"
+def test_parse_config_ini_basic(recorded):
+    config = emulator_selector.parse_config_ini(recorded.text("avd_config_ini"))
     assert config["abi.type"] == "arm64-v8a"
-    assert "image.sysdir.1" in config
-    assert "blank-without-equals" not in config
+    assert config["hw.device.name"] == "pixel_9"
+    assert config["image.sysdir.1"] == "system-images/android-34/google_apis/arm64-v8a/"
+    assert config["target"] == "android-34"
+    # Every line is one key: nothing dropped, nothing merged.
+    assert len(config) == len(recorded.lines("avd_config_ini"))
+
+
+def test_the_recorded_config_has_no_display_name_and_a_placeholder_id(recorded):
+    """Facts about this recording, not a verdict on what the selector should do.
+
+    `_build_candidate` reads `display_name` from `avd.ini.displayname`, which
+    this avdmanager-created config does not have (the Studio-made AVD on the
+    recording host does); and the id keys a reader might reach for instead hold
+    `<build>`, not the AVD's name. What display_name SHOULD be for such an AVD
+    is undecided, so nothing here asserts the empty string is right.
+    """
+    config = emulator_selector.parse_config_ini(recorded.text("avd_config_ini"))
+    assert "avd.ini.displayname" not in config
+    assert "AvdId" not in config
+    assert config["avd.id"] == config["avd.name"] == "<build>"
+
+
+def test_parse_api_level_from_the_recorded_config(recorded):
+    config = emulator_selector.parse_config_ini(recorded.text("avd_config_ini"))
+    assert emulator_selector.parse_api_level(config) == 34
 
 
 def test_parse_api_level_from_sysdir():
@@ -357,23 +372,24 @@ def test_a_listing_that_failed_is_disclosed_not_ranked_as_all_idle(
     assert "running state unavailable" in text
 
 
-def test_read_avd_config_honours_the_resolved_avd_home(monkeypatch, tmp_path):
+def test_read_avd_config_honours_the_resolved_avd_home(monkeypatch, tmp_path, recorded):
     """R4: it was hard-coded to ~/.android/avd.
 
     On a host that relocates the AVD tree every config read returned {}, so
     every AVD silently lost its API level, device profile and ABI from the
     ranking -- a ranking with no inputs, reported as a recommendation.
     """
+    recorded_config = recorded.text("avd_config_ini")
     avd_home = tmp_path / "avds"
     (avd_home / "Pixel_9.avd").mkdir(parents=True)
-    # The file's single config.ini text, reused rather than a second invention.
-    (avd_home / "Pixel_9.avd" / "config.ini").write_text(CONFIG_INI)
+    (avd_home / "Pixel_9.avd" / "config.ini").write_text(recorded_config)
     monkeypatch.setenv("ANDROID_AVD_HOME", str(avd_home))
 
     config = emulator_selector.read_avd_config("Pixel_9")
 
     assert config, "the config under $ANDROID_AVD_HOME was not read"
-    assert config == emulator_selector.parse_config_ini(CONFIG_INI)
+    assert config == emulator_selector.parse_config_ini(recorded_config)
+    assert emulator_selector.parse_api_level(config) == 34
 
 
 def _fake_emulator_on_path(monkeypatch):

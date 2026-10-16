@@ -65,6 +65,10 @@ Therefore:
    python tests/record_fixtures.py --profile pixel4xl-api33 --serial <SERIAL>
    ```
 
+   Recorders that change the device (`Fixture.emulator_only`, 37 today) refuse any
+   serial that does not start with `emulator-`, so on a phone record only read-only
+   fixtures with `--only <names>`; overriding that is a deliberate code edit, by design.
+
    Fixtures are namespaced per device under `tests/fixtures/recorded/<profile>/`,
    so the same command captured on a different API level is a new file rather
    than a silent overwrite — diffing two profiles is how you spot a format that
