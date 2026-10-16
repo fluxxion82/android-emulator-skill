@@ -43,6 +43,9 @@ from common.env_config import env_int
 # output token-efficient; --verbose/--json always emit the full detail.
 MAX_LISTED_KEYS = env_int("ANDROID_EMU_LOCALIZATION_MAX_LISTED_KEYS", 10, min_value=1)
 
+# The usual wrong --res is one level off: app/src/main instead of app/src/main/res.
+RES_REMEDY = "Pass the res/ directory that holds values/strings.xml, e.g. --res app/src/main/res."
+
 
 # === TYPES ===
 
@@ -284,11 +287,34 @@ class LocalizationAuditor:
         return sorted(mismatches, key=lambda m: (m.locale, m.key))
 
     def audit(self) -> AuditReport:
-        """Run the full audit and return a structured report."""
+        """Run the full audit and return a structured report.
+
+        Raises:
+            ValueError: A ``strings.xml`` is malformed.
+            cli.Failure: There is nothing to audit -- no default
+                ``values/strings.xml`` under ``res_dir``, or no translation for
+                the ``--locale`` asked about. Every check compares a locale
+                with the default, so either way the audit would inspect nothing
+                and report "No issues found." at exit 0 (N11).
+        """
         locales = load_locales(self.res_dir)
 
-        default = locales.get("", {})
         translation_locales = sorted(loc for loc in locales if loc != "")
+        found = ", ".join(translation_locales) or "none"
+        if "" not in locales:
+            cli.fail(
+                f"nothing to audit: no values/strings.xml under {self.res_dir} "
+                f"(translation locales found: {found})",
+                RES_REMEDY,
+            )
+        if self.locale_filter and self.locale_filter not in translation_locales:
+            cli.fail(
+                f"nothing to audit: no values-{self.locale_filter}/strings.xml under "
+                f"{self.res_dir} (translation locales found: {found})",
+                "Pass --locale with one of the locales found, or omit it to audit them all.",
+            )
+
+        default = locales[""]
         if self.locale_filter:
             translation_locales = [loc for loc in translation_locales if loc == self.locale_filter]
 
@@ -440,15 +466,18 @@ def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    # Refusals go through common.cli: printed here, they reached --json callers
+    # as an empty stdout behind exit 1.
     res_dir: Path = args.res
     if not res_dir.is_dir():
-        print(f"Error: res directory not found: {res_dir}", file=sys.stderr)
-        sys.exit(1)
+        cli.fail(f"res directory not found: {res_dir}", RES_REMEDY)
 
     source_dir: Path | None = args.source
     if source_dir is not None and not source_dir.is_dir():
-        print(f"Error: source directory not found: {source_dir}", file=sys.stderr)
-        sys.exit(1)
+        cli.fail(
+            f"source directory not found: {source_dir}",
+            "Pass --source the root of the module's code (e.g. app/src/main/java), or omit it.",
+        )
 
     try:
         auditor = LocalizationAuditor(
@@ -456,8 +485,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         report = auditor.audit()
     except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        # parse_strings_xml's message names the file and the parser's complaint.
+        cli.fail(str(exc), "Fix the XML the error names so that it parses, then re-run.")
 
     if args.json_output:
         print(json.dumps(report.to_dict(), indent=2))

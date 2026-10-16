@@ -9,6 +9,7 @@ recency ordering, plus the ANDROID_EMU_DELETE_KEEP tunable.
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import emulator_delete
 import pytest
+from fake_toolchain import assert_refusal
 
 from common import cli
 from common.sdk_tools import SdkToolError
@@ -68,22 +70,52 @@ def test_single_delete_missing_avd(monkeypatch, deleter):
     assert calls == []  # never invokes avdmanager when the AVD is absent
 
 
-def test_delete_prompts_by_default_and_can_decline(monkeypatch, deleter):
-    monkeypatch.setattr(deleter, "list_avds", lambda: ["MyTestDevice"])
+def _answer(monkeypatch, text: str) -> None:
+    """Type ``text`` at the confirmation prompt (the prompt reads stdin)."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+
+
+def _listing(monkeypatch, names: list[str]) -> None:
+    """avdmanager resolves, and `list avd -c` answers ``names``."""
+    monkeypatch.setattr(
+        emulator_delete.EmulatorDeleter, "get_avdmanager_path", lambda _self: "/sdk/avdmanager"
+    )
+    monkeypatch.setattr(emulator_delete.EmulatorDeleter, "list_avds", lambda _self: names)
+
+
+def _run_cli(monkeypatch, capsys, *argv: str) -> subprocess.CompletedProcess:
+    """The real entry point through common.cli, as the process would end."""
+    monkeypatch.setattr(emulator_delete.sys, "argv", ["emulator_delete.py", *argv])
+    with pytest.raises(SystemExit) as exc:
+        cli.run(emulator_delete.main)
+    out, err = capsys.readouterr()
+    return subprocess.CompletedProcess(argv, exc.value.code, stdout=out, stderr=err)
+
+
+def test_delete_prompts_by_default_and_can_decline(monkeypatch, capsys):
+    """A declined `--name` is the boundary's refusal: exit 1, one object, nothing deleted."""
+    _listing(monkeypatch, ["MyTestDevice"])
     calls = _capture_run(monkeypatch)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    _answer(monkeypatch, "no\n")
 
-    success, message = deleter.delete("MyTestDevice", confirm=False)
+    result = _run_cli(monkeypatch, capsys, "--name", "MyTestDevice", "--json")
 
-    assert success is False
-    assert message == "Deletion cancelled by user"
-    assert calls == []  # declined -> no delete command issued
+    assert calls == [], "a delete reached avdmanager after the user typed no"
+    payload = assert_refusal(result, json_mode=True, naming=("deletion cancelled",), status=1)
+    assert payload["error"] == (
+        "deletion cancelled: 'Permanently delete AVD MyTestDevice?' was not answered "
+        "`yes`, so nothing was deleted"
+    )
+    assert payload["remedy"] == emulator_delete.CANCELLED_REMEDY
+    assert "--yes" in payload["remedy"]
+    # The question is on stderr: on stdout it preceded the object (N4).
+    assert "Permanently delete AVD MyTestDevice? (type 'yes' to confirm): " in result.stderr
 
 
 def test_delete_prompt_accepts_yes(monkeypatch, deleter):
     monkeypatch.setattr(deleter, "list_avds", lambda: ["MyTestDevice"])
     calls = _capture_run(monkeypatch)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "YES")
+    _answer(monkeypatch, "YES\n")
 
     success, _message = deleter.delete("MyTestDevice", confirm=False)
 
@@ -95,10 +127,11 @@ def test_delete_yes_skips_prompt(monkeypatch, deleter):
     monkeypatch.setattr(deleter, "list_avds", lambda: ["MyTestDevice"])
     calls = _capture_run(monkeypatch)
 
-    def _boom(_prompt):
-        raise AssertionError("input() must not be called when confirm=True")
+    class _NoPrompt(io.StringIO):
+        def readline(self, *_args):
+            raise AssertionError("the prompt must not be read when confirm=True")
 
-    monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr("sys.stdin", _NoPrompt())
 
     success, _message = deleter.delete("MyTestDevice", confirm=True)
 
@@ -167,12 +200,71 @@ def test_delete_old_keep_all_when_count_exceeds(monkeypatch, deleter):
 
 
 def test_delete_old_prompt_can_decline(monkeypatch, deleter):
+    """N4 at the method: a declined batch raises, it does not return an empty one.
+
+    ``(0, 0, [])`` is "nothing to delete"; returning it for "no" is how
+    ``--old`` and ``--all`` came to exit 0 on a refused request.
+    """
     monkeypatch.setattr(deleter, "list_avds_by_recency", lambda: ["new", "old"])
     calls = _capture_run(monkeypatch)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    _answer(monkeypatch, "n\n")
 
-    assert deleter.delete_old(keep_count=1, confirm=False) == (0, 0, [])
+    with pytest.raises(cli.Failure, match="cancelled"):
+        deleter.delete_old(keep_count=1, confirm=False)
     assert calls == []
+
+
+@pytest.mark.parametrize("stdin", ["", "yes"], ids=["end-of-input", "no-newline"])
+def test_the_prompt_line_is_ended_when_nothing_echoed_one(monkeypatch, capsys, deleter, stdin):
+    """The refusal's ``Error:`` must start a line, not trail the question.
+
+    With stdin piped, no terminal echoes the newline after the answer; without
+    one, the boundary's ``Error: ...`` would land on the prompt's line, where a
+    reader looking for a line starting ``Error:`` does not find it.
+    """
+    _answer(monkeypatch, stdin)
+
+    deleter._confirm("Delete?")
+
+    assert capsys.readouterr().err.endswith("(type 'yes' to confirm): \n")
+
+
+@pytest.mark.parametrize("case", ["missing-name", "command-failure", "timeout"])
+def test_a_failed_single_delete_is_one_refusal_object(monkeypatch, capsys, recorded, case):
+    """`--name` failures answer in the boundary's shape, like every other mode.
+
+    They printed ``{"success": false, "message": ...}`` at exit 1 -- no
+    `error`, no remedy. The command failure replays avdmanager's recorded
+    refusal for the name it was recorded with, which the existence check
+    listed: the AVD went between the check and the delete, the window
+    ``_delete_one`` reports on.
+    """
+    gone = "aes_does_not_exist"  # the name avdmanager_delete_missing was recorded with
+    _listing(monkeypatch, [] if case == "missing-name" else [gone])
+    deletes: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        deletes.append(cmd)
+        if case == "timeout":
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+        raise subprocess.CalledProcessError(
+            1, cmd, output="", stderr=recorded.text("avdmanager_delete_missing")
+        )
+
+    monkeypatch.setattr(emulator_delete.subprocess, "run", fake_run)
+
+    result = _run_cli(monkeypatch, capsys, "--name", gone, "--yes", "--json")
+
+    names_the_failure = {
+        "missing-name": f"AVD not found: {gone}",
+        # avdmanager's own sentence, from the recording, survives into `error`.
+        "command-failure": recorded.lines("avdmanager_delete_missing")[0],
+        "timeout": f"did not finish deleting {gone}",
+    }[case]
+    payload = assert_refusal(result, json_mode=True, naming=(names_the_failure,), status=1)
+    assert gone in payload["error"], payload
+    assert "--list" in payload["remedy"], payload
+    assert len(deletes) == (0 if case == "missing-name" else 1), deletes
 
 
 def test_default_keep_count_tunable():

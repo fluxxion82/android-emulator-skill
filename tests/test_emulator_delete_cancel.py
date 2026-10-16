@@ -1,12 +1,13 @@
-"""N4 -- a declined batch delete exits 0; a declined single delete exits 1.
+"""N4 -- a declined batch delete exited 0; a declined single delete exited 1.
 
-``emulator_delete --name X`` that the user declines answers "Deletion
-cancelled by user" and exits 1 (``emulator_delete.py:251-252``, ``:449``).
-The batch paths ask the same question and treat "no" as "nothing to do":
-``_delete_many`` returns ``(0, 0, [])`` (``:320-321``), ``_report_batch``
-prints "No AVDs deleted", and ``--all`` / ``--old`` exit 0 (``:420``,
-``:440``, ``:503-504``). Two answers to one question, and the batch one says
-the request succeeded when it was refused.
+Until the fix, ``emulator_delete --name X`` that the user declined answered
+"Deletion cancelled by user" and exited 1 (main @ 6e4e646:
+``emulator_delete.py:251-252``, ``:449``). The batch paths asked the same
+question and treated "no" as "nothing to do": ``_delete_many`` returned
+``(0, 0, [])`` (``:320-321``), ``_report_batch`` printed "No AVDs deleted",
+and ``--all`` / ``--old`` exited 0 (``:420``, ``:440``, ``:503-504``). Two
+answers to one question, and the batch one said the request succeeded when it
+was refused. Every mode now refuses the same way, through common.cli.
 
 The stub ``avdmanager`` answers ``list avd -c`` with the recorded compact
 listing (one AVD, Pixel_9), so there is something to delete and the prompt is
@@ -62,23 +63,15 @@ def test_a_declined_single_delete_exits_one(one_avd, recorded):
     assert result.returncode == 1, result.stdout
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "N4: emulator_delete.py:320-321,420 -- a declined --all exits 0; and the input() "
-        "prompt at :198 lands on stdout, ahead of the --json document"
-    ),
-)
 @pytest.mark.parametrize("argv", [("--all",), ("--all", "--json")], ids=" ".join)
 def test_n4_a_declined_batch_delete_is_a_cancelled_request(argv, one_avd):
     """N4: refusing ``--all`` is a cancelled request -- a refusal, exit 1.
 
     In the shared boundary's shape, naming the cancellation: one refusal
     object under ``--json``, ``Error:``/``Remedy:`` on stderr otherwise. Under
-    ``--json`` that means stdout is ONLY the object -- today the confirmation
-    prompt (``input()`` at ``emulator_delete.py:198``) is written to stdout
-    first, so a caller parsing the JSON gets
+    ``--json`` that means stdout is ONLY the object -- before the fix the
+    confirmation prompt (``input()`` at ``emulator_delete.py:198`` on main @
+    6e4e646) was written to stdout first, so a caller parsing the JSON got
     ``Permanently delete ALL 1 AVDs? (type 'yes' to confirm): {...`` instead.
     """
     result = _declined(one_avd, *argv)

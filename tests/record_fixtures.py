@@ -2553,6 +2553,49 @@ FIXTURES: list[Fixture] = [
         post=_requires("link -> a b.txt", "\n-rw"),
     ),
     Fixture(
+        name="run_as_cat_missing",
+        args=["shell", "-T", "run-as", COMPOSE_PACKAGE, "cat", "shared_prefs/aes_missing.xml"],
+        record_both_streams=True,
+        description=(
+            "`adb shell -T run-as <pkg> cat` of a file that does not exist: exit "
+            "1, stdout EMPTY, the reason on stderr. Over `adb exec-out` the same "
+            "read exits 0 and the reason arrives on STDOUT -- as the file's "
+            "content -- which is how container.py's --cat answered a missing "
+            "file with the error text as its content, and export wrote it into "
+            "a snapshot as a prefs file (measured on emulator-5554). `-T` (no "
+            "pty) leaves a successful read's bytes as exec-out delivers them: "
+            "fixture.db, 32768 bytes, cmp-identical over both."
+        ),
+    ),
+    Fixture(
+        name="run_as_cat_missing_exec_out",
+        args=["exec-out", "run-as", COMPOSE_PACKAGE, "cat", "shared_prefs/aes_missing.xml"],
+        record_both_streams=True,
+        description=(
+            "The same missing-file read as run_as_cat_missing, over `adb exec-out`: "
+            "exit 0, stderr EMPTY, and the reason on STDOUT where the file's bytes "
+            "would be. Nothing in the result says the read failed, so a caller that "
+            "reads files this way takes the error text for the file -- the transport "
+            "container.py's --cat, --shared-prefs NAME and --export used."
+        ),
+    ),
+    Fixture(
+        name="adb_version",
+        args=[],
+        host_argv=["adb", "version"],
+        description=(
+            "The HOST adb client's `adb version` banner; its first line is "
+            "'Android Debug Bridge version X.Y.Z'. container.py reads app files "
+            "with `adb shell -T`, which a client older than 1.0.36 (platform-tools "
+            "24) does not refuse: it forwards `-T` to the device shell as command "
+            "text and exits 0 after printing the shell's error, which a read "
+            "deciding by exit status takes for the file. So the client is checked "
+            "against this line before the first read. The install path is "
+            "scrubbed of the recording account's home directory."
+        ),
+        post=_chain(_scrub_home_paths, _requires("Android Debug Bridge version ")),
+    ),
+    Fixture(
         name="sqlite_schema_host",
         args=[],
         prepare=_pull_app_database,
