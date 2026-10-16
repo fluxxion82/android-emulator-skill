@@ -73,7 +73,20 @@ DERIVATION_ARG_MAX = 120
 STATIC_REPEAT_CAP = 10_000
 
 # Keyword arguments that hand fabricated output to a test double.
-OUTPUT_KEYWORDS = ("stdout", "stderr", "output")
+#
+# `writes` is tests/fake_toolchain.py's Rule keyword for files a stub writes as
+# a side effect -- the JUnit XML a fake gradlew leaves behind for the build
+# parser to read. That is tool output reaching a parser by another door, so it
+# is held to the same rule (review of PR #20: XML handed through `writes=` was
+# invisible to this ratchet).
+OUTPUT_KEYWORDS = ("stdout", "stderr", "output", "writes")
+
+# Test helpers that are not `test_*.py` but build test doubles, so a literal
+# moved into one is still a transcript handed to a parser. Named exactly, not
+# globbed: a glob over tests/ would also pick up conftest.py and the recorders,
+# whose literals are commands, not output. (Review of PR #20: the fake
+# toolchain was outside the scan.)
+SCANNED_HELPERS = ("fake_toolchain.py",)
 
 # Fixtures that hand back verbatim recorded output. An expression reaching one
 # of these is ground truth however much it is then reshaped -- CLAUDE.md's
@@ -611,11 +624,19 @@ def _scan_source(source: str, parsers: set[str]) -> set[str]:
     return found
 
 
+def _scanned_modules() -> list[Path]:
+    """Every module the ratchet reads: the test files, plus the named helpers."""
+    helpers = [TESTS / name for name in SCANNED_HELPERS]
+    missing = [path.name for path in helpers if not path.is_file()]
+    assert not missing, f"SCANNED_HELPERS names files that do not exist: {missing}"
+    return sorted(TESTS.rglob("test_*.py")) + helpers
+
+
 def _violations() -> set[str]:
     parsers = _parser_names()
     return {
         f"{path.name}::{name}"
-        for path in sorted(TESTS.rglob("test_*.py"))
+        for path in _scanned_modules()
         for name in _scan_source(path.read_text(encoding="utf-8"), parsers)
     }
 
@@ -1035,6 +1056,33 @@ def test_the_documented_derivations_are_not_debt():
     offenders = {entry.split("::")[0] for entry in _violations()}
     assert "test_crash_triage.py" not in offenders
     assert "test_anr_watcher.py" not in offenders
+
+
+def test_the_fake_toolchain_helper_is_scanned_and_conftest_is_not():
+    """The helper that builds every stub is inside the ratchet, by exact name."""
+    scanned = {path.name for path in _scanned_modules()}
+    assert "fake_toolchain.py" in scanned
+    assert "conftest.py" not in scanned
+    assert "record_fixtures.py" not in scanned
+
+
+def test_a_transcript_handed_to_writes_is_caught():
+    """``writes=`` is a door into a parser, like ``stdout=``."""
+    blob = "<testsuite>" + "x" * 200 + "</testsuite>"
+    found = _scan_source(
+        f"Rule(('testDebugUnitTest',), writes=(('/p/TEST-A.xml', {blob!r}),))\n",
+        _parser_names(),
+    )
+    assert found == {"Rule"}
+
+
+def test_a_recording_handed_to_writes_is_not_flagged():
+    found = _scan_source(
+        "def test_x(recorded_gradle):\n"
+        "    Rule(('t',), writes=(('/p/TEST-A.xml', recorded_gradle('junit_xml_error_case')),))\n",
+        _parser_names(),
+    )
+    assert found == set()
 
 
 def _string_constants(source: str) -> set[str]:
