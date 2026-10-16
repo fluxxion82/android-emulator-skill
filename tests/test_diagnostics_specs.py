@@ -241,6 +241,44 @@ def test_n6_a_result_file_older_than_the_run_is_not_this_runs_result(
     assert result.returncode == 0, result.stdout
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "N6: gradle/results.py:43-51 -- with no report from this run, the verdict comes "
+        "from an old one, or from nothing"
+    ),
+)
+def test_n6_a_run_that_wrote_no_results_is_not_a_pass(toolchain, tmp_path, recorded_gradle):
+    """N6, the no-results case: filtering everything out must not read as a pass.
+
+    Gradle exits 0 and writes no JUnit XML this run -- what an UP-TO-DATE test
+    task does -- while a passing report from an hour ago (recorded
+    junit_xml_passing_case) sits in the results directory. Today that old
+    report is the verdict: one test, passed. With N6's filter alone, the
+    verdict would come from nothing: "0 tests, 0 failed", success -- X7's
+    shape, a pass no test produced (review of PR #20). Either way the run has
+    no results of its own, and must not report success.
+    """
+    results = _results_dir(tmp_path / "proj")
+    stale = results / "TEST-com.example.PassingTest.xml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(recorded_gradle("junit_xml_passing_case"), encoding="utf-8")
+    an_hour_ago = time.time() - 3600
+    os.utime(stale, (an_hour_ago, an_hour_ago))
+
+    project = _gradle_project(toolchain, tmp_path, Rule(("testDebugUnitTest",), exit=0))
+    result = toolchain.run("build_and_test.py", "--project", str(project), "--test", "--json")
+    if not toolchain.calls("gradlew"):
+        pytest.fail("gradlew was never run")
+
+    document = result.stdout.strip()
+    assert document.startswith("{"), f"--json printed no object: {document[:200]!r}"
+    payload = json.loads(document)
+    assert payload.get("success") is False, f"a run with no test results passed: {payload}"
+    assert result.returncode != 0, f"a run with no test results exited 0: {payload}"
+
+
 # ===========================================================================
 # D1 -- log_monitor --severity: an unknown name is a usage error.
 # ===========================================================================
