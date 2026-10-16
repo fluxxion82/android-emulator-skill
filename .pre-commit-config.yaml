@@ -4,6 +4,13 @@
 #    by `pre-commit install` alone)
 # Run manually: pre-commit run --all-files
 
+# Recorded fixtures are tool output kept byte for byte. "Fixing" their trailing
+# whitespace or final newline makes them something no tool printed (avdmanager
+# pads its progress lines and ends `delete avd` with no newline), and identify
+# classes am_profile_hang.trace as text because its header is, so the
+# whitespace hooks would rewrite bytes inside its binary record stream.
+exclude: ^tests/fixtures/recorded/
+
 repos:
   # Black - Code formatter
   - repo: https://github.com/psf/black
