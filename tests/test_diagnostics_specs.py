@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fake_toolchain import FakeToolchain, Rule
+from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
 # The threadtime layout, read for its PRIORITY and PID columns only:
 #   MM-DD HH:MM:SS.mmm  PID  TID  P  Tag: message
@@ -574,39 +574,56 @@ def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(toolchain, rec
 # ===========================================================================
 
 
+X6_MODES = {
+    # argv: (json_mode, streaming)
+    ("--watch", "--duration", "5"): (False, True),
+    ("--watch", "--duration", "5", "--json"): (True, True),
+    ("--since", "1m"): (False, False),
+    ("--since", "1m", "--json"): (True, False),
+}
+
+
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="X6: anr_watcher.py:184-203,222-232 report success when adb fails",
+    reason=(
+        "X6: anr_watcher.py:184-203,222-232 report success when adb fails; "
+        "a device-not-found answer is device-unavailable, exit 3"
+    ),
 )
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ("--watch", "--duration", "5"),
-        ("--watch", "--duration", "5", "--json"),
-        ("--since", "1m"),
-        ("--since", "1m", "--json"),
-    ],
-    ids=lambda argv: " ".join(argv),
-)
-def test_x6_a_failing_adb_is_not_a_quiet_watch(argv, toolchain, recorded_anywhere):
+@pytest.mark.parametrize("argv", list(X6_MODES), ids=" ".join)
+def test_x6_a_device_that_is_not_there_is_not_a_quiet_watch(
+    argv, toolchain, recorded, recorded_anywhere
+):
     """X6: ``anr_watcher.py:184-203`` (--watch) and ``:222-232`` (--since).
 
     Both read adb's stdout to EOF and return True without looking at how adb
     exited, so a device that is not there reads as a device that had no ANRs:
-    exit 0, "No ANR/jank events detected." The adb here fails every call with
-    the recorded device-not-found message, the exit-code sweep's double.
+    exit 0, "No ANR/jank events detected." Here ``adb devices`` lists the
+    recorded emulator, and every other call -- the logcat read -- answers with
+    the recorded device-not-found message and exit 1.
+
+    Under the shared boundary that is a refusal with exit 3, device
+    unavailable: ``adb_exec`` classifies exactly this text as
+    ``DeviceNotFoundError``. ``--watch`` is a streaming mode, so under
+    ``--json`` the refusal object is the last line of stdout; ``--since`` is
+    not, so the object is the whole of it.
     """
     toolchain.install(
         "adb",
-        [Rule((), stderr=recorded_anywhere("adb_shell_device_not_found"), exit=1)],
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule((), stderr=recorded_anywhere("adb_shell_device_not_found"), exit=1),
+        ],
     )
     result = toolchain.run("anr_watcher.py", *argv)
 
-    assert toolchain.calls("adb"), "anr_watcher never reached for adb"
-    assert "Traceback" not in result.stderr, result.stderr
-    assert result.returncode != 0, f"exit 0 with adb failing:\n{result.stdout}{result.stderr}"
-    assert "error" in (result.stdout + result.stderr).lower(), "the failure is not reported"
+    if not any("logcat" in call for call in toolchain.calls("adb")):
+        pytest.fail(f"anr_watcher never asked for logcat: {toolchain.calls('adb')}")
+    json_mode, streaming = X6_MODES[argv]
+    assert_refusal(
+        result, json_mode=json_mode, naming=("adb", "logcat"), status=3, streaming=streaming
+    )
 
 
 # ===========================================================================

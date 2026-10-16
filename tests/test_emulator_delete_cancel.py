@@ -17,7 +17,7 @@ reached; it answers ``delete avd`` with silence -- and every spec asserts that
 from __future__ import annotations
 
 import pytest
-from fake_toolchain import FakeToolchain, Rule
+from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
 SCRIPT = "emulator_delete.py"
 
@@ -42,9 +42,15 @@ def _deleted(chain: FakeToolchain) -> list[list[str]]:
 
 
 def _declined(chain: FakeToolchain, *argv: str):
+    """Run with "no" on stdin. A deletion after "no" fails loudly, never as N4.
+
+    ``pytest.fail`` rather than an assertion: that would be a far worse defect
+    than the one pinned here, and ``raises=AssertionError`` must not be able
+    to excuse it.
+    """
     result = chain.run(SCRIPT, *argv, stdin="no\n")
-    assert not _deleted(chain), f"an AVD was deleted after the user typed no: {_deleted(chain)}"
-    assert "Traceback" not in result.stderr, result.stderr
+    if _deleted(chain):
+        pytest.fail(f"an AVD was deleted after the user typed no: {_deleted(chain)}")
     return result
 
 
@@ -58,13 +64,23 @@ def test_a_declined_single_delete_exits_one(one_avd, recorded):
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="N4: emulator_delete.py:320-321,420 -- a declined --all reports success, exit 0",
+    reason=(
+        "N4: emulator_delete.py:320-321,420 -- a declined --all exits 0; and the input() "
+        "prompt at :198 lands on stdout, ahead of the --json document"
+    ),
 )
 @pytest.mark.parametrize("argv", [("--all",), ("--all", "--json")], ids=" ".join)
-def test_n4_a_declined_batch_delete_exits_one_like_a_declined_single_one(argv, one_avd):
-    """N4: refusing ``--all`` is a cancelled request, exit 1, not "nothing to do"."""
+def test_n4_a_declined_batch_delete_is_a_cancelled_request(argv, one_avd):
+    """N4: refusing ``--all`` is a cancelled request -- a refusal, exit 1.
+
+    In the shared boundary's shape, naming the cancellation: one refusal
+    object under ``--json``, ``Error:``/``Remedy:`` on stderr otherwise. Under
+    ``--json`` that means stdout is ONLY the object -- today the confirmation
+    prompt (``input()`` at ``emulator_delete.py:198``) is written to stdout
+    first, so a caller parsing the JSON gets
+    ``Permanently delete ALL 1 AVDs? (type 'yes' to confirm): {...`` instead.
+    """
     result = _declined(one_avd, *argv)
-    assert ["list", "avd", "-c"] in one_avd.calls("avdmanager"), "the batch never listed AVDs"
-    assert (
-        result.returncode == 1
-    ), f"{' '.join(argv)} declined, exit {result.returncode}:\n{result.stdout}"
+    if ["list", "avd", "-c"] not in one_avd.calls("avdmanager"):
+        pytest.fail(f"the batch never listed AVDs, so no prompt was reached: {one_avd.calls()}")
+    assert_refusal(result, json_mode="--json" in argv, naming=("cancel",), status=1)

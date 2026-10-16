@@ -48,7 +48,7 @@ import sys
 
 import emulator_create
 import pytest
-from fake_toolchain import FakeToolchain, Rule
+from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
 SCRIPT = "emulator_create.py"
 DEVICE = "pixel_7"
@@ -229,28 +229,36 @@ def _without(toolchain: FakeToolchain, tool: str, how: str) -> None:
         toolchain.install_broken(tool)
 
 
+# --json, or text. Every refusal below is checked in both, against the shared
+# boundary's contract (fake_toolchain.assert_refusal): one refusal object on
+# stdout, or `Error:`/`Remedy:` on stderr with no JSON on stdout.
+OUTPUT = {"json": ("--json",), "text": ()}
+
+
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
     reason="N3: emulator_create.py:511-512 skips the image check when sdkmanager is missing",
 )
+@pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
-def test_n3_create_does_not_skip_the_image_check_without_sdkmanager(how, toolchain, recorded):
+def test_n3_create_does_not_skip_the_image_check_without_sdkmanager(
+    how, output, toolchain, recorded
+):
     """N3: no sdkmanager -> no installed list -> ``if installed`` skips the check.
 
     ``avdmanager create`` then runs against an image nobody verified. Without
-    sdkmanager the create cannot know the image is there, so it must stop and
-    say which tool is missing -- and must not have created anything.
+    sdkmanager the create cannot know the image is there, so it must refuse,
+    naming sdkmanager -- and must not have created anything.
     """
     _avdmanager(toolchain, recorded)
     _without(toolchain, "sdkmanager", how)
     result = toolchain.run(
-        SCRIPT, "--device", DEVICE, "--api", "34", "--abi", "arm64-v8a", "--json"
+        SCRIPT, "--device", DEVICE, "--api", "34", "--abi", "arm64-v8a", *OUTPUT[output]
     )
 
     assert not _created_packages(toolchain), "an AVD was created with the image check skipped"
-    assert result.returncode != 0, result.stdout
-    assert "sdkmanager" in (result.stdout + result.stderr).lower(), result.stdout
+    assert_refusal(result, json_mode=output == "json", naming=("sdkmanager",), status=1)
 
 
 @pytest.mark.xfail(
@@ -258,18 +266,18 @@ def test_n3_create_does_not_skip_the_image_check_without_sdkmanager(how, toolcha
     raises=AssertionError,
     reason="X3: emulator_create.py:393,404,421,432 answer {'system_images': []} at exit 0 with no sdkmanager",
 )
+@pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
-def test_x3_list_images_without_sdkmanager_is_an_error(how, toolchain):
-    """X3 remainder: ``--list-images --json`` with no sdkmanager.
+def test_x3_list_images_without_sdkmanager_is_an_error(how, output, toolchain):
+    """X3 remainder: ``--list-images`` with no sdkmanager.
 
     Measured: ``{"system_images": []}``, exit 0 -- "this host has no images"
     and "I could not ask" in one answer.
     """
     _without(toolchain, "sdkmanager", how)
-    result = toolchain.run(SCRIPT, "--list-images", "--json")
+    result = toolchain.run(SCRIPT, "--list-images", *OUTPUT[output])
 
-    assert result.returncode != 0, result.stdout
-    assert "sdkmanager" in (result.stdout + result.stderr).lower(), result.stdout
+    assert_refusal(result, json_mode=output == "json", naming=("sdkmanager",), status=1)
 
 
 @pytest.mark.xfail(
@@ -277,14 +285,14 @@ def test_x3_list_images_without_sdkmanager_is_an_error(how, toolchain):
     raises=AssertionError,
     reason="X3: emulator_create.py:326,369 answer {'devices': []} at exit 0 with no avdmanager",
 )
+@pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
-def test_x3_list_devices_without_avdmanager_is_an_error(how, toolchain):
-    """X3 remainder: ``--list-devices --json`` with no avdmanager."""
+def test_x3_list_devices_without_avdmanager_is_an_error(how, output, toolchain):
+    """X3 remainder: ``--list-devices`` with no avdmanager."""
     _without(toolchain, "avdmanager", how)
-    result = toolchain.run(SCRIPT, "--list-devices", "--json")
+    result = toolchain.run(SCRIPT, "--list-devices", *OUTPUT[output])
 
-    assert result.returncode != 0, result.stdout
-    assert "avdmanager" in (result.stdout + result.stderr).lower(), result.stdout
+    assert_refusal(result, json_mode=output == "json", naming=("avdmanager",), status=1)
 
 
 @pytest.mark.xfail(
@@ -292,8 +300,9 @@ def test_x3_list_devices_without_avdmanager_is_an_error(how, toolchain):
     raises=AssertionError,
     reason="X3: emulator_create.py:326 -- no avdmanager reads as 'device not found'",
 )
+@pytest.mark.parametrize("output", list(OUTPUT))
 @pytest.mark.parametrize("how", NO_TOOL)
-def test_x3_create_without_avdmanager_names_the_missing_tool(how, toolchain, recorded):
+def test_x3_create_without_avdmanager_names_the_missing_tool(how, output, toolchain, recorded):
     """X3 remainder: a create with no avdmanager blames the device name.
 
     The empty device-definition list makes every ``--device`` "not found",
@@ -306,10 +315,9 @@ def test_x3_create_without_avdmanager_names_the_missing_tool(how, toolchain, rec
         recorded.text("sdkmanager_list_installed"),
         recorded.text("sdkmanager_list"),
     )
-    result = toolchain.run(SCRIPT, "--device", DEVICE, "--api", "34", "--json")
+    result = toolchain.run(SCRIPT, "--device", DEVICE, "--api", "34", *OUTPUT[output])
 
-    assert result.returncode != 0, result.stdout
-    assert "avdmanager" in (result.stdout + result.stderr).lower(), result.stdout
+    assert_refusal(result, json_mode=output == "json", naming=("avdmanager",), status=1)
 
 
 def test_a_broken_tool_is_really_reached(toolchain):

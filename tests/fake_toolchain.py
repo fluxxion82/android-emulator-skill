@@ -294,3 +294,101 @@ class FakeToolchain:
                 f"{tool} resolves to {found}, outside the fake bin -- a real SDK "
                 f"tool is reachable and these specs would drive a real device"
             )
+
+
+# --- the refusal contract ------------------------------------------------------
+#
+# What a script must print when it refuses, as the shared CLI boundary (PR #18,
+# `common/cli.py`) defines it -- the contract the Inc 1 fixes are written
+# against. The red specs assert it rather than "non-zero, and the tool's name
+# somewhere", which a traceback also satisfies (review of PR #20):
+#
+#   --json, non-streaming   stdout is exactly one object
+#                           {"success": false, "error": <str>, "remedy": <str>}
+#   --json, streaming       that object is the LAST line of stdout
+#   text                    stderr carries `Error: <str>` then `Remedy: <str>`,
+#                           and stdout carries no JSON
+#   exit status             1 failure, 2 usage, 3 device unavailable
+#
+# `error` must NAME what failed -- the tool or the operation -- checked as a
+# case-insensitive substring from a set the spec chooses, never as a sentence.
+
+
+def _json_lines(text: str) -> list[str]:
+    """Lines of ``text`` that parse, on their own, as a JSON object."""
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            if isinstance(json.loads(stripped), dict):
+                found.append(stripped)
+        except json.JSONDecodeError:
+            continue
+    return found
+
+
+def assert_refusal(
+    result: subprocess.CompletedProcess,
+    *,
+    json_mode: bool,
+    naming: tuple[str, ...],
+    status: int,
+    streaming: bool = False,
+) -> dict | None:
+    """Assert ``result`` is a refusal in the shared boundary's shape.
+
+    Args:
+        result: The finished run.
+        json_mode: Whether ``--json`` was asked for.
+        naming: Any one of these (case-insensitive) must appear in the error --
+            the tool or operation that failed.
+        status: The exit status the refusal must carry (1, 2 or 3).
+        streaming: A streaming mode, where the refusal is the last stdout line.
+
+    Returns:
+        The parsed refusal object under ``--json``, else None.
+
+    Raises:
+        AssertionError: on any departure from the contract. A malformed
+            document that LOOKS like an object (starts and ends with a brace)
+            raises JSONDecodeError instead: that is a broken fix, not the
+            pinned defect, and ``raises=AssertionError`` must not excuse it.
+    """
+    names = tuple(name.lower() for name in naming)
+    shown = f"\nstdout: {result.stdout[-600:]!r}\nstderr: {result.stderr[-600:]!r}"
+
+    assert "Traceback" not in result.stderr, f"refused by crashing:{shown}"
+    assert result.returncode == status, f"exit {result.returncode}, not {status}{shown}"
+
+    if json_mode:
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert lines, f"--json printed nothing on stdout{shown}"
+        document = lines[-1] if streaming else result.stdout.strip()
+        assert document.startswith("{") and document.endswith(
+            "}"
+        ), f"stdout is not {'a last line holding ' if streaming else ''}one JSON object{shown}"
+        objects = len(_json_lines(result.stdout))
+        assert streaming or objects <= 1, f"stdout holds {objects} JSON objects, not one{shown}"
+        payload = json.loads(document)
+        assert isinstance(payload, dict), f"not an object: {payload!r}"
+        assert payload.get("success") is False, f"success is not false: {payload!r}"
+        error, remedy = payload.get("error"), payload.get("remedy")
+        assert isinstance(error, str) and error.strip(), f"no error string: {payload!r}"
+        assert isinstance(remedy, str) and remedy.strip(), f"no remedy string: {payload!r}"
+        assert any(
+            name in error.lower() for name in names
+        ), f"the error does not name any of {naming}: {error!r}"
+        return payload
+
+    stderr_lines = result.stderr.splitlines()
+    errors = [i for i, line in enumerate(stderr_lines) if line.startswith("Error:")]
+    remedies = [i for i, line in enumerate(stderr_lines) if line.startswith("Remedy:")]
+    assert errors, f"no `Error:` line on stderr{shown}"
+    assert remedies and remedies[-1] > errors[0], f"no `Remedy:` line after the error{shown}"
+    assert any(
+        name in stderr_lines[i].lower() for i in errors for name in names
+    ), f"no `Error:` line names any of {naming}{shown}"
+    assert not _json_lines(result.stdout), f"text mode printed JSON on stdout{shown}"
+    return None

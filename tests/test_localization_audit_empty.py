@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from fake_toolchain import SCRIPTS
+from fake_toolchain import SCRIPTS, assert_refusal
 
 SCRIPT = SCRIPTS / "localization_audit.py"
 
@@ -41,7 +41,13 @@ def _clean_report(stdout: str) -> bool:
     "flags", [(), ("--json",), ("--strict",)], ids=lambda f: " ".join(f) or "text"
 )
 def test_n11_an_empty_res_dir_is_an_error(flags, tmp_path):
-    """N11: a ``--res`` holding no string resources fails, and says why."""
+    """N11: a ``--res`` holding no string resources is refused, naming it.
+
+    A refusal in the shared boundary's shape, exit 1 -- the same status the
+    missing-directory refusal at ``:443-445`` already uses, and not 2, which
+    ``--strict`` spends on *findings*. The error names the directory it
+    looked in, or the ``strings.xml`` it did not find there.
+    """
     import subprocess
     import sys
 
@@ -55,7 +61,10 @@ def test_n11_an_empty_res_dir_is_an_error(flags, tmp_path):
         check=False,
     )
 
-    assert "Traceback" not in result.stderr, result.stderr
     assert not _clean_report(result.stdout), f"an empty --res audited clean:\n{result.stdout}"
-    assert result.returncode != 0, result.stdout
-    assert (result.stdout + result.stderr).strip(), "failed without saying why"
+    assert_refusal(
+        result,
+        json_mode="--json" in flags,
+        naming=(str(res).lower(), "strings.xml"),
+        status=1,
+    )
