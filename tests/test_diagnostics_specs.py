@@ -8,18 +8,22 @@ marked spec red, so a marker cannot outlive its defect.
 
 Every marker also carries ``raises=AssertionError``. Strict mode rejects an
 unexpected PASS but accepts any way of failing, so on its own it would excuse
-a hung worker, a JSON decode error or a missing snapshot file as "still the
-pinned defect". Narrowed to the assertion, a spec that breaks some other way
-fails loudly. The unmarked controls beside each group check the harness itself.
+a JSON decode error or a missing snapshot file as "still the pinned defect".
+Narrowed to the assertion -- and with every harness prerequisite (an artifact
+that must exist, a tool that must have been asked, a recording that must still
+hold what the spec needs) failing through ``pytest.fail`` instead -- a spec
+that breaks some other way fails loudly. The unmarked controls beside each
+group check the harness itself.
 
-**What these assert, and what they deliberately do not.** Every spec drives
-the real CLI as a subprocess (or ``main()`` where a host fact has to be
-patched) and reads what an agent would read: exit status, stdout, the JSON, the
-files a snapshot leaves behind. None of them names a function the fix has to
-keep, so Inc 1 can restructure freely -- the test is the contract, not the
-implementation. Where a spec also checks the command a script sent, that is
-because the device would answer differently to a different command and the fake
-cannot (see D1 and D3).
+**What these assert, and what they deliberately do not.** The specs drive the
+real CLI as a subprocess, or the ANR pipeline over recorded lines where that
+is the only deterministic path (D5, A5), and read what an agent would read:
+exit status, stdout, the JSON, the files a snapshot leaves behind. A refusal
+is checked against the shared boundary's contract (PR #18), through
+``fake_toolchain.assert_refusal``. Wording and implementation are left to the
+fix -- the test is the contract, not the code. The one place a command sent to
+the device is checked is D1's unmarked floor: the fake ignores ``*:P``
+priority filters, so only the command can show a device dropping warnings.
 
 **Every byte a fake tool prints is recorded.** The toolchain comes from
 ``tests/fake_toolchain.py``; each rule is handed text read through the
