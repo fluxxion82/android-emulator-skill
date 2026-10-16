@@ -397,8 +397,33 @@ def _crash_loop_pids(recorded) -> list[str]:
     for m in _threadtime_lines(recorded.text("logcat_crash_loop")):
         if m["pid"] not in pids:
             pids.append(m["pid"])
-    assert len(pids) >= 2, "the crash loop recording no longer holds a restart"
+    if len(pids) < 2:
+        pytest.fail("the crash loop recording no longer holds a restart")
     return pids
+
+
+def _device_buffer(recorded) -> tuple[str, set[str]]:
+    """What the device's buffer holds: other processes' logging, then the crash loop.
+
+    Two recordings, concatenated in time order (logcat_threadtime is 08-31,
+    logcat_crash_loop 09-01), so the window an agent asks for holds both the
+    app's three crashed processes and system processes that are not the app.
+    Returns the transcript and the pids that are NOT the app.
+    """
+    unrelated = {m["pid"] for m in _threadtime_lines(recorded.text("logcat_threadtime"))}
+    app = set(_crash_loop_pids(recorded))
+    if not unrelated or unrelated & app:
+        pytest.fail(f"the two recordings no longer separate app {app} from others {unrelated}")
+    return recorded.text("logcat_threadtime") + recorded.text("logcat_crash_loop"), unrelated
+
+
+def _assert_the_apps_window(seen: set[str], pids: list[str], unrelated: set[str]) -> None:
+    """The crashed process is in; nothing that is not the app is."""
+    assert (
+        pids[0] in seen
+    ), f"the crashed process {pids[0]} is missing from the window; saw only {sorted(seen)}"
+    leaked = sorted(seen & unrelated)
+    assert not leaked, f"processes that are not the app leaked into its window: {leaked}"
 
 
 @pytest.mark.xfail(
@@ -406,7 +431,7 @@ def _crash_loop_pids(recorded) -> list[str]:
     raises=AssertionError,
     reason="D4: log_monitor.py:316-333,366-367 filters to the restarted app's new pid only",
 )
-def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, recorded):
+def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, tmp_path, recorded):
     """D4: ``log_monitor.py:316-333,366-367``.
 
     ``--app`` resolves ONE pid with ``pidof`` and passes ``--pid=`` to logcat.
@@ -414,19 +439,26 @@ def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, reco
     is looking for -- logged by the process that died -- is filtered out of the
     very window it asked for. Recorded: logcat_crash_loop, three crashes under
     three pids.
+
+    Both directions are pinned. Dropping the package filter altogether would
+    bring the crashed process back, along with every other process on the
+    device; the window must hold the app's processes, old and new, and none
+    of the others (review of PR #20).
     """
     pids = _crash_loop_pids(recorded)
-    _snapshot_device(toolchain, recorded, recorded.text("logcat_crash_loop"), pid_answer=pids[-1])
+    buffer, unrelated = _device_buffer(recorded)
+    _snapshot_device(toolchain, recorded, buffer, pid_answer=pids[-1])
+    saved = tmp_path / "logs"
     result = toolchain.run(
-        "log_monitor.py", "--app", PACKAGE, "--last", "5m", "--json", ANDROID_EMU_LOG_TAIL="500"
+        "log_monitor.py", "--app", PACKAGE, "--last", "5m", "--output", str(saved), "--json"
     )
-    assert result.returncode == 0, result.stderr
-    seen = {
-        m["pid"] for m in _threadtime_lines("\n".join(json.loads(result.stdout)["sample_logs"]))
-    }
-    assert (
-        pids[0] in seen
-    ), f"the crashed process {pids[0]} is missing from the window; saw only {sorted(seen)}"
+    if result.returncode != 0:
+        pytest.fail(f"log_monitor failed outright:\n{result.stderr}")
+    logs = sorted(saved.glob("*.log"))
+    if len(logs) != 1:
+        pytest.fail(f"expected one saved log under {saved}, found {logs}")
+    seen = {m["pid"] for m in _threadtime_lines(logs[0].read_text(encoding="utf-8"))}
+    _assert_the_apps_window(seen, pids, unrelated)
 
 
 @pytest.mark.xfail(
@@ -437,16 +469,24 @@ def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, reco
 def test_d4_app_state_capture_keeps_the_crashed_pid_of_a_restarted_app(
     toolchain, tmp_path, recorded
 ):
-    """D4, the same shape in ``app_state_capture.py:410-414``."""
+    """D4, the same shape in ``app_state_capture.py:410-414``, both directions."""
     pids = _crash_loop_pids(recorded)
-    _snapshot_device(toolchain, recorded, recorded.text("logcat_crash_loop"), pid_answer=pids[-1])
+    buffer, unrelated = _device_buffer(recorded)
+    _snapshot_device(toolchain, recorded, buffer, pid_answer=pids[-1])
     output = tmp_path / "snapshots"
-    toolchain.run("app_state_capture.py", "--package", PACKAGE, "--output", str(output), "--json")
+    toolchain.run(
+        "app_state_capture.py",
+        "--package",
+        PACKAGE,
+        "--output",
+        str(output),
+        "--log-lines",
+        "100000",
+        "--json",
+    )
     saved = _snapshot_artifact(output, "app-logs.txt").read_text(encoding="utf-8")
     seen = {m["pid"] for m in _threadtime_lines(saved)}
-    assert (
-        pids[0] in seen
-    ), f"the crashed process {pids[0]} is missing from the snapshot; saw only {sorted(seen)}"
+    _assert_the_apps_window(seen, pids, unrelated)
 
 
 def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
@@ -454,30 +494,28 @@ def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
 
     Without this the two D4 specs would pass against a fake that ignored the
     filter -- which is the bug they pin. Asked directly, so the control stays
-    true whatever Inc 1 changes about how the scripts filter.
+    true whatever Inc 1 changes about how the scripts filter. Unfiltered, the
+    buffer holds the app AND the unrelated processes the exclusion half needs.
     """
     import subprocess
 
     pids = _crash_loop_pids(recorded)
-    _snapshot_device(toolchain, recorded, recorded.text("logcat_crash_loop"), pid_answer=pids[-1])
-    answer = subprocess.run(
-        [str(toolchain.bin / "adb"), "logcat", "-d", f"--pid={pids[-1]}"],
-        env=toolchain.env(),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-    )
-    assert {m["pid"] for m in _threadtime_lines(answer.stdout)} == {pids[-1]}
-    unfiltered = subprocess.run(
-        [str(toolchain.bin / "adb"), "logcat", "-d"],
-        env=toolchain.env(),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-    )
-    assert {m["pid"] for m in _threadtime_lines(unfiltered.stdout)} == set(pids)
+    buffer, unrelated = _device_buffer(recorded)
+    _snapshot_device(toolchain, recorded, buffer, pid_answer=pids[-1])
+
+    def ask(*argv: str) -> set[str]:
+        answer = subprocess.run(
+            [str(toolchain.bin / "adb"), "logcat", "-d", *argv],
+            env=toolchain.env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return {m["pid"] for m in _threadtime_lines(answer.stdout)}
+
+    assert ask(f"--pid={pids[-1]}") == {pids[-1]}
+    assert ask() == set(pids) | unrelated
 
 
 # ===========================================================================
