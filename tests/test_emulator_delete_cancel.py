@@ -58,6 +58,7 @@ def test_a_declined_single_delete_exits_one(one_avd, recorded):
     """The reference behaviour, unmarked and green today."""
     name = recorded.text("avdmanager_list_avd_compact").split()[0]
     result = _declined(one_avd, "--name", name)
+    assert "Traceback" not in result.stderr + result.stdout, result.stderr
     assert result.returncode == 1, result.stdout
 
 

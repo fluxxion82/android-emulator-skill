@@ -544,10 +544,26 @@ def test_d4_log_monitor_keeps_the_crashed_pid_of_a_restarted_app(toolchain, tmp_
     _snapshot_device(toolchain, recorded, buffer, pid_answer=pids[-1])
     saved = tmp_path / "logs"
     result = toolchain.run(
-        "log_monitor.py", "--app", PACKAGE, "--last", "5m", "--output", str(saved), "--json"
+        "log_monitor.py",
+        "--app",
+        PACKAGE,
+        "--last",
+        "5m",
+        "--output",
+        str(saved),
+        "--json",
+        ANDROID_EMU_LOG_TAIL="500",
     )
     if result.returncode != 0:
         pytest.fail(f"log_monitor failed outright:\n{result.stderr}")
+
+    # Both places the window reaches an agent: the JSON it reads (sample_logs)
+    # and the log it saved. Checking only the file let a run with correct
+    # disk output and a wrong JSON window pass (verification of PR #20).
+    printed = json.loads(result.stdout)["sample_logs"]
+    seen = {m["pid"] for m in _threadtime_lines("\n".join(printed))}
+    _assert_the_apps_window(seen, pids, unrelated)
+
     logs = sorted(saved.glob("*.log"))
     if len(logs) != 1:
         pytest.fail(f"expected one saved log under {saved}, found {logs}")
