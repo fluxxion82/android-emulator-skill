@@ -78,6 +78,32 @@ def _gradle_project(toolchain: FakeToolchain, root: Path, rule: Rule) -> Path:
     return project
 
 
+def _recorded_counts(recorded_gradle) -> tuple[int, int]:
+    """(failed, passed) across the run's recorded JUnit suites, read off the XML.
+
+    From the suites' own attributes, not typed here: the error case alone is
+    failures="2"; the run's three suites together are 3 failed, 1 passed,
+    1 skipped -- the same "5 tests completed, 3 failed, 1 skipped" the
+    recorded log prints.
+    """
+    import xml.etree.ElementTree as ET
+
+    failed = passed = 0
+    for _, fixture in JUNIT_SUITES:
+        suite = ET.fromstring(recorded_gradle(fixture))
+        tests, skipped = int(suite.get("tests", 0)), int(suite.get("skipped", 0))
+        bad = int(suite.get("failures", 0)) + int(suite.get("errors", 0))
+        failed += bad
+        passed += tests - bad - skipped
+    return failed, passed
+
+
+def _count(text: str, word: str) -> int | None:
+    """The first count printed for ``word``: "3 failed", "1/5 passed" or "Failed: 3"."""
+    match = re.search(rf"(\d+)(?:/\d+)?\s+{word}\b|\b{word}:\s*(\d+)", text, re.IGNORECASE)
+    return int(match.group(1) or match.group(2)) if match else None
+
+
 def _ignore_failures_project(toolchain, tmp_path, recorded_gradle) -> Path:
     """A `test { ignoreFailures = true }` run: three failures, exit 0.
 
@@ -120,7 +146,10 @@ def test_x7_failing_tests_fail_the_build_whatever_gradle_exits(
     over three failing tests (recorded: gradle_junit_error_ignorefailures).
     The verdict must come from the tests, and every output mode must say the
     same thing: exit non-zero, ``success: false`` in JSON and in the cache an
-    agent drills into later, FAIL in text and verbose.
+    agent drills into later, and in text and verbose a verdict line that says
+    FAIL/FAILED with the failed and passed counts the recorded XML holds. A
+    per-test breakdown listing PASSED tests beside FAILED ones is correct
+    output, so "PASS" appearing somewhere is not prohibited (review of PR #20).
     """
     project = _ignore_failures_project(toolchain, tmp_path, recorded_gradle)
     result = toolchain.run(
@@ -130,20 +159,28 @@ def test_x7_failing_tests_fail_the_build_whatever_gradle_exits(
     assert (
         result.returncode != 0
     ), f"{mode}: three JUnit failures and exit {result.returncode}.\n{result.stdout[-600:]}"
+    failed, passed = _recorded_counts(recorded_gradle)
     if mode == "json":
         payload = json.loads(result.stdout)
         assert payload["success"] is False, payload
+        assert payload["test_results"]["failed"] == failed, payload["test_results"]
+        assert payload["test_results"]["passed"] == passed, payload["test_results"]
         from gradle import BuildResultCache
 
         cache = BuildResultCache(
             cache_dir=str(toolchain.home / ".android-emulator-skill" / "cache")
         )
         cached = cache.get(payload["build_id"])
-        assert cached is not None, "the build id printed under --json does not resolve"
+        if cached is None:
+            pytest.fail(f"the build id printed under --json does not resolve: {payload}")
         assert cached["success"] is False, "--get-errors would drill into a build cached as passed"
     else:
-        assert "FAIL" in result.stdout, result.stdout
-        assert "SUCCESS" not in result.stdout and "PASS" not in result.stdout, result.stdout
+        verdict = next((line for line in result.stdout.splitlines() if line.strip()), "")
+        assert re.search(
+            r"\bfail(ed)?\b", verdict, re.IGNORECASE
+        ), f"the verdict line does not say FAILED: {verdict!r}"
+        assert _count(result.stdout, "failed") == failed, result.stdout
+        assert _count(result.stdout, "passed") == passed, result.stdout
 
 
 def test_x7_the_fixture_build_really_reads_three_failures(toolchain, tmp_path, recorded_gradle):
@@ -344,7 +381,7 @@ def _snapshot_artifact(output: Path, name: str) -> Path:
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="D3: app_state_capture.py:85-91 counts errors from prose; :420 requests no format",
+    reason="D3: app_state_capture.py:85-91 counts errors from prose, not the priority column",
 )
 def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
     """D3: ``app_state_capture.py:85-91`` counts errors from prose.
@@ -352,8 +389,10 @@ def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
     A line counts as an error if its text contains "error" or "exception",
     whatever its priority. The count in the snapshot must equal the number of
     E/F lines in the log the snapshot itself saved -- the window it read, as
-    recorded -- and the logcat request must ask for the format that count
-    parses (``:420`` passes ``fmt=None``, inheriting the device's default).
+    recorded. How the fix gets there (which ``-v`` format it asks for, which
+    parser reads it) is not pinned: the review of PR #20 rejected the first
+    version's exact ``-v threadtime`` argv check as an implementation
+    constraint. ``:420`` passing ``fmt=None`` remains the likely cause.
     """
     _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
     output = tmp_path / "snapshots"
@@ -377,11 +416,6 @@ def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
         f"snapshot reports {summary['logs']['errors']} errors; the log it saved has "
         f"{expected} E/F lines"
     )
-
-    logcat_calls = [call for call in toolchain.calls("adb") if "logcat" in call]
-    assert any(
-        call[i : i + 2] == ["-v", "threadtime"] for call in logcat_calls for i in range(len(call))
-    ), f"the snapshot parses threadtime but did not ask for it: {logcat_calls}"
 
 
 # ===========================================================================

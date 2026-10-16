@@ -25,17 +25,20 @@ file is only the failed-probe contract, pinned red until Inc 1 fixes it.
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
 from fake_toolchain import FakeToolchain, Rule
 
 SCRIPT = "android_health_check.sh"
 
-# How the fixed script may phrase the failed probe. Several spellings are
-# accepted so the fix is free to word it; what is not accepted is silence, or
-# "No devices", which is the claim this finding is about.
-FAILED_PROBE = re.compile(r"(could not|couldn't|cannot|can't|failed to) list devices", re.I)
+# The probe the output must name. Not a sentence: "adb devices -l exited 1",
+# "could not run adb devices" and any other wording that names it all pass
+# (review of PR #20 rejected the first version's fixed phrase).
+PROBE = "adb devices"
+
+# The claim this finding is about. With it gone, so is its "  adb devices"
+# hint line -- which today would otherwise satisfy PROBE on its own.
+EMPTY_ANSWER = "No devices or emulators connected"
 
 
 @pytest.fixture
@@ -66,37 +69,38 @@ def test_the_stub_really_fails_the_device_probe(broken_adb):
 def test_h1_a_failed_device_probe_is_named_and_fails_the_check(broken_adb):
     """H1: ``android_health_check.sh:254-263,303``.
 
-    The probe failed, so the check failed: say which probe, exit non-zero, and
+    The probe failed, so the check failed: exit non-zero, name the probe, and
     do not tell the reader that nothing is connected -- nobody looked.
     """
     result = broken_adb.run(SCRIPT)
     output = result.stdout + result.stderr
 
     assert result.returncode != 0, f"a failed device probe exited 0:\n{output[-800:]}"
-    assert FAILED_PROBE.search(output), f"the failed probe is not named:\n{output[-800:]}"
-    assert (
-        "No devices or emulators connected" not in output
-    ), "a probe that failed is reported as an empty answer"
+    assert EMPTY_ANSWER not in output, "a probe that failed is reported as an empty answer"
+    assert PROBE in output, f"the failed probe is not named:\n{output[-800:]}"
 
 
 @pytest.mark.xfail(
     strict=True, raises=AssertionError, reason="H1: android_health_check.sh ignores --json"
 )
-def test_h1_json_is_json_and_fails_too(broken_adb):
+def test_h1_json_is_an_object_saying_the_check_failed(broken_adb):
     """H1: ``--json`` is a flag the script does not have; it must be real.
 
-    Asked for JSON, the script must print a JSON document on stdout -- and the
-    failed probe fails it in that mode as well.
+    Asked for JSON, stdout must be a JSON OBJECT whose ``success`` (or
+    ``ok``) is false, and the run must exit non-zero. A bare ``null`` with
+    exit 1 is not that (review of PR #20).
+
+    Whether stdout is an object at all is the pinned behaviour, asserted on
+    its first character. Decoding happens only after that, unwrapped: a
+    document that starts like an object but does not parse is a broken fix,
+    and ``raises=AssertionError`` must not excuse it as "H1, still red".
     """
     result = broken_adb.run(SCRIPT, "--json")
 
-    try:
-        json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        # An AssertionError, not pytest.fail: the xfail accepts only that, so
-        # a harness that breaks some other way fails loudly instead of being
-        # excused as "H1, still red".
-        raise AssertionError(
-            f"--json stdout is not JSON ({error}); it begins {result.stdout[:80]!r}"
-        ) from error
+    document = result.stdout.strip()
+    assert document.startswith("{"), f"--json stdout is not a JSON object: {document[:80]!r}"
+    payload = json.loads(document)
+    assert isinstance(payload, dict), payload
+    verdict = payload["success"] if "success" in payload else payload.get("ok")
+    assert verdict is False, f"the JSON does not say the check failed: {payload!r}"
     assert result.returncode != 0, "under --json a failed device probe exited 0"

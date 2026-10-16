@@ -33,20 +33,22 @@ NOTE for the Inc 1 implementer of N3: ``tests/test_emulator_create.py:291-295``
 relies on the skipped check this file pins as a defect. That file is being
 rewritten by another unit this wave and was deliberately not edited here.
 
-L11 runs ``main()`` in-process, because the host has to be patched:
-``platform.machine`` is replaced on the ``platform`` module, so the fix must
-call it as ``platform.machine()`` (a ``from platform import machine`` binding
-would not see the patch).
+L11 runs ``main()`` in-process, because the host has to be patched.
+``platform.machine`` is replaced BEFORE the script is imported fresh, so the
+fix may read the host however it likes -- per call, at import time, or
+through a ``from platform import machine`` binding. Which flag carries the
+image to ``avdmanager create`` (``-k`` or ``--package``) is not pinned either:
+the image id is found in the call by its own shape.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import platform
 import re
 import sys
 
-import emulator_create
 import pytest
 from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
@@ -93,10 +95,38 @@ def _sdk(toolchain: FakeToolchain, recorded) -> None:
     )
 
 
-def _main(monkeypatch, capsys, toolchain: FakeToolchain, machine: str, *argv: str):
-    """Run ``emulator_create.main()`` on a host reporting ``machine``."""
-    toolchain.apply(monkeypatch)
+def _import_on_host(monkeypatch, name: str, machine: str):
+    """Import ``name`` afresh on a host whose ``platform.machine()`` is ``machine``."""
     monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    return importlib.import_module(name)
+
+
+def test_the_host_patch_reaches_an_import_time_binding(monkeypatch, tmp_path):
+    """Control, unmarked: the L11 harness patches before the import, not after.
+
+    A module that binds ``from platform import machine`` and reads it at
+    import time -- the shape the review said the first harness would miss --
+    sees the patched host.
+    """
+    module = tmp_path / "host_probe_l11.py"
+    module.write_text("from platform import machine\nHOST = machine()\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert _import_on_host(monkeypatch, "host_probe_l11", "aarch64").HOST == "aarch64"
+
+
+def _main(monkeypatch, capsys, toolchain: FakeToolchain, machine: str, *argv: str):
+    """Run ``emulator_create.main()`` on a host reporting ``machine``.
+
+    The host is patched BEFORE the script is imported -- the module is dropped
+    from ``sys.modules`` and imported fresh -- so a fix that reads the machine
+    at import time, or binds ``from platform import machine``, sees the patch
+    as well as one that calls ``platform.machine()`` per run (review of PR
+    #20: patching after import constrained the fix to the latter).
+    ``monkeypatch`` puts the original module back afterwards.
+    """
+    toolchain.apply(monkeypatch)
+    emulator_create = _import_on_host(monkeypatch, "emulator_create", machine)
     monkeypatch.setattr(sys, "argv", ["emulator_create.py", *argv])
     with pytest.raises(SystemExit) as exited:
         emulator_create.main()
@@ -104,12 +134,17 @@ def _main(monkeypatch, capsys, toolchain: FakeToolchain, machine: str, *argv: st
     return exited.value.code, captured.out + captured.err
 
 
-def _created_packages(toolchain: FakeToolchain) -> list[str]:
-    packages = []
+def _created_images(toolchain: FakeToolchain) -> list[str]:
+    """The system image of every ``avdmanager create avd`` the script ran.
+
+    Read off the stub's argv log by the image id's own shape, whichever flag
+    carries it -- ``--package`` and ``-k`` are both avdmanager's spelling.
+    """
+    images = []
     for call in toolchain.calls("avdmanager"):
-        if call[:2] == ["create", "avd"] and "--package" in call:
-            packages.append(call[call.index("--package") + 1])
-    return packages
+        if "create" in call and "avd" in call:
+            images += [arg for arg in call if IMAGE_ID.fullmatch(arg)]
+    return images
 
 
 # --- L11 --------------------------------------------------------------------
@@ -135,9 +170,9 @@ def test_l11_the_default_abi_is_the_hosts(machine, monkeypatch, capsys, toolchai
         monkeypatch, capsys, toolchain, machine, "--device", DEVICE, "--api", "34", "--json"
     )
 
-    assert _created_packages(toolchain) == [
-        "system-images;android-34;google_apis;arm64-v8a"
-    ], output
+    created = _created_images(toolchain)
+    assert len(created) == 1, f"expected one AVD created, got {created}:\n{output}"
+    assert "android-34;" in created[0] and created[0].endswith(";arm64-v8a"), created
     assert code == 0, output
 
 
@@ -164,7 +199,7 @@ def test_l11_the_not_installed_remedy_names_an_image_the_host_can_run(
     assert code != 0, output
     abis = {m["abi"] for m in IMAGE_ID.finditer(output) if "android-30;" in m[0]}
     assert abis == {"arm64-v8a"}, f"the remedy for API 30 names {sorted(abis)}:\n{output}"
-    assert not _created_packages(toolchain)
+    assert not _created_images(toolchain)
 
 
 @pytest.mark.xfail(
@@ -257,7 +292,7 @@ def test_n3_create_does_not_skip_the_image_check_without_sdkmanager(
         SCRIPT, "--device", DEVICE, "--api", "34", "--abi", "arm64-v8a", *OUTPUT[output]
     )
 
-    assert not _created_packages(toolchain), "an AVD was created with the image check skipped"
+    assert not _created_images(toolchain), "an AVD was created with the image check skipped"
     assert_refusal(result, json_mode=output == "json", naming=("sdkmanager",), status=1)
 
 
@@ -339,4 +374,4 @@ def test_create_output_is_parsed_as_json_when_it_succeeds(toolchain, recorded):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["success"] is True
-    assert _created_packages(toolchain) == ["system-images;android-34;google_apis;arm64-v8a"]
+    assert _created_images(toolchain) == ["system-images;android-34;google_apis;arm64-v8a"]
