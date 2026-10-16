@@ -34,7 +34,7 @@ from pathlib import Path
 from common import cli
 from common.emu_console import RunningVerdict, avd_running
 from common.env_config import env_float, env_int
-from common.sdk_tools import resolve_avd_home
+from common.sdk_tools import AVD_HOME_REMEDY, resolve_avd_home
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
 DEFAULT_ERASE_TIMEOUT = env_int("ANDROID_EMU_ERASE_TIMEOUT", 90)
@@ -83,14 +83,29 @@ class EmulatorEraser:
 
     def list_avds(self) -> list:
         """
-        List available AVDs.
+        List the AVDs under the AVD home, by their ``<name>.avd`` directories.
+
+        No SDK tool is consulted: an erase deletes files in those directories,
+        so the directory listing is the inventory it acts on.
 
         Returns:
-            List of AVD names
+            List of AVD names. Empty means the AVD home exists and holds none.
+
+        Raises:
+            cli.Failure: The AVD home does not exist. That is "could not look",
+                not "no AVDs": it answered ``[]`` at exit 0 -- ``--list`` said
+                "No AVDs found", ``--all`` erased nothing successfully -- on a
+                host whose AVDs were simply somewhere else (N1).
         """
         avd_home = self.get_avd_home()
-        if not avd_home.exists():
-            return []
+        if not avd_home.is_dir():
+            cli.fail(
+                f"AVD home not found: {avd_home} is not a directory, so no AVD could be "
+                f"listed. It is $ANDROID_AVD_HOME, else $ANDROID_SDK_HOME/.android/avd, "
+                f"else ~/.android/avd.",
+                f"If your AVDs live elsewhere, {AVD_HOME_REMEDY}; if this host has none "
+                f"yet, create one with emulator_create.py.",
+            )
 
         avds = []
         for item in avd_home.iterdir():

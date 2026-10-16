@@ -14,10 +14,13 @@ so the arg->command mapping (and parsing) is asserted without a real toolchain.
 from __future__ import annotations
 
 import importlib
+import platform
 import subprocess
 
 import emulator_create
 import pytest
+
+from common.sdk_tools import SdkToolError, without_null_lines
 
 DEVICES = [
     {"id": "pixel_7", "name": "Pixel 7"},
@@ -136,7 +139,7 @@ def test_list_installed_system_images_parses_sdkmanager(monkeypatch, recorded):
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        captured["check"] = kwargs.get("check")
+        captured["timeout"] = kwargs.get("timeout")
         return subprocess.CompletedProcess(
             cmd, 0, stdout=recorded.text("sdkmanager_list_installed"), stderr=""
         )
@@ -146,7 +149,7 @@ def test_list_installed_system_images_parses_sdkmanager(monkeypatch, recorded):
     images = creator.list_installed_system_images()
 
     assert captured["cmd"] == ["/fake/sdkmanager", "--list_installed"]
-    assert captured["check"] is True
+    assert captured["timeout"], "sdkmanager --list_installed went out unbounded"
     assert images, "no images parsed from real sdkmanager output"
     # Only system-images lines; build-tools and platforms are ignored.
     assert all(img["id"].startswith("system-images;") for img in images)
@@ -243,7 +246,11 @@ def test_list_system_images_falls_back_to_the_local_listing_when_list_fails(monk
 
     Returning [] there reads as "this machine has no system images", which is
     the same wrong answer the defect gave. The local `--list_installed` still
-    works with no network, so a failed `--list` degrades to it.
+    works with no network, so a failed `--list` degrades to it -- and says so,
+    so the installed-only answer does not pass for the whole catalogue.
+
+    The failure is a bare non-zero exit: no offline sdkmanager output is
+    recorded, so none is invented here.
     """
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
@@ -253,7 +260,7 @@ def test_list_system_images_falls_back_to_the_local_listing_when_list_fails(monk
     def fake_run(cmd, **kwargs):
         attempted.append(cmd)
         if "--list" in cmd:
-            raise subprocess.CalledProcessError(1, cmd, stderr="Connection refused")
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         return subprocess.CompletedProcess(
             cmd, 0, stdout=recorded.text("sdkmanager_list_installed"), stderr=""
         )
@@ -265,6 +272,27 @@ def test_list_system_images_falls_back_to_the_local_listing_when_list_fails(monk
     assert [cmd[-1] for cmd in attempted] == ["--list", "--list_installed"]
     assert images, "an offline listing came back empty instead of local-only"
     assert all(image["installed"] for image in images)
+    assert len(creator.warnings) == 1, creator.warnings
+    assert "only the installed system images" in creator.warnings[0]
+
+
+def test_a_listing_sdkmanager_cannot_answer_is_an_error_not_an_empty_list(monkeypatch):
+    """X3: both listings failing is "I could not look", not "no images exist".
+
+    The fallback above is for a `--list` that cannot reach the network. When
+    the local listing fails as well there is no true short answer left, and
+    `[]` at exit 0 was the lie. Exit 127 is the sweep's "not installed" double.
+    """
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+    monkeypatch.setattr(
+        emulator_create.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 127, stdout="", stderr=""),
+    )
+
+    with pytest.raises(SdkToolError, match="sdkmanager"):
+        creator.list_system_images()
 
 
 # --- Delta 2: auto-generated AVD name --------------------------------------
@@ -289,41 +317,78 @@ def test_generate_avd_name_empty_base_falls_back():
 # --- create() arg->command mapping (subprocess mocked) ---------------------
 
 
-def test_create_builds_expected_avdmanager_command(monkeypatch):
+def test_create_builds_expected_avdmanager_command(monkeypatch, recorded):
+    """The image check runs against the recorded installed set, then avdmanager.
+
+    This test used to make sdkmanager unavailable in order to skip the check --
+    and the check DID skip, which is N3: with no sdkmanager the create ran
+    avdmanager against an image nobody had verified. The image here is one the
+    recorded host has installed, so the check passes for the right reason.
+    """
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
-    # No system-image pre-check (skips that subprocess call path).
-    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: None)
-
-    captured: dict = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["check"] = kwargs.get("check")
-        captured["input"] = kwargs.get("input")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+    calls: list[dict] = []
+    monkeypatch.setattr(emulator_create.subprocess, "run", _recorded_sdk(recorded, calls))
 
     success, _message, avd_name = creator.create(
-        device_id="pixel_7", api_level=34, name="MyAVD", abi="x86_64", variant="google_apis"
+        device_id="pixel_7", api_level=34, name="MyAVD", abi="arm64-v8a", variant="google_apis"
     )
 
     assert success is True
     assert avd_name == "MyAVD"
-    assert captured["check"] is True
-    assert captured["input"] == "no\n"
-    assert captured["cmd"] == [
+    assert calls[0]["cmd"][1:] == ["--list_installed"], "the image check did not run first"
+    create_call = calls[-1]
+    assert create_call["kwargs"]["check"] is True
+    assert create_call["kwargs"]["input"] == "no\n"
+    assert create_call["cmd"] == [
         "/fake/avdmanager",
         "create",
         "avd",
         "--name",
         "MyAVD",
         "--package",
-        "system-images;android-34;google_apis;x86_64",
+        "system-images;android-34;google_apis;arm64-v8a",
         "--device",
         "pixel_7",
     ]
+
+
+def test_create_refuses_without_sdkmanager_and_runs_nothing(monkeypatch):
+    """N3, at the method: no sdkmanager means no create, not an unchecked one."""
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: None)
+    calls: list = []
+    monkeypatch.setattr(emulator_create.subprocess, "run", lambda cmd, **_kw: calls.append(cmd))
+
+    with pytest.raises(SdkToolError, match=r"sdkmanager not found\. Looked in: PATH"):
+        creator.create(device_id="pixel_7", api_level=34, name="MyAVD", abi="arm64-v8a")
+
+    assert calls == [], "a tool was run although the image could not be checked"
+
+
+@pytest.mark.parametrize(
+    ("machine", "abi"),
+    [
+        ("arm64", "arm64-v8a"),  # macOS on Apple silicon
+        ("aarch64", "arm64-v8a"),  # Linux on ARM
+        ("x86_64", "x86_64"),  # macOS on Intel, Linux
+        ("AMD64", "x86_64"),  # Windows
+    ],
+)
+def test_the_default_abi_follows_the_host(monkeypatch, machine, abi):
+    """L11: the default ABI is read from platform.machine() at call time, not fixed."""
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    assert emulator_create.host_abi() == abi
+
+
+def test_the_help_states_this_hosts_default_abi(monkeypatch, capsys):
+    """L11: `--help` names the ABI this host will get, not a constant."""
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    with pytest.raises(SystemExit):
+        emulator_create.main(["--help"])
+    assert "default: arm64-v8a" in capsys.readouterr().out
 
 
 def test_resolve_device_returns_suggestions_on_miss(monkeypatch):
@@ -524,21 +589,28 @@ def test_deleting_an_avd_that_does_not_exist_reports_avdmanagers_reason(monkeypa
     assert f"There is no Android Virtual Device named '{missing}'." in message, message
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "N13: avdmanager's trailing null line is passed through at "
-        "emulator_create.py:586 / emulator_delete.py:221"
-    ),
-)
 def test_a_failed_delete_does_not_hand_on_avdmanagers_stray_null_line(monkeypatch, recorded):
     """The desired behaviour: the reason, without a line that says nothing."""
     _missing, _success, message = _delete_missing(monkeypatch, recorded)
     assert "null" not in [line.strip() for line in message.splitlines()], message
 
 
-def test_a_listing_timeout_degrades_to_an_empty_list(monkeypatch):
-    """A bounded call raises TimeoutExpired; that must not reach the user raw."""
+def test_only_the_bare_null_line_goes(recorded):
+    """N13's helper on the recording: the reason survives whole, the `null` line does not."""
+    text = recorded.text("avdmanager_delete_missing")
+    cleaned = without_null_lines(text)
+
+    assert cleaned == recorded.lines("avdmanager_delete_missing")[0]
+    assert cleaned.startswith("Error: There is no Android Virtual Device named")
+    assert without_null_lines(recorded.lines("avdmanager_delete_missing")[-1]) == ""
+
+
+def test_a_listing_timeout_is_an_error_not_an_empty_list(monkeypatch):
+    """A bounded call raises TimeoutExpired; it reaches the user as a remedy, not raw.
+
+    It used to degrade to `[]`, and `--list-devices` printed nothing at exit 0
+    -- "no device definitions" for "avdmanager never answered" (X3).
+    """
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
 
@@ -547,21 +619,30 @@ def test_a_listing_timeout_degrades_to_an_empty_list(monkeypatch):
 
     monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
 
-    assert creator.list_device_definitions() == []
+    with pytest.raises(SdkToolError) as excinfo:
+        creator.list_device_definitions()
+
+    assert str(emulator_create.SDK_TOOL_TIMEOUT) in str(excinfo.value)
+    assert excinfo.value.remedy, "the timeout carries no remedy"
 
 
-def test_create_reports_its_own_timeout(monkeypatch):
+def test_create_reports_its_own_timeout(monkeypatch, recorded):
     """avdmanager waiting on stdin used to hang forever; now it is a message."""
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_avdmanager_path", lambda: "/fake/avdmanager")
-    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: None)
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+    replay = _recorded_sdk(recorded, [])
 
-    def fake_run(cmd, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=emulator_create.SDK_TOOL_TIMEOUT)
+    def fake_run(cmd, **kwargs):
+        if cmd[1:3] == ["create", "avd"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=emulator_create.SDK_TOOL_TIMEOUT)
+        return replay(cmd, **kwargs)
 
     monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
 
-    success, message, avd_name = creator.create(device_id="pixel_7", api_level=34, name="MyAVD")
+    success, message, avd_name = creator.create(
+        device_id="pixel_7", api_level=34, name="MyAVD", abi="arm64-v8a"
+    )
 
     assert success is False
     assert avd_name is None

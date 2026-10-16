@@ -73,9 +73,11 @@ MODES = (
         "the same, for one AVD",
     ),
     Mode("emulator_delete.py", ("--json",), 1, "no target printed the help text to stdout"),
-    # An empty AVD home is an answer (no AVDs), so exit 0 -- the point here is
-    # that the verbose progress line no longer precedes it on stdout.
-    Mode("emulator_erase.py", ("--all", "--json", "--verbose"), 0, "verbose progress"),
+    # The point here is that the verbose progress line no longer precedes the
+    # object on stdout. The AVD home in this environment does not EXIST (no
+    # home/.android/avd), so the object is a refusal, exit 1 -- this was pinned
+    # at 0, an empty listing for "could not look", which is N1.
+    Mode("emulator_erase.py", ("--all", "--json", "--verbose"), 1, "verbose progress"),
     Mode("emulator_erase.py", ("--name", "probe", "--json", "--verbose"), 1, "verbose progress"),
     Mode(
         "app_state_capture.py",

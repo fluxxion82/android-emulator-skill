@@ -120,6 +120,14 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Create by device type and API level
    - List available device definitions
    - List available system images
+   - `--abi` defaults to this host's: `arm64-v8a` on an arm64/aarch64 machine
+     (an Apple-silicon Mac's emulator boots nothing else), `x86_64` otherwise;
+     `--help` states the value it will use. A Python running under Rosetta
+     reports `x86_64`, so the default is wrong there: pass `--abi arm64-v8a`
+     explicitly
+   - Checks the image is installed before creating. No `sdkmanager` (or no
+     `avdmanager`) is an error naming where it was looked for, exit 1 — never
+     an empty listing, and never a create of an image nobody could check
    - Options: `--device`, `--api`, `--name`, `--abi`, `--variant`, `--list-devices`, `--list-images`, `--json`
 
 8. **emulator_delete.py** ⭐ NEW - Delete AVDs permanently
@@ -140,6 +148,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
    - Wipe user data without deleting AVD
    - Preserve AVD configuration
+   - Reads the AVD home directly (`$ANDROID_AVD_HOME`, else
+     `$ANDROID_SDK_HOME/.android/avd`, else `~/.android/avd`); no SDK tool is
+     consulted. An AVD home that does not exist is an error naming the path,
+     exit 1 — not "No AVDs found"
    - Batch erase with `--all`; `--verify` polls the AVD on disk until the wipe
      lands, bounded by `--timeout` (default 90s, `ANDROID_EMU_ERASE_TIMEOUT`)
    - Refuses to erase unless every attached emulator has been identified and
@@ -713,12 +725,13 @@ printed name back into `navigator`, so "implemented but unreachable" fails.
   asserts the exit status rather than the message. (The failure *shape* is now
   `common/cli.py`'s; see **Failures** under Known gaps.)
 - **A missing SDK tool says so in the lifecycle scripts** — `device_list`,
-  `emulator_boot`, `emulator_delete`, `emulator_erase` and `emulator_selector`
+  `emulator_boot`, `emulator_create`, `emulator_delete` and `emulator_selector`
   route through `common/sdk_tools.py`, which names where the tool was looked
   for and gives the `cmdline-tools` remedy instead of returning an empty list.
   A tool that ran and genuinely found nothing still exits 0. (`device_list`
   keeps a missing `avdmanager` as a *warning*: it only decorates AVDs the
-  emulator already listed.)
+  emulator already listed.) `emulator_erase` runs no SDK tool — it reads the
+  AVD home itself — and refuses a missing AVD home the same way.
 
 The correction remains fixture-driven: `tests/fixtures/recorded/` holds verbatim
 output captured from real devices on two API levels, parser tests consume it,
@@ -744,10 +757,6 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
   from a screenshot, which is not implemented.
 - `privacy_manager` acts on the default user only. It passes no `--user`, so a
   work profile or a secondary user is out of reach.
-- `emulator_create` still returns an empty list when `avdmanager` or
-  `sdkmanager` is missing or fails, so `--list-devices` and `--list-images`
-  print nothing and exit 0 — the shape the lifecycle scripts above no longer
-  have.
 - **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is
   promised, and what is not yet:
   - A *typed* failure — a missing `adb` or SDK tool, an adb call that failed, a
@@ -781,8 +790,12 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
     reports itself — `success: false` beside a
     `message` from `keyboard`, `gesture`, `location`, and per operation in
     `status_bar` and `appearance`; `{"error": ...}` from `app_launcher`,
-    `navigator`, the `emulator_*` refusals and `emulator_selector` — until each
-    moves to `cli.fail(error, remedy)`.
+    `navigator`, the other `emulator_*` refusals and `emulator_selector` — until
+    each moves to `cli.fail(error, remedy)`. `emulator_create`'s own refusals —
+    device not found, no API level, image not installed, a failed create —
+    still answer `{"success": false, "message": ...}`, exit 1, pending the same
+    migration (a follow-up); a missing or failing `avdmanager` / `sdkmanager`
+    already answers in the schema above.
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

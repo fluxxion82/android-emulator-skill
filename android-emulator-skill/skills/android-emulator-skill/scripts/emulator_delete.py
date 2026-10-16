@@ -39,6 +39,7 @@ from common.sdk_tools import (
     resolve_avd_home,
     run_sdk_tool,
     searched_locations,
+    without_null_lines,
 )
 
 # Default number of newest AVDs to keep when --old is given without a value.
@@ -219,7 +220,8 @@ class EmulatorDeleter:
             )
             return True, f"AVD deleted: {name}"
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else str(e)
+            # Minus the bare `null` line avdmanager prints after its reason (N13).
+            error_msg = without_null_lines(e.stderr or "") or str(e)
             return False, f"Failed to delete AVD: {error_msg}"
         except subprocess.TimeoutExpired:
             return (

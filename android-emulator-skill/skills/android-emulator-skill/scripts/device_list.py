@@ -54,9 +54,10 @@ from common.sdk_tools import (
     EMULATOR_NOT_FOUND_REMEDY,
     SdkToolError,
     get_emulator_path,
+    missing_cmdline_tool_error,
     missing_emulator_error,
+    resolve_sdk_tool,
     run_sdk_tool,
-    searched_locations,
 )
 
 # Tunable defaults (override via the ANDROID_EMU_ prefix).
@@ -64,6 +65,16 @@ from common.sdk_tools import (
 SUMMARY_PREVIEW_COUNT = env_int("ANDROID_EMU_LIST_PREVIEW_COUNT", 3, min_value=0)
 # Per-command timeout (seconds) for the discovery subprocess calls.
 LIST_COMMAND_TIMEOUT = env_int("ANDROID_EMU_LIST_TIMEOUT", 15, min_value=1)
+
+
+def get_avdmanager_path() -> str | None:
+    """avdmanager, resolved through PATH and then the SDK's command-line-tools dirs.
+
+    Module-level, like ``get_emulator_path``, so there is one name to
+    substitute. The probe is :func:`common.sdk_tools.resolve_sdk_tool`'s, which
+    is also what the "Looked in" list of a missing-tool warning describes.
+    """
+    return resolve_sdk_tool("avdmanager", CMDLINE_TOOLS_SUBDIRS)
 
 
 def parse_adb_devices(output: str) -> list[dict]:
@@ -308,10 +319,9 @@ class DeviceLister:
         has to be able to say what went missing and why, or "no ABI shown" and
         "no ABI known" stay indistinguishable.
 
-        Every failure mode ``run_sdk_tool`` names is caught here, including the
-        ``OSError`` that a PATH holding the SDK *root* produces: a bare tool
-        name can then resolve to a directory, and execve raises
-        ``PermissionError`` rather than ``FileNotFoundError``.
+        Every failure mode ``run_sdk_tool`` names is caught here, including an
+        ``OSError`` from a resolved path that will not execute. ``cmd[0]`` is
+        that resolved path -- see :func:`get_avdmanager_path`.
         """
         try:
             stdout = run_sdk_tool(cmd, timeout=LIST_COMMAND_TIMEOUT, remedy=CMDLINE_TOOLS_REMEDY)
@@ -364,11 +374,19 @@ class DeviceLister:
         )
         names = parse_emulator_avds(names_output)
 
-        meta_output, failure = self._run_optional(["avdmanager", "list", "avd"])
+        # Resolved, not exec'd by bare name: a bare `avdmanager` reaches PATH
+        # and nothing else, so one installed where the SDK puts it --
+        # cmdline-tools/latest/bin, Android Studio's default and not on PATH --
+        # was reported missing, from a "Looked in" list naming SDK directories
+        # nothing had probed (N2). Now the list is what resolve_sdk_tool tried.
+        avdmanager = get_avdmanager_path()
+        if avdmanager is None:
+            meta_output, failure = None, str(missing_cmdline_tool_error("avdmanager"))
+        else:
+            meta_output, failure = self._run_optional([avdmanager, "list", "avd"])
         if meta_output is None:
             self.warnings.append(
                 f"AVD target/ABI detail is missing from this listing: {failure} "
-                f"Looked in: {searched_locations('avdmanager', CMDLINE_TOOLS_SUBDIRS)}. "
                 f"The AVD names above come from `emulator -list-avds` and are complete."
             )
         metadata = parse_avdmanager_avds(meta_output) if meta_output else {}

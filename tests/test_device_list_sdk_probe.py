@@ -59,11 +59,6 @@ def test_the_stub_sits_where_the_warning_says_it_looked(sdk_layout_toolchain, mo
     assert resolve_sdk_tool("avdmanager", CMDLINE_TOOLS_SUBDIRS) == str(stub)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="N2: device_list.py:366 runs a bare 'avdmanager' and never probes the SDK layout it names",
-)
 def test_n2_avdmanager_is_found_where_the_warning_says_it_was_looked_for(
     sdk_layout_toolchain, recorded
 ):
