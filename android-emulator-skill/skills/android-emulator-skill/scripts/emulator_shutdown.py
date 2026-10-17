@@ -74,7 +74,11 @@ class EmulatorShutdown:
         devices = get_connected_devices()
         device = next((d for d in devices if d["serial"] == self.serial), None)
         if not device:
-            return False, f"Device {self.serial} not found"
+            remedy = "Run `adb devices` to see which emulator serials are available."
+            raise adb_exec.DeviceNotFoundError(
+                f"Device {self.serial!r} is not attached. {remedy}",
+                remedy=remedy,
+            )
 
         # Refuse a handset BEFORE issuing anything. `--all` and `--name` already
         # filter on type; `--serial` did not, and `adb emu kill` fails on a
