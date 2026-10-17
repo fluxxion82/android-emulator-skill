@@ -1,0 +1,2 @@
+fixture.db
+fixture.db-journal

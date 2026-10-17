@@ -650,19 +650,70 @@ def test_the_emulator_lane_asserts_the_fixture_app_installed():
     assert ["exit", "1"] in [words[:2] for words in _then_branch(commands, checks[0])]
 
 
+def _is_pytest_attribute(node: ast.expr, *path: str) -> bool:
+    """True if ``node`` is ``pytest.<path[0]>.<path[1]>...``."""
+    for name in reversed(path):
+        if not (isinstance(node, ast.Attribute) and node.attr == name):
+            return False
+        node = node.value
+    return isinstance(node, ast.Name) and node.id == "pytest"
+
+
+def _mark_names(node: ast.expr) -> set[str]:
+    """The marks an expression is: ``pytest.mark.<name>``, a call of one, or a list of them."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return {name for element in node.elts for name in _mark_names(element)}
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute) and _is_pytest_attribute(node.value, "mark"):
+        return {node.attr}
+    return set()
+
+
+def _decorator_marks(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> set[str]:
+    """Marks a test's decorators apply, including ``marks=`` on a ``pytest.param`` in them."""
+    used: set[str] = set()
+    for decorator in node.decorator_list:
+        used |= _mark_names(decorator)
+        for call in ast.walk(decorator):
+            if isinstance(call, ast.Call) and _is_pytest_attribute(call.func, "param"):
+                for keyword in call.keywords:
+                    if keyword.arg == "marks":
+                        used |= _mark_names(keyword.value)
+    return used
+
+
+def _marks_applied_in(body: list[ast.stmt]) -> set[str]:
+    """Marks that reach a test from these statements: a module's, or a test class's.
+
+    Applied means a decorator on a ``test*`` function or ``Test*`` class, or a
+    ``pytestmark`` assignment. A mark merely named -- ``unused_marker =
+    pytest.mark.two_devices`` -- applies to nothing, and an exclusion of it
+    excludes nothing. The final v0.8.0 review replaced the two-device test's
+    decorator with exactly that line and this guard, then counting every
+    ``pytest.mark.<name>`` anywhere in the file, still passed.
+    """
+    used: set[str] = set()
+    for node in body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if node.value is not None and any(
+                isinstance(target, ast.Name) and target.id == "pytestmark" for target in targets
+            ):
+                used |= _mark_names(node.value)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                used |= _decorator_marks(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            used |= _decorator_marks(node) | _marks_applied_in(node.body)
+    return used
+
+
 def _marks_in_tests() -> set[str]:
-    """Every ``pytest.mark.<name>`` applied anywhere under tests/, read from the AST."""
+    """Every pytest mark applied to a test under tests/, read from the AST."""
     used: set[str] = set()
     for path in sorted((REPO_ROOT / "tests").rglob("test_*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Attribute)
-                and node.value.attr == "mark"
-                and isinstance(node.value.value, ast.Name)
-                and node.value.value.id == "pytest"
-            ):
-                used.add(node.attr)
+        used |= _marks_applied_in(ast.parse(path.read_text(encoding="utf-8")).body)
     return used
 
 
@@ -686,6 +737,39 @@ def test_every_marker_the_lane_excludes_is_registered_and_still_on_a_test():
     for marker in excluded:
         assert marker in registered, f"the lane excludes `{marker}`, which is not registered"
         assert marker in used, f"the lane excludes `{marker}`, which no test carries any more"
+
+
+SMOKE_TESTS = REPO_ROOT / "tests" / "test_emulator_smoke.py"
+TWO_DEVICES_DECORATOR = "@pytest.mark.two_devices"
+
+
+def _replace_two_devices_decorator(source: str, *replacement: str) -> str:
+    lines = source.splitlines()
+    (at,) = [index for index, line in enumerate(lines) if line == TWO_DEVICES_DECORATOR]
+    return "\n".join([*lines[:at], *replacement, *lines[at + 1 :]]) + "\n"
+
+
+MARKER_MUTATIONS = {
+    # The final v0.8.0 review's: the mark is still in the file, on nothing.
+    "decorator replaced by an unused name": lambda source: _replace_two_devices_decorator(
+        source, "unused_marker = pytest.mark.two_devices"
+    ),
+    "decorator moved onto a helper": lambda source: _replace_two_devices_decorator(source)
+    + f"\n\n{TWO_DEVICES_DECORATOR}\ndef _helper():\n    pass\n",
+}
+
+
+@pytest.mark.parametrize("mutation", list(MARKER_MUTATIONS))
+def test_the_marker_guard_counts_only_a_mark_that_reaches_a_test(mutation):
+    """Each way of keeping `two_devices` in the file while no test carries it.
+
+    Applied to the real file's text, so it follows the file as it changes.
+    """
+    source = SMOKE_TESTS.read_text(encoding="utf-8")
+    assert "two_devices" in _marks_applied_in(ast.parse(source).body), "the real test lost it"
+    mutated = MARKER_MUTATIONS[mutation](source)
+    assert "pytest.mark.two_devices" in mutated, f"{mutation}: the mark left the file"
+    assert "two_devices" not in _marks_applied_in(ast.parse(mutated).body), mutation
 
 
 # ---------------------------------------------------------------------------
@@ -843,9 +927,26 @@ _SCENARIO_TESTS = {
 }
 
 
+def _pm_path_rule(recorded, *, installed: bool) -> Rule:
+    """`pm path <fixture app>` answered as the device answered it, installed or not.
+
+    Both are recorded: pm_path_installed (`package:<apk>` on stdout, exit 0)
+    and pm_path_absent (nothing on either stream, exit 1). The absent one was
+    asked of a package that is not installed, and named nothing, so it stands
+    for the fixture app unchanged.
+    """
+    name = "pm_path_installed" if installed else "pm_path_absent"
+    entry = {f["name"]: f for f in recorded.manifest["fixtures"]}[name]
+    assert entry["stderr_bytes"] == 0, entry
+    stdout = recorded.text(name)
+    assert entry["stdout_bytes"] == len(stdout.encode()), entry
+    return Rule(("pm", "path", FIXTURE_PACKAGE), stdout=stdout, exit=entry["exit_status"])
+
+
 def _run_lane(
     tmp_path: Path,
     outcomes: tuple[str, ...],
+    recorded,
     *,
     device_after: bool,
     installed: bool = True,
@@ -874,14 +975,14 @@ def _run_lane(
         [
             # As emulator-5554 answers: `adb get-state` prints `device` (exit
             # 0), and for a device that is not there prints nothing on stdout
-            # (exit 1); `pm path` exits 0 for an installed package and 1 for
-            # one that is not, and the lane reads only that status.
+            # (exit 1). `pm path` is recorded (see _pm_path_rule); the lane
+            # reads only its status.
             Rule(
                 ("get-state",),
                 stdout="device\n" if device_after else "",
                 exit=0 if device_after else 1,
             ),
-            Rule(("pm", "path", FIXTURE_PACKAGE), exit=0 if installed else 1),
+            _pm_path_rule(recorded, installed=installed),
         ],
         default_exit=0,
     )
@@ -928,14 +1029,14 @@ LANE_SCENARIOS = {
 
 
 @pytest.mark.parametrize("scenario", list(LANE_SCENARIOS))
-def test_the_lane_script_under_stub_tools(tmp_path, scenario):
+def test_the_lane_script_under_stub_tools(tmp_path, recorded, scenario):
     """T11's acceptance, run: each outcome exits with the status the workflow reads.
 
     A device gone after pytest is 3 even when tests failed -- those failures are
     what a lost device looks like, and 1 would never be retried.
     """
     outcomes, device_after, status, says = LANE_SCENARIOS[scenario]
-    result, repo, toolchain = _run_lane(tmp_path, outcomes, device_after=device_after)
+    result, repo, toolchain = _run_lane(tmp_path, outcomes, recorded, device_after=device_after)
     shown = f"\nstdout:\n{result.stdout[-1500:]}\nstderr:\n{result.stderr[-1500:]}"
 
     assert result.returncode == status, f"exit {result.returncode}, not {status}{shown}"
@@ -957,9 +1058,11 @@ def test_the_lane_script_under_stub_tools(tmp_path, scenario):
     assert pytest_argv[:3] == ["tests/", "-m", "emulator and not two_devices"], pytest_argv
 
 
-def test_the_lane_refuses_to_run_without_the_fixture_app(tmp_path):
+def test_the_lane_refuses_to_run_without_the_fixture_app(tmp_path, recorded):
     """No app, no lane: exit 1 saying so, before pytest is run at all."""
-    result, _, toolchain = _run_lane(tmp_path, ("pass",), device_after=True, installed=False)
+    result, _, toolchain = _run_lane(
+        tmp_path, ("pass",), recorded, device_after=True, installed=False
+    )
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert f"{FIXTURE_PACKAGE} is not installed" in result.stdout
@@ -1002,31 +1105,33 @@ def _step(step_id: str) -> dict:
     return step
 
 
-def _first_attempt(tmp_path: Path, outcomes, *, device_after: bool) -> tuple[str, bool]:
+def _first_attempt(tmp_path: Path, outcomes, recorded, *, device_after: bool) -> tuple[str, bool]:
     """Run the lane once, then the workflow's reader and its retry condition on it.
 
     Returns (the exit status the reader handed on, whether the retry runs).
     """
-    _, repo, _ = _run_lane(tmp_path, outcomes, device_after=device_after)
+    _, repo, _ = _run_lane(tmp_path, outcomes, recorded, device_after=device_after)
     _, outputs, _ = _run_step(_step("first-exit"), tmp_path, repo)
     condition = RETRY_CONDITION.fullmatch(_step("attempt2")["if"])
     assert condition and condition.group(1) == "first-exit"
     return outputs.get(condition.group(2), ""), outputs.get(condition.group(2)) == "3"
 
 
-def test_a_lost_device_is_retried_once_and_counted(tmp_path):
+def test_a_lost_device_is_retried_once_and_counted(tmp_path, recorded):
     """The lane's exit 3, through the workflow's own steps: one retry, `retries: 1`.
 
     The retry (attempt 2, run here too) decides the job: green if it passed,
     red if it did not -- and the summary names its exit status, so a second
     lost device (3) is told apart from a test that failed once the device held.
     """
-    code, retried = _first_attempt(tmp_path, ("pass", "pass"), device_after=False)
+    code, retried = _first_attempt(tmp_path, ("pass", "pass"), recorded, device_after=False)
     assert (code, retried) == ("3", True)
 
     for device_after, retry_outcome, verdict in ((True, "success", 0), (False, "failure", 1)):
         root = tmp_path / f"retry-{retry_outcome}"
-        result, repo, _ = _run_lane(root, ("pass",), device_after=device_after, attempt="2")
+        result, repo, _ = _run_lane(
+            root, ("pass",), recorded, device_after=device_after, attempt="2"
+        )
         assert (result.returncode == 0) == (retry_outcome == "success"), result.stdout
 
         status, _, summary = _run_step(
@@ -1043,9 +1148,9 @@ def test_a_lost_device_is_retried_once_and_counted(tmp_path):
         assert f"Retry: {retry_outcome} (exit status {result.returncode})." in lines, lines
 
 
-def test_a_failing_test_is_never_retried(tmp_path):
+def test_a_failing_test_is_never_retried(tmp_path, recorded):
     """The lane's exit 1, through the workflow's own steps: no retry, a red job."""
-    code, retried = _first_attempt(tmp_path, ("pass", "fail"), device_after=True)
+    code, retried = _first_attempt(tmp_path, ("pass", "fail"), recorded, device_after=True)
     assert (code, retried) == ("1", False)
 
     status, _, summary = _run_step(

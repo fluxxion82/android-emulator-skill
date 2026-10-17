@@ -556,6 +556,10 @@ def _redact_private_packages(text: str, mapping: dict[str, str]) -> str:
 # directory's AndroidManifest.xml for the build-and-install commands.
 COMPOSE_PACKAGE = "com.example.composefixture"
 
+# Its data dir as container.py and model_inspector.py name it: absolute, so a
+# listing they run -- and the error a failed one prints -- carries this path.
+COMPOSE_DATA_DIR = f"/data/data/{COMPOSE_PACKAGE}"
+
 
 def _trim_hierarchy(raw: str) -> str:
     """Trim an ``exec-out uiautomator dump`` stream to just its XML document.
@@ -979,6 +983,40 @@ def _device_path_absent(listing: list[str]) -> Callable[[str | None], None]:
                 f"`adb {' '.join(listing)}` does not show the path gone after "
                 f"teardown (exit {result.returncode}): {result.text.strip()[:200]!r}"
             )
+
+    return verify
+
+
+# The name a fixture moves one of the fixture app's directories aside to while
+# it records what a listing of the missing directory prints.
+_MOVED_ASIDE = ".aes_moved"
+
+
+def _app_dir_restored(directory: str, holds: str) -> Callable[[str | None], None]:
+    """Read back that the fixture app's ``directory`` is listable again and whole.
+
+    For the fixtures that move a directory aside, or take its owner's read bit
+    away, to record what a failed listing prints. ``mv`` and ``chmod`` exiting
+    0 is not the same claim: the listing must succeed, still hold ``holds`` (a
+    file the app wrote there), and the moved-aside name must exist neither
+    beside it nor inside it -- which is where ``mv`` would have put it had the
+    app recreated the directory meanwhile (the teardown's ``-T`` refuses that).
+    """
+
+    def verify(serial: str | None) -> None:
+        argv = ["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", directory]
+        listing = _run(argv, serial, timeout=15)
+        if (
+            listing.returncode != 0
+            or f" {holds}\n" not in _strip_cr(listing.stdout)
+            or _MOVED_ASIDE in listing.stdout
+        ):
+            raise CaptureError(
+                f"`adb {' '.join(argv)}` does not show {directory}/ restored (exit "
+                f"{listing.returncode}): {listing.text.strip()[:200]!r}"
+            )
+        moved = ["shell", "run-as", COMPOSE_PACKAGE, "ls", f"{directory}{_MOVED_ASIDE}"]
+        _device_path_absent(moved)(serial)
 
     return verify
 
@@ -2876,6 +2914,31 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="run_as_not_an_application_stderr",
+        record_both_streams=True,
+        args=["shell", "run-as", "com.android.settings", "ls"],
+        description=(
+            "run_as_not_an_application without its `2>&1`, so the manifest says "
+            "where run-as puts a refusal: on STDERR, stdout empty, exit 1, one "
+            "line starting `run-as: `. container.py now takes only such a line "
+            "for a run-as denial. It used to scan every stream for markers, and "
+            "`ls: <dir>: Permission denied` (run_as_ls_shared_prefs_unreadable) "
+            "matched 'permission denied' and was given the debug-build hint."
+        ),
+        post=_requires("run-as: package not an application: com.android.settings"),
+    ),
+    Fixture(
+        name="run_as_unknown_package_stderr",
+        record_both_streams=True,
+        args=["shell", "run-as", "com.nonexistent.app", "ls"],
+        description=(
+            "run_as_unknown_package without its `2>&1`: on STDERR, stdout empty, "
+            "exit 1, `run-as: unknown package: <pkg>` (the package name aliased "
+            "like any non-AOSP name)."
+        ),
+        post=_requires("run-as: unknown package: "),
+    ),
+    Fixture(
         name="run_as_ls_data_dir",
         args=["shell", "run-as com.example.composefixture ls -la"],
         description=(
@@ -2965,6 +3028,128 @@ FIXTURES: list[Fixture] = [
             "reads files this way takes the error text for the file -- the transport "
             "container.py's --cat, --shared-prefs NAME and --export used."
         ),
+    ),
+    Fixture(
+        name="run_as_ls_data_dir_seeded",
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", COMPOSE_DATA_DIR],
+        description=(
+            "The fixture app's data dir listed as container.py lists it (by its "
+            "absolute path), after the app has run: shared_prefs/ and databases/ "
+            "are in it. run_as_ls_data_dir was recorded before the app first ran "
+            "and holds neither -- the listing of an app with no prefs and no "
+            "databases, which --export reports as absent, not as a failure."
+        ),
+        post=_requires(" shared_prefs\n", " databases\n"),
+    ),
+    Fixture(
+        name="run_as_ls_shared_prefs",
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", f"{COMPOSE_DATA_DIR}/shared_prefs"],
+        description=(
+            "`ls -la` of the fixture app's shared_prefs/, as --shared-prefs and "
+            "--export list it: one prefs file, fixture_settings.xml (the file "
+            "shared_prefs_settings_xml holds)."
+        ),
+        post=_requires(" fixture_settings.xml\n"),
+    ),
+    Fixture(
+        name="run_as_ls_shared_prefs_absent",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", f"{COMPOSE_DATA_DIR}/shared_prefs"],
+        description=(
+            "The same listing while shared_prefs/ is moved aside (renamed "
+            "shared_prefs.aes_moved inside the data dir, and back after): exit 1, "
+            "stdout EMPTY, `ls: <path>: No such file or directory` on stderr. "
+            "--export took any failed sub-listing for an empty directory and "
+            "reported success; a directory the data-dir listing names and this "
+            "listing cannot find is a listing that failed."
+        ),
+        setup=[
+            [
+                "shell",
+                "run-as",
+                COMPOSE_PACKAGE,
+                "mv",
+                "-T",
+                "shared_prefs",
+                "shared_prefs.aes_moved",
+            ]
+        ],
+        teardown=[
+            [
+                "shell",
+                "run-as",
+                COMPOSE_PACKAGE,
+                "mv",
+                "-T",
+                "shared_prefs.aes_moved",
+                "shared_prefs",
+            ]
+        ],
+        teardown_verify=_app_dir_restored("shared_prefs", "fixture_settings.xml"),
+        post=_requires("No such file or directory"),
+    ),
+    Fixture(
+        name="run_as_ls_shared_prefs_unreadable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", f"{COMPOSE_DATA_DIR}/shared_prefs"],
+        description=(
+            "The same listing with the owner's read bit taken off shared_prefs/ "
+            "(`chmod u-r`, and `u+r` after; the app's uid is the owner, so the "
+            "group's r does not apply): exit 1, stdout EMPTY, `ls: <path>: "
+            "Permission denied` on stderr. The reviewer's reproduction of export "
+            "reporting success with unread 0 over exactly this. Note the text "
+            "matches container.py's run-as denial marker 'permission denied'."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-r", "shared_prefs"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+r", "shared_prefs"]],
+        teardown_verify=_app_dir_restored("shared_prefs", "fixture_settings.xml"),
+        post=_requires("Permission denied"),
+    ),
+    Fixture(
+        name="run_as_ls_databases_unreadable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", f"{COMPOSE_DATA_DIR}/databases"],
+        description=(
+            "run_as_ls_shared_prefs_unreadable for databases/ (`chmod u-r`, then "
+            "`u+r`). Taking only the read bit leaves the directory searchable, so "
+            "an open database is undisturbed. --export wrote this failure into "
+            "databases.json and still reported success."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-r", "databases"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+r", "databases"]],
+        teardown_verify=_app_dir_restored("databases", "fixture.db"),
+        post=_requires("Permission denied"),
+    ),
+    Fixture(
+        name="run_as_ls_1_databases",
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-1", f"{COMPOSE_DATA_DIR}/databases"],
+        description=(
+            "`ls -1` of databases/, as model_inspector's live mode lists it: one "
+            "name per line, no `.`/`..`, and the zero-byte fixture.db-journal "
+            "beside fixture.db -- not the -wal/-shm pair a hand-written listing "
+            "had in its place."
+        ),
+        post=_requires("fixture.db\n", "fixture.db-journal\n"),
+    ),
+    Fixture(
+        name="run_as_ls_1_databases_unreadable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-1", f"{COMPOSE_DATA_DIR}/databases"],
+        description=(
+            "model_inspector's `ls -1` of databases/ with the owner's read bit "
+            "taken off it (`chmod u-r`, `u+r` after; run_as_ls_databases_unreadable "
+            "is the `ls -la` container.py runs): exit 1, stdout EMPTY, `ls: <path>: "
+            "Permission denied` on stderr -- which matched the run-as denial "
+            "marker 'permission denied' and was answered with the debug-build hint."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-r", "databases"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+r", "databases"]],
+        teardown_verify=_app_dir_restored("databases", "fixture.db"),
+        post=_requires("Permission denied"),
     ),
     Fixture(
         name="adb_version",
@@ -3568,6 +3753,28 @@ FIXTURES: list[Fixture] = [
             "all; only the exit status separates the two."
         ),
         catches=("D4",),
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="pm_path_installed",
+        record_both_streams=True,
+        args=["shell", "pm", "path", COMPOSE_PACKAGE],
+        description=(
+            "`pm path` of an installed package, the emulator lane's check that "
+            "the fixture app is there before it runs: exit 0, `package:<apk "
+            "path>` on stdout, stderr empty. The lane reads only the status."
+        ),
+        post=_requires("package:/data/app/", f"/{COMPOSE_PACKAGE}-"),
+    ),
+    Fixture(
+        name="pm_path_absent",
+        record_both_streams=True,
+        args=["shell", "pm", "path", "com.nonexistent.app"],
+        description=(
+            "`pm path` of a package that is not installed: nothing on either "
+            "stream, and exit 1 -- the status is the whole answer, which is why "
+            "the lane can send stdout to /dev/null."
+        ),
         post=_requires_empty(),
     ),
     # --- naming a process from its pid ------------------------------------
