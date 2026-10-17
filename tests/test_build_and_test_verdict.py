@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -173,3 +174,37 @@ def test_rerun_reaches_gradle_right_after_the_test_task(toolchain, tmp_path, rec
     task = argv.index(":app:testDebugUnitTest")
     assert argv[task + 1] == "--rerun", argv
     assert argv[argv.index("--tests") + 1] == "com.example.PassingTest", argv
+
+
+def test_gradle_timeout_is_a_refusal_and_preserves_the_partial_log(
+    toolchain, tmp_path, monkeypatch, capsys, recorded_gradle
+):
+    """B9: a timed-out wrapper uses common.cli after caching what it printed."""
+    import build_and_test as build_script
+
+    import gradle.builder as builder_mod
+    from common import cli
+    from gradle import BuildResultCache
+
+    partial = recorded_gradle("gradle_build_successful")
+    project = _project(toolchain, tmp_path, Rule(("unused",), stdout=partial))
+    cache = BuildResultCache(cache_dir=str(tmp_path / "cache"))
+    monkeypatch.setattr(build_script, "BuildResultCache", lambda: cache)
+    monkeypatch.setattr(builder_mod, "BUILD_TIMEOUT", 1)
+
+    def time_out(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"], output=partial, stderr="")
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", time_out)
+    with pytest.raises(SystemExit) as stopped:
+        cli.run(build_script.main, ["--project", str(project), "--json"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert stopped.value.code == 1
+    assert "error" in payload, payload
+    assert "timed out" in payload["error"].lower()
+    assert "ANDROID_EMU_BUILD_TIMEOUT" in payload["remedy"]
+    match = re.search(r"--get-log (build-[\w-]+)", payload["remedy"])
+    assert match, payload["remedy"]
+    assert partial.strip() in cache.get_log(match.group(1))
