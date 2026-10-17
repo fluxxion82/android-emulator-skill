@@ -989,10 +989,10 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     — per operation in `status_bar` and `appearance`, per permission in
     `privacy_manager`'s grant/revoke, per AVD in the `emulator_*` `--all`
     modes — which exit 1 with their own summary when one item failed.
-  - A device error is adb's own line — one that starts `adb: ` or `error: `.
-    A command run on the device writes its stderr through adb's, so a file
-    named `unauthorized.db` that is not there is a missing file (exit 1), not
-    an unauthorized device (exit 3).
+  - Device-error confirmation applies to app-file reads (`container` and
+    `model_inspector` through `run_argv`). Other shell commands use `run_adb`;
+    their arguments are agent-supplied and matching stderr is not yet confirmed
+    (follow-up).
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

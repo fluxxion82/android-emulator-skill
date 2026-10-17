@@ -498,3 +498,59 @@ def test_run_argv_types_adbs_own_failures_like_run_adb(fake_run, recorded_anywhe
     fake_run(raises=subprocess.TimeoutExpired(cmd, 5))
     with pytest.raises(adb_exec.AdbTimeoutError):
         adb_exec.run_argv(cmd, serial=None, timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("probe", "retains_error"),
+    [
+        pytest.param(
+            (1, "", "error: device unauthorized.\n", None),
+            True,
+            id="nonzero-device-error",
+        ),
+        pytest.param((1, "", "ordinary failure\n", None), True, id="nonzero-other-error"),
+        pytest.param(
+            (None, "", "", subprocess.TimeoutExpired(cmd="adb get-state", timeout=30)),
+            True,
+            id="timeout",
+        ),
+        pytest.param((None, "", "", FileNotFoundError("adb")), True, id="adb-missing"),
+        pytest.param((0, "device\n", "", None), False, id="device"),
+        pytest.param((0, "offline\n", "", None), True, id="offline"),
+        pytest.param((0, "", "", None), True, id="empty"),
+        pytest.param(
+            (0, "error: device offline\n", "", None),
+            True,
+            id="device-error-text",
+        ),
+    ],
+)
+def test_run_argv_only_suppresses_a_suspected_device_error_when_probe_reports_device(
+    monkeypatch, probe, retains_error
+):
+    """The probe confirms reachability only with the documented ``device`` state."""
+    calls: list[list[str]] = []
+    probe_returncode, probe_stdout, probe_stderr, probe_exception = probe
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(cmd, 1, b"", b"error: device offline\n")
+        if probe_exception is not None:
+            raise probe_exception
+        return subprocess.CompletedProcess(cmd, probe_returncode, probe_stdout, probe_stderr)
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    cmd = ["adb", "-s", "emulator-5554", "shell", "-T", "run-as", "pkg", "cat", "f"]
+
+    if retains_error:
+        with pytest.raises(adb_exec.DeviceOfflineError) as excinfo:
+            adb_exec.run_argv(cmd, serial="emulator-5554")
+        assert "reconnect" in str(excinfo.value).lower()
+    else:
+        result = adb_exec.run_argv(cmd, serial="emulator-5554")
+        assert result.returncode == 1
+        assert result.stderr == b"error: device offline\n"
+
+    assert len(calls) == 2
+    assert calls[1][-1] == "get-state"

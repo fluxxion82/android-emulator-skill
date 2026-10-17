@@ -346,6 +346,27 @@ def test_shutdown_by_name_still_reports_a_genuine_miss(monkeypatch, capsys, reco
     assert "No running emulator found" in capsys.readouterr().err
 
 
+def test_missing_serial_in_successful_inventory_is_device_unavailable(monkeypatch, capsys):
+    """B8: name the requested serial and the different emulator that is attached."""
+    _connected(
+        monkeypatch,
+        [{"serial": "emulator-5554", "state": "device", "type": "emulator"}],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(
+            emulator_shutdown.main,
+            ["--serial", "emulator-9999", "--json"],
+        )
+
+    assert exc.value.code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is False
+    assert "emulator-9999" in payload["error"]
+    assert "Attached: emulator-5554" in payload["error"]
+    assert payload["remedy"]
+
+
 def test_get_avd_name_skips_ok_status_line(monkeypatch):
     monkeypatch.setattr(
         adb_exec.subprocess,
