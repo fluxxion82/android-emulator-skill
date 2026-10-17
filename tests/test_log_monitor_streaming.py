@@ -14,8 +14,9 @@ parses nothing, cannot be stopped, can deadlock, and reports success either way.
       indistinguishable from a quiet device.
 
 The fake-process harness below drives the loop without a device: `readline()`
-drains a scripted list then returns "", and `poll()` reports the exit code only
-once drained, mirroring a real pipe.
+drains a scripted list then returns b"", and `poll()` reports the exit code only
+once drained, mirroring a real pipe. Its pipes carry bytes, as the real
+`Popen` (opened without `text=`) does.
 """
 
 from __future__ import annotations
@@ -63,23 +64,23 @@ class FakeProc:
         self._returncode = returncode
         self._never_ends = never_ends
         self._emitted = 0
-        self._filler = (lines[0] if lines else "01-01 00:00:00.000 1 1 I Tag: x") + "\n"
+        self._filler = ((lines[0] if lines else "01-01 00:00:00.000 1 1 I Tag: x") + "\n").encode()
         self.terminated = False
         self.killed = False
         self.waited_without_timeout = False
         self.stdout = self
-        self.stderr = io.StringIO(stderr_text)
+        self.stderr = io.BytesIO(stderr_text.encode())
         self.returncode = None
 
     # Safety cap for the never-ending stream. A correct duration check breaks
     # out long before this; hitting it means the duration was never enforced.
     MAX_LINES = 5000
 
-    def readline(self) -> str:
+    def readline(self) -> bytes:
         if self.terminated:
-            return ""
+            return b""
         if self._lines:
-            return self._lines.pop(0) + "\n"
+            return (self._lines.pop(0) + "\n").encode()
         if self._never_ends:
             # A busy device streams continuously and the pipe never closes.
             # Blocking for real would hang the suite, so emit endlessly instead
@@ -91,7 +92,7 @@ class FakeProc:
                     "the duration deadline is never enforced"
                 )
             return self._filler
-        return ""
+        return b""
 
     def poll(self):
         return self.returncode

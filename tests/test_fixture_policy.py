@@ -78,8 +78,9 @@ STATIC_REPEAT_CAP = 10_000
 # a side effect -- the JUnit XML a fake gradlew leaves behind for the build
 # parser to read. That is tool output reaching a parser by another door, so it
 # is held to the same rule (review of PR #20: XML handed through `writes=` was
-# invisible to this ratchet).
-OUTPUT_KEYWORDS = ("stdout", "stderr", "output", "writes")
+# invisible to this ratchet). `buffered` is the history a fake `logcat -T`
+# replays before its `stdout` -- the same transcript, by a third door.
+OUTPUT_KEYWORDS = ("stdout", "stderr", "output", "writes", "buffered")
 
 # Test helpers that are not `test_*.py` but build test doubles, so a literal
 # moved into one is still a transcript handed to a parser. Named exactly, not
@@ -1063,6 +1064,13 @@ def test_a_transcript_handed_to_writes_is_caught():
         f"Rule(('testDebugUnitTest',), writes=(('/p/TEST-A.xml', {blob!r}),))\n",
         _parser_names(),
     )
+    assert found == {"Rule"}
+
+
+def test_a_transcript_handed_to_buffered_is_caught():
+    """``buffered=`` is the logcat history a fake replays: a door like ``stdout=``."""
+    blob = "10-17 12:00:00.000 " + "x" * 200
+    found = _scan_source(f"Rule(('logcat',), buffered={blob!r})\n", _parser_names())
     assert found == {"Rule"}
 
 

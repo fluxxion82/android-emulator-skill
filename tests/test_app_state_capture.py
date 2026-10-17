@@ -15,7 +15,7 @@ default carry their own budget instead of raising it for the whole skill.
 And the log window's two lies: errors counted from prose instead of the
 priority column (D3), and a window that was either the restarted app's newest
 process alone or, with the app not running, every process on the device (D4).
-Both are read against recordings -- logcat_app_restart holds three processes
+Both are read against recordings -- logcat_app_restart_usec holds three processes
 of one app in one window, with the pids `pidof` gave for each.
 """
 
@@ -36,22 +36,48 @@ from app_state_capture import (
     count_ui_elements,
     parse_package_pids,
 )
+from fake_toolchain import recorded_package_listing, recorded_ps_answer
+
+from common.device_utils import parse_package_uids
 
 
 def _node(tag: str, *children: dict) -> dict:
     return {"tag": tag, "attributes": {}, "children": list(children)}
 
 
-def _device(*, pidof: tuple[str, int], window: str):
+def _device(
+    *, pidof: tuple[str, int], window: str, system_server: str | None = None, recorded=None
+):
     """A stand-in for adb: ``pidof`` answers ``(stdout, status)``, ``logcat`` the window.
 
     Both handed in by the test from the recorded corpus. Everything else
     answers with silence, which the snapshot records as unknown.
+
+    ``pidof system_server`` answers ``system_server`` -- the pid recorded with
+    the window it belongs to -- or, without one, as ``pidof`` answers for a
+    process that is not there (no output, exit 1). Only system_server's own
+    ActivityManager lines may say which pids were the app's.
+
+    With ``recorded`` (#27), the uid questions are answered too, from the
+    recorded answers: the package's uid (package_list_uid, the package name
+    substituted) and the ``pidof`` pid's (ps_pid_uid, the pid substituted). A
+    pid is the app's only when its uid is the package's, so without them the
+    fake would say "this is the app's process" and then fail to back it up.
     """
 
     def fake_run(cmd, *args, **kwargs):
+        if "pidof" in cmd and "system_server" in cmd:
+            if system_server is None:
+                return SimpleNamespace(stdout="", stderr="", returncode=1)
+            return SimpleNamespace(stdout=system_server, stderr="", returncode=0)
         if "pidof" in cmd:
             return SimpleNamespace(stdout=pidof[0], stderr="", returncode=pidof[1])
+        if recorded is not None and "package" in cmd and "-U" in cmd:
+            listing = recorded_package_listing(recorded, cmd[-1])
+            return SimpleNamespace(stdout=listing, stderr="", returncode=0)
+        if recorded is not None and "ps" in cmd and pidof[0].strip().isdigit():
+            answer = recorded_ps_answer(recorded, pidof[0].strip())
+            return SimpleNamespace(stdout=answer, stderr="", returncode=0)
         if "logcat" in cmd:
             return SimpleNamespace(stdout=window, stderr="", returncode=0)
         return SimpleNamespace(stdout="", stderr="", returncode=0)
@@ -174,7 +200,7 @@ def test_capture_logs_respects_log_lines_cap_and_counts(monkeypatch, tmp_path, r
     monkeypatch.setattr(
         app_state_capture.adb_exec.subprocess,
         "run",
-        _device(pidof=(pid, 0), window=log_text),
+        _device(pidof=(pid, 0), window=log_text, recorded=recorded),
     )
 
     capturer = AppStateCapture(package="com.example.app", serial="emulator-5554")
@@ -588,7 +614,7 @@ def test_device_info_records_the_effective_density_not_the_physical_one(monkeypa
 
 # === D4: the app's window is every process it had, and nothing else ========
 #
-# logcat_app_restart is one window holding three processes of the fixture app
+# logcat_app_restart_usec is one window holding three processes of the fixture app
 # -- crashed, force-stopped, running -- and its manifest entry holds the pids
 # `pidof` reported while each was alive. That is the oracle: what the device
 # said at the time, not this parser's own reading of the same text.
@@ -601,9 +627,9 @@ def _manifest_entry(recorded, name: str) -> dict:
 
 
 def _app_pids(recorded) -> list[str]:
-    pids = _manifest_entry(recorded, "logcat_app_restart")["pids"]
+    pids = _manifest_entry(recorded, "logcat_app_restart_usec")["pids"]
     if len(set(pids)) < 2:
-        pytest.fail("logcat_app_restart no longer records a restart; re-record it")
+        pytest.fail("logcat_app_restart_usec no longer records a restart; re-record it")
     return pids
 
 
@@ -613,9 +639,26 @@ def _not_running(recorded) -> tuple[str, int]:
     return recorded.text("pidof_not_running"), status
 
 
+def _oracles(recorded) -> dict:
+    """system_server's pid and the package's uid, recorded beside the window (#27)."""
+    entry = _manifest_entry(recorded, "logcat_app_restart_usec")
+    listing = entry["package_uid_listing"]["output"]
+    return {
+        "system_server_pid": entry["system_server_pid"],
+        "package_uids": parse_package_uids(listing, APP),
+    }
+
+
 def test_every_process_the_window_ties_to_the_package_is_found(recorded):
-    """Started, crashed, killed: each way the device names a process of the app."""
-    assert parse_package_pids(recorded.text("logcat_app_restart"), APP) == set(_app_pids(recorded))
+    """Started, crashed, killed: each way the device names a process of the app.
+
+    With system_server's pid as recorded beside the window: ActivityManager's
+    lines count only from it (the killed process is named by nothing else).
+    And with the package's uid (#27): a start or kill counts only for it.
+    """
+    assert parse_package_pids(
+        recorded.text("logcat_app_restart_usec"), APP, **_oracles(recorded)
+    ) == set(_app_pids(recorded))
 
 
 def test_naming_the_package_does_not_make_a_line_the_apps(recorded):
@@ -625,23 +668,37 @@ def test_naming_the_package_does_not_make_a_line_the_apps(recorded):
     some of those lines carry another number beside it (a task's uid
     `A=10205:<pkg>`, the shell's `from pid N`). None of them is the app.
     """
-    text = recorded.text("logcat_app_restart")
+    text = recorded.text("logcat_app_restart_usec")
     namers = {fields[2] for fields in _columns(text) if APP in " ".join(fields)}
     others = namers - set(_app_pids(recorded))
     assert others, "premise: processes other than the app name it in this window"
 
-    assert not parse_package_pids(text, APP) & others
+    assert not parse_package_pids(text, APP, **_oracles(recorded)) & others
 
 
 def test_a_package_is_matched_whole_not_as_a_prefix(recorded):
     """`com.example.compose` is not `com.example.composefixture`."""
-    assert parse_package_pids(recorded.text("logcat_app_restart"), APP[:-7]) == set()
+    assert (
+        parse_package_pids(recorded.text("logcat_app_restart_usec"), APP[:-7], **_oracles(recorded))
+        == set()
+    )
 
 
-def test_a_crash_loop_is_attributed_from_the_crash_lines_alone(recorded):
-    """The crash buffer has no system_server lines: AndroidRuntime's own `Process:`."""
+def test_crash_lines_alone_attribute_nothing(recorded):
+    """AndroidRuntime's `Process: <pkg>, PID: N` confirms; it never names a pid alone.
+
+    Flipped in #27 (Codex review, ruling A). That line is written by the dying
+    process itself, and any app can write the same line -- naming ANOTHER
+    package and its own pid -- through the public `android.util.Log` API, which
+    put the attacker's own lines into the victim's window. A real crash is
+    attributed anyway, by system_server's `Start proc` / `has died` for that
+    pid; the crash buffer on its own, which has no system_server line, names
+    nothing.
+    """
     text = recorded.text("logcat_crash_loop")
-    assert parse_package_pids(text, APP) == {fields[2] for fields in _columns(text)}
+    if not {fields[2] for fields in _columns(text)}:
+        pytest.fail("the crash loop recording no longer holds a crash")
+    assert parse_package_pids(text, APP) == set()
 
 
 @pytest.mark.parametrize("alive", ["none", "latest"])
@@ -659,10 +716,13 @@ def test_the_saved_log_holds_every_process_of_the_app_and_no_other(
     unrelated = {fields[2] for fields in _columns(recorded.text("logcat_threadtime"))}
     if unrelated & set(pids):
         pytest.fail("the two recordings no longer separate the app from other processes")
-    window = recorded.text("logcat_threadtime") + recorded.text("logcat_app_restart")
+    window = recorded.text("logcat_threadtime") + recorded.text("logcat_app_restart_usec")
     pidof = _not_running(recorded) if alive == "none" else (pids[-1], 0)
+    system_server = _manifest_entry(recorded, "logcat_app_restart_usec")["system_server_pid"]
     monkeypatch.setattr(
-        app_state_capture.adb_exec.subprocess, "run", _device(pidof=pidof, window=window)
+        app_state_capture.adb_exec.subprocess,
+        "run",
+        _device(pidof=pidof, window=window, system_server=system_server, recorded=recorded),
     )
 
     capturer = AppStateCapture(package=APP, serial="emulator-5554")
@@ -675,9 +735,18 @@ def test_the_saved_log_holds_every_process_of_the_app_and_no_other(
 
 
 def test_the_capture_asks_for_the_format_it_parses(monkeypatch, tmp_path, recorded):
-    """D3's other half: `fmt=None` inherited the device's format, unparsed."""
+    """D3's other half: `fmt=None` inherited the device's format, unparsed.
+
+    `pidof` answers the live process (#27): with no system_server answer and
+    no running process, the capture refuses before this spec's assertion, as
+    an app with no attributable process now does.
+    """
     seen: list[list[str]] = []
-    fake = _device(pidof=_not_running(recorded), window=recorded.text("logcat_app_restart"))
+    fake = _device(
+        pidof=(_app_pids(recorded)[-1], 0),
+        window=recorded.text("logcat_app_restart_usec"),
+        recorded=recorded,
+    )
 
     def recording_run(cmd, *args, **kwargs):
         seen.append(cmd)

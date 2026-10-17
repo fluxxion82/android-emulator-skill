@@ -21,16 +21,28 @@ Usage Examples:
 
 import argparse
 import contextlib
+import functools
 import json
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from common import adb_exec, cli, logcat
 from common.cache_utils import default_cache_dir
-from common.device_utils import get_ui_hierarchy, parse_display_density, quote_for_device_shell
+from common.device_utils import (
+    get_package_uids,
+    get_pid_uids,
+    get_system_server_pid,
+    get_ui_hierarchy,
+    parse_display_density,
+    quote_for_device_shell,
+)
 from common.env_config import env_int
+
+# One app's log window is read the same way here and in log_monitor, through
+# common.logcat. These two are re-exported under the names this module has
+# always offered (parse_package_pids is no longer called here).
+from common.logcat import parse_package_pids, parse_threadtime  # noqa: F401
 from common.screenshot_utils import capture_screenshot
 
 # Tunable defaults (override via ANDROID_EMU_* env vars).
@@ -77,72 +89,6 @@ def count_ui_elements(node: dict | None) -> int:
     for child in node.get("children", []) or []:
         total += count_ui_elements(child)
     return total
-
-
-# `logcat -v threadtime`: "MM-DD HH:MM:SS.mmm  PID  TID P Tag: message", one
-# header per line (a multi-line message is several headed lines). Only the PID
-# and priority columns are read. Recorded: logcat_threadtime.
-#
-# log_monitor, anr_pipeline and crash_triage each carry a threadtime regex of
-# their own. This one and parse_package_pids belong in common/logcat.py, which
-# log_monitor's D4 fix needs too; they live here until they move there together.
-_THREADTIME = re.compile(
-    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+(?P<pid>\d+)\s+\d+\s+(?P<priority>[VDIWEF])\s"
-)
-
-
-def parse_threadtime(line: str) -> tuple[str, str] | None:
-    """``(pid, priority)`` of one threadtime line; None for anything else.
-
-    "Anything else" is the reader's ``--------- beginning of main`` separator
-    in practice: in threadtime every line of a message carries its own header.
-
-    Args:
-        line: One line of ``logcat -v threadtime`` output.
-    """
-    match = _THREADTIME.match(line)
-    return (match["pid"], match["priority"]) if match else None
-
-
-def parse_package_pids(text: str, package: str) -> set[str]:
-    """The pids a logcat window itself says were processes of ``package``.
-
-    ``pidof`` only knows the process alive now. A restarted app's earlier
-    process -- the one that crashed, which is usually why a snapshot is being
-    taken -- is gone, and only the log still ties its pid to the package (D4).
-    Four sentences do that, each naming a pid and the process name together.
-    Recorded in logcat_app_restart (an app crashed, force-stopped and
-    relaunched) and logcat_crash_loop::
-
-        ActivityManager: Start proc 14407:<package>/u0a205 for next-top-activity {...}
-        ActivityManager: Process <package> (pid 14407) has died: fg  TOP
-        ActivityManager: Killing 14459:<package>/u0a205 (adj 0): stop <package> due to from pid 14489
-        AndroidRuntime:  Process: <package>, PID: 14407
-
-    The package name on its own proves nothing: in that recording most lines
-    naming it are system_server's, the launcher's and the IME's. Nor does a
-    number beside it -- ``A=10205:<package>`` is a task's uid, ``from pid
-    14489`` the shell that asked for the stop, and ``Process : Sending signal.
-    PID: 14407`` has no package at all -- so only these four shapes count.
-
-    The process name must be exactly ``package``, as ``pidof`` matches it: a
-    ``<package>:remote`` process is neither found by ``pidof`` nor counted here.
-
-    Args:
-        text: ``logcat -v threadtime`` output.
-        package: The application id.
-
-    Returns:
-        The pids, as the decimal strings the PID column holds.
-    """
-    name = re.escape(package)
-    pattern = re.compile(
-        rf"\bStart proc (\d+):{name}/"
-        rf"|\bProcess {name} \(pid (\d+)\) has died\b"
-        rf"|\bKilling (\d+):{name}/"
-        rf"|\bProcess: {name}, PID: (\d+)\b"
-    )
-    return {next(g for g in m.groups() if g) for m in pattern.finditer(text)}
 
 
 def analyze_logcat(text: str) -> dict:
@@ -512,21 +458,35 @@ class AppStateCapture:
         pid_result = adb_exec.run_adb(
             "shell", self.serial, "pidof", quote_for_device_shell(self.package)
         )
-        running = (
+        candidates = (
             {token for token in pid_result.stdout.split() if token.isdigit()}
             if pid_result.ok
             else set()
         )
+        # `pidof` matches a process NAME, which another app can give its own
+        # process (`android:process`): keep only pids whose uid `ps` reports
+        # as one of the package's (it has one per user it is installed for).
+        # They are asked of the device once, and only when something needs them.
+        package_uids = functools.cache(lambda: get_package_uids(self.serial, self.package))
+        running: set[str] = set()
+        if candidates and package_uids():
+            owners = get_pid_uids(self.serial, candidates)
+            running = {pid for pid in candidates if owners.get(pid) in package_uids()}
 
         try:
             # threadtime, explicitly: the PID and priority columns read below
             # are the ones it prints, whatever the device's default format is.
+            # Microsecond headers tell a continuation line from a new message
+            # (common.logcat.USEC_FORMAT).
+            # Bytes, split on "\n" only: text mode would turn an app's raw "\r"
+            # into a line break and let it forge a line (common.logcat.app_window).
             result = adb_exec.run_adb(
                 "logcat",
                 self.serial,
-                *logcat.logcat_args(since=since),
+                *logcat.logcat_args(since=since, usec=True),
                 timeout=LOGCAT_TIMEOUT_SECONDS,
                 check=True,
+                raw_text=True,
             )
         except adb_exec.DeviceError:
             # Nothing reached the device. A snapshot that merely notes "logs
@@ -537,8 +497,18 @@ class AppStateCapture:
                 f.write(f"Error capturing logs: {e}\n")
             return {"captured": False, "error": str(e)}
 
-        window = result.stdout
-        pids = running | parse_package_pids(window, self.package)
+        # The app's lines: those of each process the device vouches for (its
+        # uid the package's), inside that process's life -- the same rule
+        # log_monitor --app reads by (common.logcat.app_window). system_server's
+        # pid is asked of the device only if the window holds a sentence.
+        window = logcat.app_window(
+            result.stdout,
+            self.package,
+            system_server_pid=lambda: get_system_server_pid(self.serial, not_one_of=candidates),
+            package_uids=package_uids,
+            running=running,
+        )
+        pids = window.pids
         if not pids:
             # Not "no logs": the device's whole window is not the app's, and an
             # empty one would read as an app that ran and logged nothing.
@@ -549,11 +519,7 @@ class AppStateCapture:
                 "if it ran earlier, or pass --no-logs.",
             )
 
-        lines = [
-            line
-            for line in window.splitlines()
-            if (parsed := parse_threadtime(line)) is not None and parsed[0] in pids
-        ]
+        lines = window.lines
         # Cap retained lines (keep the most recent) for token efficiency.
         if log_lines > 0 and len(lines) > log_lines:
             lines = lines[-log_lines:]

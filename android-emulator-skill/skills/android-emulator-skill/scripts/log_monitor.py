@@ -34,6 +34,7 @@ Usage Examples:
 """
 
 import argparse
+import bisect
 import contextlib
 import json
 import re
@@ -51,7 +52,13 @@ from common.adb_exec import (
     classify_device_error,
     run_adb,
 )
-from common.device_utils import get_connected_devices, quote_for_device_shell
+from common.device_utils import (
+    get_connected_devices,
+    get_package_uids,
+    get_pid_uids,
+    get_system_server_pid,
+    quote_for_device_shell,
+)
 from common.env_config import env_int
 
 # Output caps (env-configurable via ANDROID_EMU_LOG_*). Defaults preserve the
@@ -61,6 +68,16 @@ LOG_TAIL = env_int("ANDROID_EMU_LOG_TAIL", 50)
 LOG_TEXT_SUMMARY_CAP = env_int("ANDROID_EMU_LOG_TEXT_SUMMARY", 5)
 LOG_JSON_CAP = env_int("ANDROID_EMU_LOG_JSON_CAP", 20)
 LOG_INFO_CAP = env_int("ANDROID_EMU_LOG_INFO_CAP", 20)
+# Lines a live `--app` read holds from pids not yet known to be the app's, in
+# case a later line names one (see LogMonitor._take). Bounded because every
+# other process's lines pass through it on a busy device and a --follow can
+# run for hours. 2000 lines is about seven minutes of the API 35 emulator
+# (2929 lines in a measured ten). The gap it exists for: a process already
+# running when the read began is named only by system_server's uid-carrying
+# `Killing` line, after all of its own -- in logcat_app_restart_usec the
+# force-stopped process logged for 3.6 s before it. A line older than the cap
+# is dropped, and counted (`attribution.pending_evicted`).
+LOG_PENDING_CAP = env_int("ANDROID_EMU_LOG_PENDING_CAP", 2000)
 # Grace period for a terminated logcat to exit before it is killed. Bounded
 # so shutdown can never become the hang it is meant to prevent.
 STREAM_SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_LOG_SHUTDOWN_TIMEOUT", 5)
@@ -92,10 +109,19 @@ class LogMonitor:
             app_package: Filter logs by app package name
             device_serial: Device serial (auto-detects if None)
             severity_filter: List of severities to include (error, warning, info, debug, verbose)
+
+        Raises:
+            ValueError: A severity is not one of ``common.logcat.SEVERITY_NAMES``.
+                An unknown one used to be kept and matched nothing (D1).
         """
         self.app_package = app_package
         self.device_serial = device_serial
         self.severity_filter = severity_filter or ["error", "warning", "info", "debug"]
+        unknown = [name for name in self.severity_filter if name not in logcat.SEVERITY_NAMES]
+        if unknown:
+            raise ValueError(
+                f"unknown severity {unknown[0]!r}; accepted: {', '.join(logcat.SEVERITY_NAMES)}"
+            )
 
         # Log storage
         self.log_lines = []
@@ -103,7 +129,10 @@ class LogMonitor:
         self.warnings = []
         self.info_messages = []
 
-        # Statistics
+        # Statistics. error_count / warning_count are LINES, the same thing a
+        # reader counts down the priority column; the unique counts come from
+        # the dedup signatures below. They were one number, the signature count,
+        # so six recorded W lines reported "warnings: 2" (N15).
         self.error_count = 0
         self.warning_count = 0
         self.info_count = 0
@@ -111,8 +140,28 @@ class LogMonitor:
         self.verbose_count = 0
         self.total_lines = 0
 
-        # Deduplication
-        self.seen_messages = set()
+        # Deduplication, per severity, so a warning cannot hide an error with
+        # the same text.
+        self.seen_messages: dict[str, set[str]] = {"error": set(), "warning": set()}
+
+        # Every pid of app_package with a life in this capture: the one `pidof`
+        # named (its uid checked), and any the log itself names as the app's (D4).
+        self.app_pids: set[str] = set()
+        self._pidof_failure: str | None = None
+        self._pidof_pids: set[str] = set()
+        self._pidof_rejected: set[str] = set()
+        self._running: set[str] = set()
+        self._system_server: str | None = None
+        self._system_server_asked = False
+        self._package_uids: frozenset[int] | None = None
+        self._package_uid_asked = False
+        # The live --app reader (common.logcat.AppWindowStream); None otherwise.
+        self._stream: logcat.AppWindowStream | None = None
+        # What decided the window, for the JSON's `attribution` (None without --app).
+        self.attribution: dict | None = None
+        # Input order of each stored line, parallel to log_lines: a live read
+        # decides some lines late and must still store them in order.
+        self._log_order: list[int] = []
 
         # Process control
         self.log_process = None
@@ -152,7 +201,12 @@ class LogMonitor:
             Dict with parsed fields or None if invalid
         """
         # Match logcat format
-        pattern = r"(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+([^:]+):\s*(.*)"
+        # The fraction is 3 digits, or 6 with `-v usec` (which the command asks
+        # for: see build_logcat_command).
+        pattern = (
+            r"(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}(?:\d{3})?)\s+(\d+)\s+(\d+)\s+([VDIWEF])\s+"
+            r"([^:]+):\s*(.*)"
+        )
         match = re.match(pattern, line)
 
         if not match:
@@ -194,13 +248,14 @@ class LogMonitor:
         # V
         return "verbose"
 
-    def deduplicate_message(self, message: str, tag: str) -> bool:
+    def deduplicate_message(self, message: str, tag: str, severity: str = "warning") -> bool:
         """
         Check if message is duplicate.
 
         Args:
             message: Log message
             tag: Log tag
+            severity: ``error`` or ``warning`` -- each has its own signatures.
 
         Returns:
             True if this is a new message, False if duplicate
@@ -210,18 +265,29 @@ class LogMonitor:
         signature = re.sub(r"\d+", "", signature)  # Remove numbers
         signature = re.sub(r"\s+", " ", signature).strip()
 
-        if signature in self.seen_messages:
+        seen = self.seen_messages[severity]
+        if signature in seen:
             return False
 
-        self.seen_messages.add(signature)
+        seen.add(signature)
         return True
 
-    def process_log_line(self, line: str):
+    def _store(self, line: str, sequence: int | None) -> None:
+        """Keep ``line`` in ``log_lines`` at its place in input order."""
+        if sequence is None:
+            sequence = self._log_order[-1] + 1 if self._log_order else 0
+        at = bisect.bisect_right(self._log_order, sequence)
+        self._log_order.insert(at, sequence)
+        self.log_lines.insert(at, line)
+
+    def process_log_line(self, line: str, sequence: int | None = None):
         """
         Process a single log line.
 
         Args:
             line: Log line to process
+            sequence: Its position in the input, when it is decided out of
+                order (a live --app read replays held lines); stored there.
         """
         if not line.strip():
             return
@@ -230,12 +296,12 @@ class LogMonitor:
         parsed = self.parse_logcat_line(line)
         if not parsed:
             # Store unparsed line as-is
-            self.log_lines.append(line)
+            self._store(line, sequence)
             self.total_lines += 1
             return
 
         self.total_lines += 1
-        self.log_lines.append(parsed["raw"])
+        self._store(parsed["raw"], sequence)
 
         # Classify severity
         severity = self.classify_log_line(parsed)
@@ -244,18 +310,17 @@ class LogMonitor:
         if severity not in self.severity_filter:
             return
 
-        # Deduplicate (for errors and warnings)
-        if severity in ["error", "warning"]:
-            if not self.deduplicate_message(parsed["message"], parsed["tag"]):
-                return
-
-        # Store by severity
-        if severity == "error":
-            self.error_count += 1
-            self.errors.append(f"[{parsed['tag']}] {parsed['message']}")
-        elif severity == "warning":
-            self.warning_count += 1
-            self.warnings.append(f"[{parsed['tag']}] {parsed['message']}")
+        # Errors and warnings: every line counts; only a new message is listed.
+        # The count used to sit behind the dedup `return`, so it counted
+        # messages, not lines (N15).
+        if severity in ("error", "warning"):
+            if severity == "error":
+                self.error_count += 1
+            else:
+                self.warning_count += 1
+            if self.deduplicate_message(parsed["message"], parsed["tag"], severity):
+                listed = self.errors if severity == "error" else self.warnings
+                listed.append(f"[{parsed['tag']}] {parsed['message']}")
         elif severity == "info":
             self.info_count += 1
             if len(self.info_messages) < LOG_INFO_CAP:  # Keep only recent info
@@ -279,7 +344,6 @@ class LogMonitor:
 
     def build_logcat_command(
         self,
-        pid: str | None = None,
         last_minutes: float | None = None,
         now: datetime | None = None,
     ) -> list[str]:
@@ -298,8 +362,13 @@ class LogMonitor:
         unparsed branch, severity counts stayed at zero and ``--follow`` printed
         nothing at all.
 
+        No ``--pid``: ``--app`` is filtered here, on the host (``_is_apps``).
+        One ``--pid`` is one process, so after a crash and restart it kept only
+        the new process and dropped the one that crashed (D4). Under a severity
+        floor above I, ``ActivityManager:I`` is kept so the lines that name the
+        app's processes still arrive.
+
         Args:
-            pid: App PID to filter by (omitted if None/empty)
             last_minutes: If set, dump a historical window with ``-d -t`` instead
                 of streaming live. The window starts at ``now - last_minutes``.
             now: Reference time for the historical window (defaults to current
@@ -312,17 +381,50 @@ class LogMonitor:
         if last_minutes is not None:
             since = logcat.window_start(last_minutes * 60, now=now)
 
+        min_priority = self._severity_min_priority()
+        tag_priorities: tuple[tuple[str, str], ...] = ()
+        if (
+            self.app_package
+            and min_priority is not None
+            and logcat.PRIORITY_ORDER.index(min_priority)
+            > logcat.PRIORITY_ORDER.index(logcat.PROCESS_TAG_PRIORITY)
+        ):
+            tag_priorities = ((logcat.PROCESS_TAG, logcat.PROCESS_TAG_PRIORITY),)
+
+        # `-v usec` on every read, so a line's header tells a continuation of
+        # a multi-line message apart from a new message (common.logcat
+        # USEC_FORMAT) -- and so one read has one format, with --app or not.
+        # A live read starts at the end of the buffer (`-T 1`, as anr_watcher's
+        # live stream does): without it `adb logcat` first replays the whole
+        # ring buffer, and an --app read opened the running pid's life before
+        # that history, so an EARLIER owner of the pid had its lines kept
+        # (security review of #27). History is --last's job.
         return logcat.build_logcat_command(
             self.device_serial,
             since=since,
-            pid=pid,
-            min_priority=self._severity_min_priority(),
+            min_priority=min_priority,
+            tag_priorities=tag_priorities,
+            usec=True,
+            tail=1 if last_minutes is None else None,
         )
 
-    def _resolve_app_pid(self) -> str | None:
-        """Look up the running PID for ``self.app_package`` (None if not running)."""
+    def _resolve_app_pids(self) -> set[str]:
+        """The pids ``pidof`` reports for ``self.app_package`` now.
+
+        No answer is not a refusal on its own: an app that crashed and was not
+        restarted has no process now, and its window is the one most worth
+        reading. The capture is refused only when no pid of the app can be
+        found at all (``stream_logs``) -- the rule app_state_capture follows,
+        so the two read one app's window the same way.
+
+        Returns:
+            The pids; empty when ``pidof`` names none. The recorded answer for
+            an app that is not running (pidof_not_running) is no output, exit 1.
+            Any other failure is kept in ``self._pidof_failure`` for the
+            refusal to quote, should one follow.
+        """
         if not self.app_package:
-            return None
+            return set()
         try:
             result = run_adb(
                 "shell",
@@ -331,11 +433,156 @@ class LogMonitor:
                 quote_for_device_shell(self.app_package),
                 check=True,
             )
-        except AdbCommandError:
-            # `pidof` exits non-zero when the app is not running, which is an
-            # answer rather than a failure: continue without a PID filter.
-            return None
-        return result.stdout.strip() or None
+        except AdbCommandError as error:
+            if error.returncode != 1 or error.stdout.strip() or error.stderr.strip():
+                self._pidof_failure = str(error)
+            return set()
+        return {token for token in result.stdout.split() if token.isdigit()}
+
+    def _take(self, line: str, echo: bool) -> None:
+        """Take one line of a live read into the capture.
+
+        Without ``--app`` every line is the capture's. With it, the live
+        reader (``common.logcat.AppWindowStream``) decides: a line from one of
+        the app's processes, inside that process's life, is kept; a line from
+        a pid not yet decided is held back and kept later if the pid is named
+        (a process already running when the read began is named only when it
+        is killed). Held lines arrive late and are stored at their place in
+        input order; ``--follow`` prints them when they are decided, marked.
+        """
+        if self._stream is None:
+            self._keep(line, echo)
+            return
+        for sequence, kept, replayed in self._stream.feed(line):
+            self._keep(kept, echo, sequence=sequence, replayed=replayed)
+
+    def _system_server_pid(self) -> str | None:
+        """system_server's pid, asked of the device once, when first needed.
+
+        Only system_server may say which pids were the app's (an app can log
+        under its tag). The question is put only when a line about some
+        process's start or death arrives, so a capture that never sees one
+        makes no extra adb call.
+        """
+        if not self._system_server_asked:
+            self._system_server_asked = True
+            self._system_server = get_system_server_pid(
+                self.device_serial, not_one_of=self._pidof_pids
+            )
+            if self._system_server is None:
+                print(
+                    "system_server's pid is unknown, so ActivityManager's lines about "
+                    f"{self.app_package}'s processes cannot be verified and are not used: "
+                    "the window holds only the process `pidof` names.",
+                    file=sys.stderr,
+                )
+        return self._system_server
+
+    def _package_uid_lookup(self) -> int | None:
+        """The package's uid, asked of the device once, when first needed.
+
+        A pid is the app's only when its uid is the package's: any app may
+        name its own process after another package (``android:process``).
+        Unknown, no process can be confirmed (fail closed).
+        """
+        if not self._package_uid_asked:
+            self._package_uid_asked = True
+            self._package_uids = get_package_uids(self.device_serial, self.app_package)
+            if self._package_uids is None:
+                print(
+                    f"{self.app_package}'s uid is unknown (`cmd package list packages -U` "
+                    "named none), so no process can be confirmed as its own.",
+                    file=sys.stderr,
+                )
+        return self._package_uids
+
+    def _verify_running(self, pids: set[str]) -> set[str]:
+        """The pids of ``pids`` whose uid ``ps`` reports as one of the package's.
+
+        ``pidof`` matches a process NAME, which another app can give its own
+        process. One bounded ``ps -o PID,UID`` call checks them all. The
+        package has one uid per user it is installed for; any of them counts.
+        """
+        if not pids:
+            return set()
+        uids = self._package_uid_lookup()
+        owners = get_pid_uids(self.device_serial, pids) if uids else {}
+        verified = {pid for pid in pids if uids and owners.get(pid) in uids}
+        self._pidof_rejected = pids - verified
+        if self._pidof_rejected and uids:
+            print(
+                f"`pidof {self.app_package}` named {sorted(self._pidof_rejected, key=int)}, "
+                "whose uid is not the package's; left out.",
+                file=sys.stderr,
+            )
+        return verified
+
+    def _settle_attribution(self, held: list[str] | None) -> None:
+        """Decide a held (historical) window, and record what decided the window.
+
+        Sets ``app_pids`` and ``attribution``. The live counts are reported on
+        stderr when nonzero: lines of the app that the live hold dropped at its
+        cap before the app's process was named (``pending_evicted``), and lines
+        still held when the read ended, from processes it never decided
+        (``unattributed_at_end`` -- mostly other processes' lines; it says how
+        much the read could not decide, not how much of the app was lost).
+        """
+        evicted = unattributed = 0
+        if held is not None:
+            window = logcat.app_window(
+                "\n".join(held),
+                self.app_package,
+                system_server_pid=self._system_server_pid,
+                package_uids=self._package_uid_lookup,
+                running=self._running,
+            )
+            for line in window.lines:
+                self._keep(line, echo=False)
+            self.app_pids, from_log = window.pids, window.pids_from_log
+        elif self._stream is not None:
+            self.app_pids, from_log = set(self._stream.pids), self._stream.pids_from_log
+            evicted, unattributed = self._stream.pending_evicted, self._stream.unattributed
+        else:
+            from_log = set()
+
+        def status(asked: bool, value) -> str:
+            return "not needed" if not asked else ("known" if value is not None else "unknown")
+
+        self.attribution = {
+            "system_server_pid": self._system_server,
+            "system_server": status(self._system_server_asked, self._system_server),
+            "package_uids": sorted(self._package_uids) if self._package_uids else None,
+            "package_uids_status": status(self._package_uid_asked, self._package_uids),
+            "pids_from_pidof": sorted(self._running, key=int),
+            "pidof_rejected": sorted(self._pidof_rejected, key=int),
+            "pids_from_log": sorted(from_log, key=int),
+            "pending_evicted": evicted,
+            "unattributed_at_end": unattributed,
+        }
+        if evicted:
+            print(
+                f"{evicted} line(s) of {self.app_package}'s processes were dropped before the "
+                f"process was named: the live hold keeps {LOG_PENDING_CAP} lines "
+                "(ANDROID_EMU_LOG_PENDING_CAP).",
+                file=sys.stderr,
+            )
+        if unattributed:
+            print(
+                f"{unattributed} line(s) were still held when the read ended, from processes "
+                f"never shown to be {self.app_package}'s; not shown.",
+                file=sys.stderr,
+            )
+
+    def _keep(
+        self, line: str, echo: bool, sequence: int | None = None, replayed: bool = False
+    ) -> None:
+        """Process one line of the capture, and print it in follow mode."""
+        self.process_log_line(line, sequence)
+        if echo:
+            parsed = self.parse_logcat_line(line)
+            if parsed and self.classify_log_line(parsed) in self.severity_filter:
+                # A held line is printed when it is decided, after newer ones.
+                print(f"[held back] {line}" if replayed else line)
 
     def stream_logs(
         self,
@@ -356,6 +603,12 @@ class LogMonitor:
 
         Returns:
             True if successful
+
+        Raises:
+            cli.Failure: ``--app`` was given and no process of the app was found
+                -- not by ``pidof``, and not in any line read. The capture is
+                refused rather than reported as an empty (or, before D4, a
+                whole-device) window.
         """
         self._verify_device_available()
 
@@ -367,9 +620,38 @@ class LogMonitor:
             with contextlib.suppress(AdbCommandError):
                 run_adb("logcat", self.device_serial, *logcat.logcat_args(clear=True), check=True)
 
-        # Resolve app PID (device call) then build the command (pure mapping).
-        pid = self._resolve_app_pid()
-        cmd = self.build_logcat_command(pid=pid, last_minutes=last_minutes)
+        # Resolve the app's pids (device calls: pidof, then its uid checked)
+        # then build the command (pure mapping).
+        self._pidof_pids = self._resolve_app_pids()
+        self._running = self._verify_running(self._pidof_pids)
+        self.app_pids = set(self._running)
+        if self.app_package and not self._running:
+            state = "`pidof` failed" if self._pidof_failure else "none running is the package's"
+            print(
+                f"No process of {self.app_package} now ({state}); keeping the lines of any "
+                f"of its processes the log names.",
+                file=sys.stderr,
+            )
+        cmd = self.build_logcat_command(last_minutes=last_minutes)
+
+        # A historical window is read whole before it is filtered: a process
+        # already running when the window opens is named only at its end, by
+        # system_server's `Killing` (recorded: logcat_app_restart_usec), after every
+        # line it logged. A live stream cannot wait for the end; it learns pids
+        # as lines arrive and holds back the lines of pids not yet named, up to
+        # LOG_PENDING_CAP, to keep them if one is (see _take).
+        held: list[str] | None = [] if self.app_package and last_minutes is not None else None
+        self._stream = (
+            logcat.AppWindowStream(
+                self.app_package,
+                system_server_pid=self._system_server_pid,
+                package_uids=self._package_uid_lookup,
+                running=self._running,
+                pending_cap=LOG_PENDING_CAP,
+            )
+            if self.app_package and held is None
+            else None
+        )
 
         # Setup signal handler for graceful interruption
         def signal_handler(sig, frame):
@@ -388,12 +670,14 @@ class LogMonitor:
             # stdout instead would feed adb's own error text through the log
             # parser and count it as device output. Draining it on a thread
             # avoids both, and keeps the text for diagnosis on failure.
+            # Bytes, split on b"\n" only (readline on a binary pipe): a text
+            # pipe also breaks lines at "\r", which logcat leaves raw inside an
+            # app's message -- an app could append "\r<forged header>" and have
+            # it read as a line of its own (security review of #27).
             self.log_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # Line buffered
             )
             self._stderr_lines = []
             self._start_stderr_drain()
@@ -416,18 +700,15 @@ class LogMonitor:
 
             start_time = datetime.now()
 
-            for line in iter(self.log_process.stdout.readline, ""):
-                if not line:
+            for raw in iter(self.log_process.stdout.readline, b""):
+                if not raw:
                     break
+                line = logcat.decode_log_line(raw).rstrip()
 
-                self.process_log_line(line.rstrip())
-
-                if follow:
-                    parsed = self.parse_logcat_line(line.rstrip())
-                    if parsed:
-                        severity = self.classify_log_line(parsed)
-                        if severity in self.severity_filter:
-                            print(line.rstrip())
+                if held is not None:
+                    held.append(line)
+                else:
+                    self._take(line, echo=follow)
 
                 if duration and (datetime.now() - start_time).total_seconds() >= duration:
                     stopped_by_us = True
@@ -437,7 +718,7 @@ class LogMonitor:
                     stopped_by_us = True
                     break
 
-            return self._finish_stream(stopped_by_us)
+            finished = self._finish_stream(stopped_by_us)
 
         # No `except Exception` here any more: it printed the error and returned
         # False, so a device that vanished mid-stream exited 1 with no remedy
@@ -447,6 +728,25 @@ class LogMonitor:
                 deadline_timer.cancel()
             if self.log_process and self.log_process.poll() is None:
                 self.log_process.terminate()
+
+        if self.app_package:
+            self._settle_attribution(held)
+
+        if self.app_package and not self.app_pids:
+            # Not "no logs": the device's whole window is not the app's, and an
+            # empty one would read as an app that ran and logged nothing.
+            running = (
+                f"`pidof` failed ({self._pidof_failure})"
+                if self._pidof_failure
+                else "`pidof` found none running"
+            )
+            cli.fail(
+                f"{self.app_package} had no process in this capture: {running}, and no "
+                f"line read names one of its processes.",
+                "Launch the app and retry (or widen --last to when it ran); drop --app to "
+                "read every process.",
+            )
+        return finished
 
     def _verify_device_available(self) -> None:
         """Check an explicitly requested serial is actually attached.
@@ -493,10 +793,10 @@ class LogMonitor:
 
         def _drain() -> None:
             with contextlib.suppress(ValueError, OSError):
-                for line in iter(stream.readline, ""):
+                for line in iter(stream.readline, b""):
                     if not line:
                         break
-                    self._stderr_lines.append(line.rstrip())
+                    self._stderr_lines.append(line.decode("utf-8", errors="replace").rstrip())
 
         thread = threading.Thread(target=_drain, daemon=True)
         thread.start()
@@ -570,24 +870,26 @@ class LogMonitor:
 
         # Header
         if self.app_package:
-            lines.append(f"Logs for: {self.app_package}")
+            lines.append(f"Logs for: {self.app_package} (pids: {', '.join(self._app_pid_list())})")
         else:
             lines.append("Logs for: All processes")
 
         # Statistics
         lines.append(f"Total lines: {self.total_lines}")
         lines.append(
-            f"Errors: {self.error_count}, Warnings: {self.warning_count}, Info: {self.info_count}"
+            f"Errors: {self.error_count} ({len(self.errors)} unique), "
+            f"Warnings: {self.warning_count} ({len(self.warnings)} unique), "
+            f"Info: {self.info_count}"
         )
 
         # Top issues
         if self.errors:
-            lines.append(f"\nTop Errors ({len(self.errors)}):")
+            lines.append(f"\nTop Errors ({len(self.errors)} unique):")
             for error in self.errors[:LOG_TEXT_SUMMARY_CAP]:
                 lines.append(f"  ❌ {error[:LOG_LINE_MAX]}")  # Truncate long lines
 
         if self.warnings:
-            lines.append(f"\nTop Warnings ({len(self.warnings)}):")
+            lines.append(f"\nTop Warnings ({len(self.warnings)} unique):")
             for warning in self.warnings[:LOG_TEXT_SUMMARY_CAP]:
                 lines.append(f"  ⚠️  {warning[:LOG_LINE_MAX]}")
 
@@ -599,15 +901,34 @@ class LogMonitor:
 
         return "\n".join(lines)
 
+    def _app_pid_list(self) -> list[str]:
+        """The app's pids in this capture, oldest process first."""
+        return sorted(self.app_pids, key=int)
+
     def get_json_output(self) -> dict:
-        """Get log results as JSON."""
+        """Get log results as JSON.
+
+        ``errors`` / ``warnings`` under ``statistics`` count lines; the
+        ``unique_*`` counts are the distinct messages, which the top-level
+        ``errors`` / ``warnings`` lists hold (capped at ``LOG_JSON_CAP``).
+        ``app_pids`` is every process of ``app_package`` in the window -- more
+        than one after a restart -- and null without ``--app``. ``attribution``
+        says what decided it (see ``_settle_attribution``): whether
+        system_server's pid and the package's uid were known, which pids came
+        from ``pidof`` (uid-checked) and which from the log, and how many lines
+        a live read dropped or never decided. Null without ``--app``.
+        """
         return {
             "app_package": self.app_package,
+            "app_pids": self._app_pid_list() if self.app_package else None,
+            "attribution": self.attribution,
             "device_serial": self.device_serial,
             "statistics": {
                 "total_lines": self.total_lines,
                 "errors": self.error_count,
+                "unique_errors": len(self.errors),
                 "warnings": self.warning_count,
+                "unique_warnings": len(self.warnings),
                 "info": self.info_count,
                 "debug": self.debug_count,
                 "verbose": self.verbose_count,
@@ -648,6 +969,18 @@ class LogMonitor:
         return str(log_file)
 
 
+def _severity_list(text: str) -> list[str]:
+    """``--severity``'s type: a usage error (exit 2) for a name outside the set.
+
+    Checked by argparse, so a refused filter never reaches the device. An
+    unknown name used to be passed through and match nothing (D1).
+    """
+    try:
+        return logcat.parse_severities(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -686,7 +1019,13 @@ Examples:
         "--serial", dest="device_serial", help="Device serial (uses default if not specified)"
     )
     parser.add_argument(
-        "--severity", help="Comma-separated severity levels (error,warning,info,debug,verbose)"
+        "--severity",
+        type=_severity_list,
+        help=(
+            "Comma-separated severities to keep, from: "
+            f"{','.join(logcat.SEVERITY_NAMES)} (default: error,warning,info,debug). "
+            "Any other name is a usage error"
+        ),
     )
 
     # Time options
@@ -709,16 +1048,11 @@ Examples:
 
     args = parser.parse_args(argv)
 
-    # Parse severity filter
-    severity_filter = None
-    if args.severity:
-        severity_filter = [s.strip().lower() for s in args.severity.split(",")]
-
     # Initialize monitor
     monitor = LogMonitor(
         app_package=args.app_package,
         device_serial=args.device_serial,
-        severity_filter=severity_filter,
+        severity_filter=args.severity,
     )
 
     # Parse duration. `--duration 30` (no unit) raised ValueError out of

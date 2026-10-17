@@ -34,7 +34,8 @@ Four documented departures from verbatim, all visible in the code below:
    ``config.ini``. Fixtures are public; an account name is not theirs to
    publish. The placeholder keeps the path absolute, so a parser that splits
    or joins it exercises the same code it would on the real one.
-4. ``logcat_app_restart`` keeps only some LINES of its window
+4. ``logcat_app_restart`` and ``logcat_app_restart_usec`` keep only some LINES
+   of their window
    (``_app_restart_window``): those that name the fixture package or carry one
    of the pids ``pidof`` reported for it, plus the reader's ``beginning of``
    separators. A full window carries every other app's free text, which is not
@@ -1548,8 +1549,15 @@ _LAUNCH_COMPOSE = ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.Defa
 _RESTART_ENDINGS: tuple[tuple[str, ...] | None, ...] = (("am", "crash"), ("am", "force-stop"), None)
 
 
-def _app_restart_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _app_restart_window(
+    _scratch: Path, serial: str | None, extra: dict, *, usec: bool = True
+) -> Capture:
     """Three processes of the fixture app in one logcat window, and their pids.
+
+    ``usec`` asks for microsecond headers (logcat_app_restart_usec, what
+    log_monitor and app_state_capture read); without it the headers are
+    logcat's default milliseconds (logcat_app_restart, what the ANR readers
+    read). Both record the same oracles.
 
     Each pid is measured with ``pidof`` while that process is alive and stored
     in the manifest (``pids``), so a test can hold what a parser attributes to
@@ -1583,7 +1591,13 @@ def _app_restart_window(_scratch: Path, serial: str | None, extra: dict) -> Capt
     if len(set(pids)) != len(pids):
         raise CaptureError(f"expected a new process per launch; pidof saw {pids}")
 
-    window = _run(["logcat", "-d", "-v", "threadtime"], serial, timeout=60)
+    # Microsecond headers, as log_monitor and app_state_capture ask for them:
+    # the lines of ONE multi-line message share their header to the
+    # microsecond, while two messages logged in the same millisecond do not --
+    # measured: `Force stopping` and `Killing` once shared `.651` at ms
+    # precision. The continuation rule in common.logcat needs that resolution.
+    usec_args = ["-v", "usec"] if usec else []
+    window = _run(["logcat", "-d", "-v", "threadtime", *usec_args], serial, timeout=60)
 
     def _pid_column(line: str) -> str | None:
         fields = line.split()
@@ -1599,9 +1613,111 @@ def _app_restart_window(_scratch: Path, serial: str | None, extra: dict) -> Capt
     silent = [pid for pid in pids if not any(_pid_column(line) == pid for line in kept)]
     if silent:
         raise CaptureError(f"process(es) {silent} logged nothing in the window; re-record")
+
+    # Who may say which pids were the app's. Any app can log under
+    # ActivityManager's tag; only system_server writes it with its own pid, so
+    # that pid is the oracle the parser's producer check is held against --
+    # read from the device in the same run, not from the lines being checked.
+    answer = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
+    if not answer.isdigit():
+        raise CaptureError(f"pidof system_server named no single pid: {answer!r}")
+    # Every launch, not only the first: a capture where any `Start proc` line
+    # came from another writer is not the evidence this fixture records.
+    for pid in pids:
+        starts = [line for line in kept if f"ActivityManager: Start proc {pid}:" in line]
+        if not starts or any(_pid_column(line) != answer for line in starts):
+            raise CaptureError(
+                f"system_server is pid {answer}, but the `Start proc {pid}` line(s) came "
+                f"from {sorted({_pid_column(line) for line in starts})}"
+            )
+    # The uid oracles, read in the same run: the package's uid, and the uid of
+    # the process still alive, as `ps` reports it. A pid is the app's only when
+    # its uid is the package's -- any app may name a process of its own after
+    # another package (`android:process`), and system_server then really logs
+    # `Start proc N:<that package>/<the impostor's uid>`.
+    listing = _run(
+        ["shell", "cmd", "package", "list", "packages", "-U", COMPOSE_PACKAGE], serial, timeout=15
+    )
+    ps = _run(["shell", "ps", "-o", "PID,UID", "-p", pids[-1]], serial, timeout=15)
+    if f"package:{COMPOSE_PACKAGE} uid:" not in listing.text or pids[-1] not in ps.text:
+        raise CaptureError(
+            f"uid oracles incomplete: listing {listing.text.strip()!r}, ps {ps.text.strip()!r}"
+        )
     extra["pids"] = pids
     extra["pid_endings"] = ["am crash", "am force-stop", "running when the window was read"]
+    extra["system_server_pid"] = answer
+    extra["package_uid_listing"] = {
+        "command": f"adb shell cmd package list packages -U {COMPOSE_PACKAGE}",
+        "exit_status": listing.returncode,
+        "output": _strip_cr(listing.text),
+    }
+    extra["ps_alive"] = {
+        "command": f"adb shell ps -o PID,UID -p {pids[-1]}",
+        "exit_status": ps.returncode,
+        "output": _strip_cr(ps.text),
+    }
     return Capture("".join(kept), window.stderr, window.returncode)
+
+
+def _app_restart_window_ms(scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """:func:`_app_restart_window` with logcat's default millisecond headers."""
+    return _app_restart_window(scratch, serial, extra, usec=False)
+
+
+def _package_uids_two_users(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """`cmd package list packages -U` with the fixture app installed for two users.
+
+    A throwaway secondary user is created, the app installed for it, the
+    listing read, and the user removed -- in a `finally`, then read back until
+    the listing names one uid again (measured: removal settles within seconds).
+    Only for an emulator (`emulator_only`).
+    """
+    created = _run(["shell", "pm", "create-user", "u5-fixture-tmp"], serial, timeout=60)
+    match = re.search(r"created user id (\d+)", created.text)
+    if created.returncode != 0 or match is None:
+        raise CaptureError(f"pm create-user failed: {created.text.strip()!r}")
+    user = match.group(1)
+    listing_args = ["shell", "cmd", "package", "list", "packages", "-U", COMPOSE_PACKAGE]
+    try:
+        installed = _run(
+            ["shell", "pm", "install-existing", "--user", user, COMPOSE_PACKAGE], serial, timeout=60
+        )
+        if installed.returncode != 0:
+            raise CaptureError(f"install-existing failed: {installed.text.strip()!r}")
+        capture = _run(listing_args, serial, timeout=15)
+        if "," not in capture.text:
+            raise CaptureError(f"expected one uid per user, got {capture.text.strip()!r}")
+    finally:
+        _run(["shell", "pm", "remove-user", user], serial, timeout=60)
+    for _ in range(15):
+        if "," not in _run(listing_args, serial, timeout=15).text:
+            break
+        time.sleep(1)
+    else:
+        raise CaptureError(f"user {user} still listed after pm remove-user; check the emulator")
+    extra["secondary_user"] = user
+    return capture
+
+
+def _ps_two_owners(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """`ps -o PID,UID` for the fixture app's process and system_server's, in one call.
+
+    Two rows with two different uids: the evidence a `pidof` answer is checked
+    against, including the case where one of its pids is not the package's.
+    """
+    _run(["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"], serial)
+    _run(["shell", "sleep", "2"], serial)
+    app = _run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15).text.strip()
+    system_server = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
+    if not (app.isdigit() and system_server.isdigit()):
+        raise CaptureError(f"pidof answered app {app!r}, system_server {system_server!r}")
+    args = ["shell", "ps", "-o", "PID,UID", "-p", f"{app},{system_server}"]
+    capture = _run(args, serial, timeout=15)
+    if app not in capture.text or system_server not in capture.text:
+        raise CaptureError(f"ps did not list both processes: {capture.text.strip()!r}")
+    extra["pids"] = {"app": app, "system_server": system_server}
+    extra["argv"] = ["adb", "shell", "ps", "-o", "PID,UID", "-p", "<app>,<system_server>"]
+    return capture
 
 
 FIXTURES: list[Fixture] = [
@@ -1898,7 +2014,89 @@ FIXTURES: list[Fixture] = [
             "pids; other apps' free text is not recorded."
         ),
         catches=("D4",),
+        capture_with=_app_restart_window_ms,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+    ),
+    Fixture(
+        name="logcat_app_restart_usec",
+        emulator_only=True,
+        args=["logcat", "-d", "-v", "threadtime", "-v", "usec"],
+        command=(
+            "adb shell am start -W (x3, ended by am crash, then am force-stop, then left "
+            "running), then adb logcat -d -v threadtime -v usec, host-filtered to the lines "
+            "that name the package or come from its pids"
+        ),
+        description=(
+            "One app, three processes, one window: the fixture app launched, "
+            "crashed (`am crash`), relaunched, force-stopped, relaunched. The "
+            "manifest's `pids` are what `pidof` answered while each was alive, "
+            "in order. This is the evidence that ties a pid to a package when "
+            "the process is gone and `pidof` can no longer say: what "
+            "system_server and the app itself write about a process. Note "
+            "that most lines naming the package come from processes that are "
+            "NOT the app (system_server, the launcher, the IME), so naming "
+            "the package says nothing about which process wrote the line. "
+            "Host-filtered to lines that name the package or carry one of its "
+            "pids; other apps' free text is not recorded. `system_server_pid` "
+            "is `pidof system_server` read in the same run: the only process "
+            "whose ActivityManager lines may say which pids were the app's, "
+            "since any app can log under that tag. `package_uid_listing` and "
+            "`ps_alive` are the uid oracles from the same run: `cmd package list "
+            "packages -U` for the package, `ps -o PID,UID` for the live pid. "
+            "Microsecond headers (`-v usec`): the lines of one multi-line message "
+            "share their header to the microsecond; separate messages in one "
+            "millisecond do not."
+        ),
+        catches=("D4",),
         capture_with=_app_restart_window,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+    ),
+    Fixture(
+        name="package_list_uid",
+        args=["shell", "cmd", "package", "list", "packages", "-U", COMPOSE_PACKAGE],
+        description=(
+            "`cmd package list packages -U <package>`: one line, "
+            "'package:<package> uid:<uid>', exit 0. The filter is a SUBSTRING "
+            "match (measured: asking for 'com.example.compose' lists "
+            "com.example.composefixture too), and a package that is not "
+            "installed prints nothing and still exits 0 -- so a reader must pick "
+            "the line whose name is exactly the package, and treat none as "
+            "unknown."
+        ),
+        post=_requires(f"package:{COMPOSE_PACKAGE} uid:"),
+    ),
+    Fixture(
+        name="package_list_uid_two_users",
+        emulator_only=True,
+        args=[],
+        command=(
+            "adb shell pm create-user; pm install-existing --user <id> <package>; "
+            "cmd package list packages -U <package>; pm remove-user <id>"
+        ),
+        description=(
+            "`cmd package list packages -U <package>` with the package installed "
+            "for two users: ONE row, the uids comma-separated "
+            "('uid:10205,1110205' for user 11), not a row per user (measured, Android 15). A "
+            "reader keeping the first number rejects the second user's processes. "
+            "The throwaway user is removed before the capture is accepted, and the "
+            "listing is read back until it names one uid again."
+        ),
+        capture_with=_package_uids_two_users,
+    ),
+    Fixture(
+        name="ps_pid_uid",
+        emulator_only=True,
+        args=[],
+        command="adb shell ps -o PID,UID -p <fixture app pid>,<system_server pid>",
+        description=(
+            "`ps -o PID,UID -p <pid>,<pid>`: a header, then one row per pid that "
+            "exists, sorted by pid, with the NUMERIC uid (10205 for the fixture "
+            "app, 1000 for system_server). Measured: `-p a -p b` answers the same; "
+            "a pid that does not exist is left out, and with none existing only "
+            "the header prints and the exit status is 1. The pids are under "
+            "'pids' in this entry."
+        ),
+        capture_with=_ps_two_owners,
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
     ),
     Fixture(
