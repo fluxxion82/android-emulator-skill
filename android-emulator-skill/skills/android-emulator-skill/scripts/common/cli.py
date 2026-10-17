@@ -28,6 +28,12 @@ what to do. Many messages already end in their remedy, so the remedy can appear
 in both -- accepted, because cutting it out of ``error`` is presentation logic
 that can empty the field or disagree with the message.
 
+A refusal that found something on the way -- the screens a search covered, the
+entries a listing could read -- may carry it: ``fail(error, remedy,
+details={...})`` adds those keys to the JSON object after the three above,
+which they can never replace. The text form stays two lines; what a detail
+says that matters belongs in ``error`` as well.
+
 **What stdout holds under --json.** For a non-streaming mode (almost all of
 them) the refusal object is the whole of stdout; a question for the user, such
 as ``emulator_delete``'s confirmation prompt, goes to stderr. A streaming mode --
@@ -86,7 +92,7 @@ import json
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NoReturn
 
 from . import adb_exec
@@ -108,14 +114,16 @@ class Failure(Exception):  # noqa: N818 -- reads as `cli.Failure` at the call si
 
     Attributes:
         remedy: What the caller should do about it.
+        details: Extra keys for the ``--json`` object (see :func:`fail`).
     """
 
-    def __init__(self, error: str, remedy: str):
+    def __init__(self, error: str, remedy: str, details: Mapping[str, object] | None = None):
         super().__init__(error)
         self.remedy = remedy
+        self.details = dict(details or {})
 
 
-def fail(error: str, remedy: str) -> NoReturn:
+def fail(error: str, remedy: str, *, details: Mapping[str, object] | None = None) -> NoReturn:
     """Raise a failure the script detected itself, for :func:`run` to report (exit 1).
 
     For the shape this skill keeps finding: a script notices the lookup failed,
@@ -126,6 +134,10 @@ def fail(error: str, remedy: str) -> NoReturn:
     Args:
         error: What went wrong, as a sentence.
         remedy: What the caller should do next.
+        details: What the failed operation found before it failed, for a JSON
+            caller: added to the refusal object after ``success`` / ``error`` /
+            ``remedy``, none of which a detail can replace. Not printed in the
+            text form, so nothing an agent needs may live only here.
 
     Example:
         >>> if not packages and result.returncode != 0:
@@ -134,7 +146,7 @@ def fail(error: str, remedy: str) -> NoReturn:
         ...         "Check the device is booted (`adb shell getprop sys.boot_completed`).",
         ...     )
     """
-    raise Failure(error, remedy)
+    raise Failure(error, remedy, details)
 
 
 # What the skill expects to fail with. Everything raised under RuntimeError
@@ -232,17 +244,29 @@ def describe(error: BaseException) -> tuple[str, str]:
     return message, DEFAULT_REMEDIES[RuntimeError]
 
 
-def report(error: str, remedy: str, *, json_mode: bool) -> None:
+def report(
+    error: str,
+    remedy: str,
+    *,
+    json_mode: bool,
+    details: Mapping[str, object] | None = None,
+) -> None:
     """Emit the one failure shape.
 
     Args:
         error: What went wrong, one line.
         remedy: What to do about it, one line.
         json_mode: Write the JSON object to stdout instead of two lines to stderr.
+        details: Extra keys for the JSON object; never one of the three above.
     """
     try:
         if json_mode:
-            print(json.dumps({"success": False, "error": error, "remedy": remedy}))
+            payload: dict[str, object] = {"success": False, "error": error, "remedy": remedy}
+            for key, value in (details or {}).items():
+                payload.setdefault(key, value)
+            # default=str: a detail that is not JSON must not turn the refusal
+            # into a TypeError traceback with nothing on stdout.
+            print(json.dumps(payload, default=str))
         else:
             print(f"Error: {error}", file=sys.stderr)
             print(f"Remedy: {remedy}", file=sys.stderr)
@@ -307,7 +331,10 @@ def run(
             # traceback with nothing on stdout: report it as one, keeping both
             # tracebacks (the original is this exception's __context__).
             _report_defect(broken, json_mode=json_mode)
-        report(what, remedy, json_mode=json_mode)
+        # Only a Failure carries details: another error's `details` attribute,
+        # if it had one, would be its own business rather than this contract's.
+        details = error.details if isinstance(error, Failure) else None
+        report(what, remedy, json_mode=json_mode, details=details)
         sys.exit(exit_code_for(error))
     except Exception as error:
         _report_defect(error, json_mode=json_mode)

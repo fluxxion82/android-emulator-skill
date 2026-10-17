@@ -70,7 +70,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
-from common import cli
+from common import adb_exec, cli
 from common.device_utils import (
     build_adb_command,
     permission_state,
@@ -446,14 +446,19 @@ class NotificationTester:
             return _EXIT_TIMEOUT, "", f"adb timed out after {ADB_TIMEOUT}s: {' '.join(cmd)}"
         except FileNotFoundError:
             return _EXIT_ADB_MISSING, "", "adb not found on PATH"
+        if completed.returncode != 0:
+            # A device that is not there is not this command's failure: adb's
+            # own words (a line starting `adb: ` / `error: `), typed as run_adb
+            # types them, reach common.cli as exit 3 like every other script.
+            device_error = adb_exec.classify_device_error(completed.stderr or "", self.serial)
+            if device_error is not None:
+                device_error.command = cmd
+                raise device_error
         return completed.returncode, completed.stdout, completed.stderr
 
 
-def _print_post(success: bool, result: dict, verbose: bool) -> None:
+def _print_post(result: dict, verbose: bool) -> None:
     """Print the concise ``--post`` report."""
-    if not success:
-        print(f"x Post failed: {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
     print(f"+ Posted tag {result['tag']!r} as {SHELL_PACKAGE} (channel {SHELL_CHANNEL})")
     print(f"  {SHELL_POST_CAVEAT}")
     if result["verified"]:
@@ -465,11 +470,8 @@ def _print_post(success: bool, result: dict, verbose: bool) -> None:
         print("  Read back later with: --list --expect-package " + SHELL_PACKAGE)
 
 
-def _print_list(success: bool, result: dict, verbose: bool) -> None:
+def _print_list(result: dict, verbose: bool) -> None:
     """Print the concise ``--list`` report."""
-    if not success:
-        print(f"x {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
     packages = ", ".join(result["packages"]) or "none"
     print(f"{result['count']} notification(s) posted by: {packages}")
     if verbose:
@@ -479,28 +481,18 @@ def _print_list(success: bool, result: dict, verbose: bool) -> None:
         print("  (--verbose for keys)")
 
 
-def _print_expect(success: bool, result: dict, verbose: bool) -> None:
+def _print_expect(result: dict, verbose: bool) -> None:
     """Print the concise ``--expect-package`` report."""
     package = result.get("expect_package", "?")
-    if not success:
-        print(f"x {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
     print(f"+ {package} has {result['count']} posted notification(s)")
     if verbose:
         for item in result["notifications"]:
             print(f"  {item['key']}")
 
 
-def _print_permission(success: bool, result: dict, verbose: bool) -> None:
+def _print_permission(result: dict, verbose: bool) -> None:
     """Print the concise permission report."""
     granted = bool(result.get("granted"))
-    if not success:
-        attempt = "grant" if granted else "revoke"
-        print(
-            f"x Failed to {attempt} {POST_NOTIFICATIONS}: {result.get('error', 'unknown error')}",
-            file=sys.stderr,
-        )
-        return
     print(f"+ {'Granted' if granted else 'Revoked'} {POST_NOTIFICATIONS} for {result['package']}")
     if result.get("verified"):
         print(f"  Verified in `dumpsys package`: granted={result.get('state')}")
@@ -517,13 +509,38 @@ _PRINTERS = {
 }
 
 
-def _emit(success: bool, result: dict, args: argparse.Namespace) -> None:
-    """Render a result as JSON or as the concise human report."""
+# What to do about a failed post, read-back or permission change. The error
+# says which, in the device's words where it had any.
+PUSH_REMEDY = (
+    "Fix what the error names, then retry; `adb devices` shows whether the device is "
+    "attached, and `push_notification.py --list` what is posted now."
+)
+
+
+def _emit(result: dict, args: argparse.Namespace) -> None:
+    """Render a successful result as JSON or as the concise human report."""
     if args.json:
-        print(json.dumps({"success": success, **result}, indent=2))
+        print(json.dumps({"success": True, **result}, indent=2))
         return
     printer = _PRINTERS.get(str(result.get("action")), _print_list)
-    printer(success, result, args.verbose)
+    printer(result, args.verbose)
+
+
+def _refuse(result: dict) -> None:
+    """Report a failed action through common.cli (exit 1), keeping what it found.
+
+    Each printer printed its own `x ...` line and ``main`` exited 1; under
+    --json the object had an ``error`` and no remedy (the absent-toolchain
+    sweep, N5, and the Codex review of #29). What the action did find (the
+    posted key, the listing, the permission state) rides along.
+
+    Raises:
+        cli.Failure: always.
+    """
+    action = str(result.get("action") or "notification")
+    error = str(result.get("error") or "unknown error")
+    details = {key: value for key, value in result.items() if key != "error"}
+    cli.fail(f"{action} failed: {error}", PUSH_REMEDY, details=details)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -632,8 +649,10 @@ def main(argv: list[str] | None = None) -> None:
     else:
         success, result = tester.set_post_permission(args.package, granted=args.grant_permission)
 
-    _emit(success, result, args)
-    sys.exit(0 if success else 1)
+    if not success:
+        _refuse(result)
+    _emit(result, args)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

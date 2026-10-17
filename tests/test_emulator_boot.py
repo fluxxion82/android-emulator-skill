@@ -294,7 +294,7 @@ def test_boot_refuses_when_the_emulators_cannot_be_listed(monkeypatch, capsys, r
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_boot.main()
+        cli.run(emulator_boot.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()
@@ -356,13 +356,38 @@ def test_avd_listing_reports_its_own_timeout(monkeypatch):
     assert "retry" in str(excinfo.value), "the timeout names no remedy"
 
 
+def test_a_successful_boot_answers_json(monkeypatch, capsys):
+    """`--avd X --json` on a boot that WORKED reported a defect, exit 1.
+
+    `json` was imported inside `_dispatch`'s list branches only, which made it
+    a local of the whole function: the success path's `json.dumps` raised
+    UnboundLocalError, and common.cli reported "a defect in the skill". Found
+    while moving this script's refusals to common.cli (N5). The boot itself is
+    not what is tested here, so it is stubbed; the output path is real.
+    """
+    monkeypatch.setattr(
+        emulator_boot.EmulatorBooter,
+        "boot",
+        lambda self, **_kwargs: (True, f"Emulator booting: {self.avd_name}"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(emulator_boot.main, ["--avd", "Pixel_9", "--json"])
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 0, captured.out + captured.err
+    payload = json.loads(captured.out)
+    assert payload["success"] is True and payload["avd"] == "Pixel_9", payload
+    assert "Traceback" not in captured.err
+
+
 def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
     """At the CLI boundary the agent gets the remedy, not a stack trace.
 
     Since F2 the listing failure is a refused boot rather than an escaping
     exception -- `get_connected_devices` re-wraps a failed listing as a BARE
     RuntimeError, which is not an AdbError and so reached the user as a
-    traceback. It is reported through the same `_fail` as every other failure,
+    traceback. It is reported through common.cli like every other failure,
     so the remedy still arrives; what changed is that it arrives having said
     which operation could not be completed.
     """
@@ -377,7 +402,7 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, capsys):
     monkeypatch.setattr(emulator_boot.sys, "argv", ["emulator_boot.py", "--avd", "Pixel_9"])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_boot.main()
+        cli.run(emulator_boot.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()

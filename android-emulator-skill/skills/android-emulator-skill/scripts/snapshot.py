@@ -461,12 +461,8 @@ class SnapshotManager:
         return f"\nSnapshots that do exist: {', '.join(names)}."
 
 
-def _print_list(success: bool, result: dict, verbose: bool) -> None:
+def _print_list(result: dict, verbose: bool) -> None:
     """Print the concise ``--list`` report."""
-    if not success:
-        print(f"x {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
-
     target = result.get("serial") or "the default emulator"
     snapshots = result["snapshots"]
     if not snapshots:
@@ -487,11 +483,8 @@ def _print_list(success: bool, result: dict, verbose: bool) -> None:
         print(f"  ! {len(result['unrecognised'])} line(s) not understood (--json to see them)")
 
 
-def _print_save(success: bool, result: dict, verbose: bool) -> None:
+def _print_save(result: dict, verbose: bool) -> None:
     """Print the concise ``--save`` report."""
-    if not success:
-        print(f"x Save failed: {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
     seconds = result.get("duration_seconds")
     print(f"+ Saved snapshot {result['name']!r} in {seconds}s")
     if result["verified"]:
@@ -502,11 +495,8 @@ def _print_save(success: bool, result: dict, verbose: bool) -> None:
         print(f"  Restore it with: --load {result['name']}")
 
 
-def _print_load(success: bool, result: dict, verbose: bool) -> None:
+def _print_load(result: dict, verbose: bool) -> None:
     """Print the concise ``--load`` report."""
-    if not success:
-        print(f"x Load failed: {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
     seconds = result.get("duration_seconds")
     print(f"+ Loaded snapshot {result['name']!r} in {seconds}s")
     print(f"  {result.get('note', '')}")
@@ -514,11 +504,8 @@ def _print_load(success: bool, result: dict, verbose: bool) -> None:
         print("  A failed load exits 0 at the adb level; this exit code reflects the reply.")
 
 
-def _print_delete(success: bool, result: dict, verbose: bool) -> None:
+def _print_delete(result: dict, verbose: bool) -> None:
     """Print the concise ``--delete`` report."""
-    if not success:
-        print(f"x Delete failed: {result.get('error', 'unknown error')}", file=sys.stderr)
-        return
     print(f"+ Deleted snapshot {result['name']!r}")
     if result["verified"]:
         print("  Verified: it is gone from `adb emu avd snapshot list`.")
@@ -537,13 +524,41 @@ _PRINTERS = {
 }
 
 
-def _emit(success: bool, result: dict, args: argparse.Namespace) -> None:
-    """Render a result as JSON or as the concise human report."""
+# What to do about a failed snapshot operation. The error says what the
+# console answered -- a KO, a name it does not have, a save the listing never
+# showed -- and, for a name, which snapshots do exist.
+SNAPSHOT_REMEDY = (
+    "Fix what the error names, then retry; `snapshot.py --list` shows the snapshots this "
+    "emulator has. Snapshots need a running emulator: a physical device has no console."
+)
+
+
+def _emit(result: dict, args: argparse.Namespace) -> None:
+    """Render a successful result as JSON or as the concise human report."""
     if args.json:
-        print(json.dumps({"success": success, **result}, indent=2))
+        print(json.dumps({"success": True, **result}, indent=2))
         return
     printer = _PRINTERS.get(str(result.get("action")), _print_list)
-    printer(success, result, args.verbose)
+    printer(result, args.verbose)
+
+
+def _refuse(result: dict) -> None:
+    """Report a failed operation through common.cli (exit 1), keeping what it found.
+
+    Each printer printed its own `x ... failed` line and ``main`` exited 1;
+    under --json the object had an ``error`` and no remedy -- and with no adb
+    at all, nothing else either (the absent-toolchain sweep, N5). What the
+    operation did find (the listing, the name, ``verified``) rides along in
+    the refusal object.
+
+    Raises:
+        cli.Failure: always.
+    """
+    action = str(result.get("action") or "snapshot")
+    error = str(result.get("error") or "unknown error")
+    what = "Could not list snapshots" if action == "list" else f"{action.capitalize()} failed"
+    details = {key: value for key, value in result.items() if key != "error"}
+    cli.fail(f"{what}: {error}", SNAPSHOT_REMEDY, details=details)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -635,8 +650,10 @@ def main(argv: list[str] | None = None) -> None:
     else:
         success, result = manager.delete(args.delete, verify=not args.no_verify)
 
-    _emit(success, result, args)
-    sys.exit(0 if success else 1)
+    if not success:
+        _refuse(result)
+    _emit(result, args)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

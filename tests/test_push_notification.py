@@ -34,6 +34,8 @@ from types import SimpleNamespace
 import push_notification
 import pytest
 
+from common import cli
+
 SOURCE = Path(push_notification.__file__).read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 
@@ -110,7 +112,7 @@ def _run_main(monkeypatch, argv: list[str]) -> int:
     monkeypatch.setattr(push_notification.sys, "argv", ["push_notification.py", *argv])
     monkeypatch.setattr(push_notification, "resolve_device_identifier", lambda _serial: None)
     with pytest.raises(SystemExit) as exit_info:
-        push_notification.main()
+        cli.run(push_notification.main)
     return exit_info.value.code
 
 
@@ -751,7 +753,7 @@ def test_serial_is_resolved_through_the_shared_helper(fake_adb, monkeypatch):
         push_notification.sys, "argv", ["push_notification.py", "--list", "--serial", "emulator"]
     )
     with pytest.raises(SystemExit):
-        push_notification.main()
+        cli.run(push_notification.main)
 
     assert seen == ["emulator"]
     assert fake_adb.calls[0][:3] == ["adb", "-s", "emulator-5554"]

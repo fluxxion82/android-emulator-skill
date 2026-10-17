@@ -1058,28 +1058,18 @@ class _JsonAwareParser(argparse.ArgumentParser):
         super().error(message)
 
 
-def _fail(args: argparse.Namespace, message: str, **extra: object):
-    """Report a failed lookup or action, and exit non-zero.
+# What to do when a lookup finds nothing, or finds only a label. The message
+# already says which, and how far the search went.
+NOT_FOUND_REMEDY = (
+    "Run screen_mapper.py and search for a name it prints; on a screen that scrolls, "
+    "add --scroll-to-find. To act on a spot with no name, use --tap-at x,y."
+)
 
-    One boundary, because the failure contract was kept in some branches and not
-    others: ``--json`` answered ``{"success": false, ...}`` for a miss,
-    ``{"error": ...}`` never, and nothing at all for a usage error. An agent
-    should not have to know which branch it hit to know where to read the
-    reason.
-
-    The text form stays on stdout, where every existing caller reads it: the
-    message is this tool's answer, not a diagnostic about it.
-
-    Args:
-        args: Parsed CLI arguments; only ``--json`` is consulted.
-        message: What failed, carrying its remedy.
-        **extra: Additional JSON keys (the search detail, for instance).
-    """
-    if args.json:
-        print(json_lib.dumps({"error": message, **extra}, indent=2))
-    else:
-        print(message)
-    sys.exit(1)
+# What to do when the element was found and the tap or text entry failed.
+ACTION_REMEDY = (
+    "Fix what the error names, then retry; screen_mapper.py shows the screen as it is "
+    "now, and --tap-at x,y acts on coordinates directly."
+)
 
 
 def _scroll_budget(value: str) -> int:
@@ -1271,15 +1261,14 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
         try:
             x, y = (int(part) for part in args.tap_at.split(","))
         except ValueError:
-            _fail(
-                args,
-                f"--tap-at requires two whole numbers as 'x,y' (e.g. 200,400); "
-                f"got {args.tap_at!r}",
+            cli.fail(
+                f"--tap-at requires two whole numbers as 'x,y'; got {args.tap_at!r}",
+                "Pass the coordinates as x,y, e.g. --tap-at 200,400.",
             )
 
         success, message = navigator.tap_at(x, y)
         if not success:
-            _fail(args, message)
+            cli.fail(message, ACTION_REMEDY)
         if args.json:
             print(
                 json_lib.dumps({"success": True, "message": message, "tapped_at": [x, y]}, indent=2)
@@ -1344,8 +1333,11 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
             # the screen has more below. Saying so is what stops an agent
             # reading this as "the element does not exist".
             detail = "searched 1 screen; this screen scrolls -- retry with --scroll-to-find"
+        # Every failure here goes to common.cli. The text form used to be the
+        # message alone on stdout, and the JSON `{"error": ...}` with no remedy;
+        # the search detail still rides in the object (cli.fail's details).
         message = f"Not found: {', '.join(criteria)} ({detail})"
-        _fail(args, message, search=_search_json(search))
+        cli.fail(message, NOT_FOUND_REMEDY, details={"search": _search_json(search)})
 
     # A name that matched only a passive label is not an answer.
     #
@@ -1356,12 +1348,12 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     # ownership ignore what the caption says (INC1-04) -- and the reason a
     # scrollable-only ancestor is not allowed to stand in for one.
     if search_text and not (args.find_type or args.find_id) and not element.interactive:
-        _fail(
-            args,
+        cli.fail(
             f'Not actionable: "{element.label}" is a passive label with no control -- '
             f"nothing on this screen that answers to that name can be tapped. Run "
             f"screen_mapper.py to see the controls, or give coordinates with --tap-at x,y.",
-            search=_search_json(search),
+            "Run screen_mapper.py to see the controls, or give coordinates with --tap-at x,y.",
+            details={"search": _search_json(search)},
         )
 
     # Perform action on found element. Its bounds come from the screen as it
@@ -1385,7 +1377,7 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     if search.scrolls:
         message = f"{message} ({search.detail})"
     if not success:
-        _fail(args, message, search=_search_json(search))
+        cli.fail(message, ACTION_REMEDY, details={"search": _search_json(search)})
     if args.verbose:
         print(
             f"  bounds={element.bounds} clickable={element.clickable} "

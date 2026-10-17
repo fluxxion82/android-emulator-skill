@@ -338,18 +338,14 @@ def main(argv: list[str] | None = None):
     _run(parser, args)
 
 
-def _fail(error: object, *, json_mode: bool) -> None:
-    """Report a failure the way the caller asked to be spoken to, and exit 1.
-
-    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
-    and got a sentence on stderr has an empty stdout to parse. Same signature as
-    `emulator_boot` and `emulator_selector`, which have had it since #15.
-    """
-    if json_mode:
-        print(json.dumps({"error": str(error)}, indent=2))
-    else:
-        print(f"Error: {error}", file=sys.stderr)
-    sys.exit(1)
+# What to do about an erase that did not happen. The error says which it was:
+# a name this host has no AVD for, an AVD that is running (or an emulator that
+# would not say which AVD it is), a file that would not delete, or a wipe that
+# --verify did not see land.
+ERASE_REMEDY = (
+    "Fix what the error names, then retry: `emulator_erase.py --list` lists the AVDs, "
+    "and a running one is shut down first (`emulator_shutdown.py --name <avd>`)."
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -459,9 +455,9 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if not args.name:
         if not args.json:
             parser.print_help(file=sys.stderr)
-        _fail(
+        cli.fail(
             "--name is required (or --all to erase every AVD, --list to see them)",
-            json_mode=args.json,
+            "Pass --name <avd>; `emulator_erase.py --list` lists the names.",
         )
 
     if args.verbose:
@@ -472,10 +468,10 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     )
 
     if not success:
-        # Every failing mode answers the same way (F5). This path emitted
-        # `{"success": false, "message": ...}`, so a caller checking for the
-        # documented `error` key found none and read a refusal as a result.
-        _fail(message, json_mode=args.json)
+        # Every failing mode answers the same way (F5), through common.cli.
+        # This path emitted `{"success": false, "message": ...}`, and then a
+        # script-local `{"error": ...}` -- neither with a remedy.
+        cli.fail(message, ERASE_REMEDY)
 
     if args.json:
         print(

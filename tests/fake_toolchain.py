@@ -340,6 +340,28 @@ def uid_rules(recorded, package: str, pid: str | None) -> list[Rule]:
     return rules
 
 
+# A file read that fails ON THE DEVICE, where the file is named like a device
+# state. `adb shell` hands the device command's stderr back as its own, so
+# these are the device's words in adb's stream -- the case that read as "the
+# device is unauthorized" when the classifier matched keywords anywhere (Codex
+# review of #29). Derived by substitution from run_as_cat_missing: only the
+# path changes.
+COLLIDING_FILE_NAMES = (
+    "unauthorized.db",
+    "device offline.db",
+    "device not found.db",
+    "more than one device.db",
+    "no devices.db",
+)
+
+
+def recorded_missing_file(recorded, directory: str, name: str) -> str:
+    """run_as_cat_missing's stderr (`cat: <path>: No such file or directory`) for ``directory/name``."""
+    text = recorded.text("run_as_cat_missing")
+    assert "shared_prefs/aes_missing.xml" in text, "the fixture moved; re-derive"
+    return text.replace("shared_prefs/aes_missing.xml", f"{directory.rstrip('/')}/{name}")
+
+
 # --- the refusal contract ------------------------------------------------------
 #
 # What a script must print when it refuses, as the shared CLI boundary (PR #18,

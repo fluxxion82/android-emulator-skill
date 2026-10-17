@@ -135,7 +135,7 @@ def test_run_as_arguments_are_quoted(monkeypatch):
         captured["cmd"] = cmd
         return _Result()
 
-    monkeypatch.setattr(model_inspector.subprocess, "run", _run)
+    monkeypatch.setattr(adb_exec.subprocess, "run", _run)
     inspector = model_inspector.LiveInspector()
     inspector._run_as("com.example.app", ["sqlite3", "a;id", ".schema"])
 

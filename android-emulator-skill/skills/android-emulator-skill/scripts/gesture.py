@@ -52,6 +52,13 @@ REFRESH_START_PCT = env_float("ANDROID_EMU_REFRESH_START_PCT", 0.30)
 REFRESH_END_PCT = env_float("ANDROID_EMU_REFRESH_END_PCT", 0.80)
 REFRESH_DURATION_MS = env_int("ANDROID_EMU_REFRESH_DURATION_MS", 600)
 
+# What to do about a gesture that was not sent. The message names it: a
+# malformed coordinate list, or what `input` answered.
+GESTURE_REMEDY = (
+    "Fix what the error names, then retry; screen_mapper.py shows the screen and its "
+    "coordinates, and `adb devices` whether the device is attached."
+)
+
 
 def _gesture_timeout(duration_ms: int) -> int:
     """Time budget for an ``input swipe`` that itself lasts ``duration_ms``.
@@ -407,33 +414,44 @@ Examples:
             x, y = map(int, args.long_press.split(","))
             success, message = simulator.long_press(x, y, duration)
         except ValueError:
-            message = "Error: --long-press requires format 'x,y'"
+            message = "--long-press requires format 'x,y'"
     elif args.swipe_path:
         try:
             x1, y1, x2, y2 = map(int, args.swipe_path.split(","))
             success, message = simulator.swipe_path(x1, y1, x2, y2, duration)
         except ValueError:
-            message = "Error: --swipe-path requires format 'x1,y1,x2,y2'"
+            message = "--swipe-path requires format 'x1,y1,x2,y2'"
     elif args.drag:
         try:
             x1, y1, x2, y2 = map(int, args.drag.split(","))
             success, message = simulator.drag_and_drop(x1, y1, x2, y2, duration)
         except ValueError:
-            message = "Error: --drag requires format 'x1,y1,x2,y2'"
+            message = "--drag requires format 'x1,y1,x2,y2'"
     elif args.refresh:
         success, message = simulator.refresh(refresh_duration)
     else:
-        parser.print_help()
-        sys.exit(1)
+        # The help text goes to stderr, and only in text mode: on stdout it was
+        # the whole of what a --json caller got.
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "no gesture given",
+            "Pass one of --swipe, --scroll, --long-press, --swipe-path, --drag or --refresh.",
+        )
+
+    if not success:
+        # Through common.cli: this printed `{"success": false, "message": ...}`
+        # -- no `error`, no remedy -- and the message alone on stdout otherwise.
+        cli.fail(message, GESTURE_REMEDY)
 
     if args.json:
         import json
 
-        print(json.dumps({"success": success, "message": message}, indent=2))
+        print(json.dumps({"success": True, "message": message}, indent=2))
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

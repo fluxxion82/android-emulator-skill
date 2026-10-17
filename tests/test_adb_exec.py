@@ -15,9 +15,11 @@ Two problems this replaces, measured with AST across the skill:
 Error strings are matched against recorded adb output where a fixture exists,
 and the two profiles disagree about the prefix: `adb_shell_device_not_found`
 (emulator-api35) is `adb: device '...' not found`, while
-`adb_device_not_found` (pixel4xl-api33) is `error: ...`. The matcher is
-therefore prefix-AGNOSTIC, and anchoring it on either would silently stop
-classifying the other profile's failure.
+`adb_device_not_found` (pixel4xl-api33) is `error: ...`. The matcher
+therefore accepts EITHER prefix -- anchoring it on one would silently stop
+classifying the other profile's failure -- but only at the start of a line:
+a command run on the device writes its stderr through adb's, and a file named
+`unauthorized.db` is not an unauthorized device (Codex review of #29).
 
 This docstring used to claim the fixture "proves the prefix is `error:` and not
 `adb:`". It proves no such thing — the other profile shows the opposite. Which
@@ -31,6 +33,7 @@ from __future__ import annotations
 import subprocess
 
 import pytest
+from fake_toolchain import COLLIDING_FILE_NAMES, recorded_missing_file
 
 from common import adb_exec
 
@@ -371,14 +374,14 @@ def test_adb_that_cannot_be_executed_is_an_adb_error(monkeypatch, error, situati
 
 
 def test_the_not_found_match_is_prefix_agnostic(recorded_anywhere):
-    """The two profiles disagree about the prefix, so neither may be anchored on.
+    """The two profiles disagree about the prefix, so neither ALONE may be anchored on.
 
     `adb -s <unknown> shell` prints `adb: device '...' not found` on
     emulator-api35 and `error: device '...' not found` on pixel4xl-api33. Both
-    are recorded. A matcher anchored on either prefix silently stops
-    classifying the other profile's failure, and the module docstring used to
-    claim it was anchored on `error:` -- documentation asserting a precision the
-    code never had.
+    are recorded. A matcher anchored on one prefix silently stops classifying
+    the other profile's failure, and the module docstring used to claim it was
+    anchored on `error:` -- documentation asserting a precision the code never
+    had. It is anchored on both now, at the start of a line.
     """
     for name in ("adb_shell_device_not_found", "adb_device_not_found"):
         text = recorded_anywhere(name)
@@ -386,6 +389,53 @@ def test_the_not_found_match_is_prefix_agnostic(recorded_anywhere):
         assert isinstance(
             error, adb_exec.DeviceNotFoundError
         ), f"{name} ({text.strip()!r}) was not classified as a missing device"
+
+
+# What every recorded adb device error must still be classified as, per name.
+RECORDED_DEVICE_ERRORS = {
+    "adb_shell_device_not_found": adb_exec.DeviceNotFoundError,
+    "adb_device_not_found": adb_exec.DeviceNotFoundError,
+    "adb_more_than_one_device": adb_exec.MultipleDevicesError,
+}
+
+
+def test_every_recorded_device_error_still_classifies_in_every_profile(any_profile):
+    """The anchoring below must not cost a real adb error its type, in either profile.
+
+    Every one this profile recorded is checked; across the profiles that is
+    four recordings, two prefixes (`adb:` and `error:`) and two error types.
+    """
+    checked = [name for name in RECORDED_DEVICE_ERRORS if any_profile.has(name)]
+    assert checked, "this profile recorded no adb device error at all"
+    for name in checked:
+        text = any_profile.text(name)
+        error = adb_exec._classify(text, "no-such-serial-xyz")
+        assert isinstance(
+            error, RECORDED_DEVICE_ERRORS[name]
+        ), f"{name}: {text.strip()!r} -> {error!r}"
+
+
+# Each name's missing-file message matched one of _classify's checks when it
+# looked for keywords anywhere (see fake_toolchain.COLLIDING_FILE_NAMES).
+@pytest.mark.parametrize("name", COLLIDING_FILE_NAMES)
+def test_a_device_commands_stderr_is_not_read_as_adbs(fake_run, recorded, name):
+    """Codex review of #29: `cat: databases/unauthorized.db: No such file ...` exited 3.
+
+    With file reads through run_argv, the REMOTE command's stderr reached
+    `_classify`, which looked for "unauthorized" anywhere: model_inspector said
+    the device had not authorised this computer, and "No such file or
+    directory" was lost. adb's own errors start a line with `adb: ` or
+    `error: ` (both recorded); a device command's do not.
+    """
+    stderr = recorded_missing_file(recorded, "databases", name)
+    assert adb_exec.classify_device_error(stderr, "emulator-5554") is None
+
+    fake_run(returncode=1, stderr=stderr.encode())
+    cmd = ["adb", "-s", "emulator-5554", "shell", "-T", "run-as", "pkg", "cat", name]
+    assert adb_exec.run_argv(cmd, serial="emulator-5554").returncode == 1
+
+    fake_run(returncode=1, stderr=stderr)
+    assert adb_exec.run_adb("shell", "emulator-5554", "cat", name).returncode == 1
 
 
 def test_a_requested_serial_is_named_even_when_nothing_is_attached(monkeypatch):
@@ -411,3 +461,40 @@ def test_a_requested_serial_is_named_even_when_nothing_is_attached(monkeypatch):
     message = str(excinfo.value)
     assert "no-such-device" in message, f"the requested serial was dropped: {message}"
     assert "adb devices" in message, "the remedy is missing"
+
+
+# ---------------------------------------------------------------------------
+# run_argv: the byte reads run_adb cannot serve, failing the same way.
+# ---------------------------------------------------------------------------
+
+
+def test_run_argv_hands_back_the_bytes_untouched(fake_run, recorded):
+    """A database is bytes; run_adb's raw_text would decode it. Recorded run-as read."""
+    status = {f["name"]: f.get("exit_status") for f in recorded.manifest["fixtures"]}
+    stderr = recorded.text("run_as_cat_missing").encode()
+    captured = fake_run(returncode=status["run_as_cat_missing"], stdout=b"", stderr=stderr)
+
+    cmd = ["adb", "-s", "emulator-5554", "shell", "-T", "run-as", "pkg", "cat", "f"]
+    result = adb_exec.run_argv(cmd, serial="emulator-5554")
+
+    assert result.returncode == status["run_as_cat_missing"]
+    assert result.stderr == stderr, "the device's own failure is the caller's to judge"
+    assert captured["kwargs"]["text"] is False
+    assert captured["kwargs"]["timeout"] == adb_exec.DEFAULT_TIMEOUT
+
+
+def test_run_argv_types_adbs_own_failures_like_run_adb(fake_run, recorded_anywhere):
+    """container.py answered these with "Command failed ...", exit 1, no remedy."""
+    cmd = ["adb", "-s", "no-such-serial-xyz", "shell", "-T", "run-as", "pkg", "ls"]
+
+    fake_run(returncode=1, stderr=recorded_anywhere("adb_shell_device_not_found").encode())
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        adb_exec.run_argv(cmd, serial="no-such-serial-xyz")
+
+    fake_run(raises=FileNotFoundError("adb"))
+    with pytest.raises(adb_exec.AdbNotInstalledError):
+        adb_exec.run_argv(cmd, serial=None)
+
+    fake_run(raises=subprocess.TimeoutExpired(cmd, 5))
+    with pytest.raises(adb_exec.AdbTimeoutError):
+        adb_exec.run_argv(cmd, serial=None, timeout=5)

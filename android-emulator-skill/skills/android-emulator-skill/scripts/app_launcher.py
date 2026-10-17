@@ -580,24 +580,30 @@ class AppLauncher:
         return None
 
 
-def _report_failure(args: argparse.Namespace, message: str) -> None:
-    """Report a failed operation the way the agent reading it expects, and exit 1.
+# What to do about a failed operation. The message names the operation and
+# what the device answered, and usually how to check it.
+APP_REMEDY = (
+    "Fix what the error names, then retry; `adb devices` shows whether the device is "
+    "attached, and `app_launcher.py --list` what is installed."
+)
+
+
+def _report_failure(message: str) -> None:
+    """Report a failed operation through common.cli (exit 1).
 
     One place, because C6 was the same contract kept in some branches and not
     others: ``--list`` and ``--state`` printed an empty-looking answer and
-    exited 0, while ``--launch`` next to them exited 1. In ``--json`` the
-    payload is ``{"error": ...}`` on stdout -- an agent parsing stdout must not
-    have to also read stderr to find out the run failed.
+    exited 0, while ``--launch`` next to them exited 1. It printed
+    ``{"error": ...}`` itself, with no ``success`` and no remedy; it is the
+    shared refusal now.
 
     Args:
-        args: Parsed CLI arguments; only ``--json`` is consulted.
         message: What failed, already carrying its remedy.
+
+    Raises:
+        cli.Failure: always.
     """
-    if args.json:
-        print(json_lib.dumps({"error": message}, indent=2))
-    else:
-        print(f"Error: {message}", file=sys.stderr)
-    sys.exit(1)
+    cli.fail(message, APP_REMEDY)
 
 
 def _report_action(
@@ -610,10 +616,10 @@ def _report_action(
     """Print the outcome of one lifecycle action and exit.
 
     The success shape is unchanged (``success`` / ``message`` / ``action``).
-    A failure goes through :func:`_report_failure`, so ``--json`` answers
-    ``{"error": ...}`` on every mode of this script rather than six modes
-    answering ``{"success": false, ...}`` while two answered ``{"error": ...}``
-    -- an agent should not have to know which flag it passed to know where the
+    A failure goes through :func:`_report_failure`, so every mode of this
+    script refuses in common.cli's one shape, rather than six modes answering
+    ``{"success": false, ...}`` while two answered ``{"error": ...}`` -- an
+    agent should not have to know which flag it passed to know where the
     failure is written.
 
     Args:
@@ -625,7 +631,7 @@ def _report_action(
             ``am start -W`` resolved, for instance.
     """
     if not success:
-        _report_failure(args, message)
+        _report_failure(message)
 
     if args.json:
         payload = {"success": True, "message": message, "action": action}
@@ -699,8 +705,8 @@ Examples:
     try:
         extras = parse_extras(args.args)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        # `Error:` alone on stderr, nothing under --json: the shared refusal now.
+        cli.fail(str(e), "Pass each intent extra as --args KEY=VALUE.")
 
     # Resolve device
     serial = resolve_device_identifier(args.serial)
@@ -748,7 +754,6 @@ Examples:
         success, packages = launcher.list_packages(args.filter)
         if not success:
             _report_failure(
-                args,
                 "could not list installed packages; run `adb devices` to check "
                 "the device is attached and unlocked",
             )
@@ -768,7 +773,6 @@ Examples:
             # `state['package']` below, which is exactly how C6 turned a
             # failed lookup into a KeyError traceback.
             _report_failure(
-                args,
                 state.get(
                     "error",
                     "could not read app state; run `adb devices` to check the "
@@ -790,8 +794,14 @@ Examples:
         sys.exit(0 if success else 1)
 
     else:
-        parser.print_help()
-        sys.exit(1)
+        # The help text went to stdout: under --json, the whole answer.
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "no operation given",
+            "Pass one of --launch, --restart, --terminate, --install, --uninstall, "
+            "--open-url, --list or --state.",
+        )
 
 
 if __name__ == "__main__":

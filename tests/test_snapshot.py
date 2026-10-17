@@ -107,7 +107,7 @@ def _run_main(monkeypatch, argv: list[str], serial: str | None = None) -> int:
     monkeypatch.setattr(snapshot.sys, "argv", ["snapshot.py", *argv])
     monkeypatch.setattr(snapshot, "resolve_device_identifier", lambda _serial: serial)
     with pytest.raises(SystemExit) as exit_info:
-        snapshot.main()
+        cli.run(snapshot.main)
     return exit_info.value.code
 
 
@@ -505,7 +505,7 @@ def test_the_serial_is_resolved_through_the_shared_helper(fake_adb, monkeypatch)
     monkeypatch.setattr(snapshot, "resolve_device_identifier", _resolve)
     monkeypatch.setattr(snapshot.sys, "argv", ["snapshot.py", "--list", "--serial", "emulator"])
     with pytest.raises(SystemExit):
-        snapshot.main()
+        cli.run(snapshot.main)
     assert seen == ["emulator"]
     assert fake_adb.calls[0][:3] == ["adb", "-s", "emulator-5556"]
 

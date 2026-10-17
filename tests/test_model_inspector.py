@@ -15,6 +15,14 @@ import json
 import subprocess
 
 import model_inspector
+import pytest
+from fake_toolchain import (
+    COLLIDING_FILE_NAMES,
+    FakeToolchain,
+    Rule,
+    assert_refusal,
+    recorded_missing_file,
+)
 from model_inspector import (
     LiveInspector,
     SchemaInspector,
@@ -22,6 +30,21 @@ from model_inspector import (
     parse_sqlite_schema,
     strip_comments,
 )
+
+from common.run_as import parse_adb_version
+
+
+@pytest.fixture(autouse=True)
+def _the_recorded_adb_client(monkeypatch, recorded):
+    """A database read first asks `adb version`; in-process, answer with the recorded banner.
+
+    The CLI tests at the bottom run the script as a subprocess, where this does
+    not reach: there the fake adb answers `adb version` itself.
+    """
+    version = parse_adb_version(recorded.text("adb_version"))
+    assert version is not None, "the recorded banner no longer parses"
+    monkeypatch.setattr(model_inspector, "adb_client_version", lambda: version)
+
 
 # === SOURCE MODE ===========================================================
 
@@ -335,7 +358,7 @@ def test_live_dump_schema_via_device_sqlite3(monkeypatch, recorded):
         captured.append(cmd)
         return _completed(cmd, stdout=schema)
 
-    monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     ok, result = LiveInspector(serial="emulator-5554").execute("com.example.app", db_name="app.db")
     assert ok is True
@@ -359,7 +382,7 @@ def test_live_list_databases_skips_sidecars(monkeypatch):
     def fake_run(cmd, *args, **kwargs):
         return _completed(cmd, stdout=listing)
 
-    monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     ok, result = LiveInspector().execute("com.example.app")
     assert ok is True
@@ -385,7 +408,7 @@ def test_live_falls_back_to_host_sqlite3(monkeypatch, tmp_path):
         # exec-out cat returns raw DB bytes.
         return subprocess.CompletedProcess(cmd, 0, stdout=db_bytes, stderr=b"")
 
-    monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     ok, result = LiveInspector().execute("com.example.app", db_name="real.db")
     assert ok is True
@@ -411,7 +434,7 @@ def test_live_run_as_denied_release_build(monkeypatch, recorded):
         # reaches.
         return _completed(cmd, returncode=1, stderr=denial.encode("utf-8"))
 
-    monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     ok, result = LiveInspector().execute("com.example.app", db_name="app.db")
     assert ok is False
@@ -423,7 +446,7 @@ def test_live_run_as_denied_listing(monkeypatch):
     def fake_run(cmd, *args, **kwargs):
         return _completed(cmd, returncode=1, stderr="run-as: unknown package: com.nope")
 
-    monkeypatch.setattr(model_inspector.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     ok, result = LiveInspector().execute("com.nope")
     assert ok is False
@@ -476,3 +499,135 @@ def test_a_foreign_key_clause_is_not_mistaken_for_a_column(recorded):
 
     assert columns == ["id", "order_id", "label", "quantity"], columns
     assert not any("FOREIGN" in name.upper() for name in columns)
+
+
+# ---------------------------------------------------------------------------
+# LIVE's database read: `adb shell -T`, never `adb exec-out`.
+#
+# exec-out exits 0 whatever the device command did and puts the device's
+# stderr on STDOUT, so a database that is not there came back as the bytes
+# "cat: ...: No such file or directory", was written to a temp file, and was
+# reported as "not a valid SQLite database" -- the reason lost, the read
+# reported as a corrupt file. container.py was fixed for the same lie in #22
+# (recorded: run_as_cat_missing_exec_out vs run_as_cat_missing). Both
+# transports are answered here, each with its own recording, so the test says
+# which one the script used by what it reports.
+# ---------------------------------------------------------------------------
+
+
+def _device_without_the_database(
+    tmp_path, recorded, cat_stderr: str | None = None
+) -> FakeToolchain:
+    """adb answering with recorded output only; a missing DB over either transport.
+
+    The on-device `sqlite3 .schema` attempt is answered with silence and exit
+    127 (no rule): sqlite3 is absent from user builds (see
+    test_sqlite_schema_parses_a_real_android_database), and nothing here
+    claims to know what the device prints when it is. ``cat_stderr`` replaces
+    what the `shell -T` read answers on stderr (default: the recording).
+    """
+    status = {f["name"]: f.get("exit_status") for f in recorded.manifest["fixtures"]}
+    if cat_stderr is None:
+        cat_stderr = recorded.text("run_as_cat_missing")
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    chain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("version",), stdout=recorded.text("adb_version"), exit=status["adb_version"]),
+            Rule(
+                ("exec-out", "cat"),
+                stdout=recorded.text("run_as_cat_missing_exec_out"),
+                exit=status["run_as_cat_missing_exec_out"],
+            ),
+            Rule(("-T", "cat"), stderr=cat_stderr, exit=status["run_as_cat_missing"]),
+        ],
+        default_exit=127,
+    )
+    return chain
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_database_that_is_not_there_is_refused_with_the_devices_reason(
+    tmp_path, recorded, json_mode
+):
+    chain = _device_without_the_database(tmp_path, recorded)
+    argv = ["--package", "com.example.composefixture", "--db", "absent.db"]
+    result = chain.run(
+        "model_inspector.py", *argv, "--serial", "emulator-5554", *(["--json"] if json_mode else [])
+    )
+
+    assert_refusal(result, json_mode=json_mode, naming=("no such file or directory",), status=1)
+    assert "not a valid sqlite" not in (result.stdout + result.stderr).lower()
+    reads = [call for call in chain.calls("adb") if "cat" in call]
+    assert reads and all("exec-out" not in call for call in reads), reads
+
+
+@pytest.mark.parametrize("name", COLLIDING_FILE_NAMES)
+def test_a_missing_database_named_like_a_device_state_is_still_a_missing_file(
+    tmp_path, recorded, name
+):
+    """Codex review of #29: `--db unauthorized.db` exited 3, "unauthorized device".
+
+    The device's `cat: ...: No such file or directory` came back through adb's
+    stderr, and the classifier found "unauthorized" in it. The read is the
+    app's file, missing: exit 1, with the device's reason.
+    """
+    databases = "/data/data/com.example.composefixture/databases"
+    chain = _device_without_the_database(
+        tmp_path, recorded, recorded_missing_file(recorded, databases, name)
+    )
+    argv = ["--package", "com.example.composefixture", "--db", name, "--serial", "emulator-5554"]
+
+    result = chain.run("model_inspector.py", *argv, "--json")
+
+    payload = assert_refusal(
+        result, json_mode=True, naming=("no such file or directory",), status=1
+    )
+    assert name in payload["error"], payload
+
+
+def test_a_device_that_is_gone_during_the_read_is_still_exit_3(tmp_path, recorded):
+    """The control: adb's own `adb: device '...' not found` on that read is the device's."""
+    chain = _device_without_the_database(
+        tmp_path, recorded, recorded.text("adb_shell_device_not_found")
+    )
+    argv = ["--package", "com.example.composefixture", "--db", "fixture.db"]
+
+    result = chain.run("model_inspector.py", *argv, "--serial", "emulator-5554", "--json")
+
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+
+
+def test_an_adb_client_too_old_for_t_is_refused_before_the_database_is_read(tmp_path, recorded):
+    """The recorded banner with ONLY its X.Y.Z replaced (1.0.32): `-T` predates it.
+
+    Before ANY read of the app's data -- the on-device `sqlite3 .schema` query
+    included, which ran ahead of the check (Codex review of #29).
+    """
+    status = {f["name"]: f.get("exit_status") for f in recorded.manifest["fixtures"]}
+    banner = recorded.text("adb_version")
+    old = banner.replace(".".join(map(str, parse_adb_version(banner))), "1.0.32", 1)
+    assert old != banner
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    chain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("version",), stdout=old, exit=status["adb_version"]),
+        ],
+        default_exit=127,
+    )
+
+    result = chain.run(
+        "model_inspector.py",
+        *("--package", "com.example.composefixture", "--db", "fixture.db"),
+        *("--serial", "emulator-5554", "--json"),
+    )
+
+    payload = assert_refusal(result, json_mode=True, naming=("older than 1.0.36",), status=1)
+    assert "platform-tools" in payload["remedy"]
+    reads = [call for call in chain.calls("adb") if "run-as" in call]
+    assert not reads, f"the app's data was read before the client was checked: {reads}"

@@ -319,19 +319,19 @@ def test_the_watchdog_guard_accepts_a_bounded_unbuffered_read():
 # this was) let two new bypasses in while it still had headroom.
 #
 # common/adb_exec.py is not listed: it is the runner everything else goes
-# through. privacy_manager.py left this list in Inc -1.
+# through. privacy_manager.py left this list in Inc -1; container.py and
+# model_inspector.py in Inc 2 (N5), when their byte reads moved to
+# adb_exec.run_argv.
 DIRECT_SUBPROCESS_MODULES: frozenset[str] = frozenset(
     {
         "anr_watcher.py",  # streams `adb logcat` in a detached worker
         "common/sdk_tools.py",  # runs SDK binaries (emulator, avdmanager), not adb
-        "container.py",  # `adb shell [-T] run-as`: bytes, not text
         "emulator_boot.py",  # launches the emulator binary detached
         "emulator_create.py",  # avdmanager / sdkmanager
         "emulator_delete.py",  # avdmanager
         "emulator_selector.py",  # launches the emulator binary detached
         "gradle/builder.py",  # the Gradle wrapper
         "log_monitor.py",  # streams `adb logcat`
-        "model_inspector.py",  # `adb exec-out run-as`: binary-safe bytes
         "push_notification.py",  # its own bounded _shell runner (debt)
         "test_recorder.py",  # emits a logcat marker
     }

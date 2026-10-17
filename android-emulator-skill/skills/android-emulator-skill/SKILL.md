@@ -46,7 +46,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### Implemented (32 scripts)
 
-#### Core Utilities (12 modules in `common/`)
+#### Core Utilities (13 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
@@ -60,8 +60,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    fails), **logcat.py** (the one place that builds an `adb logcat` argv and
    parses a duration, shared by all four log readers), **sdk_tools.py** (resolves
    SDK binaries; `emulator` by bare name hits the `<sdk>/emulator` *directory* on an
-   SDK-root PATH and raises `PermissionError`), **env_config.py**,
-   **anr_pipeline.py**, **anr_sessions.py**.
+   SDK-root PATH and raises `PermissionError`), **run_as.py** (reads a
+   debuggable app's files with `adb shell -T run-as`, never `exec-out`, which
+   answers a missing file with its error text as the bytes; checks the adb
+   client honours `-T` first), **env_config.py**, **anr_pipeline.py**,
+   **anr_sessions.py**.
 
 #### App Management (1 script)
 4. **app_launcher.py** - App lifecycle management
@@ -98,8 +101,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      instance of one AVD corrupts its userdata. The refusal names the serial,
      its state, and says to terminate the stale emulator *process* — a console
      that is not answering cannot be shut down through one
-   - Failures answer in the mode they were asked in: a JSON object carrying
-     `error` under `--json`, the message on stderr otherwise, always non-zero
+   - Failures — a refused or failed boot, a missing `--avd` — are the shared
+     refusal: `{"success": false, "error": ..., "remedy": ...}` under `--json`,
+     `Error:` / `Remedy:` on stderr otherwise, exit 1. A successful boot under
+     `--json` answers `{"success": true, ...}` (it reported a defect, exit 1,
+     before v0.8.0)
    - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
@@ -110,8 +116,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      queried — or the emulators could not be listed at all — that is reported
      as itself and exits non-zero, never as "No running emulator found", which
      is a confident negative over a device nobody managed to ask
-   - Failures answer in the mode they were asked in: a JSON object carrying
-     `error` under `--json`, the message on stderr otherwise, always non-zero
+   - Failures are the shared refusal: `{"success": false, "error": ...,
+     "remedy": ...}` under `--json`, `Error:` / `Remedy:` on stderr otherwise,
+     exit 1 (3 when adb says the device is not there)
    - Optional verification of shutdown completion
    - Batch shutdown operations (running emulators only)
    - Options: `--serial`, `--name`, `--verify`, `--timeout`, `--all`, `--json`
@@ -128,6 +135,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Checks the image is installed before creating. No `sdkmanager` (or no
      `avdmanager`) is an error naming where it was looked for, exit 1 — never
      an empty listing, and never a create of an image nobody could check
+   - Every refusal — a device definition not found, no API level, an image
+     not installed (the error names the installed ones), a create avdmanager
+     refused, a missing `--device` — is the shared `{"success": false,
+     "error": ..., "remedy": ...}` under `--json` (it was `{"success": false,
+     "message": ...}`), `Error:` / `Remedy:` on stderr otherwise, exit 1
    - Reads both `sdkmanager` listing formats: the Java tool's pipe table
      (every cmdline-tools before 23, and CI images) and the slash-path columns
      of cmdline-tools 23's Android-CLI wrapper. It read only the second, so
@@ -168,10 +180,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      none of them is this AVD. A console query that failed, or an emulator not
      yet in state `device`, is "unknown" and refuses, naming the serial, its
      state and the remedy — `--force` erases anyway
-   - Every failure answers in the mode it was asked in: `{"error": ...}` on
-     stdout under `--json`, the message on stderr otherwise, always non-zero.
-     `--all` keeps its per-AVD summary and carries `error` alongside it when
-     any AVD failed
+   - Every failure is the shared refusal: `{"success": false, "error": ...,
+     "remedy": ...}` under `--json`, `Error:` / `Remedy:` on stderr otherwise,
+     exit 1. `--all` keeps its per-AVD summary and carries `error` alongside it
+     when any AVD failed
    - **Snapshots are kept**: a successful erase prints "snapshots kept; use
      snapshot.py --delete `<name>` to remove them", because a later
      `snapshot.py --load` can otherwise undo the factory state
@@ -278,8 +290,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       stderr as it happens.
     - Under `--json`, a successful `--tap`/`--enter-text` reports
       **`tapped_at: [x, y]`** -- the coordinates that reached the device, so a
-      caller can check where the tap went without parsing prose. Every failure,
-      including a usage error, prints `{"error": ...}` and exits non-zero.
+      caller can check where the tap went without parsing prose. Every failure
+      is the shared refusal — `{"success": false, "error": ..., "remedy": ...}`
+      under `--json`, `Error:` / `Remedy:` on stderr otherwise (it was the
+      message alone on stdout), exit 1 — and a lookup's refusal carries its
+      `search` detail in the object. A usage error still prints `{"error": ...}`
+      at exit 2 (see Failures under Known gaps).
     - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible
       screen, and `Not found` is indistinguishable from "the item is two rows down". The default
       path now says which it was: `(searched 1 screen; this screen scrolls -- retry with
@@ -400,6 +416,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - `--list` reads back what is really posted, by any package — the check
       that a notification exists rather than that a command exited 0.
       `--expect-package PKG` turns that read-back into an exit status.
+    - A failed post, read-back or permission change is the shared refusal
+      (`{"success": false, "error": ..., "remedy": ...}` under `--json`,
+      carrying what it found), exit 1; a device adb cannot reach is exit 3
     - `--grant-permission` / `--revoke-permission` toggle `POST_NOTIFICATIONS`
       (API 33+) on `--package`, for exercising the runtime-permission path.
     - Options: `--post`, `--list`, `--grant-permission`, `--revoke-permission`,
@@ -476,13 +495,27 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       written) a name that would land outside the snapshot. A name holding a
       real newline can still add a plain-named entry to a listing (`ls -1b` /
       `find -print0` would end that; not done)
+    - A failed or incomplete inspection is the shared refusal (`{"success":
+      false, "error": ..., "remedy": ...}` under `--json`, carrying what was
+      read; a run-as denial's hint is its remedy). No adb, a hang, or a device
+      that is not there is adb's own error (exit 3 for the device), not "the
+      command failed" at exit 1
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
+    - LIVE reads the database with `adb shell -T` (common/run_as.py), after the
+      same adb 1.0.36 check as container.py. It used `adb exec-out`, which
+      exits 0 on a missing file and hands back the error text as the bytes, so
+      a database that was not there was reported as "not a valid SQLite
+      database"; now the device's reason is the error, exit 1
+    - Failures in every mode are the shared refusal (`{"success": false,
+      "error": ..., "remedy": ...}` under `--json`; a run-as denial's hint is
+      its remedy)
     - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
-    - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
+    - Session mode: `--start [--package PKG]` → id (the bare id as text, for
+      `SID=$(...)`; `{"success": true, "session_id": ...}` under `--json`); `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
     - An unknown session, a session with no summary yet, or a `--cluster` past
       the end exits 1 and says what to run instead (the refusal object under
       `--json`) — it does not print the sentence and exit 0
@@ -912,7 +945,9 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
     screen that would not dump, a timeout, or a failure a script raises with
     `cli.fail` — answers `{"success": false, "error": ..., "remedy": ...}` on
     one line of stdout under `--json`, `Error:` / `Remedy:` on stderr
-    otherwise, and exits **1**.
+    otherwise, and exits **1**. A refusal that found something on the way may
+    carry it as extra keys after those three (a lookup's `search`, a capture's
+    `partial`, the entries a listing could read); the three are always there.
   - A device that is **unavailable** (not found, offline, unauthorized) is the
     same object and exits **3** — whether `--serial` resolution noticed or adb
     did mid-run. Several devices and no `--serial` is 1.
@@ -933,18 +968,21 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
     emulator-console survey (`emu_console`), and the partial-capture policy of
     `test_recorder` steps and `app_state_capture` (what arrived is kept and
     handed over).
+  - Checked, not just promised: `tests/test_exit_code_sweep.py` runs every
+    Quick Start command and the modes its table lists twice — with the Android
+    tools present and failing, and with none on PATH at all — and
+    asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
+    naming the tool; the exact status), not just a non-zero exit.
   - Not in the schema yet: a usage error (exit 2 — argparse's prose on stderr,
     or a script's own `{"error": ...}` where it answers usage errors in JSON,
-    as `navigator` and `emulator_delete` do), and failures a script still
-    reports itself — `success: false` beside a
-    `message` from `keyboard`, `gesture`, `location`, and per operation in
-    `status_bar` and `appearance`; `{"error": ...}` from `app_launcher`,
-    `navigator` and the other `emulator_*` refusals — until
-    each moves to `cli.fail(error, remedy)`. `emulator_create`'s own refusals —
-    device not found, no API level, image not installed, a failed create —
-    still answer `{"success": false, "message": ...}`, exit 1, pending the same
-    migration (a follow-up); a missing or failing `avdmanager` / `sdkmanager`
-    already answers in the schema above.
+    as `navigator` and `emulator_delete` do), and batches that report per item
+    — per operation in `status_bar` and `appearance`, per permission in
+    `privacy_manager`'s grant/revoke, per AVD in the `emulator_*` `--all`
+    modes — which exit 1 with their own summary when one item failed.
+  - A device error is adb's own line — one that starts `adb: ` or `error: `.
+    A command run on the device writes its stderr through adb's, so a file
+    named `unauthorized.db` that is not there is a missing file (exit 1), not
+    an unauthorized device (exit 3).
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

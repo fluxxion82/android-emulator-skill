@@ -316,6 +316,50 @@ def test_a_scripts_own_runtime_error_handler_does_not_swallow_fail(capsys):
     assert err.splitlines() == ["Error: detected", "Remedy: Look again."]
 
 
+def test_details_ride_after_the_contract_keys_and_never_replace_them(capsys):
+    """A refusal can carry what it found (a search's screens, a listing's
+    entries); a detail named like a contract key is dropped, not obeyed."""
+
+    def main(argv):
+        cli.fail(
+            "Not found: text='x'",
+            "Map the screen first.",
+            details={"search": {"scrolls": 2}, "success": True, "error": "", "remedy": ""},
+        )
+
+    code, out, err = _run(main, ["--json"], capsys)
+    assert code == 1
+    assert out.count("\n") == 1, "the refusal is one line, details and all"
+    assert json.loads(out) == {
+        "success": False,
+        "error": "Not found: text='x'",
+        "remedy": "Map the screen first.",
+        "search": {"scrolls": 2},
+    }
+    assert err == ""
+
+
+def test_details_are_not_printed_in_text_mode(capsys):
+    def main(argv):
+        cli.fail("detected", "Look again.", details={"search": {"scrolls": 2}})
+
+    code, out, err = _run(main, [], capsys)
+    assert code == 1
+    assert out == ""
+    assert err.splitlines() == ["Error: detected", "Remedy: Look again."]
+
+
+def test_a_detail_that_is_not_json_still_leaves_one_object(capsys):
+    """json.dumps would raise TypeError on a Path; the refusal must still parse."""
+
+    def main(argv):
+        cli.fail("detected", "Look again.", details={"where": os.path.curdir.encode()})
+
+    code, out, _ = _run(main, ["--json"], capsys)
+    assert code == 1
+    assert json.loads(out)["where"] == str(os.path.curdir.encode())
+
+
 # ---------------------------------------------------------------------------
 # Which argv asks for JSON
 # ---------------------------------------------------------------------------

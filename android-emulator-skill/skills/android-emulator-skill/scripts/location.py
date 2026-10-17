@@ -557,8 +557,13 @@ Notes:
         try:
             waypoints = _read_gpx_file(args.gpx)
         except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+            # `Error:` alone, on stderr, and nothing under --json: the shared
+            # refusal now.
+            cli.fail(
+                str(e) if args.gpx in str(e) else f"{args.gpx}: {e}",
+                "Pass a GPX file with at least one <trkpt>, <rtept> or <wpt> carrying "
+                "lat and lon attributes.",
+            )
         success, message = manager.replay_gpx(
             waypoints, interval_seconds=interval, verbose=args.verbose
         )
@@ -576,13 +581,24 @@ Notes:
 
     # === Output ===
 
+    if not success:
+        # Through common.cli: this printed `{"success": false, "message": ...}`
+        # -- no `error`, no remedy -- and the message alone on stdout otherwise.
+        # What was asked for (the action, the coordinates) rides along.
+        cli.fail(
+            message,
+            "Fix what the error names, then retry. Mock locations need a running "
+            "emulator (`adb emu geo fix`); a physical device has no console.",
+            details={"action": action, "serial": serial, **extra},
+        )
+
     if args.json:
         print(
             json.dumps(
                 {
                     "action": action,
                     "serial": serial,
-                    "success": success,
+                    "success": True,
                     "message": message,
                     **extra,
                 },
@@ -592,7 +608,7 @@ Notes:
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

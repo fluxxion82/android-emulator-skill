@@ -30,7 +30,12 @@ from container import (
     parse_shared_prefs_xml,
     parse_sqlite_schema,
 )
-from fake_toolchain import SYSTEM_PATH
+from fake_toolchain import (
+    COLLIDING_FILE_NAMES,
+    SYSTEM_PATH,
+    assert_refusal,
+    recorded_missing_file,
+)
 
 from common import cli
 
@@ -694,6 +699,57 @@ def test_cat_of_a_missing_file_is_a_failure_not_content(tmp_path, monkeypatch, c
     assert reason.strip() in payload["error"]
 
 
+@pytest.mark.parametrize("name", COLLIDING_FILE_NAMES)
+def test_a_missing_file_named_like_a_device_state_is_still_a_missing_file(
+    tmp_path, monkeypatch, capsys, recorded, name
+):
+    """Codex review of #29: the device's `cat` error for `unauthorized.db` exited 3.
+
+    `shell -T` hands back the device command's stderr as adb's, and the
+    classifier found "unauthorized" in it. It is the app's file, missing: exit
+    1, with the device's reason (derived: run_as_cat_missing, path replaced).
+    """
+    status = {f["name"]: f.get("exit_status") for f in recorded.manifest["fixtures"]}
+    reason = recorded_missing_file(recorded, PKG_DIR + "/shared_prefs", name)
+    _routed_adb(
+        tmp_path,
+        monkeypatch,
+        [(("-T", "cat"), b"", reason.encode(), status["run_as_cat_missing"])],
+    )
+
+    result = _run_main(
+        monkeypatch,
+        capsys,
+        *("--package", "com.example.app", "--serial", "emulator-5554"),
+        *("--cat", f"shared_prefs/{name}", "--json"),
+    )
+
+    payload = assert_refusal(
+        result, json_mode=True, naming=("no such file or directory",), status=1
+    )
+    assert reason.strip() in payload["error"]
+
+
+def test_a_device_that_is_gone_during_a_read_is_still_exit_3(
+    tmp_path, monkeypatch, capsys, recorded
+):
+    """The control: adb's own `adb: device '...' not found` on that read is the device's."""
+    _routed_adb(
+        tmp_path,
+        monkeypatch,
+        [(("-T", "cat"), b"", recorded.text("adb_shell_device_not_found").encode(), 1)],
+    )
+
+    result = _run_main(
+        monkeypatch,
+        capsys,
+        *("--package", "com.example.app", "--serial", "emulator-5554"),
+        *("--cat", "shared_prefs/fixture_settings.xml", "--json"),
+    )
+
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+
+
 # ---------------------------------------------------------------------------
 # The adb client check. `shell -T` needs adb 1.0.36; an older client forwards
 # `-T` to the device shell and exits 0 after its error, which a read deciding
@@ -783,6 +839,34 @@ def test_an_adb_client_that_cannot_honour_t_is_refused_before_any_read(
     assert error in payload["error"], payload
     assert "platform-tools" in payload["remedy"]
     assert calls == [["version"]], f"a read was attempted: {calls}"
+
+
+def test_a_schema_dump_checks_the_client_before_the_on_device_query(
+    _real_client_check, tmp_path, monkeypatch, capsys, recorded
+):
+    """`--databases NAME` ran `run-as ... sqlite3 <db> .schema` BEFORE the check.
+
+    Codex review of #29: "refused before any read" was not true of the schema
+    path. Derived banner as above (recorded `adb version`, X.Y.Z -> 1.0.32).
+    """
+    status = {f["name"]: f.get("exit_status") for f in recorded.manifest["fixtures"]}
+    banner = recorded.text("adb_version")
+    recorded_version = ".".join(map(str, container.parse_adb_version(banner)))
+    old_client = banner.replace(recorded_version, "1.0.32", 1)
+    log = _routed_adb(
+        tmp_path, monkeypatch, [(("version",), old_client.encode(), b"", status["adb_version"])]
+    )
+
+    result = _run_main(
+        monkeypatch,
+        capsys,
+        *("--package", "com.example.app", "--serial", "emulator-5554"),
+        *("--databases", "fixture.db", "--json"),
+    )
+
+    assert_refusal(result, json_mode=True, naming=("older than 1.0.36",), status=1)
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert not [call for call in calls if "run-as" in call], calls
 
 
 def test_export_with_a_refused_adb_client_writes_nothing(

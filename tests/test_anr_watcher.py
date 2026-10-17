@@ -1259,6 +1259,42 @@ def test_stop_waits_for_a_worker_still_naming_a_process(recorded, tmp_path):
     assert asked == [str(pid)], f"looked up after the stop: {asked}"
 
 
+def test_start_json_answers_an_object_whose_session_id_stop_accepts(recorded, tmp_path):
+    """`--start --json` printed the bare session id: a token, not an object.
+
+    Now ``{"success": true, "session_id": ...}``, like every other mode. The
+    loop is the proof: the id is read out of what --start PRINTED and handed to
+    --stop, which must accept it as the session it started. (The text form is
+    still the bare id, for `SID=$(... --start)`; the test above reads it.)
+    """
+    toolchain = FakeToolchain(tmp_path / "toolchain")
+    toolchain.assert_isolated()
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("logcat",), stdout=recorded.text("logcat_anr_broadcast")),
+        ],
+    )
+
+    started = toolchain.run("anr_watcher.py", "--start", "--serial", "emulator-5554", "--json")
+    assert started.returncode == 0, started.stderr
+    payload = json.loads(started.stdout)
+    assert payload["success"] is True, payload
+    session_id = payload["session_id"]
+    store = SessionStore(base_dir=toolchain.home / "anr-sessions")
+    try:
+        stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--json")
+    finally:
+        worker = store.load_meta(session_id).pid
+        if worker:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(worker, signal.SIGKILL)
+
+    assert stopped.returncode == 0, stopped.stderr
+    assert json.loads(stopped.stdout)["session_id"] == session_id
+
+
 def test_a_stream_restart_forgets_who_held_each_pid(recorded, tmp_path, monkeypatch):
     """Review of PR #26: a pid's owner was cached across a stream restart.
 

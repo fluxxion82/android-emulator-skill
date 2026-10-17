@@ -34,7 +34,6 @@ Usage Examples:
 
 import argparse
 import json
-import sys
 
 from common import cli
 from common.env_config import env_int
@@ -67,8 +66,12 @@ def _print_get_log(cache: BuildResultCache, build_id: str, as_json: bool) -> int
     """Print the cached combined log for a build ID."""
     log = cache.get_log(build_id)
     if log is None:
-        print("No build log available", file=sys.stderr)
-        return 1
+        # A sentence on stderr and exit 1, nothing under --json: the shared
+        # refusal now.
+        cli.fail(
+            f"no build log is cached for build {build_id}",
+            "Use --list-builds to see the builds that are cached, then pass one of their ids.",
+        )
     if as_json:
         print(json.dumps({"build_id": build_id, "log": log}, indent=2))
     else:
@@ -103,9 +106,11 @@ def _handle_disclosure(args: argparse.Namespace, cache: BuildResultCache) -> int
 
     payload = cache.get(build_id)
     if payload is None:
-        print(f"Error: build result not found: {build_id}", file=sys.stderr)
-        print("Use --list-builds to see available builds", file=sys.stderr)
-        return 1
+        # `Error:` and a hint on stderr, nothing under --json: the shared refusal now.
+        cli.fail(
+            f"build result not found: {build_id}",
+            "Use --list-builds to see the builds that are cached, then pass one of their ids.",
+        )
 
     if args.get_errors:
         return _print_get_errors(payload, args.json)

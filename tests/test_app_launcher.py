@@ -359,7 +359,11 @@ ACTION_MODES = [
 def test_every_action_mode_reports_a_failed_command_the_same_way(
     monkeypatch, capsys, action, argv, json_mode
 ):
-    """adb ran, the command failed: exit 1, and `{"error": ...}` under --json."""
+    """adb ran, the command failed: exit 1, and common.cli's refusal under --json.
+
+    It was `{"error": ...}` alone -- no `success`, no remedy -- until N5's
+    payload check.
+    """
 
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, "", "boom")
@@ -374,7 +378,8 @@ def test_every_action_mode_reports_a_failed_command_the_same_way(
     assert "Traceback" not in captured.err
     if json_mode:
         payload = json_lib.loads(captured.out)
-        assert set(payload) == {"error"}, f"{action} answered {payload}"
+        assert set(payload) == {"success", "error", "remedy"}, f"{action} answered {payload}"
+        assert payload["success"] is False and payload["remedy"], payload
         assert payload["error"], "the error payload is empty"
     else:
         assert captured.out == "", f"{action} printed an answer on failure: {captured.out!r}"
@@ -678,7 +683,8 @@ def test_state_json_mode_reports_the_error_and_exits_non_zero(monkeypatch, capsy
     payload = json_lib.loads(capsys.readouterr().out)
 
     assert code == 1
-    assert set(payload) == {"error"}, payload
+    assert set(payload) == {"success", "error", "remedy"}, payload
+    assert payload["success"] is False, payload
 
 
 @pytest.mark.parametrize("json_mode", [False, True])

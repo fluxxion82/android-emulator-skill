@@ -226,6 +226,11 @@ def _remedy_for_multiple_devices() -> str:
     return "Pass --serial to choose a device (see `adb devices`)."
 
 
+# How adb itself begins an error line (case-sensitive: a device tool's
+# "Error: ..." is not adb's). Both are recorded, one per profile.
+_ADB_OWN_PREFIXES = ("adb: ", "error: ")
+
+
 def _classify(stderr: str, serial: str | None) -> AdbError | None:
     """Map adb's own error text to a typed error that names a remedy.
 
@@ -235,12 +240,21 @@ def _classify(stderr: str, serial: str | None) -> AdbError | None:
     host-level failure. For an agent that treats these messages as retry
     prompts, that is a false remedy.
 
-    adb reports device problems with a mix of ``adb:`` and ``error:`` prefixes,
-    so matching is on the message body rather than the prefix. Returns None when
-    the text is not a recognised device error, meaning the command reached a
-    device and its status is the command's own.
+    adb reports device problems with a mix of ``adb:`` and ``error:`` prefixes
+    (both recorded: adb_shell_device_not_found, adb_device_not_found), so either
+    prefix is accepted -- but only at the START of a line. A command run on the
+    device writes ITS stderr through adb's (``adb shell``), and matching the
+    body anywhere read ``cat: databases/unauthorized.db: No such file or
+    directory`` as an unauthorized device: exit 3, the file's reason lost
+    (Codex review of #29, once file reads went through run_argv). Returns None
+    when the text is not a recognised device error, meaning the command reached
+    a device and its status is the command's own.
     """
-    text = stderr.lower()
+    text = "\n".join(
+        line for line in stderr.splitlines() if line.startswith(_ADB_OWN_PREFIXES)
+    ).lower()
+    if not text:
+        return None
 
     if "more than one device" in text:
         remedy = _remedy_for_multiple_devices()
@@ -308,6 +322,26 @@ def _as_text(output: bytes | str | None) -> str:
     return output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output
 
 
+def _not_installed_error() -> AdbNotInstalledError:
+    """The error for an adb that could not be run at all, with its remedy."""
+    return AdbNotInstalledError(
+        f"adb could not be run: it is not on PATH, or the file found is not "
+        f"executable. {_ADB_NOT_INSTALLED_REMEDY}",
+        remedy=_ADB_NOT_INSTALLED_REMEDY,
+    )
+
+
+def _timeout_error(cmd: list[str], budget: float) -> AdbTimeoutError:
+    """The error for an adb call that did not finish within ``budget`` seconds."""
+    remedy = "try `adb kill-server` and retry."
+    return AdbTimeoutError(
+        f"`{' '.join(cmd)}` did not finish within {budget}s. The device may be "
+        f"busy or the adb connection wedged; {remedy}",
+        command=cmd,
+        remedy=remedy,
+    )
+
+
 def run_adb(
     operation: str,
     serial: str | None = None,
@@ -369,19 +403,9 @@ def run_adb(
         # Both were reproduced: with only such a stub on PATH, the raw
         # PermissionError escaped this function and reached the user as a
         # traceback instead of a remedy.
-        raise AdbNotInstalledError(
-            f"adb could not be run: it is not on PATH, or the file found is not "
-            f"executable. {_ADB_NOT_INSTALLED_REMEDY}",
-            remedy=_ADB_NOT_INSTALLED_REMEDY,
-        ) from exc
+        raise _not_installed_error() from exc
     except subprocess.TimeoutExpired as exc:
-        remedy = "try `adb kill-server` and retry."
-        raise AdbTimeoutError(
-            f"`{' '.join(cmd)}` did not finish within {budget}s. The device may be "
-            f"busy or the adb connection wedged; {remedy}",
-            command=cmd,
-            remedy=remedy,
-        ) from exc
+        raise _timeout_error(cmd, budget) from exc
 
     result = AdbResult(
         returncode=completed.returncode,
@@ -405,3 +429,53 @@ def run_adb(
             )
 
     return result
+
+
+def run_argv(
+    cmd: list[str],
+    *,
+    serial: str | None,
+    timeout: float | None = None,
+    text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run an adb argv the caller built, for raw bytes, failing as :func:`run_adb` does.
+
+    For the reads :func:`run_adb` cannot serve: an app's file or database
+    (``common.run_as``), and a listing whose names are bytes until something
+    decides otherwise. ``raw_text`` decodes, which would replace what is not
+    UTF-8. The argv comes from ``build_command`` or
+    ``device_utils.build_adb_command``, so it starts with ``adb`` and carries
+    ``-s`` when ``serial`` is set.
+
+    adb's own failures are typed exactly as in :func:`run_adb`, so they reach
+    ``common.cli`` with their remedy and exit status instead of being folded
+    into "the command failed": they were, in container.py and
+    model_inspector.py, which answered a device that was not there with
+    "Command failed (ls -la ...): adb: device ... not found" at exit 1.
+
+    Args:
+        cmd: The full argv.
+        serial: The serial ``cmd`` targets, for a device error's message.
+        timeout: Seconds to allow. Defaults to ``ANDROID_EMU_ADB_TIMEOUT`` (30).
+        text: Decode as text instead (for output nothing makes a path of).
+
+    Returns:
+        The completed process; its status and streams are the caller's to judge.
+
+    Raises:
+        AdbNotInstalledError, AdbTimeoutError, and the device errors, as
+        :func:`run_adb` raises them. Never :class:`AdbCommandError`.
+    """
+    budget = DEFAULT_TIMEOUT if timeout is None else timeout
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=text, timeout=budget, check=False)
+    except OSError as exc:
+        raise _not_installed_error() from exc
+    except subprocess.TimeoutExpired as exc:
+        raise _timeout_error(cmd, budget) from exc
+    if completed.returncode != 0:
+        device_error = _classify(_as_text(completed.stderr), serial)
+        if device_error is not None:
+            device_error.command = cmd
+            raise device_error
+    return completed

@@ -1,56 +1,65 @@
-"""Every documented mode, with adb failing: does the CLI say so in its exit status?
+"""Every documented mode, with the toolchain broken or gone: is the refusal the contract?
 
 The finding this pins (C6, X5, X8, X3, L8) is one shape in four places: a
 failure converted into an empty result, printed calmly, and reported as
 success. ``app_launcher --list`` answered ``Installed packages (0)`` when adb
 never ran, and ``device_list --json`` answered ``{"devices": [], "avds": []}``
-when the SDK was not installed. Both were fixed during v0.7.0 and are green
-here unmarked; the shape survives in ``emulator_create``, which this sweep does
-not cover. An agent cannot tell "nothing is there" from "I could not look", and
-it has no second signal to consult -- exit status is the signal.
+when the SDK was not installed. An agent cannot tell "nothing is there" from
+"I could not look", and it has no second signal to consult.
+
+**Two passes, because a broken tool and a missing one are different failures
+(N5).** Until v0.8.0 this sweep faked every tool as PRESENT and failing (adb
+exit 1, the SDK binaries exit 127) and asserted only "exit != 0". That is why
+``privacy_manager``'s traceback and ``emulator_create``'s ``[]`` survived a
+release: a script that resolves a tool by path, or catches the exec failure
+itself, never meets a stub that is there. So every mode runs twice:
+
+- **broken**: ``adb`` on PATH answering every call with the RECORDED
+  device-not-found stderr, exit 1; ``emulator`` / ``avdmanager`` /
+  ``sdkmanager`` on PATH, exit 127.
+- **absent**: PATH is ``/usr/bin:/bin`` -- no Android tool anywhere -- and
+  HOME, ANDROID_HOME and ANDROID_SDK_ROOT are empty temp directories.
+  ``ANDROID_AVD_HOME`` names ``.android/avd`` inside that empty HOME, which
+  does not exist: a host that never had an SDK has no AVD home, and an
+  existing empty one is a legitimate "no AVDs", which is not this sweep's
+  question. The interpreter is the test's own, by absolute path -- stripping
+  PATH otherwise hands ``python3`` to the system 3.9, which cannot import
+  these scripts.
+
+**The payload, not just the status.** Each mode's refusal is checked with
+``fake_toolchain.assert_refusal``, the checker every refusal spec uses:
+``--json`` -> stdout is exactly one ``{"success": false, "error", "remedy"}``
+object whose ``error`` names the tool or operation; text -> ``Error:`` then
+``Remedy:`` on stderr and no JSON on stdout. The exit status is exact: 3 when
+the device is unavailable (the broken adb's stderr is a device error), 1
+otherwise -- every mode in the absent pass, where adb could not be run at all.
+"exit != 0" alone was satisfied by a traceback.
 
 **Why this is a runtime sweep and not another AST guard.** The obvious static
 rule -- "a function that builds a dict with an ``error`` key must not fall
 through to ``sys.exit(0)``" -- was written down, costed, and dropped. It is not
 expressible: the dict is built in one function, returned through two more, and
-the exit is decided by a ``main()`` that never sees the key. Both the
-adjudicating reviewer and the plan critic rejected it as inexpressible before a
-line of it existed. What *is* checkable is the thing the agent experiences, so
-this runs the real CLI, as a subprocess, against an adb that fails.
+the exit is decided by a ``main()`` that never sees the key. What *is*
+checkable is the thing the agent experiences, so this runs the real CLI, as a
+subprocess, against a toolchain that fails.
 
 **The fake adb is a fault injector, not a simulator.** It answers every
-invocation the same way -- the failure this sweep is about is "adb did not
-work", and which subcommand was asked does not change that. The one piece of
-tool *text* it emits is read from ``tests/fixtures/recorded/``
-(``adb_shell_device_not_found``), not written here: CLAUDE.md's rule applies to
-a test double's output as much as to a parser's input, and this file would
-otherwise have hard-coded ``error: device ... not found`` -- which is the wrong
-prefix. Real adb says ``adb:``; ``error:`` belongs to ``adb get-state``. That
-exact mistake is already recorded in ``test_fixture_policy``'s debt notes.
+invocation the same way. The one piece of tool *text* it emits is read from
+``tests/fixtures/recorded/`` (``adb_shell_device_not_found``), not written
+here: real adb says ``adb:``; ``error:`` belongs to ``adb get-state``.
 
-``emulator``, ``avdmanager`` and ``sdkmanager`` are faked as exit 127, which is
-the "SDK tool is not installed" case X3 and L8 are about.
+**Three tests per mode and pass, and only one of them may carry an xfail.**
+``xfail(strict=True)`` rejects an unexpected *pass*, never an unexpected reason
+for failing, so a single combined test would accept a hang, a fresh traceback
+or a vanished tool call as "the expected failure" for a mode still pinned red.
+So completion and the absence of a traceback are asserted unmarked for every
+mode; the tool-invocation floor is asserted unmarked for every mode that
+touches a tool (broken: the fake logged a call; absent: the output names the
+tool it could not find); and the ``xfail`` covers exactly one assertion, the
+payload. A mode that sets ``defect`` is red today and says why.
 
-Each mode also asserts that a fake tool was *invoked*, so a script that answers
-without ever looking cannot pass the sweep vacuously. The two modes that
-legitimately touch no tool say so in the table.
-
-Each mode is checked by three separate tests, and only one of them can carry
-an ``xfail``. That split is not tidiness. ``xfail(strict=True)`` rejects an
-unexpected *pass*, never an unexpected reason for failing, so a single combined
-test would accept a hang, a fresh Python traceback or a vanished marker file as
-"the expected failure" for any mode still pinned red -- the sweep would go on
-reporting the defect it already knows about while a new one hid behind it.
-Every mode is green today -- v0.7.0 closed the eight that were red -- so no
-mode sets ``defect`` and nothing is marked; the split stands for the next one.
-So:
-completion and the absence of a traceback are asserted unmarked for all
-twenty-three modes, the tool-invocation floor is asserted unmarked for the
-twenty-one that touch a tool, and the ``xfail`` covers exactly one assertion,
-``exit status != 0``.
-
-Each mode's subprocess runs once and the outcome is shared between its three
-tests, so all three describe the same run rather than three attempts at it.
+Each mode's subprocess runs once per pass and the outcome is shared between
+its three tests, so all three describe the same run.
 """
 
 from __future__ import annotations
@@ -63,6 +72,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from fake_toolchain import ANDROID_TOOLS, assert_refusal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "scripts"
@@ -78,6 +88,8 @@ TOOL_LOG_VAR = "SWEEP_TOOL_LOG"
 # Substituted with the mode's own working directory before the script runs, so
 # nothing writes into the repo.
 WORKDIR = "<workdir>"
+
+SYSTEM_PATH = ("/usr/bin", "/bin")
 
 _FAKE_ADB = """#!/bin/sh
 printf 'adb %s\\n' "$*" >> "$SWEEP_TOOL_LOG"
@@ -95,140 +107,209 @@ exit 127
 
 MISSING_TOOLS = ("emulator", "avdmanager", "sdkmanager")
 
+PASSES = ("broken", "absent")
+
+# The device is unavailable: what the broken adb's recorded stderr says.
+DEVICE_UNAVAILABLE = 3
+FAILURE = 1
+
 
 class Mode(NamedTuple):
-    """One documented invocation, and what it must do when the tool fails."""
+    """One documented invocation, and what its refusal must be."""
 
     script: str
     argv: tuple[str, ...]
-    tool: str | None  # the fake that must be invoked; None with a reason below
+    tool: str | None  # the tool the mode needs; None with a reason below
     reason: str  # why no tool, or what the mode is for
-    defect: str | None = None  # finding ID when this mode is red today
+    naming: tuple[str, ...]  # any one must appear in the error (case-insensitive)
+    broken_status: int  # the exit status in the broken pass; the absent pass is always 1
+    defect: str | None = None  # "<ID>: why" when this mode's payload is red today
+    streaming: bool = False  # the refusal is the last stdout line, not all of it
 
     @property
     def ident(self) -> str:
         return f"{self.script.removesuffix('.py')} {' '.join(self.argv)}".strip()
 
+    @property
+    def json_mode(self) -> bool:
+        return "--json" in self.argv
 
-# The sweep table. `defect` is filled from an unmarked run, not from a guess:
-# every entry below was observed, and the eight that were marked printed a zero
-# exit status with an empty-looking answer. All eight are fixed; no entry sets
-# `defect` today.
+    def status(self, toolchain: str) -> int:
+        """The exact exit status this mode's refusal carries in ``toolchain``."""
+        return self.broken_status if toolchain == "broken" else FAILURE
+
+
+def _adb(script: str, argv: tuple[str, ...], reason: str, **kw) -> Mode:
+    """A mode whose first move is adb: device unavailable (3) when adb answers."""
+    kw.setdefault("naming", ("adb",))
+    kw.setdefault("broken_status", DEVICE_UNAVAILABLE)
+    return Mode(script, argv, "adb", reason, **kw)
+
+
+def _sdk(script: str, argv: tuple[str, ...], tool: str, reason: str) -> Mode:
+    """A mode whose first move is an SDK binary: exit 127, or not there at all."""
+    return Mode(script, argv, tool, reason, naming=(tool,), broken_status=FAILURE)
+
+
+# The sweep table. `defect` is filled from an unmarked run, not from a guess.
 MODES: tuple[Mode, ...] = (
-    # --- C6: app_launcher ---------------------------------------------------
-    # Green since Inc 1: list_packages no longer answers a failed lookup with
-    # an empty list, and main() reports the failure in both output modes.
-    Mode("app_launcher.py", ("--list",), "adb", "package listing"),
-    Mode("app_launcher.py", ("--list", "--json"), "adb", "package listing"),
-    # --state and --launch already exit 1 here: the injected failure is a
-    # device error, which main() maps before the state path can swallow it.
-    # C6's second half (an adb call that RAN and failed) needs a recorded
-    # "command failed on a live device" fixture, which the corpus lacks.
-    Mode("app_launcher.py", ("--state", "com.example.app"), "adb", "foreground check"),
-    Mode("app_launcher.py", ("--state", "com.example.app", "--json"), "adb", "foreground check"),
-    Mode("app_launcher.py", ("--launch", "com.example.app"), "adb", "activity launch"),
-    Mode("app_launcher.py", ("--launch", "com.example.app", "--json"), "adb", "activity launch"),
-    # --- the core loop ------------------------------------------------------
-    Mode("screen_mapper.py", (), "adb", "default text output, Quick Start step 2"),
-    Mode("screen_mapper.py", ("--json",), "adb", "machine-readable screen map"),
-    Mode("navigator.py", ("--find-text", "x", "--json"), "adb", "Quick Start step 3"),
+    # --- C6: app_launcher, Quick Start step 1 -------------------------------
+    _adb("app_launcher.py", ("--list",), "package listing"),
+    _adb("app_launcher.py", ("--list", "--json"), "package listing"),
+    _adb("app_launcher.py", ("--state", "com.example.app"), "foreground check"),
+    _adb("app_launcher.py", ("--state", "com.example.app", "--json"), "foreground check"),
+    _adb("app_launcher.py", ("--launch", "com.example.app"), "Quick Start step 1"),
+    _adb("app_launcher.py", ("--launch", "com.example.app", "--json"), "activity launch"),
+    # --- the core loop: Quick Start steps 2-5 -------------------------------
+    _adb("screen_mapper.py", (), "default text output, Quick Start step 2"),
+    _adb("screen_mapper.py", ("--json",), "machine-readable screen map"),
+    _adb("navigator.py", ("--find-text", "x", "--json"), "lookup"),
+    _adb("navigator.py", ("--find-text", "x", "--tap"), "Quick Start step 3"),
+    _adb(
+        "navigator.py",
+        ("--find-type", "EditText", "--enter-text", "x"),
+        "Quick Start step 4",
+    ),
+    _adb("accessibility_audit.py", (), "Quick Start step 5"),
+    _adb("accessibility_audit.py", ("--json",), "the audit as JSON"),
     # --- X5: anr_watcher session store --------------------------------------
     Mode(
         "anr_watcher.py",
         ("--get-details", "no-such-session", "--json"),
         None,
         "reads the on-disk session store under $HOME; no device is involved",
+        naming=("session",),
+        broken_status=FAILURE,
     ),
     Mode(
         "anr_watcher.py",
         ("--diff", "a", "b", "--json"),
         None,
         "reads the on-disk session store under $HOME; no device is involved",
+        naming=("summary.json", "session"),
+        broken_status=FAILURE,
     ),
     # --- X8: app_state_capture ----------------------------------------------
-    # Exits 1 here because the whole capture fails at the device level. X8 is
-    # the PARTIAL capture -- a snapshot that succeeded except for the logs it
-    # was asked for -- which needs a device that answers. Named so the gap is
-    # visible rather than assumed covered; Inc 1 fixed it and asserts the exit
-    # status by injecting the component failure directly, in
-    # test_app_state_capture.py ("X8: a component that was asked for").
-    Mode(
+    # The partial-capture policy catches a device error on purpose (common/cli's
+    # list of deliberate catches), so the refusal is exit 1 even when adb says
+    # the device is not there. Red when N5 first ran it: its own
+    # `{"error", "partial"}` object, no `success`, no remedy.
+    _adb(
         "app_state_capture.py",
         ("--package", "com.example.app", "--output", f"{WORKDIR}/snapshots", "--json"),
-        "adb",
         "whole-capture failure; the partial-capture case (X8) is out of reach here",
+        naming=("adb", "device"),
+        broken_status=FAILURE,
     ),
-    # --- X3 / L8: the lifecycle scripts with no SDK -------------------------
-    Mode("device_list.py", ("--json",), "adb", "device and AVD inventory"),
-    Mode("emulator_boot.py", ("--list-avds", "--json"), "emulator", "AVD listing"),
-    Mode("emulator_selector.py", ("--suggest", "--json"), "emulator", "AVD suggestion"),
-    Mode(
+    # --- X3 / L8 / N1: the lifecycle scripts with no SDK ---------------------
+    _adb("device_list.py", ("--json",), "device and AVD inventory"),
+    _sdk("emulator_boot.py", ("--list-avds", "--json"), "emulator", "AVD listing"),
+    _sdk("emulator_selector.py", ("--suggest", "--json"), "emulator", "AVD suggestion"),
+    _sdk(
         "emulator_delete.py",
         ("--all", "--yes", "--json"),
         "avdmanager",
         "batch delete with no avdmanager",
     ),
+    _sdk("emulator_create.py", ("--list-images",), "sdkmanager", "system image listing"),
+    _sdk("emulator_create.py", ("--list-images", "--json"), "sdkmanager", "the same, as JSON"),
+    _sdk("emulator_create.py", ("--list-devices", "--json"), "avdmanager", "device definitions"),
+    _sdk(
+        "emulator_create.py",
+        ("--device", "pixel_7", "--api", "34", "--name", "probe"),
+        "avdmanager",
+        "a create: the device definition is resolved first",
+    ),
+    _sdk(
+        "emulator_create.py",
+        ("--device", "pixel_7", "--api", "34", "--name", "probe", "--json"),
+        "avdmanager",
+        "the same create, as JSON",
+    ),
+    *(
+        Mode(
+            "emulator_erase.py",
+            argv,
+            None,
+            "reads the AVD home on disk, which this host does not have; no SDK tool "
+            "is involved in listing or erasing",
+            naming=("avd",),
+            broken_status=FAILURE,
+        )
+        for argv in (("--list",), ("--list", "--json"), ("--all",), ("--all", "--json"))
+    ),
     # --- diagnostics --------------------------------------------------------
-    Mode("log_monitor.py", ("--last", "1m", "--json"), "adb", "historical log window"),
-    Mode("crash_triage.py", ("--json",), "adb", "crash buffer triage"),
+    _adb("log_monitor.py", ("--last", "1m", "--json"), "historical log window"),
+    _adb("crash_triage.py", ("--json",), "crash buffer triage"),
     # --- emulator console and device services -------------------------------
-    Mode("snapshot.py", ("--list", "--json"), "adb", "snapshot listing via the console"),
-    Mode("sms.py", ("--list", "--json"), "adb", "inbox read"),
-    Mode(
+    _adb("snapshot.py", ("--list", "--json"), "snapshot listing via the console"),
+    _adb("sms.py", ("--list", "--json"), "inbox read"),
+    _adb(
         "privacy_manager.py",
         ("--list", "--package", "com.example.app", "--json"),
-        "adb",
         "permission listing",
     ),
-    Mode("status_bar.py", ("--reset", "--json"), "adb", "demo-mode reset"),
-    Mode(
+    _adb("status_bar.py", ("--reset", "--json"), "demo-mode reset"),
+    # Red when added (Codex review of #29): `{"success": false, ...}` with no
+    # remedy, `x adb not found` in text, and a device error at exit 1.
+    _adb("push_notification.py", ("--list", "--json"), "posted-notification read-back"),
+    _adb("push_notification.py", ("--list",), "the same, as text"),
+    _adb(
+        "push_notification.py",
+        ("--post", "--tag", "t", "--text", "x", "--json"),
+        "post into the shade",
+    ),
+    _adb(
         "container.py",
         ("--package", "com.example.app", "--ls", "--json"),
-        "adb",
         "app sandbox listing",
     ),
 )
 
 
-class FakeSdk(NamedTuple):
-    """A PATH where every Android tool fails, and an SDK root with nothing in it."""
+class Toolchain(NamedTuple):
+    """One pass's toolchain: where the tools are (or are not), and an empty SDK."""
 
-    bin_dir: Path
+    name: str
+    path: str
     sdk_root: Path
-    home: Path
 
 
 @pytest.fixture(scope="session")
-def fake_sdk(tmp_path_factory, recorded_anywhere) -> FakeSdk:
-    """An Android toolchain that is present, reachable, and broken.
+def toolchains(tmp_path_factory, recorded_anywhere) -> dict[str, Toolchain]:
+    """The broken toolchain and the absent one.
 
-    ``adb`` fails every call; the three SDK binaries answer 127. Both are put
-    ahead of anything real on PATH, and ``ANDROID_HOME`` points at an empty
-    directory, so ``common.sdk_tools.resolve_sdk_tool`` -- PATH first, then the
-    SDK subdirectories -- cannot reach a real installation from here.
+    broken: ``adb`` fails every call; the three SDK binaries answer 127. Both
+    are put ahead of anything real on PATH. absent: nothing but the system
+    directories. In both, ``ANDROID_HOME`` is an empty directory, so
+    ``common.sdk_tools.resolve_sdk_tool`` -- PATH first, then the SDK
+    subdirectories -- cannot reach a real installation.
     """
-    root = tmp_path_factory.mktemp("fake-sdk")
-    bin_dir = root / "bin"
-    bin_dir.mkdir()
+    built: dict[str, Toolchain] = {}
+    for name in PASSES:
+        root = tmp_path_factory.mktemp(f"toolchain-{name}")
+        sdk_root = root / "sdk"
+        sdk_root.mkdir()
+        dirs = list(SYSTEM_PATH)
+        if name == "broken":
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            device_not_found = recorded_anywhere("adb_shell_device_not_found").rstrip("\n")
+            (bin_dir / "adb").write_text(
+                _FAKE_ADB.format(recorded=device_not_found), encoding="utf-8"
+            )
+            for tool in MISSING_TOOLS:
+                (bin_dir / tool).write_text(_FAKE_MISSING_TOOL, encoding="utf-8")
+            for entry in bin_dir.iterdir():
+                entry.chmod(0o755)
+            dirs.insert(0, str(bin_dir))
+        built[name] = Toolchain(name, os.pathsep.join(dirs), sdk_root)
+    return built
 
-    device_not_found = recorded_anywhere("adb_shell_device_not_found").rstrip("\n")
-    (bin_dir / "adb").write_text(_FAKE_ADB.format(recorded=device_not_found), encoding="utf-8")
-    for tool in MISSING_TOOLS:
-        (bin_dir / tool).write_text(_FAKE_MISSING_TOOL, encoding="utf-8")
-    for entry in bin_dir.iterdir():
-        entry.chmod(0o755)
 
-    sdk_root = root / "sdk"
-    sdk_root.mkdir()
-    home = root / "home"
-    home.mkdir()
-    return FakeSdk(bin_dir=bin_dir, sdk_root=sdk_root, home=home)
-
-
-# Stands in for the exit status of a run that never finished. Non-zero on
-# purpose: a hung mode must fail the completion test loudly rather than quietly
-# satisfying the exit-status test, and for a mode carrying an xfail it turns
-# into an unexpected pass, which strict mode also reports.
+# Stands in for the exit status of a run that never finished. Not 1 or 3 on
+# purpose: a hung mode must fail the completion test loudly, and can never
+# satisfy the exact status the payload test asks for.
 TIMED_OUT_STATUS = -1
 
 
@@ -239,33 +320,50 @@ class Outcome(NamedTuple):
     tools: tuple[str, ...]
     timed_out: bool = False
 
+    def completed(self, argv: list[str]) -> subprocess.CompletedProcess:
+        """The run, in the shape ``assert_refusal`` reads."""
+        return subprocess.CompletedProcess(argv, self.returncode, self.stdout, self.stderr)
 
-def _invoke(mode: Mode, fake: FakeSdk, workdir: Path) -> Outcome:
-    """Run one mode with the fake toolchain and nothing else on PATH.
 
-    A timeout is captured rather than raised, so the three tests sharing this
-    outcome each get to say their own thing about it.
+def _env(chain: Toolchain, workdir: Path, tool_log: Path) -> dict[str, str]:
+    """A from-scratch environment: nothing inherited, nothing real reachable.
+
+    HOME is a new empty directory per run, so what one mode leaves in it (a
+    session store, a cache) cannot become the next mode's answer.
     """
-    tool_log = workdir / "tools.log"
-    tool_log.touch()
-
-    env = {
-        "PATH": os.pathsep.join([str(fake.bin_dir), "/usr/bin", "/bin"]),
-        "HOME": str(fake.home),
-        "ANDROID_HOME": str(fake.sdk_root),
-        "ANDROID_SDK_ROOT": str(fake.sdk_root),
-        "ANDROID_SDK_HOME": str(fake.home),
+    home = workdir / "home"
+    home.mkdir()
+    return {
+        "PATH": chain.path,
+        "HOME": str(home),
+        "ANDROID_HOME": str(chain.sdk_root),
+        "ANDROID_SDK_ROOT": str(chain.sdk_root),
+        "ANDROID_SDK_HOME": str(home),
+        "ANDROID_AVD_HOME": str(home / ".android" / "avd"),
         "TMPDIR": str(workdir),
         TOOL_LOG_VAR: str(tool_log),
     }
+
+
+def _invoke(mode: Mode, chain: Toolchain, workdir: Path) -> Outcome:
+    """Run one mode in one toolchain.
+
+    The interpreter is this test's own (``sys.executable``, an absolute path),
+    never ``python3`` looked up on the reduced PATH. A timeout is captured
+    rather than raised, so the three tests sharing this outcome each get to
+    say their own thing about it.
+    """
+    tool_log = workdir / "tools.log"
+    tool_log.touch()
     argv = [arg.replace(WORKDIR, str(workdir)) for arg in mode.argv]
 
     timed_out = False
     try:
         completed = subprocess.run(
             [sys.executable, str(SCRIPTS / mode.script), *argv],
-            env=env,
+            env=_env(chain, workdir, tool_log),
             cwd=workdir,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=MODE_TIMEOUT_SECONDS,
@@ -293,115 +391,165 @@ def _invoke(mode: Mode, fake: FakeSdk, workdir: Path) -> Outcome:
 
 
 @pytest.fixture(scope="session")
-def swept(fake_sdk: FakeSdk, tmp_path_factory):
-    """One subprocess per mode, memoised for the three tests that read it.
+def swept(toolchains, tmp_path_factory):
+    """One subprocess per mode and pass, memoised for the three tests that read it.
 
     Sharing the run matters as well as saving it: "no traceback", "a tool was
-    invoked" and "the exit status was non-zero" are three statements about the
-    same invocation, and running the script three times would let them describe
-    three different ones.
+    reached for" and "the refusal is the contract" are three statements about
+    the same invocation, and running the script three times would let them
+    describe three different ones.
     """
-    seen: dict[str, Outcome] = {}
+    seen: dict[tuple[str, str], Outcome] = {}
 
-    def _outcome(mode: Mode) -> Outcome:
-        if mode.ident not in seen:
+    def _outcome(toolchain: str, mode: Mode) -> Outcome:
+        key = (toolchain, mode.ident)
+        if key not in seen:
             workdir = tmp_path_factory.mktemp("mode")
-            seen[mode.ident] = _invoke(mode, fake_sdk, workdir)
-        return seen[mode.ident]
+            seen[key] = _invoke(mode, toolchains[toolchain], workdir)
+        return seen[key]
 
     return _outcome
 
 
-def _params() -> list:
-    marked = []
-    for mode in MODES:
-        marks = []
-        if mode.defect:
-            marks.append(
-                pytest.mark.xfail(
-                    strict=True,
-                    reason=f"{mode.defect}: {mode.ident} reports success when the tool failed",
+def _cases(*, needs_tool: bool = False, marked: bool = False) -> list:
+    """(pass, mode) parameters; the payload test's carry each red mode's xfail."""
+    cases = []
+    for toolchain in PASSES:
+        for mode in MODES:
+            if needs_tool and mode.tool is None:
+                continue
+            marks = []
+            if marked and mode.defect:
+                marks.append(
+                    pytest.mark.xfail(strict=True, raises=AssertionError, reason=mode.defect)
                 )
+            cases.append(
+                pytest.param(toolchain, mode, id=f"{toolchain}: {mode.ident}", marks=marks)
             )
-        marked.append(pytest.param(mode, id=mode.ident, marks=marks))
-    return marked
+    return cases
 
 
-@pytest.mark.parametrize("mode", [pytest.param(m, id=m.ident) for m in MODES])
-def test_the_mode_finishes_without_crashing(mode: Mode, swept):
-    """Unmarked, and covering every mode including the two local ANR ones.
+@pytest.mark.parametrize(("toolchain", "mode"), _cases())
+def test_the_mode_finishes_without_crashing(toolchain: str, mode: Mode, swept):
+    """Unmarked, and covering every mode in both passes.
 
     Deliberately outside the ``xfail``. A hang and a Python traceback are both
-    *worse* than the exit-status defect this file pins, and strict xfail only
-    rejects an unexpected pass -- so folded into the marked test they would be
-    swallowed as "still red, as expected". A non-zero status reached by raising
-    through ``main()`` is not the contract either: it hands the agent a
-    traceback where a remedy belongs, which this repo has shipped twice.
+    *worse* than a malformed refusal, and strict xfail only rejects an
+    unexpected pass -- so folded into the marked test they would be swallowed
+    as "still red, as expected".
     """
-    outcome = swept(mode)
+    outcome = swept(toolchain, mode)
 
     assert not outcome.timed_out, (
         f"{mode.ident} did not finish within {MODE_TIMEOUT_SECONDS}s. Every fake "
         f"tool exits immediately, so this is a hang, not slowness.\n"
         f"partial stdout: {outcome.stdout[:400]!r}"
     )
-    assert "Traceback" not in outcome.stderr, (
+    assert "Traceback" not in outcome.stderr + outcome.stdout, (
         f"{mode.ident} failed by crashing:\n{outcome.stderr[-1500:]}\n"
         f"Report the failure; do not raise through main()."
     )
 
 
-@pytest.mark.parametrize("mode", [pytest.param(m, id=m.ident) for m in MODES if m.tool])
-def test_the_mode_actually_reaches_for_a_tool(mode: Mode, swept):
-    """Anti-vacuity, per mode, and unmarked for the same reason as above.
+@pytest.mark.parametrize(("toolchain", "mode"), _cases(needs_tool=True))
+def test_the_mode_actually_reaches_for_a_tool(toolchain: str, mode: Mode, swept):
+    """Anti-vacuity, per mode and pass, and unmarked for the same reason as above.
 
     Without this a mode could pass the sweep by rejecting its own arguments
-    before touching the toolchain -- exit non-zero, no traceback, and no
-    evidence at all about the failure this file is written to catch. Keeping it
-    out of the ``xfail`` means a marker file that stops being written fails
-    here instead of disappearing into an expected failure. The two modes with
+    before touching the toolchain -- a well-formed refusal, and no evidence at
+    all about the failure this file is written to catch. broken: the fake
+    logged a call. absent: there is nothing to log a call, so the evidence is
+    that the refusal names the tool it went looking for. The modes with
     ``tool=None`` say in the table why they touch nothing.
     """
-    outcome = swept(mode)
-    assert mode.tool in outcome.tools, (
-        f"{mode.ident} never invoked the fake {mode.tool} (saw {outcome.tools or 'nothing'}). "
-        f"The mode's exit status therefore says nothing about tool failure."
-    )
+    outcome = swept(toolchain, mode)
+    if toolchain == "broken":
+        assert mode.tool in outcome.tools, (
+            f"{mode.ident} never invoked the fake {mode.tool} (saw "
+            f"{outcome.tools or 'nothing'}). Its refusal therefore says nothing "
+            f"about tool failure."
+        )
+    else:
+        said = (outcome.stdout + outcome.stderr).lower()
+        assert mode.tool in said, (
+            f"{mode.ident} with no {mode.tool} on PATH never said so:\n"
+            f"stdout: {outcome.stdout[-400:]!r}\nstderr: {outcome.stderr[-400:]!r}"
+        )
 
 
-@pytest.mark.parametrize("mode", _params())
-def test_a_failing_tool_produces_a_failing_exit_status(mode: Mode, swept):
-    """The one assertion the xfail covers: exit non-zero when the tool failed.
+@pytest.mark.parametrize(("toolchain", "mode"), _cases(marked=True))
+def test_a_failing_toolchain_is_refused_in_the_contracts_shape(toolchain: str, mode: Mode, swept):
+    """The one assertion an xfail may cover: the refusal itself.
 
-    Nothing else lives in here, so an ``xfail`` on this test can only ever be
-    excusing the exit status -- never a hang, a crash, or a mode that never
-    reached for a tool at all.
+    One object (``--json``) or ``Error:`` / ``Remedy:`` (text), an error that
+    names the tool or operation, and the exact exit status. Nothing else lives
+    in here, so an ``xfail`` on this test can only ever be excusing the
+    payload -- never a hang, a crash, or a mode that never reached for a tool.
     """
-    outcome = swept(mode)
-    assert outcome.returncode != 0, (
-        f"{mode.ident} exited 0 with the toolchain broken.\n"
-        f"stdout: {outcome.stdout[:400]!r}\n"
-        f"An agent reading this cannot tell an empty result from a failed "
-        f"lookup, and exit status is the only other signal it has."
+    outcome = swept(toolchain, mode)
+    assert_refusal(
+        outcome.completed([mode.script, *mode.argv]),
+        json_mode=mode.json_mode,
+        naming=mode.naming,
+        status=mode.status(toolchain),
+        streaming=mode.streaming,
     )
 
 
-def test_the_fake_toolchain_shadows_any_real_one(fake_sdk: FakeSdk):
+def test_the_broken_toolchain_shadows_any_real_one(toolchains):
     """The harness must not be able to reach the machine's real adb.
 
     A phone is attached to the machine this suite is developed on, and every
     invocation in the table would otherwise drive it.
     """
-    path = os.pathsep.join([str(fake_sdk.bin_dir), "/usr/bin", "/bin"])
-    for tool in ("adb", *MISSING_TOOLS):
-        resolved = shutil.which(tool, path=path)
+    broken = toolchains["broken"]
+    bin_dir = Path(broken.path.split(os.pathsep)[0])
+    for tool in ANDROID_TOOLS:
+        resolved = shutil.which(tool, path=broken.path)
         assert resolved is not None, f"the fake {tool} is not executable"
-        assert Path(resolved).parent == fake_sdk.bin_dir, f"{tool} resolves outside the fake bin"
+        assert Path(resolved).parent == bin_dir, f"{tool} resolves outside the fake bin"
+    assert not any(broken.sdk_root.iterdir()), "ANDROID_HOME must be empty"
 
-    assert not any(fake_sdk.sdk_root.iterdir()), "ANDROID_HOME must be empty"
+
+def test_the_absent_toolchain_has_no_android_tool_at_all(toolchains, tmp_path):
+    """The absent pass is only worth anything if nothing is there.
+
+    pytest.fail, not assert: an Android tool in /usr/bin or /bin would make
+    every absent-pass result a statement about that tool instead.
+    """
+    absent = toolchains["absent"]
+    assert absent.path == os.pathsep.join(SYSTEM_PATH)
+    for tool in ANDROID_TOOLS:
+        found = shutil.which(tool, path=absent.path)
+        if found is not None:
+            pytest.fail(f"{tool} resolves to {found} on the absent PATH")
+    assert not any(absent.sdk_root.iterdir()), "ANDROID_HOME must be empty"
+
+    env = _env(absent, tmp_path, tmp_path / "tools.log")
+    assert not any(Path(env["HOME"]).iterdir()), "HOME must be empty"
+    assert not Path(env["ANDROID_AVD_HOME"]).exists(), "the AVD home must not exist"
 
 
-def test_the_fake_adb_speaks_recorded_output(fake_sdk: FakeSdk, tmp_path, recorded_anywhere):
+def test_the_absent_pass_runs_the_tests_interpreter_not_the_systems(toolchains, tmp_path):
+    """zsh-probe trap: with PATH stripped, `python3` is the system 3.9.
+
+    That interpreter cannot import these scripts (`str | None` at runtime),
+    and every mode would "refuse" with a SyntaxError-shaped traceback that says
+    nothing about the toolchain. The sweep runs ``sys.executable``.
+    """
+    assert Path(sys.executable).is_absolute()
+    probe = subprocess.run(
+        [sys.executable, "-c", "import sys; print(sys.version_info[:2] >= (3, 10))"],
+        env={"PATH": toolchains["absent"].path},
+        capture_output=True,
+        text=True,
+        timeout=MODE_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert probe.stdout.strip() == "True", probe
+
+
+def test_the_fake_adb_speaks_recorded_output(toolchains, tmp_path, recorded_anywhere):
     """The double's own output is recorded too, not invented.
 
     Writing ``error: device 'emulator-5554' not found`` here would have been
@@ -411,8 +559,9 @@ def test_the_fake_adb_speaks_recorded_output(fake_sdk: FakeSdk, tmp_path, record
     """
     tool_log = tmp_path / "tools.log"
     tool_log.touch()
+    adb = shutil.which("adb", path=toolchains["broken"].path)
     completed = subprocess.run(
-        [str(fake_sdk.bin_dir / "adb"), "-s", "emulator-5554", "shell", "true"],
+        [adb, "-s", "emulator-5554", "shell", "true"],
         env={"PATH": "/usr/bin:/bin", TOOL_LOG_VAR: str(tool_log)},
         capture_output=True,
         text=True,
@@ -428,3 +577,38 @@ def test_every_swept_script_exists():
     """A typo in the table would silently sweep nothing."""
     missing = sorted({mode.script for mode in MODES if not (SCRIPTS / mode.script).exists()})
     assert not missing, f"the sweep names scripts that do not exist: {missing}"
+
+
+def test_the_sweep_covers_every_quick_start_command():
+    """N5: steps 4 and 5 (`--enter-text`, `accessibility_audit`) were not swept.
+
+    Read off SKILL.md by the Quick Start guard's own extractor, so a step added
+    there is a step this table has to grow. Same rule as that guard: the same
+    script, with at least the flags Quick Start names.
+    """
+    from test_quick_start_contract import quick_start_commands
+
+    swept = [(mode.script, frozenset(a for a in mode.argv if a.startswith("--"))) for mode in MODES]
+    documented = quick_start_commands()
+    assert documented, "the Quick Start extractor returned nothing"
+    missing = [
+        (script, sorted(flags))
+        for script, flags in documented
+        if not any(script == name and flags <= used for name, used in swept)
+    ]
+    assert not missing, f"Quick Start commands the sweep never runs: {missing}"
+
+
+def test_the_sweep_covers_the_scripts_n5_named():
+    """emulator_create and emulator_erase: absent from the sweep that shipped their lies."""
+    swept = {mode.ident for mode in MODES}
+    for wanted in (
+        "emulator_create --list-images --json",
+        "emulator_create --list-devices --json",
+        "emulator_erase --list --json",
+        "emulator_erase --all --json",
+    ):
+        assert wanted in swept, f"{wanted} is not in the sweep"
+    assert any(
+        mode.script == "emulator_create.py" and "--device" in mode.argv for mode in MODES
+    ), "no create is swept"

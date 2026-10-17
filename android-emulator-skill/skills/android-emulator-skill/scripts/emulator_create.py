@@ -647,6 +647,15 @@ class EmulatorCreator:
             )
 
 
+# What to do about a create that did not happen: an image that is not
+# installed, or avdmanager refusing the definition, name or image.
+CREATE_REMEDY = (
+    "Fix what the error names, then retry: `emulator_create.py --list-images` shows the "
+    "installed images (pick one with --api, --abi or --variant) and `--list-devices` "
+    "the device definitions."
+)
+
+
 def print_system_images(images: list) -> None:
     """
     Print a system-image listing that stays readable at 300+ entries.
@@ -772,27 +781,25 @@ Examples:
 
     # Create operation. Only --device is strictly required now: --api defaults to
     # the latest installed system image and --name is auto-generated from device+API.
+    # Every refusal below goes through common.cli: they printed
+    # `{"success": false, "message": ...}` -- no `error`, no remedy -- and the
+    # missing --device printed the help text to stdout, the whole of what a
+    # --json caller got.
     if not args.device:
-        print(
-            "Error: --device is required (or use --list-devices / --list-images)", file=sys.stderr
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "--device is required (or use --list-devices / --list-images)",
+            "Pass --device <definition>, e.g. --device pixel_7; `--list-devices` lists them.",
         )
-        parser.print_help()
-        sys.exit(1)
-
-    def _fail(message: str) -> None:
-        if args.json:
-            print(json.dumps({"success": False, "message": message, "avd_name": None}, indent=2))
-        else:
-            print(f"Error: {message}", file=sys.stderr)
-        sys.exit(1)
 
     # Delta 3: fuzzy-resolve --device against avdmanager device definitions.
     device_id, suggestions = creator.resolve_device(args.device)
     if not device_id:
         hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        _fail(
-            f"Device '{args.device}' not found.{hint} "
-            f"Use --list-devices for available definitions."
+        cli.fail(
+            f"Device '{args.device}' not found.{hint}",
+            "Pass a definition `emulator_create.py --list-devices` lists (its id or name).",
         )
 
     # Delta 1: default --api to the latest installed system-image API level.
@@ -802,9 +809,10 @@ Examples:
         # unless --abi said otherwise. It was a hard-coded x86_64 image, which
         # an arm64 host cannot boot (L11).
         suggested = f"system-images;android-{SUGGESTED_API_LEVEL};{args.variant};{args.abi}"
-        _fail(
+        cli.fail(
             "Could not determine an API level: sdkmanager lists no installed system "
-            f"image with one. Pass --api explicitly or install one (sdkmanager '{suggested}')."
+            "image with one.",
+            f"Pass --api explicitly or install one (sdkmanager '{suggested}').",
         )
 
     # Delta 2: auto-generate an AVD name from device + API when --name is omitted.
@@ -818,11 +826,17 @@ Examples:
         variant=args.variant,
     )
 
+    if not success:
+        # The image check's refusal names the image and the installed set;
+        # avdmanager's names its own reason. Either way the message is the
+        # error, and what to do about it is the same.
+        cli.fail(message, CREATE_REMEDY)
+
     if args.json:
         print(
             json.dumps(
                 {
-                    "success": success,
+                    "success": True,
                     "message": message,
                     "avd_name": avd_name,
                     "device_id": device_id,
@@ -834,7 +848,7 @@ Examples:
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
