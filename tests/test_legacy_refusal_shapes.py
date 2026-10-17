@@ -228,6 +228,12 @@ KNOWN_FAILURE_PRINTERS: dict[tuple[str, str], str] = {
         "every delegate refuses through common.cli, so nothing takes this path today"
     ),
     ("logs.py", "_normalise_exit"): "the same router convention as avd.py",
+    ("test_recorder.py", "_run_step"): (
+        "a step that captured nothing: the printed step is the result, and exit 1 is its finding"
+    ),
+    ("test_recorder.py", "_run_stop"): (
+        "a recorded test marked failed: the printed session is the result, and exit 1 is its finding"
+    ),
 }
 
 
@@ -250,7 +256,17 @@ def _exits_non_zero(node: ast.AST) -> bool:
 
 
 def _returns_non_zero(node: ast.AST) -> bool:
-    return isinstance(node, ast.Return) and _non_zero_int(node.value)
+    if not isinstance(node, ast.Return):
+        return False
+
+    def can_be_non_zero(value: ast.AST | None) -> bool:
+        if _non_zero_int(value):
+            return True
+        if isinstance(value, ast.IfExp):
+            return can_be_non_zero(value.body) or can_be_non_zero(value.orelse)
+        return False
+
+    return can_be_non_zero(node.value)
 
 
 def _prints(node: ast.AST) -> bool:
@@ -260,13 +276,20 @@ def _prints(node: ast.AST) -> bool:
     return name == "print" or name.endswith(".print_help")
 
 
-def _refusal_shaped(node: ast.AST) -> bool:
+def _refusal_shaped(node: ast.AST, assignments: dict[str, ast.AST] | None = None) -> bool:
     """A print of `{"error": ...}`, `{"success": False, ...}`, or text starting `Error:`."""
     if not (isinstance(node, ast.Call) and ast.unparse(node.func) == "print" and node.args):
         return False
     shown = node.args[0]
     if isinstance(shown, ast.Call) and ast.unparse(shown.func).endswith("dumps") and shown.args:
         shown = shown.args[0]
+    seen: set[str] = set()
+    while isinstance(shown, ast.Name) and assignments and shown.id not in seen:
+        seen.add(shown.id)
+        replacement = assignments.get(shown.id)
+        if replacement is None:
+            break
+        shown = replacement
     if isinstance(shown, ast.Dict):
         for key, value in zip(shown.keys, shown.values, strict=True):
             if isinstance(key, ast.Constant) and key.value == "error":
@@ -315,9 +338,19 @@ def failure_printers(source: str) -> set[str]:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         inner = list(ast.walk(node))
+        assigned: dict[str, list[ast.AST]] = {}
+        for statement in inner:
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    if isinstance(target, ast.Name):
+                        assigned.setdefault(target.id, []).append(statement.value)
+            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                if statement.value is not None:
+                    assigned.setdefault(statement.target.id, []).append(statement.value)
+        assignments = {name: values[0] for name, values in assigned.items() if len(values) == 1}
         prints = any(map(_prints, inner))
         if (
-            any(map(_refusal_shaped, inner))
+            any(_refusal_shaped(item, assignments) for item in inner)
             or (node.name != "main" and prints and any(map(_exits_non_zero, inner)))
             or (node.name in reached and prints and any(map(_returns_non_zero, inner)))
         ):
@@ -356,6 +389,15 @@ def test_no_script_prints_a_refusal_itself():
             "def main():\n    return _show()\n",
             {"_show"},
         ),
+        (
+            "import json\ndef main():\n    payload = {'success': False}\n"
+            "    print(json.dumps(payload))\n    return 0\n",
+            {"main"},
+        ),
+        (
+            "def main(ok):\n    print('build result')\n    return 0 if ok else 1\n",
+            {"main"},
+        ),
         # Shaped like a refusal wherever it is, whatever happens next.
         ("import sys\ndef _say(m):\n    print(f'Error: {m}', file=sys.stderr)\n", {"_say"}),
         ("def _say(m):\n    print({'success': False, 'message': m})\n", {"_say"}),
@@ -373,6 +415,8 @@ def test_no_script_prints_a_refusal_itself():
         "usage-helper",
         "main-prints-error-returns-1",
         "printer-one-hop-from-main",
+        "variable-built-failure-payload",
+        "conditional-nonzero-return",
         "text-error-anywhere",
         "success-false-anywhere",
         "success",
