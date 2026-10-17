@@ -628,7 +628,8 @@ def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
 # of PR #20 showed the worker's select()-on-a-buffered-pipe read
 # (anr_watcher.py:659-670) keeps lines back depending on timing -- stopping
 # while the writer is open retained one line of four -- so no sleep can make
-# that path isolate a classification defect. That read is its own defect.
+# that path isolate a classification defect. That read was its own defect,
+# N16, fixed and pinned deterministically in tests/test_anr_watcher.py.
 # ===========================================================================
 
 
@@ -637,26 +638,23 @@ def _pipeline(lines: list[str]):
 
     What each of ``anr_watcher``'s readers actually runs:
 
-    - the legacy ``--since``/``--watch`` reader (``_handle_line``,
-      ``anr_watcher.py:265-274``) only PARSES: ``parse_logcat_anr``, then it
-      prints the raw event. Its count is pinned through the CLI below.
-    - the session worker (``_read_stream_into_events``, ``:676-694``) parses
-      and normalises (``build_normalised_event``); ``--stop`` clusters when it
-      builds the summary (``anr_sessions.py:402`` -> ``cluster_events`` via
-      ``anr_pipeline.py:909``).
+    - the legacy ``--since``/``--watch`` reader (``AnrWatcher._handle_line``)
+      feeds each line to an ``AnrRecordAssembler`` and prints the events it
+      completes. Its count is pinned through the CLI below.
+    - the session worker (``_read_stream_into_events``) feeds the same
+      assembler and normalises (``build_normalised_event``); ``--stop``
+      clusters when it builds the summary (``SessionStore.build_summary`` ->
+      ``cluster_events`` via ``SummaryBuilder``).
 
     This helper is the session composition, run over recorded lines without a
-    stream. The parse stage is shared, so a classification fix shows in both.
-    If D5's fix introduces a multi-line entry point, the readers and this
-    helper must go through it -- the assertions below do not change.
+    stream. D5's fix introduced the multi-line entry point, so the readers and
+    this helper go through it (``parse_logcat_stream`` is the assembler over a
+    finite run of lines); the assertions below did not change.
     """
     from common import anr_pipeline as p
 
     events = []
-    for line in lines:
-        raw = p.parse_logcat_anr(line)
-        if raw is None:
-            continue
+    for raw in p.parse_logcat_stream(lines):
         event = p.build_normalised_event(raw, session_start_ms=0, current_ms=1000)
         if event is not None:
             events.append(event)
@@ -683,11 +681,6 @@ def _jank_lines(recorded, frame_counts, pid: str | None = None) -> list[str]:
     return lines
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="D5: common/anr_pipeline.py:258-266 -- the Reason: line becomes a second ANR",
-)
 def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(recorded):
     """D5: ``common/anr_pipeline.py:258-266``.
 
@@ -702,11 +695,6 @@ def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(recorded):
     assert len(clusters) == 1, [c.symbol_or_prefix for c in clusters]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="D5: common/anr_pipeline.py:258-266 -- --since prints one broadcast ANR twice",
-)
 def test_d5_since_reports_a_broadcast_anr_once(toolchain, recorded):
     """D5 through the CLI, in the finite mode: ``--since 1m --json``.
 
@@ -728,11 +716,6 @@ def test_d5_since_reports_a_broadcast_anr_once(toolchain, recorded):
     assert len(events) == 1, [event.get("message") for event in events]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="A5: common/anr_pipeline.py:47 -- the frame count stays in the jank fingerprint",
-)
 def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(recorded):
     """A5: ``common/anr_pipeline.py:47`` redacts only integers of 4+ digits.
 
@@ -787,14 +770,6 @@ X6_MODES = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "X6: anr_watcher.py:184-203,222-232 report success when adb fails; "
-        "a device-not-found answer is device-unavailable, exit 3"
-    ),
-)
 @pytest.mark.parametrize("argv", list(X6_MODES), ids=" ".join)
 def test_x6_a_device_that_is_not_there_is_not_a_quiet_watch(
     argv, toolchain, recorded, recorded_anywhere
@@ -852,11 +827,6 @@ def _seed_session(store, events) -> str:
     return meta.session_id
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="N9: common/anr_pipeline.py:742-749 -- --diff --json emits bare Infinity",
-)
 def test_n9_a_zero_duration_cluster_diffs_to_finite_json(toolchain, recorded):
     """N9: ``common/anr_pipeline.py:742-749`` -- a 0 -> N cluster is ``inf``.
 

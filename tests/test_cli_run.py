@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -482,6 +483,10 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
     meet that is not the stream simply ending. Before this change ``watch``
     caught it, printed a sentence on stderr and returned False: exit 1, and no
     refusal on stdout at all.
+
+    The pipe is a real one: since PR #26 ``watch`` reads the descriptor itself
+    (``anr_watcher._FdLines``) rather than calling ``readline()`` on the file,
+    so the break is injected where that reader reports the end of the stream.
     """
     anr_lines = [
         line + "\n"
@@ -490,19 +495,23 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
     ]
     assert anr_lines, "the recorded buffer has no ANR line to stream"
 
-    class _Pipe:
-        def __init__(self):
-            self._lines = iter(anr_lines)
+    read_end, write_end = os.pipe()
+    os.write(write_end, "".join(anr_lines).encode())
+    os.close(write_end)
+    pipe = os.fdopen(read_end, "rb", buffering=0)
+    real_read = anr_watcher._FdLines.read
 
-        def readline(self):
-            try:
-                return next(self._lines)
-            except StopIteration:
-                raise OSError(5, "Input/output error") from None
+    def read_until_the_pipe_breaks(self, timeout):
+        lines = real_read(self, timeout)
+        if lines is None:
+            raise OSError(5, "Input/output error")
+        return lines
+
+    monkeypatch.setattr(anr_watcher._FdLines, "read", read_until_the_pipe_breaks)
 
     class _Logcat:
         def __init__(self, cmd, **kwargs):
-            self.stdout = _Pipe()
+            self.stdout = pipe
 
         def poll(self):
             return None
@@ -515,7 +524,10 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
 
     monkeypatch.setattr(anr_watcher.subprocess, "Popen", _Logcat)
 
-    code, out, _ = _run(anr_watcher.main, ["--watch", "--json"], capsys)
+    try:
+        code, out, _ = _run(anr_watcher.main, ["--watch", "--json"], capsys)
+    finally:
+        pipe.close()
 
     assert code == 1
     lines = out.splitlines()

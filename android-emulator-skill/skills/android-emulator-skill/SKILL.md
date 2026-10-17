@@ -438,12 +438,76 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
     - Session mode: `--start [--package PKG]` → id; `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
     - An unknown session, a session with no summary yet, or a `--cluster` past
-      the end exits 1 and says what to run instead (`{"error": ...}` under
+      the end exits 1 and says what to run instead (the refusal object under
       `--json`) — it does not print the sentence and exit 0
     - `--older-than` takes `30s`/`5m`/`24h`/`7d` and a session id is
-      `anr-YYYYMMDD-HHMMSS-XXXX`; either malformed is a usage error (exit 2),
-      and `--clear-sessions` deletes nothing when it rejects one
-    - Legacy: `--watch [--duration N]`, `--since 5m`
+      `anr-YYYYMMDD-HHMMSS-XXXX`; either malformed is a usage error (exit 2)
+      for every mode that takes one, `--stop` included, and `--clear-sessions`
+      deletes nothing when it rejects one
+    - An ANR is counted once per incident as far as the log can show it.
+      ActivityManager logs an ANR as one record of many lines; its `PID:` (the
+      stalled app's own pid — the logcat pid column is system_server's) and
+      `Reason:` (what timed out) arrive as the event's `app_pid` and `reason`,
+      not as further ANRs. WindowManager's `ANR in Window{...}` line is a
+      report *to* ActivityManager: it is dropped when ActivityManager records
+      — or calls a duplicate — an ANR of the same package within 10 s of it
+      (by log time, either side; the recorded gap is 0.35 s for an input ANR
+      and 5.06 s for the dialog that follows a broadcast ANR), and is an event
+      of its own otherwise — a stream cut between the two, or one of
+      ActivityManager's early returns. That fallback is emitted once the 10 s
+      have passed or the stream ends, so it can print after later events. An
+      ActivityManager record arriving more than 10 s after WindowManager's
+      report would be counted twice
+    - Jank clusters by process, not by frame count: one screen dropping 31 and
+      120 frames is one cluster, two apps janking alike are two. A session
+      names the process behind a jank line and keys it by that name
+      (`identity: "package"`), so an app restarted mid-way is still one site.
+      The name comes from ActivityManager's `Start proc` line in the stream,
+      else from one device call per pid (`ps -o PID,NAME,ELAPSED -p <pid>`,
+      bounded at 3 s), and counts only if that process existed when the line
+      was read: its age must cover the time since, both measured as durations
+      on the host's monotonic clock (no wall clock, so no DST, clock-step or
+      year mistakes). A pid is recycled, and its current owner is not evidence
+      about an older line; every stream (re)start forgets what it knew. An age
+      `ps` prints in a form not yet recorded (days) is not read. Jank whose
+      process could not be named is keyed by pid (`identity: "pid"`); `--diff`
+      lists it under `not_comparable` instead of calling it resolved or new,
+      and so does a named cluster whose only possible counterpart in the other
+      session is such a pid-keyed cluster of the same kind and text
+    - `--stop` saves the summary only after the session's worker has exited
+      (it waits up to 5.5 s: a lookup under way, the drain, a margin). If the
+      worker is still running then, the summary is saved with
+      `"incomplete": true` and stderr says so — it used to be saved early,
+      empty, with nothing said
+    - `--diff` never says "no change" about what it could not see: with
+      clusters set aside as not comparable, or a session saved incomplete, and
+      nothing else changed, the verdict is `inconclusive: …` naming why; a
+      verdict that did find a change carries the same caveats after it
+    - A session keeps the fingerprint version it was captured with — `--stop`
+      on an older session does not restamp it — and `--diff` refuses (exit 1,
+      naming both versions) two sessions captured under different versions.
+      This release's jank fingerprint is version 2; sessions recorded before
+      it are version 1
+    - `--diff --json`: each `drift` entry carries `from_zero`; when it is true
+      (the cluster's max duration was 0 in the first session) `delta_pct` is
+      `null` — never the non-JSON `Infinity` — and the entry counts as worsened
+    - A live stream (`--start`, `--watch`) starts at the end of the device's
+      buffer (`logcat -T 1`, which first prints the one most recent line); it
+      used to replay the whole buffer as if it were happening now. `--since`
+      reads its own window. Both live readers print an ANR as soon as the
+      stream goes quiet after its record (a quarter-second), not at the next
+      line
+    - `--package` keeps a session's own jank, because the session names the
+      janking process. **`--watch` and `--since` do not name processes**: a
+      Choreographer or StrictMode line names no package, so under `--package`
+      they drop all jank and StrictMode events
+    - Legacy: `--watch [--duration N]`, `--since 5m`. A logcat read that adb
+      ends with a failure is a refusal, not "no ANRs": exit 3 when the device
+      is unavailable (an unknown `--serial` is caught before streaming), 1
+      otherwise
+    - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
+      `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
+      it used to be raised to 1
     - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
       `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,
       `--duration`, `--min-frames`, `--top`, `--all`, `--budget-tokens`,
@@ -788,13 +852,14 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
 
 - `log_monitor --severity` does not validate its names. An unrecognised one
   (`warn`, say) matches nothing, so the capture silently filters to empty.
-- `anr_watcher` does not attach an ANR's `Reason:` / `PID:` continuation lines to
-  the `ANR in` event above them, so one ANR can surface as two clusters.
 - `status_bar --time` must be given zero-padded — `09:41`, not `9:41`. The value
   reaches SystemUI's demo mode as `hhmm`; an unpadded one is ignored while the
   script still reports success.
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
+- `anr_watcher --watch` / `--since` with `--package` drop every jank and
+  StrictMode event: those lines name no package, and only session mode names
+  the process behind a pid. Use `--start`/`--stop` to keep an app's jank.
 - `privacy_manager` acts on the default user only. It passes no `--user`, so a
   work profile or a secondary user is out of reach.
 - **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is
