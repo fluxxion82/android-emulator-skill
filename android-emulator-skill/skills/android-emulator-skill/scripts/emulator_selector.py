@@ -43,7 +43,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common import adb_exec, cli
+from common import cli
 from common.device_utils import get_connected_devices
 from common.emu_console import (
     EmulatorProbe,
@@ -53,9 +53,9 @@ from common.emu_console import (
 )
 from common.env_config import env_int
 from common.sdk_tools import (
+    AVD_HOME_REMEDY,
     EMULATOR_NOT_FOUND_MESSAGE,
     EMULATOR_NOT_FOUND_REMEDY,
-    SdkToolError,
     get_emulator_path,
     missing_emulator_error,
     resolve_avd_home,
@@ -104,6 +104,30 @@ FALLBACK_CONFIG_DIR = Path.home() / ".android-emulator-skill"
 # Pre-0.5 installs kept history next to the script, inside the distributed
 # package. Still read if present so nobody loses their history; never created.
 LEGACY_CONFIG_PATH = Path(__file__).resolve().parent / CONFIG_FILENAME
+
+# What to do when `--boot` is refused. The refusal's own message says why; this
+# says where to look next.
+BOOT_REFUSED_REMEDY = (
+    "Check the name against `emulator_selector.py --list`, and see the boot in detail "
+    "with `emulator_boot.py --avd NAME --wait-ready`."
+)
+
+
+class AvdConfigError(RuntimeError):
+    """An AVD's ``config.ini`` could not be read.
+
+    Deliberately not an empty dict: ``{}`` is what a config with no keys parses
+    to, so a failed read used to rank the AVD as one that simply has no API
+    level or device -- and when the AVD home was misresolved, every AVD at once
+    (R4), with nothing said.
+
+    Attributes:
+        remedy: What to do about it.
+    """
+
+    def __init__(self, message: str, *, remedy: str | None = None):
+        super().__init__(message)
+        self.remedy = remedy
 
 
 def _normalize(value: str) -> str:
@@ -247,6 +271,9 @@ class EmulatorSelector:
         # Why the running state could not be established at all, if it could
         # not. Distinct from `unidentified`, which needs a listing to exist.
         self.running_unavailable: str | None = None
+        # One line per AVD whose config.ini could not be read by the last
+        # list_avds(): ranked without its API level or device, and said so.
+        self.config_warnings: list[str] = []
 
     @staticmethod
     def _default_config_path() -> Path:
@@ -271,8 +298,11 @@ class EmulatorSelector:
 
         Returns:
             List of candidate dicts with name, api_level, device, display_name.
+            An AVD whose config.ini could not be read is still listed, and named
+            in :attr:`config_warnings`.
         """
         names = self._list_avd_names()
+        self.config_warnings = []
         return [self._build_candidate(name) for name in names]
 
     def _build_candidate(self, name: str) -> dict:
@@ -284,8 +314,19 @@ class EmulatorSelector:
         avd_config_ini), so every AVD this skill creates had an empty display
         name (N17). The config's ``avd.id`` / ``avd.name`` are no substitute:
         avdmanager leaves them as the literal placeholder ``<build>``.
+
+        A config that cannot be read leaves the AVD in the ranking -- it exists,
+        and a suggestion is not destructive -- but recorded in
+        :attr:`config_warnings`, the same way a running state nobody could
+        establish is disclosed rather than ranked as idle (F2).
         """
-        config = read_avd_config(name)
+        try:
+            config = read_avd_config(name)
+        except AvdConfigError as error:
+            self.config_warnings.append(
+                f"{error}; ranked without its API level or device. {error.remedy}"
+            )
+            config = {}
         return {
             "name": name,
             "api_level": parse_api_level(config),
@@ -494,20 +535,27 @@ def read_avd_config(name: str) -> dict[str, str]:
     read returned ``{}`` and every AVD silently lost its API level, its device
     profile and its ABI from the ranking (R4).
 
-    Returns an empty dict when the file is missing or unreadable so callers can
-    degrade gracefully.
-
     Args:
         name: AVD name (without the ``.avd`` suffix).
 
     Returns:
         Dict of config.ini keys to string values.
+
+    Raises:
+        AvdConfigError: The file is missing or unreadable. It used to return
+            ``{}``, which is also what a config with no keys parses to -- so the
+            R4 fix made a misresolved AVD home visible only to whoever already
+            knew to look.
     """
     config_path = resolve_avd_home() / f"{name}.avd" / "config.ini"
     try:
         text = config_path.read_text()
-    except (FileNotFoundError, OSError):
-        return {}
+    except OSError as error:
+        raise AvdConfigError(
+            f"could not read the config of AVD {name!r} at {config_path} "
+            f"({error.strerror or error})",
+            remedy=f"If your AVDs live elsewhere, {AVD_HOME_REMEDY}.",
+        ) from error
     return parse_config_ini(text)
 
 
@@ -559,6 +607,7 @@ def format_candidates(
     json_format: bool = False,
     unidentified: "tuple[EmulatorProbe, ...]" = (),
     unavailable: str | None = None,
+    config_warnings: "list[str] | tuple[str, ...]" = (),
 ) -> str:
     """
     Format candidates for output (token-efficient by default).
@@ -573,10 +622,13 @@ def format_candidates(
         unavailable: Why the running state could not be established at all
             (F2). Reported as a `warnings` entry rather than silently ranking
             every AVD as idle.
+        config_warnings: AVDs ranked without their config.ini, because it could
+            not be read. Reported as `warnings` entries too.
 
     Returns:
         Formatted output string.
     """
+    warnings = [*([unavailable] if unavailable else []), *config_warnings]
     if json_format:
         payload: dict = {"suggestions": candidates}
         if unidentified:
@@ -584,8 +636,8 @@ def format_candidates(
                 {"serial": probe.serial, "state": probe.state, "reason": probe.reason}
                 for probe in unidentified
             ]
-        if unavailable:
-            payload["warnings"] = [unavailable]
+        if warnings:
+            payload["warnings"] = warnings
         return json.dumps(payload, indent=2)
 
     if not candidates:
@@ -602,13 +654,15 @@ def format_candidates(
         lines.append(line)
     for probe in unidentified:
         lines.append(f"   ! {probe.describe()}")
-    if unavailable:
-        lines.append(f"   ! {unavailable}")
+    for warning in warnings:
+        lines.append(f"   ! {warning}")
     return "\n".join(lines)
 
 
 def _warn_unidentified(
-    unidentified: "tuple[EmulatorProbe, ...]", unavailable: str | None = None
+    unidentified: "tuple[EmulatorProbe, ...]",
+    unavailable: str | None = None,
+    config_warnings: "list[str] | tuple[str, ...]" = (),
 ) -> None:
     """Say on stderr that the ranking was taken over an incomplete picture.
 
@@ -619,24 +673,18 @@ def _warn_unidentified(
         print(f"Warning: {probe.describe()}", file=sys.stderr)
     if unavailable:
         print(f"Warning: {unavailable}", file=sys.stderr)
-
-
-def _fail(error: object, *, json_mode: bool) -> None:
-    """Report a failure the way the caller asked to be spoken to, and exit 1.
-
-    Under ``--json`` that is ``{"error": ...}`` on stdout. A caller that asked
-    for JSON and got a sentence on stderr has an empty stdout to parse, which
-    is the same "no usable answer" this increment is about -- one layer out.
-    """
-    if json_mode:
-        print(json.dumps({"error": str(error)}, indent=2))
-    else:
-        print(f"Error: {error}", file=sys.stderr)
-    sys.exit(1)
+    for warning in config_warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None):
-    """Main entry point. Failures raised before dispatch reach common.cli."""
+    """Main entry point.
+
+    Every failure reaches common.cli, which already knows whether --json was
+    asked for: it reads argv itself. This script used to catch SdkToolError and
+    AdbError in its own handler and print ``{"error": ...}`` -- a second
+    boundary, with no ``success`` and no ``remedy``, the last one left.
+    """
     _run(argv)
 
 
@@ -677,13 +725,7 @@ Examples:
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args(argv)
-    try:
-        _dispatch(args)
-    except (SdkToolError, adb_exec.AdbError) as error:
-        # Caught HERE, where --json is known: main() cannot see it, so a
-        # failure reported there is a sentence on stderr and an empty stdout
-        # for whoever asked for JSON.
-        _fail(error, json_mode=args.json)
+    _dispatch(args)
 
 
 def _dispatch(args: argparse.Namespace) -> None:
@@ -693,35 +735,51 @@ def _dispatch(args: argparse.Namespace) -> None:
     # Boot mode
     if args.boot:
         success, message = selector.boot(args.boot, headless=args.headless)
+        if not success:
+            # A refused boot is a refusal like any other, not a document that
+            # says `success: false` beside a `message`.
+            cli.fail(message.removeprefix("Error: "), BOOT_REFUSED_REMEDY)
         if args.json:
             print(
                 json.dumps(
-                    {"action": "boot", "avd": args.boot, "success": success, "message": message},
+                    {"action": "boot", "avd": args.boot, "success": True, "message": message},
                     indent=2,
                 )
             )
         else:
             print(message)
-        sys.exit(0 if success else 1)
+        sys.exit(0)
 
     # List mode (every candidate, ranked for context)
     if args.list:
         candidates = selector.suggest(count=len(selector.list_avds()) or 1)
         print(
             format_candidates(
-                candidates, args.json, selector.unidentified, selector.running_unavailable
+                candidates,
+                args.json,
+                selector.unidentified,
+                selector.running_unavailable,
+                selector.config_warnings,
             )
         )
-        _warn_unidentified(selector.unidentified, selector.running_unavailable)
+        _warn_unidentified(
+            selector.unidentified, selector.running_unavailable, selector.config_warnings
+        )
         sys.exit(0)
 
     # Default + --suggest: ranked top N
     suggestions = selector.suggest(args.count)
-    _warn_unidentified(selector.unidentified, selector.running_unavailable)
+    _warn_unidentified(
+        selector.unidentified, selector.running_unavailable, selector.config_warnings
+    )
     if args.json or args.verbose:
         print(
             format_candidates(
-                suggestions, args.json, selector.unidentified, selector.running_unavailable
+                suggestions,
+                args.json,
+                selector.unidentified,
+                selector.running_unavailable,
+                selector.config_warnings,
             )
         )
     elif suggestions:

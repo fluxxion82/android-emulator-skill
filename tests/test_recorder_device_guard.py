@@ -28,10 +28,18 @@ MUTATING = sorted(f.name for f in rf.FIXTURES if f.emulator_only)
 READ_ONLY = "cmd_statusbar_help"
 
 # Fixtures that run no device command at all: the throwaway-AVD lifecycle works
-# on the host, in a private AVD home. Named so the rule below cannot be
-# satisfied by hiding a device call inside a capture callable.
+# on the host, in a private AVD home, and the Java sdkmanager listings read the
+# host's SDK. Named so the rule below cannot be satisfied by hiding a device
+# call inside a capture callable.
 HOST_ONLY = frozenset(
-    {"avdmanager_create", "avd_config_ini", "avdmanager_delete", "avdmanager_delete_missing"}
+    {
+        "avdmanager_create",
+        "avd_config_ini",
+        "avdmanager_delete",
+        "avdmanager_delete_missing",
+        "sdkmanager_java_list_installed",
+        "sdkmanager_java_list",
+    }
 )
 
 # Token sequences that change a device. A `wm size` / `wm density` with a

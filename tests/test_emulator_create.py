@@ -122,15 +122,16 @@ def test_resolve_api_level_none_when_nothing_installed(monkeypatch):
 
 
 def test_list_installed_system_images_parses_sdkmanager(monkeypatch, recorded):
-    """Rewritten against recorded output; it used to assert an invented format.
+    """Rewritten against recorded output; it used to assert a hand-written one.
 
     The old input was
     `system-images;android-34;google_apis;x86_64 | 7 | Google APIs` --
-    semicolons AND pipe-delimited columns. sdkmanager prints neither: it emits
+    semicolons AND pipe-delimited columns, written from memory. cmdline-tools
+    23's wrapper prints neither: it emits
     `  system-images/android-34/google_apis/arm64-v8a` with whitespace-padded
-    columns. The invented format and the parser agreed with each other, so this
-    test passed while the parser matched nothing on a real machine and AVD
-    creation was impossible.
+    columns, and the parser matched nothing there. The pipe table is real too --
+    it is the Java sdkmanager's (sdkmanager_java_list_installed, below) -- which
+    is why neither format may be the only one the parser reads.
     """
     creator = emulator_create.EmulatorCreator()
     monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
@@ -239,6 +240,97 @@ def test_an_api_token_is_not_always_an_integer(recorded):
     assert "system-images;android-34-ext12;google_apis_playstore;x86_64" in ids
     # And they are listed, not silently dropped.
     assert sum(1 for image in images if image["api_level"] is None) > 0
+
+
+# ---------------------------------------------------------------------------
+# The Java sdkmanager's format. cmdline-tools 23's `sdkmanager` is a wrapper
+# around the Android CLI (the recordings above); every earlier release, and the
+# CI runner image, run the Java SdkManagerCli, which prints a pipe table keyed
+# by the semicolon id. The parser read only the wrapper's rows, so on the
+# runner `--list_installed` answered "none installed" right after the runner
+# had installed and booted an image -- and the lane's AVD round trip skipped.
+# ---------------------------------------------------------------------------
+
+
+def test_list_installed_system_images_reads_the_java_sdkmanager(monkeypatch, recorded):
+    """AVD-JAVA-SDKMANAGER: the installed images, in the format CI's sdkmanager prints."""
+    creator = emulator_create.EmulatorCreator()
+    monkeypatch.setattr(creator, "get_sdkmanager_path", lambda: "/fake/sdkmanager")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=recorded.text("sdkmanager_java_list_installed"), stderr=""
+        )
+
+    monkeypatch.setattr(emulator_create.subprocess, "run", fake_run)
+
+    images = creator.list_installed_system_images()
+
+    assert images, "the Java sdkmanager's installed images parsed to nothing"
+    assert all(image["installed"] for image in images)
+    ids = {image["id"] for image in images}
+    assert "system-images;android-35;google_apis_playstore_ps16k;arm64-v8a" in ids
+    assert emulator_create.latest_api_level(images) == 35
+    # Not a column of the row: the Location column repeats the path with
+    # slashes, and must not become a second image.
+    assert len(ids) == len(images)
+    assert not any("/" in image["id"] or "|" in image["id"] for image in images)
+
+
+def test_both_sdkmanager_formats_name_the_same_installed_images(recorded):
+    """Two recordings of one SDK, one per sdkmanager, cross-checked.
+
+    The wrapper lists every installed image the Java tool lists except the one
+    the Android CLI leaves out -- a privacy-sandbox image whose API token is not
+    an integer. Anything more than that difference means one format is being
+    misread.
+    """
+    java = emulator_create.parse_system_images(recorded.text("sdkmanager_java_list_installed"))
+    wrapper = emulator_create.parse_system_images(recorded.text("sdkmanager_list_installed"))
+    java_ids = {image["id"] for image in java}
+    wrapper_ids = {image["id"] for image in wrapper}
+
+    assert wrapper_ids < java_ids, wrapper_ids - java_ids
+    (only_java,) = java_ids - wrapper_ids
+    sandbox = next(image for image in java if image["id"] == only_java)
+    assert sandbox["api"] == "UpsideDownCakePrivacySandbox"
+    assert sandbox["api_level"] is None
+
+
+def test_the_java_list_has_three_sections_and_only_one_is_installed(recorded):
+    """`--list` from the Java tool: Installed, Available Packages, Available Updates.
+
+    Its installed section must agree with `--list_installed`, and images under
+    `Available Packages:` are the downloadable ones.
+    """
+    images = emulator_create.parse_system_images(recorded.text("sdkmanager_java_list"))
+    installed = {image["id"] for image in images if image["installed"]}
+    from_list_installed = {
+        image["id"]
+        for image in emulator_create.parse_system_images(
+            recorded.text("sdkmanager_java_list_installed")
+        )
+    }
+
+    assert installed == from_list_installed, installed ^ from_list_installed
+    assert any(not image["installed"] for image in images), "no downloadable image was read"
+    levels = {image["api"]: image["api_level"] for image in images}
+    assert levels["34-ext12"] is None and levels["34"] == 34
+
+
+def test_an_image_under_available_updates_is_not_read_as_a_download(recorded):
+    """The Java tool's `Available Updates:` rows are packages already installed.
+
+    The recorded section has one row, `emulator`. The same row naming an
+    installed image -- what the section says when that image has a newer
+    revision -- must add nothing: no extra entry for `--list-images` to offer.
+    """
+    text = recorded.text("sdkmanager_java_list")
+    image_id = "system-images;android-34;google_apis;arm64-v8a"
+    derived = text.replace("  emulator | 37.1.11", "  " + image_id + " | 37.1.11")
+    assert derived.count(image_id) == text.count(image_id) + 1, "the update row was not found"
+
+    assert emulator_create.parse_system_images(derived) == emulator_create.parse_system_images(text)
 
 
 def test_list_system_images_falls_back_to_the_local_listing_when_list_fails(monkeypatch, recorded):

@@ -14,8 +14,9 @@ import subprocess
 
 import emulator_selector
 import pytest
+from fake_toolchain import assert_refusal
 
-from common import adb_exec
+from common import adb_exec, cli
 from common.sdk_tools import SdkToolError
 
 # ---------------------------------------------------------------------------
@@ -350,7 +351,13 @@ def test_suggest_lists_an_emulator_it_could_not_identify(monkeypatch, tmp_path, 
 
 
 def test_a_complete_picture_adds_no_noise_to_the_output(monkeypatch, tmp_path, recorded):
-    """The false-positive control: nothing unidentified, nothing extra printed."""
+    """The false-positive control: nothing unidentified, nothing extra printed.
+
+    Every listed AVD has a readable config.ini here, so no config warning either
+    -- the AVD home is a scratch one rather than whatever this host has.
+    """
+    for name in recorded.lines("emulator_list_avds"):
+        _avd_home_with(monkeypatch, tmp_path, name, recorded.text("avd_config_ini"))
     monkeypatch.setattr(
         emulator_selector,
         "get_connected_devices",
@@ -369,10 +376,18 @@ def test_a_complete_picture_adds_no_noise_to_the_output(monkeypatch, tmp_path, r
     suggestions = selector.suggest(4)
 
     assert selector.unidentified == ()
+    assert selector.config_warnings == []
     payload = json.loads(
-        emulator_selector.format_candidates(suggestions, True, selector.unidentified)
+        emulator_selector.format_candidates(
+            suggestions,
+            True,
+            selector.unidentified,
+            selector.running_unavailable,
+            selector.config_warnings,
+        )
     )
     assert "unidentified_emulators" not in payload
+    assert "warnings" not in payload
 
 
 def test_a_listing_that_failed_is_disclosed_not_ranked_as_all_idle(
@@ -594,27 +609,37 @@ def test_boot_via_cli_reports_actionable_hint_when_unresolvable(monkeypatch):
     assert "$ANDROID_HOME/emulator" in message
 
 
+def _refusal(exc: pytest.ExceptionInfo, capsys) -> subprocess.CompletedProcess:
+    """What ``cli.run`` printed and exited with, in the shape assert_refusal reads."""
+    captured = capsys.readouterr()
+    return subprocess.CompletedProcess([], exc.value.code, captured.out, captured.err)
+
+
+def _no_emulator(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
+    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+
+
 def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, tmp_path, capsys):
     """X3, as the agent meets it: `--suggest` on a host with no emulator binary.
 
     This replaces a test that asserted the hint was printed only once per run --
     a print-and-carry-on shape that only makes sense while a broken SDK still
     produces a ranking. It does not: `--suggest` now fails, once, with the
-    remedy, and ranks nothing.
+    remedy, and ranks nothing -- in the shared boundary's shape, `Error:` then
+    `Remedy:` on stderr.
     """
-    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
-    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    _no_emulator(monkeypatch, tmp_path)
     monkeypatch.setattr(emulator_selector.sys, "argv", ["emulator_selector.py", "--suggest"])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_selector.main()
+        cli.run(emulator_selector.main)
 
-    assert exc.value.code == 1
-    captured = capsys.readouterr()
-    assert captured.err.count("emulator' binary not found") == 1
-    assert "Traceback" not in captured.err
-    assert "No AVDs" not in captured.out, "an empty ranking was printed as well"
+    result = _refusal(exc, capsys)
+    assert_refusal(result, json_mode=False, naming=("emulator' binary not found",), status=1)
+    assert result.stderr.count("emulator' binary not found") == 1
+    assert "No AVDs" not in result.stdout, "an empty ranking was printed as well"
 
 
 @pytest.mark.parametrize(
@@ -625,24 +650,103 @@ def test_the_cli_exits_non_zero_when_avd_discovery_fails(monkeypatch, tmp_path, 
 def test_a_json_caller_gets_the_failure_in_the_json(monkeypatch, tmp_path, capsys, argv):
     """--json means "answer on stdout in JSON", failures included.
 
-    The first version of this fix caught SdkToolError in `main()`, which cannot
-    see `args`: the exit status was right and stdout was EMPTY, so an agent
-    parsing it got a decode error rather than the remedy. Every mode is now
-    dispatched under a handler that knows what was asked for, which is why all
-    three are exercised here rather than the one that was reported.
+    The first version of this fix caught SdkToolError in `main()`, which could
+    not see `args`, and stdout was EMPTY. The second caught it in `_run` and
+    printed `{"error": ...}` -- the last helper-routed boundary in the skill,
+    with no `success` and no `remedy`. The error now reaches common.cli, which
+    reads --json off argv itself, for every mode.
     """
-    monkeypatch.setattr(emulator_selector, "get_emulator_path", lambda: None)
-    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    _no_emulator(monkeypatch, tmp_path)
     monkeypatch.setattr(emulator_selector.sys, "argv", ["emulator_selector.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_selector.main()
+        cli.run(emulator_selector.main)
 
-    assert exc.value.code == 1
+    payload = assert_refusal(_refusal(exc, capsys), json_mode=True, naming=("emulator",), status=1)
+    assert "$ANDROID_HOME/emulator" in payload["remedy"], "the JSON refusal names no remedy"
+    assert "suggestions" not in payload, "an empty ranking was printed beside the error"
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_a_refused_boot_is_a_refusal(monkeypatch, tmp_path, capsys, json_mode):
+    """`--boot` that does not start an emulator answers in the boundary's shape.
+
+    It printed `{"action": "boot", "success": false, "message": ...}` at exit 1:
+    a failure dressed as a result, with no remedy. The boot here really runs
+    `emulator_boot`'s path to its "emulator binary not found" refusal -- no
+    emulator is listed, and none can be found to launch.
+    """
+    import emulator_boot
+
+    monkeypatch.setattr(emulator_boot, "get_connected_devices", lambda: [])
+    monkeypatch.setattr(emulator_boot, "get_emulator_path", lambda: None)
+    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    argv = ["emulator_selector.py", "--boot", "Pixel_9", *(["--json"] if json_mode else [])]
+    monkeypatch.setattr(emulator_selector.sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(emulator_selector.main)
+
+    result = _refusal(exc, capsys)
+    payload = assert_refusal(result, json_mode=json_mode, naming=("emulator",), status=1)
+    error = payload["error"] if payload else result.stderr.splitlines()[0]
+    assert "Error: Error:" not in error and not error.startswith("Error: Error"), error
+    assert "--list" in (payload["remedy"] if payload else result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# An unreadable config.ini is not an empty one
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreadable_config_is_an_error_not_an_empty_config(monkeypatch, tmp_path):
+    """`read_avd_config` returned `{}` for a file it could not read.
+
+    `{}` is also what a config with no keys parses to, so the AVD was ranked as
+    one with no API level and no device, and nothing said why. It raises now,
+    naming the AVD and the path it looked at.
+    """
+    avd_home = tmp_path / "avds"
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(avd_home))
+
+    with pytest.raises(emulator_selector.AvdConfigError) as excinfo:
+        emulator_selector.read_avd_config("Pixel_9")
+
+    assert "'Pixel_9'" in str(excinfo.value)
+    assert str(avd_home / "Pixel_9.avd" / "config.ini") in str(excinfo.value)
+    assert "ANDROID_AVD_HOME" in excinfo.value.remedy
+
+
+def test_an_avd_whose_config_could_not_be_read_is_ranked_and_disclosed(
+    monkeypatch, tmp_path, capsys, recorded
+):
+    """The ranking goes on -- the AVD exists, a suggestion is not destructive --
+    and says what it ranked without: in `warnings` under --json, and on stderr.
+
+    The AVD home is a scratch directory with no `.avd` in it, so the recorded
+    `emulator -list-avds` names an AVD whose config is not where it was looked
+    for -- R4's shape, for one AVD.
+    """
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path / "avds"))
+    monkeypatch.setattr(emulator_selector, "get_connected_devices", lambda: [])
+    monkeypatch.setattr(emulator_selector, "FALLBACK_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(emulator_selector, "LEGACY_CONFIG_PATH", tmp_path / "absent.json")
+    _fake_emulator_on_path(monkeypatch)
+    _fake_adb(monkeypatch, {("emulator",): (0, recorded.text("emulator_list_avds"), "")})
+    (name,) = recorded.lines("emulator_list_avds")
+    monkeypatch.setattr(
+        emulator_selector.sys, "argv", ["emulator_selector.py", "--suggest", "--json"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(emulator_selector.main)
+
+    assert exc.value.code == 0, "one unreadable config made the whole suggestion fatal"
     captured = capsys.readouterr()
-    assert "Traceback" not in captured.err
     payload = json.loads(captured.out)
-    assert "error" in payload, f"--json reported no error: {payload}"
-    assert "$ANDROID_HOME/emulator" in payload["error"], "the JSON error names no remedy"
-    assert "candidates" not in payload, "an empty ranking was printed beside the error"
+    assert [c["name"] for c in payload["suggestions"]] == [name], "the AVD was dropped"
+    assert payload["suggestions"][0]["api_level"] is None
+    (warning,) = payload["warnings"]
+    assert repr(name) in warning and "config" in warning, warning
+    assert f"Warning: {warning}" in captured.err.splitlines()

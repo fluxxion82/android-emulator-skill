@@ -84,4 +84,5 @@ pythonpath = [".", "android-emulator-skill/skills/android-emulator-skill/scripts
 addopts = "-ra -m 'not emulator'"
 markers = [
     "emulator: requires a booted emulator or device; opt in with `-m emulator`",
+    "two_devices: needs two attached devices; the one-emulator CI lane deselects it",
 ]
