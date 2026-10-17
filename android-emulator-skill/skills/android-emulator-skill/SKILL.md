@@ -141,8 +141,14 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `$ANDROID_SDK_HOME/.android/avd`, else `~/.android/avd`
    - `N` must be at least 1: `--old 0` keeps nothing, so it is rejected as a
      usage error (exit 2) pointing at `--all --yes`
-   - Failures answer `{"error": ...}` under `--json`; a batch keeps its summary
-     and carries `error` alongside it when any AVD failed
+   - Without `--yes` the question goes to stderr and the answer is read from
+     stdin; anything but `yes` (including end of input) deletes nothing and is
+     a refusal in every mode — `deletion cancelled`, exit 1 — so `--all` and
+     `--old` no longer answer a "no" with an empty batch at exit 0
+   - Failures answer `{"success": false, "error": ..., "remedy": ...}` under
+     `--json` — including a `--name` that is not listed, and a delete
+     avdmanager refused or did not finish; a batch keeps its summary and
+     carries `error` alongside it when any AVD failed (exit 1)
    - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
 
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
@@ -388,6 +394,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
+    - An audit of nothing is a refusal (exit 1), never "No issues found": a
+      `--res` with no `values/strings.xml` (often a path one level off, e.g.
+      `app/src/main` for `app/src/main/res`), or a `--locale` with no
+      `values-<code>/strings.xml` there. `--strict`'s exit 2 stays for findings
     - Options: `--res DIR`, `--source DIR`, `--locale CODE`, `--strict`, `--json`, `--verbose`
 
 27. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
@@ -398,6 +408,28 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 29. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
     - List/read files, dump `shared_prefs` XML, list databases and dump SQLite schema (Room == SQLite), export a snapshot
+    - File names come from the app, so they are untrusted. A listing is read as
+      bytes, so a CR stays in its name rather than becoming a line break. Every
+      line of it is an entry, refused, or one of three skips — a blank line,
+      `total N`, and the directory's own `.`/`..`. Refused: a line that is not
+      UTF-8, an unknown mode (`??????????`) or any other line that is not
+      toybox's layout, a name that is not a plain file name (`/`, `\`, NUL, CR,
+      LF), and a symlink target holding a CR or NUL. A refused entry is counted
+      in `rejected` and named, escaped, in `rejected_entries` (`--verbose`
+      prints them), and the answer exits 1 with what could be read still shown
+      — all refused is never "No shared_prefs found"
+    - Requires adb 1.0.36 or later (platform-tools 24+), checked once with
+      `adb version` before the first file read: an older client does not
+      refuse `shell -T` but forwards it to the device and exits 0 after the
+      error, so reads would take the error for the file. Older, or a banner
+      with no version, is refused (exit 1) and nothing is read or written
+    - Files are read with `adb shell -T`, so a failed read is a failure: `--cat`
+      of a missing file exits 1 (over `exec-out` it answered with the error text
+      as the content). `--export` counts a listed file it could not read in
+      `unread` / `unread_entries` and exits 1, and refuses (exit 1, nothing
+      written) a name that would land outside the snapshot. A name holding a
+      real newline can still add a plain-named entry to a listing (`ls -1b` /
+      `find -print0` would end that; not done)
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
@@ -781,9 +813,9 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
     `accessibility_audit` exits 1 when a critical issue is present.
   - A streaming mode (`log_monitor --follow`, `anr_watcher --watch`) cannot
     take back the records it already printed: there the refusal object is the
-    **last line** of stdout, and parses on its own. Other modes keep stdout to
-    the one object under `--json`, with one known exception: `emulator_delete`
-    without `--yes` asks for confirmation, and that prompt goes to stdout (N4).
+    **last line** of stdout, and parses on its own. Every other mode keeps
+    stdout to the one object under `--json` (`emulator_delete`'s confirmation
+    prompt goes to stderr).
   - Six places catch a device error on purpose, so it does not reach the
     boundary: boot-completion polling (`emulator_boot`), the snapshot
     save/delete verify poll (`snapshot`, which keeps asking until its deadline

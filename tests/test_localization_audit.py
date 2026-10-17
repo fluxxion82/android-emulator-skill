@@ -8,9 +8,12 @@ detection.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from fake_toolchain import SCRIPTS, assert_refusal
 from localization_audit import (
     LocalizationAuditor,
     _extract_placeholders,
@@ -18,6 +21,8 @@ from localization_audit import (
     parse_strings_xml,
     scan_source_refs,
 )
+
+from common import cli
 
 
 def _write(path: Path, content: str) -> None:
@@ -201,6 +206,86 @@ def test_locale_filter_restricts_output(tmp_path: Path):
     report = LocalizationAuditor(res_dir=res, locale_filter="es").audit()
     assert report.locales == ["es"]
     assert {m.locale for m in report.missing_keys} == {"es"}
+
+
+# === nothing to audit (N11) ===
+#
+# Every check compares a translation with the default values/strings.xml. An
+# audit that has no default, or no translation for the --locale it was asked
+# about, inspects nothing -- and used to say "No issues found." at exit 0.
+# The empty --res itself is pinned end to end in test_localization_audit_empty.py.
+
+
+def test_translations_without_a_default_are_nothing_to_audit(tmp_path: Path):
+    """A `values-es/` with no `values/` beside it: nothing to compare it with."""
+    res = _make_res(tmp_path, {"values-es": '<string name="hello">Hola</string>'})
+
+    with pytest.raises(cli.Failure, match=r"no values/strings\.xml under") as excinfo:
+        LocalizationAuditor(res_dir=res).audit()
+    assert "translation locales found: es" in str(excinfo.value)
+
+
+def test_a_locale_that_is_not_there_is_nothing_to_audit(tmp_path: Path):
+    """`--locale fr` against a tree with only `values-es/` audited no locale, clean."""
+    res = _make_res(
+        tmp_path,
+        {
+            "values": '<string name="hello">Hello</string>',
+            "values-es": '<string name="other">Hola</string>',
+        },
+    )
+
+    with pytest.raises(cli.Failure, match=r"no values-fr/strings\.xml under") as excinfo:
+        LocalizationAuditor(res_dir=res, locale_filter="fr").audit()
+    assert "translation locales found: es" in str(excinfo.value)
+
+
+def test_a_default_with_no_keys_is_still_an_answer(tmp_path: Path):
+    """The line N11 draws: a `values/strings.xml` that was read is audited, even empty.
+
+    Zero keys there is a fact about the app, reported as `total_keys: 0` --
+    unlike a tree with no default at all, where nothing was read.
+    """
+    res = _make_res(tmp_path, {"values": "", "values-es": ""})
+
+    report = LocalizationAuditor(res_dir=res).audit()
+
+    assert (report.total_keys, report.locales) == (0, ["es"])
+
+
+def _cli(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / "localization_audit.py"), *argv],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("case", ["missing-res", "missing-source", "malformed-xml"])
+def test_every_refusal_reaches_the_boundary(tmp_path: Path, case: str, json_mode: bool):
+    """The refusals N11 sits beside, in the same shape.
+
+    Each printed `Error:` to stderr and exited 1, so under --json stdout was
+    empty -- the shape the boundary exists to end.
+    """
+    res = _make_res(tmp_path, {"values": '<string name="a">A</string>'})
+    argv = ["--res", str(res)]
+    if case == "missing-res":
+        argv = ["--res", str(tmp_path / "absent")]
+        naming = "res directory not found"
+    elif case == "missing-source":
+        argv += ["--source", str(tmp_path / "absent")]
+        naming = "source directory not found"
+    else:
+        _write(res / "values-es" / "strings.xml", "<resources><string name='a'>A</resources>")
+        naming = "invalid xml"
+
+    result = _cli(*argv, *(["--json"] if json_mode else []))
+
+    assert_refusal(result, json_mode=json_mode, naming=(naming,), status=1)
 
 
 # === source cross-reference ===

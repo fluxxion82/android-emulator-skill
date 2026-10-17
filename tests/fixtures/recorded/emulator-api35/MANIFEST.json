@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-16T22:36:53Z",
+  "recorded_at": "2026-10-17T08:14:12Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 9,
+  "redacted_package_count": 0,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -45,6 +45,16 @@
       "description": "`adb -s <unknown> shell` -- the call shape the skill's scripts actually make. The prefix here is 'adb:', where the same failure from `get-state` (adb_device_not_found) says 'error:'. adb mixes the two, which is why adb_exec._classify matches the message body rather than the prefix; recorded so that stays a measured fact rather than a comment.",
       "catches": [],
       "bytes": 43
+    },
+    {
+      "name": "adb_version",
+      "file": "adb_version.txt",
+      "command": "adb version",
+      "description": "The HOST adb client's `adb version` banner; its first line is 'Android Debug Bridge version X.Y.Z'. container.py reads app files with `adb shell -T`, which a client older than 1.0.36 (platform-tools 24) does not refuse: it forwards `-T` to the device shell as command text and exits 0 after printing the shell's error, which a read deciding by exit status takes for the file. So the client is checked against this line before the first read. The install path is scrubbed of the recording account's home directory.",
+      "catches": [],
+      "bytes": 159,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "am_broadcast_missing_receiver",
@@ -658,6 +668,30 @@
         "S10"
       ],
       "bytes": 106
+    },
+    {
+      "name": "run_as_cat_missing",
+      "file": "run_as_cat_missing.txt",
+      "command": "adb shell -T run-as com.example.composefixture cat shared_prefs/aes_missing.xml",
+      "description": "`adb shell -T run-as <pkg> cat` of a file that does not exist: exit 1, stdout EMPTY, the reason on stderr. Over `adb exec-out` the same read exits 0 and the reason arrives on STDOUT -- as the file's content -- which is how container.py's --cat answered a missing file with the error text as its content, and export wrote it into a snapshot as a prefs file (measured on emulator-5554). `-T` (no pty) leaves a successful read's bytes as exec-out delivers them: fixture.db, 32768 bytes, cmp-identical over both.",
+      "catches": [],
+      "bytes": 61,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 61
+    },
+    {
+      "name": "run_as_cat_missing_exec_out",
+      "file": "run_as_cat_missing_exec_out.txt",
+      "command": "adb exec-out run-as com.example.composefixture cat shared_prefs/aes_missing.xml",
+      "description": "The same missing-file read as run_as_cat_missing, over `adb exec-out`: exit 0, stderr EMPTY, and the reason on STDOUT where the file's bytes would be. Nothing in the result says the read failed, so a caller that reads files this way takes the error text for the file -- the transport container.py's --cat, --shared-prefs NAME and --export used.",
+      "catches": [],
+      "bytes": 61,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 61,
+      "stderr_bytes": 0
     },
     {
       "name": "run_as_ls_data_dir",

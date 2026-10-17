@@ -28,12 +28,16 @@ documented, safe mechanism and is what real debugging workflows rely on.
 """
 
 import argparse
+import functools
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from common import cli
+from common.adb_exec import run_adb
 from common.cache_utils import ProgressiveCache
 from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
@@ -48,6 +52,18 @@ CAT_CACHE_BYTES = env_int("ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES", 8_192, min_va
 
 # Timeout (seconds) for a single run-as adb invocation.
 RUN_AS_TIMEOUT = env_int("ANDROID_EMU_CONTAINER_TIMEOUT", 30, min_value=5)
+
+# Files are read with `adb shell -T`, which adb has understood since 1.0.36
+# (platform-tools 24). An older CLIENT does not refuse it: it forwards `-T` to
+# the device shell as command text and exits 0 after printing the shell's
+# error, and _read_run_as, which decides by exit status, would take that error
+# for the file. So the client is checked once, before the first read.
+MIN_ADB_FOR_READS = (1, 0, 36)
+_ADB_VERSION_LINE = re.compile(r"^Android Debug Bridge version (\d+)\.(\d+)\.(\d+)\s*$", re.M)
+ADB_UPDATE_REMEDY = (
+    'Update Android SDK platform-tools (sdkmanager "platform-tools") so `adb version` '
+    "reports 1.0.36 or later, and make sure that adb is the one on PATH."
+)
 
 # Markers adb/run-as emit when run-as is refused. Matched case-insensitively as
 # substrings; the platform wording has drifted across API levels.
@@ -118,27 +134,28 @@ class ContainerInspector:
 
         target = _join_remote(self.data_dir(package), rel)
         try:
-            output = self._run_as(package, ["ls", "-la", target])
+            output = self._run_as_bytes(package, ["ls", "-la", target])
         except RunAsDeniedError as exc:
             return False, _denied_result(package, exc)
         except _RunAsError as exc:
             return False, {"error": str(exc)}
 
-        entries = parse_ls_output(output)
+        listing = parse_ls_output(output)
         return True, {
             "package": package,
             "data_dir": self.data_dir(package),
             "listed_path": target,
-            "entries": entries,
-            "total_entries": len(entries),
+            "entries": listing.entries,
+            "total_entries": len(listing.entries),
+            **_rejections(listing),
         }
 
     def cat_file(self, package: str, relpath: str) -> tuple[bool, dict]:
         """Read a file under the data dir via ``run-as cat`` (size-capped).
 
-        The file is read through ``adb exec-out run-as <pkg> cat`` so binary
-        bytes survive transport. Output is capped at CAT_MAX_BYTES; large text
-        is routed through ProgressiveCache.
+        The file is read through :meth:`_read_run_as` (``adb shell -T``), so
+        binary bytes survive transport and a failed read is a failure. Output is
+        capped at CAT_MAX_BYTES; large text is routed through ProgressiveCache.
 
         Args:
             package: App package name.
@@ -153,7 +170,7 @@ class ContainerInspector:
 
         target = _join_remote(self.data_dir(package), rel)
         try:
-            raw = self._exec_out_run_as(package, ["cat", target])
+            raw = self._read_run_as(package, ["cat", target])
         except RunAsDeniedError as exc:
             return False, _denied_result(package, exc)
         except _RunAsError as exc:
@@ -213,23 +230,25 @@ class ContainerInspector:
 
         if name is None:
             try:
-                output = self._run_as(package, ["ls", "-la", prefs_dir])
+                output = self._run_as_bytes(package, ["ls", "-la", prefs_dir])
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
             except _RunAsError as exc:
                 return False, {"error": str(exc)}
-            files = [e["name"] for e in parse_ls_output(output) if e["name"].endswith(".xml")]
+            listing = parse_ls_output(output)
+            files = [e["name"] for e in listing.entries if e["name"].endswith(".xml")]
             return True, {
                 "package": package,
                 "shared_prefs_dir": prefs_dir,
                 "files": files,
                 "total_files": len(files),
+                **_rejections(listing),
             }
 
         filename = name if name.endswith(".xml") else f"{name}.xml"
         target = _join_remote(prefs_dir, filename)
         try:
-            raw = self._exec_out_run_as(package, ["cat", target])
+            raw = self._read_run_as(package, ["cat", target])
         except RunAsDeniedError as exc:
             return False, _denied_result(package, exc)
         except _RunAsError as exc:
@@ -258,7 +277,7 @@ class ContainerInspector:
 
         Schema strategy: try ``run-as <pkg> sqlite3 <db> .schema`` first (the
         on-device sqlite3 binary is not always present); on failure fall back to
-        pulling the DB bytes via ``exec-out run-as cat`` to a local temp file and
+        pulling the DB bytes via ``run-as cat`` (:meth:`_read_run_as`) to a local temp file and
         reading the schema with the host's sqlite3 module.
 
         Args:
@@ -272,22 +291,25 @@ class ContainerInspector:
 
         if name is None:
             try:
-                output = self._run_as(package, ["ls", "-la", db_dir])
+                output = self._run_as_bytes(package, ["ls", "-la", db_dir])
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
             except _RunAsError as exc:
                 return False, {"error": str(exc)}
-            entries = parse_ls_output(output)
+            listing = parse_ls_output(output)
             files = [
-                e for e in entries if e["kind"] == "file" and not _is_sqlite_sidecar(e["name"])
+                e
+                for e in listing.entries
+                if e["kind"] == "file" and not _is_sqlite_sidecar(e["name"])
             ]
-            sidecars = [e["name"] for e in entries if _is_sqlite_sidecar(e["name"])]
+            sidecars = [e["name"] for e in listing.entries if _is_sqlite_sidecar(e["name"])]
             return True, {
                 "package": package,
                 "databases_dir": db_dir,
                 "databases": [{"name": e["name"], "size_bytes": e["size_bytes"]} for e in files],
                 "sidecars": sidecars,
                 "total_databases": len(files),
+                **_rejections(listing),
             }
 
         target = _join_remote(db_dir, name)
@@ -333,8 +355,20 @@ class ContainerInspector:
         target = Path(dest_dir) / package
         if target.exists():
             return False, {"error": f"Destination already exists: {target}"}
-        target.mkdir(parents=True)
 
+        # The prefs file names come from the app. Every destination is checked
+        # before anything is created, so a refusal leaves nothing behind.
+        prefs_ok, prefs = self.shared_prefs(package)
+        prefs_out = target / "shared_prefs"
+        prefs_files = [
+            (fname, _host_path_inside(prefs_out, fname))
+            for fname in (prefs["files"] if prefs_ok else [])
+        ]
+
+        # Before anything is created: a client that cannot read files safely
+        # must not leave a half-written snapshot behind its refusal.
+        require_adb_for_reads()
+        target.mkdir(parents=True)
         written: list[str] = []
 
         # Top-level file tree.
@@ -345,19 +379,21 @@ class ContainerInspector:
         tree_path.write_text("\n".join(tree_lines) + "\n", encoding="utf-8")
         written.append(str(tree_path))
 
-        # shared_prefs/*.xml — dump each verbatim.
-        prefs_ok, prefs = self.shared_prefs(package)
-        if prefs_ok and prefs["files"]:
-            prefs_out = target / "shared_prefs"
+        # shared_prefs/*.xml — dump each verbatim. A file the listing showed
+        # and the read could not deliver is reported, not skipped: the
+        # snapshot is incomplete, and saying nothing made it look whole.
+        unread: list[dict] = []
+        if prefs_files:
             prefs_out.mkdir()
-            for fname in prefs["files"]:
+            for fname, dest in prefs_files:
                 src = _join_remote(self.data_dir(package), f"shared_prefs/{fname}")
                 try:
-                    raw = self._exec_out_run_as(package, ["cat", src])
-                except (RunAsDeniedError, _RunAsError):
+                    raw = self._read_run_as(package, ["cat", src])
+                except (RunAsDeniedError, _RunAsError) as exc:
+                    unread.append({"name": fname, "error": str(exc)})
                     continue
-                (prefs_out / fname).write_bytes(raw)
-                written.append(str(prefs_out / fname))
+                dest.write_bytes(raw)
+                written.append(str(dest))
 
         # databases listing (metadata only — not the binary DBs).
         db_ok, dbs = self.databases(package)
@@ -366,17 +402,43 @@ class ContainerInspector:
         db_json.write_text(json.dumps(db_payload, indent=2), encoding="utf-8")
         written.append(str(db_json))
 
+        # Every listing export read: an entry refused anywhere leaves the
+        # snapshot incomplete, and the result says so.
+        refused = [
+            name for part in (listing, prefs, dbs) for name in part.get("rejected_entries", [])
+        ]
         return True, {
             "package": package,
             "destination": str(target),
             "files_written": written,
             "total_files": len(written),
+            "rejected": len(refused),
+            "rejected_entries": refused,
+            "unread": len(unread),
+            "unread_entries": unread,
         }
 
     # === COMMAND EXECUTION ===
 
     def _run_as(self, package: str, argv: list[str]) -> str:
-        """Run ``adb shell run-as <package> <argv...>`` and return text stdout.
+        """Run ``adb shell run-as <package> <argv...>`` and return stdout as text.
+
+        For output nothing makes a path of (a schema); a listing is parsed from
+        :meth:`_run_as_bytes`, where an undecodable name can be refused rather
+        than replaced.
+
+        Raises:
+            RunAsDeniedError: run-as refused (non-debuggable / missing package).
+            _RunAsError: any other command failure.
+        """
+        return self._run_as_bytes(package, argv).decode("utf-8", errors="replace")
+
+    def _run_as_bytes(self, package: str, argv: list[str]) -> bytes:
+        """Run ``adb shell run-as <package> <argv...>`` and return stdout's bytes.
+
+        Bytes, with no universal-newlines translation: ``text=True`` turned a CR
+        inside a file name into a line break before parse_ls_output saw it, and
+        a crafted name then forged a second ``ls`` line.
 
         Raises:
             RunAsDeniedError: run-as refused (non-debuggable / missing package).
@@ -387,37 +449,36 @@ class ContainerInspector:
             "shell", self.serial, "run-as", quote_for_device_shell(package), *quoted
         )
         result = self._invoke(cmd)
-        combined = f"{result.stdout}\n{result.stderr}"
-        _raise_if_denied(package, combined, result.returncode)
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        _raise_if_denied(package, f"{stdout}\n{stderr}", result.returncode)
         if result.returncode != 0:
-            raise _RunAsError(_describe_failure(argv, result))
+            raise _RunAsError(_describe_failure(argv, result.returncode, stdout, stderr))
         return result.stdout
 
-    def _exec_out_run_as(self, package: str, argv: list[str]) -> bytes:
-        """Run ``adb exec-out run-as <package> <argv...>`` and return raw bytes.
+    def _read_run_as(self, package: str, argv: list[str]) -> bytes:
+        """Run ``adb shell -T run-as <package> <argv...>`` and return stdout's raw bytes.
 
-        ``exec-out`` avoids the line-ending mangling ``shell`` applies, so binary
-        payloads (sqlite DBs, blobs) survive.
+        Not ``adb exec-out``, which this used: it exits 0 whatever the device
+        command did and delivers the device's stderr on stdout, so a ``cat`` of
+        a missing file came back as content -- ``cat: …: No such file or
+        directory`` -- and a non-debuggable app's ``run-as`` refusal did too
+        (measured on emulator-5554). ``shell -T`` (no pty) keeps stdout's bytes
+        as exec-out delivers them -- fixture.db, 32768 bytes, cmp-identical --
+        and returns the exit status and stderr apart (recorded:
+        run_as_cat_missing).
 
         Raises:
             RunAsDeniedError / _RunAsError as in :meth:`_run_as`.
+            cli.Failure: the adb client is older than ``MIN_ADB_FOR_READS``,
+                or its version cannot be read (see :func:`require_adb_for_reads`).
         """
+        require_adb_for_reads()
         quoted = [quote_for_device_shell(a) for a in argv]
         cmd = build_adb_command(
-            "exec-out", self.serial, "run-as", quote_for_device_shell(package), *quoted
+            "shell", self.serial, "-T", "run-as", quote_for_device_shell(package), *quoted
         )
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                check=False,
-                timeout=RUN_AS_TIMEOUT,
-            )
-        except FileNotFoundError as exc:
-            raise _RunAsError("adb not found on PATH — install Android platform-tools") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise _RunAsError(f"adb timed out after {RUN_AS_TIMEOUT}s") from exc
-
+        result = self._invoke(cmd)
         stderr_text = result.stderr.decode("utf-8", errors="replace")
         _raise_if_denied(package, stderr_text, result.returncode)
         if result.returncode != 0:
@@ -425,12 +486,11 @@ class ContainerInspector:
         return result.stdout
 
     def _invoke(self, cmd: list[str]) -> subprocess.CompletedProcess:
-        """Run a text-mode adb command with consistent error mapping."""
+        """Run an adb command, capturing raw bytes, with consistent error mapping."""
         try:
             return subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
                 check=False,
                 timeout=RUN_AS_TIMEOUT,
             )
@@ -456,7 +516,7 @@ class ContainerInspector:
 
         # Strategy 2: pull the DB bytes and read its schema with the host sqlite3.
         try:
-            raw = self._exec_out_run_as(package, ["cat", remote_db])
+            raw = self._read_run_as(package, ["cat", remote_db])
         except RunAsDeniedError as exc:
             return None, _denied_result(package, exc)["error"]
         except _RunAsError as exc:
@@ -485,6 +545,57 @@ class ContainerInspector:
 
         schema_text = "\n".join(f"{row[0]};" for row in rows)
         return schema_text, "host-sqlite3"
+
+
+# === ADB CLIENT ===
+
+
+def parse_adb_version(banner: str) -> tuple[int, int, int] | None:
+    """The X.Y.Z of an ``adb version`` banner's first line, or None when it has none.
+
+    Recorded: adb_version -- ``Android Debug Bridge version 1.0.41``.
+    """
+    match = _ADB_VERSION_LINE.search(banner)
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+@functools.cache
+def adb_client_version() -> tuple[int, int, int]:
+    """The host adb client's version, asked once per process (``adb version``, bounded).
+
+    Raises:
+        cli.Failure: the banner names no version. Not assumed fine: a client
+            whose version cannot be read cannot be shown to honour ``-T``.
+        AdbError: adb is missing, timed out, or ``adb version`` failed.
+    """
+    banner = run_adb("version", None, timeout=RUN_AS_TIMEOUT, check=True).stdout
+    version = parse_adb_version(banner)
+    if version is None:
+        first = banner.strip().splitlines()[0] if banner.strip() else "(nothing)"
+        cli.fail(
+            f"cannot tell whether this adb can read app files safely: `adb version` "
+            f"answered {first!r}, with no 'Android Debug Bridge version X.Y.Z' line",
+            ADB_UPDATE_REMEDY,
+        )
+    return version
+
+
+def require_adb_for_reads() -> None:
+    """Refuse, before any file is read, an adb client too old to honour ``shell -T``.
+
+    Raises:
+        cli.Failure: older than ``MIN_ADB_FOR_READS``, or unreadable.
+    """
+    version = adb_client_version()
+    if version < MIN_ADB_FOR_READS:
+        shown = ".".join(map(str, version))
+        cli.fail(
+            f"adb {shown} is older than 1.0.36 and cannot read app files safely",
+            ADB_UPDATE_REMEDY,
+        )
 
 
 # === EXCEPTIONS / RESULT HELPERS ===
@@ -525,9 +636,9 @@ def _denied_result(package: str, exc: RunAsDeniedError) -> dict:
     }
 
 
-def _describe_failure(argv: list[str], result: subprocess.CompletedProcess) -> str:
-    """Compose an error message from a failed text-mode command."""
-    detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+def _describe_failure(argv: list[str], returncode: int, stdout: str, stderr: str) -> str:
+    """Compose an error message from a failed command's decoded output."""
+    detail = stderr.strip() or stdout.strip() or f"exit code {returncode}"
     return f"Command failed ({' '.join(argv)}): {detail}"
 
 
@@ -553,6 +664,28 @@ def _safe_relative(subpath: str) -> str | None:
     return "/".join(parts)
 
 
+def _host_path_inside(directory: Path, name: str) -> Path:
+    """``directory / name`` resolved -- refused unless it lands directly in ``directory``.
+
+    ``name`` was chosen by the app on the device. parse_ls_output already drops
+    names that are not plain file names; this is the check at the point the
+    name becomes a host path, so a listing that reached export() another way
+    cannot write outside the snapshot either.
+
+    Raises:
+        cli.Failure: The name resolves anywhere but ``directory`` itself.
+    """
+    dest = (directory / name).resolve()
+    if dest.parent != directory.resolve():
+        cli.fail(
+            f"refusing to export the device entry {name!r}: as a host path it resolves "
+            f"to {dest}, outside {directory}",
+            "Nothing was written. The app holds a file whose name is not a plain file "
+            "name; inspect it with --ls, and rename or remove it on the device first.",
+        )
+    return dest
+
+
 def _join_remote(base: str, rel: str) -> str:
     """Join a remote base path with a relative path (POSIX semantics)."""
     if not rel:
@@ -568,66 +701,136 @@ def _is_sqlite_sidecar(name: str) -> bool:
 
 # === PURE PARSERS ===
 
+# toybox `ls -l` -- what every caller's `run-as <pkg> ls -la` runs -- prints
+# mode, links, owner, group and size separated by runs of spaces, the timestamp
+# as two columns, `%F %H:%M` (recorded: run_as_ls_symlink_space), then ONE space
+# and the name exactly as printed: it may hold spaces, start or end with one, or
+# look like a date.
+_LS_ENTRY = re.compile(
+    r"(?P<mode>\S+) +(?P<links>\S+) +(?P<owner>\S+) +(?P<group>\S+) +(?P<size>\S+) +"
+    r"(?P<day>[0-9]{4}-[0-9]{2}-[0-9]{2}) (?P<clock>[0-9]{2}:[0-9]{2}) (?P<name>.+)"
+)
 
-def parse_ls_output(output: str) -> list[dict]:
-    """Parse ``ls -la`` output into structured entries.
+# A name is chosen by the app on the device, so it is untrusted input to the
+# host: export() turns it into a host path. None of these belongs in a single
+# directory entry -- `/` and NUL cannot occur in one at all, so seeing them means
+# the line is not what it claims; `\` is a separator on a Windows host; a
+# newline is how a crafted name forges a second `ls` line.
+_NAME_FORBIDDEN = frozenset("/\\\0\n\r")
+# A symlink's target is a device path, so `/` is expected there; a CR or NUL is
+# not, and the target is printed to the caller.
+_TARGET_FORBIDDEN = frozenset("\0\n\r")
 
-    Handles the toybox/coreutils layouts adb ships:
+
+class LsListing(NamedTuple):
+    """What an ``ls -la`` listing held: the entries read, and the ones refused.
+
+    ``rejected`` holds each refused name -- or the whole line, when its columns
+    could not be placed -- as ``repr()``, so a control character in it is
+    shown escaped rather than reaching a terminal or a log raw. Every caller
+    reports them: dropping them silently answered "nothing there" for
+    "refused to read it".
+    """
+
+    entries: list[dict]
+    rejected: list[str]
+
+
+def parse_ls_output(output: bytes | str) -> LsListing:
+    r"""Parse ``ls -la`` output into structured entries.
+
+    Reads toybox's layout by position -- every caller runs ``run-as <pkg> ls
+    -la`` on the device, and the device's ``ls`` is toybox (recorded:
+    ``run_as_ls_symlink_space``):
 
         drwx------ 4 u0_a123 u0_a123 4096 2024-01-02 03:04 shared_prefs
         -rw------- 1 u0_a123 u0_a123  220 2024-01-02 03:04 prefs.xml
         lrwxrwxrwx 1 root    root       11 2024-01-02 03:04 lib -> /data/app
 
-    The leading ``total N`` line and the ``.`` / ``..`` entries are skipped.
+    The name is everything after the two timestamp columns, so a file named
+    ``2026-10-16``, ``03:04`` or ``May`` keeps its name. (Skipping every
+    date-looking token instead -- and, before that, coreutils' month names and
+    bare years -- made such names vanish from the listing.)
+
+    Every line is an entry, refused, or one of three skips: a blank line, the
+    ``total N`` line, and the directory's own ``.`` / ``..``. Refused, and
+    returned in ``rejected`` (never dropped silently):
+
+    - a line that is not UTF-8 -- decoding it with replacement would hand on
+      a name that is not the file's, and the read of it would fail;
+    - a line that is not that layout: an unknown mode (``??????????``), a
+      device node, whose size is ``major, minor`` (measured: ``1,   3``) and
+      takes two columns, or any other text;
+    - a name that is not a plain file name (see ``_NAME_FORBIDDEN``), or a
+      symlink target holding a CR or NUL.
+
+    The names come from the app, and :meth:`ContainerInspector.export` makes
+    host paths of them.
+
+    Lines are split on ``\n`` only -- what ``ls`` separates entries with --
+    not ``str.splitlines``, which also breaks on ``\r``, ``\x1c``-``\x1e``,
+    ``\x85`` and ``\u2028``/``\u2029``, any of which a name may hold and
+    would then forge a line without a newline. (The transport keeps a CR a CR
+    for the same reason; see ``_run_as``.) A name holding a real newline still
+    can: ``ls -1b`` or ``find -print0`` would make names unambiguous, and is
+    not done here.
 
     Args:
-        output: Raw ``ls -la`` stdout.
+        output: Raw ``ls -la`` stdout: bytes from the device, or text already
+            decoded (the recorded fixtures).
 
     Returns:
-        List of dicts: {name, mode, kind, size_bytes, owner, group, symlink_target}.
+        :class:`LsListing`: ``entries`` as dicts {name, mode, kind, size_bytes,
+        owner, group, symlink_target}, and the ``rejected`` names.
     """
+    raw = output.encode("utf-8") if isinstance(output, str) else output
     entries: list[dict] = []
-    for raw_line in output.splitlines():
-        line = raw_line.rstrip()
-        if not line or line.startswith("total "):
+    rejected: list[str] = []
+    for raw_line in raw.split(b"\n"):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            rejected.append(repr(raw_line))
             continue
-        parts = line.split()
-        if len(parts) < 6:
+        if not line.strip() or line.startswith("total "):
             continue
-        mode = parts[0]
-        if not _looks_like_mode(mode):
+        match = _LS_ENTRY.fullmatch(line)
+        if match is None or not _looks_like_mode(match["mode"]):
+            rejected.append(repr(line))
             continue
-
-        kind = _kind_from_mode(mode)
-        # Size is the 5th column on a standard `ls -l` (after mode, links,
-        # owner, group). Device files have major,minor instead — treat as 0.
-        size_bytes = 0
-        if len(parts) >= 5 and parts[4].isdigit():
-            size_bytes = int(parts[4])
-
-        owner = parts[2] if len(parts) > 2 else ""
-        group = parts[3] if len(parts) > 3 else ""
-
-        # The name is everything after the timestamp columns. Rather than guess
-        # the date format, locate the name by stripping the known leading fields
-        # and any date/time tokens; simplest robust approach: take the tail after
-        # the size column index, then drop date-like tokens.
-        name, symlink_target = _extract_name(parts, kind)
-        if name in (".", "..", ""):
+        kind = _kind_from_mode(match["mode"])
+        name, symlink_target = _extract_name(match["name"], kind)
+        if name in (".", ".."):
+            continue
+        if not _is_plain_file_name(name):
+            rejected.append(repr(name))
+            continue
+        if symlink_target is not None and _TARGET_FORBIDDEN.intersection(symlink_target):
+            rejected.append(repr(match["name"]))
             continue
 
         entries.append(
             {
                 "name": name,
-                "mode": mode,
+                "mode": match["mode"],
                 "kind": kind,
-                "size_bytes": size_bytes,
-                "owner": owner,
-                "group": group,
+                "size_bytes": int(match["size"]) if match["size"].isdigit() else 0,
+                "owner": match["owner"],
+                "group": match["group"],
                 "symlink_target": symlink_target,
             }
         )
-    return entries
+    return LsListing(entries, rejected)
+
+
+def _rejections(listing: LsListing) -> dict:
+    """The refused entries of a listing, as a result carries them (see LsListing)."""
+    return {"rejected": len(listing.rejected), "rejected_entries": listing.rejected}
+
+
+def _is_plain_file_name(name: str) -> bool:
+    """True if ``name`` is one directory entry that is safe to join to a host path."""
+    return name not in ("", ".", "..") and not _NAME_FORBIDDEN.intersection(name)
 
 
 def _looks_like_mode(token: str) -> bool:
@@ -647,79 +850,22 @@ def _kind_from_mode(mode: str) -> str:
     return "file"
 
 
-_MONTH_ABBR = {
-    "jan",
-    "feb",
-    "mar",
-    "apr",
-    "may",
-    "jun",
-    "jul",
-    "aug",
-    "sep",
-    "oct",
-    "nov",
-    "dec",
-}
-
-
-def _extract_name(parts: list[str], kind: str) -> tuple[str, str | None]:
-    """Extract the entry name (and symlink target) from ls columns.
-
-    Two date-block layouts are handled, both starting after the fixed columns
-    (mode, nlink, owner, group, size):
-
-    - toybox / busybox (Android): ``YYYY-MM-DD HH:MM`` — two tokens.
-    - GNU coreutils: ``Mon DD HH:MM`` or ``Mon DD YYYY`` — three tokens.
+def _extract_name(rest: str, kind: str) -> tuple[str, str | None]:
+    """Split the name column into the name and, for a symlink, its target.
 
     Args:
-        parts: Whitespace-split ls line.
+        rest: Everything after the time column. toybox prints a name bare
+            (unquoted, unescaped) and a symlink as ``name -> target``.
         kind: Entry kind (symlinks split on " -> ").
 
     Returns:
         (name, symlink_target) — target is None for non-symlinks.
     """
-    tail = parts[5:]
-    if tail and tail[0][:3].lower() in _MONTH_ABBR:
-        date_tokens = 3  # GNU: month, day, year-or-time
-    else:
-        # toybox: ISO date + time. Skip leading date/time-looking tokens.
-        idx = 0
-        while idx < len(tail) and _is_datetime_token(tail[idx]):
-            idx += 1
-        date_tokens = idx
-    name = " ".join(tail[date_tokens:])
-
-    symlink_target: str | None = None
-    if kind == "symlink" and " -> " in name:
-        name, _, symlink_target = name.partition(" -> ")
-        name = name.rstrip()
-        symlink_target = symlink_target.strip()
-    return name, symlink_target
-
-
-def _is_datetime_token(token: str) -> bool:
-    """Heuristic: True if a token is a date / time / year column from ls."""
-    if "-" in token and token.replace("-", "").isdigit():
-        return True  # 2024-01-02
-    if ":" in token and token.replace(":", "").isdigit():
-        return True  # 03:04 or 03:04:05
-    if token.isdigit() and len(token) == 4:
-        return True  # bare year column (coreutils -l)
-    return token in {
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sep",
-        "Oct",
-        "Nov",
-        "Dec",
-    }
+    if kind == "symlink" and " -> " in rest:
+        # Not stripped: a CR or space at either end belongs to the name.
+        name, _, symlink_target = rest.partition(" -> ")
+        return name, symlink_target
+    return rest, None
 
 
 def parse_shared_prefs_xml(xml_text: str) -> dict:
@@ -956,22 +1102,75 @@ def _emit(action: str, success: bool, result: dict, args: argparse.Namespace) ->
         print(json.dumps({"action": action, "success": success, **result}, indent=2))
         return
     if not success:
+        if result.get("rejected") or result.get("unread"):
+            # A partial answer: what was read, then why it is incomplete.
+            _format_text(action, result, args)
         print(f"Error: {result.get('error', result)}", file=sys.stderr)
+        if result.get("remedy"):
+            print(f"Remedy: {result['remedy']}", file=sys.stderr)
         if result.get("run_as_denied"):
             print(f"Hint: {result['hint']}", file=sys.stderr)
         return
     _format_text(action, result, args)
 
 
+def _report_rejections(success: bool, result: dict) -> tuple[bool, dict]:
+    """Make an incomplete answer a failure that still carries the answer.
+
+    Incomplete means an entry was refused (see LsListing) or a listed file
+    could not be read (export's ``unread``). Exit 1 even when only some were:
+    the listing or snapshot is incomplete, and the exit status is the one
+    signal a caller cannot skip. What was read stays in the result, as a
+    failing batch keeps its summary. Everything refused and nothing read is
+    the same failure -- never "No shared_prefs found".
+    """
+    refused, unread = result.get("rejected", 0), result.get("unread", 0)
+    if not success or not (refused or unread):
+        return success, result
+    reasons = []
+    if refused:
+        shown = ", ".join(result["rejected_entries"][:3]) + (", ..." if refused > 3 else "")
+        reasons.append(
+            f"refused {refused} entr{'y' if refused == 1 else 'ies'} the app named with "
+            f"bytes that are not UTF-8 or a character no plain file name carries (/, \\, "
+            f"NUL, CR, LF), or in a layout ls does not print: {shown}"
+        )
+    if unread:
+        shown = ", ".join(
+            f"{entry['name']!r} ({entry['error']})" for entry in result["unread_entries"][:3]
+        ) + (", ..." if unread > 3 else "")
+        reasons.append(f"could not read {unread} listed file(s): {shown}")
+    return False, {
+        **result,
+        "error": "; ".join(reasons),
+        "remedy": (
+            "Whatever could be read is shown. Inspect the named entries on the device "
+            "(`adb shell run-as <package> ls -lab`); rename or remove a refused one, "
+            "and retry an unread one, to read them here."
+        ),
+    }
+
+
+def _print_refused(result: dict, args: argparse.Namespace) -> None:
+    """The refused names (escaped) and the unread files, under --verbose."""
+    if args.verbose:
+        for name in result.get("rejected_entries", []):
+            print(f"  refused: {name}")
+        for entry in result.get("unread_entries", []):
+            print(f"  unread: {entry['name']!r} ({entry['error']})")
+
+
 def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
     """Token-efficient text rendering per action (detail under --verbose)."""
+    refused = f", {result['rejected']} refused" if result.get("rejected") else ""
     if action == "ls":
-        print(f"{result['listed_path']}  ({result['total_entries']} entries)")
+        print(f"{result['listed_path']}  ({result['total_entries']} entries{refused})")
         for entry in result["entries"]:
             size = _format_size(entry["size_bytes"]) if entry["kind"] == "file" else ""
             suffix = f"  [{size}]" if size else ""
             link = f" -> {entry['symlink_target']}" if entry.get("symlink_target") else ""
             print(f"  {entry['name']}  ({entry['kind']}){suffix}{link}")
+        _print_refused(result, args)
     elif action == "cat":
         if "cache_id" in result:
             print(f"[{result['path']}]  {_format_size(result['size_bytes'])}")
@@ -988,12 +1187,13 @@ def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
                 print(f"  {key} = {value!r}")
         else:
             files = result["files"]
-            if not files:
+            if not files and not refused:
                 print(f"No shared_prefs found for {result['package']}")
             else:
-                print(f"shared_prefs ({result['total_files']}):")
+                print(f"shared_prefs ({result['total_files']}{refused}):")
                 for fname in files:
                     print(f"  {fname}")
+            _print_refused(result, args)
     elif action == "databases":
         if "tables" in result:
             print(
@@ -1007,18 +1207,21 @@ def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
                 print(result["schema"])
         else:
             dbs = result["databases"]
-            if not dbs:
+            if not dbs and not refused:
                 print(f"No databases found for {result['package']}")
             else:
-                print(f"databases ({result['total_databases']}):")
+                print(f"databases ({result['total_databases']}{refused}):")
                 for db in dbs:
                     print(f"  {db['name']}  [{_format_size(db['size_bytes'])}]")
+            _print_refused(result, args)
     elif action == "export":
         print(f"Exported {result['package']} -> {result['destination']}")
-        print(f"  {result['total_files']} files written")
+        unread = f", {result['unread']} unread" if result.get("unread") else ""
+        print(f"  {result['total_files']} files written{refused}{unread}")
         if args.verbose:
             for path in result["files_written"]:
                 print(f"  - {path}")
+        _print_refused(result, args)
 
 
 # === CLI ===
@@ -1095,24 +1298,23 @@ Examples:
     pkg = args.package
 
     if args.ls is not None:
-        success, result = inspector.list_dir(pkg, subpath=args.ls)
-        _emit("ls", success, result, args)
+        action, (success, result) = "ls", inspector.list_dir(pkg, subpath=args.ls)
     elif args.cat is not None:
-        success, result = inspector.cat_file(pkg, args.cat)
-        _emit("cat", success, result, args)
+        action, (success, result) = "cat", inspector.cat_file(pkg, args.cat)
     elif hasattr(args, "shared_prefs"):
+        action = "shared-prefs"
         success, result = inspector.shared_prefs(pkg, name=args.shared_prefs)
-        _emit("shared-prefs", success, result, args)
     elif hasattr(args, "databases"):
+        action = "databases"
         success, result = inspector.databases(pkg, name=args.databases)
-        _emit("databases", success, result, args)
     elif args.export is not None:
-        success, result = inspector.export(pkg, args.export)
-        _emit("export", success, result, args)
+        action, (success, result) = "export", inspector.export(pkg, args.export)
     else:  # pragma: no cover - argparse guarantees one op
         parser.error("no operation selected")
         return
 
+    success, result = _report_rejections(success, result)
+    _emit(action, success, result, args)
     sys.exit(0 if success else 1)
 
 

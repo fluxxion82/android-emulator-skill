@@ -50,6 +50,9 @@ DEFAULT_KEEP_COUNT = env_int("ANDROID_EMU_DELETE_KEEP", 3)
 # caller with no diagnosis. Both operations here are local to the SDK.
 SDK_TOOL_TIMEOUT = 120
 
+# What to do about a declined prompt -- the same for every mode that asks.
+CANCELLED_REMEDY = "Answer `yes` at the prompt, or pass --yes to delete without asking."
+
 
 class AvdHomeError(SdkToolError):
     """A listed AVD has no ``.avd`` directory under the resolved AVD home.
@@ -187,20 +190,56 @@ class EmulatorDeleter:
 
     def _confirm(self, prompt: str) -> bool:
         """
-        Ask the user to confirm a destructive action.
+        Ask the user to confirm a destructive action: question on stderr, answer from stdin.
+
+        Not ``input(prompt)``, which writes the question to stdout. Under
+        ``--json`` stdout is the one answer object, and the prompt landed in
+        front of it -- ``Permanently delete ALL 1 AVDs? (type 'yes' to
+        confirm): {...`` -- so a caller parsing the JSON got neither (N4).
 
         Args:
             prompt: Question to present (a ``(type 'yes' to confirm): `` suffix
                 is appended automatically)
 
         Returns:
-            True if the user typed ``yes``, False otherwise
+            True if the user typed ``yes``; False for anything else, including
+            end of input and Ctrl-C.
         """
+        print(f"{prompt} (type 'yes' to confirm): ", end="", file=sys.stderr, flush=True)
+        stdin = sys.stdin
         try:
-            response = input(f"{prompt} (type 'yes' to confirm): ")
-        except (KeyboardInterrupt, EOFError):
-            return False
-        return response.strip().lower() == "yes"
+            answer = stdin.readline() if stdin is not None else ""
+        except KeyboardInterrupt:
+            answer = ""
+        if stdin is None or not stdin.isatty() or not answer.endswith("\n"):
+            # No terminal echoed a newline after the question, so end its line
+            # here: whatever follows (`Error: ...`) must start a line of its own.
+            print(file=sys.stderr)
+        return answer.strip().lower() == "yes"
+
+    def _require_confirmation(self, prompt: str, confirm: bool) -> None:
+        """
+        Return only if ``confirm`` is set or the user typed ``yes``; otherwise refuse.
+
+        One answer to a declined prompt, whichever mode asked. ``--name``
+        answered "Deletion cancelled by user" and exit 1, while ``--all`` and
+        ``--old`` returned an empty batch, printed "No AVDs deleted" and exited
+        0 -- reporting a refused request as a successful one with nothing to do
+        (N4).
+
+        Args:
+            prompt: The question, which the refusal quotes.
+            confirm: ``--yes`` was given, so there is nothing to ask.
+
+        Raises:
+            cli.Failure: The user did not type ``yes``. Nothing was deleted.
+        """
+        if confirm or self._confirm(prompt):
+            return
+        cli.fail(
+            f"deletion cancelled: {prompt!r} was not answered `yes`, so nothing was deleted",
+            CANCELLED_REMEDY,
+        )
 
     def _delete_one(self, name: str, avdmanager: str) -> tuple[bool, str]:
         """
@@ -243,6 +282,7 @@ class EmulatorDeleter:
 
         Raises:
             SdkToolError: avdmanager is absent or failed.
+            cli.Failure: The user declined the prompt.
         """
         avdmanager = self.require_avdmanager()
 
@@ -251,9 +291,7 @@ class EmulatorDeleter:
         if name not in avds:
             return False, f"AVD not found: {name}"
 
-        if not confirm and not self._confirm(f"Permanently delete AVD {name}?"):
-            return False, "Deletion cancelled by user"
-
+        self._require_confirmation(f"Permanently delete AVD {name}?", confirm)
         return self._delete_one(name, avdmanager)
 
     def delete_all(self, confirm: bool = False) -> tuple[int, int, list]:
@@ -270,6 +308,7 @@ class EmulatorDeleter:
         Raises:
             SdkToolError: avdmanager is absent or failed -- the same error the
                 single-name path gives, rather than an empty batch (L8).
+            cli.Failure: The user declined the prompt.
         """
         avdmanager = self.require_avdmanager()
 
@@ -293,6 +332,7 @@ class EmulatorDeleter:
 
         Raises:
             SdkToolError: avdmanager is absent or failed.
+            cli.Failure: The user declined the prompt.
         """
         avdmanager = self.require_avdmanager()
 
@@ -315,13 +355,16 @@ class EmulatorDeleter:
             prompt: Confirmation question shown when ``confirm`` is False
 
         Returns:
-            (succeeded, failed, results) tuple
+            (succeeded, failed, results) tuple. ``(0, 0, [])`` means there was
+            nothing to delete -- never that the prompt was declined.
+
+        Raises:
+            cli.Failure: The user declined the prompt.
         """
         if not names:
             return 0, 0, []
 
-        if not confirm and not self._confirm(prompt):
-            return 0, 0, []
+        self._require_confirmation(prompt, confirm)
 
         succeeded = 0
         failed = 0
@@ -452,13 +495,21 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
         print(f"Deleting AVD: {args.name}", file=progress)
 
     success, message = deleter.delete(args.name, confirm=args.yes)
+    if not success:
+        # Through common.cli: a name avdmanager does not list, and a delete it
+        # refused or never finished, answered {"success": false, "message"} --
+        # the one failure here with no `error` and no remedy.
+        cli.fail(
+            message,
+            "Run --list to verify the AVD name; resolve the reported failure before retrying.",
+        )
 
     if args.json:
         print(json.dumps({"success": success, "message": message}, indent=2))
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 def _fail_usage(args: argparse.Namespace, message: str) -> None:
@@ -504,7 +555,8 @@ def _report_batch(
         return
 
     if total == 0:
-        print("No AVDs deleted")
+        # Only when nothing matched: a declined prompt is a refusal (N4).
+        print("No AVDs to delete")
     else:
         print(f"Delete summary: {succeeded}/{total} succeeded, {failed} failed")
 

@@ -29,8 +29,8 @@ in both -- accepted, because cutting it out of ``error`` is presentation logic
 that can empty the field or disagree with the message.
 
 **What stdout holds under --json.** For a non-streaming mode (almost all of
-them) the refusal object is the whole of stdout -- with one known exception,
-``emulator_delete``'s confirmation prompt without ``--yes`` (N4). A streaming mode --
+them) the refusal object is the whole of stdout; a question for the user, such
+as ``emulator_delete``'s confirmation prompt, goes to stderr. A streaming mode --
 ``log_monitor --follow``, ``anr_watcher --watch`` -- may already have printed
 records when the failure arrives, and nothing can retract them; there the
 contract is that the refusal object is the *last line* of stdout and parses on

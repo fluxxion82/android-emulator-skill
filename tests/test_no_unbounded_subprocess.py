@@ -178,7 +178,7 @@ DIRECT_SUBPROCESS_MODULES: frozenset[str] = frozenset(
     {
         "anr_watcher.py",  # streams `adb logcat` in a detached worker
         "common/sdk_tools.py",  # runs SDK binaries (emulator, avdmanager), not adb
-        "container.py",  # `adb exec-out run-as`: binary-safe bytes, not text
+        "container.py",  # `adb shell [-T] run-as`: bytes, not text
         "emulator_boot.py",  # launches the emulator binary detached
         "emulator_create.py",  # avdmanager / sdkmanager
         "emulator_delete.py",  # avdmanager
