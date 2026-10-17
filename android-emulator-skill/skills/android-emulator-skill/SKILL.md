@@ -1,6 +1,6 @@
 ---
 name: android-emulator-skill
-version: 0.7.0
+version: 0.8.0
 description: Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output. Android equivalent of ios-simulator-skill.
 ---
 
@@ -42,7 +42,7 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 
 All scripts support `--help` for detailed options and `--json` for machine-readable output.
 
-## Scripts (v0.7.0)
+## Scripts (v0.8.0)
 
 ### Implemented (32 scripts)
 
@@ -884,47 +884,57 @@ handler is not reachable from adb — see `push_notification.py` above.
 
 ## Status & Roadmap
 
-**v0.7.0 — the agent loop is verified from this skill's own printed output.**
-Earlier releases checked that a fix existed at a given line. This one checks
-that the loop closes: a test reads what `screen_mapper` prints and feeds each
-printed name back into `navigator`, so "implemented but unreachable" fails.
+**v0.8.0 — the diagnostics stop lying.** v0.7.0 proved the agent loop closes
+from the skill's own output. This release goes after the numbers an agent
+reads: a verdict, a count or "nothing found" that the device did not actually
+produce. Each fix below started as a strict-xfail spec written against a
+recorded fixture, and was red before the fix.
 
-- **`screen_mapper` names up to 15 controls per bucket in the default report
-  (the full inventory is in `--json`), and `navigator` finds and taps every
-  name it printed** — including Jetpack Compose captions, which the dump leaves
-  anonymous and which are resolved to the control that owns them. A
-  caption whose only enclosing "owner" is a scroll container is *refused*, not
-  tapped at that container's centre.
-- **A bare `--tap` is refused.** A tap lands inside the rectangle the name
-  describes — the test resolves that rectangle from the dump with its own
-  parser, so navigator is checked against the screen rather than against
-  itself.
-- **`--launch` and `--open-url` wait for the activity** — `am start -W`, with
-  `Status: ok` required — instead of returning as soon as `am start` exits.
-- **`emulator_shutdown` cannot power off a handset.** `reboot -p` is gone and a
-  non-emulator serial is refused before anything is issued. One tri-state probe
-  answers "which AVD is this serial" for every caller, so "the device listing
-  itself failed" is no longer read as "not running".
-- **Every value crossing the device shell is quoted** — all 19 sites, each
-  enumerated positively by a guard, so "zero unquoted sites" cannot come from a
-  blind detector.
-- **Every failing mode exits non-zero.** A runtime sweep drives 23 documented
-  invocations across 16 scripts against a toolchain where every tool fails, and
-  asserts the exit status rather than the message. (The failure *shape* is now
-  `common/cli.py`'s; see **Failures** under Known gaps.)
-- **A missing SDK tool says so in the lifecycle scripts** — `device_list`,
-  `emulator_boot`, `emulator_create`, `emulator_delete` and `emulator_selector`
-  route through `common/sdk_tools.py`, which names where the tool was looked
-  for and gives the `cmdline-tools` remedy instead of returning an empty list.
-  A tool that ran and genuinely found nothing still exits 0. (`device_list`
-  keeps a missing `avdmanager` as a *warning*: it only decorates AVDs the
-  emulator already listed.) `emulator_erase` runs no SDK tool — it reads the
-  AVD home itself — and refuses a missing AVD home the same way.
+- **One error boundary for every script** (`common/cli.py`). A refusal is one
+  `{"success": false, "error", "remedy"}` object under `--json` (or
+  `Error:`/`Remedy:` on stderr), and exits 1, or 3 when the device is
+  unavailable. An AST guard enumerates all 32 scripts, and the exit-code sweep
+  asserts the payload of 39 documented modes twice: once with every tool
+  failing and once with none installed.
+- **"Could not look" is no longer "nothing there."** `emulator_create`,
+  `emulator_erase`, `device_list` and `android_health_check.sh` refuse a
+  missing or failing SDK tool or AVD home instead of returning an empty list.
+  `emulator_create` defaults to the host's ABI, never skips its image check,
+  and reads both `sdkmanager` formats. The Java tool's pipe table had parsed to
+  nothing, which kept the lane's AVD lifecycle test skipped on every CI run.
+- **Build verdicts come from this run's tests.** `build_and_test` deletes the
+  test task's old JUnit reports, reruns the task, and passes only on Gradle
+  exit 0 with no `<failure>`/`<error>`. A run that wrote no results is refused,
+  never reported as "0 passed". A Gradle older than 7.6 is refused by name.
+- **Log windows belong to the app.** `log_monitor --app` and
+  `app_state_capture` keep every process of the app and no other, including a
+  crashed one that has since restarted. A pid counts only on evidence that
+  system_server wrote and whose uid matches the package; app-written lines
+  cannot forge attribution. `--severity` validates its names, and counts are
+  line counts. Snapshots no longer land in the caller's working directory.
+- **One ANR is one event.** The `Reason:`/`PID:` lines attach to their record,
+  and a WindowManager-only ANR still counts. Jank is keyed by process, and a
+  pid is named only when its owner was running at the time.
+  `--diff` says "inconclusive" when it could not compare sessions, and never
+  emits `Infinity`. The live readers no longer lose lines or swallow adb's
+  exit status.
+- **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
+  the error text as content (measured), so `container` and `model_inspector`
+  now read through `adb shell -T` and refuse an adb client too old to honour
+  it. Device file names are treated as untrusted input: unsafe, undecodable or
+  CR-carrying names are refused and reported, and exports stay inside their
+  directory.
+- **The required emulator lane can no longer pass without testing.** It fails
+  on any skip, exits 3 with diagnostics when the device is lost, retries only
+  that case once, and counts the retry in the step summary.
+
+Tests: 1,653 → 2,619, and 0 xfailed. Fixture-policy debt is down to two
+entries, and the boundary guard's debt list is empty.
 
 The correction remains fixture-driven: `tests/fixtures/recorded/` holds verbatim
 output captured from real devices on two API levels, parser tests consume it,
 and a known defect, when one exists, is pinned with `xfail(strict=True)` so
-fixing it forces the marker's removal. None is pinned in v0.7.0. See
+fixing it forces the marker's removal. None is pinned in v0.8.0. See
 `CLAUDE.md` in the source repository.
 
 **Known gaps, for the next release:**
