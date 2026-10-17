@@ -195,9 +195,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - One-line summary + a result ID by default; drill in on demand
     - Parses JUnit XML for pass/fail counts + failed test names; extracts Gradle/Kotlin/Java errors & warnings
     - `--test` reads only the reports *this* run wrote: it deletes the test task's old `TEST-*.xml` reports
-      first and reruns the task (`--rerun`, Gradle 7.6+; an older wrapper is refused by name). It passes only
+      first, after proving their resolved paths stay inside the selected module and exact task directory,
+      and reruns the task (`--rerun`, Gradle 7.6+; an older wrapper is refused by name). It passes only
       if Gradle exits 0 **and** they hold no failure or error — `ignoreFailures = true` cannot turn failing
-      tests into a pass. A run that wrote no test results is a failure, not "0 tests passed"
+      tests into a pass. An unreadable or malformed report refuses the partial verdict. A run that wrote no
+      test results is a failure, not "0 tests passed". If Gradle times out, its partial log is cached and the
+      command refuses with a remedy to raise `ANDROID_EMU_BUILD_TIMEOUT` or inspect the stuck build
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring

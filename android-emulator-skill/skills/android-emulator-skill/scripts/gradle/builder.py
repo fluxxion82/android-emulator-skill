@@ -17,11 +17,13 @@ import contextlib
 import subprocess
 from pathlib import Path
 
+from common import cli
 from common.env_config import env_int
 
 from .config import Config
 from .results import (
     aggregate_test_results,
+    find_test_result_directories,
     find_test_result_files,
     parse_build_output,
 )
@@ -54,6 +56,7 @@ class BuildResult:
         duration: float,
         returncode: int | None,
         results_dir: str | None = None,
+        timeout_seconds: int | None = None,
     ):
         self.success = success
         self.stdout = stdout
@@ -69,6 +72,12 @@ class BuildResult:
         self.returncode = returncode
         # Where a test run's JUnit XML was looked for; None for a build.
         self.results_dir = results_dir
+        self.timeout_seconds = timeout_seconds
+
+    @property
+    def timed_out(self) -> bool:
+        """Whether the Gradle wrapper exceeded the configured execution timeout."""
+        return self.timeout_seconds is not None
 
     @property
     def rerun_unsupported(self) -> bool:
@@ -209,14 +218,55 @@ class BuildRunner:
     def _results_root(self) -> Path:
         """The directory a test run's reports are searched under: the module's, if it has one."""
         if self.module:
-            module_dir = self.module.lstrip(":").replace(":", "/")
-            candidate = self.project_dir / module_dir
-            if candidate.exists():
-                return candidate
+            parts = self.module.lstrip(":").split(":")
+            if not parts or any(
+                not part or part in {".", ".."} or "/" in part or "\\" in part for part in parts
+            ):
+                cli.fail(
+                    f"invalid Gradle module path: {self.module}",
+                    "Pass a colon-separated Gradle project path such as :app or :feature:login.",
+                )
+            candidate = self.project_dir.joinpath(*parts)
+            if not candidate.resolve().is_relative_to(self.project_dir.resolve()):
+                cli.fail(
+                    f"Gradle module path resolves outside the project: {candidate}",
+                    "Pass --module a project contained under the selected --project root.",
+                )
+            return candidate
         return self.project_dir
 
-    @staticmethod
-    def _clear_reports(root: Path, task: str) -> None:
+    def _report_files(self, root: Path, task: str) -> tuple[list[Path], list[Path]]:
+        """Find reports and prove every resolved path stays in its permitted directory."""
+        recursive = self.module is None
+        directories = find_test_result_directories(root, task=task, recursive=recursive)
+        paths = find_test_result_files(root, task=task, recursive=recursive)
+        project = self.project_dir.resolve()
+        resolved_directories = [directory.resolve() for directory in directories]
+
+        # Validate every target before unlinking any of them. In particular, a
+        # build/ symlink may put both the directory and its reports elsewhere.
+        for path in paths:
+            resolved = path.resolve()
+            permitted = any(
+                resolved.is_relative_to(directory) and path.parent.resolve() == directory
+                for directory in resolved_directories
+            )
+            if not resolved.is_relative_to(project) or not permitted:
+                cli.fail(
+                    f"refusing to use JUnit report outside its project task directory: {path}",
+                    "Replace build/test-results symlinks with directories inside the project, "
+                    "then rerun the Gradle test task.",
+                )
+        for directory in resolved_directories:
+            if not directory.is_relative_to(project):
+                cli.fail(
+                    f"refusing JUnit report directory outside the project: {directory}",
+                    "Replace build/test-results symlinks with directories inside the project, "
+                    "then rerun the Gradle test task.",
+                )
+        return directories, paths
+
+    def _clear_reports(self, root: Path, task: str) -> None:
         """Delete the task's ``TEST-*.xml`` reports under ``root`` before Gradle runs.
 
         After the run, everything in the task's results directory is then this
@@ -238,7 +288,8 @@ class BuildRunner:
             OSError: A report could not be deleted -- reading results then
                 would be guessing again, so the run does not start.
         """
-        for path in find_test_result_files(root, task=task):
+        _, paths = self._report_files(root, task)
+        for path in paths:
             path.unlink(missing_ok=True)
 
     def _run(
@@ -308,6 +359,7 @@ class BuildRunner:
                 tasks=tasks,
                 duration=round(duration, 2),
                 returncode=None,
+                timeout_seconds=timeout,
             )
 
         duration = time.time() - start
@@ -319,13 +371,12 @@ class BuildRunner:
         if name is not None:
             # The task's reports were cleared before the run, so whatever is
             # in its directory now, this run wrote (N6).
-            scoped = root != self.project_dir
+            directories, xml_files = self._report_files(root, name)
             results_dir = str(
-                root / "build" / "test-results" / name
-                if scoped
+                directories[0]
+                if len(directories) == 1
                 else root / "**" / "build" / "test-results" / name
             )
-            xml_files = find_test_result_files(root, task=name)
             aggregate = aggregate_test_results(xml_files)
             # A report with no test case in it (a truncated write parses to
             # zero) is no more a result than no report at all.

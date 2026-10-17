@@ -276,6 +276,14 @@ Examples:
         duration=result.duration,
     )
 
+    if result.timed_out:
+        cli.fail(
+            f"Gradle timed out after {result.timeout_seconds}s; the partial log is cached as "
+            f"{build_id}",
+            "Raise ANDROID_EMU_BUILD_TIMEOUT or check the build for a stuck Gradle task; "
+            f"read the partial log with `build_and_test.py --get-log {build_id}`.",
+        )
+
     if result.rerun_unsupported:
         # --rerun (Gradle 7.6+) is what makes "this run's results" true; an
         # older Gradle rejects it before any test runs. Said plainly rather

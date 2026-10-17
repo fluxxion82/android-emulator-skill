@@ -19,8 +19,53 @@ import re
 from pathlib import Path
 from xml.etree import ElementTree
 
+from common import cli
 
-def find_test_result_files(search_root: Path, *, task: str | None = None) -> list[Path]:
+
+def find_test_result_directories(
+    search_root: Path, *, task: str, recursive: bool = True
+) -> list[Path]:
+    """Resolve the one case-insensitive task directory below each eligible module.
+
+    Gradle accepts a miscased task selector and writes reports under the task's
+    declared spelling. One case-insensitive match is therefore usable, while
+    two are ambiguous: choosing either would make cleanup delete a directory
+    the caller did not uniquely identify.
+    """
+    if recursive:
+        result_roots = sorted(set(search_root.glob("**/build/test-results")))
+    else:
+        result_roots = [search_root / "build" / "test-results"]
+
+    directories: list[Path] = []
+    wanted = task.casefold()
+    for result_root in result_roots:
+        try:
+            matches = sorted(
+                path
+                for path in result_root.iterdir()
+                if path.is_dir() and path.name.casefold() == wanted
+            )
+        except FileNotFoundError:
+            matches = []
+        if len(matches) > 1:
+            cli.fail(
+                f"ambiguous Gradle test result directories for {task}: "
+                + ", ".join(str(path) for path in matches),
+                "Remove or rename the case-colliding task result directories, then retry.",
+            )
+        if matches:
+            directories.extend(matches)
+        elif not recursive:
+            # Keep the intended location available for containment checks and
+            # for the no-results diagnostic even before Gradle creates it.
+            directories.append(result_root / task)
+    return directories
+
+
+def find_test_result_files(
+    search_root: Path, *, task: str | None = None, recursive: bool = True
+) -> list[Path]:
     """
     Find Gradle's JUnit XML reports under a project or module directory.
 
@@ -41,6 +86,8 @@ def find_test_result_files(search_root: Path, *, task: str | None = None) -> lis
             returned, the name compared without case: Gradle resolves a
             miscased task name (recorded: gradle_miscased_variant_resolves) and
             writes the directory under the task's real spelling.
+        recursive: Search nested modules. A module-scoped build passes false so
+            cleanup cannot cross into one of that module's children.
 
     Returns:
         Sorted list of report paths (empty if none match or the path is missing).
@@ -50,12 +97,8 @@ def find_test_result_files(search_root: Path, *, task: str | None = None) -> lis
 
     candidates: set[Path] = set()
     if task is not None:
-        wanted = task.casefold()
-        candidates.update(
-            path
-            for path in search_root.glob("**/build/test-results/*/TEST-*.xml")
-            if path.parent.name.casefold() == wanted
-        )
+        for directory in find_test_result_directories(search_root, task=task, recursive=recursive):
+            candidates.update(directory.glob("TEST-*.xml"))
     else:
         candidates.update(search_root.glob("**/test-results/**/TEST-*.xml"))
         # search_root may itself be a task's results directory.
@@ -64,7 +107,7 @@ def find_test_result_files(search_root: Path, *, task: str | None = None) -> lis
     return sorted(path for path in candidates if path.is_file())
 
 
-def parse_junit_xml(xml_text: str) -> dict:
+def parse_junit_xml(xml_text: str, *, strict: bool = False) -> dict:
     """
     Parse a single JUnit XML document's text into counts and failed tests.
 
@@ -75,6 +118,10 @@ def parse_junit_xml(xml_text: str) -> dict:
 
     Args:
         xml_text: Raw JUnit XML content
+        strict: Raise ``ElementTree.ParseError`` for empty or malformed XML.
+            Aggregation enables this because dropping one report can reverse a
+            verdict; the standalone parser preserves its historical empty
+            result for callers inspecting arbitrary text.
 
     Returns:
         Dict with keys: total, passed, failed, skipped, errors,
@@ -90,11 +137,15 @@ def parse_junit_xml(xml_text: str) -> dict:
     }
 
     if not xml_text or not xml_text.strip():
+        if strict:
+            raise ElementTree.ParseError("empty JUnit XML")
         return result
 
     try:
         root = ElementTree.fromstring(xml_text)
     except ElementTree.ParseError:
+        if strict:
+            raise
         return result
 
     # Collect all testsuite elements regardless of root shape.
@@ -171,9 +222,20 @@ def aggregate_test_results(xml_files: list[Path]) -> dict:
     for path in xml_files:
         try:
             xml_text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        parsed = parse_junit_xml(xml_text)
+        except OSError as error:
+            cli.fail(
+                f"could not read JUnit report {path}: {error}",
+                "Check the report is readable and rerun the Gradle test task; "
+                "a partial test aggregate cannot determine the verdict.",
+            )
+        try:
+            parsed = parse_junit_xml(xml_text, strict=True)
+        except ElementTree.ParseError as error:
+            cli.fail(
+                f"could not parse JUnit report {path}: {error}",
+                "Rerun the Gradle test task so it writes a complete report; "
+                "a partial test aggregate cannot determine the verdict.",
+            )
         for key in ("total", "passed", "failed", "skipped", "errors"):
             aggregate[key] += parsed[key]
         aggregate["failed_tests"].extend(parsed["failed_tests"])
