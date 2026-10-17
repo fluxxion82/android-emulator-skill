@@ -14,13 +14,18 @@ separate directory.
 
 from __future__ import annotations
 
+import ast
 import functools
 import json
 import re
 import shlex
+import subprocess
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+from fake_toolchain import FakeToolchain, Rule
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "android-emulator-skill"
@@ -207,9 +212,14 @@ def test_the_emulator_workflow_is_callable_as_a_gate():
 
 LANE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "run-emulator-lane.sh"
 
-# The floor the lane enforces, as the script spells it. Matched as one shell
-# word (the quoted grep pattern), not as a substring of the file.
-LANE_PASSED_PATTERN = "[0-9]+ passed"
+# What the floor's grep patterns must make of the terms in pytest's summary
+# line. The patterns are checked as regexes against these, not compared as
+# strings, so a respelling that means the same thing passes and one that lets
+# a skip through does not. "23 passed" and "2171 deselected" are a green lane's
+# own words (run 38983850283).
+FLOOR_PASSED_TERMS = ("1 passed", "23 passed")
+FLOOR_FAILING_TERMS = ("1 skipped", "2 skipped", "1 failed", "1 error", "2 errors")
+FLOOR_NEUTRAL_TERMS = ("23 passed", "2171 deselected", "1 xfailed", "3 warnings")
 
 
 def _shell_commands(script: str) -> list[tuple[int, list[str]]]:
@@ -237,8 +247,8 @@ def _then_branch(commands: list[tuple[int, list[str]]], start: int) -> list[list
 
     Only the ``then`` branch, and only its direct commands. An ``else`` or
     ``elif`` at this block's depth ends the branch -- an ``exit 1`` moved into
-    ``else`` runs when the test FAILS, which for the passed-floor means "exit 1
-    when something passed" -- and nested ``if ... fi`` blocks are skipped over,
+    ``else`` runs when the test FAILS, which for the floor means "exit 1 when
+    the lane was clean" -- and nested ``if ... fi`` blocks are skipped over,
     because an exit under an inner condition is not this block's exit. The
     first version of this helper treated every line before ``fi`` as the body,
     and the ``else`` mutation passed it (review of PR #20).
@@ -265,121 +275,328 @@ def _then_branch(commands: list[tuple[int, list[str]]], start: int) -> list[list
     raise AssertionError(f"the `if` on line {commands[start][0]} is never closed by `fi`")
 
 
+def _condition(words: list[str]) -> list[str]:
+    """The words of an ``if`` line between ``if`` and ``then``."""
+    end = words.index("then") if "then" in words else len(words)
+    return [word for word in words[1:end] if word != ";"]
+
+
+def _clauses(condition: list[str]) -> tuple[list[str], list[list[str]]]:
+    """A condition split on ``||`` / ``&&``: the operators, and the clauses between."""
+    operators: list[str] = []
+    clauses: list[list[str]] = [[]]
+    for word in condition:
+        if word in ("||", "&&"):
+            operators.append(word)
+            clauses.append([])
+        else:
+            clauses[-1].append(word)
+    return operators, clauses
+
+
+def _grep_clause(clause: list[str]) -> tuple[bool, str, str] | None:
+    """``(negated, pattern, file)`` for ``[!] grep -FLAGS PATTERN FILE``, else None."""
+    negated = clause[:1] == ["!"]
+    words = clause[1:] if negated else clause
+    if words[:1] != ["grep"]:
+        return None
+    operands = [word for word in words[1:] if not word.startswith("-")]
+    if len(operands) != 2:
+        return None
+    return negated, operands[0], operands[1]
+
+
+def _searches(pattern: str, term: str) -> bool:
+    """Whether the ERE ``pattern`` finds ``term``; an unparsable pattern finds nothing."""
+    try:
+        return re.search(pattern, term) is not None
+    except re.error:
+        return False
+
+
+def _counts_passed(pattern: str) -> bool:
+    """A pattern that finds a positive count of passed tests, and not a zero one."""
+    return all(_searches(pattern, term) for term in FLOOR_PASSED_TERMS) and not _searches(
+        pattern, "0 passed"
+    )
+
+
 def _lane_floor(commands: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
-    """Every ``if ! grep -qE '[0-9]+ passed' <log>`` command, with its index."""
+    """Every ``if`` whose condition greps for a count of passed tests, with its index."""
+    floors = []
+    for index, (_, words) in enumerate(commands):
+        if words[0] != "if":
+            continue
+        greps = [_grep_clause(clause) for clause in _clauses(_condition(words))[1]]
+        if any(grep and _counts_passed(grep[1]) for grep in greps):
+            floors.append((index, words))
+    return floors
+
+
+def _device_checks(commands: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
+    """Every ``if`` whose condition asks ``adb get-state``, with its index.
+
+    The question sits inside a ``"$(...)"``, which is one shell word; its own
+    words are compared, so ``adb  get-state`` and ``adb get-state`` are the same.
+    """
     return [
         (index, words)
         for index, (_, words) in enumerate(commands)
-        if words[0] == "if" and "!" in words and "grep" in words and LANE_PASSED_PATTERN in words
+        if words[0] == "if" and any("adb get-state" in " ".join(word.split()) for word in words)
     ]
 
 
+# The lane's marker expression: the emulator tests, minus whole markers. Never
+# minus node ids -- `--deselect` of a test that no longer exists is silent.
+LANE_MARKER_EXPRESSION = re.compile(r"emulator((?: and not [a-z_]+)*)")
+
+
+def _lane_marker_expression(words: list[str]) -> str | None:
+    """The ``-m`` expression of a pytest command, when it selects the emulator lane."""
+    for position, word in enumerate(words[:-1]):
+        if word == "-m" and LANE_MARKER_EXPRESSION.fullmatch(words[position + 1]):
+            return words[position + 1]
+    return None
+
+
+def _lane_excluded_markers(script: str) -> list[str]:
+    """The markers the lane's ``-m`` expression subtracts (``and not <marker>``)."""
+    for _, words in _shell_commands(script):
+        expression = _lane_marker_expression(words) if "pytest" in words else None
+        if expression is not None:
+            return re.findall(r"and not ([a-z_]+)", expression)
+    return []
+
+
 def _check_lane_floor(script: str) -> None:
-    """Raise AssertionError unless ``script`` fails the lane when no test passed."""
+    """Raise AssertionError unless ``script`` holds the lane to its verdict.
+
+    T11: pytest's status is kept (not left to ``set -e``); a device that is
+    gone after pytest exits 3; and otherwise the lane exits 1 unless the
+    summary says N passed (N >= 1) with no skipped, failed or error term --
+    read from the summary of the log pytest tees to, and in that order.
+    """
     commands = _shell_commands(script)
 
     pytest_runs = [
         (index, words)
         for index, (_, words) in enumerate(commands)
-        if "pytest" in words
-        and any(words[i : i + 2] == ["-m", "emulator"] for i in range(len(words) - 1))
+        if "pytest" in words and _lane_marker_expression(words) is not None
     ]
     assert len(pytest_runs) == 1, (
-        f"expected exactly one `pytest ... -m emulator` command in the lane, "
-        f"found {len(pytest_runs)}"
+        f"expected exactly one `pytest ... -m emulator` command in the lane "
+        f'(`-m emulator`, or `-m "emulator and not <marker>..."`), found {len(pytest_runs)}'
     )
     pytest_index, pytest_words = pytest_runs[0]
     assert "tee" in pytest_words, "the lane no longer tees pytest's output to a log"
     tee_position = pytest_words.index("tee")
     assert tee_position + 1 < len(pytest_words), "`tee` is given no log file"
     lane_log = pytest_words[tee_position + 1]
+    captured = pytest_words[tee_position + 2 :]
+    assert len(captured) == 2 and captured[0] == "||" and re.fullmatch(r"\w+=\$\?", captured[1]), (
+        "pytest's status is not captured (`pytest ... | tee <log> || status=$?`): "
+        "under `set -e` a failing run ends the script there, so tests that failed "
+        "because the device went away exit 1 and never reach the device check"
+    )
+
+    summaries = [
+        (index, words)
+        for index, (_, words) in enumerate(commands)
+        if index > pytest_index and lane_log in words and ">" in words
+    ]
+    assert len(summaries) == 1, (
+        f"expected one command after pytest that writes the summary of {lane_log!r} "
+        f"to a file (`> <file>`), found {len(summaries)}: the floor reads no summary "
+        f"of this run"
+    )
+    summary_index, summary_words = summaries[0]
+    summary_file = summary_words[summary_words.index(">") + 1]
 
     floors = _lane_floor(commands)
     assert len(floors) == 1, (
-        f"expected one `if ! grep -qE '{LANE_PASSED_PATTERN}' <log>` floor in the "
-        f"lane, found {len(floors)}: the lane no longer fails when no test ran"
+        f"expected one `if` that greps the summary for a passed count, found "
+        f"{len(floors)}: the lane no longer fails when no test ran"
     )
     floor_index, floor_words = floors[0]
-    read_log = floor_words[floor_words.index(LANE_PASSED_PATTERN) + 1]
-
     assert floor_index > pytest_index, (
-        "the passed-floor runs before `pytest -m emulator`, so it reads a log "
-        "this run has not written yet"
+        "the floor runs before `pytest -m emulator`, so it reads a log this run has "
+        "not written yet"
     )
-    assert read_log == lane_log, (
-        f"the floor greps {read_log!r} but pytest tees to {lane_log!r}; it is "
-        f"checking a file this run did not write"
+    assert floor_index > summary_index, "the floor runs before its summary is written"
+
+    operators, clauses = _clauses(_condition(floor_words))
+    greps = [_grep_clause(clause) for clause in clauses]
+    assert all(greps), f"the floor's condition is not only greps of the summary: {clauses}"
+    assert set(operators) <= {"||"}, (
+        "the floor's greps are not joined by `||`: any ONE of them must fail the lane, "
+        "and `&&` lets through a run that trips only one"
     )
+    for _negated, _pattern, read in greps:
+        assert read == summary_file, (
+            f"the floor greps {read!r} but the summary is written to {summary_file!r}; "
+            f"it is checking a file this run did not write"
+        )
+    passed = [grep for grep in greps if _counts_passed(grep[1])]
+    assert len(passed) == 1 and passed[0][0], (
+        "the passed count is not negated (`! grep ... passed`): the floor must fail "
+        "the lane when NO test passed"
+    )
+    failing = [grep[1] for grep in greps if not grep[0]]
+    for term in FLOOR_FAILING_TERMS:
+        assert any(_searches(pattern, term) for pattern in failing), (
+            f"the floor lets {term!r} through. A skip in the gated lane means a "
+            f"precondition failed; the floor is ZERO skipped, failed or errored"
+        )
+    for term in FLOOR_NEUTRAL_TERMS:
+        assert not any(
+            _searches(pattern, term) for pattern in failing
+        ), f"the floor fails the lane on {term!r}, which a green lane prints"
     assert ["exit", "1"] in [words[:2] for words in _then_branch(commands, floor_index)], (
-        "the passed-floor no longer exits 1 when nothing passed; the lane goes "
-        "green having exercised no device"
+        "the floor no longer exits 1; the lane goes green having skipped, failed or "
+        "exercised no device"
+    )
+
+    checks = _device_checks(commands)
+    assert len(checks) == 1, (
+        f"expected one `if` on `adb get-state` after pytest, found {len(checks)}: "
+        f"a device that died mid-run reads as failing tests, never retried"
+    )
+    check_index, _ = checks[0]
+    assert check_index > pytest_index, "the device check runs before pytest"
+    assert check_index < floor_index, (
+        "the device check runs after the floor: tests that failed because the device "
+        "went away exit 1 there, and a lost device is never retried"
+    )
+    branch = _then_branch(commands, check_index)
+    assert ["exit", "3"] in [
+        words[:2] for words in branch
+    ], "a lost device no longer exits 3, the one status the workflow retries"
+    assert any(
+        words[0] == "echo" and "DEVICE LOST after" in " ".join(words[1:]) for words in branch
+    ), "a lost device is not named (`DEVICE LOST after N passed`)"
+
+    passed_through = [
+        words for _, words in commands if words[0] == "exit" and "$" in "".join(words)
+    ]
+    assert not passed_through, (
+        f"the lane exits with a status it did not choose ({passed_through}); pytest's "
+        f"own 3 is 'internal error', which would read as a lost device and be retried"
     )
 
 
 def test_the_emulator_lane_fails_when_every_test_skips():
-    """A lane where everything skipped is not a lane that passed.
+    """A lane where anything skipped is not a lane that passed.
 
     Every emulator test skips politely when no device or fixture app is
     present -- correct on a laptop, useless as a gate. The script must notice.
 
     N7: this guard used to assert the SUBSTRINGS "passed" and "exit 1" occur
-    somewhere in the script. Both also occur in comments, an echo and the
-    fixture-app check (run-emulator-lane.sh:47,56,67), so deleting the real
-    floor at :60-65 left it green -- confirmed by mutation. It now reads the
-    script's commands: the ``if ! grep -qE '[0-9]+ passed' <log>`` floor must
-    exist, read the log ``pytest -m emulator`` tees to, come after that
-    pytest run, and have ``exit 1`` as a direct command of its ``if ... fi``.
+    somewhere in the script, which comments and echoes also satisfied; it then
+    read the script's commands for a ``grep -qE '[0-9]+ passed'`` floor.
 
-    T11 (Inc 2) replaces this floor with "0 skipped" and a device-loss exit 3.
-    That PR must update this guard in the same change; the guard failing on
-    T11's diff is the guard working, not a reason to loosen it.
+    T11 (Inc 2): the floor became ZERO skipped, because ``live_device`` resolves
+    once per session -- a device that dies after the first pass made the rest
+    skip or fail, and "at least one passed" read that as green. The guard now
+    pins the whole verdict: pytest's status captured, the summary of the log it
+    tees, a device check exiting 3 between pytest and the floor, and the floor
+    exiting 1 unless N passed (N >= 1) with no skipped, failed or error term.
     """
     _check_lane_floor(LANE_SCRIPT.read_text(encoding="utf-8"))
 
 
-def _floor_block(lines: list[str]) -> tuple[int, int, int]:
-    """0-based (if, exit 1, fi) line indexes of the real script's passed-floor."""
+def _if_block(lines: list[str], find) -> tuple[int, int]:
+    """0-based (``if``, ``fi``) line indexes of the one ``if`` ``find`` returns."""
     commands = _shell_commands("\n".join(lines))
-    ((floor_index, _),) = _lane_floor(commands)
-    if_line = commands[floor_index][0] - 1
-    exit_line = fi_line = None
-    for number, words in commands[floor_index + 1 :]:
-        if words[:2] == ["exit", "1"] and exit_line is None:
-            exit_line = number - 1
-        if words[0] == "fi":
-            fi_line = number - 1
-            break
-    assert exit_line is not None and fi_line is not None, "the real floor has changed shape"
-    return if_line, exit_line, fi_line
+    ((index, _),) = find(commands)
+    depth = 0
+    for number, words in commands[index:]:
+        if words[0] == "if":
+            depth += 1
+        elif words[0] == "fi":
+            depth -= 1
+            if depth == 0:
+                return commands[index][0] - 1, number - 1
+    raise AssertionError("the real block has changed shape")
+
+
+def _line_in(lines: list[str], block: tuple[int, int], prefix: str) -> int:
+    """The first line of ``block`` that starts (after indentation) with ``prefix``."""
+    start, end = block
+    return next(i for i in range(start, end + 1) if lines[i].strip().startswith(prefix))
+
+
+def _line_starting(lines: list[str], prefix: str) -> int:
+    return next(i for i, line in enumerate(lines) if line.startswith(prefix))
 
 
 def _delete_floor(lines: list[str]) -> list[str]:
-    start, _, end = _floor_block(lines)
+    start, end = _if_block(lines, _lane_floor)
     return lines[:start] + lines[end + 1 :]
 
 
 def _delete_exit(lines: list[str]) -> list[str]:
-    _, exit_line, _ = _floor_block(lines)
+    exit_line = _line_in(lines, _if_block(lines, _lane_floor), "exit 1")
     return lines[:exit_line] + lines[exit_line + 1 :]
 
 
 def _exit_into_else(lines: list[str]) -> list[str]:
-    _, exit_line, _ = _floor_block(lines)
+    exit_line = _line_in(lines, _if_block(lines, _lane_floor), "exit 1")
     return lines[:exit_line] + ["else"] + lines[exit_line:]
 
 
 def _floor_before_pytest(lines: list[str]) -> list[str]:
-    start, _, end = _floor_block(lines)
+    start, end = _if_block(lines, _lane_floor)
     block = lines[start : end + 1]
     rest = lines[:start] + lines[end + 1 :]
-    pytest_line = next(i for i, line in enumerate(rest) if line.startswith("pytest "))
+    pytest_line = _line_starting(rest, "pytest ")
     return rest[:pytest_line] + block + rest[pytest_line:]
 
 
-def _floor_reads_another_log(lines: list[str]) -> list[str]:
-    start, _, _ = _floor_block(lines)
+def _floor_reads_another_file(lines: list[str]) -> list[str]:
+    start, _ = _if_block(lines, _lane_floor)
     return [
-        line.replace("emulator-lane.log", "some-other.log") if i == start else line
+        line.replace("emulator-lane.summary", "some-other.summary") if i == start else line
+        for i, line in enumerate(lines)
+    ]
+
+
+def _summary_reads_another_log(lines: list[str]) -> list[str]:
+    summary = _line_starting(lines, "grep -E")
+    return [
+        line.replace("emulator-lane.log", "some-other.log") if i == summary else line
+        for i, line in enumerate(lines)
+    ]
+
+
+def _skips_allowed(lines: list[str]) -> list[str]:
+    start, _ = _if_block(lines, _lane_floor)
+    return [line.replace("skipped|", "") if i == start else line for i, line in enumerate(lines)]
+
+
+def _delete_device_check(lines: list[str]) -> list[str]:
+    start, end = _if_block(lines, _device_checks)
+    return lines[:start] + lines[end + 1 :]
+
+
+def _device_check_after_floor(lines: list[str]) -> list[str]:
+    start, end = _if_block(lines, _device_checks)
+    block = lines[start : end + 1]
+    rest = lines[:start] + lines[end + 1 :]
+    _, floor_end = _if_block(rest, _lane_floor)
+    return rest[: floor_end + 1] + block + rest[floor_end + 1 :]
+
+
+def _device_loss_exits_1(lines: list[str]) -> list[str]:
+    exit_line = _line_in(lines, _if_block(lines, _device_checks), "exit 3")
+    return [
+        line.replace("exit 3", "exit 1") if i == exit_line else line for i, line in enumerate(lines)
+    ]
+
+
+def _pytest_status_uncaptured(lines: list[str]) -> list[str]:
+    pytest_line = _line_starting(lines, "pytest ")
+    return [
+        line.replace(" || pytest_status=$?", "") if i == pytest_line else line
         for i, line in enumerate(lines)
     ]
 
@@ -389,18 +606,24 @@ LANE_MUTATIONS = {
     "exit 1 deleted": _delete_exit,
     "exit 1 moved into else": _exit_into_else,
     "floor moved before pytest": _floor_before_pytest,
-    "floor reads another log": _floor_reads_another_log,
+    "floor reads another file": _floor_reads_another_file,
+    "summary reads another log": _summary_reads_another_log,
+    "skips allowed": _skips_allowed,
+    "get-state check deleted": _delete_device_check,
+    "device check moved after the floor": _device_check_after_floor,
+    "device loss exits 1": _device_loss_exits_1,
+    "pytest status left to set -e": _pytest_status_uncaptured,
 }
 
 
 @pytest.mark.parametrize("mutation", list(LANE_MUTATIONS))
 def test_the_lane_guard_rejects_each_way_of_losing_the_floor(mutation):
-    """N7's mutations, kept as regression tests rather than a one-off run.
+    """Each way of losing the verdict, kept as a regression test.
 
     Each is applied to the REAL script's text, so they follow the script as
     it changes, and each must make the guard fail. The ``else`` case is the
-    review's: the first structural guard collected every line before ``fi``
-    and accepted an ``exit 1`` that only runs when tests DID pass.
+    review of PR #20's: the first structural guard collected every line before
+    ``fi`` and accepted an ``exit 1`` that only runs when the lane was clean.
     """
     lines = LANE_SCRIPT.read_text(encoding="utf-8").splitlines()
     mutated = "\n".join(LANE_MUTATIONS[mutation](lines))
@@ -410,12 +633,444 @@ def test_the_lane_guard_rejects_each_way_of_losing_the_floor(mutation):
 
 
 def test_the_emulator_lane_asserts_the_fixture_app_installed():
-    """Without the app, the end-to-end agent test skips and the gate is empty."""
-    script = LANE_SCRIPT.read_text(encoding="utf-8")
-    assert "pm list packages" in script, (
+    """Without the app, the end-to-end agent test skips and the lane fails on it.
+
+    The skip would now fail the floor anyway; this check is what says WHY.
+    """
+    commands = _shell_commands(LANE_SCRIPT.read_text(encoding="utf-8"))
+    checks = [
+        index
+        for index, (_, words) in enumerate(commands)
+        if words[0] == "if" and any(words[i : i + 2] == ["pm", "path"] for i in range(len(words)))
+    ]
+    assert len(checks) == 1, (
         "the lane no longer asserts the fixture app installed; the end-to-end "
-        "agent test would skip and the gate would pass having tested nothing"
+        "agent test would skip, and the lane would not say why"
     )
+    assert ["exit", "1"] in [words[:2] for words in _then_branch(commands, checks[0])]
+
+
+def _marks_in_tests() -> set[str]:
+    """Every ``pytest.mark.<name>`` applied anywhere under tests/, read from the AST."""
+    used: set[str] = set()
+    for path in sorted((REPO_ROOT / "tests").rglob("test_*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "mark"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "pytest"
+            ):
+                used.add(node.attr)
+    return used
+
+
+def test_every_marker_the_lane_excludes_is_registered_and_still_on_a_test():
+    """A lane exclusion must not outlive what it excludes.
+
+    The two-device test was deselected by node id until a review showed pytest
+    accepts `--deselect` of a test that does not exist, exit 0: rename the test
+    and the stale line excludes nothing, says nothing, and stays. A marker
+    excludes whatever carries it -- and this checks that something still does,
+    and that pyproject.toml registers it.
+    """
+    excluded = _lane_excluded_markers(LANE_SCRIPT.read_text(encoding="utf-8"))
+    assert excluded, "the lane excludes no marker; if that is deliberate, delete this test"
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    registered = {
+        line.split(":", 1)[0].strip()
+        for line in pyproject["tool"]["pytest"]["ini_options"]["markers"]
+    }
+    used = _marks_in_tests()
+    for marker in excluded:
+        assert marker in registered, f"the lane excludes `{marker}`, which is not registered"
+        assert marker in used, f"the lane excludes `{marker}`, which no test carries any more"
+
+
+# ---------------------------------------------------------------------------
+# The retry (T11d): exit 3 only, once, counted.
+# ---------------------------------------------------------------------------
+
+RUNNER_ACTION = "reactivecircus/android-emulator-runner@"
+
+# The one condition the retry may run on: a step output equal to '3'.
+RETRY_CONDITION = re.compile(r"\s*steps\.([\w-]+)\.outputs\.([\w-]+)\s*==\s*'3'\s*")
+
+FULL_SHA_PIN = re.compile(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}")
+
+
+def _lane_steps(workflow: dict) -> list[dict]:
+    return workflow["jobs"]["emulator"]["steps"]
+
+
+def _check_lane_retry(workflow: dict) -> None:
+    """Raise AssertionError unless the lane is retried on exit 3 only, and once."""
+    steps = _lane_steps(workflow)
+    runs = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith(RUNNER_ACTION)
+    ]
+    assert (
+        len(runs) == 2
+    ), f"expected the lane and ONE retry, found {len(runs)} emulator-runner steps"
+    (first_index, first), (retry_index, retry) = runs
+    assert first.get("continue-on-error") is True and retry.get("continue-on-error") is True, (
+        "an attempt fails the job by itself; the verdict step must be the one place "
+        "that decides, or a retried flake is red and nothing counts the retry"
+    )
+    assert retry.get("with") == first.get("with"), "the retry does not run the same lane"
+    attempts = [str((step.get("env") or {}).get("LANE_ATTEMPT")) for step in (first, retry)]
+    assert attempts == ["1", "2"], (
+        f"LANE_ATTEMPT is {attempts}, not ['1', '2']: the retry writes its diagnostics "
+        f"over the evidence of the loss it retried"
+    )
+
+    condition = RETRY_CONDITION.fullmatch(str(retry.get("if", "")))
+    assert condition, (
+        f"the retry runs on {retry.get('if')!r}; it must run on exit status 3 alone "
+        f"(`steps.<id>.outputs.<name> == '3'`) -- a failing test is never retried"
+    )
+    readers = [index for index, step in enumerate(steps) if step.get("id") == condition.group(1)]
+    assert (
+        len(readers) == 1 and first_index < readers[0] < retry_index
+    ), "the step whose output the retry reads is not between the two attempts"
+
+    verdicts = [
+        index
+        for index, step in enumerate(steps)
+        if step.get("id") == "verdict" and step.get("if") == "always()"
+    ]
+    assert len(verdicts) == 1 and verdicts[0] > retry_index, (
+        "no `verdict` step runs always() after the retry: with both attempts "
+        "continuing on error, nothing would fail the job"
+    )
+    uploads = [
+        step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1 and FULL_SHA_PIN.fullmatch(
+        uploads[0]["uses"]
+    ), "the lane's diagnostics are not uploaded by an upload-artifact pinned to a commit"
+    assert "failure()" in str(uploads[0].get("if", "")), "diagnostics are not uploaded on failure"
+
+
+def test_the_lane_is_retried_on_a_lost_device_only_and_once():
+    """T11(d): retry ONLY exit 3, ONLY once. A required check at ~25% flake is not
+    acceptable, and un-requiring it is worse -- six v0.7.0 defects only the lane
+    found -- so a lost device gets one more emulator and a failing test none."""
+    _check_lane_retry(_yaml("emulator.yml"))
+
+
+def _retry_on_any_exit(text: str) -> str:
+    return text.replace(
+        "if: steps.first-exit.outputs.code == '3'", "if: steps.attempt1.outcome == 'failure'"
+    )
+
+
+def _second_retry(text: str) -> str:
+    start = text.index("      - name: Retry the emulator lane")
+    end = text.index("      - name: Lane verdict")
+    retry = text[start:end].replace("id: attempt2", "id: attempt3")
+    return text[:end] + retry + text[end:]
+
+
+def _first_attempt_fails_the_job(text: str) -> str:
+    return text.replace("        continue-on-error: true\n", "", 1)
+
+
+RETRY_MUTATIONS = {
+    "retry on any exit": _retry_on_any_exit,
+    "a second retry": _second_retry,
+    "first attempt fails the job": _first_attempt_fails_the_job,
+}
+
+
+@pytest.mark.parametrize("mutation", list(RETRY_MUTATIONS))
+def test_the_retry_guard_rejects_each_way_of_widening_the_retry(mutation):
+    """Applied to the real workflow's text; each must make the guard fail."""
+    import yaml
+
+    text = (WORKFLOWS / "emulator.yml").read_text(encoding="utf-8")
+    mutated = RETRY_MUTATIONS[mutation](text)
+    assert mutated != text, f"{mutation}: the mutation changed nothing"
+    with pytest.raises(AssertionError):
+        _check_lane_retry(yaml.safe_load(mutated))
+
+
+# ---------------------------------------------------------------------------
+# The lane, run. The guards above read the script; these run it, against stub
+# tools on PATH, and feed what it wrote into the workflow's own steps -- the
+# same chain a CI run goes through, minus the emulator.
+# ---------------------------------------------------------------------------
+
+FIXTURE_PACKAGE = "com.example.composefixture"
+FIXTURE_APK = "tests/fixtures/scaffold/compose/app/build/outputs/apk/debug/app-debug.apk"
+
+# A stand-in pytest that runs the REAL pytest over a scenario module, so the
+# summary line the lane reads is pytest's own output, never a transcript.
+_FAKE_PYTEST = """#!{python}
+import json
+import subprocess
+import sys
+
+with open({log!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(["pytest", *sys.argv[1:]]) + "\\n")
+command = [sys.executable, "-m", "pytest", {scenario!r}, "-v", "--color=no", "-p", "no:cacheprovider"]
+sys.exit(subprocess.run(command, timeout=120, check=False).returncode)
+"""
+
+# Host tools the lane's diagnostics touch. None of them may reach the host:
+# `sudo` and `dmesg` especially.
+_HOST_STUBS = {
+    "timeout": 'shift\nexec "$@"\n',
+    "sudo": '[ "$1" = "-n" ] && shift\nexec "$@"\n',
+    "dmesg": "exit 0\n",
+    "pgrep": "exit 1\n",
+}
+
+# Each outcome as a test that produces it, (decorator, body): the scenario
+# module is run by the real pytest, so every summary term the floor reads --
+# xfailed, xpassed, warnings -- is pytest's own spelling.
+_SCENARIO_TESTS = {
+    "pass": ("", "pass"),
+    "skip": ("", "pytest.skip('precondition missing')"),
+    "fail": ("", "assert False, 'a failing test'"),
+    "xfail": ("@pytest.mark.xfail(reason='a pinned defect')", "assert False"),
+    "xpass": ("@pytest.mark.xfail(reason='a pinned defect')", "pass"),
+    "strict_xpass": ("@pytest.mark.xfail(strict=True, reason='a fixed defect')", "pass"),
+    "warn": ("", "warnings.warn(UserWarning('deprecated'))"),
+}
+
+
+def _run_lane(
+    tmp_path: Path,
+    outcomes: tuple[str, ...],
+    *,
+    device_after: bool,
+    installed: bool = True,
+    attempt: str = "1",
+):
+    """Run a copy of the lane script; return (result, repo copy, toolchain)."""
+    repo = tmp_path / "repo"
+    script = repo / ".github" / "scripts" / LANE_SCRIPT.name
+    script.parent.mkdir(parents=True)
+    script.write_text(LANE_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    apk = repo / FIXTURE_APK
+    apk.parent.mkdir(parents=True)
+    apk.write_bytes(b"")
+
+    scenario = tmp_path / "scenario" / "test_scenario.py"
+    scenario.parent.mkdir()
+    body = ["import warnings", "", "import pytest", ""]
+    for number, outcome in enumerate(outcomes):
+        decorator, statement = _SCENARIO_TESTS[outcome]
+        body += [decorator, f"def test_{number}_{outcome}():", f"    {statement}", ""]
+    scenario.write_text("\n".join(body), encoding="utf-8")
+
+    toolchain = FakeToolchain(tmp_path / "toolchain")
+    toolchain.install(
+        "adb",
+        [
+            # As emulator-5554 answers: `adb get-state` prints `device` (exit
+            # 0), and for a device that is not there prints nothing on stdout
+            # (exit 1); `pm path` exits 0 for an installed package and 1 for
+            # one that is not, and the lane reads only that status.
+            Rule(
+                ("get-state",),
+                stdout="device\n" if device_after else "",
+                exit=0 if device_after else 1,
+            ),
+            Rule(("pm", "path", FIXTURE_PACKAGE), exit=0 if installed else 1),
+        ],
+        default_exit=0,
+    )
+    fake_pytest = toolchain.bin / "pytest"
+    fake_pytest.write_text(
+        _FAKE_PYTEST.format(
+            python=sys.executable, log=str(toolchain.log), scenario=str(scenario.parent)
+        )
+    )
+    fake_pytest.chmod(0o755)
+    for name, stub_body in _HOST_STUBS.items():
+        stub = toolchain.bin / name
+        stub.write_text("#!/bin/sh\n" + stub_body)
+        stub.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/bash", str(script)],
+        env=toolchain.env(LANE_ATTEMPT=attempt),
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    return result, repo, toolchain
+
+
+LANE_SCENARIOS = {
+    # name: (outcomes, device still there after pytest, exit status, what it says)
+    "all passed": (("pass", "pass"), True, 0, "2 passed"),
+    "one skipped": (("pass", "skip"), True, 1, "nothing skipped, failed or errored"),
+    "a test failed": (("pass", "fail"), True, 1, "nothing skipped, failed or errored"),
+    "nothing ran": ((), True, 1, "nothing skipped, failed or errored"),
+    "device gone after pytest": (("pass", "pass"), False, 3, "DEVICE LOST after 2 passed"),
+    "device gone and tests failed": (("pass", "fail"), False, 3, "DEVICE LOST after 1 passed"),
+    # The summary terms that are not skips, failures or errors. An xfail is a
+    # pinned defect, so it may sit beside passes -- but alone it is no pass.
+    "only xfailed": (("xfail",), True, 1, "nothing skipped, failed or errored"),
+    "passed beside an xfail": (("pass", "xfail"), True, 0, "1 xfailed"),
+    "passed beside a non-strict xpass": (("pass", "xpass"), True, 0, "1 xpassed"),
+    "a strict xpass": (("pass", "strict_xpass"), True, 1, "nothing skipped, failed or errored"),
+    "passed with a warning": (("warn",), True, 0, "1 warning"),
+}
+
+
+@pytest.mark.parametrize("scenario", list(LANE_SCENARIOS))
+def test_the_lane_script_under_stub_tools(tmp_path, scenario):
+    """T11's acceptance, run: each outcome exits with the status the workflow reads.
+
+    A device gone after pytest is 3 even when tests failed -- those failures are
+    what a lost device looks like, and 1 would never be retried.
+    """
+    outcomes, device_after, status, says = LANE_SCENARIOS[scenario]
+    result, repo, toolchain = _run_lane(tmp_path, outcomes, device_after=device_after)
+    shown = f"\nstdout:\n{result.stdout[-1500:]}\nstderr:\n{result.stderr[-1500:]}"
+
+    assert result.returncode == status, f"exit {result.returncode}, not {status}{shown}"
+    assert says in result.stdout, f"the lane does not say {says!r}{shown}"
+
+    diagnostics = repo / "emulator-lane-diagnostics" / "attempt-1"
+    assert (diagnostics / "exit-code").read_text().strip() == str(status)
+    captured = sorted(path.name for path in diagnostics.iterdir())
+    if status:
+        expected = {"emulator-lane.log", "adb-devices.txt", "pgrep-emulator.txt", "dmesg-tail.txt"}
+        assert expected <= set(captured), f"a failure left no diagnostics: {captured}"
+    else:
+        assert captured == ["exit-code"], f"a clean run left diagnostics behind: {captured}"
+
+    adb = toolchain.calls("adb")
+    assert ["install", "-r", str(repo / FIXTURE_APK)] in adb, "the built APK was not installed"
+    assert ["get-state"] in adb, "the lane never asked whether the device was still there"
+    (pytest_argv,) = toolchain.calls("pytest")
+    assert pytest_argv[:3] == ["tests/", "-m", "emulator and not two_devices"], pytest_argv
+
+
+def test_the_lane_refuses_to_run_without_the_fixture_app(tmp_path):
+    """No app, no lane: exit 1 saying so, before pytest is run at all."""
+    result, _, toolchain = _run_lane(tmp_path, ("pass",), device_after=True, installed=False)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{FIXTURE_PACKAGE} is not installed" in result.stdout
+    assert toolchain.calls("pytest") == [], "pytest ran without the app it needs"
+
+
+def _run_step(step: dict, tmp_path: Path, cwd: Path, **env: str) -> tuple[int, dict, str]:
+    """Run a workflow step's ``run:`` as GitHub's ``shell: bash`` would.
+
+    Returns (exit status, the outputs it wrote, the step summary it wrote).
+    """
+    assert step.get("shell") == "bash", f"{step.get('id')} does not declare `shell: bash`"
+    assert "${{" not in step["run"], f"{step.get('id')} interpolates an expression into shell"
+    body = tmp_path / f"{step['id']}.sh"
+    body.write_text(step["run"], encoding="utf-8")
+    outputs = tmp_path / f"{step['id']}.outputs"
+    summary = tmp_path / f"{step['id']}.summary"
+    outputs.write_text("")
+    summary.write_text("")
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", str(body)],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "GITHUB_OUTPUT": str(outputs),
+            "GITHUB_STEP_SUMMARY": str(summary),
+            **env,
+        },
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    written = dict(line.split("=", 1) for line in outputs.read_text().splitlines() if "=" in line)
+    return result.returncode, written, summary.read_text()
+
+
+def _step(step_id: str) -> dict:
+    (step,) = [step for step in _lane_steps(_yaml("emulator.yml")) if step.get("id") == step_id]
+    return step
+
+
+def _first_attempt(tmp_path: Path, outcomes, *, device_after: bool) -> tuple[str, bool]:
+    """Run the lane once, then the workflow's reader and its retry condition on it.
+
+    Returns (the exit status the reader handed on, whether the retry runs).
+    """
+    _, repo, _ = _run_lane(tmp_path, outcomes, device_after=device_after)
+    _, outputs, _ = _run_step(_step("first-exit"), tmp_path, repo)
+    condition = RETRY_CONDITION.fullmatch(_step("attempt2")["if"])
+    assert condition and condition.group(1) == "first-exit"
+    return outputs.get(condition.group(2), ""), outputs.get(condition.group(2)) == "3"
+
+
+def test_a_lost_device_is_retried_once_and_counted(tmp_path):
+    """The lane's exit 3, through the workflow's own steps: one retry, `retries: 1`.
+
+    The retry (attempt 2, run here too) decides the job: green if it passed,
+    red if it did not -- and the summary names its exit status, so a second
+    lost device (3) is told apart from a test that failed once the device held.
+    """
+    code, retried = _first_attempt(tmp_path, ("pass", "pass"), device_after=False)
+    assert (code, retried) == ("3", True)
+
+    for device_after, retry_outcome, verdict in ((True, "success", 0), (False, "failure", 1)):
+        root = tmp_path / f"retry-{retry_outcome}"
+        result, repo, _ = _run_lane(root, ("pass",), device_after=device_after, attempt="2")
+        assert (result.returncode == 0) == (retry_outcome == "success"), result.stdout
+
+        status, _, summary = _run_step(
+            _step("verdict"),
+            root,
+            repo,
+            FIRST_OUTCOME="failure",
+            FIRST_EXIT=code,
+            RETRY_OUTCOME=retry_outcome,
+        )
+        lines = summary.splitlines()
+        assert status == verdict, f"a retry that ended {retry_outcome} gave the job {status}"
+        assert "retries: 1" in lines
+        assert f"Retry: {retry_outcome} (exit status {result.returncode})." in lines, lines
+
+
+def test_a_failing_test_is_never_retried(tmp_path):
+    """The lane's exit 1, through the workflow's own steps: no retry, a red job."""
+    code, retried = _first_attempt(tmp_path, ("pass", "fail"), device_after=True)
+    assert (code, retried) == ("1", False)
+
+    status, _, summary = _run_step(
+        _step("verdict"), tmp_path, tmp_path, FIRST_OUTCOME="failure", FIRST_EXIT=code
+    )
+    assert status == 1
+    assert "retries: 0" in summary.splitlines()
+
+
+def test_a_lane_that_never_ran_is_not_retried(tmp_path):
+    """The runner failed before the script ran: no exit-code file, so `none`, not 3."""
+    _, outputs, _ = _run_step(_step("first-exit"), tmp_path, tmp_path)
+    assert outputs == {"code": "none"}
+
+    status, _, summary = _run_step(
+        _step("verdict"), tmp_path, tmp_path, FIRST_OUTCOME="failure", FIRST_EXIT="none"
+    )
+    assert status == 1
+    assert "retries: 0" in summary.splitlines()
+
+
+def test_a_clean_first_attempt_is_green_with_no_retry(tmp_path):
+    status, _, summary = _run_step(_step("verdict"), tmp_path, tmp_path, FIRST_OUTCOME="success")
+    assert status == 0
+    assert "retries: 0" in summary.splitlines()
 
 
 def test_skill_md_does_not_link_nonexistent_docs():

@@ -514,19 +514,11 @@ class Debt(NamedTuple):
 # so paying one off cannot silently re-open the door. Read the current debt off
 # this tuple, not off any prose about it.
 #
-# The one entry left, and it is staged, not permitted. Its wording is the
-# review ruling's, verbatim.
-_SELECTOR_DEBT = (
-    "Only emulator_selector._run retains legacy formatting ({'error': …}, exit 1); "
-    "remove this entry and migrate tests/test_emulator_selector.py in the next PR, "
-    "before v0.8.0."
-)
-
-KNOWN_HELPER_BOUNDARIES: tuple[Debt, ...] = (
-    Debt(
-        "emulator_selector.py", "_run", "(SdkToolError, adb_exec.AdbError)", "_fail", _SELECTOR_DEBT
-    ),
-)
+# Empty, and meant to stay so. The last entry was emulator_selector._run's
+# `except (SdkToolError, adb_exec.AdbError)` -> `_fail`, printing
+# `{"error": ...}` at exit 1; it was deleted in Inc 2 and the error now reaches
+# cli.run. A new entry is a second boundary being let back in.
+KNOWN_HELPER_BOUNDARIES: tuple[Debt, ...] = ()
 
 
 def test_helper_routed_boundaries_are_the_known_debt():

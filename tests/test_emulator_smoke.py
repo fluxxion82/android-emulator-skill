@@ -107,6 +107,7 @@ def test_effective_display_geometry_is_reported(adb: str, live_device: str):
     assert re.search(r"Physical size: \d+x\d+", result.stdout), f"unexpected: {result.stdout!r}"
 
 
+@pytest.mark.two_devices
 def test_omitting_serial_fails_loudly_when_multiple_devices_attached(adb: str):
     """R5 floor: ambiguity must not silently target an arbitrary device.
 

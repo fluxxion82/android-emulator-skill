@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-17T08:20:37Z",
+  "recorded_at": "2026-10-17T08:54:16Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -796,6 +796,34 @@
       "description": "run-as refused for a package that is not installed: 'run-as: unknown package: <pkg>'. This one the marker list does match, which is why the actionable hint appears here and not for run_as_not_an_application -- the contrast is the point.",
       "catches": [],
       "bytes": 42
+    },
+    {
+      "name": "sdkmanager_java_list",
+      "file": "sdkmanager_java_list.txt",
+      "command": "java -Dcom.android.sdklib.toolsdir=<cmdline-tools/latest> -classpath <cmdline-tools/latest>/lib/avdmanager-classpath.jar:<cmdline-tools/latest>/lib/sdklib/tools.sdklib.jar com.android.sdklib.tool.sdkmanager.SdkManagerCli --list",
+      "description": "`sdkmanager --list` from the Java SdkManagerCli (see sdkmanager_java_list_installed). Three sections, not two: `Installed packages:` (with a Location column), `Available Packages:` (capital P, no Location), and `Available Updates:`, whose rows are `ID | Installed | Available` -- packages that are ALREADY installed, so an image listed there must not be read as one to download. Needs the network: it fetches the remote index.",
+      "catches": [
+        "AVD-JAVA-SDKMANAGER"
+      ],
+      "bytes": 115094,
+      "exit_status": 0,
+      "stream": "stdout",
+      "cmdline_tools_revision": "23.0",
+      "java_version": "openjdk version \"17.0.20.1\" 2026-08-18 LTS"
+    },
+    {
+      "name": "sdkmanager_java_list_installed",
+      "file": "sdkmanager_java_list_installed.txt",
+      "command": "java -Dcom.android.sdklib.toolsdir=<cmdline-tools/latest> -classpath <cmdline-tools/latest>/lib/avdmanager-classpath.jar:<cmdline-tools/latest>/lib/sdklib/tools.sdklib.jar com.android.sdklib.tool.sdkmanager.SdkManagerCli --list_installed",
+      "description": "`sdkmanager --list_installed` from the Java SdkManagerCli -- the sdkmanager the CI runner image and every cmdline-tools before 23 run. NOT the format of sdkmanager_list_installed, which is cmdline-tools 23's wrapper handing the command to the Android CLI: this is a pipe table, `Path | Version | Description | Location`, keyed by the SEMICOLON install id (`system-images;android-34;default;arm64-v8a | 4 | ... | system-images/android-34/default/arm64-v8a`), after progress lines (`Loading package information...`, a `[====   ] 25%` bar) that a terminal overwrites in place. A parser that took the wrapper's slash rows as the only format answered 'no system image installed' on the runner that had just booted from one. It also lists an image the wrapper does not (`android-UpsideDownCakePrivacySandbox`), whose API token is not an integer.",
+      "catches": [
+        "AVD-JAVA-SDKMANAGER"
+      ],
+      "bytes": 7432,
+      "exit_status": 0,
+      "stream": "stdout",
+      "cmdline_tools_revision": "23.0",
+      "java_version": "openjdk version \"17.0.20.1\" 2026-08-18 LTS"
     },
     {
       "name": "sdkmanager_list",

@@ -333,6 +333,67 @@ def _emulator_tool() -> str:
     return resolved
 
 
+# The Java class every `sdkmanager` ran until cmdline-tools 23, and the one the
+# GitHub runner image's cmdline-tools still run.
+_JAVA_SDKMANAGER_MAIN = "com.android.sdklib.tool.sdkmanager.SdkManagerCli"
+
+
+def _java_sdkmanager() -> list[str]:
+    """argv prefix that runs the Java ``SdkManagerCli`` directly.
+
+    cmdline-tools 23's ``bin/sdkmanager`` is a shell wrapper that hands the
+    command to the Android CLI, which prints slash paths in whitespace columns
+    (sdkmanager_list*). The Java tool prints a pipe table keyed by the
+    semicolon install id -- a different format, and the one CI and most
+    installs see. 23 still ships the class, in ``lib/sdklib/tools.sdklib.jar``;
+    it is run here the way the pre-23 wrapper ran it, with avdmanager's
+    classpath (the same sdklib) and ``com.android.sdklib.toolsdir`` set so it
+    finds its SDK root.
+    """
+    tools = Path(_sdk_tool("avdmanager")).parents[1]
+    jar = tools / "lib" / "sdklib" / "tools.sdklib.jar"
+    classpath = tools / "lib" / "avdmanager-classpath.jar"
+    for path in (jar, classpath):
+        if not path.exists():
+            raise CaptureError(f"{path} not found; this cmdline-tools has no Java sdkmanager")
+    java_home = os.environ.get("JAVA_HOME")
+    java = str(Path(java_home) / "bin" / "java") if java_home else shutil.which("java")
+    if not java:
+        raise CaptureError("no `java` on PATH and JAVA_HOME is not set")
+    return [
+        java,
+        f"-Dcom.android.sdklib.toolsdir={tools}",
+        "-classpath",
+        f"{classpath}{os.pathsep}{jar}",
+        _JAVA_SDKMANAGER_MAIN,
+    ]
+
+
+def _capture_java_sdkmanager(*args: str, timeout: int) -> Callable[..., Capture]:
+    """A ``capture_with`` that runs the Java sdkmanager with ``args``."""
+
+    def capture(_scratch: Path, _serial: str | None, extra: dict) -> Capture:
+        argv = _java_sdkmanager()
+        tools = Path(argv[1].split("=", 1)[1])
+        properties = (tools / "source.properties").read_text(encoding="utf-8")
+        revision = re.search(r"^Pkg\.Revision=(.+)$", properties, re.MULTILINE)
+        version = subprocess.run(
+            [argv[0], "-version"], capture_output=True, text=True, timeout=30, check=False
+        )
+        extra["cmdline_tools_revision"] = revision.group(1).strip() if revision else None
+        extra["java_version"] = (version.stderr or version.stdout).splitlines()[0]
+        return _run_host([*argv, *args], timeout)
+
+    return capture
+
+
+_JAVA_SDKMANAGER_COMMAND = (
+    "java -Dcom.android.sdklib.toolsdir=<cmdline-tools/latest> -classpath "
+    "<cmdline-tools/latest>/lib/avdmanager-classpath.jar:"
+    f"<cmdline-tools/latest>/lib/sdklib/tools.sdklib.jar {_JAVA_SDKMANAGER_MAIN}"
+)
+
+
 def _make_scripts_importable() -> None:
     """Put the skill's scripts directory on sys.path, for ``common.*``."""
     scripts = (
@@ -2893,11 +2954,13 @@ FIXTURES: list[Fixture] = [
         host_argv=["{sdkmanager}", "--list_installed"],
         post=_scrub_home_paths,
         description=(
-            "`sdkmanager --list_installed`, and the reason AVD creation could "
-            "never work. emulator_create looked for lines starting "
-            "`system-images;` and split them on `|`. sdkmanager prints "
-            "`  system-images/android-34/google_apis/arm64-v8a` -- SLASHES, and "
-            "whitespace-padded columns with no pipe anywhere. So the installed "
+            "`sdkmanager --list_installed` from cmdline-tools 23, whose "
+            "`bin/sdkmanager` is a wrapper that hands the command to the "
+            "Android CLI -- one of TWO formats (the Java tool's is "
+            "sdkmanager_java_list_installed). emulator_create looked for lines "
+            "starting `system-images;` and split them on `|`. This wrapper "
+            "prints `  system-images/android-34/google_apis/arm64-v8a` -- "
+            "SLASHES, and whitespace-padded columns with no pipe. So the installed "
             "list was always empty, every image reported as 'not installed', "
             "and `--api` inference had nothing to infer from. Note also that "
             "the *install* id uses semicolons, so the slashes have to be "
@@ -2913,9 +2976,11 @@ FIXTURES: list[Fixture] = [
         timeout=180,
         catches=("AVD-LIST-IMAGES",),
         description=(
-            "`sdkmanager --list` -- what `--list-images` reads, and inert for "
-            "the same reason its sibling was: it looked for `system-images;` "
-            "lines split on `|`, and sdkmanager prints neither. The rows are "
+            "`sdkmanager --list` from cmdline-tools 23's Android-CLI wrapper "
+            "(the Java tool's is sdkmanager_java_list) -- what `--list-images` "
+            "reads, and inert for the same reason its sibling was: it looked "
+            "for `system-images;` lines split on `|`, and this wrapper prints "
+            "neither. The rows are "
             "the same slash-separated paths in whitespace-padded columns as "
             "`--list_installed`, in TWO sections -- `Installed packages:` then "
             "`Available packages:` -- which is the only thing here that says "
@@ -2925,6 +2990,50 @@ FIXTURES: list[Fixture] = [
             "`android-36.1`, `android-37.2-beta1`, `android-CANARY`): they are "
             "76 of the 325 image rows, so a parser requiring `android-<int>` "
             "silently drops a quarter of the listing."
+        ),
+    ),
+    Fixture(
+        name="sdkmanager_java_list_installed",
+        args=[],
+        command=f"{_JAVA_SDKMANAGER_COMMAND} --list_installed",
+        capture_with=_capture_java_sdkmanager("--list_installed", timeout=120),
+        post=_scrub_home_paths,
+        timeout=120,
+        catches=("AVD-JAVA-SDKMANAGER",),
+        description=(
+            "`sdkmanager --list_installed` from the Java SdkManagerCli -- the "
+            "sdkmanager the CI runner image and every cmdline-tools before 23 "
+            "run. NOT the format of sdkmanager_list_installed, which is "
+            "cmdline-tools 23's wrapper handing the command to the Android "
+            "CLI: this is a pipe table, `Path | Version | Description | "
+            "Location`, keyed by the SEMICOLON install id "
+            "(`system-images;android-34;default;arm64-v8a | 4 | ... | "
+            "system-images/android-34/default/arm64-v8a`), after progress "
+            "lines (`Loading package information...`, a `[====   ] 25%` bar) "
+            "that a terminal overwrites in place. A parser that took the wrapper's "
+            "slash rows as the only format answered 'no system image "
+            "installed' on the runner that had just booted from one. It also "
+            "lists an image the wrapper does not "
+            "(`android-UpsideDownCakePrivacySandbox`), whose API token is not "
+            "an integer."
+        ),
+    ),
+    Fixture(
+        name="sdkmanager_java_list",
+        args=[],
+        command=f"{_JAVA_SDKMANAGER_COMMAND} --list",
+        capture_with=_capture_java_sdkmanager("--list", timeout=240),
+        post=_scrub_home_paths,
+        timeout=240,
+        catches=("AVD-JAVA-SDKMANAGER",),
+        description=(
+            "`sdkmanager --list` from the Java SdkManagerCli (see "
+            "sdkmanager_java_list_installed). Three sections, not two: "
+            "`Installed packages:` (with a Location column), `Available "
+            "Packages:` (capital P, no Location), and `Available Updates:`, "
+            "whose rows are `ID | Installed | Available` -- packages that are "
+            "ALREADY installed, so an image listed there must not be read as "
+            "one to download. Needs the network: it fetches the remote index."
         ),
     ),
     Fixture(

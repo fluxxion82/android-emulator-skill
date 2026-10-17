@@ -71,6 +71,25 @@ jobs:
         # still depends on, and the build failed in CI while succeeding locally.
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Build the Compose fixture app
+        # Built here, before the emulator-runner step boots the emulator; the
+        # lane script only `adb install`s the APK. The build used to run inside
+        # the runner's script, beside a booted emulator, and the lane has
+        # flaked (test_agent_task_e2e's screen map saw 2 of 7 controls;
+        # test_navigator_scroll). That the build was the stressor is a
+        # HYPOTHESIS: this moves it out of the way, and the retry count the
+        # verdict step records is what will say whether it was.
+        #
+        # Through the wrapper, deliberately. CI first ran this with whatever
+        # Gradle `setup-gradle` provisioned -- 9.7.1 -- which removed an
+        # internal API that AGP 8.x still uses, so the build failed with "use
+        # Gradle 9.5" while the same sources built fine locally on 8.13. A
+        # wrapper is the only way CI and a laptop agree on the toolchain.
+        # Sources are committed; build output is gitignored, so this always
+        # builds.
+        working-directory: tests/fixtures/scaffold/compose
+        run: ./gradlew --no-daemon :app:assembleDebug
+
       - name: Enable KVM
         # Without this the emulator falls back to software rendering and the
         # lane takes long enough to hit the job timeout.
@@ -80,8 +99,20 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # The lane runs at most twice, and the lane script's exit status decides,
+      # read from the file it writes (emulator-lane-diagnostics/attempt-N/
+      # exit-code): 3 -- the device was lost -- earns ONE retry, in a new
+      # emulator process on the same AVD (force-avd-creation is false, so the
+      # runner reuses it: a new process, not a wiped device). Any other
+      # failure, a failing or skipped test above all, is final. Both attempts
+      # continue on error so that the verdict step is the one place that
+      # decides the job, and counts the retry.
       - name: Run the emulator lane
+        id: attempt1
+        continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          LANE_ATTEMPT: '1'
         with:
           api-level: 35
           arch: x86_64
@@ -92,11 +123,66 @@ jobs:
           disable-animations: true
           script: .github/scripts/run-emulator-lane.sh
 
-      - name: Summary
-        if: always()
+      - name: Read the first attempt's exit status
+        id: first-exit
+        if: steps.attempt1.outcome == 'failure'
+        shell: bash
         run: |
+          # "none" when the script never ran -- the emulator did not boot. Not
+          # 3, so not retried.
+          code="$(cat emulator-lane-diagnostics/attempt-1/exit-code 2>/dev/null || echo none)"
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          echo "The first attempt exited ${code}."
+
+      - name: Retry the emulator lane (device lost only)
+        id: attempt2
+        if: steps.first-exit.outputs.code == '3'
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          LANE_ATTEMPT: '2'
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: .github/scripts/run-emulator-lane.sh
+
+      - name: Lane verdict
+        id: verdict
+        if: always()
+        shell: bash
+        env:
+          FIRST_OUTCOME: ${{ steps.attempt1.outcome }}
+          FIRST_EXIT: ${{ steps.first-exit.outputs.code }}
+          RETRY_OUTCOME: ${{ steps.attempt2.outcome }}
+        run: |
+          # `retries: N` goes to the step summary on every run, so the flake
+          # rate is a number rather than an impression.
+          retries=0
+          verdict=1
+          retry_exit=""
+          if [[ "${FIRST_OUTCOME}" == "success" ]]; then
+            verdict=0
+          elif [[ "${FIRST_EXIT}" == "3" ]]; then
+            retries=1
+            if [[ "${RETRY_OUTCOME}" == "success" ]]; then
+              verdict=0
+            fi
+            # The retry's own status, so a second lost device (3) is told apart
+            # from a test that failed once the device held (1).
+            retry_exit="$(cat emulator-lane-diagnostics/attempt-2/exit-code 2>/dev/null || echo none)"
+          fi
           {
             echo "## Emulator lane"
+            echo ""
+            echo "retries: ${retries}"
+            echo ""
+            echo "First attempt: ${FIRST_OUTCOME:-not run}${FIRST_EXIT:+ (exit status ${FIRST_EXIT})}."
+            echo "Retry: ${RETRY_OUTCOME:-not run}${retry_exit:+ (exit status ${retry_exit})}."
             echo ""
             echo "Ran \`pytest -m emulator\` against a real API 35 AVD."
             echo ""
@@ -104,3 +190,17 @@ jobs:
             echo "they assert an agent got a usable answer from a device, not that a"
             echo "command was shaped a certain way."
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "${verdict}"
+
+      - name: Upload lane diagnostics
+        # On failure -- and on a retried flake that then passed, because the
+        # first attempt's evidence is the point of counting retries at all.
+        if: failure() || steps.attempt1.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: emulator-lane-diagnostics
+          path: |
+            emulator-lane.log
+            emulator-lane-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

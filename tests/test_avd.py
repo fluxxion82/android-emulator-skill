@@ -535,16 +535,31 @@ def test_routed_create_refuses_an_image_it_cannot_see_and_names_the_ones_it_can(
 
 
 def test_no_recorded_sdkmanager_output_uses_the_pipe_delimited_id_format(recorded):
-    """The ground truth behind the two tests above, stated once.
+    """The ground truth behind the two tests above, stated once -- for ONE sdkmanager.
 
     `system-images;` and `|` are what the original parsers required. Neither
-    appears anywhere in what sdkmanager actually printed on a real machine.
+    appears in what cmdline-tools 23's `sdkmanager` prints: it is a wrapper
+    around the Android CLI. The Java sdkmanager prints exactly that format
+    (next test), so the parser reads both.
     """
     for name in ("sdkmanager_list_installed", "sdkmanager_list"):
         text = recorded.text(name)
         assert "system-images/" in text, name
         assert "system-images;" not in text, name
         assert "|" not in text, name
+
+
+def test_the_java_sdkmanager_prints_the_pipe_delimited_id_format(recorded):
+    """AVD-JAVA-SDKMANAGER: the format the first parser read is real -- in the Java tool.
+
+    Every cmdline-tools before 23, and the CI runner image, run the Java
+    SdkManagerCli. Its rows lead with the semicolon id and split on `|`; the
+    slash path survives only in the installed table's Location column.
+    """
+    for name in ("sdkmanager_java_list_installed", "sdkmanager_java_list"):
+        rows = [line for line in recorded.lines(name) if line.strip().startswith("system-images")]
+        assert rows, name
+        assert all(row.strip().startswith("system-images;") and "|" in row for row in rows), name
 
 
 def test_routed_list_images_reads_the_format_sdkmanager_actually_prints(
@@ -664,7 +679,12 @@ def test_create_then_delete_leaves_the_avd_store_as_it_found_it(emulator_only_de
     creator = emulator_create.EmulatorCreator()
     if not creator.get_avdmanager_path():
         pytest.skip("avdmanager is not installed; nothing to create with")
-    images = creator.list_installed_system_images()
+    # Only an image with an integer API level can be named by `--api`. The Java
+    # sdkmanager also lists android-UpsideDownCakePrivacySandbox (api_level
+    # None), and max() over None and an int raises.
+    images = [
+        image for image in creator.list_installed_system_images() if image["api_level"] is not None
+    ]
     if not images:
         pytest.skip("no system image installed; no AVD can be created")
     if not creator.resolve_device("pixel_7")[0]:

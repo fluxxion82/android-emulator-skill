@@ -175,40 +175,78 @@ def suggest_devices(query: str, devices: list, limit: int = DEVICE_MATCH_SUGGEST
     return scored[:limit]
 
 
-# sdkmanager listings -- both `--list` and `--list_installed` -- print package
-# PATHS with SLASHES in whitespace-padded columns, under section headers:
+# sdkmanager prints its listings in TWO formats, depending on which program
+# answers to the name. Both are recorded, and this one parser reads both.
+#
+# The Java SdkManagerCli -- every cmdline-tools before 23, and the one the CI
+# runner image runs -- prints a pipe table keyed by the SEMICOLON install id
+# (sdkmanager_java_list, sdkmanager_java_list_installed):
+#
+#   Installed packages:
+#     Path                                        | Version | Description | Location
+#     system-images;android-34;default;arm64-v8a  | 4       | ARM 64 ...  | system-images/...
+#   Available Packages:
+#     system-images;android-36;google_apis;x86_64 | 1       | Google APIs ...
+#   Available Updates:
+#     ID       | Installed | Available
+#     emulator | 37.1.11   | 37.2.12
+#
+# cmdline-tools 23's `bin/sdkmanager` is a wrapper that hands the command to
+# the Android CLI, which prints slash PATHS in whitespace-padded columns, with
+# no pipe and no semicolon (sdkmanager_list, sdkmanager_list_installed):
 #
 #   Installed packages:
 #     system-images/android-34/google_apis/arm64-v8a   14.0.0   Google APIs ...
 #   Available packages:
 #     system-images/android-36/google_apis/x86_64      13.0.0   Google APIs ...
 #
-# There is no pipe anywhere and no semicolon anywhere. Both listings were once
-# parsed as `system-images;<id> | <rev> | <desc>`, a format neither command has
-# ever printed, so both matched nothing: creation was impossible (fixed in
-# 19325db) and `--list-images` printed an empty list (this). One parser now, so
-# the two cannot drift apart again. Recorded as sdkmanager_list and
-# sdkmanager_list_installed.
+# Each format has in turn been taken for the only one. The first parser read
+# only the pipe table, so with the wrapper both listings matched nothing
+# (19325db). Its replacement read only the slash rows, under a comment saying
+# the pipe table had never existed -- so on the runner, which had just booted
+# from an installed image, `--list_installed` answered "none installed".
 SYSTEM_IMAGE_PREFIX = "system-images/"
+SYSTEM_IMAGE_ID_PREFIX = "system-images;"
 _INSTALLED_HEADER = "installed packages"
 _AVAILABLE_HEADER = "available packages"
+# The Java tool's third section. Its rows are packages that are ALREADY
+# installed and have a newer version, so none of them is an image to download.
+_UPDATES_HEADER = "available updates"
+_SECTION_HEADERS = (_INSTALLED_HEADER, _AVAILABLE_HEADER, _UPDATES_HEADER)
+
+
+def _system_image_id(line: str) -> str | None:
+    """The semicolon install id a listing row names, or None for any other row.
+
+    A Java row is ``<id> | <version> | ...``; a wrapper row is ``<path>
+    <version> ...`` with slashes, converted to the id that ``sdkmanager '<id>'``
+    and ``avdmanager --package`` take.
+    """
+    stripped = line.strip()
+    if stripped.startswith(SYSTEM_IMAGE_ID_PREFIX):
+        return stripped.split("|", 1)[0].split()[0]
+    if stripped.startswith(SYSTEM_IMAGE_PREFIX):
+        return stripped.split()[0].replace("/", ";")
+    return None
 
 
 def parse_system_images(text: str) -> list:
     """
-    Parse the system-image rows out of an sdkmanager listing.
+    Parse the system-image rows out of an sdkmanager listing, in either format.
 
     Args:
-        text: stdout of ``sdkmanager --list`` or ``sdkmanager --list_installed``.
+        text: stdout of ``sdkmanager --list`` or ``sdkmanager --list_installed``,
+            from the Java tool or from cmdline-tools 23's wrapper.
 
     Returns:
-        One dict per ``system-images/...`` row, in the order printed:
+        One dict per system-image row, in the order printed:
 
         - ``id``: the install id, semicolons not slashes -- what
           ``sdkmanager '<id>'`` and ``avdmanager --package`` want.
         - ``api``: the API token verbatim, minus the ``android-`` prefix.
-          Not always an integer: ``34-ext12``, ``36.1``, ``37.2-beta1`` and
-          ``CANARY`` are all real rows in the recording.
+          Not always an integer: ``34-ext12``, ``36.1``, ``37.2-beta1``,
+          ``CANARY`` and ``UpsideDownCakePrivacySandbox`` are all real rows in
+          the recordings.
         - ``api_level``: that token as an int when it is a bare integer, else
           None. Deliberately strict, because ``create()`` builds its package id
           as ``system-images;android-{api_level};...`` -- calling ``34-ext12``
@@ -216,35 +254,36 @@ def parse_system_images(text: str) -> list:
         - ``variant`` / ``abi``.
         - ``installed``: True while the rows are under ``Installed packages:``.
           ``--list_installed`` prints only that section; ``--list`` prints the
-          installed one first and then everything downloadable.
+          installed one first and then everything downloadable. Rows under the
+          Java tool's ``Available Updates:`` are skipped: they repeat packages
+          already listed as installed.
     """
     images = []
-    installed = True
+    section = _INSTALLED_HEADER
     for line in text.splitlines():
-        stripped = line.strip()
-        lowered = stripped.lower()
-        if lowered.startswith(_AVAILABLE_HEADER):
-            installed = False
+        lowered = line.strip().lower()
+        header = next((name for name in _SECTION_HEADERS if lowered.startswith(name)), None)
+        if header is not None:
+            section = header
             continue
-        if lowered.startswith(_INSTALLED_HEADER):
-            installed = True
+        if section == _UPDATES_HEADER:
             continue
-        if not stripped.startswith(SYSTEM_IMAGE_PREFIX):
+        image_id = _system_image_id(line)
+        if image_id is None:
             continue
-        path = stripped.split()[0]
-        parts = path.split("/")
+        parts = image_id.split(";")
         if len(parts) != 4:
             continue
         _, api_token, variant, abi = parts
         bare_integer = re.fullmatch(r"android-(\d+)", api_token)
         images.append(
             {
-                "id": path.replace("/", ";"),
+                "id": image_id,
                 "api": api_token.removeprefix("android-"),
                 "api_level": int(bare_integer.group(1)) if bare_integer else None,
                 "variant": variant,
                 "abi": abi,
-                "installed": installed,
+                "installed": section == _INSTALLED_HEADER,
             }
         )
     return images
@@ -510,9 +549,10 @@ class EmulatorCreator:
         # Check the image is installed, against the LOCAL package list.
         #
         # This used to run `sdkmanager --list` and ask whether the semicolon
-        # form appeared anywhere in its stdout. It never does: --list prints
-        # paths with slashes. So every image looked missing and no AVD could
-        # ever be created -- with an error telling the user to install
+        # form appeared anywhere in its stdout. With cmdline-tools 23's wrapper
+        # it never does: that --list prints paths with slashes (the Java tool's
+        # does print it -- see parse_system_images). So every image looked
+        # missing and no AVD could be created -- with an error telling the user to install
         # something they already had. `--list` also reaches the network, so the
         # check was slow and failed offline for the wrong reason.
         #

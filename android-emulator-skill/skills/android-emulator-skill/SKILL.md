@@ -128,6 +128,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Checks the image is installed before creating. No `sdkmanager` (or no
      `avdmanager`) is an error naming where it was looked for, exit 1 — never
      an empty listing, and never a create of an image nobody could check
+   - Reads both `sdkmanager` listing formats: the Java tool's pipe table
+     (every cmdline-tools before 23, and CI images) and the slash-path columns
+     of cmdline-tools 23's Android-CLI wrapper. It read only the second, so
+     with the Java tool an installed image was reported as not installed
    - Options: `--device`, `--api`, `--name`, `--abi`, `--variant`, `--list-devices`, `--list-images`, `--json`
 
 8. **emulator_delete.py** ⭐ NEW - Delete AVDs permanently
@@ -385,12 +389,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 25. **emulator_selector.py** - Suggest the best AVD (ranked by running → recently used → latest API → common models); list or boot one.
     - A host with no AVDs ranks nothing and exits 0; a missing or failing
       `emulator` binary exits 1 with the remedy instead of an empty ranking
+      (`{"success": false, "error": ..., "remedy": ...}` under `--json`), and
+      so does a `--boot` that is refused
     - An emulator that will not say which AVD it is gets no "currently running"
       bonus, but is listed with its state (`unidentified_emulators` under
       `--json`, a warning on stderr otherwise) so the ranking never claims a
       completeness it does not have. If the emulators cannot be listed at all,
       the ranking still runs — the AVDs on disk are real — and says so
-      (`warnings` under `--json`)
+      (`warnings` under `--json`). The same goes for an AVD whose `config.ini`
+      cannot be read: it is ranked without its API level and device, and named
+      in `warnings` (and on stderr) with the path that was tried
     - Options: `--suggest`, `--list`, `--boot NAME`, `--headless`, `--count`, `--json`, `--verbose`
 
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
@@ -895,7 +903,7 @@ fixing it forces the marker's removal. None is pinned in v0.7.0. See
     reports itself — `success: false` beside a
     `message` from `keyboard`, `gesture`, `location`, and per operation in
     `status_bar` and `appearance`; `{"error": ...}` from `app_launcher`,
-    `navigator`, the other `emulator_*` refusals and `emulator_selector` — until
+    `navigator` and the other `emulator_*` refusals — until
     each moves to `cli.fail(error, remedy)`. `emulator_create`'s own refusals —
     device not found, no API level, image not installed, a failed create —
     still answer `{"success": false, "message": ...}`, exit 1, pending the same
