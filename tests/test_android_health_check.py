@@ -88,8 +88,12 @@ def _python_stub(version: str, pillow: bool = False) -> str:
 
     ``version`` is "MAJOR.MINOR". ``import PIL`` succeeds only when ``pillow`` is
     True, so callers control whether the Pillow check passes or warns without
-    needing a real Pillow install.
+    needing a real Pillow install. ``"broken"`` is an interpreter that resolves
+    on PATH and cannot run: every invocation exits 42, printing nothing (the
+    final v0.8.0 review's reproduction).
     """
+    if version == "broken":
+        return "exit 42\n"
     major, minor = version.split(".")
     pil_exit = "0" if pillow else "1"
     real_python = shlex.quote(sys.executable)
@@ -132,6 +136,8 @@ def sandbox(tmp_path: Path):
         java_version_stdout: bool = False,
         timeout_log: Path | None = None,
         text: bool = True,
+        tmpdir: Path | None = None,
+        before_list_avds: str = "",
     ) -> subprocess.CompletedProcess:
         if adb:
             _write_stub(
@@ -159,7 +165,7 @@ def sandbox(tmp_path: Path):
                 bin_dir,
                 "emulator",
                 f'if [ "$1" = "-version" ]; then {emulator_version_result}; fi\n'
-                f'if [ "$1" = "-list-avds" ]; then {emulator_list_result}; fi\n'
+                f'if [ "$1" = "-list-avds" ]; then {before_list_avds} {emulator_list_result}; fi\n'
                 "exit 0\n",
             )
         if avdmanager:
@@ -194,10 +200,13 @@ def sandbox(tmp_path: Path):
                 java_body,
             )
         if timeout_log is not None:
+            # One record per call, ended by RS (octal 036): the JSON encoder's argv
+            # is a whole Python program, newlines and all.
             _write_stub(
                 bin_dir,
                 "timeout",
-                f"printf '%s\\n' \"$*\" >> {shlex.quote(str(timeout_log))}\n" 'shift\nexec "$@"\n',
+                f"printf '%s\\036' \"$*\" >> {shlex.quote(str(timeout_log))}\n"
+                'shift\nexec "$@"\n',
             )
 
         env = dict(os.environ)
@@ -209,6 +218,8 @@ def sandbox(tmp_path: Path):
         env["PATH"] = os.pathsep.join([str(bin_dir), *system_paths])
         env["ANDROID_HOME"] = str(tmp_path / "sdk")
         (tmp_path / "sdk").mkdir(exist_ok=True)
+        if tmpdir is not None:
+            env["TMPDIR"] = str(tmpdir)
         return subprocess.run(
             ["bash", str(SCRIPT), *argv],
             capture_output=True,
@@ -335,20 +346,152 @@ def test_java_version_uses_first_combined_output_line(sandbox):
     assert 'java installed (openjdk version "17.0.15")' in result.stdout
 
 
+def _bounded_calls(timeout_log: Path) -> list[str]:
+    """Each call the `timeout` stub saw, as `<seconds> <argv...>`."""
+    return timeout_log.read_text().split("\036")[:-1]
+
+
 def test_external_probes_are_bounded(sandbox, tmp_path):
+    """Every probe runs under the bound, the Python ones too (final v0.8.0 review)."""
     timeout_log = tmp_path / "timeout.log"
 
     result = sandbox(python_version="3.12", pillow=True, timeout_log=timeout_log)
 
     assert result.returncode == 0
-    assert timeout_log.read_text().splitlines() == [
+    assert _bounded_calls(timeout_log) == [
         "10 adb --version",
         "10 emulator -version",
         "10 sdkmanager --version",
         "10 java -version",
+        "10 python3 -c import sys; print(sys.version_info.major)",
+        "10 python3 -c import sys; print(sys.version_info.minor)",
+        "10 python3 -c import PIL",
         "10 adb devices -l",
         "10 emulator -list-avds",
     ]
+
+
+def test_the_json_encoder_is_bounded(sandbox, tmp_path):
+    """A python3 that hangs while encoding must not hang the health check."""
+    timeout_log = tmp_path / "timeout.log"
+
+    result = sandbox("--json", python_version="3.12", pillow=True, timeout_log=timeout_log)
+
+    assert result.returncode == 0, result.stderr[-800:]
+    encoders = [
+        call
+        for call in _bounded_calls(timeout_log)
+        if call.startswith("10 python3 -c ") and "json.dumps" in call
+    ]
+    assert len(encoders) == 1, _bounded_calls(timeout_log)
+    assert json.loads(result.stdout)["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# C5 (final v0.8.0 review): --json must always end in one JSON object. The
+# emitter ran python3 without checking it, so a python3 that resolves on PATH
+# and cannot run left stdout EMPTY at exit 0; and a check record that could not
+# be written was never noticed.
+# ---------------------------------------------------------------------------
+
+
+def _one_object(result: subprocess.CompletedProcess) -> dict:
+    """The run's stdout as the single JSON object --json promises."""
+    shown = f"\nstdout: {result.stdout[-400:]!r}\nstderr: {result.stderr[-800:]!r}"
+    assert len(result.stdout.splitlines()) == 1, f"not one line of JSON on stdout{shown}"
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, dict), payload
+    return payload
+
+
+def test_a_python3_that_cannot_run_still_gets_a_json_report(sandbox):
+    """python3 exits 42 on every call; the Android probes succeed.
+
+    Was: exit 0 and an empty stdout, and the Python check read "Python 0.0
+    found". Now the Bash encoder answers, and the check names the failure.
+    """
+    result = sandbox("--json", python_version="broken")
+
+    assert result.returncode == 0, result.stderr[-800:]
+    payload = _one_object(result)
+    assert payload["success"] is True and len(payload["checks"]) == 10, payload
+    (python,) = [c for c in payload["checks"] if c["name"] == "Checking Python 3.12+..."]
+    assert python["status"] == "warning", python
+    assert "could not run" in python["message"] and "exited 42" in python["message"], python
+    (pillow,) = [c for c in payload["checks"] if c["name"] == "Checking Python Pillow (PIL)..."]
+    assert pillow["status"] == "warning" and "could not run" in pillow["message"], pillow
+    assert "Python 0.0" not in result.stdout + result.stderr
+
+
+def test_a_check_record_that_cannot_be_written_is_one_structured_error(sandbox, tmp_path):
+    """The record directory is gone before the last check is recorded.
+
+    The `emulator -list-avds` stub removes it -- TMPDIR is this test's own
+    directory, so the glob reaches nothing else. A report missing a check
+    would claim a completeness it does not have: one JSON error line, exit 1.
+    """
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    result = sandbox(
+        "--json",
+        pillow=True,
+        tmpdir=tmpdir,
+        before_list_avds='rm -rf "$TMPDIR"/android-health-check-json.*;',
+    )
+
+    assert result.returncode == 1, result.stderr[-800:]
+    payload = _one_object(result)
+    assert payload["success"] is False and payload["remedy"], payload
+    assert "could not write the record of check 10" in payload["error"], payload
+    assert list(tmpdir.iterdir()) == []
+
+
+def test_records_neither_encoder_can_read_are_one_structured_error(sandbox, tmp_path):
+    """python3 cannot run, and the Bash encoder finds the records gone: exit 1, one line.
+
+    The stub deletes the records written so far, keeping their directory, so
+    every write succeeds and only the reads fail.
+    """
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    result = sandbox(
+        "--json",
+        python_version="broken",
+        tmpdir=tmpdir,
+        before_list_avds='rm -f "$TMPDIR"/android-health-check-json.*/check-*;',
+    )
+
+    assert result.returncode == 1, result.stderr[-800:]
+    payload = _one_object(result)
+    assert payload["success"] is False and payload["remedy"], payload
+    assert "could not emit" in payload["error"], payload
+
+
+def test_no_directory_for_the_records_is_one_structured_error(sandbox, tmp_path):
+    """TMPDIR names a directory that does not exist: refused at once, one JSON line."""
+    missing = tmp_path / "missing"
+
+    result = sandbox("--json", pillow=True, tmpdir=missing)
+
+    assert result.returncode == 1, result.stderr[-800:]
+    payload = _one_object(result)
+    assert payload["success"] is False and "TMPDIR" in payload["remedy"], payload
+    assert "could not create a directory for the check records" in payload["error"], payload
+    assert str(missing) in payload["error"], payload
+
+
+def test_a_probe_with_no_temporary_file_says_it_did_not_run(sandbox, tmp_path):
+    """The same shape in the probes: their output files are mktemp'd too.
+
+    The probe used to run against an empty path, and its failure read "exited
+    1 with no error output" -- the tool's, though the tool never ran.
+    """
+    result = sandbox(pillow=True, tmpdir=tmp_path / "missing")
+
+    assert result.returncode == 1, result.stdout[-800:]
+    assert "adb --version failed: did not run, no temporary file" in result.stdout, result.stdout
+    assert "could not list devices (adb devices -l): did not run" in result.stdout
+    assert "with no error output" not in result.stdout
 
 
 def test_missing_adb_is_hard_failure(sandbox):

@@ -1,0 +1,1 @@
+ls: /data/data/com.example.composefixture/shared_prefs: Permission denied

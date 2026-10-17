@@ -433,6 +433,15 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 #### Discovery & Device State (14 scripts) ⭐ NEW
 
 23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
+    - Every probe is bounded (10 s), the Python version and Pillow probes
+      included. A `python3` on PATH that cannot run is a warning saying so,
+      not "Python 0.0 found"
+    - `--json` prints one object on stdout (progress goes to stderr). When
+      `python3` cannot encode it, a Bash encoder does; when the report cannot
+      be emitted at all (no temporary directory, or a check record that could
+      not be written or read back), it exits 1 with one `{"success": false,
+      "error": ..., "remedy": ...}` line — never an empty stdout
+    - Options: `--json`, `--help`
 
 24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
     - An empty inventory at exit 0 means the tools ran and found nothing. A
@@ -495,6 +504,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       written) a name that would land outside the snapshot. A name holding a
       real newline can still add a plain-named entry to a listing (`ls -1b` /
       `find -print0` would end that; not done)
+    - `--export` lists `shared_prefs/` and `databases/` only when the data dir
+      holds them. One it does not hold is named in `absent` — the app has none,
+      a complete export at exit 0, and `databases.json` says `"absent": true`.
+      One it holds whose own listing fails (unreadable, or gone since) is in
+      `unlisted` / `unlisted_dirs` with the device's reason; nothing is written
+      for it, and the export exits 1 naming what was written and where (a
+      failed listing used to read as an empty directory, at exit 0)
     - A failed or incomplete inspection is the shared refusal (`{"success":
       false, "error": ..., "remedy": ...}` under `--json`, carrying what was
       read; a run-as denial's hint is its remedy). No adb, a hang, or a device

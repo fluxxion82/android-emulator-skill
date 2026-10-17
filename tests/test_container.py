@@ -558,7 +558,7 @@ def _export_rules(recorded, prefs_listing: bytes, *cat_rules):
         (("cat",), recorded.text("shared_prefs_settings_xml").encode(), b"", 0),
         (("ls", f"{PKG_DIR}/shared_prefs"), prefs_listing, b"", 0),
         (("ls", f"{PKG_DIR}/databases"), recorded.text("run_as_ls_databases").encode(), b"", 0),
-        (("ls", PKG_DIR), recorded.text("run_as_ls_data_dir").encode(), b"", 0),
+        (("ls", PKG_DIR), recorded.text("run_as_ls_data_dir_seeded").encode(), b"", 0),
     ]
 
 
@@ -1180,19 +1180,21 @@ def test_databases_schema_via_device_sqlite3(monkeypatch, recorded):
 def test_export_writes_snapshot(monkeypatch, tmp_path, recorded):
     """Every listing served here is recorded output, with ONE substitution.
 
-    `export` issues its own `ls -la` against shared_prefs/ and databases/
-    whatever the data-dir listing contains, so the recorded data-dir and
-    databases listings are served verbatim -- no synthesised topology.
+    `export` lists shared_prefs/ and databases/ only when the data-dir
+    listing holds them, so the root is the seeded data dir
+    (run_as_ls_data_dir_seeded, which holds both); it and the databases
+    listing are served verbatim -- no synthesised topology.
 
-    The single derivation is the prefs directory, because no `ls -la` of a
-    shared_prefs/ directory was captured: the recorded databases listing has
-    its `fixture.db-journal` entry renamed to `fixture_settings.xml`, the
-    prefs file the recorder actually read. That leaves a directory holding one
-    `.xml` and one file that is not one, which is what `shared_prefs()` has to
-    filter. Column widths, the `total` header and the `.`/`..` entries are
-    exactly as the device printed them.
+    The single derivation is the prefs directory, kept for the filter it
+    exercises: the recorded databases listing has its `fixture.db-journal`
+    entry renamed to `fixture_settings.xml`, the prefs file the recorder
+    actually read. That leaves a directory holding one `.xml` and one file
+    that is not one, which is what `shared_prefs()` has to filter (the real
+    prefs listing, run_as_ls_shared_prefs, holds only the `.xml`). Column
+    widths, the `total` header and the `.`/`..` entries are exactly as the
+    device printed them.
     """
-    ls_root = recorded.text("run_as_ls_data_dir")
+    ls_root = recorded.text("run_as_ls_data_dir_seeded")
     ls_dbs = recorded.text("run_as_ls_databases")
     ls_prefs = ls_dbs.replace("fixture.db-journal", "fixture_settings.xml")
     prefs_xml = recorded.text("shared_prefs_settings_xml").encode("utf-8")
@@ -1225,7 +1227,7 @@ def _serve_export(monkeypatch, recorded, ls_prefs: str) -> bytes:
 
     Returns the recorded prefs bytes every `cat` answers with.
     """
-    ls_root = recorded.text("run_as_ls_data_dir")
+    ls_root = recorded.text("run_as_ls_data_dir_seeded")
     ls_dbs = recorded.text("run_as_ls_databases")
     prefs_xml = recorded.text("shared_prefs_settings_xml").encode("utf-8")
 
@@ -1326,6 +1328,236 @@ def test_export_refuses_existing_destination(monkeypatch, tmp_path, recorded):
     ok, result = ContainerInspector().export("com.example.app", str(tmp_path))
     assert ok is False
     assert "already exists" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# A sub-listing that fails (final review of v0.8.0, C2). export() took any
+# failed `ls -la` of shared_prefs/ or databases/ for an empty directory: exit 0,
+# `success: true`, `unread: 0`, the databases failure visible only inside the
+# databases.json it wrote. Every listing below is the fixture app's own,
+# recorded for it -- so these runs use its package, and the reason in each
+# recorded failure names exactly the path export() lists.
+# ---------------------------------------------------------------------------
+
+FIXTURE_PKG = "com.example.composefixture"
+FIXTURE_DIR = f"/data/data/{FIXTURE_PKG}"
+
+
+def _recorded_answer(recorded, name: str) -> tuple[bytes, bytes, int]:
+    """(stdout, stderr, exit) of a recorded command, each stream where the manifest says it was."""
+    entry = {f["name"]: f for f in recorded.manifest["fixtures"]}[name]
+    text = recorded.text(name).encode()
+    if entry.get("stream") == "stderr":
+        assert entry["stdout_bytes"] == 0, entry
+        return b"", text, entry["exit_status"]
+    return text, b"", entry.get("exit_status", 0)
+
+
+def _fixture_app_export(tmp_path, monkeypatch, capsys, recorded, *, data_dir, prefs, dbs, text):
+    """Export the fixture app with each listing answered by the named recording.
+
+    Returns (the run, the export directory, the argv of every adb call).
+    """
+    log = _routed_adb(
+        tmp_path,
+        monkeypatch,
+        [
+            (("cat",), recorded.text("shared_prefs_settings_xml").encode(), b"", 0),
+            (("ls", f"{FIXTURE_DIR}/shared_prefs"), *_recorded_answer(recorded, prefs)),
+            (("ls", f"{FIXTURE_DIR}/databases"), *_recorded_answer(recorded, dbs)),
+            (("ls", FIXTURE_DIR), *_recorded_answer(recorded, data_dir)),
+        ],
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    result = _run_main(
+        monkeypatch,
+        capsys,
+        *("--package", FIXTURE_PKG, "--serial", "emulator-5554", "--export", str(out)),
+        *([] if text else ["--json"]),
+    )
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    return result, out / FIXTURE_PKG, calls
+
+
+def test_the_recorded_export_listings_are_what_the_device_printed(recorded):
+    """Anti-vacuity: each failure is exit 1 with its reason on stderr, the listings exit 0.
+
+    run_as_ls_data_dir was recorded before the app first ran, so it names
+    neither directory; the seeded listing names both.
+    """
+    for name, reason in [
+        ("run_as_ls_shared_prefs_unreadable", "shared_prefs: Permission denied"),
+        ("run_as_ls_databases_unreadable", "databases: Permission denied"),
+        ("run_as_ls_shared_prefs_absent", "shared_prefs: No such file or directory"),
+    ]:
+        stdout, stderr, status = _recorded_answer(recorded, name)
+        assert (stdout, status) == (b"", 1), name
+        assert stderr.decode().strip() == f"ls: {FIXTURE_DIR}/{reason}", name
+    seeded = {
+        e["name"] for e in parse_ls_output(recorded.text("run_as_ls_data_dir_seeded")).entries
+    }
+    unseeded = {e["name"] for e in parse_ls_output(recorded.text("run_as_ls_data_dir")).entries}
+    assert {"shared_prefs", "databases"} <= seeded
+    assert not {"shared_prefs", "databases"} & unseeded
+
+
+@pytest.mark.parametrize(
+    ("unreadable", "still_written"),
+    [
+        ("shared_prefs", "databases.json"),
+        ("databases", "shared_prefs/fixture_settings.xml"),
+    ],
+)
+def test_export_refuses_when_a_directory_it_holds_cannot_be_listed(
+    tmp_path, monkeypatch, capsys, recorded, unreadable, still_written
+):
+    """C2: the data dir names the directory, and its listing fails -> exit 1, reason kept.
+
+    What was exported stays exported and is named in the refusal; nothing is
+    written for the directory that could not be listed (no databases.json
+    holding an error).
+    """
+    listings = {"prefs": "run_as_ls_shared_prefs", "dbs": "run_as_ls_databases"}
+    listings["prefs" if unreadable == "shared_prefs" else "dbs"] = (
+        f"run_as_ls_{unreadable}_unreadable"
+    )
+    reason = recorded.text(f"run_as_ls_{unreadable}_unreadable").strip()
+
+    result, snapshot, _ = _fixture_app_export(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        recorded,
+        data_dir="run_as_ls_data_dir_seeded",
+        text=False,
+        **listings,
+    )
+
+    payload = assert_refusal(result, json_mode=True, naming=(f"{unreadable}/",), status=1)
+    assert reason in payload["error"], payload["error"]
+    assert payload["unlisted"] == 1, payload
+    (unlisted,) = payload["unlisted_dirs"]
+    assert (unlisted["name"], unlisted["path"]) == (unreadable, f"{FIXTURE_DIR}/{unreadable}")
+    # The device's words. "Permission denied" matches a run-as denial marker,
+    # but run-as just listed the data dir: no "run-as denied", no debug hint.
+    assert unlisted["error"] == reason, unlisted
+    assert "run-as denied" not in payload["error"] and "debuggable" not in payload["remedy"]
+    written = {str(Path(p).relative_to(snapshot)) for p in payload["files_written"]}
+    assert written == {"file_tree.txt", still_written}, written
+    assert written == _files_under(snapshot)
+    assert payload["destination"] in payload["remedy"]
+
+
+def test_export_refuses_when_neither_directory_can_be_listed(
+    tmp_path, monkeypatch, capsys, recorded
+):
+    """The reviewer's reproduction: both sub-listings fail. Was exit 0, success, unread 0."""
+    result, snapshot, _ = _fixture_app_export(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        recorded,
+        data_dir="run_as_ls_data_dir_seeded",
+        prefs="run_as_ls_shared_prefs_unreadable",
+        dbs="run_as_ls_databases_unreadable",
+        text=False,
+    )
+
+    payload = assert_refusal(result, json_mode=True, naming=("could not list 2",), status=1)
+    assert "shared_prefs/" in payload["error"] and "databases/" in payload["error"]
+    assert [d["name"] for d in payload["unlisted_dirs"]] == ["shared_prefs", "databases"]
+    assert _files_under(snapshot) == {"file_tree.txt"}
+
+
+def test_a_directory_listed_and_then_not_found_is_a_failed_listing(
+    tmp_path, monkeypatch, capsys, recorded
+):
+    """Absent is decided by the data-dir listing, not by a failure's wording.
+
+    The data dir names shared_prefs/, and its listing answers "No such file or
+    directory" (recorded with the directory moved aside): gone between two
+    listings, or never readable -- either way the export did not read it.
+    """
+    reason = recorded.text("run_as_ls_shared_prefs_absent").strip()
+
+    result, _, _ = _fixture_app_export(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        recorded,
+        data_dir="run_as_ls_data_dir_seeded",
+        prefs="run_as_ls_shared_prefs_absent",
+        dbs="run_as_ls_databases",
+        text=False,
+    )
+
+    payload = assert_refusal(result, json_mode=True, naming=("shared_prefs/",), status=1)
+    assert reason in payload["error"]
+    assert payload["absent"] == []
+
+
+@pytest.mark.parametrize("text", [False, True], ids=["json", "text"])
+def test_an_app_with_no_prefs_and_no_databases_exports_and_says_so(
+    tmp_path, monkeypatch, capsys, recorded, text
+):
+    """The data-dir listing names neither directory: a complete export, exit 0, saying so.
+
+    run_as_ls_data_dir is that app -- recorded before the fixture app first
+    ran. Neither directory is listed (the recorded "No such file" would be
+    the answer if one were), and databases.json records the absence instead
+    of an error.
+    """
+    result, snapshot, calls = _fixture_app_export(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        recorded,
+        data_dir="run_as_ls_data_dir",
+        prefs="run_as_ls_shared_prefs_absent",
+        dbs="run_as_ls_shared_prefs_absent",
+        text=text,
+    )
+
+    assert result.returncode == 0, result
+    listed = [call[-1] for call in calls if "ls" in call]
+    assert listed == [FIXTURE_DIR], f"a directory the data dir does not hold was listed: {listed}"
+    assert _files_under(snapshot) == {"file_tree.txt", "databases.json"}
+    databases_json = json.loads((snapshot / "databases.json").read_text(encoding="utf-8"))
+    assert (databases_json["absent"], databases_json["databases"]) == (True, [])
+    if text:
+        assert "shared_prefs/: absent" in result.stdout, result.stdout
+        assert "databases/: absent" in result.stdout, result.stdout
+    else:
+        payload = json.loads(result.stdout)
+        assert payload["success"] is True
+        assert payload["absent"] == ["shared_prefs", "databases"]
+        assert (payload["unlisted"], payload["unlisted_dirs"]) == (0, [])
+
+
+def test_a_failed_listing_in_text_mode_shows_the_partial_export_then_the_refusal(
+    tmp_path, monkeypatch, capsys, recorded
+):
+    """Text mode: what was written on stdout, the reason and remedy on stderr, exit 1."""
+    reason = recorded.text("run_as_ls_shared_prefs_unreadable").strip()
+
+    result, snapshot, _ = _fixture_app_export(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        recorded,
+        data_dir="run_as_ls_data_dir_seeded",
+        prefs="run_as_ls_shared_prefs_unreadable",
+        dbs="run_as_ls_databases",
+        text=True,
+    )
+
+    assert result.returncode == 1, result
+    assert f"Exported {FIXTURE_PKG} -> {snapshot}" in result.stdout
+    assert "1 directory not listed" in result.stdout, result.stdout
+    assert "Error: could not list 1 directory" in result.stderr, result.stderr
+    assert reason in result.stderr
+    assert "Remedy:" in result.stderr
 
 
 # ---------------------------------------------------------------------------

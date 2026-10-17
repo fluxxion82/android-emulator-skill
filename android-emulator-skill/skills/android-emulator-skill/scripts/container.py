@@ -57,6 +57,9 @@ CAT_CACHE_BYTES = env_int("ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES", 8_192, min_va
 # Timeout (seconds) for a single run-as adb invocation.
 RUN_AS_TIMEOUT = env_int("ANDROID_EMU_CONTAINER_TIMEOUT", 30, min_value=5)
 
+# The data-dir subdirectories --export lists, in the order it lists them.
+_EXPORTED_DIRS = ("shared_prefs", "databases")
+
 # Files are read with `adb shell -T` (common.run_as), and the adb client is
 # checked once, before the first read, for a version that honours `-T`.
 
@@ -335,6 +338,15 @@ class ContainerInspector:
         - ``databases.json`` — a listing of databases/ (names + sizes)
         - ``file_tree.txt`` — the top-level data-dir listing
 
+        shared_prefs/ and databases/ are listed only when the data-dir listing
+        holds them. One it does not hold is ``absent``: the app has none, a
+        complete answer, and databases.json says so. One it holds whose own
+        listing then fails is in ``unlisted_dirs`` with the device's reason,
+        and nothing is written for it; the snapshot is incomplete, and main()
+        refuses it with what was written. A failed listing used to be taken
+        for an empty directory -- exit 0, ``success: true``, ``unread: 0`` --
+        and a databases failure was written into databases.json as content.
+
         Args:
             package: App package name.
             dest_dir: Local destination directory (created if absent).
@@ -351,13 +363,21 @@ class ContainerInspector:
         if target.exists():
             return False, {"error": f"Destination already exists: {target}"}
 
+        held = {entry["name"] for entry in listing["entries"]}
+        absent = [name for name in _EXPORTED_DIRS if name not in held]
+        unlisted: list[dict] = []
+
         # The prefs file names come from the app. Every destination is checked
         # before anything is created, so a refusal leaves nothing behind.
-        prefs_ok, prefs = self.shared_prefs(package)
+        prefs: dict = {}
+        if "shared_prefs" not in absent:
+            prefs_ok, prefs = self.shared_prefs(package)
+            if not prefs_ok:
+                unlisted.append(self._unlisted(package, "shared_prefs", prefs))
+                prefs = {}
         prefs_out = target / "shared_prefs"
         prefs_files = [
-            (fname, _host_path_inside(prefs_out, fname))
-            for fname in (prefs["files"] if prefs_ok else [])
+            (fname, _host_path_inside(prefs_out, fname)) for fname in prefs.get("files", [])
         ]
 
         # Before anything is created: a client that cannot read files safely
@@ -390,12 +410,27 @@ class ContainerInspector:
                 dest.write_bytes(raw)
                 written.append(str(dest))
 
-        # databases listing (metadata only — not the binary DBs).
-        db_ok, dbs = self.databases(package)
-        db_json = target / "databases.json"
-        db_payload = dbs if db_ok else {"error": dbs.get("error", "unavailable")}
-        db_json.write_text(json.dumps(db_payload, indent=2), encoding="utf-8")
-        written.append(str(db_json))
+        # databases listing (metadata only — not the binary DBs). A listing that
+        # failed writes no file: databases.json holds a listing, never an error.
+        dbs: dict = {}
+        if "databases" in absent:
+            dbs = {
+                "package": package,
+                "databases_dir": _join_remote(self.data_dir(package), "databases"),
+                "absent": True,
+                "databases": [],
+                "sidecars": [],
+                "total_databases": 0,
+            }
+        else:
+            db_ok, dbs = self.databases(package)
+            if not db_ok:
+                unlisted.append(self._unlisted(package, "databases", dbs))
+                dbs = {}
+        if dbs:
+            db_json = target / "databases.json"
+            db_json.write_text(json.dumps(dbs, indent=2), encoding="utf-8")
+            written.append(str(db_json))
 
         # Every listing export read: an entry refused anywhere leaves the
         # snapshot incomplete, and the result says so.
@@ -411,7 +446,24 @@ class ContainerInspector:
             "rejected_entries": refused,
             "unread": len(unread),
             "unread_entries": unread,
+            "absent": absent,
+            "unlisted": len(unlisted),
+            "unlisted_dirs": unlisted,
         }
+
+    def _unlisted(self, package: str, name: str, failure: dict) -> dict:
+        """A directory the data dir holds whose own listing failed, with the device's reason.
+
+        Its listing goes through run-as, which the data-dir listing just used,
+        so a "denial" here is not run-as refusing the app: `ls: <dir>:
+        Permission denied` matches the denial markers (recorded:
+        run_as_ls_shared_prefs_unreadable). The reason is the device's text,
+        without the "run-as denied" framing or the debuggable-app hint.
+        """
+        error = str(failure.get("error") or "the listing failed")
+        if failure.get("run_as_denied"):
+            error = error.removeprefix(_denial_prefix(package))
+        return {"name": name, "path": _join_remote(self.data_dir(package), name), "error": error}
 
     # === COMMAND EXECUTION ===
 
@@ -573,7 +625,12 @@ def _raise_if_denied(package: str, text: str, returncode: int) -> None:
     lowered = text.lower()
     for marker in _RUN_AS_DENIED_MARKERS:
         if marker in lowered:
-            raise RunAsDeniedError(f"run-as denied for '{package}': {text.strip() or marker}")
+            raise RunAsDeniedError(f"{_denial_prefix(package)}{text.strip() or marker}")
+
+
+def _denial_prefix(package: str) -> str:
+    """How a RunAsDeniedError's message starts; the rest is the device's own text."""
+    return f"run-as denied for '{package}': "
 
 
 def _denied_result(package: str, exc: RunAsDeniedError) -> dict:
@@ -1079,7 +1136,7 @@ def _refuse(action: str, result: dict, args: argparse.Namespace) -> None:
     Raises:
         cli.Failure: always.
     """
-    if not args.json and (result.get("rejected") or result.get("unread")):
+    if not args.json and (result.get("rejected") or result.get("unread") or result.get("unlisted")):
         # A partial answer: what was read, then why it is incomplete.
         _format_text(action, result, args)
     remedy = result.get("remedy") or result.get("hint") or CONTAINER_REMEDY
@@ -1094,15 +1151,17 @@ def _refuse(action: str, result: dict, args: argparse.Namespace) -> None:
 def _report_rejections(success: bool, result: dict) -> tuple[bool, dict]:
     """Make an incomplete answer a failure that still carries the answer.
 
-    Incomplete means an entry was refused (see LsListing) or a listed file
-    could not be read (export's ``unread``). Exit 1 even when only some were:
-    the listing or snapshot is incomplete, and the exit status is the one
-    signal a caller cannot skip. What was read stays in the result, as a
-    failing batch keeps its summary. Everything refused and nothing read is
-    the same failure -- never "No shared_prefs found".
+    Incomplete means an entry was refused (see LsListing), a listed file
+    could not be read (export's ``unread``), or a directory the data dir
+    holds could not be listed (export's ``unlisted``). Exit 1 even when only
+    some were: the listing or snapshot is incomplete, and the exit status is
+    the one signal a caller cannot skip. What was read stays in the result,
+    as a failing batch keeps its summary. Everything refused and nothing read
+    is the same failure -- never "No shared_prefs found".
     """
     refused, unread = result.get("rejected", 0), result.get("unread", 0)
-    if not success or not (refused or unread):
+    unlisted = result.get("unlisted", 0)
+    if not success or not (refused or unread or unlisted):
         return success, result
     reasons = []
     if refused:
@@ -1117,15 +1176,31 @@ def _report_rejections(success: bool, result: dict) -> tuple[bool, dict]:
             f"{entry['name']!r} ({entry['error']})" for entry in result["unread_entries"][:3]
         ) + (", ..." if unread > 3 else "")
         reasons.append(f"could not read {unread} listed file(s): {shown}")
-    return False, {
-        **result,
-        "error": "; ".join(reasons),
-        "remedy": (
-            "Whatever could be read is shown. Inspect the named entries on the device "
-            "(`adb shell run-as <package> ls -lab`); rename or remove a refused one, "
-            "and retry an unread one, to read them here."
-        ),
-    }
+    if unlisted:
+        shown = ", ".join(
+            f"{entry['name']}/ ({entry['error']})" for entry in result["unlisted_dirs"]
+        )
+        reasons.append(
+            f"could not list {unlisted} director{'y' if unlisted == 1 else 'ies'} the data dir "
+            f"holds: {shown}"
+        )
+    remedy = ["Whatever could be read is shown."]
+    if refused or unread:
+        remedy.append(
+            "Inspect the named entries on the device (`adb shell run-as <package> ls -lab`); "
+            "rename or remove a refused one, and retry an unread one, to read them here."
+        )
+    if unlisted:
+        remedy.append(
+            "Find why the named directory cannot be listed (`adb shell run-as <package> "
+            "ls -la <directory>`) and fix it."
+        )
+    if "destination" in result:
+        remedy.append(
+            f"What was exported is in {result['destination']}; export again to a destination "
+            "that does not exist yet."
+        )
+    return False, {**result, "error": "; ".join(reasons), "remedy": " ".join(remedy)}
 
 
 def _print_refused(result: dict, args: argparse.Namespace) -> None:
@@ -1135,6 +1210,8 @@ def _print_refused(result: dict, args: argparse.Namespace) -> None:
             print(f"  refused: {name}")
         for entry in result.get("unread_entries", []):
             print(f"  unread: {entry['name']!r} ({entry['error']})")
+        for entry in result.get("unlisted_dirs", []):
+            print(f"  not listed: {entry['name']}/ ({entry['error']})")
 
 
 def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
@@ -1194,7 +1271,11 @@ def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
     elif action == "export":
         print(f"Exported {result['package']} -> {result['destination']}")
         unread = f", {result['unread']} unread" if result.get("unread") else ""
-        print(f"  {result['total_files']} files written{refused}{unread}")
+        count = result.get("unlisted", 0)
+        unlisted = f", {count} director{'y' if count == 1 else 'ies'} not listed" if count else ""
+        print(f"  {result['total_files']} files written{refused}{unread}{unlisted}")
+        for name in result.get("absent", []):
+            print(f"  {name}/: absent (the data dir holds none)")
         if args.verbose:
             for path in result["files_written"]:
                 print(f"  - {path}")
