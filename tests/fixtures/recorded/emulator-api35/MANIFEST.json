@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-17T08:54:16Z",
+  "recorded_at": "2026-10-17T17:27:42Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -738,6 +738,30 @@
       "bytes": 7
     },
     {
+      "name": "pm_path_absent",
+      "file": "pm_path_absent.txt",
+      "command": "adb shell pm path com.nonexistent.app",
+      "description": "`pm path` of a package that is not installed: nothing on either stream, and exit 1 -- the status is the whole answer, which is why the lane can send stdout to /dev/null.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 1,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "pm_path_installed",
+      "file": "pm_path_installed.txt",
+      "command": "adb shell pm path com.example.composefixture",
+      "description": "`pm path` of an installed package, the emulator lane's check that the fixture app is there before it runs: exit 0, `package:<apk path>` on stdout, stderr empty. The lane reads only the status.",
+      "catches": [],
+      "bytes": 106,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 106,
+      "stderr_bytes": 0
+    },
+    {
       "name": "ps_lifetime",
       "file": "ps_lifetime.txt",
       "command": "adb shell ps -o PID,NAME,ELAPSED -p $(pidof com.android.systemui)",
@@ -833,6 +857,16 @@
       "stderr_bytes": 0
     },
     {
+      "name": "run_as_ls_1_databases",
+      "file": "run_as_ls_1_databases.txt",
+      "command": "adb shell run-as com.example.composefixture ls -1 /data/data/com.example.composefixture/databases",
+      "description": "`ls -1` of databases/, as model_inspector's live mode lists it: one name per line, no `.`/`..`, and the zero-byte fixture.db-journal beside fixture.db -- not the -wal/-shm pair a hand-written listing had in its place.",
+      "catches": [],
+      "bytes": 30,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "run_as_ls_data_dir",
       "file": "run_as_ls_data_dir.txt",
       "command": "adb shell run-as com.example.composefixture ls -la",
@@ -841,12 +875,68 @@
       "bytes": 337
     },
     {
+      "name": "run_as_ls_data_dir_seeded",
+      "file": "run_as_ls_data_dir_seeded.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture",
+      "description": "The fixture app's data dir listed as container.py lists it (by its absolute path), after the app has run: shared_prefs/ and databases/ are in it. run_as_ls_data_dir was recorded before the app first ran and holds neither -- the listing of an app with no prefs and no databases, which --export reports as absent, not as a failure.",
+      "catches": [],
+      "bytes": 480,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "run_as_ls_databases",
       "file": "run_as_ls_databases.txt",
       "command": "adb shell run-as com.example.composefixture ls -la databases",
       "description": "The databases directory. Carries the -journal file alongside the database, which anything listing databases has to not offer as a database.",
       "catches": [],
       "bytes": 252
+    },
+    {
+      "name": "run_as_ls_databases_unreadable",
+      "file": "run_as_ls_databases_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/databases",
+      "description": "run_as_ls_shared_prefs_unreadable for databases/ (`chmod u-r`, then `u+r`). Taking only the read bit leaves the directory searchable, so an open database is undisturbed. --export wrote this failure into databases.json and still reported success.",
+      "catches": [],
+      "bytes": 71,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 71
+    },
+    {
+      "name": "run_as_ls_shared_prefs",
+      "file": "run_as_ls_shared_prefs.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
+      "description": "`ls -la` of the fixture app's shared_prefs/, as --shared-prefs and --export list it: one prefs file, fixture_settings.xml (the file shared_prefs_settings_xml holds).",
+      "catches": [],
+      "bytes": 188,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "run_as_ls_shared_prefs_absent",
+      "file": "run_as_ls_shared_prefs_absent.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
+      "description": "The same listing while shared_prefs/ is moved aside (renamed shared_prefs.aes_moved inside the data dir, and back after): exit 1, stdout EMPTY, `ls: <path>: No such file or directory` on stderr. --export took any failed sub-listing for an empty directory and reported success; a directory the data-dir listing names and this listing cannot find is a listing that failed.",
+      "catches": [],
+      "bytes": 82,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 82
+    },
+    {
+      "name": "run_as_ls_shared_prefs_unreadable",
+      "file": "run_as_ls_shared_prefs_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
+      "description": "The same listing with the owner's read bit taken off shared_prefs/ (`chmod u-r`, and `u+r` after; the app's uid is the owner, so the group's r does not apply): exit 1, stdout EMPTY, `ls: <path>: Permission denied` on stderr. The reviewer's reproduction of export reporting success with unread 0 over exactly this. Note the text matches container.py's run-as denial marker 'permission denied'.",
+      "catches": [],
+      "bytes": 74,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 74
     },
     {
       "name": "run_as_ls_symlink_space",

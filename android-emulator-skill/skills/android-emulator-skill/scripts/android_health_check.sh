@@ -14,7 +14,8 @@
 #
 # Exit codes:
 #   0 - All hard requirements satisfied (warnings allowed)
-#   1 - A hard requirement is missing (adb not on PATH)
+#   1 - A hard requirement is missing (adb not on PATH), or --json could not
+#       emit its report (one {"success": false, "error", "remedy"} line instead)
 
 set -u
 
@@ -71,17 +72,10 @@ This script checks for:
 
 Exit codes:
   0 - All hard requirements satisfied (warnings allowed)
-  1 - A hard requirement is missing (adb not on PATH)
+  1 - A hard requirement is missing (adb not on PATH), or --json could not
+      emit its report (one {"success": false, "error", "remedy"} line instead)
 EOF
     exit 0
-fi
-
-if [ "$JSON_MODE" = true ]; then
-    exec 3>&1
-    exec 1>&2
-    JSON_RECORD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/android-health-check-json.XXXXXX")
-else
-    JSON_RECORD_DIR=""
 fi
 
 # ---------------------------------------------------------------------------
@@ -94,19 +88,35 @@ CURRENT_SECTION=""
 CURRENT_TITLE=""
 FIRST_FAILURE=""
 CHECKS_RECORDED=0
+JSON_RECORD_DIR=""
+# Why a check's record could not be written, if one could not. A report
+# without that check would claim a completeness it does not have, so --json
+# then ends in a refusal instead (see emit_json).
+JSON_RECORD_ERROR=""
 
 record_check() {
     local record_prefix
+    local write_error
 
     if [ "$JSON_MODE" != true ]; then
         return
     fi
 
     record_prefix="$JSON_RECORD_DIR/check-$CHECKS_RECORDED"
-    printf "%s" "$CURRENT_SECTION" >"$record_prefix.section"
-    printf "%s" "$CURRENT_TITLE" >"$record_prefix.name"
-    printf "%s" "$1" >"$record_prefix.status"
-    printf "%s" "$2" >"$record_prefix.message"
+    # In a subshell so a redirection's failure is captured as text; the files
+    # it writes are on disk either way.
+    if ! write_error=$(
+        {
+            printf "%s" "$CURRENT_SECTION" >"$record_prefix.section" &&
+                printf "%s" "$CURRENT_TITLE" >"$record_prefix.name" &&
+                printf "%s" "$1" >"$record_prefix.status" &&
+                printf "%s" "$2" >"$record_prefix.message"
+        } 2>&1
+    ); then
+        if [ -z "$JSON_RECORD_ERROR" ]; then
+            JSON_RECORD_ERROR="could not write the record of check $((CHECKS_RECORDED + 1)) ($2): ${write_error:-no error output}"
+        fi
+    fi
     CHECKS_RECORDED=$((CHECKS_RECORDED + 1))
 }
 
@@ -201,10 +211,12 @@ emit_json_fallback() {
     printf '{"ok":%s,"success":%s,"checks":[' "$ok" "$ok"
     for ((index = 0; index < CHECKS_RECORDED; index++)); do
         record_prefix="$JSON_RECORD_DIR/check-$index"
-        section_value=$(<"$record_prefix.section")
-        name_value=$(<"$record_prefix.name")
-        status_value=$(<"$record_prefix.status")
-        message_value=$(<"$record_prefix.message")
+        # A record that cannot be read fails the whole document; the caller
+        # captures it and discards a partial one.
+        section_value=$(<"$record_prefix.section") || return 1
+        name_value=$(<"$record_prefix.name") || return 1
+        status_value=$(<"$record_prefix.status") || return 1
+        message_value=$(<"$record_prefix.message") || return 1
         printf '%s{"section":"%s","name":"%s","status":"%s","message":"%s"}' \
             "$separator" \
             "$(fallback_json_escape "$section_value")" \
@@ -223,6 +235,13 @@ emit_json_fallback() {
     printf '}\n'
 }
 
+emit_json_unavailable() {
+    # One line built from nothing but its two arguments: for when the checks'
+    # results cannot be emitted at all. The checks' own lines are on stderr.
+    printf '{"ok":false,"success":false,"error":"%s","remedy":"%s"}\n' \
+        "$(fallback_json_escape "$1")" "$(fallback_json_escape "$2")"
+}
+
 cleanup_json_records() {
     local index
     local record_prefix
@@ -235,15 +254,53 @@ cleanup_json_records() {
             "$record_prefix.status" \
             "$record_prefix.message"
     done
-    rmdir "$JSON_RECORD_DIR"
+    if [ -d "$JSON_RECORD_DIR" ]; then
+        rmdir "$JSON_RECORD_DIR"
+    fi
 }
 
+is_json_object() {
+    case "$1" in
+        "{"*"}") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Prints the report on stdout, and returns non-zero when it could not: the
+# caller's exit status must say so. The encoder's output is captured and
+# checked before any of it is printed -- python3 used to be run unchecked, so
+# one that resolved on PATH and could not run left stdout empty at exit 0.
 emit_json() {
-    if command -v python3 >/dev/null 2>&1; then
-        # Read each field as UTF-8 once, replacing every invalid byte with U+FFFD.
-        # Python owns the real JSON encoding so Unicode and control characters
-        # are never interpreted by Bash's locale-sensitive character handling.
-        python3 -c '
+    local document=""
+    local status=0
+    local remedy="The checks ran and their results are on stderr. Fix what the error names, then run the health check again."
+
+    if [ -n "$JSON_RECORD_ERROR" ]; then
+        emit_json_unavailable "could not emit the diagnostics: $JSON_RECORD_ERROR" "$remedy"
+        status=1
+    elif command -v python3 >/dev/null 2>&1 && document=$(emit_json_python) &&
+        is_json_object "$document"; then
+        printf '%s\n' "$document"
+    elif document=$(emit_json_fallback) && is_json_object "$document"; then
+        if command -v python3 >/dev/null 2>&1; then
+            printf "python3 could not encode the report; the Bash encoder did.\n" >&2
+        fi
+        printf '%s\n' "$document"
+    else
+        emit_json_unavailable \
+            "could not emit the diagnostics: neither python3 nor the Bash encoder could read the check records in $JSON_RECORD_DIR" \
+            "$remedy"
+        status=1
+    fi
+    cleanup_json_records
+    return "$status"
+}
+
+emit_json_python() {
+    # Read each field as UTF-8 once, replacing every invalid byte with U+FFFD.
+    # Python owns the real JSON encoding so Unicode and control characters
+    # are never interpreted by Bash's locale-sensitive character handling.
+    run_bounded 10 python3 -c '
 import json
 import sys
 from pathlib import Path
@@ -279,10 +336,6 @@ if not ok:
     payload["remedy"] = "Fix the failed checks above, then run the health check again."
 print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 ' "$JSON_RECORD_DIR" "$CHECKS_RECORDED" "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED"
-    else
-        emit_json_fallback
-    fi
-    cleanup_json_records
 }
 
 run_bounded() {
@@ -301,12 +354,30 @@ CAPTURED_STDOUT=""
 CAPTURED_STDERR=""
 CAPTURED_STATUS=0
 
+# mktemp into the variable named $1. On failure the probe has not run, and
+# says why in CAPTURED_STDERR and CAPTURED_COMBINED. Unchecked, the redirect
+# to an empty path failed, the tool never ran, and the probe read "exited 1
+# with no error output" -- a failure of the tool's that never happened.
+make_temp_file() {
+    local made
+    if ! made=$(mktemp "${TMPDIR:-/tmp}/android-health-check-$2.XXXXXX" 2>&1); then
+        CAPTURED_STATUS=1
+        CAPTURED_STDERR="did not run, no temporary file for its output: ${made:-mktemp failed}"
+        CAPTURED_COMBINED=$CAPTURED_STDERR
+        return 1
+    fi
+    printf -v "$1" "%s" "$made"
+}
+
 run_captured() {
     local stdout_file
     local stderr_file
 
-    stdout_file=$(mktemp "${TMPDIR:-/tmp}/android-health-check-stdout.XXXXXX")
-    stderr_file=$(mktemp "${TMPDIR:-/tmp}/android-health-check-stderr.XXXXXX")
+    make_temp_file stdout_file stdout || return 1
+    if ! make_temp_file stderr_file stderr; then
+        rm -f "$stdout_file"
+        return 1
+    fi
     if run_bounded 10 "$@" >"$stdout_file" 2>"$stderr_file"; then
         CAPTURED_STATUS=0
     else
@@ -328,7 +399,7 @@ CAPTURED_COMBINED=""
 run_combined_captured() {
     local combined_file
 
-    combined_file=$(mktemp "${TMPDIR:-/tmp}/android-health-check-combined.XXXXXX")
+    make_temp_file combined_file combined || return 1
     if run_bounded 10 "$@" >"$combined_file" 2>&1; then
         CAPTURED_STATUS=0
     else
@@ -343,6 +414,19 @@ run_combined_captured() {
     rm -f "$combined_file"
     [ "$CAPTURED_STATUS" -eq 0 ]
 }
+
+if [ "$JSON_MODE" = true ]; then
+    exec 3>&1
+    exec 1>&2
+    # Without somewhere to keep the records there is no report to emit: refuse
+    # now, in the one line --json promises, rather than run the checks for none.
+    if ! JSON_RECORD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/android-health-check-json.XXXXXX" 2>&1); then
+        emit_json_unavailable \
+            "could not create a directory for the check records: ${JSON_RECORD_DIR:-mktemp -d failed with no error output}" \
+            "Point TMPDIR at a writable directory (it is ${TMPDIR:-unset, so /tmp}), then run the health check again." >&3
+        exit 1
+    fi
+fi
 
 printf "%b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$BLUE" "$NC"
 printf "%b  Android Emulator Testing - Environment Health Check%b\n" "$BLUE" "$NC"
@@ -467,21 +551,42 @@ echo ""
 # ---------------------------------------------------------------------------
 section "6/8" "Checking Python 3.12+..."
 PYTHON_BIN=""
+PYTHON_RUNS=false
 if command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="python3"
 elif command -v python >/dev/null 2>&1; then
     PYTHON_BIN="python"
 fi
 
+# One part of the interpreter's version into CAPTURED_STDOUT, bounded like
+# every other probe. Fails, with the reason in CAPTURED_STDERR, unless the
+# interpreter ran and printed a number: a failed probe used to read as
+# "Python 0.0 found".
+python_version_part() {
+    run_captured "$PYTHON_BIN" -c "import sys; print(sys.version_info.$1)" || return 1
+    case "$CAPTURED_STDOUT" in
+        "" | *[!0-9]*)
+            CAPTURED_STDERR="printed ${CAPTURED_STDOUT:-nothing} as its version"
+            return 1
+            ;;
+    esac
+}
+
 if [ -n "$PYTHON_BIN" ]; then
-    PY_MAJOR=$("$PYTHON_BIN" -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo 0)
-    PY_MINOR=$("$PYTHON_BIN" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo 0)
-    # Pure version-gate logic: pass only when version >= 3.12.
-    if [ "$PY_MAJOR" -gt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -ge 12 ]; }; then
-        check_passed "Python $PY_MAJOR.$PY_MINOR (>= 3.12 required)"
+    if python_version_part major && PY_MAJOR=$CAPTURED_STDOUT &&
+        python_version_part minor && PY_MINOR=$CAPTURED_STDOUT; then
+        PYTHON_RUNS=true
+        # Pure version-gate logic: pass only when version >= 3.12.
+        if [ "$PY_MAJOR" -gt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -ge 12 ]; }; then
+            check_passed "Python $PY_MAJOR.$PY_MINOR (>= 3.12 required)"
+        else
+            check_warning "Python $PY_MAJOR.$PY_MINOR found — Python 3.12+ required for skill scripts"
+            hint "Install Python 3.12+: brew install python@3.12"
+        fi
     else
-        check_warning "Python $PY_MAJOR.$PY_MINOR found — Python 3.12+ required for skill scripts"
-        hint "Install Python 3.12+: brew install python@3.12"
+        check_warning "$PYTHON_BIN is on PATH but could not run: $CAPTURED_STDERR"
+        hint "Path: $(command -v "$PYTHON_BIN")"
+        hint "Python 3.12+ is required to run this skill's Python scripts"
     fi
 else
     check_warning "Python 3 not found on PATH"
@@ -494,13 +599,15 @@ echo ""
 # Check 7: Pillow (optional Python dependency)
 # ---------------------------------------------------------------------------
 section "7/8" "Checking Python Pillow (PIL)..."
-if [ -n "$PYTHON_BIN" ]; then
-    if "$PYTHON_BIN" -c "import PIL" >/dev/null 2>&1; then
+if [ "$PYTHON_RUNS" = true ]; then
+    if run_captured "$PYTHON_BIN" -c "import PIL"; then
         check_passed "Pillow (PIL) importable — screenshot resizing available"
     else
         check_warning "Pillow (PIL) not importable — screenshot resizing won't work"
         hint "Install: $PYTHON_BIN -m pip install pillow"
     fi
+elif [ -n "$PYTHON_BIN" ]; then
+    check_warning "Cannot check Pillow ($PYTHON_BIN could not run)"
 else
     check_warning "Cannot check Pillow (Python 3 not available)"
 fi
@@ -512,8 +619,10 @@ echo ""
 section "8/8" "Checking devices and AVDs..."
 if [ "$ADB_MISSING" = false ]; then
     # adb devices -l prints a header line, then one line per device.
-    ADB_ERROR_FILE=$(mktemp "${TMPDIR:-/tmp}/android-health-check-adb.XXXXXX")
-    if ADB_DEVICES_OUTPUT=$(run_bounded 10 adb devices -l 2>"$ADB_ERROR_FILE"); then
+    ADB_ERROR_FILE=""
+    if ! make_temp_file ADB_ERROR_FILE adb; then
+        check_failed "could not list devices (adb devices -l): $CAPTURED_STDERR"
+    elif ADB_DEVICES_OUTPUT=$(run_bounded 10 adb devices -l 2>"$ADB_ERROR_FILE"); then
         DEVICE_LINES=$(printf "%s\n" "$ADB_DEVICES_OUTPUT" | sed '1d' | grep -v '^$' || true)
         if [ -n "$DEVICE_LINES" ]; then
             DEVICE_COUNT=$(printf "%s\n" "$DEVICE_LINES" | wc -l | tr -d ' ')
@@ -537,7 +646,9 @@ if [ "$ADB_MISSING" = false ]; then
         check_failed "could not list devices (adb devices -l): $ADB_ERROR"
         hint "Check that adb can start and retry: adb devices -l"
     fi
-    rm -f "$ADB_ERROR_FILE"
+    if [ -n "$ADB_ERROR_FILE" ]; then
+        rm -f "$ADB_ERROR_FILE"
+    fi
 else
     check_warning "Cannot list devices (adb not available)"
 fi
@@ -584,14 +695,14 @@ if [ "$CHECKS_FAILED" -gt 0 ]; then
     exit 1
 elif [ "$CHECKS_WARNED" -gt 0 ]; then
     printf "%bWARN%b — environment is usable, but address the warnings above for full functionality.\n" "$YELLOW" "$NC"
-    if [ "$JSON_MODE" = true ]; then
-        emit_json >&3
+    if [ "$JSON_MODE" = true ] && ! emit_json >&3; then
+        exit 1
     fi
     exit 0
 else
     printf "%bPASS%b — environment is ready for Android emulator testing.\n" "$GREEN" "$NC"
-    if [ "$JSON_MODE" = true ]; then
-        emit_json >&3
+    if [ "$JSON_MODE" = true ] && ! emit_json >&3; then
+        exit 1
     fi
     exit 0
 fi

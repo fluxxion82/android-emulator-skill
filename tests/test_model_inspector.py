@@ -376,18 +376,29 @@ def test_live_dump_schema_via_device_sqlite3(monkeypatch, recorded):
     assert "/data/data/com.example.app/databases/app.db" in cmd
 
 
-def test_live_list_databases_skips_sidecars(monkeypatch):
-    listing = "app.db\napp.db-wal\napp.db-shm\nother.db\n"
+def test_live_list_databases_skips_sidecars(monkeypatch, recorded):
+    """The fixture app's `ls -1 databases/`, recorded: the journal is not a database.
+
+    This listing was hand-written as `app.db`, `-wal`, `-shm` and `other.db`;
+    the device's is fixture.db beside a zero-byte fixture.db-journal, one name
+    per line with no `.`/`..` (run_as_ls_1_databases).
+    """
+    listing = recorded.text("run_as_ls_1_databases")
+    assert listing.split() == ["fixture.db", "fixture.db-journal"], "the recording changed"
+    captured: list[list[str]] = []
 
     def fake_run(cmd, *args, **kwargs):
+        captured.append(cmd)
         return _completed(cmd, stdout=listing)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    ok, result = LiveInspector().execute("com.example.app")
+    ok, result = LiveInspector().execute("com.example.composefixture")
     assert ok is True
-    assert set(result["databases"]) == {"app.db", "other.db"}
-    assert result["total_databases"] == 2
+    assert result["databases"] == ["fixture.db"]
+    assert result["total_databases"] == 1
+    # The recording is of this command: the same `ls -1` of the same directory.
+    assert captured[0][-3:] == ["ls", "-1", "/data/data/com.example.composefixture/databases"]
 
 
 def test_live_falls_back_to_host_sqlite3(monkeypatch, tmp_path):
