@@ -447,17 +447,33 @@ Available Keys:
     elif args.dismiss:
         success, message = keyboard.dismiss_keyboard()
     else:
-        parser.print_help()
-        sys.exit(1)
+        # The help text goes to stderr, and only in text mode: on stdout it was
+        # the whole of what a --json caller got.
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "no keyboard action given",
+            "Pass one of --type, --key, --button, --keys, --clear, --hide-keyboard or "
+            "--dismiss.",
+        )
+
+    if not success:
+        # Through common.cli: this printed `{"success": false, "message": ...}`
+        # -- no `error`, no remedy -- and the message alone on stdout otherwise.
+        cli.fail(
+            message,
+            "Fix what the error names, then retry; `--help` lists the key and button "
+            "names, and `adb devices` shows whether the device is attached.",
+        )
 
     if args.json:
         import json
 
-        print(json.dumps({"success": success, "message": message}, indent=2))
+        print(json.dumps({"success": True, "message": message}, indent=2))
     else:
         print(message)
 
-    sys.exit(0 if success else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

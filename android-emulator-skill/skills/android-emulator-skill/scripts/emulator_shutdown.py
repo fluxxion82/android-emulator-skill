@@ -278,18 +278,11 @@ def main(argv: list[str] | None = None):
     _run(parser, args)
 
 
-def _fail(error: object, *, json_mode: bool) -> None:
-    """Report a failure the way the caller asked to be spoken to, and exit 1.
-
-    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
-    and got a sentence on stderr has an empty stdout to parse. Same signature as
-    `emulator_boot` and `emulator_selector`, which have had it since #15.
-    """
-    if json_mode:
-        print(json.dumps({"error": str(error)}, indent=2))
-    else:
-        print(f"Error: {error}", file=sys.stderr)
-    sys.exit(1)
+# What to do about a shutdown that did not happen, or could not be verified.
+SHUTDOWN_REMEDY = (
+    "Fix what the error names, then retry. `device_list.py` lists the running "
+    "emulators by serial and AVD name; a shutdown that only needs longer takes --timeout."
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -372,31 +365,35 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         serial, unknown = resolve_target_by_avd_name(args.name)
         if not serial:
             # "I could not look" is reported as itself, never as a confident
-            # "nothing to shut down" (R3).
-            # Through the one failure helper, like every other failing mode:
-            # this path answered `{"success": false, "message": ...}`, so a
-            # caller checking for the documented `error` key found none (F5).
-            _fail(
-                (
-                    f"cannot tell whether '{args.name}' is running: {unknown}"
-                    if unknown
-                    else f"No running emulator found for AVD name '{args.name}'"
-                ),
-                json_mode=args.json,
+            # "nothing to shut down" (R3). Through common.cli, like every other
+            # failing mode: this path answered `{"success": false, "message":
+            # ...}`, then a script-local `{"error": ...}` (F5).
+            if unknown:
+                cli.fail(
+                    f"cannot tell whether '{args.name}' is running: {unknown}",
+                    SHUTDOWN_REMEDY,
+                )
+            cli.fail(
+                f"No running emulator found for AVD name '{args.name}'",
+                "Check the name with `device_list.py` (running emulators and their AVDs); "
+                "an AVD that is not running needs no shutdown.",
             )
 
     # Single device mode
     if not serial:
         if not args.json:
             parser.print_help(file=sys.stderr)
-        _fail("--serial or --name is required (or use --all)", json_mode=args.json)
+        cli.fail(
+            "--serial or --name is required (or use --all)",
+            "Pass --serial emulator-NNNN or --name <avd>; `device_list.py` lists both.",
+        )
 
     shutdown = EmulatorShutdown(serial)
     success, message = shutdown.shutdown(verify=args.verify, timeout_seconds=args.timeout)
 
     if not success:
-        # One failure shape for every mode (F5).
-        _fail(message, json_mode=args.json)
+        # One failure shape for every mode (F5), reported by common.cli.
+        cli.fail(message, SHUTDOWN_REMEDY)
 
     if args.json:
         payload = {

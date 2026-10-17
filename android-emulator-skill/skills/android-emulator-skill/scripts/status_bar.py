@@ -580,10 +580,15 @@ Examples:
         success, message = controller.set_time(args.time)
         results.append({"operation": "time", "success": success, "message": message})
 
-    # Output results
+    # Output results. No operation is a refusal: the help text went to
+    # stdout, the whole of what a --json caller got.
     if not results:
-        parser.print_help()
-        sys.exit(1)
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "no status bar operation given",
+            "Pass --preset, --battery, --wifi, --mobile, --time or --reset.",
+        )
 
     if args.json:
         print(json.dumps({"results": results}, indent=2))

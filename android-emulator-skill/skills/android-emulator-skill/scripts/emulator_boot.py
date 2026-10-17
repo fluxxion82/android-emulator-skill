@@ -14,6 +14,7 @@ Key features:
 """
 
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -107,8 +108,8 @@ class EmulatorBooter:
             # stale `offline` emulator needs the very console that is not
             # answering. Killing the process is the thing that actually works.
             #
-            # Returned only, not also warned on stderr: since F2 every failure
-            # goes out through `_fail`, so a second copy on stderr was the same
+            # Returned only, not also warned on stderr: every failure goes out
+            # through common.cli, so a second copy on stderr was the same
             # sentence twice.
             return False, (
                 f"Refusing to boot {self.avd_name}: {survey.describe_gap()}. "
@@ -326,19 +327,13 @@ def list_avds() -> list:
     return avds
 
 
-def _fail(error: object, *, json_mode: bool) -> None:
-    """Report a failure the way the caller asked to be spoken to, and exit 1.
-
-    ``{"error": ...}`` on stdout under ``--json``: a caller that asked for JSON
-    and got a sentence on stderr has an empty stdout to parse.
-    """
-    if json_mode:
-        import json
-
-        print(json.dumps({"error": str(error)}, indent=2))
-    else:
-        print(f"Error: {error}", file=sys.stderr)
-    sys.exit(1)
+# What to do about a refused or failed boot. The error already says which: a
+# name this host has no AVD for, an emulator that would not start, a survey
+# that could not tell what is running, or readiness that did not arrive.
+BOOT_REMEDY = (
+    "Fix what the error names, then retry. `emulator_boot.py --list-avds` lists the "
+    "AVDs this host has; a boot that only needs longer takes --timeout."
+)
 
 
 def main(argv: list[str] | None = None):
@@ -410,8 +405,6 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
     if args.list_avds:
         avds = list_avds()
         if args.json:
-            import json
-
             print(json.dumps({"avds": avds}, indent=2))
         elif avds:
             print(f"Available AVDs ({len(avds)}):")
@@ -426,8 +419,6 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         succeeded, failed, results = EmulatorBooter.boot_all(headless=args.headless)
         total = succeeded + failed
         if args.json:
-            import json
-
             print(
                 json.dumps(
                     {
@@ -446,11 +437,15 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
             print(f"Boot summary: {succeeded}/{total} succeeded, {failed} failed")
         sys.exit(0 if failed == 0 else 1)
 
-    # Boot mode
+    # Boot mode. The help text goes to stderr, and only in text mode: printed
+    # to stdout it was the whole answer a --json caller got.
     if not args.avd:
-        parser.print_help()
-        print("\nError: --avd is required", file=sys.stderr)
-        sys.exit(1)
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "--avd is required (or --all to boot every AVD, --list-avds to see them)",
+            "Pass --avd <name>; `emulator_boot.py --list-avds` lists the names.",
+        )
 
     booter = EmulatorBooter(args.avd)
     success, message = booter.boot(
@@ -458,9 +453,10 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
     )
 
     if not success:
-        # A refused boot is a failing mode like any other (F2/F5): one shape,
-        # `{"error": ...}` under --json and `Error: ` on stderr otherwise.
-        _fail(message, json_mode=args.json)
+        # A refused boot is a failing mode like any other (F2/F5), reported by
+        # common.cli in its one shape. A script-local `_fail` printed
+        # `{"error": ...}` here, with no `success` and no remedy.
+        cli.fail(message, BOOT_REMEDY)
 
     if args.json:
         print(

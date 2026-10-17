@@ -37,6 +37,8 @@ import device_list
 import emulator_create
 import pytest
 
+from common import cli
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "scripts"
 
@@ -509,12 +511,14 @@ def test_routed_create_refuses_an_image_it_cannot_see_and_names_the_ones_it_can(
     It never does -- the listing uses slashes -- so every image looked missing
     and the error told the user to install what they already had. The fix is
     only worth anything if the refusal now carries the installed set, which is
-    what makes it actionable.
+    what makes it actionable. The refusal is common.cli's, so it is read the
+    way the agent meets it: through ``cli.run``, from the object's ``error``.
     """
     _sdk_double(monkeypatch, recorded)
 
-    assert (
-        avd.main(
+    with pytest.raises(SystemExit) as exited:
+        cli.run(
+            avd.main,
             [
                 "create",
                 "--device",
@@ -526,11 +530,12 @@ def test_routed_create_refuses_an_image_it_cannot_see_and_names_the_ones_it_can(
                 "--name",
                 "aes_probe_unit",
                 "--json",
-            ]
+            ],
         )
-        == 1
-    )
-    message = json.loads(capsys.readouterr().out)["message"]
+    assert exited.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is False and payload["remedy"], payload
+    message = payload["error"]
     assert "system-images;android-34;google_apis;arm64-v8a" in message, message
 
 

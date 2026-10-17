@@ -167,7 +167,7 @@ def test_cli_exits_non_zero_when_refusing_a_physical_device(monkeypatch, capsys,
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code == 1
     assert calls == [], f"an adb command was issued before the refusal: {calls}"
@@ -291,7 +291,7 @@ def test_shutdown_by_name_refuses_when_an_emulator_could_not_be_queried(
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code != 0
     err = capsys.readouterr().err
@@ -315,7 +315,7 @@ def test_shutdown_by_name_when_the_emulators_cannot_be_listed(
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code != 0
     captured = capsys.readouterr()
@@ -340,7 +340,7 @@ def test_shutdown_by_name_still_reports_a_genuine_miss(monkeypatch, capsys, reco
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code != 0
     assert "No running emulator found" in capsys.readouterr().err
@@ -383,7 +383,7 @@ def test_cli_verify_default_and_opt_out(monkeypatch, argv, expected_verify):
     monkeypatch.setattr(emulator_shutdown.sys, "argv", ["emulator_shutdown.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_shutdown.main()
+        cli.run(emulator_shutdown.main)
 
     assert exc.value.code == 0
     assert captured["verify"] is expected_verify

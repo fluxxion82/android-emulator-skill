@@ -473,17 +473,20 @@ Examples:
     if args.list:
         success, message, perms_data = manager.list_app_permissions(args.package)
 
+        if not success:
+            # Through common.cli: under --json this was `{"success": false,
+            # "message": ...}` -- no `error`, no remedy -- and the message alone
+            # on stderr otherwise.
+            cli.fail(
+                message,
+                "Check the package is installed (`app_launcher.py --list`) and the device "
+                "answers (`adb devices`), then retry.",
+            )
         if args.json:
-            if success:
-                print(json.dumps(perms_data, indent=2))
-            else:
-                print(json.dumps({"success": False, "message": message}, indent=2))
-        elif success:
-            print_permissions(args.package, perms_data, args.verbose)
+            print(json.dumps(perms_data, indent=2))
         else:
-            print(message, file=sys.stderr)
-
-        sys.exit(0 if success else 1)
+            print_permissions(args.package, perms_data, args.verbose)
+        sys.exit(0)
 
     # Grant / revoke / reset permissions (shared handling)
     op_map = {

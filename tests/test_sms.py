@@ -36,7 +36,7 @@ from types import SimpleNamespace
 import pytest
 import sms
 
-from common import adb_exec
+from common import adb_exec, cli
 
 SOURCE = Path(sms.__file__).read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
@@ -135,7 +135,7 @@ def _run_main(monkeypatch, argv: list[str]) -> int:
     monkeypatch.setattr(sms.sys, "argv", ["sms.py", *argv])
     monkeypatch.setattr(sms, "resolve_device_identifier", lambda _serial: None)
     with pytest.raises(SystemExit) as exit_info:
-        sms.main()
+        cli.run(sms.main)
     return exit_info.value.code
 
 

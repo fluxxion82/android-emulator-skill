@@ -313,14 +313,15 @@ def test_an_element_whose_bounds_will_not_parse_is_refused_not_tapped(
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code != 0, "acting on an element of unknown position reported success"
     assert not [cmd for cmd in issued if "tap" in cmd], f"a tap was issued anyway: {issued}"
 
-    out = capsys.readouterr().out
-    assert "no usable bounds" in out, out
-    assert "--tap-at" in out, f"the refusal does not say what to do instead: {out}"
+    # common.cli's text refusal: `Error:` then `Remedy:`, on stderr.
+    err = capsys.readouterr().err
+    assert "no usable bounds" in err, err
+    assert "--tap-at" in err, f"the refusal does not say what to do instead: {err}"
 
 
 def test_a_name_that_is_only_a_passive_label_is_refused(monkeypatch, recorded, capsys):
@@ -350,13 +351,13 @@ def test_a_name_that_is_only_a_passive_label_is_refused(monkeypatch, recorded, c
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code != 0
     assert not [cmd for cmd in issued if "tap" in cmd], f"a passive label was tapped: {issued}"
-    out = capsys.readouterr().out
-    assert "passive label" in out, out
-    assert "screen_mapper.py" in out, f"the refusal does not say where to look: {out}"
+    err = capsys.readouterr().err
+    assert "passive label" in err, err
+    assert "screen_mapper.py" in err, f"the refusal does not say where to look: {err}"
 
 
 def test_a_caption_inside_a_control_with_an_id_still_resolves(monkeypatch, recorded):
@@ -453,7 +454,7 @@ def test_a_caption_owned_only_by_a_scroll_container_is_refused(monkeypatch, reco
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code != 0, "a caption owned by nothing tappable reported success"
     assert not [cmd for cmd in issued if "tap" in cmd], f"the screen was tapped anyway: {issued}"

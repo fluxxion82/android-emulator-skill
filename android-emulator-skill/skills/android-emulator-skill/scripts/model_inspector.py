@@ -27,21 +27,23 @@ Three modes (exactly one per run):
 
 3. LIVE (--package PKG [--db NAME]): dump the SQLite schema of a DEBUGGABLE app's
    database via ``adb shell run-as PKG``. Tries on-device ``sqlite3 <db> .schema``
-   first, else pulls the DB bytes via ``adb exec-out run-as PKG cat`` into a temp
-   file and reads the schema with the host's sqlite3 module. Fails clearly when
-   run-as is denied (release / non-debuggable app, or uninstalled package).
+   first, else pulls the DB bytes via ``adb shell -T run-as PKG cat`` into a temp
+   file and reads the schema with the host's sqlite3 module (common.run_as: not
+   ``exec-out``, which answers a missing file with its error text as the bytes).
+   Fails clearly when run-as is denied (release / non-debuggable app, or
+   uninstalled package).
 """
 
 import argparse
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
-from common import cli
+from common import adb_exec, cli, run_as
 from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
+from common.run_as import adb_client_version
 
 # Cap on bytes pulled from a device DB before we give up reading its schema
 # locally. Guards against dumping a multi-megabyte database inline. Override via
@@ -680,23 +682,17 @@ class LiveInspector:
     # --- command execution -------------------------------------------------
 
     def _run_as(self, package: str, argv: list[str]) -> str:
-        """Run ``adb shell run-as <pkg> <argv>`` returning text stdout."""
+        """Run ``adb shell run-as <pkg> <argv>`` returning text stdout.
+
+        adb's own failures -- no adb, a hang, a device that is not there --
+        raise typed (adb_exec.run_argv) and reach common.cli; they were a
+        ``_RunAsError`` reported as the app's refusal, with no remedy.
+        """
         quoted = [quote_for_device_shell(a) for a in argv]
         cmd = build_adb_command(
             "shell", self.serial, "run-as", quote_for_device_shell(package), *quoted
         )
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=RUN_AS_TIMEOUT,
-            )
-        except FileNotFoundError as exc:
-            raise _RunAsError("adb not found on PATH — install Android platform-tools") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise _RunAsError(f"adb timed out after {RUN_AS_TIMEOUT}s") from exc
+        result = adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT, text=True)
 
         combined = f"{result.stdout}\n{result.stderr}"
         _raise_if_denied(package, combined, result.returncode)
@@ -705,23 +701,24 @@ class LiveInspector:
             raise _RunAsError(f"Command failed ({' '.join(argv)}): {detail}")
         return result.stdout
 
-    def _exec_out_run_as(self, package: str, argv: list[str]) -> bytes:
-        """Run ``adb exec-out run-as <pkg> <argv>`` returning raw bytes."""
-        quoted = [quote_for_device_shell(a) for a in argv]
-        cmd = build_adb_command(
-            "exec-out", self.serial, "run-as", quote_for_device_shell(package), *quoted
-        )
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                check=False,
-                timeout=RUN_AS_TIMEOUT,
-            )
-        except FileNotFoundError as exc:
-            raise _RunAsError("adb not found on PATH — install Android platform-tools") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise _RunAsError(f"adb timed out after {RUN_AS_TIMEOUT}s") from exc
+    def _read_run_as(self, package: str, argv: list[str]) -> bytes:
+        """Run ``adb shell -T run-as <pkg> <argv>`` returning stdout's raw bytes.
+
+        Not ``adb exec-out``, which this used: it exits 0 whatever the device
+        command did and delivers the device's stderr on stdout, so a database
+        that is not there was read as the bytes ``cat: ...: No such file or
+        directory`` and reported as "not a valid SQLite database" (recorded:
+        run_as_cat_missing_exec_out). ``shell -T`` returns the status and the
+        reason apart (run_as_cat_missing). See common.run_as.
+
+        Raises:
+            RunAsDeniedError: run-as refused (non-debuggable / missing package).
+            _RunAsError: the device command failed; the message is its stderr.
+            cli.Failure: the adb client is too old to honour ``-T``.
+        """
+        require_adb_for_reads()
+        cmd = run_as.read_command(self.serial, package, argv)
+        result = adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT)
 
         stderr_text = result.stderr.decode("utf-8", errors="replace")
         _raise_if_denied(package, stderr_text, result.returncode)
@@ -735,7 +732,12 @@ class LiveInspector:
         Tries on-device sqlite3 first; falls back to pulling the DB locally and
         reading it with the host's sqlite3 module. A run-as denial propagates as
         ``RunAsDeniedError`` so the caller can build a structured denial result.
+
+        The adb client is checked first, ahead of strategy 1 as well as the
+        pull it guards: the on-device query read the database before the check
+        (Codex review of #29), so "refused before any read" was not true.
         """
+        require_adb_for_reads()
         # Strategy 1: on-device sqlite3 binary (not always present).
         try:
             out = self._run_as(package, ["sqlite3", remote_db, ".schema"])
@@ -746,7 +748,7 @@ class LiveInspector:
 
         # Strategy 2: pull the DB bytes and read its schema with host sqlite3.
         try:
-            raw = self._exec_out_run_as(package, ["cat", remote_db])
+            raw = self._read_run_as(package, ["cat", remote_db])
         except _RunAsError as exc:
             return None, f"Could not read database {name}: {exc}"
 
@@ -786,6 +788,18 @@ def _read_schema_from_bytes(raw: bytes, name: str) -> tuple[str | None, str]:
 
 
 # === RUN-AS HELPERS ========================================================
+
+
+def require_adb_for_reads() -> None:
+    """Refuse, before the database is read, an adb client too old for ``shell -T``.
+
+    Asks through this module's ``adb_client_version`` name (common.run_as's),
+    so a test that replaces it here is the one consulted.
+
+    Raises:
+        cli.Failure: older than ``run_as.MIN_ADB_FOR_READS``, or unreadable.
+    """
+    run_as.require_adb_for_reads(adb_client_version())
 
 
 class _RunAsError(RuntimeError):
@@ -1133,12 +1147,42 @@ Examples:
         _run_live(args)
 
 
+# What to do about a SOURCE or SCHEMA run that found nothing to read.
+OFFLINE_REMEDY = (
+    "Point --source at a directory of Kotlin/Java sources, or --schema at a Room "
+    "exported-schema JSON file or the directory Room writes them to "
+    "(room.schemaLocation)."
+)
+
+# What to do about a LIVE run whose result names no remedy of its own (a run-as
+# refusal carries its hint).
+LIVE_REMEDY = (
+    "Fix what the error names, then retry; `model_inspector.py --package <pkg>` "
+    "without --db lists the databases the app has."
+)
+
+
+def _refuse(result: dict, remedy: str) -> None:
+    """Report a failed run through common.cli (exit 1), keeping what it found.
+
+    These printed ``{"success": false, **result}`` -- an ``error`` and no
+    remedy -- under --json, and the text form decided its own exit. The rest of
+    the result (the package, the database, a denial's hint) rides along in the
+    refusal object.
+
+    Raises:
+        cli.Failure: always.
+    """
+    details = {key: value for key, value in result.items() if key != "error"}
+    cli.fail(str(result.get("error") or "no results found"), remedy, details=details)
+
+
 def _run_source(args: argparse.Namespace) -> None:
     """Dispatch SOURCE mode."""
     inspector = SourceInspector(args.source)
     success, result = inspector.execute()
     if not success:
-        _fail(result, args)
+        _refuse(result, OFFLINE_REMEDY)
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -1152,14 +1196,17 @@ def _run_schema(args: argparse.Namespace) -> None:
     if args.raw:
         ok, raw = inspector.get_raw_entity(args.raw)
         if not ok:
-            print(f"Error: {raw}", file=sys.stderr)
-            sys.exit(1)
+            cli.fail(
+                str(raw),
+                "Pass --raw one of the entities the schema lists (run without --raw to see "
+                "them), by tableName or class name.",
+            )
         print(raw)
         sys.exit(0)
 
     success, result = inspector.execute(show_versions=args.show_versions)
     if not success:
-        _fail(result, args)
+        _refuse(result, OFFLINE_REMEDY)
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -1174,27 +1221,16 @@ def _run_live(args: argparse.Namespace) -> None:
     inspector = LiveInspector(serial=serial)
     success, result = inspector.execute(args.package, db_name=args.db)
 
-    if args.json:
-        print(json.dumps({"success": success, **result}, indent=2))
-        sys.exit(0 if success else 1)
-
     if not success:
-        print(f"Error: {result.get('error', result)}", file=sys.stderr)
-        if result.get("run_as_denied"):
-            print(f"Hint: {result['hint']}", file=sys.stderr)
-        sys.exit(1)
+        # A run-as refusal's hint is its remedy; the text form printed it as a
+        # third line (`Hint:`), the JSON form not at all.
+        _refuse(result, result.get("hint") or LIVE_REMEDY)
 
-    print(format_live(result, verbose=args.verbose))
-    sys.exit(0)
-
-
-def _fail(result: dict, args: argparse.Namespace) -> None:
-    """Emit a failure result and exit non-zero."""
     if args.json:
-        print(json.dumps({"success": False, **result}, indent=2))
+        print(json.dumps({"success": True, **result}, indent=2))
     else:
-        print(f"Error: {result.get('error', 'no results found')}", file=sys.stderr)
-    sys.exit(1)
+        print(format_live(result, verbose=args.verbose))
+    sys.exit(0)
 
 
 if __name__ == "__main__":

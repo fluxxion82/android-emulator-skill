@@ -27,7 +27,7 @@ from pathlib import Path
 import emulator_erase
 import pytest
 
-from common import adb_exec
+from common import adb_exec, cli
 
 
 def _make_avd(avd_home: Path, name: str, with_userdata: bool = True) -> Path:
@@ -443,7 +443,7 @@ def test_cli_reports_an_adb_error_without_a_traceback(monkeypatch, tmp_path, cap
     monkeypatch.setattr(emulator_erase.sys, "argv", ["emulator_erase.py", "--name", "Pixel_9"])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_erase.main()
+        cli.run(emulator_erase.main)
 
     assert exc.value.code == 1
     captured = capsys.readouterr()
@@ -478,7 +478,7 @@ def test_every_failing_json_mode_prints_an_error_document(monkeypatch, tmp_path,
     monkeypatch.setattr(emulator_erase.sys, "argv", ["emulator_erase.py", *argv])
 
     with pytest.raises(SystemExit) as exc:
-        emulator_erase.main()
+        cli.run(emulator_erase.main)
 
     assert exc.value.code != 0
     captured = capsys.readouterr()
@@ -491,10 +491,11 @@ def test_every_failing_json_mode_prints_an_error_document(monkeypatch, tmp_path,
 def test_an_ordinary_failure_answers_with_the_documented_error_key(monkeypatch, tmp_path, capsys):
     """F5: a missing AVD emitted `{"success": false, "message": ...}`.
 
-    SKILL.md promises every failing mode answers `{"error": ...}`, and every
+    SKILL.md promises every failing mode answers with an `error`, and every
     other failing mode did. A caller checking for the documented key found none
     here and read a refusal as a result -- the promise was the wrong half of
-    the pair to trust, so the code moved rather than the documentation.
+    the pair to trust, so the code moved rather than the documentation. It is
+    common.cli's refusal now: `success` false, the `error`, and a `remedy`.
     """
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     monkeypatch.setattr(emulator_erase.EmulatorEraser, "running_check", lambda _self, _name: None)
@@ -503,12 +504,14 @@ def test_an_ordinary_failure_answers_with_the_documented_error_key(monkeypatch, 
     )
 
     with pytest.raises(SystemExit) as exc:
-        emulator_erase.main()
+        cli.run(emulator_erase.main)
 
     assert exc.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert "not found" in payload.get("error", ""), payload
-    assert "success" not in payload, "a failure still reports a success field"
+    assert payload["success"] is False, payload
+    assert payload["remedy"], "the refusal names no remedy"
+    assert "message" not in payload, "the legacy `message` key is back"
 
 
 def test_default_tunables():

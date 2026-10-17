@@ -582,21 +582,31 @@ class AppStateCapture:
             f.write("- `snapshot-summary.json`\n")
 
 
-def _report_failure(args: argparse.Namespace, message: str, partial: dict) -> None:
-    """Report a failed capture and exit 1, in whichever output mode was asked for.
+# What to do about a capture that did not complete. The error names each
+# component that failed; what did arrive is in the snapshot directory.
+CAPTURE_REMEDY = (
+    "Fix what the error names (the device reachable, the app installed), then capture "
+    "again; what did arrive is listed under `partial` (--json) and kept on disk."
+)
+
+
+def _report_failure(message: str, partial: dict) -> None:
+    """Report a failed capture through common.cli (exit 1), handing over what arrived.
+
+    It printed ``{"error", "partial"}`` itself -- no ``success``, no remedy --
+    and exited; the exit-code sweep's payload check (N5) found it. ``partial``
+    still rides in the refusal object, so the agent can use the artifacts that
+    did arrive.
 
     Args:
-        args: Parsed CLI arguments; only ``--json`` is consulted.
         message: What failed, already carrying its remedy.
         partial: The snapshot summary as far as it got; ``{}`` when nothing was
-            written. Handed over rather than discarded so the agent can still
-            use the artifacts that did arrive.
+            written.
+
+    Raises:
+        cli.Failure: always.
     """
-    if args.json:
-        print(json.dumps({"error": message, "partial": partial}, indent=2))
-    else:
-        print(f"Error: {message}", file=sys.stderr)
-    sys.exit(1)
+    cli.fail(message, CAPTURE_REMEDY, details={"partial": partial})
 
 
 def main(argv: list[str] | None = None):
@@ -680,7 +690,7 @@ Examples:
         # X8: a missing component used to be reported under "State captured"
         # with exit 0. What WAS captured is still handed over, under `partial`,
         # so the agent can use the screenshot it did get -- but the run failed.
-        _report_failure(args, message, partial)
+        _report_failure(message, partial)
 
     if args.json:
         print(

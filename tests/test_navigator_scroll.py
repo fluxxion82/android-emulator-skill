@@ -414,13 +414,15 @@ def test_cli_not_found_on_a_scrolling_screen_names_the_flag(monkeypatch, recorde
     monkeypatch.setattr(navigator.sys, "argv", ["navigator.py", "--find-text", TARGET])
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 1
-    out = capsys.readouterr().out
-    assert "Not found" in out
-    assert "this screen scrolls" in out
-    assert "--scroll-to-find" in out
+    # common.cli's text refusal is on stderr (`Error:` / `Remedy:`); it was the
+    # message alone on stdout.
+    err = capsys.readouterr().err
+    assert "Not found" in err
+    assert "this screen scrolls" in err
+    assert "--scroll-to-find" in err
 
 
 def test_cli_default_does_not_scroll(monkeypatch, recorded, capsys):
@@ -430,7 +432,7 @@ def test_cli_default_does_not_scroll(monkeypatch, recorded, capsys):
     monkeypatch.setattr(navigator.sys, "argv", ["navigator.py", "--find-text", TARGET])
 
     with pytest.raises(SystemExit):
-        navigator.main()
+        cli.run(navigator.main)
 
     assert not _swipes(commands), "a lookup without --scroll-to-find moved the app"
 
@@ -445,7 +447,7 @@ def test_cli_scroll_search_finds_below_the_fold(monkeypatch, recorded, capsys):
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -468,12 +470,12 @@ def test_cli_absent_text_says_what_was_tried(monkeypatch, recorded, capsys):
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 1
-    out = capsys.readouterr().out
-    assert "searched 4 screens" in out
-    assert "scrolled to the end" in out
+    err = capsys.readouterr().err
+    assert "searched 4 screens" in err
+    assert "scrolled to the end" in err
 
 
 def test_cli_json_carries_the_search_detail_when_nothing_matched(monkeypatch, recorded, capsys):
@@ -486,7 +488,7 @@ def test_cli_json_carries_the_search_detail_when_nothing_matched(monkeypatch, re
     )
 
     with pytest.raises(SystemExit):
-        navigator.main()
+        cli.run(navigator.main)
 
     payload = json.loads(capsys.readouterr().out)
     search = payload["search"]
@@ -508,7 +510,7 @@ def test_cli_rejects_a_scroll_budget_of_zero(monkeypatch, recorded, capsys):
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 2
     assert "--max-scrolls" in capsys.readouterr().err
@@ -524,11 +526,11 @@ def test_cli_reports_a_screen_that_does_not_scroll(monkeypatch, recorded, capsys
     )
 
     with pytest.raises(SystemExit) as exc:
-        navigator.main()
+        cli.run(navigator.main)
 
     assert exc.value.code == 1
-    out = capsys.readouterr().out
-    assert "nothing on it scrolls" in out
+    err = capsys.readouterr().err
+    assert "nothing on it scrolls" in err
     assert not _swipes(commands)
 
 
@@ -543,7 +545,7 @@ def test_cli_verbose_reports_each_screen(monkeypatch, recorded, capsys):
     )
 
     with pytest.raises(SystemExit):
-        navigator.main()
+        cli.run(navigator.main)
 
     err = capsys.readouterr().err
     assert "screen 1: no match" in err

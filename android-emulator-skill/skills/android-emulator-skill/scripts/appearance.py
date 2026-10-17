@@ -346,22 +346,27 @@ the property write succeeded; it does not guarantee apps re-localize.
 
     # Guard: require at least one action.
     if not any([args.theme, args.text_size, args.font_scale is not None, args.locale, args.reset]):
-        parser.print_help()
-        sys.exit(1)
+        # The help text went to stdout: under --json, the whole answer.
+        if not args.json:
+            parser.print_help(file=sys.stderr)
+        cli.fail(
+            "no appearance change given",
+            "Pass --theme, --text-size, --font-scale, --locale or --reset.",
+        )
 
     # Guard: --reset is incompatible with explicit appearance flags.
     if args.reset and any([args.theme, args.text_size, args.font_scale is not None, args.locale]):
-        print(
-            "Error: --reset cannot be combined with --theme, --text-size, "
-            "--font-scale, or --locale",
-            file=sys.stderr,
+        cli.fail(
+            "--reset cannot be combined with --theme, --text-size, --font-scale, or --locale",
+            "Run --reset on its own, then apply the changes you want.",
         )
-        sys.exit(1)
 
     # Guard: --text-size and --font-scale both set font_scale; reject ambiguity.
     if args.text_size and args.font_scale is not None:
-        print("Error: --text-size and --font-scale are mutually exclusive", file=sys.stderr)
-        sys.exit(1)
+        cli.fail(
+            "--text-size and --font-scale are mutually exclusive",
+            "Pass one: --text-size picks a preset scale, --font-scale an exact one.",
+        )
 
     # Resolve device.
     serial = resolve_device_identifier(args.serial)

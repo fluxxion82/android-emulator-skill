@@ -38,6 +38,7 @@ from app_state_capture import (
 )
 from fake_toolchain import recorded_package_listing, recorded_ps_answer
 
+from common import cli
 from common.device_utils import parse_package_uids
 
 
@@ -370,7 +371,7 @@ def test_unknown_serial_exits_one_with_an_actionable_message(
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        app_state_capture.main()
+        cli.run(app_state_capture.main)
 
     assert excinfo.value.code == 1
     captured = capsys.readouterr()
@@ -408,7 +409,7 @@ def _snapshot_cli(monkeypatch, tmp_path, argv: list[str]):
         ["app_state_capture.py", "--package", "com.example.app", "--output", str(tmp_path), *argv],
     )
     with pytest.raises(SystemExit) as excinfo:
-        app_state_capture.main()
+        cli.run(app_state_capture.main)
     return excinfo.value.code
 
 
@@ -446,13 +447,15 @@ def test_a_failed_log_capture_fails_the_snapshot(monkeypatch, tmp_path, capsys):
 def test_a_partial_snapshot_reports_json_as_an_error_with_what_it_kept(
     monkeypatch, tmp_path, capsys
 ):
-    """`--json` on failure is `{"error": ..., "partial": ...}` -- and the
-    partial half is what makes keeping the artifacts worth anything."""
+    """`--json` on failure is common.cli's refusal carrying `partial` -- and the
+    partial half is what makes keeping the artifacts worth anything. (It was
+    `{"error", "partial"}`, with no `success` and no remedy, until N5.)"""
     code = _snapshot_cli(monkeypatch, tmp_path, ["--logs", "1x", "--json"])
     payload = json.loads(capsys.readouterr().out)
 
     assert code == 1
-    assert set(payload) == {"error", "partial"}, payload
+    assert set(payload) == {"success", "error", "remedy", "partial"}, payload
+    assert payload["success"] is False and payload["remedy"], payload
     assert "screenshot.png" in payload["partial"]["artifacts"]
     assert payload["partial"]["logs"]["captured"] is False
 
@@ -488,11 +491,11 @@ def test_a_screenshot_that_raises_fails_the_snapshot(monkeypatch, tmp_path, caps
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        app_state_capture.main()
+        cli.run(app_state_capture.main)
     payload = json.loads(capsys.readouterr().out)
 
     assert excinfo.value.code == 1
-    assert set(payload) == {"error", "partial"}, payload
+    assert set(payload) == {"success", "error", "remedy", "partial"}, payload
     assert "screenshot" in payload["error"]
     assert "adb devices" in payload["error"], "the error does not name its remedy"
     # The hierarchy came after the screenshot and is still there.
@@ -541,13 +544,13 @@ def test_a_late_device_error_keeps_the_artifacts_already_written(
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        app_state_capture.main()
+        cli.run(app_state_capture.main)
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
     assert excinfo.value.code == 1
     assert "Traceback" not in captured.err
-    assert set(payload) == {"error", "partial"}, payload
+    assert set(payload) == {"success", "error", "remedy", "partial"}, payload
     assert "logs" in payload["error"]
     assert sorted(payload["partial"]["artifacts"]) == [
         "app-info.json",
@@ -800,11 +803,11 @@ def test_the_refusal_fails_the_snapshot_and_keeps_its_remedy(
     )
 
     with pytest.raises(SystemExit) as excinfo:
-        app_state_capture.main()
+        cli.run(app_state_capture.main)
     payload = json.loads(capsys.readouterr().out)
 
     assert excinfo.value.code == 1
-    assert set(payload) == {"error", "partial"}, payload
+    assert set(payload) == {"success", "error", "remedy", "partial"}, payload
     assert APP in payload["error"] and "--no-logs" in payload["error"]
     assert payload["partial"]["logs"]["captured"] is False
     assert "app-logs.txt" not in payload["partial"]["artifacts"]
@@ -853,5 +856,5 @@ def _snapshot_cli_without_output(monkeypatch, argv: list[str]):
     )
     monkeypatch.setattr(sys, "argv", ["app_state_capture.py", "--package", APP, *argv])
     with pytest.raises(SystemExit) as excinfo:
-        app_state_capture.main()
+        cli.run(app_state_capture.main)
     return excinfo.value.code

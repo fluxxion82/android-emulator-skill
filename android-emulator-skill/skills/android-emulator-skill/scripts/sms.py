@@ -482,13 +482,13 @@ def _print_send(success: bool, result: dict, verbose: bool) -> None:
         _warn(f"! {result['baseline_warning']}")
 
     if not result.get("accepted"):
-        _warn(f"x Console rejected the send: {result.get('error', 'unknown error')}")
-        return
+        return  # nothing happened; the refusal (common.cli) says why
 
+    # What did happen is said even when the send failed overall: the console
+    # took the command. Why that is not delivery is the refusal's to say.
     print(f"+ Console accepted `sms send` for {result['to']}")
     if not success:
         print(f"  {ACCEPTED_CAVEAT}")
-        _warn(f"x {result.get('error', 'unknown error')}")
         return
 
     if result["delivered"]:
@@ -503,12 +503,8 @@ def _print_send(success: bool, result: dict, verbose: bool) -> None:
         print(f"  {result.get('note', ACCEPTED_CAVEAT)}")
 
 
-def _print_list(success: bool, result: dict, verbose: bool, limit: int | None = None) -> None:
+def _print_list(result: dict, verbose: bool, limit: int | None = None) -> None:
     """Print the concise ``--list`` report."""
-    if not success:
-        _warn(f"x {result.get('error', 'unknown error')}")
-        return
-
     messages = result["messages"]
     shown = messages if limit is None else messages[:limit]
     print(f"{result['count']} message(s) in {INBOX_URI}, newest first")
@@ -519,11 +515,8 @@ def _print_list(success: bool, result: dict, verbose: bool, limit: int | None = 
         print(f"  ... {len(messages) - len(shown)} older (--limit to show more)")
 
 
-def _print_otp(success: bool, result: dict, verbose: bool) -> None:
+def _print_otp(result: dict, verbose: bool) -> None:
     """Print the concise ``--otp`` report."""
-    if not success:
-        _warn(f"x {result.get('error', 'unknown error')}")
-        return
     message = result["message"]
     print(result["code"])
     print(f"  from {message['address']}: {message['body']!r}")
@@ -538,18 +531,49 @@ def _truncate(text: str, width: int = 60) -> str:
     return collapsed if len(collapsed) <= width else f"{collapsed[: width - 1]}..."
 
 
+# What to do about a failed read or send. The error names the provider's
+# answer, the console's refusal, or the read-back that never saw the message.
+SMS_REMEDY = (
+    "Fix what the error names, then retry; `sms.py --list` reads the inbox as it is now. "
+    "Sending needs a running emulator: a physical device has no console."
+)
+
+
 def _emit(success: bool, result: dict, args: argparse.Namespace) -> None:
-    """Render a result as JSON or as the concise human report."""
+    """Render a result as JSON or as the concise human report.
+
+    On a failure this prints only what did happen (a send the console
+    accepted); the failure itself is :func:`_refuse`'s.
+    """
     if args.json:
-        print(json.dumps({"success": success, **result}, indent=2))
+        if success:
+            print(json.dumps({"success": True, **result}, indent=2))
         return
     action = result.get("action")
     if action == "send":
         _print_send(success, result, args.verbose)
+    elif not success:
+        return
     elif action == "otp":
-        _print_otp(success, result, args.verbose)
+        _print_otp(result, args.verbose)
     else:
-        _print_list(success, result, args.verbose, args.limit)
+        _print_list(result, args.verbose, args.limit)
+
+
+def _refuse(result: dict) -> None:
+    """Report a failed read or send through common.cli (exit 1), keeping what it found.
+
+    Each printer printed its own `x <error>` line and ``main`` exited 1; under
+    --json the object had an ``error`` and no remedy -- and with no adb at all,
+    nothing else either (the absent-toolchain sweep, N5). What the action did
+    find (``accepted``, ``delivered``, the provider's stderr) rides along in
+    the refusal object.
+
+    Raises:
+        cli.Failure: always.
+    """
+    details = {key: value for key, value in result.items() if key != "error"}
+    cli.fail(str(result.get("error") or "unknown error"), SMS_REMEDY, details=details)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -645,7 +669,9 @@ def main(argv: list[str] | None = None) -> None:
         success, result = tester.list_inbox()
 
     _emit(success, result, args)
-    sys.exit(0 if success else 1)
+    if not success:
+        _refuse(result)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,6 @@ documented, safe mechanism and is what real debugging workflows rely on.
 """
 
 import argparse
-import functools
 import json
 import re
 import subprocess
@@ -36,11 +35,16 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-from common import cli
-from common.adb_exec import run_adb
+from common import adb_exec, cli, run_as
 from common.cache_utils import ProgressiveCache
 from common.device_utils import build_adb_command, quote_for_device_shell, resolve_device_identifier
 from common.env_config import env_int
+
+# The shell -T transport and its client guard moved to common.run_as when
+# model_inspector became the second script to read app files. Both names are
+# bound here: `adb_client_version` is what require_adb_for_reads asks (and what
+# a test replaces), `parse_adb_version` is where the tests found it.
+from common.run_as import adb_client_version, parse_adb_version  # noqa: F401
 
 # Cap on bytes pulled by --cat before truncation. Guards against dumping a
 # multi-megabyte database/blob inline. Override via the ANDROID_EMU_ prefix.
@@ -53,17 +57,8 @@ CAT_CACHE_BYTES = env_int("ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES", 8_192, min_va
 # Timeout (seconds) for a single run-as adb invocation.
 RUN_AS_TIMEOUT = env_int("ANDROID_EMU_CONTAINER_TIMEOUT", 30, min_value=5)
 
-# Files are read with `adb shell -T`, which adb has understood since 1.0.36
-# (platform-tools 24). An older CLIENT does not refuse it: it forwards `-T` to
-# the device shell as command text and exits 0 after printing the shell's
-# error, and _read_run_as, which decides by exit status, would take that error
-# for the file. So the client is checked once, before the first read.
-MIN_ADB_FOR_READS = (1, 0, 36)
-_ADB_VERSION_LINE = re.compile(r"^Android Debug Bridge version (\d+)\.(\d+)\.(\d+)\s*$", re.M)
-ADB_UPDATE_REMEDY = (
-    'Update Android SDK platform-tools (sdkmanager "platform-tools") so `adb version` '
-    "reports 1.0.36 or later, and make sure that adb is the one on PATH."
-)
+# Files are read with `adb shell -T` (common.run_as), and the adb client is
+# checked once, before the first read, for a version that honours `-T`.
 
 # Markers adb/run-as emit when run-as is refused. Matched case-insensitively as
 # substrings; the platform wording has drifted across API levels.
@@ -470,15 +465,11 @@ class ContainerInspector:
 
         Raises:
             RunAsDeniedError / _RunAsError as in :meth:`_run_as`.
-            cli.Failure: the adb client is older than ``MIN_ADB_FOR_READS``,
+            cli.Failure: the adb client is older than ``run_as.MIN_ADB_FOR_READS``,
                 or its version cannot be read (see :func:`require_adb_for_reads`).
         """
         require_adb_for_reads()
-        quoted = [quote_for_device_shell(a) for a in argv]
-        cmd = build_adb_command(
-            "shell", self.serial, "-T", "run-as", quote_for_device_shell(package), *quoted
-        )
-        result = self._invoke(cmd)
+        result = self._invoke(run_as.read_command(self.serial, package, argv))
         stderr_text = result.stderr.decode("utf-8", errors="replace")
         _raise_if_denied(package, stderr_text, result.returncode)
         if result.returncode != 0:
@@ -486,24 +477,24 @@ class ContainerInspector:
         return result.stdout
 
     def _invoke(self, cmd: list[str]) -> subprocess.CompletedProcess:
-        """Run an adb command, capturing raw bytes, with consistent error mapping."""
-        try:
-            return subprocess.run(
-                cmd,
-                capture_output=True,
-                check=False,
-                timeout=RUN_AS_TIMEOUT,
-            )
-        except FileNotFoundError as exc:
-            raise _RunAsError("adb not found on PATH — install Android platform-tools") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise _RunAsError(f"adb timed out after {RUN_AS_TIMEOUT}s") from exc
+        """Run an adb command for raw bytes; adb's own failures raise typed.
+
+        A missing adb, a hang and a device that is not there used to become
+        ``_RunAsError`` -- "Command failed (ls -la ...): adb: device ... not
+        found" at exit 1, with no remedy -- and so read as a refusal by the app.
+        They are not the app's: they reach common.cli as adb_exec's errors
+        (exit 3 for the device), the way every other script reports them.
+        """
+        return adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT)
 
     def _dump_schema(self, package: str, remote_db: str, name: str) -> tuple[str | None, str]:
         """Return (schema_text, method) or (None, error_message).
 
         Tries on-device sqlite3 first; falls back to pulling the DB locally.
+        The adb client is checked before either, so no read of the database
+        happens ahead of it (the sqlite3 query did; Codex review of #29).
         """
+        require_adb_for_reads()
         # Strategy 1: on-device sqlite3.
         try:
             out = self._run_as(package, ["sqlite3", remote_db, ".schema"])
@@ -550,52 +541,16 @@ class ContainerInspector:
 # === ADB CLIENT ===
 
 
-def parse_adb_version(banner: str) -> tuple[int, int, int] | None:
-    """The X.Y.Z of an ``adb version`` banner's first line, or None when it has none.
-
-    Recorded: adb_version -- ``Android Debug Bridge version 1.0.41``.
-    """
-    match = _ADB_VERSION_LINE.search(banner)
-    if match is None:
-        return None
-    major, minor, patch = (int(part) for part in match.groups())
-    return major, minor, patch
-
-
-@functools.cache
-def adb_client_version() -> tuple[int, int, int]:
-    """The host adb client's version, asked once per process (``adb version``, bounded).
-
-    Raises:
-        cli.Failure: the banner names no version. Not assumed fine: a client
-            whose version cannot be read cannot be shown to honour ``-T``.
-        AdbError: adb is missing, timed out, or ``adb version`` failed.
-    """
-    banner = run_adb("version", None, timeout=RUN_AS_TIMEOUT, check=True).stdout
-    version = parse_adb_version(banner)
-    if version is None:
-        first = banner.strip().splitlines()[0] if banner.strip() else "(nothing)"
-        cli.fail(
-            f"cannot tell whether this adb can read app files safely: `adb version` "
-            f"answered {first!r}, with no 'Android Debug Bridge version X.Y.Z' line",
-            ADB_UPDATE_REMEDY,
-        )
-    return version
-
-
 def require_adb_for_reads() -> None:
     """Refuse, before any file is read, an adb client too old to honour ``shell -T``.
 
+    Asks through this module's ``adb_client_version`` name (common.run_as's,
+    re-exported), so a test that replaces it here is the one consulted.
+
     Raises:
-        cli.Failure: older than ``MIN_ADB_FOR_READS``, or unreadable.
+        cli.Failure: older than ``run_as.MIN_ADB_FOR_READS``, or unreadable.
     """
-    version = adb_client_version()
-    if version < MIN_ADB_FOR_READS:
-        shown = ".".join(map(str, version))
-        cli.fail(
-            f"adb {shown} is older than 1.0.36 and cannot read app files safely",
-            ADB_UPDATE_REMEDY,
-        )
+    run_as.require_adb_for_reads(adb_client_version())
 
 
 # === EXCEPTIONS / RESULT HELPERS ===
@@ -1096,22 +1051,44 @@ def _format_size(num: int) -> str:
     return f"{value:.1f} TB"
 
 
-def _emit(action: str, success: bool, result: dict, args: argparse.Namespace) -> None:
-    """Print a result in the requested mode and dispatch text formatting."""
+# What to do about a failed inspection whose result names no remedy of its own
+# (a run-as refusal carries its hint; an incomplete listing, its own remedy).
+CONTAINER_REMEDY = (
+    "Fix what the error names, then retry; `container.py --package <pkg> --ls` shows "
+    "what the app's data directory holds."
+)
+
+
+def _emit(action: str, result: dict, args: argparse.Namespace) -> None:
+    """Print a successful result in the requested mode."""
     if args.json:
-        print(json.dumps({"action": action, "success": success, **result}, indent=2))
-        return
-    if not success:
-        if result.get("rejected") or result.get("unread"):
-            # A partial answer: what was read, then why it is incomplete.
-            _format_text(action, result, args)
-        print(f"Error: {result.get('error', result)}", file=sys.stderr)
-        if result.get("remedy"):
-            print(f"Remedy: {result['remedy']}", file=sys.stderr)
-        if result.get("run_as_denied"):
-            print(f"Hint: {result['hint']}", file=sys.stderr)
+        print(json.dumps({"action": action, "success": True, **result}, indent=2))
         return
     _format_text(action, result, args)
+
+
+def _refuse(action: str, result: dict, args: argparse.Namespace) -> None:
+    """Report a failed or incomplete inspection through common.cli (exit 1).
+
+    It was printed here -- ``{"action", "success": false, "error"}`` with no
+    remedy under --json, a ``Hint:`` line on stderr otherwise -- and the exit
+    decided by ``main``. Now it is the shared refusal; what the inspection did
+    read (an incomplete listing's entries, a denial's package) rides along in
+    the object, and in text mode the partial answer is still printed first.
+
+    Raises:
+        cli.Failure: always.
+    """
+    if not args.json and (result.get("rejected") or result.get("unread")):
+        # A partial answer: what was read, then why it is incomplete.
+        _format_text(action, result, args)
+    remedy = result.get("remedy") or result.get("hint") or CONTAINER_REMEDY
+    details = {key: value for key, value in result.items() if key not in ("error", "remedy")}
+    cli.fail(
+        str(result.get("error") or f"{action} failed"),
+        remedy,
+        details={"action": action, **details},
+    )
 
 
 def _report_rejections(success: bool, result: dict) -> tuple[bool, dict]:
@@ -1314,8 +1291,10 @@ Examples:
         return
 
     success, result = _report_rejections(success, result)
-    _emit(action, success, result, args)
-    sys.exit(0 if success else 1)
+    if not success:
+        _refuse(action, result, args)
+    _emit(action, result, args)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

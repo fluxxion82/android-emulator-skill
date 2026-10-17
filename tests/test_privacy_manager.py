@@ -26,11 +26,13 @@ contract.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from types import SimpleNamespace
 
 import privacy_manager
 import pytest
+from fake_toolchain import assert_refusal
 from privacy_manager import PrivacyManager, build_test_trail, print_permissions
 
 from common import adb_exec, cli
@@ -417,6 +419,28 @@ def test_a_device_lost_mid_batch_stops_it_with_the_boundary_shape(
     assert set(payload) == {"success", "error", "remedy"}
     assert payload["success"] is False
     assert len(fake_adb.commands_matching("pm", "grant")) == 2, "the batch did not stop there"
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_listing_a_package_that_is_not_installed_is_the_shared_refusal(
+    fake_adb, recorded, monkeypatch, capsys, json_mode
+):
+    """`dumpsys package <unknown>` exits 0 (recorded: dumpsys_package_unknown).
+
+    The refusal was `{"success": false, "message": ...}` under --json -- no
+    `error`, no remedy -- and the bare message on stderr otherwise.
+    """
+    fake_adb.when("dumpsys", "package", stdout=recorded.text("dumpsys_package_unknown"))
+    argv = ["--list", "--package", "com.example.app1", "--serial", "emulator-5554"]
+
+    code, out, err = _cli(monkeypatch, capsys, *argv, *(["--json"] if json_mode else []))
+
+    assert_refusal(
+        subprocess.CompletedProcess(argv, code, out, err),
+        json_mode=json_mode,
+        naming=("not installed",),
+        status=1,
+    )
 
 
 def test_no_package_is_reported_through_the_boundary(monkeypatch, capsys):

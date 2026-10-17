@@ -52,6 +52,8 @@ import sys
 import pytest
 from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
+from common import cli
+
 SCRIPT = "emulator_create.py"
 DEVICE = "pixel_7"
 
@@ -124,12 +126,15 @@ def _main(monkeypatch, capsys, toolchain: FakeToolchain, machine: str, *argv: st
     as well as one that calls ``platform.machine()`` per run (review of PR
     #20: patching after import constrained the fix to the latter).
     ``monkeypatch`` puts the original module back afterwards.
+
+    Through ``cli.run``, as the script's own ``__main__`` block runs it: a
+    refusal is raised to that boundary, which prints it and exits.
     """
     toolchain.apply(monkeypatch)
     emulator_create = _import_on_host(monkeypatch, "emulator_create", machine)
     monkeypatch.setattr(sys, "argv", ["emulator_create.py", *argv])
     with pytest.raises(SystemExit) as exited:
-        emulator_create.main()
+        cli.run(emulator_create.main)
     captured = capsys.readouterr()
     return exited.value.code, captured.out + captured.err
 

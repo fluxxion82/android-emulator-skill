@@ -1270,7 +1270,14 @@ def main(argv: list[str] | None = None):
             "package": args.package,
         }
         session_id = buster.start(start_args, serial=args.serial)
-        print(session_id)
+        # The bare id is the text form, so `SID=$(anr_watcher.py --start)` keeps
+        # working. Under --json it was the same bare id: a JSON document, by
+        # luck of being a token, but not an object an agent could read a field
+        # from -- and not the shape every other mode answers in.
+        if args.json:
+            print(json.dumps({"success": True, "session_id": session_id}))
+        else:
+            print(session_id)
         sys.exit(0)
 
     if args.stop:
