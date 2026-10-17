@@ -251,7 +251,7 @@ def _classify(stderr: str, serial: str | None) -> AdbError | None:
     a device and its status is the command's own.
     """
     text = "\n".join(
-        line for line in stderr.splitlines() if line.startswith(_ADB_OWN_PREFIXES)
+        line for line in stderr.split("\n") if line.startswith(_ADB_OWN_PREFIXES)
     ).lower()
     if not text:
         return None
@@ -340,6 +340,23 @@ def _timeout_error(cmd: list[str], budget: float) -> AdbTimeoutError:
         command=cmd,
         remedy=remedy,
     )
+
+
+def _confirm_device_error(error: AdbError, serial: str | None) -> AdbError | None:
+    """Keep a suspected device verdict only when one bounded reachability probe fails.
+
+    ``adb shell`` puts a remote command's stderr on adb's stderr, so even an
+    anchored ``adb:`` line can come from a filename or other device-controlled
+    field. A successful ``get-state`` is enough to show that the original
+    failure belongs to the remote command; its output is deliberately not
+    parsed. If the probe itself cannot reach adb or the target, retain the
+    original, more specific verdict and remedy.
+    """
+    try:
+        run_adb("get-state", serial, timeout=DEFAULT_TIMEOUT, check=True)
+    except AdbError:
+        return error
+    return None
 
 
 def run_adb(
@@ -475,6 +492,8 @@ def run_argv(
         raise _timeout_error(cmd, budget) from exc
     if completed.returncode != 0:
         device_error = _classify(_as_text(completed.stderr), serial)
+        if device_error is not None:
+            device_error = _confirm_device_error(device_error, serial)
         if device_error is not None:
             device_error.command = cmd
             raise device_error

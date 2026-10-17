@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 import sys
 import traceback
@@ -271,11 +272,31 @@ def report(
             print(f"Error: {error}", file=sys.stderr)
             print(f"Remedy: {remedy}", file=sys.stderr)
         sys.stdout.flush()
+    except BrokenPipeError:
+        _neutralize_stdout()
     except (OSError, ValueError):
         # The reader has gone: a broken pipe (OSError), or a stream that is
         # already closed (ValueError, "I/O operation on closed file"). There is
         # nobody left to tell, and raising here would replace the exit status
         # with a traceback; the caller still exits with the status.
+        pass
+
+
+def _neutralize_stdout() -> None:
+    """Point stdout's file descriptor at the null device after a broken pipe.
+
+    Catching ``BrokenPipeError`` is not enough: the buffered stream retries its
+    failed flush during interpreter finalization and replaces the intended exit
+    status with 120. Replacing the descriptor lets that final flush complete.
+    """
+    try:
+        stdout_fd = sys.stdout.fileno()
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null_fd, stdout_fd)
+        finally:
+            os.close(null_fd)
+    except (AttributeError, OSError, ValueError):
         pass
 
 
