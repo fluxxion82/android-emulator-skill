@@ -3702,3 +3702,261 @@ def test_an_interrupted_watch_asks_the_device_nothing_more(recorded, monkeypatch
     assert asked == ["pidof system_server"], asked
     (event,) = watcher.events
     assert (event["anr_package"], event["attribution"]) == (None, "unverified")
+
+
+# ---------------------------------------------------------------------------
+# Closure review of v0.8.0: jank --package dropped unnamed, and a cut stream's adb words
+# ---------------------------------------------------------------------------
+
+FOREIGN = "logcat_anr_foreign_process_records"
+CRASH_DUMP = "logcat_crash_buffer_records"
+# DeviceNotFoundError's remedy, as adb_exec types the recorded not-found text.
+NOT_FOUND_REMEDY = "Run `adb devices` to see what is available."
+
+
+def _neutral(recorded) -> Frame:
+    """A recorded record that is no event and names no process: the reviewer's first record.
+
+    logcat_anr_foreign_process_records' first ``Broadcasting:`` record, read
+    first so that the jank after it is read, not `-T 1`'s replay.
+    """
+    return next(f for f in _frames(recorded, FOREIGN) if f.message.startswith("Broadcasting:"))
+
+
+def _launch(recorded, index: int) -> tuple[Frame, Frame]:
+    """The restart recording's ``index``th process: its `Start proc` record and its jank."""
+    pid = _entry(recorded, RESTART)["pids"][index]
+    records = _frames(recorded, RESTART)
+    start = next(f for f in records if f.message.startswith(f"Start proc {pid}:"))
+    jank = next(f for f in records if f.tag == "Choreographer" and f.pid == pid)
+    return start, jank
+
+
+def _package_session(store, records: list[Frame], recorded, tmp_path) -> str:
+    """A ``--package`` session over ``records``, read as the worker reads its first stream."""
+    return _session_starting_on(
+        store, records, tmp_path, package=PACKAGE, process_names=_names(recorded)
+    )
+
+
+@pytest.mark.parametrize("absent_from", ["second", "first"])
+def test_jank_package_dropped_unnamed_is_never_read_as_resolved(
+    absent_from, recorded, store, tmp_path, no_device
+):
+    """Closure review of v0.8.0, REQUIRED 1: the reviewer's replay, through the worker's reader.
+
+    Session A reads the recorded `Start proc` of the fixture app's first
+    process, then that process's recorded jank. Session B reads the same jank
+    with the `Start proc` moved out of its stream -- the process started
+    before the capture -- after the reviewer's neutral first record. Under
+    --package, B dropped the jank for naming no package and kept only its pid
+    (``unnamed_pids``), so `--diff A B` said "improvement: 1 resolved" with
+    nothing unconfirmed (and B A "regression: 1 new"). B holds evidence it
+    did not count: the jank is unconfirmed, and the verdict says what B
+    dropped.
+    """
+    start, jank = _launch(recorded, 0)
+    buster = anr_watcher.AnrBuster(store=store)
+    named = _package_session(store, [start, jank], recorded, tmp_path)
+    unnamed = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    buster.stop(named)
+    buster.stop(unnamed)
+    first, second = (named, unnamed) if absent_from == "second" else (unnamed, named)
+
+    result = json.loads(buster.diff(first, second, json_mode=True))
+
+    assert (result["resolved_clusters"], result["new_clusters"]) == ([], []), result["verdict"]
+    assert [c["absent_from"] for c in result["unconfirmed"]] == [unnamed], result
+    assert result["verdict"].startswith("inconclusive: "), result["verdict"]
+    assert f"{unnamed} dropped 1 jank/StrictMode record" in result["verdict"], result["verdict"]
+    text = buster.diff(first, second)
+    assert "improvement" not in text and "regression" not in text, text
+    assert f"absent from {unnamed}" in text, text
+
+
+def test_jank_package_dropped_unnamed_makes_a_shared_maximum_a_lower_bound(
+    recorded, store, tmp_path, no_device
+):
+    """Absence is one conclusion it cannot support; a maximum is the other.
+
+    Both sessions read the first process's recorded `Start proc` and jank (33
+    frames). B also reads the second process's recorded jank (50 frames) with
+    its `Start proc` moved out of the stream, so --package dropped it -- a
+    jank of the package's, uncounted. A cluster both hold compared as
+    "stable" on B's 33 frames, a maximum B was missing a record above.
+    """
+    start, jank = _launch(recorded, 0)
+    _, other_jank = _launch(recorded, 1)
+    buster = anr_watcher.AnrBuster(store=store)
+    before = _package_session(store, [_neutral(recorded), start, jank], recorded, tmp_path)
+    after = _package_session(
+        store, [_neutral(recorded), start, jank, other_jank], recorded, tmp_path
+    )
+    buster.stop(before)
+    buster.stop(after)
+
+    result = json.loads(buster.diff(before, after, json_mode=True))
+
+    assert (result["drift"], result["stable_count"]) == ([], 0), result
+    (shared,) = result["not_compared"]
+    assert f"{after} dropped 1 jank/StrictMode record" in shared["reason"], shared
+    assert result["verdict"].startswith("inconclusive: "), result["verdict"]
+
+
+def test_a_session_discloses_the_jank_package_dropped_unnamed(recorded, store, tmp_path, no_device):
+    """--stop says what --package dropped for want of a name: JSON, text and the one-line form.
+
+    The reviewer's session B: the recorded jank of a process whose `Start
+    proc` the stream never showed. One below the frame threshold -- the
+    same record, its count set to 5 -- would have been dropped named or
+    not, so it is not counted as lost. Without --package nothing is dropped:
+    the jank is kept, keyed by pid.
+    """
+    _, jank = _launch(recorded, 0)
+    (small,) = _jank_records(recorded, (5,), pid=jank.pid)
+    buster = anr_watcher.AnrBuster(store=store)
+    session = _package_session(store, [_neutral(recorded), jank, small], recorded, tmp_path)
+    everything = _session_starting_on(
+        store, [_neutral(recorded), jank], tmp_path, process_names=_names(recorded)
+    )
+
+    payload = json.loads(buster.stop(session, json_mode=True))
+
+    assert payload["unnamed_dropped"] == {"records": 1, "pids": [int(jank.pid)]}, payload
+    assert payload["incomplete"] is False, payload
+    details = buster.get_details(session)
+    assert f"--package dropped 1 jank/StrictMode record of pid {jank.pid}" in details, details
+    terse = buster.stop(session, terse=True)
+    assert "1 jank/StrictMode record dropped unnamed" in terse, terse
+    unfiltered = json.loads(buster.stop(everything, json_mode=True))
+    assert unfiltered["unnamed_dropped"] == {"records": 0, "pids": []}, unfiltered
+
+
+def test_since_with_package_says_what_it_dropped_unnamed(toolchain, recorded):
+    """The same shape in the legacy reader: --package dropped jank, and said nothing.
+
+    --watch and --since name no process, so under --package every jank and
+    StrictMode record is dropped -- documented, but the summary read "No
+    ANR/jank events detected." with no word of it. The dump is the recorded
+    Choreographer record; it is dropped, and counted, and said.
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("logcat",), stdout=framed(_jank_records(recorded, (80,)))),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--package", PACKAGE)
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "No ANR/jank events detected. --package dropped 1 jank/StrictMode record(s)"
+        in result.stdout
+    ), result.stdout
+    assert "warning: --package dropped 1 jank/StrictMode record:" in result.stderr, result.stderr
+
+
+def _cut_stream(toolchain, recorded, recorded_anywhere, adb_exit: int, said: str) -> None:
+    """The reviewer's replay as an adb: the recorded crash dump less one byte, and adb's words.
+
+    The recorded binary crash dump less its last byte -- a stream that ends
+    inside its second record, by itself -- after which adb writes ``said``
+    (the recorded device-not-found text, or nothing) and exits ``adb_exit``;
+    `adb get-state` answers the recorded `device`, the device back by the
+    time it is asked.
+    """
+    stderr = recorded_anywhere("adb_device_not_found") if said == "device not found" else ""
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(
+                ("logcat",),
+                stdout=recorded.data(f"{CRASH_DUMP}.bin")[:-1],
+                stderr=stderr,
+                exit=adb_exit,
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize("adb_exit", [1, 255])
+@pytest.mark.parametrize(
+    "mode", [("--watch", "--duration", "30"), ("--since", "1m")], ids=["watch", "since"]
+)
+def test_a_read_cut_by_itself_keeps_the_device_error_adb_wrote(
+    mode, adb_exit, toolchain, recorded, recorded_anywhere
+):
+    """Closure review of v0.8.0, REQUIRED 2: adb's own words come before the framing refusal.
+
+    adb exits 255 as the reviewer ran it, or 1, the recorded refusal's own
+    status. --watch asked the device, was told it was there, and refused the
+    framing: exit 1, LogFramingError, where log_monitor in the same place
+    keeps DeviceNotFoundError, exit 3. adb's stderr is typed first now, as
+    _refuse_unexpected_end and log_monitor type it. --since already did
+    (run_argv types adb's words before the dump is parsed): pinned with it.
+    """
+    _cut_stream(toolchain, recorded, recorded_anywhere, adb_exit, "device not found")
+
+    result = toolchain.run("anr_watcher.py", *mode, "--json")
+
+    refusal = assert_refusal(
+        result,
+        json_mode=True,
+        naming=("not attached",),
+        status=3,
+        streaming=mode[0] == "--watch",
+    )
+    assert refusal["remedy"] == NOT_FOUND_REMEDY, refusal
+
+
+@pytest.mark.parametrize("adb_exit", [1, 255])
+@pytest.mark.parametrize(
+    ("said", "status"), [("device not found", 3), ("nothing", 1)], ids=["not-found", "nothing"]
+)
+def test_a_session_cut_by_itself_keeps_what_adb_said(
+    said, status, adb_exit, toolchain, recorded, recorded_anywhere
+):
+    """REQUIRED 2's detached path: the worker kept no stderr, so --stop could not say it.
+
+    The same replay for a session, end to end: the id --start printed is
+    handed to --stop once the worker has marked the session crashed. The
+    worker's logcat wrote its stderr to /dev/null, and the worker asked `adb
+    get-state`, which answered `device`: --stop refused the framing, exit 1.
+    The device error adb wrote as the stream ended is kept now, and raised
+    again: exit 3, with its remedy and the way to read what was saved. With
+    nothing on stderr the refusal stays exit 1, and says how adb exited, as
+    --watch says it.
+    """
+    _cut_stream(toolchain, recorded, recorded_anywhere, adb_exit, said)
+    store = SessionStore(base_dir=toolchain.home / "anr-sessions")
+
+    started = toolchain.run("anr_watcher.py", "--start", "--serial", "emulator-5554", "--json")
+    assert started.returncode == 0, started.stdout + started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    try:
+        deadline = time.monotonic() + 30
+        while store.load_meta(session_id).status != "crashed":
+            if time.monotonic() > deadline:
+                pytest.fail(f"the worker never marked the session crashed: {session_id}")
+            time.sleep(0.05)
+        stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--json")
+    finally:
+        worker = store.load_meta(session_id).pid
+        if worker:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(worker, signal.SIGKILL)
+
+    naming = ("not attached",) if said == "device not found" else ("ended inside a record",)
+    refusal = assert_refusal(stopped, json_mode=True, naming=naming, status=status)
+    assert f"--get-details {session_id}" in refusal["remedy"], refusal
+    if said == "device not found":
+        assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+        assert "as it ended, `adb logcat` said" in refusal["error"], refusal
+    else:
+        assert f"`adb logcat` exited {adb_exit}: nothing on stderr" in refusal["error"], refusal
+    assert store.load_summary(session_id).stream_failure, "the summary was not saved"

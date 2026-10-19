@@ -1308,6 +1308,58 @@ def test_a_shared_cluster_does_not_drift_against_an_incomplete_side(
     assert "Not compared (1)" in p.format_diff(result)
 
 
+def _dropped_unnamed(summary: p.SessionSummary, pid: int) -> p.SessionSummary:
+    """``summary`` as a --package session that dropped one jank record of ``pid``, unnamed."""
+    return replace(
+        summary, session_id="anr-test-0002", unnamed_dropped=1, unnamed_dropped_pids=[pid]
+    )
+
+
+def test_jank_dropped_unnamed_leaves_an_anrs_absence_and_maximum_shown(recorded):
+    """Closure review of v0.8.0: what --package drops for want of a name is jank or StrictMode.
+
+    Session B dropped one recorded jank record whose process no `Start proc`
+    named (``unnamed_dropped``), so a jank cluster's absence from B, or its
+    maximum there, is not shown -- the dropped record may be it. An ANR is not
+    such a record: the recorded broadcast ANR A holds and B lacks is still
+    resolved, and an ANR both hold still compares.
+    """
+    (raw,) = _restart_jank(recorded)[:1]
+    anr = _norm(_anr_line(recorded), current_ms=5000)
+    a = _summary([anr, _named_jank(recorded, 120)])
+    b = _dropped_unnamed(_summary([_named_jank(recorded, 35)]), raw["pid"])
+
+    result = p.diff_sessions(a, b)
+
+    assert [c["fingerprint"] for c in result["resolved_clusters"]] == [anr.fingerprint]
+    assert (result["drift"], result["unconfirmed"]) == ([], [])
+    (shared,) = result["not_compared"]
+    assert shared["reason"] == (
+        f"not comparable: {b.session_id} dropped 1 jank/StrictMode record of 1 pid it never "
+        f"named, which --package could not attribute"
+    )
+    assert result["verdict"].startswith("improvement: 1 resolved; "), result["verdict"]
+
+    both = p.diff_sessions(_summary([anr]), _dropped_unnamed(_summary([anr]), raw["pid"]))
+
+    assert (both["stable_count"], both["not_compared"]) == (1, []), both
+    assert both["verdict"] == (
+        f"inconclusive: {b.session_id} dropped 1 jank/StrictMode record of 1 pid it never "
+        f"named, which --package could not attribute"
+    )
+    assert "Not compared (1)" in p.format_diff(result)
+
+
+def test_a_summary_with_jank_dropped_unnamed_round_trips(recorded):
+    """``unnamed_dropped`` survives summary.json: --diff reads it back from disk."""
+    (raw,) = _restart_jank(recorded)[:1]
+    summary = _dropped_unnamed(_summary([]), raw["pid"])
+
+    back = p.summary_from_json(p.summary_to_json(summary))
+
+    assert (back.unnamed_dropped, back.unnamed_dropped_pids) == (1, [raw["pid"]])
+
+
 def test_a_named_cluster_with_no_unnamed_lookalike_is_still_new(recorded):
     """The rule is narrow: an unrelated pid-keyed cluster does not hide a new one."""
     named, _ = _same_jank_named_and_unnamed(recorded)
