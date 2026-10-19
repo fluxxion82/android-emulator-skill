@@ -53,8 +53,9 @@ DB_MAX_BYTES = env_int("ANDROID_EMU_MODEL_DB_MAX_BYTES", 50_000_000, min_value=4
 # Timeout (seconds) for a single run-as adb invocation in LIVE mode.
 RUN_AS_TIMEOUT = env_int("ANDROID_EMU_MODEL_TIMEOUT", 30, min_value=5)
 
-# What a run-as refusal looks like is decided once, in common.run_as
-# (run_as_refused), for this script and container.py alike.
+# What a run-as refusal is, and how a directory listing is read, are decided
+# once, in common.run_as (refused, parse_ls_output), for this script and
+# container.py alike.
 
 SCOPING_NOTE = (
     "Room is backed by SQLite. This inspector covers Room (annotations + "
@@ -626,24 +627,32 @@ class LiveInspector:
         db_dir = f"/data/data/{package}/databases"
 
         if db_name is None:
+            # `ls -la` as bytes, parsed as container.py parses a listing
+            # (common.run_as.parse_ls_output). This was `ls -1` in text mode
+            # with splitlines() and strip(): the transport made a CR in a name
+            # a line break, and `x\ry.db` was listed as two databases, `x` and
+            # `y.db`, at exit 0 (final review of v0.8.0). A name no plain file
+            # name carries, or that is not UTF-8, is refused and reported.
             try:
-                output = self._run_as(package, ["ls", "-1", db_dir])
+                output = self._run_as_bytes(package, ["ls", "-la", db_dir])
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
             except _RunAsError as exc:
                 # run-as ran; the device refused the directory itself.
                 remedy = run_as.path_failure_remedy(package, db_dir)
                 return False, {"error": str(exc), "path": db_dir, "remedy": remedy}
+            listing = run_as.parse_ls_output(output)
             names = [
-                line.strip()
-                for line in output.splitlines()
-                if line.strip() and not _is_sqlite_sidecar(line.strip())
+                entry["name"]
+                for entry in listing.entries
+                if entry["kind"] == "file" and not _is_sqlite_sidecar(entry["name"])
             ]
             return True, {
                 "package": package,
                 "databases_dir": db_dir,
                 "databases": names,
                 "total_databases": len(names),
+                **run_as.rejections(listing),
             }
 
         remote_db = f"{db_dir}/{db_name}"
@@ -668,22 +677,44 @@ class LiveInspector:
     # --- command execution -------------------------------------------------
 
     def _run_as(self, package: str, argv: list[str]) -> str:
-        """Run ``adb shell run-as <pkg> <argv>`` returning text stdout.
+        """Run ``adb shell run-as <pkg> <argv>`` returning stdout as text.
+
+        For output nothing makes a name of (a schema); a listing is parsed from
+        :meth:`_run_as_bytes`, where a name that is not UTF-8 can be refused
+        rather than replaced.
+        """
+        return self._run_as_bytes(package, argv).decode("utf-8", errors="replace")
+
+    def _run_as_bytes(self, package: str, argv: list[str]) -> bytes:
+        """Run ``adb shell run-as <pkg> <argv>`` returning stdout's bytes.
+
+        Bytes, with no newline translation: in text mode a CR inside a file
+        name became a line break before anything parsed the listing.
 
         adb's own failures -- no adb, a hang, a device that is not there --
         raise typed (adb_exec.run_argv) and reach common.cli; they were a
         ``_RunAsError`` reported as the app's refusal, with no remedy.
+
+        Raises:
+            RunAsDeniedError: run-as refused the package (:meth:`_raise_if_refused`).
+            _RunAsError: the device command failed.
         """
         quoted = [quote_for_device_shell(a) for a in argv]
         cmd = build_adb_command(
             "shell", self.serial, "run-as", quote_for_device_shell(package), *quoted
         )
-        result = adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT, text=True)
+        # confirm_device_errors: this stderr is the device command's, and a
+        # name in it can print an `adb: device offline` line of its own.
+        result = adb_exec.run_argv(
+            cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT, confirm_device_errors=True
+        )
 
-        # stderr only: stdout holds names the app chose (see _raise_if_denied).
-        _raise_if_denied(package, result.stderr, result.returncode)
+        # stderr only: stdout holds names the app chose (see _raise_if_refused).
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        self._raise_if_refused(package, stderr, result.returncode)
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            detail = stderr.strip() or stdout.strip() or f"exit {result.returncode}"
             raise _RunAsError(f"Command failed ({' '.join(argv)}): {detail}")
         return result.stdout
 
@@ -704,13 +735,32 @@ class LiveInspector:
         """
         require_adb_for_reads()
         cmd = run_as.read_command(self.serial, package, argv)
-        result = adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT)
+        # confirm_device_errors: this stderr is `cat`'s, and the database name
+        # it carries can print an `adb: device offline` line of its own.
+        result = adb_exec.run_argv(
+            cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT, confirm_device_errors=True
+        )
 
         stderr_text = result.stderr.decode("utf-8", errors="replace")
-        _raise_if_denied(package, stderr_text, result.returncode)
+        self._raise_if_refused(package, stderr_text, result.returncode)
         if result.returncode != 0:
             raise _RunAsError(stderr_text.strip() or f"exit code {result.returncode}")
         return result.stdout
+
+    def _raise_if_refused(self, package: str, stderr: str, returncode: int) -> None:
+        """Raise RunAsDeniedError when run-as refused ``package``, as common.run_as decides it.
+
+        :func:`common.run_as.refused`: stderr's first line is the whole recorded
+        refusal for THIS package, and one bounded ``run-as <package> id`` does
+        not show run-as working. It took a marker on any line of
+        ``splitlines()``, so a database named ``x\\nrun-as: package not
+        debuggable`` -- or with a CR -- turned cat's "No such file" into
+        "install a debug build" (final review of v0.8.0); before that (review
+        of #33), ``ls: <dir>: Permission denied`` did (recorded:
+        run_as_ls_1_databases_unreadable).
+        """
+        if run_as.refused(self.serial, package, stderr, returncode, timeout=RUN_AS_TIMEOUT):
+            raise RunAsDeniedError(f"run-as denied for '{package}': {stderr.strip()}")
 
     def _dump_schema(self, package: str, remote_db: str, name: str) -> tuple[str | None, str]:
         """Return (schema_text, method) or (None, error_message).
@@ -790,18 +840,6 @@ def require_adb_for_reads() -> None:
 
 class _RunAsError(RuntimeError):
     """Generic run-as / adb command failure (not a denial)."""
-
-
-def _raise_if_denied(package: str, stderr: str, returncode: int) -> None:
-    """Raise RunAsDeniedError if run-as itself refused the package.
-
-    Decided by ``run_as.run_as_refused``: a ``run-as:`` line on stderr at a
-    non-zero exit. This matched the markers anywhere in stdout and stderr, so
-    ``ls: <dir>: Permission denied`` (recorded: run_as_ls_1_databases_unreadable)
-    came back as a run-as denial with "install a debug build" (review of #33).
-    """
-    if run_as.run_as_refused(stderr, returncode):
-        raise RunAsDeniedError(f"run-as denied for '{package}': {stderr.strip()}")
 
 
 def _denied_result(package: str, exc: RunAsDeniedError) -> dict:
@@ -1057,11 +1095,16 @@ def format_live(result: dict, *, verbose: bool) -> str:
         return "\n".join(lines)
 
     dbs = result["databases"]
-    if not dbs:
+    refused = result.get("rejected", 0)
+    if not dbs and not refused:
         return f"No databases found for {result['package']}"
-    lines = [f"databases ({result['total_databases']}):"]
+    # Everything refused is not "none found": the count says what was not read.
+    shown = f", {refused} refused" if refused else ""
+    lines = [f"databases ({result['total_databases']}{shown}):"]
     for db in dbs:
         lines.append(f"  {db}")
+    if verbose:
+        lines.extend(f"  refused: {name}" for name in result.get("rejected_entries", []))
     return "\n".join(lines)
 
 
@@ -1213,12 +1256,41 @@ def _run_live(args: argparse.Namespace) -> None:
         # A run-as refusal's hint is its remedy; the text form printed it as a
         # third line (`Hint:`), the JSON form not at all.
         _refuse(result, result.get("remedy") or result.get("hint") or LIVE_REMEDY)
+    if result.get("rejected"):
+        _refuse_incomplete_listing(result, args)
 
     if args.json:
         print(json.dumps({"success": True, **result}, indent=2))
     else:
         print(format_live(result, verbose=args.verbose))
     sys.exit(0)
+
+
+def _refuse_incomplete_listing(result: dict, args: argparse.Namespace) -> None:
+    """Refuse a databases listing that refused an entry, keeping what it read (exit 1).
+
+    As container.py refuses one: the listing is incomplete, and the exit
+    status is the one signal a caller cannot skip. The databases read ride
+    along in the refusal object; in text mode they are printed first.
+
+    Raises:
+        cli.Failure: always.
+    """
+    if not args.json:
+        print(format_live(result, verbose=args.verbose))
+    refused = result["rejected"]
+    shown = ", ".join(result["rejected_entries"][:3]) + (", ..." if refused > 3 else "")
+    error = (
+        f"refused {refused} entr{'y' if refused == 1 else 'ies'} of {result['databases_dir']} "
+        f"the app named with bytes that are not UTF-8 or a character no plain file name "
+        f"carries (/, \\, NUL, CR, LF), or in a layout ls does not print: {shown}"
+    )
+    remedy = (
+        "The databases that could be read are listed. Inspect the refused entries on the "
+        f"device (`adb shell run-as {result['package']} ls -lab {result['databases_dir']}`), "
+        "and rename or remove them to read them here."
+    )
+    _refuse({**result, "error": error}, remedy)
 
 
 if __name__ == "__main__":

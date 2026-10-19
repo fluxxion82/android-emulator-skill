@@ -260,40 +260,58 @@ def report(
         json_mode: Write the JSON object to stdout instead of two lines to stderr.
         details: Extra keys for the JSON object; never one of the three above.
     """
+    if json_mode:
+        payload: dict[str, object] = {"success": False, "error": error, "remedy": remedy}
+        for key, value in (details or {}).items():
+            payload.setdefault(key, value)
+        # default=str: a detail that is not JSON must not turn the refusal
+        # into a TypeError traceback with nothing on stdout.
+        try:
+            document = json.dumps(payload, default=str)
+        except ValueError:
+            # A detail that contains itself: the three keys still go out.
+            document = json.dumps({"success": False, "error": error, "remedy": remedy})
+        _emit(sys.stdout, document)
+    else:
+        _emit(sys.stderr, f"Error: {error}", f"Remedy: {remedy}")
+    # Whatever main printed before it failed may still be in stdout's buffer.
+    _emit(sys.stdout)
+
+
+def _emit(stream, *lines: str) -> None:
+    """Write ``lines`` to ``stream`` and flush it; a reader that has gone is nobody to tell.
+
+    Raising here would replace the exit status with a traceback, so a stream
+    that cannot be written is given up: one already closed (ValueError, "I/O
+    operation on closed file") as it is, one whose write failed -- a broken
+    pipe -- pointed at the null device (:func:`_neutralize`). Each stream is
+    written, and neutralised, on its own: the refusal goes to stderr in text
+    mode, and neutralising stdout after stderr broke left stderr's unwritten
+    bytes for the interpreter's last flush, which failed and exited 120
+    (final review of v0.8.0: a text device-offline refusal, exit 3, did).
+    """
     try:
-        if json_mode:
-            payload: dict[str, object] = {"success": False, "error": error, "remedy": remedy}
-            for key, value in (details or {}).items():
-                payload.setdefault(key, value)
-            # default=str: a detail that is not JSON must not turn the refusal
-            # into a TypeError traceback with nothing on stdout.
-            print(json.dumps(payload, default=str))
-        else:
-            print(f"Error: {error}", file=sys.stderr)
-            print(f"Remedy: {remedy}", file=sys.stderr)
-        sys.stdout.flush()
-    except BrokenPipeError:
-        _neutralize_stdout()
-    except (OSError, ValueError):
-        # The reader has gone: a broken pipe (OSError), or a stream that is
-        # already closed (ValueError, "I/O operation on closed file"). There is
-        # nobody left to tell, and raising here would replace the exit status
-        # with a traceback; the caller still exits with the status.
+        for line in lines:
+            print(line, file=stream)
+        stream.flush()
+    except ValueError:
         pass
+    except OSError:
+        _neutralize(stream)
 
 
-def _neutralize_stdout() -> None:
-    """Point stdout's file descriptor at the null device after a broken pipe.
+def _neutralize(stream) -> None:
+    """Point ``stream``'s file descriptor at the null device after a failed write.
 
     Catching ``BrokenPipeError`` is not enough: the buffered stream retries its
     failed flush during interpreter finalization and replaces the intended exit
     status with 120. Replacing the descriptor lets that final flush complete.
     """
     try:
-        stdout_fd = sys.stdout.fileno()
+        stream_fd = stream.fileno()
         null_fd = os.open(os.devnull, os.O_WRONLY)
         try:
-            os.dup2(null_fd, stdout_fd)
+            os.dup2(null_fd, stream_fd)
         finally:
             os.close(null_fd)
     except (AttributeError, OSError, ValueError):
@@ -338,8 +356,7 @@ def run(
     try:
         sys.exit(main(args))
     except KeyboardInterrupt:
-        with contextlib.suppress(OSError, ValueError):
-            print("Interrupted.", file=sys.stderr)
+        _emit(sys.stderr, "Interrupted.")
         sys.exit(EXIT_INTERRUPTED)
     except _DEFECTS as error:
         _report_defect(error, json_mode=json_mode)
@@ -380,9 +397,14 @@ def _report_defect(error: BaseException, *, json_mode: bool) -> NoReturn:
     beyond what any handler here can promise.)
     """
     # The traceback is evidence, not the report: if printing it fails, the
-    # report still goes out.
+    # report still goes out -- and stderr, if it was the write that failed, is
+    # neutralised, or its unwritten bytes would fail the exit's flush (120).
     with contextlib.suppress(Exception):
-        traceback.print_exception(error, file=sys.stderr)
+        try:
+            traceback.print_exception(error, file=sys.stderr)
+            sys.stderr.flush()
+        except OSError:
+            _neutralize(sys.stderr)
     report(
         _one_line(f"{type(error).__name__}: {_safe_str(error)}"),
         DEFECT_REMEDY,

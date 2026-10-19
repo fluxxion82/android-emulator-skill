@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-19T01:43:28Z",
+  "recorded_at": "2026-10-19T03:47:21Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 0,
+  "redacted_package_count": 1,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -1075,6 +1075,54 @@
       "stream": "stdout",
       "stdout_bytes": 61,
       "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_id",
+      "file": "run_as_id.txt",
+      "command": "adb shell -T run-as com.example.composefixture id",
+      "description": "`adb shell -T run-as <pkg> id` for the debuggable fixture app: exit 0, stderr EMPTY, one line on stdout starting `uid=<n>(<name>)` -- the app's uid, run-as having switched to it. The probe's 'run-as works for this package' answer: a stderr line that only looks like a run-as refusal (a file name holding one) is overturned by it.",
+      "catches": [],
+      "bytes": 325,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 325,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_id_not_an_application",
+      "file": "run_as_id_not_an_application.txt",
+      "command": "adb shell -T run-as com.android.settings id",
+      "description": "The probe for a system package: exit 1, stdout EMPTY, the whole of stderr one line, `run-as: package not an application: <pkg>` -- the same refusal run_as_not_an_application_stderr recorded for `ls`, because run-as refuses before it runs any command.",
+      "catches": [],
+      "bytes": 57,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 57
+    },
+    {
+      "name": "run_as_id_not_debuggable",
+      "file": "run_as_id_not_debuggable.txt",
+      "command": "adb shell -T run-as com.android.chrome id",
+      "description": "The probe for an installed APPLICATION (uid >= 10000) built without android:debuggable: exit 1, stdout EMPTY, `run-as: package not debuggable: <pkg>` on stderr. The refusal a release build of the user's own app gets, and the one no other recording held. com.android.chrome because it is on every Google APIs image and is not debuggable there.",
+      "catches": [],
+      "bytes": 51,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 51
+    },
+    {
+      "name": "run_as_id_unknown_package",
+      "file": "run_as_id_unknown_package.txt",
+      "command": "adb shell -T run-as com.nonexistent.app id",
+      "description": "The probe for a package that is not installed: exit 1, stdout EMPTY, `run-as: unknown package: <pkg>` on stderr (the name aliased like any non-AOSP name).",
+      "catches": [],
+      "bytes": 42,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 45
     },
     {
       "name": "run_as_ls_1_databases",

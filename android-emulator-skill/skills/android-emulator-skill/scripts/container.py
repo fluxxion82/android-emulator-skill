@@ -29,11 +29,9 @@ documented, safe mechanism and is what real debugging workflows rely on.
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
 
 from common import adb_exec, cli, run_as
 from common.cache_utils import ProgressiveCache
@@ -41,10 +39,18 @@ from common.device_utils import build_adb_command, quote_for_device_shell, resol
 from common.env_config import env_int
 
 # The shell -T transport and its client guard moved to common.run_as when
-# model_inspector became the second script to read app files. Both names are
-# bound here: `adb_client_version` is what require_adb_for_reads asks (and what
-# a test replaces), `parse_adb_version` is where the tests found it.
-from common.run_as import adb_client_version, parse_adb_version  # noqa: F401
+# model_inspector became the second script to read app files, and the `ls -la`
+# parser followed when model_inspector's databases listing was made to read
+# names as this script does. The names are bound here: `adb_client_version` is
+# what require_adb_for_reads asks (and what a test replaces); `parse_adb_version`,
+# `LsListing` and `parse_ls_output` are where the tests found them.
+from common.run_as import (  # noqa: F401
+    LsListing,
+    adb_client_version,
+    parse_adb_version,
+    parse_ls_output,
+)
+from common.run_as import rejections as _rejections
 
 # Cap on bytes pulled by --cat before truncation. Guards against dumping a
 # multi-megabyte database/blob inline. Override via the ANDROID_EMU_ prefix.
@@ -483,7 +489,7 @@ class ContainerInspector:
         result = self._invoke(cmd)
         stdout = result.stdout.decode("utf-8", errors="replace")
         stderr = result.stderr.decode("utf-8", errors="replace")
-        _raise_if_denied(package, stderr, result.returncode)
+        self._raise_if_refused(package, stderr, result.returncode)
         if result.returncode != 0:
             raise _RunAsError(_describe_failure(argv, result.returncode, stdout, stderr))
         return result.stdout
@@ -508,10 +514,22 @@ class ContainerInspector:
         require_adb_for_reads()
         result = self._invoke(run_as.read_command(self.serial, package, argv))
         stderr_text = result.stderr.decode("utf-8", errors="replace")
-        _raise_if_denied(package, stderr_text, result.returncode)
+        self._raise_if_refused(package, stderr_text, result.returncode)
         if result.returncode != 0:
             raise _RunAsError(stderr_text.strip() or f"exit code {result.returncode}")
         return result.stdout
+
+    def _raise_if_refused(self, package: str, stderr: str, returncode: int) -> None:
+        """_raise_if_denied, once common.run_as.refused agrees: the rule model_inspector's is.
+
+        The refusal is read off stderr's first line (_raise_if_denied); before
+        it is given the debug-build remedy, run-as is asked once with a command
+        that names no file (common.run_as.run_as_works). A first line that reads
+        as a refusal while run-as runs ``id`` as the app is the command's own
+        failure -- a line a name printed.
+        """
+        if run_as.refused(self.serial, package, stderr, returncode, timeout=RUN_AS_TIMEOUT):
+            _raise_if_denied(package, stderr, returncode)
 
     def _invoke(self, cmd: list[str]) -> subprocess.CompletedProcess:
         """Run an adb command for raw bytes; adb's own failures raise typed.
@@ -522,7 +540,11 @@ class ContainerInspector:
         They are not the app's: they reach common.cli as adb_exec's errors
         (exit 3 for the device), the way every other script reports them.
         """
-        return adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT)
+        # confirm_device_errors: this stderr is the device command's, and a
+        # file name in it can print an `adb: device offline` line of its own.
+        return adb_exec.run_argv(
+            cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT, confirm_device_errors=True
+        )
 
     def _dump_schema(self, package: str, remote_db: str, name: str) -> tuple[str | None, str]:
         """Return (schema_text, method) or (None, error_message).
@@ -600,15 +622,19 @@ class _RunAsError(RuntimeError):
 def _raise_if_denied(package: str, stderr: str, returncode: int) -> None:
     """Raise RunAsDeniedError if run-as itself refused the package.
 
-    Decided by ``run_as.run_as_refused``: a ``run-as:`` line on stderr at a
-    non-zero exit. ``ls: <dir>: Permission denied`` is not one (review of #33).
+    Decided by ``run_as.run_as_refused``: stderr's FIRST line is the whole
+    refusal the device prints for THIS package, ``run-as: <reason>: <package>``,
+    at a non-zero exit. ``ls: <dir>: Permission denied`` is not one (review of
+    #33), nor a line a file name printed after ``cat``'s own words, nor another
+    package's refusal (final review of v0.8.0). The inspector confirms it
+    before giving the debug-build remedy (``ContainerInspector._raise_if_refused``).
 
     Args:
         package: Target package (for the message).
         stderr: The command's stderr -- never stdout, which holds names the app chose.
         returncode: Process exit code (denials are non-zero).
     """
-    if run_as.run_as_refused(stderr, returncode):
+    if run_as.run_as_refused(stderr, returncode, package):
         raise RunAsDeniedError(f"run-as denied for '{package}': {stderr.strip()}")
 
 
@@ -730,172 +756,6 @@ def _is_sqlite_sidecar(name: str) -> bool:
 
 
 # === PURE PARSERS ===
-
-# toybox `ls -l` -- what every caller's `run-as <pkg> ls -la` runs -- prints
-# mode, links, owner, group and size separated by runs of spaces, the timestamp
-# as two columns, `%F %H:%M` (recorded: run_as_ls_symlink_space), then ONE space
-# and the name exactly as printed: it may hold spaces, start or end with one, or
-# look like a date.
-_LS_ENTRY = re.compile(
-    r"(?P<mode>\S+) +(?P<links>\S+) +(?P<owner>\S+) +(?P<group>\S+) +(?P<size>\S+) +"
-    r"(?P<day>[0-9]{4}-[0-9]{2}-[0-9]{2}) (?P<clock>[0-9]{2}:[0-9]{2}) (?P<name>.+)"
-)
-
-# A name is chosen by the app on the device, so it is untrusted input to the
-# host: export() turns it into a host path. None of these belongs in a single
-# directory entry -- `/` and NUL cannot occur in one at all, so seeing them means
-# the line is not what it claims; `\` is a separator on a Windows host; a
-# newline is how a crafted name forges a second `ls` line.
-_NAME_FORBIDDEN = frozenset("/\\\0\n\r")
-# A symlink's target is a device path, so `/` is expected there; a CR or NUL is
-# not, and the target is printed to the caller.
-_TARGET_FORBIDDEN = frozenset("\0\n\r")
-
-
-class LsListing(NamedTuple):
-    """What an ``ls -la`` listing held: the entries read, and the ones refused.
-
-    ``rejected`` holds each refused name -- or the whole line, when its columns
-    could not be placed -- as ``repr()``, so a control character in it is
-    shown escaped rather than reaching a terminal or a log raw. Every caller
-    reports them: dropping them silently answered "nothing there" for
-    "refused to read it".
-    """
-
-    entries: list[dict]
-    rejected: list[str]
-
-
-def parse_ls_output(output: bytes | str) -> LsListing:
-    r"""Parse ``ls -la`` output into structured entries.
-
-    Reads toybox's layout by position -- every caller runs ``run-as <pkg> ls
-    -la`` on the device, and the device's ``ls`` is toybox (recorded:
-    ``run_as_ls_symlink_space``):
-
-        drwx------ 4 u0_a123 u0_a123 4096 2024-01-02 03:04 shared_prefs
-        -rw------- 1 u0_a123 u0_a123  220 2024-01-02 03:04 prefs.xml
-        lrwxrwxrwx 1 root    root       11 2024-01-02 03:04 lib -> /data/app
-
-    The name is everything after the two timestamp columns, so a file named
-    ``2026-10-16``, ``03:04`` or ``May`` keeps its name. (Skipping every
-    date-looking token instead -- and, before that, coreutils' month names and
-    bare years -- made such names vanish from the listing.)
-
-    Every line is an entry, refused, or one of three skips: a blank line, the
-    ``total N`` line, and the directory's own ``.`` / ``..``. Refused, and
-    returned in ``rejected`` (never dropped silently):
-
-    - a line that is not UTF-8 -- decoding it with replacement would hand on
-      a name that is not the file's, and the read of it would fail;
-    - a line that is not that layout: an unknown mode (``??????????``), a
-      device node, whose size is ``major, minor`` (measured: ``1,   3``) and
-      takes two columns, or any other text;
-    - a name that is not a plain file name (see ``_NAME_FORBIDDEN``), or a
-      symlink target holding a CR or NUL.
-
-    The names come from the app, and :meth:`ContainerInspector.export` makes
-    host paths of them.
-
-    Lines are split on ``\n`` only -- what ``ls`` separates entries with --
-    not ``str.splitlines``, which also breaks on ``\r``, ``\x1c``-``\x1e``,
-    ``\x85`` and ``\u2028``/``\u2029``, any of which a name may hold and
-    would then forge a line without a newline. (The transport keeps a CR a CR
-    for the same reason; see ``_run_as``.) A name holding a real newline still
-    can: ``ls -1b`` or ``find -print0`` would make names unambiguous, and is
-    not done here.
-
-    Args:
-        output: Raw ``ls -la`` stdout: bytes from the device, or text already
-            decoded (the recorded fixtures).
-
-    Returns:
-        :class:`LsListing`: ``entries`` as dicts {name, mode, kind, size_bytes,
-        owner, group, symlink_target}, and the ``rejected`` names.
-    """
-    raw = output.encode("utf-8") if isinstance(output, str) else output
-    entries: list[dict] = []
-    rejected: list[str] = []
-    for raw_line in raw.split(b"\n"):
-        try:
-            line = raw_line.decode("utf-8")
-        except UnicodeDecodeError:
-            rejected.append(repr(raw_line))
-            continue
-        if not line.strip() or line.startswith("total "):
-            continue
-        match = _LS_ENTRY.fullmatch(line)
-        if match is None or not _looks_like_mode(match["mode"]):
-            rejected.append(repr(line))
-            continue
-        kind = _kind_from_mode(match["mode"])
-        name, symlink_target = _extract_name(match["name"], kind)
-        if name in (".", ".."):
-            continue
-        if not _is_plain_file_name(name):
-            rejected.append(repr(name))
-            continue
-        if symlink_target is not None and _TARGET_FORBIDDEN.intersection(symlink_target):
-            rejected.append(repr(match["name"]))
-            continue
-
-        entries.append(
-            {
-                "name": name,
-                "mode": match["mode"],
-                "kind": kind,
-                "size_bytes": int(match["size"]) if match["size"].isdigit() else 0,
-                "owner": match["owner"],
-                "group": match["group"],
-                "symlink_target": symlink_target,
-            }
-        )
-    return LsListing(entries, rejected)
-
-
-def _rejections(listing: LsListing) -> dict:
-    """The refused entries of a listing, as a result carries them (see LsListing)."""
-    return {"rejected": len(listing.rejected), "rejected_entries": listing.rejected}
-
-
-def _is_plain_file_name(name: str) -> bool:
-    """True if ``name`` is one directory entry that is safe to join to a host path."""
-    return name not in ("", ".", "..") and not _NAME_FORBIDDEN.intersection(name)
-
-
-def _looks_like_mode(token: str) -> bool:
-    """True if a token looks like a 10-char ls permission string."""
-    if len(token) < 10:
-        return False
-    return token[0] in "-dlcbsp" and all(c in "rwxsStTl-" for c in token[1:10])
-
-
-def _kind_from_mode(mode: str) -> str:
-    """Map the leading mode char to a kind label."""
-    head = mode[0]
-    if head == "d":
-        return "dir"
-    if head == "l":
-        return "symlink"
-    return "file"
-
-
-def _extract_name(rest: str, kind: str) -> tuple[str, str | None]:
-    """Split the name column into the name and, for a symlink, its target.
-
-    Args:
-        rest: Everything after the time column. toybox prints a name bare
-            (unquoted, unescaped) and a symlink as ``name -> target``.
-        kind: Entry kind (symlinks split on " -> ").
-
-    Returns:
-        (name, symlink_target) — target is None for non-symlinks.
-    """
-    if kind == "symlink" and " -> " in rest:
-        # Not stripped: a CR or space at either end belongs to the name.
-        name, _, symlink_target = rest.partition(" -> ")
-        return name, symlink_target
-    return rest, None
 
 
 def parse_shared_prefs_xml(xml_text: str) -> dict:

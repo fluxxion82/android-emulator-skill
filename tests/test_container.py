@@ -1125,23 +1125,39 @@ def test_run_as_denied_for_a_non_debuggable_package(monkeypatch, recorded):
 
 
 def test_run_as_denied_unknown_package(monkeypatch, recorded):
+    """The recorded refusal for the package it names (aliased com.example.app1), and only that one.
+
+    This listed `com.nope` and answered with the refusal for com.example.app1;
+    a refusal is now the whole recorded form for the package asked about.
+    """
+
     def fake_run(cmd, *args, **kwargs):
         return _completed(cmd, returncode=1, stderr=recorded.text("run_as_unknown_package"))
 
     monkeypatch.setattr(container.subprocess, "run", fake_run)
 
-    ok, result = ContainerInspector().list_dir("com.nope")
+    ok, result = ContainerInspector().list_dir("com.example.app1")
     assert ok is False
     assert result.get("run_as_denied") is True
 
+    ok, result = ContainerInspector().list_dir("com.example.composefixture")
+    assert ok is False
+    assert "run_as_denied" not in result, "another package's refusal was this one's"
 
-def test_raise_if_denied_helper():
-    import pytest
 
+def test_raise_if_denied_helper(recorded):
+    """The classifier on the recorded release-build refusal (run_as_id_not_debuggable).
+
+    This asserted against `run-as: package not debuggable`, with no package,
+    for `com.x`: a string no device printed, short enough to slip past the
+    fixture ratchet.
+    """
+    refusal = recorded.text("run_as_id_not_debuggable")
     with pytest.raises(RunAsDeniedError):
-        container._raise_if_denied("com.x", "run-as: package not debuggable", 1)
-    # Zero exit code never denies, even if text contains a marker.
-    container._raise_if_denied("com.x", "is not debuggable", 0)
+        container._raise_if_denied("com.android.chrome", refusal, 1)
+    # Another package's refusal is not this one's, and a zero exit never denies.
+    container._raise_if_denied("com.example.composefixture", refusal, 1)
+    container._raise_if_denied("com.android.chrome", refusal, 0)
 
 
 def test_shared_prefs_dump_reads_through_shell_t_cat(monkeypatch, recorded):

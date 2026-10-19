@@ -3636,6 +3636,60 @@ FIXTURES: list[Fixture] = [
         ),
         post=_requires("run-as: unknown package: "),
     ),
+    # `run-as <pkg> id`: the independent probe common.run_as asks before it
+    # assigns the debug-build remedy. `id` takes no argument, so nothing in its
+    # answer is a name an app chose -- unlike `cat <file>`, whose stderr carries
+    # the file name, and a name can hold a newline and a forged `run-as:` line.
+    Fixture(
+        name="run_as_id",
+        record_both_streams=True,
+        args=["shell", "-T", "run-as", COMPOSE_PACKAGE, "id"],
+        description=(
+            "`adb shell -T run-as <pkg> id` for the debuggable fixture app: exit 0, "
+            "stderr EMPTY, one line on stdout starting `uid=<n>(<name>)` -- the "
+            "app's uid, run-as having switched to it. The probe's 'run-as works "
+            "for this package' answer: a stderr line that only looks like a run-as "
+            "refusal (a file name holding one) is overturned by it."
+        ),
+        post=_requires("uid=", " gid=", " context="),
+    ),
+    Fixture(
+        name="run_as_id_not_an_application",
+        record_both_streams=True,
+        args=["shell", "-T", "run-as", "com.android.settings", "id"],
+        description=(
+            "The probe for a system package: exit 1, stdout EMPTY, the whole of "
+            "stderr one line, `run-as: package not an application: <pkg>` -- the "
+            "same refusal run_as_not_an_application_stderr recorded for `ls`, "
+            "because run-as refuses before it runs any command."
+        ),
+        post=_requires("run-as: package not an application: com.android.settings\n"),
+    ),
+    Fixture(
+        name="run_as_id_not_debuggable",
+        record_both_streams=True,
+        args=["shell", "-T", "run-as", "com.android.chrome", "id"],
+        description=(
+            "The probe for an installed APPLICATION (uid >= 10000) built without "
+            "android:debuggable: exit 1, stdout EMPTY, `run-as: package not "
+            "debuggable: <pkg>` on stderr. The refusal a release build of the "
+            "user's own app gets, and the one no other recording held. "
+            "com.android.chrome because it is on every Google APIs image and is "
+            "not debuggable there."
+        ),
+        post=_requires("run-as: package not debuggable: com.android.chrome\n"),
+    ),
+    Fixture(
+        name="run_as_id_unknown_package",
+        record_both_streams=True,
+        args=["shell", "-T", "run-as", "com.nonexistent.app", "id"],
+        description=(
+            "The probe for a package that is not installed: exit 1, stdout EMPTY, "
+            "`run-as: unknown package: <pkg>` on stderr (the name aliased like any "
+            "non-AOSP name)."
+        ),
+        post=_requires("run-as: unknown package: "),
+    ),
     Fixture(
         name="run_as_ls_data_dir",
         args=["shell", "run-as com.example.composefixture ls -la"],

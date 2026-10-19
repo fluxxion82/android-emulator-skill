@@ -350,6 +350,10 @@ def _confirm_device_error(error: AdbError, serial: str | None) -> AdbError | Non
     field. Only ``get-state`` exiting zero and printing exactly ``device``
     shows that the original failure belongs to the remote command. Every other
     outcome retains the original, more specific verdict and remedy.
+
+    Only for a caller whose stderr can carry such a field (``run_argv``'s
+    ``confirm_device_errors``): on any other, a probe answering ``device``
+    after a real device error only hides it.
     """
     try:
         result = run_adb("get-state", serial, timeout=DEFAULT_TIMEOUT, check=True)
@@ -453,6 +457,7 @@ def run_argv(
     serial: str | None,
     timeout: float | None = None,
     text: bool = False,
+    confirm_device_errors: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run an adb argv the caller built, for raw bytes, failing as :func:`run_adb` does.
 
@@ -474,6 +479,15 @@ def run_argv(
         serial: The serial ``cmd`` targets, for a device error's message.
         timeout: Seconds to allow. Defaults to ``ANDROID_EMU_ADB_TIMEOUT`` (30).
         text: Decode as text instead (for output nothing makes a path of).
+        confirm_device_errors: Put a device error to one ``adb get-state``
+            before raising it, and drop it when the device answers ``device``.
+            For a command whose stderr is a DEVICE command's -- ``adb shell``
+            or ``exec-out`` running ``run-as ... cat <file>`` -- where a file
+            name holding a newline can print an ``adb: device offline`` line of
+            its own (#32). Not for ``logcat``: its stderr is adb's, a device
+            error there is the device's, and a probe that found the device a
+            moment later turned a real one into exit 1 (final review of
+            v0.8.0: ``anr_watcher --since`` said 1 where log_monitor says 3).
 
     Returns:
         The completed process; its status and streams are the caller's to judge.
@@ -491,7 +505,7 @@ def run_argv(
         raise _timeout_error(cmd, budget) from exc
     if completed.returncode != 0:
         device_error = _classify(_as_text(completed.stderr), serial)
-        if device_error is not None:
+        if device_error is not None and confirm_device_errors:
             device_error = _confirm_device_error(device_error, serial)
         if device_error is not None:
             device_error.command = cmd

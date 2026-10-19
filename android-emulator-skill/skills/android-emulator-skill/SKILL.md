@@ -63,7 +63,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    SDK-root PATH and raises `PermissionError`), **run_as.py** (reads a
    debuggable app's files with `adb shell -T run-as`, never `exec-out`, which
    answers a missing file with its error text as the bytes; checks the adb
-   client honours `-T` first), **env_config.py**, **anr_pipeline.py**,
+   client honours `-T` first; decides what a run-as refusal is, and parses an
+   `ls -la` listing, for both inspectors), **env_config.py**, **anr_pipeline.py**,
    **anr_sessions.py**, **log_lifecycle.py** (system_server's process
    sentences — `Start proc` / `Killing` / `has died` — authenticated one way for
    `log_monitor --app` and the ANR session worker alike).
@@ -576,10 +577,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       that is not there is adb's own error (exit 3 for the device), not "the
       command failed" at exit 1
     - A run-as denial (debug-build remedy) is only a refusal run-as itself
-      printed: `run-as: …` on stderr at a non-zero exit. A path the device
-      refuses once run-as has run — `ls: <dir>: Permission denied`, a missing
-      file — is that path's failure, with an `adb shell run-as <pkg> ls -ld
-      <path>` check as its remedy
+      printed: the FIRST line of stderr, at a non-zero exit, is the whole
+      refusal the device prints for THIS package (`run-as: package not
+      debuggable: <pkg>`, `package not an application`, `unknown package`; all
+      recorded), and one bounded `run-as <pkg> id` (which names no file) does
+      not run as the app. A device error during that probe is the device's
+      (exit 3). A path the device refuses once run-as has run — `ls: <dir>:
+      Permission denied`, a missing file, a file whose name holds a newline
+      and a `run-as: …` line of its own — is that path's failure, with an
+      `adb shell run-as <pkg> ls -ld <path>` check as its remedy. An older
+      release's refusal wording is not recorded, and reads as that failure
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
@@ -591,11 +598,23 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Failures in every mode are the shared refusal (`{"success": false,
       "error": ..., "remedy": ...}` under `--json`; a run-as denial's hint is
       its remedy)
-    - A run-as denial is decided as container.py decides it, in
-      common/run_as.py: only `run-as: …` on stderr at a non-zero exit. An
-      unreadable `databases/` (`ls: <dir>: Permission denied`) is the
-      directory's failure, with an `ls -ld` check as its remedy, not "install
-      a debug build"
+    - A run-as denial is decided in common/run_as.py by the one rule
+      container.py uses: the first line of stderr must be the whole refusal
+      the device prints for THIS package (`run-as: package not debuggable:
+      <pkg>`, `package not an application`, `unknown package`; all recorded),
+      and one bounded `run-as <pkg> id` must not run as the app. An unreadable
+      `databases/` (`ls: <dir>: Permission denied`), or a database whose name
+      holds a newline or CR and a `run-as: …` line, is that path's failure,
+      with an `ls -ld` check as its remedy, not "install a debug build"
+    - LIVE lists `databases/` with `ls -la` read as bytes and parsed as
+      container.py parses a listing (common/run_as.py), where it was `ls -1`
+      in text mode: a CR in a name became a line break, and `x\ry.db` was
+      listed as two databases, `x` and `y.db`, at exit 0. A name that is not
+      a plain file name or not UTF-8 is refused and named in
+      `rejected_entries`, and the listing exits 1 with what it read
+      (`databases (0, 1 refused)`, never "No databases found"). As in
+      container.py, a name holding a real newline can still add a whole
+      plain-named entry after it (`ls -b` would end that; not done)
     - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
@@ -898,7 +917,7 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py" --output audit-reports/ --ve
 
 ## Requirements
 
-- macOS, Linux, or Windows
+- macOS, Linux, or Windows -- except `anr_watcher.py`'s live reads (`--watch`, and the session worker `--start` runs), which wait on adb's pipe with `select()`, and Python's `select()` takes only sockets on Windows: those two are Unix-only (macOS, Linux)
 - Android SDK with platform-tools and emulator
 - Python 3.12+
 - ADB (Android Debug Bridge)
@@ -1023,7 +1042,7 @@ planned rather than an invented percentage.
 
 **Structured Data**: Scripts output JSON or formatted text, not raw logs. Easy to parse and integrate.
 
-**Cross-Platform**: Works on macOS, Linux, and Windows.
+**Cross-Platform**: Works on macOS, Linux, and Windows (`anr_watcher.py`'s live reads are Unix-only: see Requirements).
 
 **Real Devices**: Unlike iOS, works with both emulators and real devices.
 
@@ -1162,9 +1181,12 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     `privacy_manager`'s grant/revoke, per AVD in the `emulator_*` `--all`
     modes — which exit 1 with their own summary when one item failed.
   - Device-error confirmation applies to app-file reads (`container` and
-    `model_inspector` through `run_argv`). Other shell commands use `run_adb`;
-    their arguments are agent-supplied and matching stderr is not yet confirmed
-    (follow-up).
+    `model_inspector` ask `run_argv` for it with `confirm_device_errors`): their
+    stderr is a device command's, and a file name can print an `adb: …` line.
+    logcat's readers do not ask: that stderr is adb's own, and a probe finding
+    the device a moment later turned a real device error into exit 1. Other
+    shell commands use `run_adb`; their arguments are agent-supplied and
+    matching stderr is not yet confirmed (follow-up).
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

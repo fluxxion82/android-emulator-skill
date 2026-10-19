@@ -1,0 +1,1 @@
+run-as: package not debuggable: com.android.chrome
