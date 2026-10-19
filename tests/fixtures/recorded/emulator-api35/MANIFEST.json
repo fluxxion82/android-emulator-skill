@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-19T03:47:21Z",
+  "recorded_at": "2026-10-19T04:43:52Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -608,6 +608,35 @@
       "bytes": 8689,
       "exit_status": 0,
       "stream": "stdout"
+    },
+    {
+      "name": "logcat_anr_foreign_process_records",
+      "file": "logcat_anr_foreign_process_records.bin",
+      "command": "adb logcat -c; am start -W the fixture app; adb shell am broadcast --async -f 0x10000000 -n com.example.composefixture/.ForeignProcessAnrReceiver (android:process=com.example.victim, AnrReceiver's 40 s block); once system_server logs its `Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the process or the provoking action",
+      "description": "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, in a process it named com.example.victim (android:process), under its own uid. ActivityManager prints the PROCESS name -- 'ANR in com.example.victim', its '\\nPID: <pid>' that process's -- and system_server's `Start proc <pid>:com.example.victim/u0a205` and `Killing <pid>:com.example.victim/u0a205 ... bg anr` carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p <pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture app's uid) and `claimed_package_uid_listing` (com.example.victim is not installed), `system_server_pid`.",
+      "catches": [
+        "W4-N"
+      ],
+      "bytes": 2638,
+      "system_server_pid": "598",
+      "stalled_pid": "24112",
+      "ps_alive": {
+        "command": "adb shell ps -o PID,UID -p 24112",
+        "exit_status": 0,
+        "output": "  PID   UID\n24112 10205\n",
+        "device_epoch": 1792385019
+      },
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10205\n"
+      },
+      "claimed_package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.victim",
+        "exit_status": 0,
+        "output": ""
+      },
+      "timezone": "America/Los_Angeles"
     },
     {
       "name": "logcat_anr_input_dispatch",

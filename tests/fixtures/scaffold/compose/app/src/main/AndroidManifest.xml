@@ -51,6 +51,22 @@
                 <action android:name="com.example.composefixture.PROVOKE_ANR" />
             </intent-filter>
         </receiver>
+
+        <!--
+          The same block, in a process named after ANOTHER package
+          (android:process may name any global process; it runs under this
+          app's uid). ActivityManager then reports this app's stall as
+          "ANR in com.example.victim". Recorded as
+          `logcat_anr_foreign_process_records`; see ForeignProcessAnrReceiver.kt.
+        -->
+        <receiver
+            android:name=".ForeignProcessAnrReceiver"
+            android:exported="true"
+            android:process="com.example.victim">
+            <intent-filter>
+                <action android:name="com.example.composefixture.PROVOKE_FOREIGN_PROCESS_ANR" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

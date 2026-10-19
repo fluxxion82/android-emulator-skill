@@ -37,12 +37,15 @@ from fake_toolchain import (
     assert_refusal,
     framed,
     frames,
+    recorded_ps_answer,
     recorded_zone,
+    uid_rules,
 )
 
 from common import cli, env_config, logcat
 from common.anr_pipeline import build_normalised_event, event_to_jsonl, parse_logcat_anr
 from common.anr_sessions import SessionStore
+from common.device_utils import parse_package_uids, parse_ps_uids
 
 # --- logcat command construction (no shell=True) ---------------------------
 
@@ -100,18 +103,17 @@ def test_watch_uses_subprocess_without_shell(monkeypatch):
     captured: dict = {}
 
     class _FakePopen:
-        """A logcat whose stdout is a pipe that is already at its end."""
+        """A logcat whose stdout is a pipe still open: quiet until the duration ends it."""
 
         def __init__(self, cmd, **kwargs):
             captured["cmd"] = cmd
             captured["kwargs"] = kwargs
-            read_end, write_end = os.pipe()
-            os.close(write_end)
+            read_end, captured["write_end"] = os.pipe()
             self.stdout = os.fdopen(read_end, "rb", buffering=0)
             captured["stdout"] = self.stdout
 
         def poll(self):
-            return 0
+            return None
 
         def terminate(self):
             return None
@@ -121,9 +123,10 @@ def test_watch_uses_subprocess_without_shell(monkeypatch):
 
     monkeypatch.setattr(anr_watcher.subprocess, "Popen", _FakePopen)
     try:
-        ok = anr_watcher.AnrWatcher().watch(json_mode=True)
+        ok = anr_watcher.AnrWatcher().watch(duration_seconds=1, json_mode=True)
     finally:
         captured["stdout"].close()
+        os.close(captured["write_end"])
     assert ok is True
     # House rule: never shell=True.
     assert captured["kwargs"].get("shell") is not True
@@ -176,6 +179,8 @@ BROADCAST = "logcat_anr_broadcast_records"
 INPUT = "logcat_anr_input_records"
 INJECTION = "logcat_tag_injection_records"
 PACKAGE = "com.example.composefixture"
+# The recorded window's title: the fixture activity's default, its component.
+WINDOW_TITLE = f"{PACKAGE}/{PACKAGE}.DefaultActivity"
 
 
 def _frames(recorded, name: str) -> list[Frame]:
@@ -196,9 +201,20 @@ def _system_server(recorded, name: str) -> str:
 
 
 def _oracle(recorded, name: str) -> anr_watcher._ProcessNames:
-    """A resolver that knows system_server as measured with ``name``, and names nothing."""
+    """A resolver answered as the device answered, knowing system_server as measured with ``name``.
+
+    Whose process a pid is: ``ps -o PID,UID -p <pid>`` answers with the
+    recorded ps_pid_uid, its app row's pid substituted (the fixture app's
+    process, alive under its uid), and a package's uids are package_list_uid's.
+    It names a jank record's pid only from a `Start proc` in the stream, as
+    the worker does.
+    """
     system_server = _system_server(recorded, name)
-    return anr_watcher._ProcessNames(system_server_pid=lambda: system_server)
+    return anr_watcher._ProcessNames(
+        system_server_pid=lambda: system_server,
+        package_uids=lambda package: parse_package_uids(recorded.text("package_list_uid"), package),
+        pid_uid=lambda pid: parse_ps_uids(recorded_ps_answer(recorded, str(pid))).get(str(pid)),
+    )
 
 
 def _moved(frame: Frame, seconds: float) -> Frame:
@@ -254,16 +270,46 @@ def test_matches_package_by_anr_package(recorded):
     assert anr_watcher.matches_package(event, "com.other.thing") is False
 
 
-def test_matches_package_by_short_name(recorded):
-    """Short-suffix matching, and how lenient it really is.
+def test_matches_package_takes_no_other_package_ending_the_same_way(recorded):
+    """The last dotted segment used to match on its own (wave 4).
 
-    The filter also matches on the last dotted segment, so an unrelated package
-    that happens to end the same way matches too. Kept because the tag-only
-    jank case has no package to match on at all -- but worth seeing against a
-    real event rather than a typed one.
+    So ``com.somebody.else.composefixture`` matched the fixture app's
+    recorded ANR, and a prefix of the package matched too. A package is
+    matched whole, or not at all.
     """
     event = _recorded_anr(recorded)
-    assert anr_watcher.matches_package(event, "com.somebody.else.composefixture") is True
+
+    for other in ("com.somebody.else.composefixture", "composefixture", "com.example"):
+        assert anr_watcher.matches_package(event, other) is False, other
+
+
+@pytest.mark.parametrize("package", ["com.example.app", "com.example.application"])
+def test_package_does_not_match_jank_by_the_words_of_its_message(package, recorded):
+    """The reviewer's replay: the recorded Choreographer record, unchanged.
+
+    Its message says "The application may be doing too much work…", so the
+    substring filter kept it for ``com.example.app`` (the short name ``app``)
+    and ``com.example.application`` alike -- jank naming no package passed
+    ``--package``. Only the identity the reader established counts: ``app``
+    (a session's verified name for the pid), ``anr_package``, and the package
+    of a whole component.
+    """
+    jank = parse_logcat_anr(_recorded_jank_burst(recorded, (80,))[0])
+    assert jank is not None and "application" in jank["message"]
+
+    assert anr_watcher.matches_package(jank, package) is False
+    assert anr_watcher.matches_package({**jank, "app": package}, package) is True
+
+
+def test_package_matches_a_components_package_whole(recorded):
+    """The recorded input ANR's report names its component: its package counts, whole."""
+    from common.anr_pipeline import event_from_record
+
+    report = event_from_record(logcat.parse_records(_anr_record(recorded, INPUT).raw)[0])
+    assert report is not None and report.get("component", "").startswith(f"{PACKAGE}/")
+
+    assert anr_watcher.matches_package({**report, "anr_package": None}, PACKAGE) is True
+    assert anr_watcher.matches_package({**report, "anr_package": None}, "com.example") is False
 
 
 # --- --stop summary over a seeded events.jsonl -----------------------------
@@ -790,26 +836,38 @@ def toolchain(tmp_path) -> FakeToolchain:
     return chain
 
 
-@pytest.mark.parametrize("mode", [("--since", "1m"), ("--watch",)], ids=["since", "watch"])
-def test_one_stall_in_the_stream_is_one_printed_event(mode, toolchain, recorded):
-    """D5 end to end, over every record a reader sees of one broadcast ANR.
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [(BROADCAST, "Broadcast of Intent"), (INPUT, "Input dispatching timed out")],
+    ids=["broadcast", "input"],
+)
+@pytest.mark.parametrize(
+    "mode", [("--since", "1m"), ("--watch", "--duration", "2")], ids=["since", "watch"]
+)
+def test_one_stall_in_the_stream_is_one_printed_event(mode, name, reason, toolchain, recorded):
+    """D5 end to end, over every record a reader sees of one recorded ANR.
 
-    The recorded records: ActivityManager's report (one record), then
-    WindowManager's report and ActivityManager's "Skipping duplicate" verdict.
-    ``--watch`` here reads a stream that ends, exit 0 -- a stream adb ended
-    cleanly is not a failure, so this also pins that X6's check is on the
-    status, not on the stream merely ending.
+    The broadcast records: ActivityManager's report (one record), then
+    WindowManager's report and ActivityManager's "Skipping duplicate"
+    verdict; the input records: WindowManager's report, then
+    ActivityManager's. ``--watch`` reads a stream that stays open, as a live
+    one does, until its duration ends it (wave 4: one that ends by itself is
+    refused), after the one already-buffered record `-T 1` replays. The
+    report's process is shown to be the package's as the device shows it: the
+    recorded uid listing, and ps_pid_uid for the report's own PID: (substituted).
     """
     toolchain.install(
         "adb",
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
-            Rule(("pidof", "system_server"), stdout=_system_server(recorded, BROADCAST) + "\n"),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, name) + "\n"),
+            *uid_rules(recorded, PACKAGE, _stated_pid(_anr_record(recorded, name))),
             Rule(
                 ("logcat",),
                 buffered=framed([_history(recorded)]),
-                stdout=recorded.data(f"{BROADCAST}.bin"),
+                stdout=recorded.data(f"{name}.bin"),
+                hang=mode[0] == "--watch",
             ),
         ],
     )
@@ -818,8 +876,8 @@ def test_one_stall_in_the_stream_is_one_printed_event(mode, toolchain, recorded)
 
     assert result.returncode == 0, result.stdout + result.stderr
     events = [json.loads(line) for line in result.stdout.splitlines()]
-    assert [event["kind"] for event in events] == ["anr"], events
-    assert "Broadcast of Intent" in events[0]["reason"]
+    assert [(event["kind"], event["anr_package"]) for event in events] == [("anr", PACKAGE)], events
+    assert events[0]["reason"].startswith(reason)
     assert isinstance(events[0]["app_pid"], int)
 
 
@@ -1370,31 +1428,54 @@ def test_worker_keeps_reading_when_the_device_cannot_say_who_system_server_is(
 
 def test_no_lookup_starts_once_a_stop_is_requested(no_device):
     """The worker's lookups ask ``may_ask`` before every device call."""
-    system_server, package_uids = anr_watcher._device_lookups(
+    system_server, package_uids, pid_uid = anr_watcher._device_lookups(
         "emulator-5554", may_ask=lambda: False
     )
 
     assert system_server() is None
     assert package_uids(PACKAGE) is None
+    assert pid_uid(4242) is None
     assert no_device == []
 
 
-def test_the_device_lookups_are_bounded(monkeypatch):
-    """Both questions carry the worker's short bound, which --stop's wait covers."""
+def test_the_device_lookups_are_bounded(monkeypatch, recorded):
+    """All three questions carry the worker's short bound, which --stop's wait covers.
+
+    The uid question is `ps -o PID,UID -p <pid>`, answered with the recorded
+    ps_pid_uid (its app row's pid substituted).
+    """
+    from common.adb_exec import AdbResult
+
     asked: list[tuple] = []
 
     def _answer(*args, **kwargs):
         asked.append((args, kwargs))
 
+    def _ps(*args, **kwargs):
+        asked.append((args, kwargs))
+        return AdbResult(0, recorded_ps_answer(recorded, "4242"), "")
+
     monkeypatch.setattr(anr_watcher, "get_system_server_pid", _answer)
     monkeypatch.setattr(anr_watcher, "get_package_uids", _answer)
-    system_server, package_uids = anr_watcher._device_lookups("emulator-5554", may_ask=lambda: True)
+    monkeypatch.setattr(anr_watcher, "run_adb", _ps)
+    system_server, package_uids, pid_uid = anr_watcher._device_lookups(
+        "emulator-5554", may_ask=lambda: True
+    )
 
     system_server()
     package_uids(PACKAGE)
+    uid = pid_uid(4242)
 
     bound = {"timeout": anr_watcher.LOOKUP_TIMEOUT_SECONDS}
-    assert asked == [(("emulator-5554",), bound), (("emulator-5554", PACKAGE), bound)]
+    assert asked == [
+        (("emulator-5554",), bound),
+        (("emulator-5554", PACKAGE), bound),
+        (("shell", "emulator-5554", "ps", "-o", "PID,UID", "-p", "4242"), bound),
+    ]
+    assert (
+        uid
+        == parse_ps_uids(recorded.text("ps_pid_uid"))[_entry(recorded, "ps_pid_uid")["pids"]["app"]]
+    )
     assert anr_watcher.WORKER_EXIT_TIMEOUT_SECONDS > anr_watcher.LOOKUP_TIMEOUT_SECONDS
 
 
@@ -1499,6 +1580,7 @@ def _device_answers(recorded, logcat_records: list[Frame], **lookups: _Answer) -
             "system_server", _Answer(("pidof", "system_server"), stdout=system_server + "\n")
         ),
         lookups.get("uids", _Answer(("cmd", "package"), stdout=listing)),
+        *([lookups["ps"]] if "ps" in lookups else []),
     ]
 
 
@@ -1783,8 +1865,11 @@ def test_since_is_not_fooled_by_a_header_forged_in_a_tag(claim, toolchain, recor
 
     assert result.returncode == 0, result.stderr
     events = [json.loads(line) for line in result.stdout.splitlines()]
-    anrs = [(e["process"], e.get("anr_package")) for e in events if e["kind"] == "anr"]
-    assert anrs == ([] if claim == "an ANR" else [("WindowManager", PACKAGE)]), events
+    # The report stands as an ANR of its window, its title kept as text (wave 4).
+    anrs = [
+        (e["process"], e.get("anr_package"), e.get("window")) for e in events if e["kind"] == "anr"
+    ]
+    assert anrs == ([] if claim == "an ANR" else [("WindowManager", None, WINDOW_TITLE)]), events
 
 
 def test_stop_waits_for_a_worker_still_asking_the_device(recorded, tmp_path):
@@ -2030,48 +2115,27 @@ def system_server_is_known(monkeypatch, recorded):
         "get_package_uids",
         lambda _serial, package, **_k: parse_package_uids(listing, package),
     )
-    monkeypatch.setattr(anr_watcher, "run_adb", _no_device_call)
+    monkeypatch.setattr(anr_watcher, "run_adb", _ps_only(recorded))
 
 
 def _no_device_call(*args, **_kwargs):
     raise AssertionError(f"the worker asked the device: {args}")
 
 
-def test_an_anr_into_an_empty_buffer_is_one_event(
-    recorded, tmp_path, monkeypatch, system_server_is_known
-):
-    """Review of PR #34: the first stream's first record was set aside as `-T 1`'s replay.
+def _ps_only(recorded):
+    """A run_adb that answers `ps -o PID,UID -p <pid>` as the device did, and nothing else.
 
-    After `logcat -c` there is nothing to replay, so the first record a
-    stream delivers can be the session's first live one -- and the recorded
-    ANR report, arriving into an empty buffer, came out as ZERO events.
-    `-T 0` cannot start a read with nothing replayed (recorded:
-    logcat_tail_zero), so the first stream reads everything it is given.
+    The answer is the recorded ps_pid_uid with its app row's pid substituted:
+    the fixture app's process, alive under its uid.
     """
-    store = SessionStore(base_dir=tmp_path / "anr-sessions")
+    from common.adb_exec import AdbResult
 
-    session_id = _worker_over_streams(store, [[_anr_record(recorded)]], tmp_path, monkeypatch)
+    def run_adb(*args, **_kwargs):
+        if args[:1] == ("shell",) and "ps" in args:
+            return AdbResult(0, recorded_ps_answer(recorded, str(args[-1]).strip("'")), "")
+        return _no_device_call(*args)
 
-    events = store.read_events(session_id)
-    assert [(e.kind, e.app) for e in events] == [("anr", PACKAGE)], events
-
-
-def test_the_one_record_a_session_starts_on_is_read_and_disclosed(
-    recorded, tmp_path, monkeypatch, unreachable_lookups
-):
-    """The price, accepted and disclosed (SKILL.md): `-T 1`'s one record may predate the session.
-
-    The recorded jank as the newest record already buffered when the session
-    began: it is read like the rest. One possibly-old record is the cost of
-    never losing the first live one.
-    """
-    store = SessionStore(base_dir=tmp_path / "anr-sessions")
-
-    session_id = _worker_over_streams(
-        store, [_jank_records(recorded, (80,))], tmp_path, monkeypatch
-    )
-
-    assert [e.kind for e in store.read_events(session_id)] == ["jank"]
+    return run_adb
 
 
 def test_a_restarted_stream_does_not_count_its_replay_again(
@@ -2151,33 +2215,39 @@ def test_a_replayed_record_is_skipped_whole(
     assert store.load_meta(session_id).extras["line_counters"]["total"] == 2
 
 
-def test_watch_prints_the_record_it_starts_on(recorded, monkeypatch):
-    """--watch reads its one stream from its first record: into an empty buffer, a live one."""
+def test_watch_prints_the_record_it_starts_on_marked_as_possibly_older(
+    recorded, monkeypatch, capsys
+):
+    """--watch prints its stream's first record -- marked: `-T 1` replays it, it may predate.
+
+    Into an empty buffer that record is a live one, so it is not dropped; but
+    nothing in it shows it was logged after the watch began, so it carries
+    ``"ambiguous_tail": true`` (wave 4, the same shape as a session's). The
+    records after it are the watch's own. The stream stays open until the
+    duration ends it.
+    """
     jank = _jank_records(recorded, (80,))[0]
     later = _moved(jank, 5)
-    read_end, write_end = os.pipe()
-    os.write(write_end, framed([jank, later]))
-    os.close(write_end)
-
-    class _EndedLogcat:
-        def __init__(self, *_args, **_kwargs):
-            self.stdout = os.fdopen(read_end, "rb", buffering=0)
-
-        def poll(self):
-            return 0
-
-        def wait(self, timeout=None):
-            return 0
-
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", _EndedLogcat)
+    stream = _OpenLogcat(framed([jank, later]))
+    monkeypatch.setattr(anr_watcher.subprocess, "Popen", lambda *_a, **_k: stream)
     watcher = anr_watcher.AnrWatcher(serial="emulator-5554")
 
-    watcher.watch(json_mode=True)
+    try:
+        assert watcher.watch(duration_seconds=1, json_mode=True) is True
+    finally:
+        stream.close()
 
-    assert [e["timestamp"] for e in watcher.events] == [
-        _printed(jank)[:21],
-        _printed(later)[:21],
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(e["timestamp"], e.get("ambiguous_tail", False)) for e in printed] == [
+        (_printed(jank)[:21], True),
+        (_printed(later)[:21], False),
     ]
+    # Shown, never in a total (Codex review of PR #39: get_summary and
+    # get_json_output still counted it).
+    output = watcher.get_json_output()
+    assert output["summary"]["total"] == 1, output
+    assert [e["timestamp"] for e in output["ambiguous_tail"]] == [_printed(jank)[:21]]
+    assert watcher.get_summary().startswith("ANR/jank events: 1 ")
 
 
 # ---------------------------------------------------------------------------
@@ -2353,7 +2423,44 @@ def test_diff_refuses_sessions_captured_under_different_versions(
     assert exc.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["success"] is False
-    assert "v1" in payload["error"] and "v2" in payload["error"], payload
+    from common.anr_pipeline import FINGERPRINT_VERSION
+
+    assert "v1" in payload["error"] and f"v{FINGERPRINT_VERSION}" in payload["error"], payload
+
+
+def test_a_v2_window_fallback_is_not_compared_with_a_v3_session(recorded, store, tmp_path):
+    """Codex review of PR #39: v2 filed a WindowManager-only ANR under its title's package.
+
+    So a v2 summary holds that fallback as a comparable, package-named
+    cluster (``identity`` null), and against a v3 session that lacks it the
+    diff said "improvement: 1 resolved". The version is now 3, a session keeps
+    the version it was captured with, and --diff refuses the pair. The v2
+    session is the recorded input ANR cut before ActivityManager's report, its
+    summary stored as v2 stored it: the cluster's identity null.
+    """
+    from common.anr_pipeline import FINGERPRINT_VERSION
+
+    old, new = store.create({}), store.create({})
+    buster = anr_watcher.AnrBuster(store=store)
+    records = _frames(recorded, INPUT)
+    report = next(i for i, f in enumerate(records) if f.message.startswith(f"ANR in {PACKAGE}"))
+    _run_worker_over(
+        store, old.session_id, records[:report], tmp_path, process_names=_oracle(recorded, INPUT)
+    )
+    buster.stop(old.session_id)
+    path = store.session_dir(old.session_id) / "summary.json"
+    v2 = json.loads(path.read_text(encoding="utf-8"))
+    v2["fingerprint_version"] = 2
+    for cluster in v2["clusters"]:
+        cluster["identity"] = None
+        cluster["sample_event"]["identity"] = None
+    path.write_text(json.dumps(v2), encoding="utf-8")
+    buster.stop(new.session_id)
+
+    with pytest.raises(cli.Failure) as refused:
+        buster.diff(old.session_id, new.session_id, json_mode=True)
+    assert "v2" in str(refused.value) and "v3" in str(refused.value)
+    assert store.load_summary(new.session_id).fingerprint_version == FINGERPRINT_VERSION == 3
 
 
 # ---------------------------------------------------------------------------
@@ -2385,6 +2492,13 @@ def test_watch_prints_an_anr_record_while_the_stream_is_still_open(recorded, tmp
     monkeypatch.setattr(anr_watcher.subprocess, "Popen", _stand_in)
     system_server = _system_server(recorded, BROADCAST)
     monkeypatch.setattr(anr_watcher, "get_system_server_pid", lambda *_a, **_k: system_server)
+    # Whose process the report's pid is, as the device answered (recorded).
+    monkeypatch.setattr(
+        anr_watcher,
+        "get_package_uids",
+        lambda _s, package, **_k: parse_package_uids(recorded.text("package_list_uid"), package),
+    )
+    monkeypatch.setattr(anr_watcher, "run_adb", _ps_only(recorded))
     watcher = anr_watcher.AnrWatcher(serial="emulator-5554")
     emitted = threading.Event()
     emit = watcher._emit
@@ -2405,7 +2519,7 @@ def test_watch_prints_an_anr_record_while_the_stream_is_still_open(recorded, tmp
         reader.join(timeout=30)
 
     assert printed_while_open, "no event while the stream was open"
-    assert [e["kind"] for e in watcher.events] == ["anr"]
+    assert [(e["kind"], e["anr_package"]) for e in watcher.events] == [("anr", PACKAGE)]
 
 
 # ---------------------------------------------------------------------------
@@ -2581,7 +2695,9 @@ def test_a_record_cut_by_the_stop_is_counted_not_lost_silently(stream, recorded,
 
 
 @pytest.mark.parametrize(
-    ("device", "status"), [("gone", 3), ("still there", 1)], ids=["gone", "still-there"]
+    ("device", "status"),
+    [("gone", 3), ("still there", 1), ("one of several", 1)],
+    ids=["gone", "still-there", "several"],
 )
 def test_a_stream_cut_by_itself_stops_the_session_and_stop_refuses(
     device, status, recorded, recorded_anywhere, tmp_path, monkeypatch, capsys
@@ -2592,7 +2708,15 @@ def test_a_stream_cut_by_itself_stops_the_session_and_stop_refuses(
     (`adb get-state`, the recorded answers), marks the session crashed, and
     --stop refuses after saving what was read -- exit 3 for a device that
     went, 1 otherwise -- never the summary as if nothing happened.
+
+    Wave 4: adb answering "more than one device" (recorded:
+    adb_more_than_one_device, typed by adb_exec as it types it everywhere)
+    was persisted as "unavailable" and rebuilt as DeviceNotFoundError: exit
+    3 and "Reconnect the device", where the same answer met directly is
+    exit 1 and "Pass --serial". The worker keeps the error's class, words and
+    remedy, and --stop raises that error again.
     """
+    from common import adb_exec
     from common.adb_exec import AdbResult, DeviceNotFoundError
 
     jank = _jank_records(recorded, (80,))[0]
@@ -2604,9 +2728,14 @@ def test_a_stream_cut_by_itself_stops_the_session_and_stop_refuses(
         spawned.append(_FileLogcat(stream_file))
         return spawned[-1]
 
+    # The serials the multiple-device remedy lists, without asking adb.
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554", "emulator-5556"])
+
     def _get_state(*_args, **_kwargs):
         if device == "gone":
             raise DeviceNotFoundError(recorded_anywhere("adb_device_not_found").strip())
+        if device == "one of several":
+            raise adb_exec._classify(recorded_anywhere("adb_more_than_one_device"), None)
         return AdbResult(0, recorded.text("adb_get_state"), "")
 
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "3")
@@ -2634,8 +2763,13 @@ def test_a_stream_cut_by_itself_stops_the_session_and_stop_refuses(
     assert exc.value.code == status
     refusal = json.loads(capsys.readouterr().out)
     assert refusal["success"] is False and "ended inside a record" in refusal["error"], refusal
+    if device == "one of several":
+        assert "More than one device" in refusal["error"], refusal
+        assert "--serial" in refusal["remedy"] and "emulator-5556" in refusal["remedy"], refusal
+        assert "Reconnect" not in refusal["remedy"], refusal
     summary = store.load_summary(meta.session_id)
     assert summary is not None and summary.stream_failure, "the summary was not saved"
+    assert f"--get-details {meta.session_id}" in refusal["remedy"], refusal
 
 
 @pytest.mark.parametrize("adb_exit", [0, 1], ids=["adb-exit-0", "adb-exit-1"])
@@ -2704,7 +2838,8 @@ def test_watch_stopped_while_a_record_arrives_on_an_open_stream_says_so(
     finally:
         stream.close()
 
-    assert [e["kind"] for e in watcher.events] == ["jank"]
+    # The one record that arrived whole is the stream's first: shown, not counted.
+    assert ([e["kind"] for e in watcher.ambiguous], watcher.events) == (["jank"], [])
     assert "warning: the watch was stopped while a record was arriving" in capsys.readouterr().err
 
 
@@ -2832,14 +2967,28 @@ def test_a_worker_with_the_wrong_token_does_not_claim_the_session(store, monkeyp
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("loss", ["stream broke", "unverified", "crashed"])
-def test_diff_concludes_nothing_from_what_a_damaged_capture_lacks(loss, recorded, store, tmp_path):
-    """A broken, unauthenticated or crashed capture was saved complete.
+@pytest.mark.parametrize(
+    ("loss", "said"),
+    [
+        ("stream broke", "the stream broke"),
+        ("unverified", "could not be authenticated"),
+        ("crashed", "crashed"),
+        ("cut record", "1 record arriving when it stopped was cut off"),
+        ("stream restarted", "the stream restarted 1 time"),
+    ],
+)
+def test_diff_concludes_nothing_from_what_a_damaged_capture_lacks(
+    loss, said, recorded, store, tmp_path
+):
+    """A broken, unauthenticated, crashed, cut or restarted capture was saved complete.
 
     So `--diff` read a cluster it lacked as resolved: "improvement: 1
     resolved" against a complete session (the reviewer's reproduction). The
     complete session holds the recorded broadcast ANR report (system_server's
     pid as measured in its run); the damaged one holds nothing, and says why.
+    Wave 4: a record cut by the stop, and a stream restart -- whose `-T 1`
+    replays only the newest record logged while no stream was up -- are
+    losses too, and were saved ``incomplete: false``.
     """
     buster = anr_watcher.AnrBuster(store=store)
     complete = store.create({})
@@ -2861,6 +3010,10 @@ def test_diff_concludes_nothing_from_what_a_damaged_capture_lacks(loss, recorded
         }
     if loss == "unverified":
         counters["unverified_anr_lines"] = 1
+    if loss == "cut record":
+        counters["cut_records"] = 1
+    if loss == "stream restarted":
+        counters["stream_restarts"] = 1
     store.persist_worker_counters(damaged.session_id, counters)
     if loss in ("stream broke", "crashed"):
         store.mark_crashed(damaged.session_id)
@@ -2872,7 +3025,9 @@ def test_diff_concludes_nothing_from_what_a_damaged_capture_lacks(loss, recorded
         buster.stop(damaged.session_id)
     result = json.loads(buster.diff(complete.session_id, damaged.session_id, json_mode=True))
 
-    assert store.load_summary(damaged.session_id).incomplete is True
+    saved = store.load_summary(damaged.session_id)
+    assert saved.incomplete is True
+    assert said in (saved.incomplete_reason or ""), saved.incomplete_reason
     assert result["resolved_clusters"] == [], result["verdict"]
     assert len(result["unconfirmed"]) == 1
     assert result["verdict"].startswith("inconclusive"), result["verdict"]
@@ -2932,5 +3087,618 @@ def test_the_worker_is_not_fooled_by_a_header_forged_in_a_tag(claim, recorded, t
     finally:
         proc.stdout.close()
 
+    # The report stands as an ANR of its window: its title names no package (wave 4).
     anrs = [(e.process, e.app) for e in store.read_events(meta.session_id) if e.kind == "anr"]
-    assert anrs == ([] if claim == "an ANR" else [("WindowManager", PACKAGE)]), anrs
+    assert anrs == ([] if claim == "an ANR" else [("WindowManager", None)]), anrs
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: a live stream that ends by itself is never a quiet success
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("device", "status"), [("gone", 3), ("still there", 1)], ids=["gone", "still-there"]
+)
+def test_a_watch_whose_stream_ends_by_itself_asks_the_device_and_never_succeeds(
+    device, status, toolchain, recorded, recorded_anywhere
+):
+    """The reviewer's replay: preflight answered, then the live logcat closes and exits 0.
+
+    `logcat -T 1` follows until it is stopped, so a stream that ends on its
+    own ended because something went away. With adb exiting 0 the watch
+    returned success -- exit 0, empty stdout -- having asked the device only
+    before it began. It asks `adb get-state` again now (the recorded answers:
+    `device` once, then -- for "gone" -- the recorded not-found refusal), and
+    refuses: exit 3 when the device went, 1 otherwise. The stream is the one
+    recorded record a fresh `-T 1` replays, then nothing.
+    """
+    get_state = [Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=device == "gone")]
+    if device == "gone":
+        get_state.append(
+            Rule(("get-state",), stderr=recorded_anywhere("adb_device_not_found"), exit=1)
+        )
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            *get_state,
+            Rule(("logcat",), stdout=framed([_history(recorded)]), exit=0),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--watch", "--duration", "30", "--json")
+
+    assert_refusal(
+        result,
+        json_mode=True,
+        naming=("not attached",) if device == "gone" else ("ended",),
+        status=status,
+        streaming=True,
+    )
+    asked = [call for call in toolchain.calls("adb") if "get-state" in call]
+    assert len(asked) == 2, f"asked the device {len(asked)} time(s): {asked}"
+
+
+def test_a_watch_whose_stream_gives_no_exit_status_asks_the_device(
+    recorded, recorded_anywhere, monkeypatch
+):
+    """The other half of the replay: the stream closes, and adb gives no exit status in time.
+
+    The same guard accepted ``None`` (a wait that timed out) as success. The
+    stand-in's stdout is at its end and its wait times out; `adb get-state`
+    answers with the recorded not-found refusal, typed as run_adb types it.
+    """
+    from common.adb_exec import DeviceNotFoundError
+
+    class _ClosedNoStatus:
+        def __init__(self, *_args, **_kwargs):
+            read_end, write_end = os.pipe()
+            os.close(write_end)
+            self.stdout = os.fdopen(read_end, "rb", buffering=0)
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("adb logcat", timeout)
+
+        def terminate(self):
+            return None
+
+    asked: list[tuple] = []
+
+    def _gone(*args, **_kwargs):
+        asked.append(args)
+        raise DeviceNotFoundError(recorded_anywhere("adb_device_not_found").strip())
+
+    monkeypatch.setattr(anr_watcher.subprocess, "Popen", _ClosedNoStatus)
+    monkeypatch.setattr(anr_watcher, "run_adb", _gone)
+    monkeypatch.setattr(anr_watcher, "STREAM_EXIT_TIMEOUT_SECONDS", 0.1)
+
+    with pytest.raises(DeviceNotFoundError):
+        anr_watcher.AnrWatcher(serial="emulator-5554").watch(json_mode=True)
+
+    assert [args[0] for args in asked] == ["get-state"]
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: the record a session starts on is shown, not counted
+# ---------------------------------------------------------------------------
+
+
+def _session_starting_on(store, records: list[Frame], tmp_path, **kwargs) -> str:
+    """A session whose stream began with ``records``, the first being `-T 1`'s replay.
+
+    Read by the worker's reader with the session's capture boundary, as
+    run_worker reads the first stream, and its counters handed over as the
+    worker hands them to --stop.
+    """
+    meta = store.create({})
+    counters = _run_worker_over(
+        store,
+        meta.session_id,
+        records,
+        tmp_path,
+        boundary=anr_watcher._CaptureBoundary(),
+        **kwargs,
+    )
+    store.persist_worker_counters(meta.session_id, counters)
+    return meta.session_id
+
+
+@pytest.mark.parametrize("first", ["anr", "jank"])
+def test_the_record_a_session_starts_on_is_shown_not_counted(first, recorded, store, tmp_path):
+    """B5's other half: `-T 1`'s one replayed record may predate the session.
+
+    The reviewer's replay: the recorded ANR report (or jank record) is the
+    newest record buffered when the session starts, and nothing new happens.
+    It was counted as the session's incident, its delta taken from when it
+    was READ. Nothing in a record can show it was logged after --start, so
+    it is kept as ``ambiguous_tail`` evidence: in the summary, in JSON and in
+    text, and out of the counts and clusters.
+    """
+    record = _anr_record(recorded) if first == "anr" else _jank_records(recorded, (80,))[0]
+    session_id = _session_starting_on(
+        store, [record], tmp_path, process_names=_oracle(recorded, BROADCAST)
+    )
+    buster = anr_watcher.AnrBuster(store=store)
+
+    payload = json.loads(buster.stop(session_id, json_mode=True))
+
+    assert (payload["event_count"], payload["clusters"]) == (0, []), payload
+    (tail,) = payload["ambiguous_tail"]
+    assert (tail["kind"], tail["timestamp"]) == (first, _printed(record)[:21]), tail
+    assert store.read_events(session_id) == []
+    details = buster.get_details(session_id)
+    assert "Ambiguous:" in details and "not counted" in details, details
+    assert "may predate" in buster.stop(session_id, terse=True)
+
+
+def test_a_record_that_may_predate_the_session_is_not_compared(recorded, store, tmp_path):
+    """--diff reads only counted clusters: the ambiguous record resolves nothing.
+
+    Session A started on the recorded ANR report as its replayed record;
+    session B on a record that is no event. Counted, the report made "A had
+    an ANR, B has none": improvement: 1 resolved. A's uncounted evidence is
+    named, so the verdict cannot be a plain "no change" either.
+    """
+    buster = anr_watcher.AnrBuster(store=store)
+    names = {"process_names": _oracle(recorded, BROADCAST)}
+    before = _session_starting_on(store, [_anr_record(recorded)], tmp_path, **names)
+    after = _session_starting_on(store, [_history(recorded)], tmp_path, **names)
+    buster.stop(before)
+    buster.stop(after)
+
+    result = json.loads(buster.diff(before, after, json_mode=True))
+
+    assert result["resolved_clusters"] == [], result["verdict"]
+    assert result["verdict"].startswith("inconclusive: "), result["verdict"]
+    assert f"{before} shows a record it started on but did not count" in result["verdict"]
+
+
+@pytest.mark.parametrize("held_back", ["ambiguous_tail", "unattributed_anrs"])
+@pytest.mark.parametrize("absent_from", ["second", "first"])
+def test_evidence_a_session_did_not_count_makes_absence_unconfirmed(
+    held_back, absent_from, recorded, store, tmp_path
+):
+    """Codex review of PR #39: excluded evidence vanished from comparisons.
+
+    One session counts the recorded broadcast ANR. The other holds the same
+    ANR only as evidence it did not count -- the record it started on
+    (``ambiguous_tail``), or an ANR ``--package`` dropped for naming no
+    verified package (``unattributed_anrs: 1``, the recorded report read
+    without its process shown to be the package's). Both summaries are
+    complete, and the diff said "improvement: 1 resolved" one way and
+    "regression: 1 new critical" the other. The ANR is unconfirmed, and the
+    verdict says what was not counted.
+    """
+    buster = anr_watcher.AnrBuster(store=store)
+    counted = store.create({})
+    _run_worker_over(
+        store,
+        counted.session_id,
+        [_anr_record(recorded)],
+        tmp_path,
+        process_names=_oracle(recorded, BROADCAST),
+    )
+    buster.stop(counted.session_id)
+    if held_back == "ambiguous_tail":
+        held = _session_starting_on(
+            store, [_anr_record(recorded)], tmp_path, process_names=_oracle(recorded, BROADCAST)
+        )
+    else:
+        meta = store.create({"package": PACKAGE})
+        counters = _run_worker_over(
+            store,
+            meta.session_id,
+            [_anr_record(recorded)],
+            tmp_path,
+            package=PACKAGE,
+            process_names=anr_watcher._ProcessNames(
+                system_server_pid=lambda: _system_server(recorded, BROADCAST)
+            ),
+        )
+        store.persist_worker_counters(meta.session_id, counters)
+        held = meta.session_id
+    buster.stop(held)
+    first, second = (
+        (counted.session_id, held) if absent_from == "second" else (held, counted.session_id)
+    )
+
+    result = json.loads(buster.diff(first, second, json_mode=True))
+
+    summary = store.load_summary(held)
+    assert summary.incomplete is False and summary.event_count == 0
+    assert (result["resolved_clusters"], result["new_clusters"]) == ([], []), result["verdict"]
+    assert [c["absent_from"] for c in result["unconfirmed"]] == [held], result
+    assert result["verdict"].startswith("inconclusive: "), result["verdict"]
+    said = {
+        "ambiguous_tail": "shows a record it started on but did not count",
+        "unattributed_anrs": "dropped 1 ANR --package could not attribute",
+    }[held_back]
+    assert f"{held} {said}" in result["verdict"], result["verdict"]
+
+
+@pytest.mark.parametrize(
+    "streams",
+    [
+        pytest.param(lambda anr, history: [[anr]], id="first-stream"),
+        pytest.param(lambda anr, history: [[], [anr]], id="restart-before-anything-was-read"),
+    ],
+)
+def test_the_worker_keeps_the_replayed_record_out_of_its_events(
+    streams, recorded, tmp_path, monkeypatch, system_server_is_known
+):
+    """run_worker end to end: the first record the session reads is the ambiguous one.
+
+    Whether the first stream delivers it, or a restart does after the first
+    stream delivered nothing -- a restart's `-T 1` replay is just as old when
+    the session has read nothing to hold it against. Review of PR #34 found
+    the recorded ANR into an empty buffer (after `logcat -c`) came out as
+    ZERO events with no word said; it is now disclosed, not lost.
+    """
+    store = SessionStore(base_dir=tmp_path / "anr-sessions")
+
+    session_id = _worker_over_streams(
+        store, streams(_anr_record(recorded), _history(recorded)), tmp_path, monkeypatch
+    )
+
+    assert store.read_events(session_id) == []
+    counters = store.load_meta(session_id).extras["line_counters"]
+    assert [(t["kind"], t["app"]) for t in counters["ambiguous_tail"]] == [("anr", PACKAGE)]
+    assert counters["matched"] == 0
+
+
+def test_a_session_counts_what_follows_the_record_it_starts_on(
+    recorded, tmp_path, monkeypatch, system_server_is_known
+):
+    """Only the one replayed record is set aside: the recorded ANR after it is the session's."""
+    store = SessionStore(base_dir=tmp_path / "anr-sessions")
+
+    session_id = _worker_over_streams(
+        store, [[_history(recorded), _anr_record(recorded)]], tmp_path, monkeypatch
+    )
+
+    assert [(e.kind, e.app) for e in store.read_events(session_id)] == [("anr", PACKAGE)]
+    assert store.load_meta(session_id).extras["line_counters"]["ambiguous_tail"] == []
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: --package keeps what it can attribute, and says what it cannot
+# ---------------------------------------------------------------------------
+
+
+def test_package_drops_an_anr_of_a_window_and_says_so(recorded, store, tmp_path):
+    """A WindowManager-only ANR names no package, so ``--package`` cannot keep it.
+
+    It is not dropped silently: the summary counts it (``unattributed_anrs``)
+    and says so in text. The recorded input ANR cut after WindowManager's
+    report -- its window titled as recorded, the fixture app's own component.
+    """
+    records = _frames(recorded, INPUT)
+    report = next(i for i, f in enumerate(records) if f.message.startswith(f"ANR in {PACKAGE}"))
+    meta = store.create({"package": PACKAGE})
+    counters = _run_worker_over(
+        store,
+        meta.session_id,
+        records[:report],
+        tmp_path,
+        package=PACKAGE,
+        process_names=_oracle(recorded, INPUT),
+    )
+    store.persist_worker_counters(meta.session_id, counters)
+    buster = anr_watcher.AnrBuster(store=store)
+
+    payload = json.loads(buster.stop(meta.session_id, json_mode=True))
+
+    assert (payload["event_count"], payload["unattributed_anrs"]) == (0, 1), payload
+    assert "Unattributed: 1" in buster.get_details(meta.session_id)
+
+
+# ---------------------------------------------------------------------------
+# Acceptance: each recorded ANR is one event, through every reader
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", [BROADCAST, INPUT])
+def test_a_session_reads_each_recorded_anr_as_one_event(name, recorded, tmp_path):
+    """--start, the recorded ANR's records after a replayed one, --stop --json: one ANR.
+
+    The report's process is shown to be the package's as the device shows it:
+    `ps -o PID,UID -p <its PID:>` answered with the recorded ps_pid_uid (that
+    pid substituted), and the package's uid listing as recorded.
+    """
+    stated = _stated_pid(_anr_record(recorded, name))
+    device = _LiveDevice(
+        tmp_path,
+        _device_answers(
+            recorded,
+            [_history(recorded), *_frames(recorded, name)],
+            system_server=_Answer(
+                ("pidof", "system_server"), stdout=_system_server(recorded, name) + "\n"
+            ),
+            ps=_Answer(("shell", "ps"), stdout=recorded_ps_answer(recorded, stated)),
+        ),
+    )
+
+    summary = _session_summary(device, events=1)
+
+    anrs = [c for c in summary["clusters"] if c["sample_event"]["kind"] == "anr"]
+    assert [(c["count"], c["sample_event"]["app"]) for c in anrs] == [(1, PACKAGE)], anrs
+    assert summary["event_count"] == 1, summary
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["com.example.victim/com.example.victim.DefaultActivity", "Skipped 80 frames!"],
+    ids=["another-apps-component", "jank-words"],
+)
+def test_since_reads_a_windows_title_as_text(title, toolchain, recorded):
+    """Both of the reviewer's replays, as an agent reads them: `--since --json`.
+
+    The recorded input ANR's records with only the window's title replaced,
+    wherever it is printed (WindowManager's report and the reason
+    ActivityManager quotes). It printed an ANR of the victim beside the real
+    one, or 80 frames of jank; it is one ANR, the app's that ActivityManager
+    names.
+    """
+    records = [
+        f.replace(message=f.message.replace(WINDOW_TITLE, title)) for f in _frames(recorded, INPUT)
+    ]
+    if records == _frames(recorded, INPUT):
+        pytest.fail("the recorded records no longer print the window's title")
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, INPUT) + "\n"),
+            *uid_rules(recorded, PACKAGE, _stated_pid(_anr_record(recorded, INPUT))),
+            Rule(("logcat",), stdout=framed(records)),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--json")
+
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e["kind"], e["process"], e.get("anr_package")) for e in events] == [
+        ("anr", "ActivityManager", PACKAGE)
+    ], events
+
+
+@pytest.mark.parametrize(
+    ("device", "status"), [("gone", 3), ("still there", 1)], ids=["gone", "still-there"]
+)
+def test_a_since_dump_that_times_out_asks_the_device(
+    device, status, toolchain, recorded, recorded_anywhere, monkeypatch, capsys
+):
+    """A dump whose device went does not fail: it waits, and the bound ends it (wave 4).
+
+    `adb logcat -d -B` aimed at a device that is not there prints "- waiting
+    for device -" and never exits (recorded: adb_waiting_for_device; W4-L
+    measured it for `-d -B`), so a timed-out `--since` read is how a dump
+    whose device went ends -- and it exited 1, "retry", without asking. adb
+    here answers `get-state` with the recorded `device` once (the preflight),
+    then -- for "gone" -- with the recorded not-found refusal, and its logcat
+    writes the recorded banner and hangs. Run in-process, against the stub
+    adb, so the dump's bound can be shortened.
+    """
+    get_state = [Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=device == "gone")]
+    if device == "gone":
+        get_state.append(
+            Rule(("get-state",), stderr=recorded_anywhere("adb_device_not_found"), exit=1)
+        )
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            *get_state,
+            Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
+        ],
+    )
+    toolchain.apply(monkeypatch)
+    monkeypatch.setattr(anr_watcher, "SINCE_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", "--since", "1m", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.run(anr_watcher.main)
+
+    assert exc.value.code == status
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["success"] is False
+    assert ("not attached" if device == "gone" else "did not finish") in refusal["error"], refusal
+    asked = [call for call in toolchain.calls("adb") if "get-state" in call]
+    assert len(asked) == 2, f"asked the device {len(asked)} time(s): {asked}"
+
+
+# ---------------------------------------------------------------------------
+# W4-N (Codex review of PR #39): ActivityManager names a process, not a package
+# ---------------------------------------------------------------------------
+
+FOREIGN = "logcat_anr_foreign_process_records"
+FOREIGN_PROCESS = "com.example.victim"
+
+
+def _foreign_listing(recorded) -> str:
+    """Both packages' uid listings as recorded in the foreign-process run."""
+    entry = _entry(recorded, FOREIGN)
+    return entry["package_uid_listing"]["output"] + entry["claimed_package_uid_listing"]["output"]
+
+
+def test_since_does_not_file_an_anr_under_the_package_its_process_is_named_after(
+    toolchain, recorded
+):
+    """The reviewer's case end to end: `--since --package com.example.victim`.
+
+    The recording: the fixture app's own stall, in a process it named
+    com.example.victim. ActivityManager reports "ANR in com.example.victim",
+    and that passed `--package com.example.victim` as the victim's ANR. adb
+    answers as the device did in that run: `pidof system_server`, each
+    package's uid listing (com.example.victim has none) and `ps` for the
+    stalled pid while it lived. system_server's own `Start proc` for the pid,
+    in the dump, gives its uid -- the fixture app's -- so ps is not needed.
+    """
+    entry = _entry(recorded, FOREIGN)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, FOREIGN) + "\n"),
+            Rule(("cmd", "package"), stdout=_foreign_listing(recorded)),
+            Rule(("shell", "ps"), stdout=entry["ps_alive"]["output"]),
+            Rule(("logcat",), stdout=recorded.data(f"{FOREIGN}.bin")),
+        ],
+    )
+
+    filtered = toolchain.run(
+        "anr_watcher.py", "--since", "1m", "--package", FOREIGN_PROCESS, "--json"
+    )
+    everything = toolchain.run("anr_watcher.py", "--since", "1m", "--json")
+
+    assert filtered.returncode == 0, filtered.stderr
+    assert filtered.stdout.strip() == "", filtered.stdout
+    assert "--package dropped 1 ANR naming no verified package" in filtered.stderr
+    (event,) = [json.loads(line) for line in everything.stdout.splitlines()]
+    assert (event["anr_package"], event["process_name"]) == (None, FOREIGN_PROCESS), event
+    assert event["attribution"] == "unverified"
+
+
+@pytest.mark.parametrize("named", [FOREIGN_PROCESS, PACKAGE], ids=["impostor", "the-package"])
+def test_a_session_takes_the_pids_uid_from_system_servers_start_proc(named, recorded, tmp_path):
+    """Lifecycle evidence first: the stream's own `Start proc <pid>:<name>/<uid>`.
+
+    The recorded foreign-process records, as recorded ("impostor"), or with
+    only the process name -- the app's to choose -- set to the package's own
+    ("the-package"), as when the receiver runs in the app's default process.
+    Either way the pid's uid is the one system_server stated when it started
+    the process, and `ps` -- which cannot show who held a pid in the past --
+    is never asked. The impostor is no package's; the package's is filed.
+    """
+    records = [
+        f.replace(message=f.message.replace(FOREIGN_PROCESS, named))
+        for f in _frames(recorded, FOREIGN)
+    ]
+    asked_ps: list[int] = []
+    names = anr_watcher._ProcessNames(
+        system_server_pid=lambda: _system_server(recorded, FOREIGN),
+        package_uids=lambda package: parse_package_uids(_foreign_listing(recorded), package),
+        pid_uid=lambda pid: asked_ps.append(pid),
+    )
+    store = SessionStore(base_dir=tmp_path / "anr-sessions")
+    meta = store.create({})
+
+    _run_worker_over(store, meta.session_id, records, tmp_path, process_names=names)
+
+    (event,) = store.read_events(meta.session_id)
+    expected = (PACKAGE, None) if named == PACKAGE else (None, "process")
+    assert (event.app, event.identity) == expected, event
+    assert asked_ps == []
+    # The attribution survives into the stored event, and --get-details says it.
+    assert event.attribution == ("verified" if named == PACKAGE else "unverified")
+    buster = anr_watcher.AnrBuster(store=store)
+    buster.stop(meta.session_id)
+    detail = buster.get_details(meta.session_id, cluster=1)
+    said = f"[unverified: process {FOREIGN_PROCESS} names no verified package]"
+    assert (said in detail) == (named != PACKAGE), detail
+
+
+def test_since_text_says_what_it_could_not_attribute(toolchain, recorded):
+    """Codex review of PR #39: the text form printed `ANR in com.example.victim` unqualified.
+
+    JSON says `attribution: unverified`; a line of text read alone said the
+    victim's ANR. The recorded foreign-process records, adb answering as the
+    device did in that run: the line says the process names no verified
+    package, and the summary that one of its events is unverified.
+    """
+    entry = _entry(recorded, FOREIGN)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, FOREIGN) + "\n"),
+            Rule(("cmd", "package"), stdout=_foreign_listing(recorded)),
+            Rule(("shell", "ps"), stdout=entry["ps_alive"]["output"]),
+            Rule(("logcat",), stdout=recorded.data(f"{FOREIGN}.bin")),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m")
+
+    assert result.returncode == 0, result.stderr
+    (line,) = [line for line in result.stdout.splitlines() if line.startswith("ANR ")]
+    assert f"[unverified: process {FOREIGN_PROCESS} names no verified package]" in line, line
+    assert "ANR/jank events: 1, including 1 unverified |" in result.stdout, result.stdout
+
+
+def test_since_text_says_a_window_report_may_be_a_duplicate(toolchain, recorded):
+    """Codex review of PR #39: two reports printed, "ANR/jank events: 2", nothing more said.
+
+    The recorded broadcast ANR cut after WindowManager's report, before the
+    verdict that settles it by hash: ActivityManager's report (its process
+    shown to be the package's, as the device answered) and an ANR of a
+    window. The window's line says it may be a duplicate of the report, by the
+    report's time, and the summary counts it so.
+    """
+    records = _frames(recorded, BROADCAST)
+    window = next(i for i, f in enumerate(records) if f.tag == "WindowManager")
+    report = _anr_record(recorded)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, BROADCAST) + "\n"),
+            *uid_rules(recorded, PACKAGE, _stated_pid(report)),
+            Rule(("logcat",), stdout=framed(records[: window + 1])),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m")
+
+    assert result.returncode == 0, result.stderr
+    lines = [line for line in result.stdout.splitlines() if line.startswith("ANR ")]
+    assert len(lines) == 2, result.stdout
+    assert "possible duplicate" not in lines[0], lines[0]
+    assert f"[possible duplicate of the ANR at {_printed(report)[:21]}]" in lines[1], lines[1]
+    assert "[an ANR of a window: its title names no package]" in lines[1], lines[1]
+    assert (
+        "ANR/jank events: 2, including 1 possible duplicate; 1 unverified |" in result.stdout
+    ), result.stdout
+
+
+def test_an_interrupted_watch_asks_the_device_nothing_more(recorded, monkeypatch):
+    """Codex review of PR #39: the legacy watcher's lookups ignored Ctrl-C.
+
+    The interrupt arrives while the first question (system_server's pid) is
+    under way. That one finishes; no other starts -- not the `ps` for the
+    report's pid, nor a package's uids -- as in the session worker. The
+    recorded broadcast ANR report, handed to the watcher as its stream would.
+    """
+    watcher = anr_watcher.AnrWatcher(serial="emulator-5554")
+    asked: list[str] = []
+
+    def _system_server_then_interrupted(*_args, **_kwargs):
+        asked.append("pidof system_server")
+        watcher.interrupted = True
+        return _system_server(recorded, BROADCAST)
+
+    def _noted(*args, **_kwargs):
+        """Note the question; answer with nothing (no uid, no ps row)."""
+        from common.adb_exec import AdbResult
+
+        asked.append(" ".join(str(arg) for arg in args))
+        return AdbResult(1, "", "") if args[:1] == ("shell",) else None
+
+    monkeypatch.setattr(anr_watcher, "get_system_server_pid", _system_server_then_interrupted)
+    monkeypatch.setattr(anr_watcher, "get_package_uids", _noted)
+    monkeypatch.setattr(anr_watcher, "run_adb", _noted)
+
+    watcher._handle_record(logcat.parse_records(_anr_record(recorded).raw)[0], None, json_mode=True)
+
+    assert asked == ["pidof system_server"], asked
+    (event,) = watcher.events
+    assert (event["anr_package"], event["attribution"]) == (None, "unverified")

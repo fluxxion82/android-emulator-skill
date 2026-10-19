@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 # === CONSTANTS ===
 
-FINGERPRINT_VERSION = 2
+FINGERPRINT_VERSION = 3
 """Bump when normalise_message, compute_fingerprint, or severity boundaries change.
 
 A session records the version it was CAPTURED with (``SessionMeta``), and its
@@ -57,10 +57,24 @@ v2 (2026-10, A5): a jank event's identity is its PROCESS, not its frame count.
 once per distinct count; N is now redacted. A Choreographer line names no app,
 so the process is hashed in: by NAME when the session worker could name the pid
 (``identity: "package"``), else by the pid itself (``identity: "pid"``), which
-``--diff`` will not compare across sessions -- a restarted app has a new pid."""
+``--diff`` will not compare across sessions -- a restarted app has a new pid.
+
+v3 (2026-10, wave 4): an ANR is filed under a package only on evidence. One
+WindowManager alone reported is an ANR of a WINDOW (``identity: "window"``,
+hashed by its title, no symbol scraped from it); one whose process
+ActivityManager named but no uid confirmed as that package's is an ANR of a
+PROCESS (``identity: "process"``). v2 filed both under the package their text
+claimed, so a v2 fallback reads back as a comparable, package-named cluster:
+compared with a v3 session it was "resolved" (Codex review of PR #39)."""
 
 # Each dropped frame on a 60Hz display is ~16.7ms of main-thread stall.
 FRAME_MS = 16.7
+
+# Event identities that hold only inside one session (``NormalisedEvent
+# .identity``): a pid, which a restart renumbers; a window, whose title is the
+# app's text; and a process name no uid confirmed, which any app may choose
+# (android:process). ``--diff`` compares none of them.
+_NO_IDENTITY = frozenset({"pid", "window", "process"})
 
 # Skipped-frame severity boundaries (frame counts). Android Choreographer only
 # warns once N skipped frames cross a threshold; we scale severity from there.
@@ -120,8 +134,9 @@ _ANR_RECORD_REASON_RE = re.compile(r"^Reason:\s*(.+?)\s*$")
 # WindowManager's line outright made a stream cut between the two -- a stop, a
 # --since window -- ZERO ANRs, and ActivityManager has other early returns
 # (crashing, killed, shutting down) where it records nothing. So the line is
-# held as a FALLBACK: it is dropped when ActivityManager accounts for the same
-# package within ANR_CORRELATION_MS, either side, and is an event otherwise.
+# held as a FALLBACK: it is dropped when ActivityManager names the same WINDOW
+# within ANR_CORRELATION_MS, either side, and is an event otherwise -- an ANR
+# of a window, which names no package (see _WINDOW_REPORT_RE).
 _ANR_PRECURSOR_TAGS = frozenset({"WindowManager"})
 
 # How far apart, by logcat timestamp, WindowManager's report and
@@ -135,24 +150,33 @@ _ANR_DUPLICATE_PREFIX = "Skipping duplicate ANR:"
 # What WindowManager's line says timed out: "...}. Reason:Input dispatching ..."
 _WINDOW_REASON_RE = re.compile(r"\.\s*Reason:\s*(.+?)\s*$")
 
-# A package as a whole token followed by its component's slash -- "(62056f6
-# com.example.composefixture/com.example..." in a duplicate verdict. Bounded on
-# the left so "example.composefixture" is not found inside
-# "com.example.composefixture" (review of PR #26: a substring match let one
-# app's verdict settle another app's ANR).
-_PACKAGE_TOKEN_RE = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.\w+)+)/")
+# WindowManager's report prints the window as WindowState.toString does:
+#   "ANR in Window{9274f0b u0 com.pkg/com.pkg.DefaultActivity}. Reason:Input ..."
+# (recorded: logcat_anr_input_records, logcat_anr_broadcast_records). Only the
+# OPENING is system_server's own -- the window's identity hash
+# (System.identityHashCode, in hex) and its user. What follows is the window's
+# TITLE, which the app sets (WindowManager.LayoutParams.setTitle; an activity's
+# defaults to its component, which is what the recordings show). So the title
+# is display text: it names no package, and nothing in it is classified. Read
+# as an identity, a title "com.example.victim/com.example.victim.Default
+# Activity" made an ANR of that app beside the real one, and "Skipped 80
+# frames!" made the report jank (final review of v0.8.0, wave 4).
+_WINDOW_REPORT_RE = re.compile(r"ANR in Window\{(?P<hash>[0-9a-f]+) u\d+ ")
 
-# One stalled app is reported by TWO subsystems in two different shapes. Both
-# are recorded: logcat_anr_broadcast and logcat_anr_input_dispatch.
-#
-# WindowManager writes the input-dispatch form FIRST in the line, and its
-# package sits inside the braces:
-#   "ANR in Window{67a8d77 u0 com.pkg/com.pkg.MainActivity}. Reason:Input ..."
-# Matched before the generic form, which would otherwise read the literal word
-# "Window" as the package name and report a fault in an app called Window.
-_ANR_IN_WINDOW_RE = re.compile(
-    r"ANR in Window\{\S+\s+\S+\s+(?P<package>[\w.]+)/(?P<component>[\w.$]+)\}",
-    re.IGNORECASE,
+# The window an input timeout names: the input channel's name, which is the
+# same identity hash and the same title -- "Input dispatching timed out
+# (9274f0b com.pkg/... (server) is not responding". Recorded in two places:
+# the Reason: line of ActivityManager's report of an input ANR
+# (logcat_anr_input_records), and ActivityManager's duplicate verdict on a
+# window report after a broadcast ANR (logcat_anr_broadcast_records), after
+# the error state it names. A broadcast ANR's own report names NO window
+# (its Reason is the broadcast). The hash, not the title, says which window
+# a report and a record share: a title any app may copy, so a title never
+# settles a report (Codex review of PR #39: an ANR of B, then a separate
+# window titled as B's, and the second vanished).
+_TIMED_OUT_WINDOW_RE = re.compile(r"Input dispatching timed out \((?P<hash>[0-9a-f]+) ")
+_VERDICT_WINDOW_RE = re.compile(
+    rf"{re.escape(_ANR_DUPLICATE_PREFIX)} \S+ Input dispatching timed out \((?P<hash>[0-9a-f]+) "
 )
 
 # ActivityManager's form is the bare package: "ANR in com.example.app". The
@@ -207,9 +231,24 @@ class NormalisedEvent:
     # The process the event belongs to, by name, when known: the ANR's package,
     # or the name the session worker found for a jank line's pid.
     app: str | None = None
-    # How a jank event's site is keyed: "package" (by ``app``) or "pid" (no
-    # name was found). None for kinds whose text names their site.
+    # How the event's site is keyed: for jank "package" (by ``app``) or "pid"
+    # (no name was found); for an ANR WindowManager alone reported, "window"
+    # (no package: a window's title is the app's text). None for an event
+    # whose record names its site.
     identity: str | None = None
+    # The title of the window an ANR of a window was reported for: display
+    # text, never an identity (_WINDOW_REPORT_RE).
+    window: str | None = None
+    # The process an ANR of a process was reported for, by the name
+    # ActivityManager gave it, which no uid showed to be a package's.
+    process_name: str | None = None
+    # An ANR of a window that ActivityManager's report of a broadcast ANR,
+    # within the correlation window, may already account for: counted, said.
+    possible_duplicate: bool = False
+    # For ActivityManager's ANR: whether its process was shown to be the
+    # package's -- "verified", "unverified" or "contradicted" (the assembler's
+    # ``attribution``), kept so --get-details says it too.
+    attribution: str | None = None
 
 
 @dataclass
@@ -261,6 +300,22 @@ class SessionSummary:
     # error a stream broke on, if one did (common.logcat's LogFramingError).
     cut_records: int = 0
     stream_failure: str | None = None
+    # Times the worker restarted a dead stream. `-T 1` replays only the newest
+    # record logged while none was up, so each restart may have lost the rest
+    # (wave 4: it was not counted as a loss).
+    stream_restarts: int = 0
+    # What the record the session started on showed: `logcat -T 1` replays the
+    # newest record already buffered, which may predate the session, and
+    # nothing in a record can show it does not. Shown, never counted,
+    # clustered or compared (wave 4).
+    ambiguous_tail: list[dict] = field(default_factory=list)
+    # ANRs ``--package`` dropped because they name no package -- of a window,
+    # or of a process no uid confirmed -- so it can neither keep them nor say
+    # they were someone else's (wave 4).
+    unattributed_anrs: int = 0
+    # ANRs of a window that a broadcast ANR's report nearby may already
+    # account for: counted, and said (``NormalisedEvent.possible_duplicate``).
+    possible_duplicates: int = 0
 
 
 # What a summary says when its ANR reports could not be authenticated.
@@ -320,12 +375,31 @@ def parse_logcat_anr(line: str) -> dict | None:
         event["component"] = classified["component"]
     if classified.get("anr_package"):
         event["anr_package"] = classified["anr_package"]
+    if classified.get("window") is not None:
+        event["window"] = classified["window"]
     return event
 
 
 def _classify_anr(tag: str, message: str) -> dict | None:
     """Map a (tag, message) pair to ANR/jank metadata, or None if irrelevant."""
     lower = message.lower()
+
+    # 0. WindowManager's report of an unresponsive window, read for its
+    # opening alone and before anything else: the rest is the window's title,
+    # the app's text (_WINDOW_REPORT_RE), so it is kept as ``window`` -- to be
+    # shown, never to name a package or to be classified. "ANR in Window{...}"
+    # also matches the generic form below, which read the word "Window" as a
+    # package; the title then made the package (wave 4).
+    window = _WINDOW_REPORT_RE.match(message)
+    if window:
+        return {
+            "kind": "anr",
+            "frames": None,
+            "duration_ms": 5000.0,
+            "component": None,
+            "anr_package": None,
+            "window": _window_title(message[window.end() :]),
+        }
 
     # 1. Choreographer "Skipped N frames!" jank.
     if "choreographer" in tag.lower() or "skipped" in lower:
@@ -340,21 +414,7 @@ def _classify_anr(tag: str, message: str) -> dict | None:
                 "anr_package": None,
             }
 
-    # 2a. WindowManager's input-dispatch ANR, whose package is inside the
-    # braces. Checked before the generic form: "ANR in Window{...}" matches
-    # that too, and reports a fault in a package called "Window".
-    window_match = _ANR_IN_WINDOW_RE.search(message)
-    if window_match:
-        package = window_match.group("package")
-        return {
-            "kind": "anr",
-            "frames": None,
-            "duration_ms": 5000.0,
-            "component": f"{package}/{window_match.group('component')}",
-            "anr_package": package,
-        }
-
-    # 2b. ActivityManager hard ANR.
+    # 2. ActivityManager hard ANR.
     anr_match = _ANR_IN_RE.search(message)
     if anr_match:
         pkg = anr_match.group(1)
@@ -403,6 +463,17 @@ def _classify_anr(tag: str, message: str) -> dict | None:
         }
 
     return None
+
+
+def _window_title(rest: str) -> str:
+    """The window's title: what WindowManager's report prints after its opening.
+
+    Up to the first "}. Reason:", which closes the window as recorded. The
+    title is the app's text and may hold that too, so this is a boundary for
+    display, nothing more.
+    """
+    end = rest.find("}. Reason:")
+    return rest[:end] if end != -1 else rest
 
 
 def is_anr_message(tag: str, message: str) -> bool:
@@ -454,7 +525,7 @@ def event_from_record(record: LogRecord, tz: tzinfo | None = None) -> dict | Non
         "kind": classified["kind"],
         "duration_ms": classified["duration_ms"],
     }
-    for key in ("frames", "component", "anr_package"):
+    for key in ("frames", "component", "anr_package", "window"):
         if classified.get(key) is not None:
             event[key] = classified[key]
     if classified["kind"] == "anr":
@@ -483,10 +554,32 @@ class AnrRecordAssembler:
     - **WindowManager's ANR report is a fallback.** It is a report to
       ActivityManager, which normally records the incident itself, before or
       after it (see ``_ANR_PRECURSOR_TAGS``). It is dropped when ActivityManager
-      records -- or calls a duplicate -- an ANR of the same package within
-      ``ANR_CORRELATION_MS`` of it, by log time; otherwise it is the event,
-      emitted once that window has passed (later records, or a quiet stream)
-      or the stream ends. Emitted late, so it can follow events logged after it.
+      names the same WINDOW -- its identity hash, in the input timeout both
+      quote -- within ``ANR_CORRELATION_MS``, by log time: in its report of an
+      input ANR, or in its duplicate verdict. Otherwise it is the event,
+      emitted once that window has passed (later records of system_server's,
+      or a quiet stream) or the stream ends. Emitted late, so it can follow
+      events logged after it. A report ActivityManager's report of a
+      broadcast ANR (which names no window) may answer is kept, with
+      ``possible_duplicate``: the window's title could say whose window it is,
+      but the title is the app's (Codex review of PR #39).
+    - **A window names no package.** What follows the window's hash is its
+      title, the app's to set (``_WINDOW_REPORT_RE``). A report nothing
+      answers is an ANR of a window: ``anr_package`` None, the title kept as
+      ``window``, display text, which neither names nor settles anything.
+    - **ActivityManager names a process, not a package.** ``ANR in <name>``
+      is the stalled process's name (``mApp.processName``), and an app may
+      name its process after another package (``android:process``; recorded:
+      logcat_anr_foreign_process_records, "ANR in com.example.victim" from the
+      fixture app's own uid). So the package stands only when
+      ``subject_owner`` shows the report's ``PID:`` is that package's
+      process; otherwise the ANR is kept as an ANR of a PROCESS --
+      ``anr_package`` None, the name kept as ``process_name``, and
+      ``attribution`` saying why.
+    - **Only system_server's records move the log clock.** A record's time is
+      its writer's (logd takes it from the client's header, unlike the pid),
+      so an app's record dated a minute ahead released a held report before
+      ActivityManager's record of the same stall came: one ANR counted twice.
 
     Jank and StrictMode records are single incidents and come straight out.
     Every reader -- ``--watch``, ``--since`` and the session worker -- feeds its
@@ -511,15 +604,28 @@ class AnrRecordAssembler:
     Args:
         system_server_pid: system_server's pid, or a function returning it
             (None when the device cannot say). None: no report counts.
+        subject_owner: ``(pid, package) -> True`` when the process ``pid``
+            is shown to be ``package``'s, False when shown not to be, None
+            when nothing shows either; asked only for an authenticated
+            report. None (the default): nothing is shown, so no ANR is filed
+            under a package.
     """
 
-    def __init__(self, system_server_pid: str | Callable[[], str | None] | None = None) -> None:
-        # WindowManager reports waiting for ActivityManager: (log ms, event).
-        self._held: list[tuple[int, dict]] = []
-        # package -> log ms of ActivityManager's latest record for it.
-        self._recorded: dict[str, int] = {}
+    def __init__(
+        self,
+        system_server_pid: str | Callable[[], str | None] | None = None,
+        subject_owner: Callable[[int, str], bool | None] | None = None,
+    ) -> None:
+        # WindowManager reports waiting for ActivityManager.
+        self._held: list[_HeldReport] = []
+        # Log ms of ActivityManager's latest report naming a window, by that
+        # window; and of every report of its, with its printed time, for a
+        # released report to say which one it may be a duplicate of.
+        self._recorded_windows: dict[str, int] = {}
+        self._reported_at: list[tuple[int, str]] = []
         self._system_server = system_server_pid
         self._system_server_asked = not callable(system_server_pid)
+        self._subject_owner = subject_owner
         # Report records set aside because system_server's pid was unknown.
         self.unverified = 0
 
@@ -533,28 +639,45 @@ class AnrRecordAssembler:
             return None
         return str(writer) == str(self._system_server)
 
-    def feed(self, record: LogRecord) -> list[dict]:
-        """Take one record; return the events it completes (often none)."""
+    def _known_to_be_system_servers(self, writer: int) -> bool:
+        """Whether system_server wrote it, as far as already known -- asking nothing.
+
+        A report is held only once system_server's pid is known, so while one
+        is held this is a true answer; with none held it is never needed.
+        """
+        known = self._system_server if self._system_server_asked else None
+        return known is not None and str(writer) == str(known)
+
+    def feed(self, record: LogRecord, *, ambiguous: bool = False) -> list[dict]:
+        """Take one record; return the events it completes (often none).
+
+        Args:
+            record: The next record.
+            ambiguous: The record may predate the read (`logcat -T 1`'s
+                replay): every event it makes carries ``ambiguous_tail``, for
+                the reader to show and not count.
+        """
         at_ms = record.sec * 1000 + record.nsec // 1_000_000
-        completed = self._release(lambda held_ms: at_ms - held_ms > ANR_CORRELATION_MS)
+        completed: list[dict] = []
+        if self._held and self._known_to_be_system_servers(record.pid):
+            completed = self._release(lambda held_ms: at_ms - held_ms > ANR_CORRELATION_MS)
         tag = record.tag
         if tag == "ActivityManager" and record.message.startswith(_ANR_DUPLICATE_PREFIX):
             if not self._written_by_system_server(record.pid):
                 return completed
             # ActivityManager's own word that a report belongs to a stall it
-            # has already recorded. It settles a held report only for a
-            # package it names exactly, and only within the window.
-            named = set(_PACKAGE_TOKEN_RE.findall(record.message))
-            self._held = [
-                (ms, e)
-                for ms, e in self._held
-                if e.get("anr_package") not in named or abs(at_ms - ms) > ANR_CORRELATION_MS
-            ]
+            # has already recorded. It settles a held report only for the
+            # window it names, by hash, and only within the window of time.
+            named = _VERDICT_WINDOW_RE.match(record.message)
+            if named:
+                self._settle(at_ms, named["hash"])
             return completed
 
         event = event_from_record(record)
         if event is None:
             return completed
+        if ambiguous:
+            event["ambiguous_tail"] = True
         if event["kind"] != "anr":
             completed.append(event)
             return completed
@@ -564,23 +687,67 @@ class AnrRecordAssembler:
             and self._written_by_system_server(record.pid)
         ):
             return completed
-        package = event.get("anr_package") or ""
         if tag in _ANR_PRECURSOR_TAGS:
-            recorded_ms = self._recorded.get(package)
-            if recorded_ms is None or abs(at_ms - recorded_ms) > ANR_CORRELATION_MS:
+            opening = _WINDOW_REPORT_RE.match(record.message)
+            report = _HeldReport(
+                at_ms=at_ms,
+                window=opening["hash"] if opening else None,
+                # An ANR of a window, which names no package (_WINDOW_REPORT_RE).
+                event={
+                    **event,
+                    "anr_package": None,
+                    "component": None,
+                    "window": event["window"] if "window" in event else event.get("anr_package"),
+                },
+            )
+            if not self._accounted_for(report):
                 reason = _WINDOW_REASON_RE.search(event["message"])
                 if reason:
-                    event["reason"] = reason.group(1)
-                self._held.append((at_ms, event))
+                    report.event["reason"] = reason.group(1)
+                self._held.append(report)
             return completed
-        self._recorded[package] = at_ms
-        self._held = [
-            (ms, e)
-            for ms, e in self._held
-            if e.get("anr_package") != package or abs(at_ms - ms) > ANR_CORRELATION_MS
-        ]
+        self._attribute(event)
+        self._reported_at.append((at_ms, event["timestamp"]))
+        timed_out = _TIMED_OUT_WINDOW_RE.match(event.get("reason") or "")
+        if timed_out:
+            self._recorded_windows[timed_out["hash"]] = at_ms
+            self._settle(at_ms, timed_out["hash"])
         completed.append(event)
         return completed
+
+    def _attribute(self, event: dict) -> None:
+        """File ActivityManager's report under its package only when its process is shown to be it.
+
+        ``ANR in <name>`` names a PROCESS (``mApp.processName``), which any
+        app may name after another package; ``PID:`` is that process. The
+        name stands as the package only when ``subject_owner`` shows the pid
+        is the package's. Otherwise the ANR is one of a process: no package,
+        no component, the name kept as ``process_name``.
+        """
+        claimed, pid = event.get("anr_package"), event.get("app_pid")
+        owned = None
+        if claimed and pid is not None and self._subject_owner is not None:
+            owned = self._subject_owner(int(pid), claimed)
+        if owned:
+            event["attribution"] = "verified"
+            return
+        event["attribution"] = "contradicted" if owned is False else "unverified"
+        event["process_name"] = claimed
+        event["anr_package"] = None
+        event["component"] = None
+
+    def _accounted_for(self, report: _HeldReport) -> bool:
+        """Whether ActivityManager has already named the window a report is of."""
+        recorded_ms = self._recorded_windows.get(report.window) if report.window else None
+        return recorded_ms is not None and abs(report.at_ms - recorded_ms) <= ANR_CORRELATION_MS
+
+    def _settle(self, at_ms: int, window: str) -> None:
+        """Drop the held reports of ``window`` logged near ``at_ms``."""
+        self._held = [
+            held
+            for held in self._held
+            if held.window != window or abs(at_ms - held.at_ms) > ANR_CORRELATION_MS
+        ]
 
     def flush(self, quiet_seconds: float = 0.0) -> list[dict]:
         """The stream has gone quiet: emit what quiet completes.
@@ -601,21 +768,55 @@ class AnrRecordAssembler:
         return self._release(lambda _held_ms: True)
 
     def _release(self, due) -> list[dict]:
-        """Emit, as events, the held WindowManager reports ``due`` says are due."""
-        released = [event for held_ms, event in self._held if due(held_ms)]
-        self._held = [(ms, event) for ms, event in self._held if not due(ms)]
+        """Emit, as events, the held WindowManager reports ``due`` says are due.
+
+        One ActivityManager reported near -- a broadcast ANR's report, which
+        names no window -- may be the same stall; nothing but the title, the
+        app's, could say so, so the report is kept and says it may be, and of
+        which (``possible_duplicate_of``: that report's printed time).
+        """
+        released = []
+        for held in self._held:
+            if not due(held.at_ms):
+                continue
+            near = [
+                stamp
+                for ms, stamp in self._reported_at
+                if abs(held.at_ms - ms) <= ANR_CORRELATION_MS
+            ]
+            if near:
+                held.event["possible_duplicate"] = True
+                held.event["possible_duplicate_of"] = near[-1]
+            released.append(held.event)
+        self._held = [held for held in self._held if not due(held.at_ms)]
         return released
 
 
+@dataclass
+class _HeldReport:
+    """A WindowManager report waiting for ActivityManager to account for it.
+
+    ``window`` is the window's identity hash (system_server's); ``event`` the
+    ANR of a window it becomes if nothing does.
+    """
+
+    at_ms: int
+    window: str | None
+    event: dict
+
+
 def parse_logcat_stream(
-    records: Iterable[LogRecord], system_server_pid: str | Callable[[], str | None] | None = None
+    records: Iterable[LogRecord],
+    system_server_pid: str | Callable[[], str | None] | None = None,
+    subject_owner: Callable[[int, str], bool | None] | None = None,
 ) -> list[dict]:
     """Every ANR/jank incident in a finite run of records (a ``logcat -d -B`` dump).
 
-    ``system_server_pid`` authenticates the ANR reports (see
-    :class:`AnrRecordAssembler`); without it none counts.
+    ``system_server_pid`` authenticates the ANR reports, and ``subject_owner``
+    their packages (see :class:`AnrRecordAssembler`); without the first none
+    counts, and without the second none is filed under a package.
     """
-    assembler = AnrRecordAssembler(system_server_pid)
+    assembler = AnrRecordAssembler(system_server_pid, subject_owner)
     events: list[dict] = []
     for record in records:
         events.extend(assembler.feed(record))
@@ -712,10 +913,24 @@ def build_normalised_event(
     kind = raw_event.get("kind", "jank")
     frames = raw_event.get("frames")
     pid = int(raw_event.get("pid", 0))
+    window = raw_event.get("window")
     # Prefer the explicit component (high signal) over a regex-scraped symbol.
     symbol = raw_event.get("component") or extract_symbol(message)
     prefix = normalise_message(message)
     app = raw_event.get("app") or raw_event.get("anr_package")
+    process_name = raw_event.get("process_name")
+    if kind == "anr" and window is not None and not app:
+        # An ANR of a window: its title is the app's text, so no symbol is
+        # scraped from it -- a title reading as another app's component made
+        # the cluster that app's. Its label says it is a title, and its
+        # window's hash (a new one per window) is left out of the prefix.
+        symbol = None
+        prefix = normalise_message(f"ANR in a window titled {window}")
+    elif kind == "anr" and process_name is not None and not app:
+        # An ANR of a process no uid showed to be the package it is named
+        # after (android:process): labelled so, with nothing scraped from it.
+        symbol = None
+        prefix = normalise_message(f"ANR in a process named {process_name}")
     # A Choreographer line names no app: every app's jank reads "Skipped <n>
     # frames!" under the same tag. Without a site, redacting the count (A5)
     # would merge every app's jank into one cluster. The site is the process:
@@ -728,6 +943,11 @@ def build_normalised_event(
     if kind == "jank":
         identity = "package" if raw_event.get("app") else "pid"
         site = f"app:{raw_event['app']}" if identity == "package" else f"pid:{pid}"
+    elif kind == "anr" and window is not None and not app:
+        # Not compared across sessions, as a pid is not (diff_sessions).
+        identity = site = "window"
+    elif kind == "anr" and process_name is not None and not app:
+        identity = site = "process"
     fingerprint = compute_fingerprint(symbol, prefix, kind, site=site)
     app_pid = raw_event.get("app_pid")
     return NormalisedEvent(
@@ -746,6 +966,10 @@ def build_normalised_event(
         app_pid=int(app_pid) if app_pid is not None else None,
         app=app,
         identity=identity,
+        window=window if identity == "window" else None,
+        process_name=process_name if identity == "process" else None,
+        possible_duplicate=bool(raw_event.get("possible_duplicate")),
+        attribution=raw_event.get("attribution"),
     )
 
 
@@ -951,7 +1175,56 @@ def _framing_note(summary: SessionSummary) -> str:
             f"Cut: {summary.cut_records} record{plural} arriving when the session stopped "
             f"{'are' if plural else 'is'} not in here."
         )
+    if summary.stream_restarts:
+        plural = "s" if summary.stream_restarts != 1 else ""
+        notes.append(
+            f"Restarted: the stream died and was restarted {summary.stream_restarts} "
+            f"time{plural}; of what was logged while it was down, only the newest record "
+            f"is in here."
+        )
     return " ".join(notes)
+
+
+def _ambiguous_note(summary: SessionSummary) -> str:
+    """The record the session started on, shown and not counted (empty when it was no event)."""
+    if not summary.ambiguous_tail:
+        return ""
+    shown = "; ".join(
+        f"{tail.get('kind')} at {tail.get('timestamp')}, "
+        f"{tail.get('app') or tail.get('process')}: {str(tail.get('message', ''))[:80]}"
+        for tail in summary.ambiguous_tail
+    )
+    return (
+        f"Ambiguous: the record the session started on may predate it (`logcat -T 1` "
+        f"first replays the newest one already buffered) -- {shown}; shown, not counted."
+    )
+
+
+def _unattributed_note(summary: SessionSummary) -> str:
+    """The ANRs --package dropped for naming no package (empty when none were)."""
+    count = summary.unattributed_anrs
+    if not count:
+        return ""
+    plural = "s" if count != 1 else ""
+    return (
+        f"Unattributed: {count} ANR{plural} named no package anything verified -- a "
+        f"window's title is the app's to set, and a process may be named after any "
+        f"package -- so --package dropped {'them' if plural else 'it'}."
+    )
+
+
+def _duplicate_note(summary: SessionSummary) -> str:
+    """The ANRs of a window that may be a broadcast ANR's duplicate (empty when none are)."""
+    count = summary.possible_duplicates
+    if not count:
+        return ""
+    plural = "s" if count != 1 else ""
+    return (
+        f"Possible duplicate{plural}: {count} ANR{plural} of a window, reported within 10 s "
+        f"of an ANR ActivityManager reported without naming its window; only the window's "
+        f"title, the app's text, could tie {'them' if plural else 'it'} to it, so "
+        f"{'both are' if not plural else 'each is'} counted."
+    )
 
 
 def _incomplete_note(reason: str | None) -> str:
@@ -964,7 +1237,14 @@ def _incomplete_note(reason: str | None) -> str:
 def _disclosures(summary: SessionSummary) -> list[str]:
     """What the summary could not see, one line each, for the text forms."""
     notes = [_incomplete_note(summary.incomplete_reason)] if summary.incomplete else []
-    found = (_framing_note(summary), _unverified_note(summary), _unnamed_note(summary))
+    found = (
+        _framing_note(summary),
+        _unverified_note(summary),
+        _unnamed_note(summary),
+        _unattributed_note(summary),
+        _duplicate_note(summary),
+        _ambiguous_note(summary),
+    )
     return [*notes, *(note for note in found if note)]
 
 
@@ -984,10 +1264,18 @@ def _markers(summary: SessionSummary) -> str:
         marks.append("stream broken")
     if summary.cut_records:
         marks.append(counted(summary.cut_records, "record", "cut by the stop"))
+    if summary.stream_restarts:
+        marks.append(counted(summary.stream_restarts, "stream restart", "losing a gap"))
     if summary.verification:
         marks.append(counted(summary.unverified_anr_lines, "ANR record", "unverified"))
     if summary.unnamed_pids:
         marks.append(counted(len(summary.unnamed_pids), "pid", "unnamed"))
+    if summary.unattributed_anrs:
+        marks.append(counted(summary.unattributed_anrs, "ANR", "unattributed"))
+    if summary.possible_duplicates:
+        marks.append(counted(summary.possible_duplicates, "window ANR", "possibly a duplicate"))
+    if summary.ambiguous_tail:
+        marks.append("1 record may predate the session, not counted")
     return f" [{'; '.join(marks)}]" if marks else ""
 
 
@@ -1103,7 +1391,45 @@ def format_cluster_detail(
             lines.append(f"      msg: {event.raw_message[:120]}")
         if event.reason:
             lines.append(f"      reason: {event.reason[:120]}")
+        said = attribution_markers(
+            attribution=event.attribution,
+            process_name=event.process_name,
+            window=event.window,
+            possible_duplicate=event.possible_duplicate,
+        )
+        if said:
+            lines.append(f"      {said}")
     return "\n".join(lines)
+
+
+def attribution_markers(
+    *,
+    attribution: str | None,
+    process_name: str | None,
+    window: str | None,
+    possible_duplicate: bool = False,
+    possible_duplicate_of: str | None = None,
+) -> str:
+    """What a text line says beside an ANR it could not tie to a package, or to one incident.
+
+    JSON carries ``attribution``, ``process_name``, ``window`` and
+    ``possible_duplicate``; a line of text read alone said ``ANR in
+    com.example.victim`` as if it were that package's (Codex review of PR
+    #39). Empty when there is nothing to qualify.
+    """
+    marks = []
+    if process_name is not None:
+        if attribution == "contradicted":
+            marks.append(f"[contradicted: process {process_name} runs under another package's uid]")
+        else:
+            marks.append(f"[unverified: process {process_name} names no verified package]")
+    if window is not None:
+        marks.append("[an ANR of a window: its title names no package]")
+    if possible_duplicate_of:
+        marks.append(f"[possible duplicate of the ANR at {possible_duplicate_of}]")
+    elif possible_duplicate:
+        marks.append("[possible duplicate of an ANR reported within 10 s that names no window]")
+    return " ".join(marks)
 
 
 def format_diff(diff: dict) -> str:
@@ -1149,8 +1475,9 @@ def format_diff(diff: dict) -> str:
     not_comparable = diff.get("not_comparable", [])
     if not_comparable:
         lines.append(
-            f"Not comparable ({len(not_comparable)}): jank whose process was never named, "
-            f"so only its pid identifies it, and a pid does not survive a restart:"
+            f"Not comparable ({len(not_comparable)}): what no package identifies -- jank "
+            f"whose process was never named (a pid does not survive a restart), or an ANR "
+            f"of a window (its title is the app's to set) -- and what either may be:"
         )
         for cluster in not_comparable[:5]:
             lines.append(
@@ -1161,8 +1488,8 @@ def format_diff(diff: dict) -> str:
     unconfirmed = diff.get("unconfirmed", [])
     if unconfirmed:
         lines.append(
-            f"Unconfirmed ({len(unconfirmed)}): missing only from an incomplete session, "
-            f"which may simply not have written them:"
+            f"Unconfirmed ({len(unconfirmed)}): missing only from a session that is "
+            f"incomplete or holds evidence it did not count, which may be them:"
         )
         for cluster in unconfirmed[:5]:
             lines.append(
@@ -1243,9 +1570,11 @@ def diff_sessions(
     document it could not read, at precisely the moment something got worse
     (N9). A 0 → N cluster counts as worsened.
 
-    ``unconfirmed`` holds the clusters one session has and the other, saved
-    ``incomplete``, lacks -- each with ``session`` (where it is) and
-    ``absent_from`` -- in place of calling them resolved or new. With either
+    ``unconfirmed`` holds the clusters one session has and the other lacks
+    while it was saved ``incomplete`` or holds evidence it did not count (an
+    ``ambiguous_tail``, ``unattributed_anrs``) -- each with ``session``
+    (where it is) and ``absent_from`` -- in place of calling them resolved or
+    new; the verdict names what was not counted. With either
     side incomplete, ``not_compared`` holds the clusters both have, in place of
     a drift or stability verdict: an incomplete side's maximum is only a lower
     bound.
@@ -1262,15 +1591,16 @@ def diff_sessions(
     # A pid-keyed cluster has no identity outside its own session: the same
     # app restarted gets a new pid, and an old pid can be another process.
     # Reporting it as resolved here and new there was a regression invented by
-    # a restart, so it is listed as not comparable instead.
+    # a restart, so it is listed as not comparable instead. So is an ANR of a
+    # window: it names no package, only a title any app may set (wave 4).
     not_comparable = [
         {**_cluster_to_dict(cluster), "session": summary.session_id}
         for summary in (summary_a, summary_b)
         for cluster in summary.clusters
-        if cluster.identity == "pid"
+        if cluster.identity in _NO_IDENTITY
     ]
-    a_map = {c.fingerprint: c for c in summary_a.clusters if c.identity != "pid"}
-    b_map = {c.fingerprint: c for c in summary_b.clusters if c.identity != "pid"}
+    a_map = {c.fingerprint: c for c in summary_a.clusters if c.identity not in _NO_IDENTITY}
+    b_map = {c.fingerprint: c for c in summary_b.clusters if c.identity not in _NO_IDENTITY}
     new_keys = b_map.keys() - a_map.keys()
     resolved_keys = a_map.keys() - b_map.keys()
     shared_keys = a_map.keys() & b_map.keys()
@@ -1329,8 +1659,10 @@ def diff_sessions(
     # that counterpart under a pid nobody could name. Calling it resolved or
     # new concluded absence from a failed identification -- "improvement" one
     # way round, "regression" the other (review of PR #26).
-    unnamed_a = {_signature(c) for c in summary_a.clusters if c.identity == "pid"}
-    unnamed_b = {_signature(c) for c in summary_b.clusters if c.identity == "pid"}
+    # An ANR of a window may be any app's ANR, so a named ANR with no
+    # counterpart while the other session holds one is uncertain the same way.
+    unnamed_a = {_signature(c) for c in summary_a.clusters if c.identity in _NO_IDENTITY}
+    unnamed_b = {_signature(c) for c in summary_b.clusters if c.identity in _NO_IDENTITY}
     uncertain_new = {k for k in new_keys if _signature(b_map[k]) in unnamed_a}
     uncertain_resolved = {k for k in resolved_keys if _signature(a_map[k]) in unnamed_b}
     not_comparable.extend(
@@ -1347,8 +1679,15 @@ def diff_sessions(
     # anyway (B3). So a cluster absent from the incomplete side is neither
     # resolved (B incomplete) nor new (A incomplete) but unconfirmed; what both
     # sides hold still compares, and so does what the complete side lacks.
-    unconfirmed_resolved = resolved_keys - uncertain_resolved if summary_b.incomplete else set()
-    unconfirmed_new = new_keys - uncertain_new if summary_a.incomplete else set()
+    # So, too, a side holding evidence it did not count -- the record it
+    # started on, or ANRs --package could not attribute: the missing cluster
+    # may be right there, uncounted (Codex review of PR #39: "improvement: 1
+    # resolved" against the same ANR kept only as ambiguous_tail).
+    uncounted = {s.session_id: _uncounted(s) for s in (summary_a, summary_b) if _uncounted(s)}
+    doubtful_a = summary_a.incomplete or summary_a.session_id in uncounted
+    doubtful_b = summary_b.incomplete or summary_b.session_id in uncounted
+    unconfirmed_resolved = resolved_keys - uncertain_resolved if doubtful_b else set()
+    unconfirmed_new = new_keys - uncertain_new if doubtful_a else set()
     unconfirmed = [
         {
             **_cluster_to_dict(cluster_map[k]),
@@ -1394,7 +1733,11 @@ def diff_sessions(
         plural = "s" if len(unconfirmed) != 1 else ""
         caveats.append(
             f"{len(unconfirmed)} cluster{plural} missing only from an incomplete session"
+            if not uncounted
+            else f"{len(unconfirmed)} cluster{plural} missing only from a session that is "
+            f"incomplete or holds evidence it did not count"
         )
+    caveats.extend(f"{sid} {why}" for sid, why in uncounted.items())
     if not_compared:
         plural = "s" if len(not_compared) != 1 else ""
         caveats.append(f"{len(not_compared)} shared cluster{plural} not comparable: {because}")
@@ -1422,9 +1765,28 @@ def diff_sessions(
     }
 
 
+def _uncounted(summary: SessionSummary) -> str:
+    """What a summary holds but did not count, in words (empty when nothing)."""
+    held = []
+    if summary.ambiguous_tail:
+        held.append("shows a record it started on but did not count (it may predate it)")
+    if summary.unattributed_anrs:
+        plural = "s" if summary.unattributed_anrs != 1 else ""
+        held.append(
+            f"dropped {summary.unattributed_anrs} ANR{plural} --package could not attribute"
+        )
+    return " and ".join(held)
+
+
 def _signature(cluster: Cluster) -> str:
-    """The cluster's fingerprint with its site left out: what it is, not whose."""
+    """The cluster's fingerprint with its site left out: what it is, not whose.
+
+    An ANR's is its kind alone: an ANR of a window and an app's ANR read
+    differently (a title, a package) and may be the same stall.
+    """
     sample = cluster.sample_event
+    if sample.kind == "anr":
+        return compute_fingerprint(None, "", sample.kind)
     return compute_fingerprint(sample.symbol, sample.message_prefix, sample.kind)
 
 
@@ -1468,6 +1830,10 @@ def summary_to_json(summary: SessionSummary) -> dict:
         "unnamed_pids": {"count": len(summary.unnamed_pids), "pids": summary.unnamed_pids},
         "cut_records": summary.cut_records,
         "stream_failure": summary.stream_failure,
+        "stream_restarts": summary.stream_restarts,
+        "ambiguous_tail": summary.ambiguous_tail,
+        "unattributed_anrs": summary.unattributed_anrs,
+        "possible_duplicates": summary.possible_duplicates,
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
     }
@@ -1494,6 +1860,10 @@ def summary_from_json(payload: dict) -> SessionSummary:
         unnamed_pids=list((payload.get("unnamed_pids") or {}).get("pids", [])),
         cut_records=payload.get("cut_records", 0),
         stream_failure=payload.get("stream_failure"),
+        stream_restarts=payload.get("stream_restarts", 0),
+        ambiguous_tail=list(payload.get("ambiguous_tail") or []),
+        unattributed_anrs=payload.get("unattributed_anrs", 0),
+        possible_duplicates=payload.get("possible_duplicates", 0),
     )
 
 
@@ -1529,6 +1899,10 @@ def _event_from_dict(payload: dict) -> NormalisedEvent:
         app_pid=payload.get("app_pid"),
         app=payload.get("app"),
         identity=payload.get("identity"),
+        window=payload.get("window"),
+        process_name=payload.get("process_name"),
+        possible_duplicate=bool(payload.get("possible_duplicate", False)),
+        attribution=payload.get("attribution"),
     )
 
 
@@ -1584,4 +1958,5 @@ class SummaryBuilder:
             clusters=clusters,
             aggregates=aggregates,
             fingerprint_version=self.fingerprint_version,
+            possible_duplicates=sum(1 for event in events if event.possible_duplicate),
         )
