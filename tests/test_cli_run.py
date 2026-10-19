@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import anr_watcher
 import pytest
@@ -482,6 +483,36 @@ def test_a_closed_stream_still_exits_with_the_status(stream, error, json_mode, m
         cli.run(_raising(error), ["--json"] if json_mode else [])
 
     assert exc.value.code == 1
+
+
+def test_a_real_closed_stdout_pipe_keeps_the_device_exit_status():
+    """Interpreter finalization must not replace exit 3 with its broken-pipe status 120."""
+    scripts = Path(cli.__file__).resolve().parents[1]
+    program = f"""
+import sys
+sys.path.insert(0, {str(scripts)!r})
+from common import adb_exec, cli
+
+def main(argv):
+    raise adb_exec.DeviceOfflineError("device offline")
+
+cli.run(main, ["--json"])
+"""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+
+    assert completed.returncode == 3, completed.stderr
 
 
 def test_an_interrupt_with_a_closed_stderr_still_exits_130(monkeypatch):

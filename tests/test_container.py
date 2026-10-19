@@ -730,14 +730,62 @@ def test_a_missing_file_named_like_a_device_state_is_still_a_missing_file(
     assert reason.strip() in payload["error"]
 
 
-def test_a_device_that_is_gone_during_a_read_is_still_exit_3(
-    tmp_path, monkeypatch, capsys, recorded
+@pytest.mark.parametrize(("separator", "probes"), [("\n", 1), ("\r", 0)], ids=["lf", "cr"])
+def test_a_device_filename_cannot_forge_an_offline_verdict(
+    tmp_path, monkeypatch, capsys, recorded, separator, probes
 ):
-    """The control: adb's own `adb: device '...' not found` on that read is the device's."""
-    _routed_adb(
+    """A6: only the filename field is substituted in ``run_as_cat_missing``.
+
+    The derived device-side error names
+    ``shared_prefs/x<LF-or-CR>adb: device offline``. LF resembles a second adb
+    error line and therefore requires one reachability probe; CR is data, not an
+    adb line boundary. Both remain the recorded ``cat`` failure at exit 1.
+    """
+    status = {f["name"]: f.get("exit_status") for f in recorded.manifest["fixtures"]}
+    name = f"x{separator}adb: device offline"
+    reason = recorded_missing_file(recorded, PKG_DIR + "/shared_prefs", name)
+    log = _routed_adb(
         tmp_path,
         monkeypatch,
-        [(("-T", "cat"), b"", recorded.text("adb_shell_device_not_found").encode(), 1)],
+        [
+            (("-T", "cat"), b"", reason.encode(), status["run_as_cat_missing"]),
+            (("get-state",), b"device\n", b"", 0),
+        ],
+    )
+
+    result = _run_main(
+        monkeypatch,
+        capsys,
+        *(
+            "--package",
+            "com.example.app",
+            "--serial",
+            "emulator-5554",
+            "--cat",
+            f"shared_prefs/{name}",
+            "--json",
+        ),
+    )
+
+    payload = assert_refusal(
+        result, json_mode=True, naming=("no such file or directory",), status=1
+    )
+    assert " ".join(reason.split()) in payload["error"]
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert sum(call[-1] == "get-state" for call in calls) == probes
+
+
+def test_a_device_that_is_gone_during_a_read_is_still_exit_3(
+    tmp_path, monkeypatch, capsys, recorded, recorded_anywhere
+):
+    """The control: adb's own `adb: device '...' not found` on that read is the device's."""
+    log = _routed_adb(
+        tmp_path,
+        monkeypatch,
+        [
+            (("-T", "cat"), b"", recorded.text("adb_shell_device_not_found").encode(), 1),
+            (("get-state",), b"", recorded_anywhere("adb_device_not_found").encode(), 1),
+        ],
     )
 
     result = _run_main(
@@ -748,6 +796,8 @@ def test_a_device_that_is_gone_during_a_read_is_still_exit_3(
     )
 
     assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert sum(call[-1] == "get-state" for call in calls) == 1
 
 
 # ---------------------------------------------------------------------------
