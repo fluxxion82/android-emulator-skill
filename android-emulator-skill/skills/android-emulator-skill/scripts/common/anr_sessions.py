@@ -10,9 +10,11 @@ Each session is a directory under
 (config + pid + status), ``events.jsonl`` (append-only normalised events), and
 ``summary.json`` (post-stop).
 
-The parent creates the directory and writes initial meta. The detached worker
-updates meta with its own pid (avoids pidfile race) and appends to
-events.jsonl. ``--stop`` SIGTERMs the worker, drains events, builds a
+The parent creates the directory and writes initial meta, with a random
+``worker_token`` it hands the worker on its command line. The detached worker
+updates meta with its own pid and start time (avoids pidfile race) and appends
+to events.jsonl. ``--stop`` SIGTERMs the worker -- only once the process at
+that pid has been shown to still be it -- drains events, builds a
 ``SessionSummary``, and writes ``summary.json``.
 
 Storage root is overridable for tests via the ``ANDROID_EMU_ANR_HOME`` env var
@@ -28,6 +30,7 @@ import os
 import re
 import secrets
 import signal
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -51,6 +54,11 @@ _STATUS_STOPPED = "stopped"
 _STATUS_CRASHED = "crashed"
 
 _DURATION_RE = re.compile(r"(\d+)([smhd])$")
+
+# How the worker's command line carries its token (see ``SessionMeta``).
+WORKER_TOKEN_FLAG = "--worker-token"
+# One `ps` question about the host's process table.
+PS_TIMEOUT_SECONDS = 5
 
 
 def _default_sessions_dir() -> Path:
@@ -89,6 +97,12 @@ class SessionMeta:
     # The fingerprint version the session's events are captured under. A
     # session recorded before this was kept is v1, the only version there was.
     fingerprint_version: int = 1
+    # Who the worker is, beyond a pid the OS reuses: a random token the parent
+    # puts on the worker's command line, and the start time `ps` gave for the
+    # pid when the worker claimed it. A pid that no longer shows both is not
+    # this session's worker, and is never signalled.
+    worker_token: str | None = None
+    worker_started: str | None = None
 
     def to_json(self) -> dict:
         return {
@@ -102,6 +116,8 @@ class SessionMeta:
             "stopped_at_ms": self.stopped_at_ms,
             "extras": self.extras,
             "fingerprint_version": self.fingerprint_version,
+            "worker_token": self.worker_token,
+            "worker_started": self.worker_started,
         }
 
     @classmethod
@@ -117,7 +133,69 @@ class SessionMeta:
             stopped_at_ms=payload.get("stopped_at_ms"),
             extras=payload.get("extras", {}),
             fingerprint_version=payload.get("fingerprint_version", 1),
+            worker_token=payload.get("worker_token"),
+            worker_started=payload.get("worker_started"),
         )
+
+
+def _ps(pid: int, field: str) -> str | None:
+    """One ``ps`` field of host process ``pid``; None when ``ps`` lists no such process.
+
+    In the C locale and UTC, so the start time reads the same whoever asks --
+    the worker when it claims its pid, a later `--stop` in another shell.
+
+    Raises:
+        OSError: ``ps`` could not be run.
+        subprocess.TimeoutExpired: It did not answer in ``PS_TIMEOUT_SECONDS``.
+    """
+    result = subprocess.run(
+        ["ps", "-o", f"{field}=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        timeout=PS_TIMEOUT_SECONDS,
+        check=False,
+        env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+    )
+    answer = result.stdout.strip()
+    return answer if result.returncode == 0 and answer else None
+
+
+def process_started(pid: int) -> str | None:
+    """When host process ``pid`` started (``ps -o lstart``); None when unknown."""
+    try:
+        return _ps(pid, "lstart")
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def worker_mismatch(meta: SessionMeta) -> str | None:
+    """Why the process at ``meta.pid`` is not (or cannot be shown to be) the session's worker.
+
+    None when it is: alive, its command line carrying the session's
+    ``worker_token``, and started when the worker claimed the pid. A crashed
+    or killed worker's pid is the OS's to give to anything; signalling it
+    without this check sent SIGTERM to whatever held the pid by then (Codex
+    review of PR #34).
+    """
+    pid = meta.pid
+    try:
+        command = _ps(pid, "command")
+        started = _ps(pid, "lstart")
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"`ps` could not say what pid {pid} is ({error})"
+    if command is None or started is None:
+        return f"pid {pid} has exited"
+    if not meta.worker_token or f"{WORKER_TOKEN_FLAG} {meta.worker_token}" not in command:
+        return (
+            f"pid {pid} is another process now (its command line has no "
+            f"{WORKER_TOKEN_FLAG} for this session)"
+        )
+    if started != meta.worker_started:
+        return (
+            f"pid {pid} started at {started}, not when this session's worker did "
+            f"({meta.worker_started or 'unrecorded'})"
+        )
+    return None
 
 
 # === SESSION STORE ===
@@ -149,6 +227,7 @@ class SessionStore:
             # The worker this session's events come from is spawned from the
             # same code, so this is the version they are fingerprinted under.
             fingerprint_version=FINGERPRINT_VERSION,
+            worker_token=secrets.token_hex(8),
         )
         self._write_meta(meta)
         return meta
@@ -164,9 +243,10 @@ class SessionStore:
         raise TimeoutError(f"Worker for {session_id} did not register within {timeout_seconds}s")
 
     def claim_worker(self, session_id: str, pid: int) -> SessionMeta:
-        """Called by worker on startup. Writes pid + status=running into meta."""
+        """Called by worker on startup. Writes pid, its start time and status=running."""
         meta = self.load_meta(session_id)
         meta.pid = pid
+        meta.worker_started = process_started(pid)
         meta.status = _STATUS_RUNNING
         self._write_meta(meta)
         return meta
@@ -200,22 +280,44 @@ class SessionStore:
 
         Records ``stopped_at`` / ``stopped_at_ms`` so capture-duration math in
         ``build_summary`` and ``--list-sessions`` reflects when the worker
-        actually died, not when the session was finally inspected.
+        actually died, not when the session was finally inspected. Clears the
+        pid: the worker is exiting, and its pid is about to be the OS's to reuse.
         """
         try:
             meta = self.load_meta(session_id)
         except FileNotFoundError:
             return
         meta.status = _STATUS_CRASHED
+        meta.pid = None
         now = datetime.now()
         meta.stopped_at = now.isoformat()
         meta.stopped_at_ms = int(now.timestamp() * 1000)
         self._write_meta(meta)
 
+    def forget_worker(self, session_id: str) -> None:
+        """The worker has exited: drop its pid, which the OS may now give to anything."""
+        meta = self.load_meta(session_id)
+        if meta.pid is not None:
+            meta.pid = None
+            self._write_meta(meta)
+
     def signal_worker(self, session_id: str, sig: int = signal.SIGTERM) -> bool:
-        """Send ``sig`` to the worker pid recorded in meta.json. Returns True if delivered."""
+        """Send ``sig`` to the session's worker, once it is shown to be it. True if delivered.
+
+        A recorded pid that is not the worker (:func:`worker_mismatch`) is never
+        signalled: the reason is kept in ``extras["worker_gone"]`` for the
+        caller to say, and the pid is forgotten -- unless `ps` could not answer,
+        when the worker may still be alive and its pid is kept.
+        """
         meta = self.load_meta(session_id)
         if not meta.pid:
+            return False
+        mismatch = worker_mismatch(meta)
+        if mismatch is not None:
+            meta.extras["worker_gone"] = mismatch
+            if not mismatch.startswith("`ps`"):
+                meta.pid = None
+            self._write_meta(meta)
             return False
         try:
             os.kill(meta.pid, sig)

@@ -20,7 +20,6 @@ import anr_watcher
 import pytest
 
 from common import adb_exec, cli
-from common.anr_pipeline import parse_logcat_anr
 from common.device_utils import resolve_device_identifier
 from common.hierarchy import HierarchyError
 from common.sdk_tools import missing_emulator_error
@@ -553,36 +552,35 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
     last is a record, and the last line is the refusal, parseable on its own --
     which is why cli.report writes it on one line.
 
-    The records are the recorded ANR lines. The failure is the pipe from adb
-    breaking after them (EIO on read), the one mid-stream failure ``watch`` can
-    meet that is not the stream simply ending. Before this change ``watch``
-    caught it, printed a sentence on stderr and returned False: exit 1, and no
-    refusal on stdout at all.
+    The stream is the recorded broadcast ANR as logd's records (`logcat -B`),
+    one event. The failure is the pipe from adb breaking after them (EIO on
+    read), the one mid-stream failure ``watch`` can meet that is not the
+    stream simply ending. Before this change ``watch`` caught it, printed a
+    sentence on stderr and returned False: exit 1, and no refusal on stdout at
+    all.
 
     The pipe is a real one: since PR #26 ``watch`` reads the descriptor itself
-    (``anr_watcher._FdLines``) rather than calling ``readline()`` on the file,
-    so the break is injected where that reader reports the end of the stream.
+    (``anr_watcher._FdRecords``, records since PR #34) rather than calling
+    ``readline()`` on the file, so the break is injected where that reader
+    reports the end of the stream.
     """
-    anr_lines = [
-        line + "\n"
-        for line in recorded.text("logcat_anr_broadcast").splitlines()
-        if parse_logcat_anr(line)
-    ]
-    assert anr_lines, "the recorded buffer has no ANR line to stream"
+    name = "logcat_anr_broadcast_records"
+    stream = recorded.data(f"{name}.bin")
+    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == name)
 
     read_end, write_end = os.pipe()
-    os.write(write_end, "".join(anr_lines).encode())
+    os.write(write_end, stream)
     os.close(write_end)
     pipe = os.fdopen(read_end, "rb", buffering=0)
-    real_read = anr_watcher._FdLines.read
+    real_read = anr_watcher._FdRecords.read
 
     def read_until_the_pipe_breaks(self, timeout):
-        lines = real_read(self, timeout)
-        if lines is None:
+        records = real_read(self, timeout)
+        if records is None:
             raise OSError(5, "Input/output error")
-        return lines
+        return records
 
-    monkeypatch.setattr(anr_watcher._FdLines, "read", read_until_the_pipe_breaks)
+    monkeypatch.setattr(anr_watcher._FdRecords, "read", read_until_the_pipe_breaks)
 
     class _Logcat:
         def __init__(self, cmd, **kwargs):
@@ -598,6 +596,16 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
             return 0
 
     monkeypatch.setattr(anr_watcher.subprocess, "Popen", _Logcat)
+    # --watch asks `adb get-state` before streaming (B4): the device is up. And
+    # an ANR report counts only as system_server wrote it: its pid as `pidof`
+    # answered in the recording's own run.
+    monkeypatch.setattr(
+        anr_watcher,
+        "run_adb",
+        lambda *_a, **_k: adb_exec.AdbResult(0, recorded.text("adb_get_state"), ""),
+    )
+    system_server = str(entry["system_server_pid"])
+    monkeypatch.setattr(anr_watcher, "get_system_server_pid", lambda *_a, **_k: system_server)
 
     try:
         code, out, _ = _run(anr_watcher.main, ["--watch", "--json"], capsys)
@@ -607,7 +615,7 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
     assert code == 1
     lines = out.splitlines()
     records, refusal = lines[:-1], json.loads(lines[-1])
-    assert len(records) == len(anr_lines), "the records streamed before the failure are kept"
+    assert len(records) == 1, "the event streamed before the failure is kept"
     assert all(json.loads(record)["kind"] for record in records)
     assert refusal["success"] is False
     assert set(refusal) == KEYS

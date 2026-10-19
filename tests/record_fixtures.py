@@ -1927,6 +1927,61 @@ def _pid_column(line: str) -> str | None:
     return fields[2] if len(fields) > 2 else None
 
 
+def _tag_and_message(raw: bytes) -> tuple[str, str]:
+    """The tag and message of one raw record, as text."""
+    payload = _record_payload(raw)
+    tag, _, rest = payload[1:].partition(b"\0")
+    return tag.decode("utf-8", errors="replace"), rest.split(b"\0", 1)[0].decode(
+        "utf-8", errors="replace"
+    )
+
+
+def _anr_records(*, requires: tuple[str, ...]) -> Callable[[str | None, dict], bytes]:
+    """One provoked ANR as logd's records -- what the ANR readers read since PR #34.
+
+    The ``-B`` counterpart of the ``*_stream`` fixtures: ActivityManager's and
+    WindowManager's records naming the fixture package, from the LAST
+    provoking ``Broadcasting:`` record on (the buffer is not cleared, as
+    there). ``requires`` is text the kept records' messages must hold --
+    among it ``"\\nPID: "``, which is only there if ActivityManager's report is
+    ONE record of many lines. Every kept record must have been written by the
+    pid ``pidof system_server`` names in the same run (``system_server_pid``).
+    """
+    marker = f"Broadcasting: Intent {{ act={COMPOSE_PACKAGE}.PROVOKE_ANR"
+
+    def capture(serial: str | None, extra: dict) -> bytes:
+        system_server = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
+        if not system_server.isdigit():
+            raise CaptureError(f"pidof system_server named no single pid: {system_server!r}")
+        records = _split_records(_run_bytes(["logcat", "-d", "-B"], serial, timeout=60))
+        starts = [
+            index
+            for index, (_pid, raw) in enumerate(records)
+            if _tag_and_message(raw)[0] == "ActivityManager"
+            and _tag_and_message(raw)[1].startswith(marker)
+        ]
+        if not starts:
+            raise CaptureError("no provoking broadcast in the buffer: the ANR was not provoked")
+        kept = [
+            (pid, raw)
+            for pid, raw in records[starts[-1] :]
+            if _tag_and_message(raw)[0] in ("ActivityManager", "WindowManager")
+            and COMPOSE_PACKAGE in _tag_and_message(raw)[1]
+        ]
+        messages = "\n".join(_tag_and_message(raw)[1] for _pid, raw in kept)
+        for needle in requires:
+            if needle not in messages:
+                raise CaptureError(f"the provoked ANR's records do not hold {needle!r}")
+        writers = {str(pid) for pid, _raw in kept}
+        if writers != {system_server}:
+            raise CaptureError(f"system_server is {system_server}; the records came from {writers}")
+        extra["system_server_pid"] = system_server
+        extra.update(_device_zone(serial))
+        return b"".join(_aliased_record(raw) for _pid, raw in kept)
+
+    return capture
+
+
 # The marker the injection's records carry, so they can be kept and found.
 _INJECTION_MARKER = "w3l-tag-injection"
 
@@ -2095,6 +2150,58 @@ def _waiting_for_device(_scratch: Path, _serial: str | None, _extra: dict) -> Ca
     if out or not err.strip():
         raise CaptureError(f"expected a stderr banner and no stdout, got {out!r} / {err!r}")
     return Capture("", err.decode("utf-8", errors="replace"), child.returncode)
+
+
+# How long `adb logcat` is left running before the recorder ends it: it
+# never ends on its own; this only has to outlast its first answer.
+_TAIL_ZERO_SECONDS = 3
+
+
+def _logcat_tail_zero(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """`logcat -T 0`: can a live read start with NO replayed entry? (It cannot.)
+
+    Asked with the session worker's own format terms, millisecond and
+    microsecond. The file holds what logcat says on stderr; the entries it
+    then prints are other processes' text and are not kept -- only the first
+    one's timestamp, beside the device's clock read just before the call, to
+    show that the entry it starts on was already in the buffer.
+    """
+    target = ["-s", serial] if serial else []
+    stamp = _run(["shell", "date '+%m-%d %H:%M:%S'"], serial, timeout=15).text.strip()
+    measured: dict[str, dict] = {}
+    capture = None
+    for name, terms in (("threadtime", []), ("threadtime_usec", ["-v", "usec"])):
+        argv = ["adb", *target, "logcat", "-v", "threadtime", *terms, "-T", "0"]
+        child = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            stdout, stderr = child.communicate(timeout=_TAIL_ZERO_SECONDS)
+        except subprocess.TimeoutExpired:
+            child.terminate()
+            stdout, stderr = child.communicate(timeout=DEFAULT_TIMEOUT)
+        entries = [line for line in stdout.splitlines() if re.match(r"\d{2}-\d{2} ", line)]
+        if "-T 0 invalid" not in stderr or not entries:
+            raise CaptureError(
+                f"`logcat -T 0` no longer replays an entry (stderr {stderr.strip()!r}); "
+                f"anr_watcher's -T 1 rests on it"
+            )
+        first = entries[0][:14]
+        measured[name] = {
+            "argv": ["adb", "-s", "<serial>", *argv[len(target) + 1 :]],
+            "stderr": stderr,
+            "first_entry_timestamp": first,
+            "first_entry_predates_the_call": first <= stamp,
+        }
+        capture = Capture("", stderr, child.returncode)
+    extra["device_clock_before_the_calls"] = stamp
+    extra["measured"] = measured
+    assert capture is not None
+    return capture
 
 
 FIXTURES: list[Fixture] = [
@@ -2489,6 +2596,90 @@ FIXTURES: list[Fixture] = [
         ),
         catches=("A1",),
         capture_bytes=_twin("logcat_tag_injection_records", "logcat_tag_injection"),
+    ),
+    Fixture(
+        name="logcat_anr_broadcast_records",
+        emulator_only=True,
+        ext="bin",
+        catches=("D5", "A1"),
+        args=["logcat", "-d", "-B"],
+        command=(
+            "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks "
+            "40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and "
+            "WindowManager records naming the package, from the provoking broadcast on"
+        ),
+        description=(
+            "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin "
+            "in kind of logcat_anr_broadcast_stream. ActivityManager's report is ONE record: "
+            "its message is 'ANR in <package>' then '\\nPID: <app pid>', '\\nReason: Broadcast "
+            "of Intent {...}' and the rest of the report, all one writer's. ~5 s later "
+            "WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping "
+            "duplicate ANR' verdict, one record each. Every record's pid is system_server's "
+            "(manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report "
+            "is held to."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+            _PROVOKE_ANR,
+            ["shell", "sleep", "20"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_bytes=_anr_records(
+            requires=(
+                f"ANR in {COMPOSE_PACKAGE}",
+                "\nPID: ",
+                "\nReason: Broadcast of Intent",
+                "ANR in Window{",
+                "Skipping duplicate ANR",
+            )
+        ),
+    ),
+    Fixture(
+        name="logcat_anr_input_records",
+        emulator_only=True,
+        ext="bin",
+        catches=("D5", "A1"),
+        args=["logcat", "-d", "-B"],
+        command=(
+            "adb shell am broadcast --async (background, 60 s timeout), then input keyevent "
+            "--async KEYCODE_SHIFT_LEFT to the blocked window; 15 s later adb logcat -d -B, "
+            "host-filtered as logcat_anr_broadcast_records"
+        ),
+        description=(
+            "An input-dispatch ANR as logd's records, the twin in kind of "
+            "logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input "
+            "dispatching timed out' record first, then ActivityManager's report -- ONE record, "
+            "'ANR in <package> (<component>)' with its PID and Reason lines. Every record's "
+            "pid is system_server's (manifest `system_server_pid`)."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+            [
+                "shell",
+                "am",
+                "broadcast",
+                "--async",
+                "-n",
+                f"{COMPOSE_PACKAGE}/.AnrReceiver",
+                "-a",
+                f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
+            ],
+            ["shell", "sleep", "2"],
+            ["shell", "input", "keyevent", "--async", "KEYCODE_SHIFT_LEFT"],
+            ["shell", "sleep", "15"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_bytes=_anr_records(
+            requires=(
+                "ANR in Window{",
+                f"ANR in {COMPOSE_PACKAGE} (",
+                "\nReason: Input dispatching timed out",
+            )
+        ),
     ),
     Fixture(
         name="logcat_crash_tail",
@@ -3057,6 +3248,30 @@ FIXTURES: list[Fixture] = [
             "capture is refused rather than written."
         ),
         post=_requires("more than one device"),
+    ),
+    Fixture(
+        name="logcat_tail_zero",
+        # It only reads, but it is a capture callable, which
+        # tests/test_recorder_device_guard.py cannot see into: the conservative mark.
+        emulator_only=True,
+        args=[],
+        capture_with=_logcat_tail_zero,
+        command=(
+            "adb -s <serial> logcat -v threadtime [-v usec] -T 0 "
+            "(each ended by the recorder after 3 s)"
+        ),
+        description=(
+            "Whether a live logcat read can start with nothing replayed: it "
+            "cannot. logcat answers 'WARNING: -T 0 invalid, setting to 1' on "
+            "stderr and starts on the newest entry already buffered, with or "
+            "without -v usec (manifest `measured`: the first entry's timestamp "
+            "against the device clock read before the calls). So anr_watcher's "
+            "live reads keep `-T 1`, and the one entry they start on may "
+            "predate the read; a restart skips only the entries it already "
+            "consumed. The entries themselves are other processes' text and "
+            "are not recorded."
+        ),
+        post=_requires("-T 0 invalid"),
     ),
     Fixture(
         name="pm_grant_not_changeable",
@@ -4259,83 +4474,6 @@ FIXTURES: list[Fixture] = [
             "the lane can send stdout to /dev/null."
         ),
         post=_requires_empty(),
-    ),
-    # --- naming a process from its pid ------------------------------------
-    #
-    # A Choreographer "Skipped N frames!" line names no app; its pid column is
-    # the only identity it has, and a pid does not survive a restart -- it is
-    # recycled. So the ANR worker asks for the pid's current owner and that
-    # owner's AGE, and trusts the name only if the owner is older than the time
-    # since the line was read (a duration on the host's monotonic clock: no
-    # wall clock, no year, no DST). The argv below is the worker's own, after
-    # `adb shell`.
-    Fixture(
-        name="ps_lifetime",
-        args=[
-            "shell",
-            "ps",
-            "-o",
-            "PID,NAME,ELAPSED",
-            "-p",
-            "$(pidof com.android.systemui)",
-        ],
-        description=(
-            "`ps -o PID,NAME,ELAPSED -p <pid>` for a long-running app process: a "
-            "header row padded with spaces and one row -- the pid right-aligned, "
-            "NAME the full process name (not the 15-character comm, so a dotted "
-            "package comes back whole), ELAPSED the age of the pid's CURRENT owner "
-            "as HH:MM:SS. A line read longer ago than that came from a process that "
-            "has since died and left its pid to another."
-        ),
-        catches=("A5",),
-        post=_requires("PID NAME", "ELAPSED", "com.android.systemui"),
-    ),
-    Fixture(
-        name="ps_lifetime_just_started",
-        emulator_only=True,
-        args=[
-            "shell",
-            "ps",
-            "-o",
-            "PID,NAME,ELAPSED",
-            "-p",
-            f"$(pidof {COMPOSE_PACKAGE})",
-        ],
-        description=(
-            "The same query for a process started seconds ago (the fixture app, "
-            "launched by setup): ELAPSED is MM:SS here, with no hours field. "
-            "Both shapes are recorded so the parser reads what ps prints rather "
-            "than what it might; a third (days) has not been seen and is not "
-            "read -- an age the parser cannot read is no evidence of lifetime."
-        ),
-        catches=("A5",),
-        setup=[
-            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
-            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
-            ["shell", "sleep", "2"],
-        ],
-        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
-        post=_requires("PID NAME", "ELAPSED", COMPOSE_PACKAGE),
-    ),
-    Fixture(
-        name="ps_lifetime_not_running",
-        record_both_streams=True,
-        args=[
-            "shell",
-            "ps",
-            "-o",
-            "PID,NAME,ELAPSED",
-            "-p",
-            "999999",
-        ],
-        description=(
-            "The same query for a pid nothing holds: the header row alone, and "
-            "exit status 1. A process that died between logging and the lookup "
-            "looks like this; the header must not be read as a process called "
-            "NAME."
-        ),
-        catches=("A5",),
-        post=_requires("PID NAME", "ELAPSED", absent=("999999",)),
     ),
     # --- IME visibility: which key actually exists ------------------------
     Fixture(

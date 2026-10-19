@@ -72,6 +72,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from typing import BinaryIO
 
+from common import log_lifecycle
 from common.device_utils import build_adb_command
 
 # `logcat -t` accepts a "MM-DD HH:MM:SS.mmm" timestamp and prints lines at or
@@ -137,8 +138,8 @@ USEC_FORMAT = "usec"
 # <pkg> (pid N) has died`; recorded in logcat_app_restart_records). They are
 # I, so a `*:W` filter would drop them; a binary read has no filter (``-B``
 # ignores filterspecs, measured), and the readers apply their floor on the
-# host after attribution.
-PROCESS_TAG = "ActivityManager"
+# host after attribution. Defined once, in common.log_lifecycle, which reads them.
+PROCESS_TAG = log_lifecycle.PROCESS_TAG
 
 # `logcat -B`: logd's records, unformatted. Each is `struct logger_entry` --
 # u16 payload length, u16 header size, i32 pid, u32 tid, u32 sec, u32 nsec,
@@ -563,19 +564,13 @@ def parse_threadtime(line: str) -> tuple[str, str] | None:
 # logged nothing. A record under any other uid is another app's: proven, not
 # unresolved.
 
-# AOSP's UserHandle.formatUid, as system_server prints the uid after a process
-# name: below FIRST_APPLICATION_UID the bare number, else u<user> followed by
-# a<n> (an app; recorded u0a205), i<n> (isolated), ai<n> (app-zygote
-# isolated) or s<appid> (a shared system id).
-_PER_USER_RANGE = 100_000
-_UID_BASES = {"a": 10_000, "ai": 90_000, "i": 99_000, "s": 0}
-_FORMATTED_UID = re.compile(r"u(?P<user>\d+)(?P<kind>ai|a|i|s)(?P<n>\d+)")
+# The sentences themselves -- who wrote them, their exact opening, the uid --
+# are read by common.log_lifecycle, the one reading the ANR session worker
+# uses too (PR #34). What a sentence means for ONE package's window is decided
+# here.
 
-# The three sentences, as the whole opening of an ActivityManager record's
-# message, for ANY process name; whose process it is comes after.
-_START = re.compile(r"Start proc (?P<pid>\d+):(?P<name>[^/\s]+)/(?P<uid>\S+) ")
-_KILLING = re.compile(r"Killing (?P<pid>\d+):(?P<name>[^/\s]+)/(?P<uid>\S+) \(adj -?\d+\): ")
-_DIED = re.compile(r"Process (?P<name>\S+) \(pid (?P<pid>\d+)\) has died\b")
+# Kept importable from here, where it was first defined.
+uid_from_formatted = log_lifecycle.uid_from_formatted
 
 # What a sentence says about the pid it names.
 _STARTED = "started"  # an app process began (uid checked)
@@ -584,77 +579,37 @@ _DIED_APP = "died"  # a process named like the app died (no uid: ends only)
 _OTHER = "other"  # the pid is (now) some other process's
 
 
-def uid_from_formatted(text: str) -> int | None:
-    """The numeric uid ``UserHandle.formatUid`` printed as ``text``.
-
-    ``u0a205`` -> 10205, ``u10a205`` -> 1010205, ``1000`` -> 1000; None for
-    anything else.
-    """
-    if text.isdigit():
-        return int(text)
-    match = _FORMATTED_UID.fullmatch(text)
-    if match is None:
-        return None
-    return int(match["user"]) * _PER_USER_RANGE + _UID_BASES[match["kind"]] + int(match["n"])
-
-
-class _Lazy:
-    """A value, or a function giving it, asked for at most once."""
-
-    def __init__(self, value):
-        self._value = value
-        self._asked = not callable(value)
-
-    def __call__(self):
-        if not self._asked:
-            self._asked = True
-            self._value = self._value()
-        return self._value
-
-
 class _Reader:
-    """Reads records in order: which pid wrote each, and what a sentence says."""
+    """Reads records in order: which pid wrote each, and what a sentence says of the package."""
 
     def __init__(self, package: str, system_server_pid, package_uids) -> None:
         self.package = package
-        self.system_server = _Lazy(system_server_pid)
-        self.package_uids = _Lazy(package_uids)
+        self.package_uids = log_lifecycle.Lazy(package_uids)
+        self._lifecycle = log_lifecycle.LifecycleReader(
+            system_server_pid, lambda name: self.package_uids() if name == package else None
+        )
 
     def uids(self) -> frozenset[int]:
         """The package's uids (asked of the device once); empty when unknown."""
-        return _uid_set(self.package_uids())
+        return log_lifecycle.uid_set(self.package_uids())
 
     def read(self, record: LogRecord) -> tuple[str, tuple[str, str] | None]:
         """``(pid that wrote record, (what, pid) said by it or None)``."""
-        writer = str(record.pid)
-        if record.tag != PROCESS_TAG:
+        writer, sentence = self._lifecycle.read(record)
+        if sentence is None:
             return writer, None
-        return writer, self._sentence(writer, record.message)
-
-    def _sentence(self, writer: str, message: str) -> tuple[str, str] | None:
-        found, pattern = next(
-            ((m, p) for p in (_START, _KILLING, _DIED) if (m := p.match(message))), (None, None)
-        )
-        if found is None or writer != self.system_server():
-            return None
-        pid = found["pid"]
-        if found["name"] != self.package:
-            return _OTHER, pid
-        if pattern is _DIED:
-            return _DIED_APP, pid
+        if sentence.name != self.package:
+            return writer, (_OTHER, sentence.pid)
+        if sentence.what == log_lifecycle.DIED:
+            return writer, (_DIED_APP, sentence.pid)
         # Any of the package's uids: it has one per user it is installed for
         # (recorded: package_list_uid_two_users).
-        uids = self.uids()
-        if not uids or uid_from_formatted(found["uid"]) not in uids:
-            return _OTHER, pid
-        return (_STARTED if pattern is _START else _KILLED), pid
-
-
-def _uid_set(uids: int | Iterable[int] | None) -> frozenset[int]:
-    """One uid, several, or none, as a set."""
-    if uids is None:
-        return frozenset()
-    return frozenset([uids]) if isinstance(uids, int) else frozenset(uids)
+        if not self._lifecycle.is_package(sentence):
+            return writer, (_OTHER, sentence.pid)
+        return writer, (
+            _STARTED if sentence.what == log_lifecycle.STARTED else _KILLED,
+            sentence.pid,
+        )
 
 
 def _spans(events: list[tuple[int, str]], end: int, alive: bool) -> list[tuple[int, int]]:

@@ -46,7 +46,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### Implemented (32 scripts)
 
-#### Core Utilities (13 modules in `common/`)
+#### Core Utilities (14 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
@@ -64,7 +64,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    debuggable app's files with `adb shell -T run-as`, never `exec-out`, which
    answers a missing file with its error text as the bytes; checks the adb
    client honours `-T` first), **env_config.py**, **anr_pipeline.py**,
-   **anr_sessions.py**.
+   **anr_sessions.py**, **log_lifecycle.py** (system_server's process
+   sentences — `Start proc` / `Killing` / `has died` — authenticated one way for
+   `log_monitor --app` and the ANR session worker alike).
 
 #### App Management (1 script)
 4. **app_launcher.py** - App lifecycle management
@@ -595,45 +597,96 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `anr-YYYYMMDD-HHMMSS-XXXX`; either malformed is a usage error (exit 2)
       for every mode that takes one, `--stop` included, and `--clear-sessions`
       deletes nothing when it rejects one
+    - Every reader — `--watch`, `--since` and a session's worker — reads
+      logd's records (`logcat -B`, `common/logcat.py`), never text: each
+      record carries the pid logd took from the writing socket, and an ANR
+      report arrives whole, as one record
     - An ANR is counted once per incident as far as the log can show it.
-      ActivityManager logs an ANR as one record of many lines; its `PID:` (the
-      stalled app's own pid — the logcat pid column is system_server's) and
+      ActivityManager logs an ANR as ONE record of many lines; its `PID:` (the
+      stalled app's own pid — the record's pid is system_server's) and
       `Reason:` (what timed out) arrive as the event's `app_pid` and `reason`,
-      not as further ANRs. WindowManager's `ANR in Window{...}` line is a
-      report *to* ActivityManager: it is dropped when ActivityManager records
-      — or calls a duplicate — an ANR of the same package within 10 s of it
-      (by log time, either side; the recorded gap is 0.35 s for an input ANR
-      and 5.06 s for the dialog that follows a broadcast ANR), and is an event
-      of its own otherwise — a stream cut between the two, or one of
-      ActivityManager's early returns. That fallback is emitted once the 10 s
-      have passed or the stream ends, so it can print after later events. An
-      ActivityManager record arriving more than 10 s after WindowManager's
-      report would be counted twice
+      not as further ANRs, and the event is out as soon as the record is read.
+      WindowManager's `ANR in Window{...}` record is a report *to*
+      ActivityManager: it is dropped when ActivityManager records — or calls a
+      duplicate — an ANR of the same package within 10 s of it (by log time,
+      either side; the recorded gaps are under half a second for an input ANR
+      and about 5 s for the dialog that follows a broadcast ANR), and is an
+      event of its own otherwise — a stream cut between the two, or one of
+      ActivityManager's early returns. That fallback is emitted once 10 s of
+      log, or of quiet, have passed or the stream ends, so it can print after
+      later events. An ActivityManager record arriving more than 10 s after
+      WindowManager's report would be counted twice
+    - An ANR report counts only as system_server wrote it: an `ANR in` record,
+      and ActivityManager's `Skipping duplicate ANR` verdict, must carry
+      exactly the right tag, open the record's message, and have been written
+      by system_server — the record's pid, checked against `pidof
+      system_server` (asked once, bounded at 3 s, in every mode). Any app can
+      log under those tags, and one could forge an ANR for another package or
+      make a real one vanish; in text, an app's TAG with a newline in it
+      printed a whole line headed with system_server's pid (recorded:
+      logcat_tag_injection), which as a record is the app's. When
+      system_server's pid is unknown nothing is counted, and it is said: the
+      session summary carries `"verification": "system_server pid unknown —
+      ANR records could not be authenticated"` and `unverified_anr_lines`, its
+      text forms an `Unverified:` line ("no *verified* ANR/jank"), and
+      `--watch` / `--since` a `warning:` on stderr (and, in text, "No verified
+      ANR/jank events")
     - Jank clusters by process, not by frame count: one screen dropping 31 and
       120 frames is one cluster, two apps janking alike are two. A session
       names the process behind a jank line and keys it by that name
       (`identity: "package"`), so an app restarted mid-way is still one site.
-      The name comes from ActivityManager's `Start proc` line in the stream,
-      else from one device call per pid (`ps -o PID,NAME,ELAPSED -p <pid>`,
-      bounded at 3 s), and counts only if that process existed when the line
-      was read: its age must cover the time since, both measured as durations
-      on the host's monotonic clock (no wall clock, so no DST, clock-step or
-      year mistakes). A pid is recycled, and its current owner is not evidence
-      about an older line; every stream (re)start forgets what it knew. An age
-      `ps` prints in a form not yet recorded (days) is not read. Jank whose
-      process could not be named is keyed by pid (`identity: "pid"`); `--diff`
-      lists it under `not_comparable` instead of calling it resolved or new,
-      and so does a named cluster whose only possible counterpart in the other
-      session is such a pid-keyed cluster of the same kind and text
+      The name comes ONLY from a `Start proc <pid>:<name>/<uid>` record earlier
+      in the same stream, read by `common/log_lifecycle.py` — the same reading
+      `log_monitor --app` uses: written by system_server (the record's pid,
+      against `pidof system_server`, asked of the device once), under
+      ActivityManager's tag exactly, the exact opening of the record's
+      message, and a process that is exactly a package
+      running under one of its uids (`cmd package list packages -U`, once per
+      package) — any app can log under ActivityManager's tag, and one can name
+      its own process after another package. A private process
+      (`<package>:<name>`) is not named. Each lookup is bounded at 3 s; an
+      unknown answer names nothing. A name ends at system_server's `Killing` /
+      `has died` for the pid, and every stream (re)start forgets them all. The
+      device is never asked who holds a pid now: `ps … ELAPSED` was judged
+      against when a line was *read*, and a line read late was given a
+      recycled pid's new owner. **So only a process started while the session
+      runs is named**: an app already running when `--start` was called (warm
+      in the background) is keyed by pid. Jank whose process could not be
+      named is keyed by pid (`identity: "pid"`), and the summary lists those
+      pids — `"unnamed_pids": {"count": N, "pids": [...]}` and one `Unnamed:`
+      sentence in text; `--diff` lists it under `not_comparable` instead of
+      calling it resolved or new, and so does a named cluster whose only
+      possible counterpart in the other session is such a pid-keyed cluster of
+      the same kind and text
+    - `--stop` signals the session's worker only once the process at its
+      recorded pid is shown to still be it: the random token `--start` put on
+      its command line, and the start time `ps` gave when it claimed the pid
+      (a crashed worker's pid is also forgotten). Anything else holding that
+      pid is never signalled; stderr says "worker gone" and why
     - `--stop` saves the summary only after the session's worker has exited
-      (it waits up to 5.5 s: a lookup under way, the drain, a margin). If the
-      worker is still running then, the summary is saved with
-      `"incomplete": true` and stderr says so — it used to be saved early,
-      empty, with nothing said
+      (it waits up to 5.5 s: a lookup under way, the drain, a margin). The
+      summary is saved with `"incomplete": true`, and `incomplete_reason`
+      saying why, whenever the capture may be missing events: the worker was
+      still running then, it crashed or vanished without being stopped, the
+      stream broke, or ANR reports could not be authenticated — so `--diff`
+      concludes nothing from what such a capture lacks. Every text form of an
+      incomplete summary says so too (`--stop`, `--get-details`,
+      `--get-details --cluster N`, whose JSON carries `incomplete`), and "no
+      ANR/jank" there reads "… in the part captured". A token budget or
+      `--terse` cuts clusters, never a disclosure: the one-line form keeps
+      them as a bracketed clause (`[stream broken; 1 record cut by the stop;
+      2 ANR records unverified; 1 pid unnamed]`)
     - `--diff` never says "no change" about what it could not see: with
       clusters set aside as not comparable, or a session saved incomplete, and
       nothing else changed, the verdict is `inconclusive: …` naming why; a
-      verdict that did find a change carries the same caveats after it
+      verdict that did find a change carries the same caveats after it. A
+      cluster one session has and the other, saved incomplete, lacks is never
+      called resolved or new — the missing events may simply be unwritten — but
+      listed under `unconfirmed` with the session it is in and the one it is
+      `absent_from`; what a complete session lacks is still resolved or new.
+      A cluster both hold does not drift either when one side is incomplete —
+      its maximum there is only a lower bound — but is listed under
+      `not_compared` with `"reason": "not comparable: <id> is incomplete"`
     - A session keeps the fingerprint version it was captured with — `--stop`
       on an older session does not restamp it — and `--diff` refuses (exit 1,
       naming both versions) two sessions captured under different versions.
@@ -643,19 +696,46 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       (the cluster's max duration was 0 in the first session) `delta_pct` is
       `null` — never the non-JSON `Infinity` — and the entry counts as worsened
     - A live stream (`--start`, `--watch`) starts at the end of the device's
-      buffer (`logcat -T 1`, which first prints the one most recent line); it
-      used to replay the whole buffer as if it were happening now. `--since`
-      reads its own window. Both live readers print an ANR as soon as the
-      stream goes quiet after its record (a quarter-second), not at the next
-      line
-    - `--package` keeps a session's own jank, because the session names the
-      janking process. **`--watch` and `--since` do not name processes**: a
-      Choreographer or StrictMode line names no package, so under `--package`
+      buffer (`logcat -B -T 1`, which first prints the one most recent record);
+      it used to replay the whole buffer as if it were happening now. **That
+      one record may predate the read, and is read like the rest**: logcat
+      refuses `-T 0` ("-T 0 invalid, setting to 1", recorded), and setting the
+      first record aside lost the first live one when the buffer was empty
+      (just after `logcat -c`) — a missed ANR is worse than one old record. A
+      session's restarted stream skips the records it replays that the
+      session already read, whole, and reads one it never did (logged while
+      the stream was down); nothing is compared by timestamp, so no clock
+      change moves that boundary. `--since` reads its own window
+    - A stream that is not logd's records to its end is never read as if it
+      were. A record still arriving when our own stop — `--duration`, Ctrl-C,
+      `--stop` — ends the read, on a stream still open or one that ended, is
+      lost and said: a `warning:` on stderr for `--watch`, and in a session
+      `cut_records` (a `Cut:` line in text). One that ends inside a record by
+      itself makes `--watch` and `--since` ask `adb get-state` again — before
+      adb's exit status is judged — and exit 3 when the device went, or refuse
+      (exit 1) naming the framing error and how adb exited. Bytes that are not
+      records at all are refused outright (exit 1), with no device question.
+      A session's worker does not restart either kind of stream: it asks the
+      device in both cases, the session is marked crashed, and `--stop` saves
+      what was read (`stream_failure` in the summary, a `Broken:` line in
+      text, readable with `--get-details`) and then refuses — exit 3 when the
+      device went, 1 otherwise
+    - `--package` keeps a session's own jank when the session named the
+      janking process — that is, when the process started while the session
+      ran (above); a process already running is keyed by pid, and `--package`
+      drops its jank (its pid is listed under `unnamed_pids`). **`--watch` and
+      `--since` do not name processes**: a
+      Choreographer or StrictMode record names no package, so under `--package`
       they drop all jank and StrictMode events
     - Legacy: `--watch [--duration N]`, `--since 5m`. A logcat read that adb
       ends with a failure is a refusal, not "no ANRs": exit 3 when the device
       is unavailable (an unknown `--serial` is caught before streaming), 1
-      otherwise
+      otherwise, typed from adb's stderr as adb wrote it
+    - `adb logcat` does not fail when its device is not there — it waits — so
+      `--watch`, `--since` and `--start` ask `adb get-state` first (bounded,
+      with or without `--serial`) and refuse at once, exit 3, when adb names
+      no device in state `device` (several and no `--serial` is exit 1);
+      `--start` creates no session then
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
       it used to be raised to 1
@@ -986,9 +1066,11 @@ recorded fixture, and was red before the fix.
   and a window that had to leave the app's lines out says so
   (`complete: false`). `--severity` validates its names, and counts are line
   counts. Snapshots no longer land in the caller's working directory.
-- **One ANR is one event.** The `Reason:`/`PID:` lines attach to their record,
-  and a WindowManager-only ANR still counts. Jank is keyed by process, and a
-  pid is named only when its owner was running at the time.
+- **One ANR is one event.** `anr_watcher` reads logd's records too, so the
+  `Reason:`/`PID:` lines arrive inside their report, and a WindowManager-only
+  ANR still counts, but only as system_server wrote it — the record's pid,
+  which no tag can forge. Jank is keyed by process, and a pid is named only
+  from system_server's own `Start proc` record for it, seen in the same stream.
   `--diff` says "inconclusive" when it could not compare sessions, and never
   emits `Infinity`. The live readers no longer lose lines or swallow adb's
   exit status.
@@ -1021,6 +1103,10 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
 - `anr_watcher --watch` / `--since` with `--package` drop every jank and
   StrictMode event: those lines name no package, and only session mode names
   the process behind a pid. Use `--start`/`--stop` to keep an app's jank.
+- An ANR session names only a process started while it runs (system_server's
+  `Start proc` is the only evidence it takes); an app already running when
+  `--start` is called is keyed by pid, listed under `unnamed_pids`, and its
+  jank is dropped under `--package`. Start the session before the app.
 - `privacy_manager` acts on the default user only. It passes no `--user`, so a
   work profile or a secondary user is out of reach.
 - **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is

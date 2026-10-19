@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-19T01:03:36Z",
+  "recorded_at": "2026-10-19T01:43:28Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -585,6 +585,19 @@
       "bytes": 424
     },
     {
+      "name": "logcat_anr_broadcast_records",
+      "file": "logcat_anr_broadcast_records.bin",
+      "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on",
+      "description": "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin in kind of logcat_anr_broadcast_stream. ActivityManager's report is ONE record: its message is 'ANR in <package>' then '\\nPID: <app pid>', '\\nReason: Broadcast of Intent {...}' and the rest of the report, all one writer's. ~5 s later WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping duplicate ANR' verdict, one record each. Every record's pid is system_server's (manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report is held to.",
+      "catches": [
+        "D5",
+        "A1"
+      ],
+      "bytes": 3527,
+      "system_server_pid": "598",
+      "timezone": "America/Los_Angeles"
+    },
+    {
       "name": "logcat_anr_broadcast_stream",
       "file": "logcat_anr_broadcast_stream.txt",
       "command": "adb shell logcat -d -v threadtime | grep -E ' (ActivityManager|WindowManager): '",
@@ -603,6 +616,19 @@
       "description": "The SAME stalled app, reported a second time by a different subsystem and in a completely different shape: WindowManager writes one line reading 'ANR in Window{<hash> u0 <pkg>/<Activity>}. Reason:Input dispatching timed out (... Waited 5006ms for FocusEvent(hasFocus=false)).' Three things a guess gets wrong. The token after 'ANR in' is the literal word 'Window', not a package -- _ANR_IN_RE's '([\\w.]+)' happily reports a fault in a package called 'Window'. The component is inside the braces rather than in parentheses. And 'Reason:' has no space after the colon, unlike ActivityManager's. One stall therefore reaches a logcat reader as two events under two tags.",
       "catches": [],
       "bytes": 334
+    },
+    {
+      "name": "logcat_anr_input_records",
+      "file": "logcat_anr_input_records.bin",
+      "command": "adb shell am broadcast --async (background, 60 s timeout), then input keyevent --async KEYCODE_SHIFT_LEFT to the blocked window; 15 s later adb logcat -d -B, host-filtered as logcat_anr_broadcast_records",
+      "description": "An input-dispatch ANR as logd's records, the twin in kind of logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input dispatching timed out' record first, then ActivityManager's report -- ONE record, 'ANR in <package> (<component>)' with its PID and Reason lines. Every record's pid is system_server's (manifest `system_server_pid`).",
+      "catches": [
+        "D5",
+        "A1"
+      ],
+      "bytes": 3628,
+      "system_server_pid": "598",
+      "timezone": "America/Los_Angeles"
     },
     {
       "name": "logcat_anr_input_stream",
@@ -854,6 +880,51 @@
       "timezone": "America/Los_Angeles"
     },
     {
+      "name": "logcat_tail_zero",
+      "file": "logcat_tail_zero.txt",
+      "command": "adb -s <serial> logcat -v threadtime [-v usec] -T 0 (each ended by the recorder after 3 s)",
+      "description": "Whether a live logcat read can start with nothing replayed: it cannot. logcat answers 'WARNING: -T 0 invalid, setting to 1' on stderr and starts on the newest entry already buffered, with or without -v usec (manifest `measured`: the first entry's timestamp against the device clock read before the calls). So anr_watcher's live reads keep `-T 1`, and the one entry they start on may predate the read; a restart skips only the entries it already consumed. The entries themselves are other processes' text and are not recorded.",
+      "catches": [],
+      "bytes": 36,
+      "exit_status": -15,
+      "stream": "stderr",
+      "device_clock_before_the_calls": "10-18 17:57:50",
+      "measured": {
+        "threadtime": {
+          "argv": [
+            "adb",
+            "-s",
+            "<serial>",
+            "logcat",
+            "-v",
+            "threadtime",
+            "-T",
+            "0"
+          ],
+          "stderr": "WARNING: -T 0 invalid, setting to 1\n",
+          "first_entry_timestamp": "10-18 17:57:50",
+          "first_entry_predates_the_call": true
+        },
+        "threadtime_usec": {
+          "argv": [
+            "adb",
+            "-s",
+            "<serial>",
+            "logcat",
+            "-v",
+            "threadtime",
+            "-v",
+            "usec",
+            "-T",
+            "0"
+          ],
+          "stderr": "WARNING: -T 0 invalid, setting to 1\n",
+          "first_entry_timestamp": "10-18 17:57:50",
+          "first_entry_predates_the_call": true
+        }
+      }
+    },
+    {
       "name": "logcat_threadtime",
       "file": "logcat_threadtime.txt",
       "command": "adb logcat -d -v threadtime -t 200",
@@ -946,44 +1017,6 @@
       "exit_status": 0,
       "stream": "stdout",
       "stdout_bytes": 106,
-      "stderr_bytes": 0
-    },
-    {
-      "name": "ps_lifetime",
-      "file": "ps_lifetime.txt",
-      "command": "adb shell ps -o PID,NAME,ELAPSED -p $(pidof com.android.systemui)",
-      "description": "`ps -o PID,NAME,ELAPSED -p <pid>` for a long-running app process: a header row padded with spaces and one row -- the pid right-aligned, NAME the full process name (not the 15-character comm, so a dotted package comes back whole), ELAPSED the age of the pid's CURRENT owner as HH:MM:SS. A line read longer ago than that came from a process that has since died and left its pid to another.",
-      "catches": [
-        "A5"
-      ],
-      "bytes": 92,
-      "exit_status": 0,
-      "stream": "stdout"
-    },
-    {
-      "name": "ps_lifetime_just_started",
-      "file": "ps_lifetime_just_started.txt",
-      "command": "adb shell ps -o PID,NAME,ELAPSED -p $(pidof com.example.composefixture)",
-      "description": "The same query for a process started seconds ago (the fixture app, launched by setup): ELAPSED is MM:SS here, with no hours field. Both shapes are recorded so the parser reads what ps prints rather than what it might; a third (days) has not been seen and is not read -- an age the parser cannot read is no evidence of lifetime.",
-      "catches": [
-        "A5"
-      ],
-      "bytes": 92,
-      "exit_status": 0,
-      "stream": "stdout"
-    },
-    {
-      "name": "ps_lifetime_not_running",
-      "file": "ps_lifetime_not_running.txt",
-      "command": "adb shell ps -o PID,NAME,ELAPSED -p 999999",
-      "description": "The same query for a pid nothing holds: the header row alone, and exit status 1. A process that died between logging and the lookup looks like this; the header must not be read as a process called NAME.",
-      "catches": [
-        "A5"
-      ],
-      "bytes": 46,
-      "exit_status": 1,
-      "stream": "stdout",
-      "stdout_bytes": 46,
       "stderr_bytes": 0
     },
     {
