@@ -13,6 +13,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -900,6 +901,36 @@ def test_a_green_run_still_passes(tmp_path: Path, monkeypatch, recorded_gradle):
     assert result.test_results["passed"] == 1
 
 
+def test_an_empty_suite_beside_a_passing_report_still_passes(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """A well-formed empty suite contributes zero without hiding a real passing result."""
+    from gradle import BuildRunner
+
+    passing = recorded_gradle("junit_xml_passing_case")
+    empty_suite = ElementTree.fromstring(passing)
+    for case in empty_suite.findall("testcase"):
+        empty_suite.remove(case)
+    empty = ElementTree.tostring(empty_suite, encoding="unicode")
+    project = _make_project(tmp_path)
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (_results(project) / "TEST-com.example.EmptyTest.xml", empty),
+            (_results(project) / "TEST-com.example.PassingTest.xml", passing),
+        ],
+    )
+
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is True
+    assert result.no_test_results is False
+    assert result.test_results["total"] == 1
+    assert result.test_results["passed"] == 1
+
+
 def test_n6_no_report_from_this_run_is_not_a_pass(tmp_path: Path, monkeypatch, recorded_gradle):
     """Gradle exited 0 and wrote nothing; an older passing report sits in the directory."""
     from gradle import BuildRunner
@@ -1211,3 +1242,278 @@ def test_the_pre_run_delete_touches_only_this_tasks_reports(
 
     assert stale not in seen, "this task's old report survived into the run"
     assert {binary, other_module, project / "gradlew"} <= seen, sorted(map(str, seen))
+
+
+def test_report_cleanup_refuses_a_build_symlink_outside_the_project(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """C1: an app/build symlink must never turn cleanup into an outside deletion."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (project / "app").mkdir()
+    outside_build = tmp_path / "outside" / "build"
+    sentinel = _report(
+        outside_build / "test-results" / TASK,
+        "sentinel",
+        recorded_gradle("junit_xml_passing_case"),
+        0,
+    )
+    (project / "app" / "build").symlink_to(outside_build, target_is_directory=True)
+    gradle_started = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal gradle_started
+        gradle_started = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    refusal = None
+    try:
+        BuildRunner(str(project), module=":app").test()
+    except cli.Failure as error:
+        refusal = error
+
+    assert sentinel.exists(), "cleanup deleted a JUnit report outside the project"
+    assert refusal is not None, "the outside report directory was not refused"
+    assert sentinel.name in str(refusal)
+    assert gradle_started is False
+
+
+def test_report_cleanup_refuses_an_in_project_build_redirect(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """A selected module's build symlink cannot redirect cleanup into its child module."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    module = project / "app"
+    module.mkdir()
+    sentinel = _report(
+        module / "child" / "build" / "test-results" / TASK,
+        "sentinel",
+        recorded_gradle("junit_xml_passing_case"),
+        0,
+    )
+    (module / "build").symlink_to("child/build", target_is_directory=True)
+    gradle_started = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal gradle_started
+        gradle_started = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    refusal = None
+    try:
+        BuildRunner(str(project), module=":app").test()
+    except cli.Failure as error:
+        refusal = error
+
+    assert sentinel.exists(), "cleanup followed app/build into the child module"
+    assert refusal is not None, "the in-project build redirect was not refused"
+    assert gradle_started is False
+
+
+def test_report_cleanup_refuses_a_task_directory_redirect(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """A task directory symlink cannot redirect cleanup to another task's reports."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    result_root = project / "app" / "build" / "test-results"
+    sentinel = _report(
+        result_root.parent / "testReleaseUnitTest",
+        "sentinel",
+        recorded_gradle("junit_xml_passing_case"),
+        0,
+    )
+    result_root.mkdir(parents=True)
+    (result_root / TASK).symlink_to("../testReleaseUnitTest", target_is_directory=True)
+    gradle_started = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal gradle_started
+        gradle_started = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    refusal = None
+    try:
+        BuildRunner(str(project), module=":app").test()
+    except cli.Failure as error:
+        refusal = error
+
+    assert sentinel.exists(), "cleanup followed the task redirect into another task"
+    assert refusal is not None, "the task-directory redirect was not refused"
+    assert gradle_started is False
+
+
+def test_report_cleanup_does_not_cross_into_a_nested_module(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """C4: :app cleanup is exact; app/child is a different module boundary."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    exact = _report(
+        _results(project),
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        0,
+    )
+    nested = _report(
+        project / "app" / "child" / "build" / "test-results" / TASK,
+        "com.example.BeforeThrowsTest",
+        recorded_gradle("junit_xml_error_case"),
+        0,
+    )
+    seen: set[Path] = set()
+    _gradle_that_runs(monkeypatch, 1, recorded_gradle("gradle_task_not_found"), seen=seen)
+
+    BuildRunner(str(project), module=":app").test()
+
+    assert exact not in seen, "the selected module's stale report survived cleanup"
+    assert nested in seen, "cleanup crossed into the selected module's nested child"
+
+
+def test_report_cleanup_refuses_ambiguous_task_directory_case(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """C4: two case variants do not identify one safe task directory to delete."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    exact = _report(
+        _results(project),
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        0,
+    )
+    variant = _report(
+        project / "app" / "build" / "test-results" / "testDEBUGUnitTest",
+        "com.example.BeforeThrowsTest",
+        recorded_gradle("junit_xml_error_case"),
+        0,
+    )
+    result_root = project / "app" / "build" / "test-results"
+    exact_dir = result_root / TASK
+    variant_dir = result_root / "testDEBUGUnitTest"
+    original_iterdir = Path.iterdir
+
+    def colliding_task_directories(path):
+        # pytest's macOS temp volume is case-insensitive, so both spellings
+        # address one on-disk directory. Substitute only the directory entries
+        # to reproduce the case-sensitive listing the review observed.
+        if path == result_root:
+            return iter((exact_dir, variant_dir))
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", colliding_task_directories)
+    gradle_started = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal gradle_started
+        gradle_started = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    refusal = None
+    try:
+        BuildRunner(str(project), module=":app").test()
+    except cli.Failure as error:
+        refusal = error
+
+    assert exact.exists() and variant.exists(), "ambiguous cleanup deleted reports"
+    assert refusal is not None, "case-colliding task directories were not refused"
+    assert "ambiguous" in str(refusal).lower()
+    assert gradle_started is False
+
+
+def test_report_cleanup_uses_the_only_case_variant(tmp_path: Path, monkeypatch, recorded_gradle):
+    """C4: recorded Gradle behavior permits one resolved spelling of a miscased task."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    resolved = _gradles_spelling_of("Prostagingdebug", recorded_gradle)
+    stale = _report(
+        project / "app" / "build" / "test-results" / f"test{resolved}UnitTest",
+        "com.example.PassingTest",
+        recorded_gradle("junit_xml_passing_case"),
+        0,
+    )
+    seen: set[Path] = set()
+    _gradle_that_runs(monkeypatch, 1, recorded_gradle("gradle_task_not_found"), seen=seen)
+
+    BuildRunner(str(project), module=":app", variant="prostagingdebug").test()
+
+    assert stale not in seen, "the sole Gradle-resolved case variant was not cleaned"
+
+
+def test_malformed_report_refuses_a_partial_aggregate(tmp_path: Path, monkeypatch, recorded_gradle):
+    """C3: truncating the recorded failing XML cannot leave its passing peer as PASS."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    failing = recorded_gradle("junit_xml_error_case")
+    # Derived from the recording by removing only its closing testsuite tag,
+    # reproducing a write truncated before completion without inventing XML.
+    truncated = failing[: failing.rindex("</testsuite>")]
+    bad_report = _results(project) / "TEST-com.example.BeforeThrowsTest.xml"
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_junit_error_ignorefailures"),
+        [
+            (bad_report, truncated),
+            (
+                _results(project) / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            ),
+        ],
+    )
+
+    with pytest.raises(cli.Failure, match=re.escape(str(bad_report))):
+        BuildRunner(str(project), module=":app").test()
+
+
+def test_unreadable_report_refuses_a_partial_aggregate(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """C3: a report that disappears between discovery and reading is not skipped."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    report = _results(project) / "TEST-com.example.PassingTest.xml"
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [(report, recorded_gradle("junit_xml_passing_case"))],
+    )
+    original_read_text = Path.read_text
+
+    def fail_report_read(path, *args, **kwargs):
+        if path == report:
+            raise OSError("simulated report read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_report_read)
+
+    with pytest.raises(cli.Failure, match=re.escape(str(report))):
+        BuildRunner(str(project), module=":app").test()
