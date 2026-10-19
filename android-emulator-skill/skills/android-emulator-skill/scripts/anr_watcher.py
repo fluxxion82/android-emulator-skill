@@ -1143,10 +1143,21 @@ class AnrBuster:
             close_fds=True,
         )
         try:
-            self.store.wait_for_worker(meta.session_id, timeout_seconds=3.0)
+            registered = self.store.wait_for_worker(meta.session_id, timeout_seconds=3.0)
         except TimeoutError:
             self.store.mark_crashed(meta.session_id)
             raise RuntimeError(f"Worker did not register within 3s for {meta.session_id}") from None
+        if registered.status == "crashed":
+            # It registered and has already ended: what ended it is the answer,
+            # never "did not register" (CI on PR #42). Stopped here as --stop
+            # stops it, so the summary is saved and the refusal is --stop's:
+            # the stream failure's own error, exit 3 for a device that went.
+            self.stop(meta.session_id)
+            cli.fail(
+                f"The worker for {meta.session_id} started and ended at once without saying "
+                f"why, so there is no session to record into.",
+                f"Read what it saved with --get-details {meta.session_id}, and --start again.",
+            )
         return meta.session_id
 
     def stop(

@@ -4512,3 +4512,113 @@ def test_a_summary_whose_meta_names_no_package_field_reads_drops_as_unknown(
 
     assert result["resolved_clusters"] == [], result["verdict"]
     assert f"{b} does not record what --package dropped" in result["verdict"], result
+
+
+# ---------------------------------------------------------------------------
+# --start and a worker that registers and ends before it looks (CI on PR #42)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("said", "status", "naming"),
+    [
+        ("device not found", 3, "not attached"),
+        ("nothing", 1, "ended by itself"),
+        ("unsaid", 1, "without saying why"),
+    ],
+    ids=["device-gone", "silent", "unsaid"],
+)
+def test_start_answers_for_a_worker_that_registered_and_ended_before_it_looked(
+    said, status, naming, recorded, recorded_anywhere, store, tmp_path, monkeypatch, capsys
+):
+    """The --start registration race, replayed deterministically: the CI flake on PR #42.
+
+    --start polls the session every 50 ms for its worker, and accepted only
+    one still running. A worker that claimed the session and was marked
+    crashed between two polls read as one that never started: "Worker did not
+    register within 3s", exit 1. Here the real worker runs to its end in place
+    of the spawn, before --start looks once: its stream is the recorded crash
+    dump, whole, after which adb exits 255 having written the recorded
+    device-not-found text, or nothing (no restart allowed). --start answers
+    with what ended it -- exit 3 for the device gone, 1 otherwise -- through
+    the CLI boundary, and the summary is saved. A worker that claimed and was
+    marked crashed with no failure persisted ("unsaid": no worker this version
+    runs ends so, but one that died outright would) is refused for that, exit 1.
+    """
+    from common import adb_exec
+
+    stream_file = tmp_path / "crash.logcat"
+    stream_file.write_bytes(recorded.data(f"{CRASH_DUMP}.bin"))
+    real_popen = subprocess.Popen
+    streams: list = []
+
+    class _Logcat:
+        """The recorded dump, whole; adb writes what it said to its stderr and exits 255."""
+
+        def __init__(self, _cmd, **kwargs):
+            self.stdout = open(stream_file, "rb", buffering=0)  # noqa: SIM115
+            streams.append(self.stdout)
+            if said == "device not found":
+                kwargs["stderr"].write(recorded_anywhere("adb_device_not_found").encode())
+                kwargs["stderr"].flush()
+
+        def poll(self):
+            return 255
+
+        def wait(self, timeout=None):
+            return 255
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    def popen(cmd, *args, **kwargs):
+        if cmd[0] == "ps":
+            return real_popen(cmd, *args, **kwargs)
+        if "logcat" in cmd:
+            return _Logcat(cmd, **kwargs)
+        if "--worker-session-id" in cmd:
+            # The real worker, run to its end before --start polls once.
+            session_id = cmd[cmd.index("--worker-session-id") + 1]
+            token = cmd[cmd.index(anr_watcher.WORKER_TOKEN_FLAG) + 1]
+            if said == "unsaid":
+                store.claim_worker(session_id, pid=os.getpid())
+                store.mark_crashed(session_id)
+            else:
+                anr_watcher.AnrBuster().run_worker(session_id, token=token)
+            return None
+        raise AssertionError(f"the test ran {cmd}")
+
+    monkeypatch.setattr(anr_watcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
+    # The device is attached and answers `device` when asked.
+    monkeypatch.setattr(anr_watcher, "resolve_device_identifier", lambda serial: serial)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
+    monkeypatch.setattr(
+        anr_watcher.sys,
+        "argv",
+        ["anr_watcher.py", "--start", "--serial", "emulator-5554", "--json"],
+    )
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            cli.run(anr_watcher.main)
+    finally:
+        for stream in streams:
+            stream.close()
+
+    assert exc.value.code == status
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["success"] is False and naming in refusal["error"], refusal
+    assert "did not register" not in refusal["error"], refusal
+    (session,) = store.list_sessions()
+    assert f"--get-details {session.session_id}" in refusal["remedy"], refusal
+    if said == "device not found":
+        assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+    summary = store.load_summary(session.session_id)
+    assert summary is not None and summary.incomplete, "the summary was not saved"
+    assert bool(summary.stream_failure) == (said != "unsaid"), summary.stream_failure

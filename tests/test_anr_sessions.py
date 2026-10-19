@@ -8,7 +8,10 @@ var — so the suite never touches the real home directory.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
+
+import pytest
 
 from common import anr_sessions
 from common.anr_pipeline import SummaryBuilder
@@ -223,3 +226,64 @@ def test_clear_all_sessions(tmp_path):
     store.create({})
     assert store.clear() == 2
     assert store.list_sessions() == []
+
+
+# --- --start's wait for its worker -------------------------------------------
+
+
+def test_a_worker_that_registers_and_crashes_between_polls_is_found_registered(tmp_path):
+    """A worker can claim its session and be marked crashed between two of --start's polls.
+
+    ``wait_for_worker`` accepted only a running worker with a pid, so one
+    already done read as one that never started -- "did not register within
+    3s", exit 1, where its own failure was the answer (CI on PR #42). Its
+    claim left ``worker_started``, which ``mark_crashed`` keeps.
+    """
+    store = _store(tmp_path)
+    meta = store.create({})
+    store.claim_worker(meta.session_id, pid=os.getpid())
+    store.mark_crashed(meta.session_id)
+
+    found = store.wait_for_worker(meta.session_id, timeout_seconds=0.3)
+
+    assert (found.status, found.pid) == ("crashed", None)
+    assert found.worker_started
+
+
+def test_a_session_crashed_without_a_claim_is_not_a_registered_worker(tmp_path):
+    """The other side: crashed, but nothing ever claimed it -- still not registered."""
+    store = _store(tmp_path)
+    meta = store.create({})
+    store.mark_crashed(meta.session_id)
+
+    with pytest.raises(TimeoutError):
+        store.wait_for_worker(meta.session_id, timeout_seconds=0.2)
+
+
+@pytest.mark.parametrize(
+    "persisted", [True, False], ids=["counters-persisted", "nothing-persisted"]
+)
+def test_a_claim_ps_could_not_time_is_registered_only_on_other_evidence(
+    persisted, tmp_path, monkeypatch
+):
+    """``worker_started`` is best effort: `ps` may not answer when the worker claims.
+
+    Then the claim leaves no start time, and that alone is no proof the
+    worker registered. The worker persists its counters before it marks the
+    session crashed, so they are: with them it registered; with neither, it
+    is not taken to have.
+    """
+    monkeypatch.setattr(anr_sessions, "process_started", lambda _pid: None)
+    store = _store(tmp_path)
+    meta = store.create({})
+    store.claim_worker(meta.session_id, pid=os.getpid())
+    if persisted:
+        store.persist_worker_counters(meta.session_id, {"total": 0})
+    store.mark_crashed(meta.session_id)
+    assert store.load_meta(meta.session_id).worker_started is None
+
+    if persisted:
+        assert store.wait_for_worker(meta.session_id, timeout_seconds=0.3).status == "crashed"
+    else:
+        with pytest.raises(TimeoutError):
+            store.wait_for_worker(meta.session_id, timeout_seconds=0.2)
