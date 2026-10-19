@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-19T06:31:37Z",
+  "recorded_at": "2026-10-19T06:58:17Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,8 +9,8 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 0,
-  "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
+  "redacted_package_count": 9,
+  "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths. The count is of the distinct aliases this profile's fixtures hold; a partial re-record numbers its own from app1, so it is a lower bound on packages redacted.",
   "fixtures": [
     {
       "name": "adb_device_not_found",
@@ -1165,6 +1165,29 @@
       "stream": "stderr"
     },
     {
+      "name": "run_as_find_databases_unsearchable",
+      "file": "run_as_find_databases_unsearchable.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/databases -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The databases/ listing with the owner's SEARCH bit taken off it (`chmod u-x`, `u+x` after): find can read the directory's names but not stat them, so it exits 1 with the directory's own record on stdout and, on stderr (run_as_find_databases_unsearchable_stderr, same run), one line per entry, `find: '<dir>/<entry>': Permission denied` -- quoted, and naming the entry, not the directory. Its first line is the listing failing AT an entry.",
+      "catches": [],
+      "bytes": 34,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 34,
+      "stderr_bytes": 335
+    },
+    {
+      "name": "run_as_find_databases_unsearchable_stderr",
+      "file": "run_as_find_databases_unsearchable_stderr.txt",
+      "command": "recorded in run_as_find_databases_unsearchable's run: its stderr",
+      "description": "The stderr of run_as_find_databases_unsearchable's one run, byte for byte.",
+      "catches": [],
+      "bytes": 335,
+      "first_half": "run_as_find_databases_unsearchable",
+      "exit_status": 1,
+      "stream": "stderr"
+    },
+    {
       "name": "run_as_find_names",
       "file": "run_as_find_names.txt",
       "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/files/aes_names -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
@@ -1334,7 +1357,7 @@
       "name": "run_as_ls_1_databases",
       "file": "run_as_ls_1_databases.txt",
       "command": "adb shell run-as com.example.composefixture ls -1 /data/data/com.example.composefixture/databases",
-      "description": "`ls -1` of databases/, as model_inspector's live mode lists it: one name per line, no `.`/`..`, and the zero-byte fixture.db-journal beside fixture.db -- not the -wal/-shm pair a hand-written listing had in its place.",
+      "description": "`ls -1` of databases/, as model_inspector's live mode first listed it: one name per line, no `.`/`..`, and the zero-byte fixture.db-journal beside fixture.db -- not the -wal/-shm pair a hand-written listing had in its place.",
       "catches": [],
       "bytes": 30,
       "exit_status": 0,
@@ -1344,7 +1367,7 @@
       "name": "run_as_ls_1_databases_unreadable",
       "file": "run_as_ls_1_databases_unreadable.txt",
       "command": "adb shell run-as com.example.composefixture ls -1 /data/data/com.example.composefixture/databases",
-      "description": "model_inspector's `ls -1` of databases/ with the owner's read bit taken off it (`chmod u-r`, `u+r` after; run_as_ls_databases_unreadable is the `ls -la` container.py runs): exit 1, stdout EMPTY, `ls: <path>: Permission denied` on stderr -- which matched the run-as denial marker 'permission denied' and was answered with the debug-build hint.",
+      "description": "model_inspector's `ls -1` of databases/ with the owner's read bit taken off it (`chmod u-r`, `u+r` after; run_as_ls_databases_unreadable is the `ls -la` container.py ran): exit 1, stdout EMPTY, `ls: <path>: Permission denied` on stderr -- which matched the run-as denial marker 'permission denied' and was answered with the debug-build hint.",
       "catches": [],
       "bytes": 71,
       "exit_status": 1,
@@ -1364,7 +1387,7 @@
       "name": "run_as_ls_data_dir_seeded",
       "file": "run_as_ls_data_dir_seeded.txt",
       "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture",
-      "description": "The fixture app's data dir listed as container.py lists it (by its absolute path), after the app has run: shared_prefs/ and databases/ are in it. run_as_ls_data_dir was recorded before the app first ran and holds neither -- the listing of an app with no prefs and no databases, which --export reports as absent, not as a failure.",
+      "description": "The fixture app's data dir listed as container.py listed it until it listed with find (run_as_find_data_dir), by its absolute path, after the app has run: shared_prefs/ and databases/ are in it. run_as_ls_data_dir was recorded before the app first ran and holds neither -- the listing of an app with no prefs and no databases, which --export reports as absent, not as a failure.",
       "catches": [],
       "bytes": 480,
       "exit_status": 0,
@@ -1406,7 +1429,7 @@
       "name": "run_as_ls_shared_prefs",
       "file": "run_as_ls_shared_prefs.txt",
       "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
-      "description": "`ls -la` of the fixture app's shared_prefs/, as --shared-prefs and --export list it: one prefs file, fixture_settings.xml (the file shared_prefs_settings_xml holds).",
+      "description": "`ls -la` of the fixture app's shared_prefs/, as --shared-prefs and --export listed it before find: one prefs file, fixture_settings.xml (the file shared_prefs_settings_xml holds).",
       "catches": [],
       "bytes": 188,
       "exit_status": 0,
@@ -1440,7 +1463,7 @@
       "name": "run_as_ls_symlink_space",
       "file": "run_as_ls_symlink_space.txt",
       "command": "adb shell run-as com.example.composefixture sh -c 'mkdir -p files/aes_fx && cd files/aes_fx && echo x > \"a b.txt\" && ln -s \"a b.txt\" link && ls -la'",
-      "description": "`run-as ls -la` of a directory holding a filename with a space and a symlink to it, made for the purpose in the fixture app's files/ and removed after. The three things parse_ls_output documents and no other recording had. What the device actually prints: toybox's ISO layout ('YYYY-MM-DD HH:MM', two tokens) -- NOT the coreutils 'Mon DD YYYY' layout the parser also claims, which this device's `ls` does not produce and no caller of the parser feeds it (all three run `run-as ... ls -la` on the device); the symlink as 'link -> a b.txt', size 7 (the length of the target string), mode lrwxrwxrwx; and the spaced name printed bare, unquoted and unescaped, so the name is everything after the time column. Note the entries are mode 0666 and the directory 0777: run-as's shell has a umask of 0.",
+      "description": "`run-as ls -la` of a directory holding a filename with a space and a symlink to it, made for the purpose in the fixture app's files/ and removed after. The three things the `ls -la` parser documented and no other recording had (both inspectors list with find now: run_as_find_names). What the device actually prints: toybox's ISO layout ('YYYY-MM-DD HH:MM', two tokens) -- NOT the coreutils 'Mon DD YYYY' layout the parser also claimed, which this device's `ls` does not produce and no caller of the parser fed it (all three ran `run-as ... ls -la` on the device); the symlink as 'link -> a b.txt', size 7 (the length of the target string), mode lrwxrwxrwx; and the spaced name printed bare, unquoted and unescaped, so the name is everything after the time column. Note the entries are mode 0666 and the directory 0777: run-as's shell has a umask of 0.",
       "catches": [],
       "bytes": 242,
       "exit_status": 0,

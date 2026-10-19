@@ -47,6 +47,20 @@ def test_manifest_matches_files_on_disk(recorded):
     )
 
 
+@pytest.mark.parametrize("profile", ["emulator-api35", "pixel4xl-api33"])
+def test_the_redaction_count_is_the_corpus_s_not_the_last_run_s(profile):
+    """MANIFEST's redacted_package_count is the distinct aliases the profile holds.
+
+    It was the last run's count, so an --only run that aliased nothing wrote 0
+    over a corpus holding com.example.app1..app9 (review of #43).
+    """
+    import record_fixtures as rf
+
+    root = RECORDED_ROOT / profile
+    manifest = json.loads((root / "MANIFEST.json").read_text(encoding="utf-8"))
+    assert manifest["redacted_package_count"] == rf._aliases_present(root)
+
+
 def test_manifest_records_device_provenance(recorded):
     """A fixture without provenance cannot be reasoned about after an OS bump."""
     device = recorded.manifest["device"]

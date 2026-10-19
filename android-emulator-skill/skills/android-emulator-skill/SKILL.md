@@ -571,6 +571,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       in `rejected` and named, escaped, in `rejected_entries` (`--verbose`
       prints them), and the answer exits 1 with what could be read still shown
       — all refused is never "No shared_prefs found"
+    - Two limits of that listing. It is only as complete as adb's exit status
+      says: the records carry no end marker, so an answer cut after a complete
+      record at exit 0 reads as a directory with fewer entries (a cut adb or
+      find reports, a non-zero exit, is refused). And `-H` follows the named
+      path's own symlink to any directory the app's uid may search, inside its
+      data dir or not — `--ls files/x`, where the app linked `x` elsewhere,
+      lists that directory's names and modes. A listing reads no file contents;
+      `--export`'s reads of the files a listing names follow their symlinks
+      too, and do not skip FIFOs or other special files (as before this
+      listing; v0.9.0)
     - Requires adb 1.0.36 or later (platform-tools 24+), checked once with
       `adb version` before the first file read: an older client does not
       refuse `shell -T` but forwards it to the device and exits 0 after the
@@ -606,6 +616,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       Permission denied`, a missing file, a file whose name holds a newline
       and a `run-as: …` line of its own — is that path's failure, with an
       `adb shell run-as <pkg> ls -ld <path>` check as its remedy. A listing
+      that fails at an entry — `find: '<dir>/<entry>': Permission denied`,
+      when the directory has its r bit but not its x bit — says it failed at
+      that entry (named escaped) and that a directory needs both bits, not
+      that the directory itself was refused. A listing
       find refuses without naming a path (`find: bad arg …`, `find: bad
       -printf …`, as this toybox answers an option or escape it lacks) is
       find's failure, not the directory's: its remedy says the device's find

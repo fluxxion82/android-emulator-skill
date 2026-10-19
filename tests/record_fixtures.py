@@ -553,6 +553,30 @@ def _redact_private_packages(text: str, mapping: dict[str, str]) -> str:
     return _PACKAGE_RE.sub(alias, text)
 
 
+# Any alias _redact_private_packages (or a binary fixture's own aliasing) wrote.
+_ALIAS_RE = re.compile(rb"\bcom\.example\.app\d+\b")
+
+
+def _aliases_present(recorded_dir: Path) -> int:
+    """How many distinct ``com.example.appN`` aliases this profile's fixtures hold.
+
+    MANIFEST.json's ``redacted_package_count`` was the CURRENT run's count, so a
+    partial re-record (``--only``) that aliased nothing wrote 0 over a corpus
+    still holding nine aliases. It is counted over every fixture file instead,
+    as bytes (some are binary). Each run numbers its aliases from app1, so two
+    runs can reuse a number for different packages: this is a lower bound on
+    the packages redacted, and exact for a corpus recorded in one run.
+    """
+    return len(
+        {
+            alias
+            for path in recorded_dir.iterdir()
+            if path.is_file() and path.name != "MANIFEST.json"
+            for alias in _ALIAS_RE.findall(path.read_bytes())
+        }
+    )
+
+
 # The Compose scaffold under tests/fixtures/scaffold/compose. Two exported
 # activities render the same screen; only the root Modifier differs. See that
 # directory's AndroidManifest.xml for the build-and-install commands.
@@ -4405,6 +4429,37 @@ FIXTURES: list[Fixture] = [
         ),
     ),
     Fixture(
+        name="run_as_find_databases_unsearchable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        description=(
+            "The databases/ listing with the owner's SEARCH bit taken off it (`chmod u-x`, "
+            "`u+x` after): find can read the directory's names but not stat them, so it "
+            "exits 1 with the directory's own record on stdout and, on stderr "
+            "(run_as_find_databases_unsearchable_stderr, same run), one line per entry, "
+            "`find: '<dir>/<entry>': Permission denied` -- quoted, and naming the entry, "
+            "not the directory. Its first line is the listing failing AT an entry."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-x", "databases"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+x", "databases"]],
+        teardown_verify=_app_dir_restored("databases", "fixture.db"),
+        capture_with=_both_streams(
+            _listing(f"{COMPOSE_DATA_DIR}/databases"), "run_as_find_databases_unsearchable"
+        ),
+        post=_requires("\0\0\0"),
+    ),
+    Fixture(
+        name="run_as_find_databases_unsearchable_stderr",
+        emulator_only=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        command="recorded in run_as_find_databases_unsearchable's run: its stderr",
+        description="The stderr of run_as_find_databases_unsearchable's one run, byte for byte.",
+        capture_bytes=_twin(
+            "run_as_find_databases_unsearchable_stderr", "run_as_find_databases_unsearchable"
+        ),
+    ),
+    Fixture(
         name="run_as_find_not_a_directory",
         record_both_streams=True,
         args=_listing(f"{COMPOSE_DATA_DIR}/shared_prefs/fixture_settings.xml"),
@@ -5490,11 +5545,13 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "recorded_on": platform.platform(),
         "device": device,
-        "redacted_package_count": len(redactions),
+        "redacted_package_count": _aliases_present(recorded_dir),
         "redaction_note": (
             "Non-AOSP package names were replaced with stable com.example.appN "
             "aliases so a developer's own apps are not published. Line shape is "
-            "unchanged, so parsers exercise identical code paths."
+            "unchanged, so parsers exercise identical code paths. The count is of "
+            "the distinct aliases this profile's fixtures hold; a partial re-record "
+            "numbers its own from app1, so it is a lower bound on packages redacted."
         ),
         "fixtures": entries,
     }

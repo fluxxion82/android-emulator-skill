@@ -234,7 +234,8 @@ def path_failure_remedy(package: str, path: str) -> str:
     return (
         f"run-as works for this app; the device refused {path} itself. Check that it "
         f"exists and that the app may read it: `adb shell run-as {package} ls -ld {path}` "
-        "(a directory needs its owner's r bit to be listed, a file its r bit to be read)."
+        "(a directory needs its owner's r bit to be listed and its x bit for what is in it "
+        "to be reached; a file needs its r bit to be read)."
     )
 
 
@@ -289,6 +290,20 @@ def read_command(serial: str | None, package: str, argv: list[str]) -> list[str]
 # an escape with `find: bad -printf %Q`, exit 1 (run_as_find_unknown_primary,
 # run_as_find_unknown_escape). Output that is not whole records is refused
 # (ListingError), never read some other way and never handed to `ls`.
+#
+# Two limits, both the transport's rather than the parse's:
+#
+# - A listing is only as complete as its exit status says. The framing has no
+#   end marker, so an answer cut after any COMPLETE record -- even right after
+#   the directory's own -- parses as a directory with fewer entries. A cut that
+#   adb or find reports (a non-zero exit, a device error) is refused before
+#   anything is parsed; a cut at exit 0 cannot be seen here.
+# - `-H` follows the named path's own symlink to any directory the app's uid
+#   may search, inside its data dir or not (SELinux permitting): `--ls files/x`,
+#   where the app planted `x` -> /some/dir, lists /some/dir. A listing reads
+#   names and modes, never contents. container.py --export's reads of the files
+#   a listing names follow those files' symlinks too; that predates this
+#   transport.
 
 LISTING_FORMAT = "%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0"
 LISTING_FIELDS = 6
@@ -371,7 +386,10 @@ def parse_listing(output: bytes) -> LsListing:
     - a symlink whose target is empty, not UTF-8, or holds a LF, CR or NUL.
 
     A newline in a name no longer forges anything: it is inside one field, and
-    the name holding it is refused and reported as itself.
+    the name holding it is refused and reported as itself. What the framing
+    cannot show is a cut after a complete record: such an answer reads as a
+    shorter directory, so its completeness is the exit status's, which both
+    callers check before they parse.
 
     Entries are sorted by name, as ``ls`` sorted them; find prints directory
     order.
@@ -465,15 +483,25 @@ def listing_failure(package: str, directory: str, error: str, stderr: str) -> di
     """The result for a listing that find ran and that exited non-zero, run-as having let it run.
 
     Not a run-as denial (see :func:`refused`). Which remedy it gets is read off
-    the FIRST line of stderr, find's own: a failure on the directory, or on an
-    entry in it, names the path first -- ``find: '<dir>': No such file or
-    directory`` (run_as_find_shared_prefs_absent), ``find: <dir>: Permission
-    denied`` (run_as_find_databases_unreadable) -- and is the path's, with
-    :func:`path_failure_remedy`. A line that names no path is find refusing the
-    command itself (run_as_find_unknown_primary, run_as_find_unknown_escape):
-    this device's find cannot list this way, and the path is not the problem.
-    An entry's name is printed after the directory's, so it cannot make a
-    failure the path's that is not, or the reverse.
+    the FIRST line of stderr, find's own, which is one of three:
+
+    - the directory itself: ``find: <dir>: Permission denied``, unquoted
+      (run_as_find_databases_unreadable), or ``find: '<dir>': No such file or
+      directory``, quoted (run_as_find_shared_prefs_absent) -- the path's
+      failure, with :func:`path_failure_remedy`;
+    - an entry in it: ``find: '<dir>/<entry>': Permission denied`` -- the
+      directory could be read but not searched, so find could not stat what it
+      holds (`chmod u-x`: run_as_find_databases_unsearchable, whose first line
+      names ``.``). The listing failed AT that entry, and the remedy says so,
+      naming it escaped (the app chose it) and the directory's r and x bits,
+      rather than claiming the directory itself was refused;
+    - neither: find refusing the command itself (run_as_find_unknown_primary,
+      run_as_find_unknown_escape) -- this device's find cannot list this way,
+      and the path is not the problem.
+
+    An entry's name is printed after the directory's, so it cannot change which
+    of the three a line is; a newline in it only ends the line early, and the
+    entry named is the part before it.
 
     Args:
         package: The package run-as ran as.
@@ -482,11 +510,38 @@ def listing_failure(package: str, directory: str, error: str, stderr: str) -> di
         stderr: The listing's stderr, decoded.
     """
     first = stderr.split("\n", 1)[0]
-    if first.startswith((f"find: {directory}", f"find: '{directory}")):
+    if first.startswith((f"find: {directory}: ", f"find: '{directory}': ")):
         remedy = path_failure_remedy(package, directory)
+    elif first.startswith((f"find: {directory}/", f"find: '{directory}/")):
+        remedy = _entry_failure_remedy(package, directory, _failed_entry(first, directory))
     else:
         remedy = _listing_tool_remedy(package, directory)
     return {"error": error, "path": directory, "remedy": remedy}
+
+
+def _failed_entry(first: str, directory: str) -> str:
+    """The entry find's first stderr line names below ``directory``, its reason dropped.
+
+    find quotes an entry's path (`find: '<dir>/<entry>': <reason>`), so the
+    reason follows the LAST `': ` -- a name may hold `': ` itself, the reasons
+    find prints do not. Without that separator (an unquoted line, or one a
+    newline in the name cut short) the rest of the line is the entry.
+    """
+    quoted = first.startswith(f"find: '{directory}/")
+    rest = first.removeprefix(f"find: '{directory}/" if quoted else f"find: {directory}/")
+    entry, separator, _reason = rest.rpartition("': " if quoted else ": ")
+    return entry if separator else rest
+
+
+def _entry_failure_remedy(package: str, directory: str, entry: str) -> str:
+    """Listing ``directory`` failed at ``entry``: say so, and which bits a listing needs."""
+    return (
+        f"run-as works for this app; listing {directory} failed at the entry {entry!r}, "
+        "which find could not read. A directory needs its owner's r bit to be listed and "
+        "its x bit for its entries to be reached: check it with "
+        f"`adb shell run-as {package} ls -ld {directory}`, and its entries with "
+        f"`adb shell run-as {package} ls -lab {directory}`."
+    )
 
 
 def unreadable_listing(package: str, directory: str, exc: ListingError) -> dict:

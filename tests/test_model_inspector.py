@@ -31,7 +31,8 @@ from model_inspector import (
     strip_comments,
 )
 
-from common.run_as import parse_adb_version
+from common.device_utils import quote_for_device_shell
+from common.run_as import listing_command, parse_adb_version
 
 
 @pytest.fixture(autouse=True)
@@ -793,8 +794,13 @@ def test_a_database_name_cannot_forge_an_offline_verdict(tmp_path, recorded, sep
 
 
 def _listed(argv: list[str]) -> str | None:
-    """The directory an adb argv lists with the listing command, or None for any other call."""
-    return argv[argv.index("-H") + 1] if "find" in argv and "-H" in argv else None
+    """The directory an adb argv lists, when it ends in the WHOLE listing command; else None."""
+    if "find" not in argv or argv.index("find") + 2 >= len(argv):
+        return None
+    at = argv.index("find")
+    directory = argv[at + 2]
+    command = [quote_for_device_shell(arg) for arg in listing_command(directory)]
+    return directory if argv[at:] == command else None
 
 
 def _with_name(recorded, name: bytes) -> dict[tuple[str, ...], bytes]:
@@ -943,6 +949,7 @@ def test_the_recorded_forging_name_lists_no_ghost_database(tmp_path, recorded):
     ("recording", "remedy"),
     [
         ("run_as_find_databases_unreadable", "ls -ld"),
+        ("run_as_find_databases_unsearchable", "failed at the entry '.'"),
         ("run_as_find_unknown_primary", "toybox find"),
         ("run_as_find_unknown_escape", "toybox find"),
     ],

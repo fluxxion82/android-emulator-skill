@@ -364,7 +364,10 @@ def test_a_symlink_is_refused_for_its_target_or_its_name(recorded, field, value,
     listing = parse_listing(raw)
 
     assert {e["name"] for e in listing.entries} == {"e f.db", "sub", "dirlink"}
-    assert refused in listing.rejected, listing.rejected
+    # The recording's own three refusals, and the derived one in its name's
+    # place: refusals are in the order of the names' bytes, as entries are.
+    expected = [repr("c\\d.db"), repr("lflink -> dangling\ntarget"), refused, repr(FORGED)]
+    assert listing.rejected == expected, listing.rejected
 
 
 def test_only_a_nul_ends_a_name(recorded):
@@ -444,8 +447,17 @@ def _bytes_adb(tmp_path: Path, monkeypatch, payload: bytes) -> Path:
 
 
 def _listed(argv: list[str]) -> str | None:
-    """The directory an adb argv lists with the listing command, or None for any other call."""
-    return argv[argv.index("-H") + 1] if "find" in argv and "-H" in argv else None
+    """The directory an adb argv lists, when it ends in the WHOLE listing command; else None.
+
+    The whole command, quoted as the scripts quote it -- not just `find` and a
+    path -- so every test that finds a call this way also pins its argv.
+    """
+    if "find" not in argv or argv.index("find") + 2 >= len(argv):
+        return None
+    at = argv.index("find")
+    directory = argv[at + 2]
+    command = [quote_for_device_shell(arg) for arg in run_as.listing_command(directory)]
+    return directory if argv[at:] == command else None
 
 
 @pytest.mark.parametrize(
@@ -1682,6 +1694,7 @@ def test_export_claims_no_absence_from_a_listing_that_refused_an_entry(
     payload = assert_refusal(result, json_mode=True, naming=("shared_prefs/",), status=1)
     assert "cannot tell whether" in payload["error"], payload["error"]
     assert payload["rejected"] == 1 and "shared_prefs -> e f.db\\r" in payload["error"]
+    assert payload["rejected_entries"] == [repr("shared_prefs -> e f.db\r")], payload
     assert payload["presence_unknown"] == ["shared_prefs"], payload
     assert "absent" not in payload, payload
     assert not snapshot.exists(), "the refusal left a snapshot behind"
@@ -1921,6 +1934,77 @@ def test_a_find_that_cannot_list_this_way_is_not_blamed_on_the_path(
     assert "toybox find" in payload["remedy"] and "Nothing was listed" in payload["remedy"]
     assert "refused" not in payload["remedy"], payload["remedy"]
     assert payload["path"] == f"{FIXTURE_DIR}/databases"
+
+
+def test_a_listing_that_failed_at_an_entry_names_the_entry_not_the_directory(
+    tmp_path, monkeypatch, capsys, recorded
+):
+    """run_as_find_databases_unsearchable (`chmod u-x`): find names `<dir>/.`, not `<dir>`.
+
+    The remedy said the device refused the directory itself; it was the
+    directory's x bit, and the listing failed at an entry. It says that now,
+    naming the entry escaped and both bits, and still gives the `ls -ld` check.
+    """
+    directory = f"{FIXTURE_DIR}/databases"
+    answer = _recorded_answer(recorded, "run_as_find_databases_unsearchable")
+    assert answer[1].startswith(f"find: '{directory}/.': ".encode()), answer
+    _routed_adb(tmp_path, monkeypatch, [(("find",), *answer)])
+
+    result = _run_main(
+        monkeypatch,
+        capsys,
+        *("--package", FIXTURE_PKG, "--serial", "emulator-5554", "--databases", "--json"),
+    )
+
+    payload = assert_refusal(result, json_mode=True, naming=("permission denied",), status=1)
+    remedy = payload["remedy"]
+    assert f"listing {directory} failed at the entry {'.'!r}" in remedy, remedy
+    assert "x bit" in remedy and "r bit" in remedy, remedy
+    assert f"refused {directory} itself" not in remedy, remedy
+    assert f"adb shell run-as {FIXTURE_PKG} ls -ld {directory}" in remedy, remedy
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["fixture.db", "evil\rname': x", "a\nfind: /elsewhere: Permission denied"],
+    ids=["plain", "cr-and-separator", "lf"],
+)
+def test_an_entry_failure_names_the_entry_escaped(recorded, entry):
+    """Derived: run_as_find_databases_unreadable_stderr with ONLY its path, `<dir>`,
+    replaced by `<dir>/<entry>` -- the position toybox prints an entry's path in
+    (unquoted here, as that recording prints its path; the quoted form is
+    run_as_find_databases_unsearchable's).
+
+    A CR or a `': ` in the name stays in the name shown, escaped; a LF ends
+    find's line, so the entry named is the part before it -- and the line is
+    still the entry's, not another path's or the tool's.
+    """
+    directory = f"{FIXTURE_DIR}/databases"
+    recorded_line = recorded.text("run_as_find_databases_unreadable_stderr")
+    assert recorded_line.startswith(f"find: {directory}: "), recorded_line
+    stderr = recorded_line.replace(directory, f"{directory}/{entry}", 1)
+
+    remedy = run_as.listing_failure(FIXTURE_PKG, directory, "error", stderr)["remedy"]
+
+    shown = entry.split("\n", 1)[0] if "\n" in entry else entry
+    assert f"failed at the entry {shown!r}" in remedy, remedy
+    assert "\r" not in remedy and "\n" not in remedy, remedy
+
+
+def test_find_s_first_line_decides_whose_failure_it_is(recorded):
+    """The three recorded kinds, each to its own remedy: the directory, an entry, the command."""
+    directory = f"{FIXTURE_DIR}/databases"
+    remedies = {
+        name: run_as.listing_failure(FIXTURE_PKG, directory, "error", text)["remedy"]
+        for name, text in [
+            ("dir", recorded.text("run_as_find_databases_unreadable_stderr")),
+            ("entry", recorded.text("run_as_find_databases_unsearchable_stderr")),
+            ("tool", recorded.text("run_as_find_unknown_primary")),
+        ]
+    }
+    assert remedies["dir"] == run_as.path_failure_remedy(FIXTURE_PKG, directory)
+    assert "failed at the entry" in remedies["entry"]
+    assert "toybox find" in remedies["tool"] and "refused" not in remedies["tool"]
 
 
 def test_a_listing_of_a_file_is_refused_not_an_empty_directory(
