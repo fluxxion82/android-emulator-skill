@@ -1,0 +1,68 @@
+{
+  "session_id": "anr-20261019-022000-4b80",
+  "started_at": "2026-10-19T02:20:00.034287",
+  "duration_ms": 444,
+  "event_count": 1,
+  "dropped_below_threshold": 0,
+  "matched_lines": 1,
+  "total_lines": 7,
+  "fingerprint_version": 3,
+  "incomplete": false,
+  "incomplete_reason": null,
+  "verification": null,
+  "unverified_anr_lines": 0,
+  "unnamed_pids": {
+    "count": 0,
+    "pids": []
+  },
+  "cut_records": 0,
+  "stream_failure": null,
+  "stream_restarts": 0,
+  "ambiguous_tail": [],
+  "unattributed_anrs": 0,
+  "unnamed_dropped": {
+    "records": 0,
+    "pids": []
+  },
+  "possible_duplicates": 0,
+  "clusters": [
+    {
+      "fingerprint": "fp:283de260515c5b34",
+      "count": 1,
+      "max_duration_ms": 5000.0,
+      "total_duration_ms": 5000.0,
+      "first_delta_ms": 174,
+      "severity": "frozen",
+      "symbol_or_prefix": "ANR in a process named com.example.compo",
+      "sample_event": {
+        "delta_ms": 174,
+        "process": "ActivityManager",
+        "pid": 598,
+        "duration_ms": 5000.0,
+        "severity": "frozen",
+        "symbol": null,
+        "message_prefix": "ANR in a process named com.example.compo",
+        "fingerprint": "fp:283de260515c5b34",
+        "raw_message": "ANR in com.example.composefixture",
+        "frames": null,
+        "kind": "anr",
+        "reason": "Broadcast of Intent { act=com.example.composefixture.PROVOKE_ANR flg=0x10400010 cmp=com.example.composefixture/.AnrReceiver }",
+        "app_pid": 19538,
+        "app": null,
+        "identity": "process",
+        "window": null,
+        "process_name": "com.example.composefixture",
+        "possible_duplicate": false,
+        "attribution": "unverified"
+      },
+      "identity": "process"
+    }
+  ],
+  "aggregates": {
+    "bursts": [],
+    "quiet_periods": [],
+    "process_distribution": {
+      "ActivityManager": 1
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "session_id": "anr-20261019-022000-5fb7",
+  "started_at": "2026-10-19T02:20:00.865247",
+  "started_at_ms": 1792401600865,
+  "args": {
+    "min_frames": 30,
+    "package": null,
+    "serial": "emulator-5554"
+  },
+  "pid": null,
+  "status": "stopped",
+  "stopped_at": "2026-10-19T02:20:01.121435",
+  "stopped_at_ms": 1792401601121,
+  "extras": {
+    "line_counters": {
+      "total": 2,
+      "matched": 0,
+      "dropped": 0,
+      "stream_restarts": 0,
+      "unnamed_pids": [],
+      "unverified_anr_lines": 0,
+      "cut_records": 0,
+      "unattributed_anrs": 0,
+      "unnamed_dropped": {
+        "records": 0,
+        "pids": []
+      },
+      "ambiguous_tail": [],
+      "stream_failure": {
+        "error": "the stream ended by itself; `adb logcat` exited 255: error: device 'no-such-serial-xyz' not found",
+        "truncated": false,
+        "what": "ended by itself",
+        "device": {
+          "state": "unavailable",
+          "message": "Device 'emulator-5554' is not attached. Attached: none. Run `adb devices` to see what is available.",
+          "error_class": "DeviceNotFoundError",
+          "remedy": "Run `adb devices` to see what is available.",
+          "source": "logcat"
+        }
+      }
+    }
+  },
+  "fingerprint_version": 3,
+  "worker_token": "94c7ac52de99b24d",
+  "worker_started": "Mon Oct 19 09:20:00 2026"
+}

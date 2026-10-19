@@ -1,0 +1,18 @@
+{
+  "session_id": "anr-20261019-022001-aee2",
+  "started_at": "2026-10-19T02:20:01.501202",
+  "started_at_ms": 1792401601501,
+  "args": {
+    "min_frames": 30,
+    "package": null,
+    "serial": "emulator-5554"
+  },
+  "pid": 20225,
+  "status": "running",
+  "stopped_at": null,
+  "stopped_at_ms": null,
+  "extras": {},
+  "fingerprint_version": 3,
+  "worker_token": "0e7791e3a55d9ddc",
+  "worker_started": "Mon Oct 19 09:20:01 2026"
+}
