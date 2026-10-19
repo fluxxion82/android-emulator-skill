@@ -47,6 +47,7 @@ from pathlib import Path
 
 from common import cli, logcat
 from common.adb_exec import (
+    DEFAULT_TIMEOUT,
     AdbCommandError,
     DeviceOfflineError,
     classify_device_error,
@@ -84,6 +85,15 @@ STREAM_SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_LOG_SHUTDOWN_TIMEOUT", 5)
 # read ends by itself. It answers at once either way (measured: `device`, or
 # `error: device '...' not found` exit 1); the bound is for a wedged server.
 STATE_TIMEOUT = env_int("ANDROID_EMU_LOG_STATE_TIMEOUT", 15)
+# Deadline for a `--last` dump. A dump ends by itself, so it is bounded
+# whatever the caller asked -- the one mode with no --duration to arm a timer
+# had none, and a read blocked on a stalled pipe (three bytes of a record's
+# header, then nothing) waited until something outside closed it (review 2 of
+# v0.8.0, item 10). Twice adb's per-call budget (ANDROID_EMU_ADB_TIMEOUT, 30 s):
+# the 60 s app_state_capture and anr_watcher --since give the same `logcat -d`,
+# raised with that variable. Measured on the API 35 emulator: its whole
+# 12.9 MB buffer dumps as records in 0.2 s.
+DUMP_TIMEOUT = 2 * DEFAULT_TIMEOUT
 
 
 class LogMonitor:
@@ -654,8 +664,11 @@ class LogMonitor:
                 refused rather than reported as an empty (or, before D4, a
                 whole-device) window.
             adb_exec.DeviceError: The device is not available -- before the
-                read, or when a live read ended by itself (exit 3 at the
-                boundary, never an empty capture).
+                read, or when a live read ended by itself or a dump did not
+                end in ``DUMP_TIMEOUT`` (exit 3 at the boundary, never an
+                empty capture).
+            cli.Failure: A dump did not end in ``DUMP_TIMEOUT`` and the device
+                is still there: what it read is not the window.
             common.logcat.LogFramingError: The stream is not logd's records.
         """
         self._verify_device_available()
@@ -713,6 +726,9 @@ class LogMonitor:
         signal.signal(signal.SIGINT, signal_handler)
 
         stopped_by_us = False
+        # A dump that its deadline stopped (_stop_overrun_dump). Not a stop of
+        # the caller's asking: what it read is refused, not reported.
+        overran = False
         deadline_timer: threading.Timer | None = None
 
         try:
@@ -738,12 +754,34 @@ class LogMonitor:
                 if self.log_process:
                     self.log_process.terminate()
 
+            def _stop_overrun_dump() -> None:
+                # Stopping the child closes the pipe the read is blocked on.
+                # One that ignores SIGTERM is killed, so the read ends either
+                # way. A dump that already exited is left alone: the read is
+                # about to reach the end it wrote.
+                nonlocal overran
+                process = self.log_process
+                if process is None or process.poll() is not None:
+                    return
+                overran = True
+                process.terminate()
+                try:
+                    process.wait(timeout=STREAM_SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
             # A live `adb logcat` never closes its pipe, so a read blocks
             # indefinitely on a quiet device. Checking the clock inside the loop
             # only helps while lines keep arriving; the timer is what guarantees
-            # --duration actually returns.
-            if duration:
+            # --duration actually returns. A dump closes its pipe when it is
+            # done, unless adb waits for a device that went or the stream
+            # stalls mid-record; its own deadline is what guarantees --last
+            # returns. --follow (and no mode at all) runs until interrupted.
+            if last_minutes is not None:
+                deadline_timer = threading.Timer(float(DUMP_TIMEOUT), _stop_overrun_dump)
+            elif duration:
                 deadline_timer = threading.Timer(float(duration), _stop_at_deadline)
+            if deadline_timer is not None:
                 deadline_timer.daemon = True
                 deadline_timer.start()
 
@@ -780,7 +818,9 @@ class LogMonitor:
             # An interrupt terminates logcat, which can end the read before the
             # loop sees the flag: still a stop, not a stream that ended itself.
             stopped_by_us = stopped_by_us or self.interrupted
-            finished = self._finish_stream(stopped_by_us, live=last_minutes is None, cut=cut)
+            finished = self._finish_stream(
+                stopped_by_us, live=last_minutes is None, cut=cut, overran=overran
+            )
 
         # No `except Exception` here any more: it printed the error and returned
         # False, so a device that vanished mid-stream exited 1 with no remedy
@@ -868,6 +908,7 @@ class LogMonitor:
         stopped_by_us: bool,
         live: bool = True,
         cut: logcat.LogFramingError | None = None,
+        overran: bool = False,
     ) -> bool:
         """Reap the logcat process and decide whether the capture succeeded.
 
@@ -882,15 +923,21 @@ class LogMonitor:
                 device is asked again (gone: exit 3), and otherwise the
                 capture is refused -- the recorded two-crash dump short by one
                 byte was a success with half its errors (review of PR #35).
+            overran: A dump was stopped by its own deadline (``DUMP_TIMEOUT``),
+                not by the caller. What it read is not the window, cut or not:
+                the device is asked again (gone: exit 3), and otherwise the
+                dump is refused.
 
         Returns:
             True if the capture completed as intended.
 
         Raises:
             adb_exec.DeviceError: adb's stderr names a device problem, or --
-                for a read that ended by itself -- ``get-state`` says the device
-                is no longer available. Exit 3, never a quiet capture.
-            cli.Failure: logcat exited non-zero and the device is still there.
+                for a read that ended by itself or a dump that overran --
+                ``get-state`` says the device is no longer available. Exit 3,
+                never a quiet capture.
+            cli.Failure: logcat exited non-zero, or a dump overran, and the
+                device is still there.
 
         Never waits without a timeout: a streaming `adb logcat` does not exit on
         its own, so an unbounded ``wait()`` here is an unconditional hang.
@@ -909,6 +956,24 @@ class LogMonitor:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=STREAM_SHUTDOWN_TIMEOUT)
             returncode = process.poll()
+
+        if overran:
+            # Its exit status is our stop's, and what it read is not the
+            # window. A dump waits for a device that is not there, as a live
+            # read does (measured: `adb -s <unknown> logcat -d -B` prints
+            # adb_waiting_for_device's banner and does not exit), so whether
+            # the device went is asked first: if it did, that is the answer.
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=STREAM_SHUTDOWN_TIMEOUT)
+            self._verify_device_available()
+            said = " ".join("\n".join(self._stderr_lines).split())
+            cli.fail(
+                f"`adb logcat -d` did not finish within {DUMP_TIMEOUT}s and was stopped, so "
+                "what it read is not reported as the window."
+                + (f" adb said: {said}" if said else ""),
+                "Retry, or narrow --last; if it repeats, restart adb (`adb kill-server && adb "
+                "start-server`), or raise ANDROID_EMU_ADB_TIMEOUT (the dump gets twice it).",
+            )
 
         # We terminated it deliberately, so its exit status says nothing about
         # whether the capture worked; a record it was sending is lost, and said.

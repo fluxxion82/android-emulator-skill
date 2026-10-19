@@ -68,6 +68,10 @@ def default_snapshot_dir() -> Path:
 # raising the module-wide default for every adb call in the skill.
 DUMPSYS_TIMEOUT_SECONDS = 60
 LOGCAT_TIMEOUT_SECONDS = 60
+# Budget for `adb get-state`, asked when the log dump came back cut or late:
+# it answers at once either way (`device`, or `error: device '...' not
+# found`; recorded: adb_get_state, adb_device_not_found). log_monitor's bound.
+STATE_TIMEOUT_SECONDS = 15
 
 
 def count_ui_elements(node: dict | None) -> int:
@@ -450,7 +454,11 @@ class AppStateCapture:
             cli.Failure: The app had no process in the window -- none running
                 and none named in it. Its logs cannot be told apart from the
                 rest of the device's, and the whole device is not the answer.
-            adb_exec.DeviceError: The device could not be reached.
+            adb_exec.DeviceError: The device could not be reached -- including
+                when the dump came back cut inside a record or late, and
+                ``get-state`` then says it is gone (_device_after_a_lost_dump).
+                A cut or late dump of a device still there is the logs'
+                failure, not a window.
         """
         # `logcat -t N` means the last N LINES; a bare duration passed here
         # silently became a line count, so "--logs 1m" returned 60 lines. The
@@ -498,21 +506,50 @@ class AppStateCapture:
         # through run_argv: bounded, adb's own failures typed as everywhere.
         command = logcat.build_logcat_command(self.serial, since=since, binary=True)
         try:
-            completed = adb_exec.run_argv(
-                command, serial=self.serial, timeout=LOGCAT_TIMEOUT_SECONDS
-            )
+            try:
+                completed = adb_exec.run_argv(
+                    command, serial=self.serial, timeout=LOGCAT_TIMEOUT_SECONDS
+                )
+            except adb_exec.AdbTimeoutError as error:
+                # Late: a dump waits for a device that is not there (measured:
+                # `adb -s <unknown> logcat -d -B` prints adb_waiting_for_device's
+                # banner and does not exit). Asked before it is the logs' fault.
+                raise adb_exec.AdbTimeoutError(
+                    f"{error}{self._device_after_a_lost_dump()}",
+                    command=command,
+                    remedy=error.remedy,
+                ) from error
+            stderr = completed.stderr or b""
+            detail = (
+                stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr
+            ).strip()
+            # Framing before status, as log_monitor and anr_watcher --since
+            # judge it: a transport that goes mid-dump leaves the dump short of
+            # a record and adb with a status of its own (0 on older adb, 255 on
+            # current), which read as "logcat exited 255" -- or, at 0, as a
+            # framing failure -- at exit 1 with no question asked (review 2 of
+            # v0.8.0, item 7).
+            try:
+                records = logcat.parse_records(completed.stdout or b"")
+            except logcat.LogFramingError as error:
+                unknown = self._device_after_a_lost_dump() if error.truncated else ""
+                exited = (
+                    f"; `adb logcat` exited {completed.returncode}: "
+                    f"{' '.join(detail.split()) or 'nothing on stderr'}"
+                    if completed.returncode
+                    else ""
+                )
+                raise logcat.LogFramingError(
+                    f"{error}, so the window is incomplete and is not counted{exited}{unknown}",
+                    offset=error.offset,
+                    truncated=error.truncated,
+                ) from None
             if completed.returncode != 0:
-                stderr = completed.stderr or b""
-                detail = (
-                    stderr.decode("utf-8", errors="replace")
-                    if isinstance(stderr, bytes)
-                    else stderr
-                ).strip() or "no output"
                 raise adb_exec.AdbCommandError(
-                    f"`{' '.join(command)}` exited {completed.returncode}: {detail}",
+                    f"`{' '.join(command)}` exited {completed.returncode}: "
+                    f"{detail or 'no output'}",
                     command=command,
                 )
-            records = logcat.parse_records(completed.stdout or b"")
         except adb_exec.DeviceError:
             # Nothing reached the device. A snapshot that merely notes "logs
             # unavailable" would hide a problem main() can state with a remedy.
@@ -579,6 +616,48 @@ class AppStateCapture:
                 file=sys.stderr,
             )
         return stats
+
+    def _device_after_a_lost_dump(self) -> str:
+        """Whether the device went, asked once the log dump came back cut or late.
+
+        A dump ends at a record boundary and in time, so one that did not lost
+        data on the way -- and if the device went, that is the answer: a typed
+        error, exit 3 through ``capture()`` with what arrived. log_monitor
+        answers a cut or late dump so, and anr_watcher --since a cut one. The
+        snapshot folded it into "the logs failed" at exit 1 without asking
+        (review 2 of v0.8.0, item 7).
+
+        Returns:
+            ``""`` when ``get-state`` answers ``device``: the dump's own
+            failure is the logs'. When get-state itself fails other than by
+            naming the device, a clause saying the device's state is unknown,
+            for that failure to carry.
+
+        Raises:
+            adb_exec.DeviceError: adb's own words for the device, typed by
+                ``run_adb`` (recorded: adb_device_not_found); or
+                DeviceOfflineError when it answers a state other than
+                ``device`` (recovery, bootloader).
+        """
+        try:
+            result = adb_exec.run_adb(
+                "get-state", self.serial, check=True, timeout=STATE_TIMEOUT_SECONDS
+            )
+        except adb_exec.DeviceError:
+            raise
+        except adb_exec.AdbError as error:
+            return (
+                f"; whether the device is still there is unknown ({' '.join(str(error).split())})"
+            )
+        state = result.stdout.strip()
+        if state != "device":
+            remedy = "Wait for it to boot into Android (`adb wait-for-device`), then capture again."
+            raise adb_exec.DeviceOfflineError(
+                f"The device is in state {state or 'unknown'!r}, not `device`, after its log "
+                f"dump came back incomplete. {remedy}",
+                remedy=remedy,
+            )
+        return ""
 
     def _write_summary_md(self, snapshot_dir: Path, summary: dict) -> None:
         """Write a human-readable ``summary.md`` alongside the JSON artifacts."""

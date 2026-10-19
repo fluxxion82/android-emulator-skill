@@ -444,8 +444,12 @@ def test_unknown_serial_exits_three_with_an_actionable_message(
 # about.
 
 
-def _snapshot_cli(monkeypatch, tmp_path, argv: list[str]):
-    """Run main() over a device that answers, with everything but logs stubbed."""
+def _snapshot_cli(monkeypatch, tmp_path, argv: list[str], run=None):
+    """Run main() over a device that answers, with everything but logs stubbed.
+
+    ``run`` stands in for adb when given; otherwise every question is answered
+    with silence, exit 0.
+    """
     monkeypatch.setattr(
         app_state_capture,
         "capture_screenshot",
@@ -455,7 +459,7 @@ def _snapshot_cli(monkeypatch, tmp_path, argv: list[str]):
     monkeypatch.setattr(
         app_state_capture.adb_exec.subprocess,
         "run",
-        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="", returncode=0),
+        run or (lambda *_a, **_k: SimpleNamespace(stdout="", stderr="", returncode=0)),
     )
     monkeypatch.setattr(
         sys,
@@ -667,6 +671,147 @@ def test_a7_several_devices_is_still_exit_one(monkeypatch, tmp_path, capsys):
     code = _snapshot_cli(monkeypatch, tmp_path, ["--json"])
     assert code == cli.EXIT_FAILURE
     assert json.loads(capsys.readouterr().out)["partial"]["artifacts"]
+
+
+# === a dump cut short or late asks whether the device went (review 2 of v0.8.0) ===
+#
+# log_monitor and anr_watcher --since answer a log dump that ends inside a record
+# by asking `adb get-state` again: gone is exit 3. The snapshot folded the same
+# dump into "the logs failed" at exit 1 without asking, and judged adb's status
+# before the framing, so the cut a transport loss leaves (adb exiting 255) read
+# as "logcat exited 255" (item 7; review 1, item 3).
+
+CRASH_DUMP = "logcat_crash_buffer_records.bin"
+FOUR_ARTIFACTS = ["app-info.json", "device-info.json", "screenshot.png", "ui-hierarchy.json"]
+
+
+def _dump_device(recorded, *, logcat, gone: bool | None):
+    """adb for a snapshot whose log dump goes wrong as ``logcat`` says, then asked again.
+
+    ``logcat(cmd, timeout)`` answers the dump. ``get-state`` answers as
+    recorded: adb_device_not_found (with its recorded exit status) when the
+    device is ``gone``, adb_get_state when it is not, and -- ``gone=None`` --
+    not at all: the call times out. ``pidof`` and everything else get silence,
+    exit 0 (no process running, which the dump's failure comes before).
+
+    Returns:
+        The stand-in for ``subprocess.run``, and the get-state calls it is asked.
+    """
+    asked: list[list[str]] = []
+    not_found = next(
+        e for e in recorded.manifest["fixtures"] if e["name"] == "adb_device_not_found"
+    )
+
+    def run(cmd, *_a, **kwargs):
+        if "get-state" in cmd:
+            asked.append(cmd)
+            if gone is None:
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            if gone:
+                return subprocess.CompletedProcess(
+                    cmd, not_found["exit_status"], "", recorded.text("adb_device_not_found")
+                )
+            return subprocess.CompletedProcess(cmd, 0, recorded.text("adb_get_state"), "")
+        if "logcat" in cmd:
+            return logcat(cmd, kwargs.get("timeout"))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    return run, asked
+
+
+def _cut_dump(recorded, status: int):
+    """The recorded two-crash dump less its final byte, adb exiting ``status``, stderr empty.
+
+    Derived: logcat_crash_buffer_records without its last byte, a dump cut
+    inside its second record. 0 is how older adb exits when the transport goes
+    and 255 current adb (log_monitor's live-read specs pin both).
+    """
+    window = recorded.data(CRASH_DUMP)[:-1]
+    return lambda cmd, _timeout: subprocess.CompletedProcess(cmd, status, window, b"")
+
+
+def _late_dump(cmd, timeout):
+    """A dump that does not finish in its budget: the bounded subprocess call times out."""
+    raise subprocess.TimeoutExpired(cmd, timeout)
+
+
+@pytest.mark.parametrize("status", [0, 255], ids=["older-adb-exit-0", "current-adb-exit-255"])
+def test_a_cut_log_dump_whose_device_went_is_exit_three_with_what_arrived(
+    status, monkeypatch, tmp_path, capsys, recorded
+):
+    """The dump ends inside a record and the device is gone: exit 3, the artifacts kept.
+
+    It was exit 1 at either status, and get-state was never asked: at 0 the
+    framing error became the logs' failure, at 255 the status was judged first.
+    """
+    run, asked = _dump_device(recorded, logcat=_cut_dump(recorded, status), gone=True)
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--json"], run=run)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_DEVICE_UNAVAILABLE, payload
+    assert len(asked) == 1, "the device was not asked again after the cut"
+    assert set(payload) == {"success", "error", "remedy", "partial"}, payload
+    assert "not attached" in payload["error"]
+    assert sorted(payload["partial"]["artifacts"]) == FOUR_ARTIFACTS
+    assert payload["partial"]["logs"]["captured"] is False
+
+
+@pytest.mark.parametrize("status", [0, 255], ids=["older-adb-exit-0", "current-adb-exit-255"])
+def test_a_cut_log_dump_of_a_device_still_there_fails_the_logs_for_the_cut(
+    status, monkeypatch, tmp_path, capsys, recorded
+):
+    """The control: asked again, the device answers. The logs fail for the cut, exit 1.
+
+    The cut is what is named -- at 255 it was "exited 255: no output" -- with
+    how adb exited added when that was a failure.
+    """
+    run, asked = _dump_device(recorded, logcat=_cut_dump(recorded, status), gone=False)
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--json"], run=run)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_FAILURE, payload
+    assert "inside a record" in payload["error"]
+    assert len(asked) == 1, "the device was not asked again after the cut"
+    assert ("exited 255" in payload["error"]) is bool(status)
+    assert payload["partial"]["logs"]["captured"] is False
+    # app-logs.txt is there too, holding the failure: a failed capture writes
+    # its reason into the file it would have filled.
+    assert set(FOUR_ARTIFACTS) <= set(payload["partial"]["artifacts"])
+
+
+def test_a_cut_log_dump_whose_device_cannot_be_asked_says_so(
+    monkeypatch, tmp_path, capsys, recorded
+):
+    """get-state itself does not answer: the cut is still the refusal, the device unknown."""
+    run, asked = _dump_device(recorded, logcat=_cut_dump(recorded, 0), gone=None)
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--json"], run=run)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_FAILURE, payload
+    assert "inside a record" in payload["error"]
+    assert "still there is unknown" in payload["error"]
+    assert len(asked) == 1
+
+
+@pytest.mark.parametrize("gone", [True, False], ids=["device-gone", "device-there"])
+def test_a_late_log_dump_asks_whether_the_device_went(
+    gone, monkeypatch, tmp_path, capsys, recorded
+):
+    """A dump past its budget is the same question: gone is exit 3; there, a timeout (exit 1).
+
+    A dump of a device that is not there does not fail, it waits (measured:
+    `adb -s <unknown> logcat -d -B` prints adb_waiting_for_device's banner and
+    does not exit), so the budget is how that snapshot ends. It was exit 1.
+    """
+    run, asked = _dump_device(recorded, logcat=_late_dump, gone=gone)
+    code = _snapshot_cli(monkeypatch, tmp_path, ["--json"], run=run)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == (cli.EXIT_DEVICE_UNAVAILABLE if gone else cli.EXIT_FAILURE), payload
+    assert ("not attached" if gone else "did not finish") in payload["error"]
+    assert len(asked) == 1, "the device was not asked again after the dump overran"
+    assert set(FOUR_ARTIFACTS) <= set(payload["partial"]["artifacts"])
+    assert payload["partial"]["logs"]["captured"] is False
 
 
 def test_a_snapshot_that_was_not_asked_for_logs_still_succeeds(monkeypatch, tmp_path, capsys):

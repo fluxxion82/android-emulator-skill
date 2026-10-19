@@ -12,15 +12,21 @@ accept and each it must reject.
 The documents are built with ``json.dumps`` and ``"\\n".join`` from short
 values: they are this skill's OWN output shape, not a tool's, and nothing here
 is handed to a parser.
+
+And ``FakeToolchain.run``'s limit: a script killed there must take the stubs it
+started with it.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import time
 
 import pytest
-from fake_toolchain import assert_refusal
+from fake_toolchain import FakeToolchain, Rule, assert_refusal
 
 REFUSAL = {"success": False, "error": "`sdkmanager` was not found", "remedy": "Install it."}
 
@@ -118,3 +124,50 @@ def test_a_malformed_object_is_loud_not_excused():
     """Looks like an object, is not one: a broken fix, so not an AssertionError."""
     with pytest.raises(json.JSONDecodeError):
         assert_refusal(_run(stdout='{"success": false,}'), json_mode=True, naming=("x",), status=1)
+
+
+# --- a run past its limit takes what it started with it (review of PR #36) ------
+
+# How long a killed stub may take to be reaped once its parent is gone too.
+REAP_LIMIT = 5
+
+
+def _gone_within(pid: int, seconds: float) -> bool:
+    """Whether ``pid`` stops existing within ``seconds`` (killed, then reaped)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_run_past_its_limit_leaves_no_stub_running(tmp_path, recorded):
+    """The script is killed at the limit, and so is the hanging stub it started.
+
+    ``log_monitor --follow`` over a ``logcat`` that waits never ends: the limit
+    is its end here. ``subprocess.run`` killed the script alone, and the stub
+    (``hang=True``, an hour's sleep) outlived it, one per timed-out run. Both
+    answers are recorded: adb_get_state, then adb_waiting_for_device's banner.
+    """
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    chain.install(
+        "adb",
+        [
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
+        ],
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        chain.run("log_monitor.py", "--follow", timeout=4)
+
+    stubs = [pid for pid, argv in chain.stub_pids("adb") if "logcat" in argv]
+    assert len(stubs) == 1, f"the script never started its logcat: {chain.calls('adb')}"
+    gone = _gone_within(stubs[0], REAP_LIMIT)
+    if not gone:
+        # Red or not, nothing is left behind.
+        os.kill(stubs[0], signal.SIGKILL)
+    assert gone, f"the hanging logcat stub (pid {stubs[0]}) outlived the run that started it"
