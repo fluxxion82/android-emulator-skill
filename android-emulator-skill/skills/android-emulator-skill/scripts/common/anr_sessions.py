@@ -233,11 +233,23 @@ class SessionStore:
         return meta
 
     def wait_for_worker(self, session_id: str, timeout_seconds: float = 2.0) -> SessionMeta:
-        """Poll meta.json until status=running or timeout. Raises on timeout."""
+        """Poll meta.json until the worker has registered, or time out. Raises on timeout.
+
+        Registered is running -- or crashed after it claimed the session: a
+        worker can claim and be marked crashed between two polls, and read as
+        one that never started ("did not register", exit 1) where its own
+        failure was the answer (CI on PR #42). The claim left
+        ``worker_started`` (kept by ``mark_crashed``), and the worker persists
+        its counters before it marks the session crashed; either shows it.
+        """
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             meta = self.load_meta(session_id)
             if meta.status == _STATUS_RUNNING and meta.pid:
+                return meta
+            if meta.status == _STATUS_CRASHED and (
+                meta.worker_started or "line_counters" in meta.extras
+            ):
                 return meta
             time.sleep(0.05)
         raise TimeoutError(f"Worker for {session_id} did not register within {timeout_seconds}s")
@@ -308,24 +320,39 @@ class SessionStore:
         signalled: the reason is kept in ``extras["worker_gone"]`` for the
         caller to say, and the pid is forgotten -- unless `ps` could not answer,
         when the worker may still be alive and its pid is kept.
+
+        When the pid is kept and may still be the worker -- `ps` could not say,
+        or the signal was refused -- why is kept in
+        ``extras["worker_unresolved"]`` too: not delivered is then not "gone",
+        and --stop must not answer as if the worker had ended (review of PR
+        #42: it saved a summary at exit 0 while the worker went on).
         """
         meta = self.load_meta(session_id)
         if not meta.pid:
             return False
+        unresolved = meta.extras.pop("worker_unresolved", None)
         mismatch = worker_mismatch(meta)
         if mismatch is not None:
             meta.extras["worker_gone"] = mismatch
-            if not mismatch.startswith("`ps`"):
+            if mismatch.startswith("`ps`"):
+                meta.extras["worker_unresolved"] = mismatch
+            else:
                 meta.pid = None
             self._write_meta(meta)
             return False
         try:
             os.kill(meta.pid, sig)
-            return True
         except ProcessLookupError:
+            if unresolved is not None:
+                self._write_meta(meta)
             return False
-        except PermissionError:
+        except PermissionError as error:
+            meta.extras["worker_unresolved"] = f"pid {meta.pid} could not be signalled ({error})"
+            self._write_meta(meta)
             return False
+        if unresolved is not None:
+            self._write_meta(meta)
+        return True
 
     def load_meta(self, session_id: str) -> SessionMeta:
         path = self._meta_path(session_id)

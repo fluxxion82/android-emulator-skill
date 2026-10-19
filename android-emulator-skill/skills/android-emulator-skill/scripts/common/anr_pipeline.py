@@ -76,6 +76,11 @@ FRAME_MS = 16.7
 # (android:process). ``--diff`` compares none of them.
 _NO_IDENTITY = frozenset({"pid", "window", "process"})
 
+# The kinds of event logged from inside the app, whose record's pid is the
+# app's own and names no package: only a session that saw the process start
+# can say whose they are (``SessionSummary.unnamed_dropped``).
+PID_NAMED_KINDS = frozenset({"jank", "strictmode"})
+
 # Skipped-frame severity boundaries (frame counts). Android Choreographer only
 # warns once N skipped frames cross a threshold; we scale severity from there.
 WARN_FRAMES = 30
@@ -313,6 +318,16 @@ class SessionSummary:
     # or of a process no uid confirmed -- so it can neither keep them nor say
     # they were someone else's (wave 4).
     unattributed_anrs: int = 0
+    # Jank and StrictMode records ``--package`` dropped because no `Start
+    # proc` in the session named their process (one already running when it
+    # began), and their pids. They may be the package's, so this session shows
+    # neither the absence of such a cluster nor its maximum (closure review of
+    # v0.8.0: the dropped jank read as "improvement: 1 resolved"). None when the
+    # summary does not say -- a --package session saved by a version that did
+    # not count them -- and then it shows neither either (review of PR #42: read
+    # as zero, an older summary still said "improvement: 1 resolved").
+    unnamed_dropped: int | None = 0
+    unnamed_dropped_pids: list[int] = field(default_factory=list)
     # ANRs of a window that a broadcast ANR's report nearby may already
     # account for: counted, and said (``NormalisedEvent.possible_duplicate``).
     possible_duplicates: int = 0
@@ -1152,10 +1167,9 @@ def _unnamed_note(summary: SessionSummary) -> str:
     pids = summary.unnamed_pids
     if not pids:
         return ""
-    shown = ", ".join(str(pid) for pid in pids[:8]) + (", …" if len(pids) > 8 else "")
     plural = "s" if len(pids) != 1 else ""
     return (
-        f"Unnamed: {len(pids)} pid{plural} ({shown}) -- only a process whose verified "
+        f"Unnamed: {len(pids)} pid{plural} ({_pids_shown(pids)}) -- only a process whose verified "
         f"Start proc this session saw is named; the rest are keyed by pid, and "
         f"--package drops them."
     )
@@ -1165,10 +1179,9 @@ def _framing_note(summary: SessionSummary) -> str:
     """What the stream itself lost: a record cut by the stop, or a break (empty when neither)."""
     notes = []
     if summary.stream_failure:
-        notes.append(
-            f"Broken: the stream stopped being logd's records ({summary.stream_failure}); "
-            f"nothing after that is in here."
-        )
+        # The failure says itself: a framing error, or a stream that ended by
+        # itself and was not restarted (review of PR #42).
+        notes.append(f"Broken: {summary.stream_failure}; nothing after that is in here.")
     if summary.cut_records:
         plural = "s" if summary.cut_records != 1 else ""
         notes.append(
@@ -1213,6 +1226,32 @@ def _unattributed_note(summary: SessionSummary) -> str:
     )
 
 
+def _pids_shown(pids: list[int]) -> str:
+    """Up to eight pids, comma-separated, an ellipsis for the rest."""
+    return ", ".join(str(pid) for pid in pids[:8]) + (", …" if len(pids) > 8 else "")
+
+
+def _dropped_note(summary: SessionSummary) -> str:
+    """The jank/StrictMode --package dropped for want of a name (empty when none was)."""
+    count = summary.unnamed_dropped
+    if count is None:
+        return (
+            "Dropped: not recorded -- this summary was saved by a version that did not count "
+            "the jank/StrictMode --package dropped for want of a name, so --diff takes no "
+            "jank/StrictMode cluster as absent here, nor a maximum here as whole."
+        )
+    if not count:
+        return ""
+    pids = summary.unnamed_dropped_pids
+    plural = "s" if count != 1 else ""
+    return (
+        f"Dropped: --package dropped {count} jank/StrictMode record{plural} of "
+        f"pid{'s' if len(pids) != 1 else ''} {_pids_shown(pids)}, whose process no Start "
+        f"proc in this session named; {'they' if plural else 'it'} may be the package's, so "
+        f"--diff takes no jank/StrictMode cluster as absent here, nor a maximum here as whole."
+    )
+
+
 def _duplicate_note(summary: SessionSummary) -> str:
     """The ANRs of a window that may be a broadcast ANR's duplicate (empty when none are)."""
     count = summary.possible_duplicates
@@ -1241,6 +1280,7 @@ def _disclosures(summary: SessionSummary) -> list[str]:
         _framing_note(summary),
         _unverified_note(summary),
         _unnamed_note(summary),
+        _dropped_note(summary),
         _unattributed_note(summary),
         _duplicate_note(summary),
         _ambiguous_note(summary),
@@ -1270,6 +1310,10 @@ def _markers(summary: SessionSummary) -> str:
         marks.append(counted(summary.unverified_anr_lines, "ANR record", "unverified"))
     if summary.unnamed_pids:
         marks.append(counted(len(summary.unnamed_pids), "pid", "unnamed"))
+    if summary.unnamed_dropped is None:
+        marks.append("jank/StrictMode drops not recorded")
+    elif summary.unnamed_dropped:
+        marks.append(counted(summary.unnamed_dropped, "jank/StrictMode record", "dropped unnamed"))
     if summary.unattributed_anrs:
         marks.append(counted(summary.unattributed_anrs, "ANR", "unattributed"))
     if summary.possible_duplicates:
@@ -1499,14 +1543,19 @@ def format_diff(diff: dict) -> str:
             )
     not_compared = diff.get("not_compared", [])
     if not_compared:
+        # One reason for all is said once; otherwise each entry says its own (a
+        # jank cluster may be short on a side where an ANR cluster is not).
+        reasons = {entry["reason"] for entry in not_compared}
+        shared = f" -- {not_compared[0]['reason']}" if len(reasons) == 1 else ""
         lines.append(
-            f"Not compared ({len(not_compared)}): in both sessions, but a maximum from an "
-            f"incomplete one is only a lower bound -- {not_compared[0]['reason']}:"
+            f"Not compared ({len(not_compared)}): in both sessions, but a maximum from a "
+            f"session that may lack some of its events is only a lower bound{shared}:"
         )
         for entry in not_compared[:5]:
+            own = f" -- {entry['reason']}" if not shared else ""
             lines.append(
                 f"  ? {entry['symbol_or_prefix']}: {entry['max_duration_ms_a']:.0f} / "
-                f"{entry['max_duration_ms_b']:.0f}ms"
+                f"{entry['max_duration_ms_b']:.0f}ms{own}"
             )
     return "\n".join(lines)
 
@@ -1572,12 +1621,13 @@ def diff_sessions(
 
     ``unconfirmed`` holds the clusters one session has and the other lacks
     while it was saved ``incomplete`` or holds evidence it did not count (an
-    ``ambiguous_tail``, ``unattributed_anrs``) -- each with ``session``
-    (where it is) and ``absent_from`` -- in place of calling them resolved or
-    new; the verdict names what was not counted. With either
-    side incomplete, ``not_compared`` holds the clusters both have, in place of
-    a drift or stability verdict: an incomplete side's maximum is only a lower
-    bound.
+    ``ambiguous_tail``, ``unattributed_anrs``; for a jank or StrictMode
+    cluster, ``unnamed_dropped``) -- each with ``session`` (where it is) and
+    ``absent_from`` -- in place of calling them resolved or new; the verdict
+    names what was not counted. With either side incomplete -- or, for a jank
+    or StrictMode cluster, holding such records it dropped -- ``not_compared``
+    holds the clusters both have, in place of a drift or stability verdict:
+    that side's maximum is only a lower bound.
     """
     if summary_a.fingerprint_version != summary_b.fingerprint_version:
         return {
@@ -1610,22 +1660,44 @@ def diff_sessions(
     # missing could raise it. Compared anyway, it read as "improved" one way
     # round and "worsened" the other (review of PR #34). So with either side
     # incomplete, no shared cluster drifts or holds stable; each is listed as
-    # not compared, and why.
+    # not compared, and why. So too a jank or StrictMode cluster against a side
+    # that dropped such records for want of a name: one of them may be its
+    # largest (closure review of v0.8.0).
     incomplete_ids = list(
         dict.fromkeys(s.session_id for s in (summary_a, summary_b) if s.incomplete)
     )
     because = " and ".join(f"{sid} is incomplete" for sid in incomplete_ids)
+    # Each side's drops, said once; a side is read off its summary, not its id.
+    dropped = list(
+        dict.fromkeys(_dropped_unnamed(s) for s in (summary_a, summary_b) if s.unnamed_dropped != 0)
+    )
+    short_by = {
+        key: list(
+            dict.fromkeys(
+                [
+                    *(f"{sid} is incomplete" for sid in incomplete_ids),
+                    *(
+                        _dropped_unnamed(s)
+                        for s in (summary_a, summary_b)
+                        if _may_hold(s, b_map[key])
+                    ),
+                ]
+            )
+        )
+        for key in shared_keys
+    }
     not_compared = [
         {
             "fingerprint": key,
             "symbol_or_prefix": b_map[key].symbol_or_prefix,
             "max_duration_ms_a": a_map[key].max_duration_ms,
             "max_duration_ms_b": b_map[key].max_duration_ms,
-            "reason": f"not comparable: {because}",
+            "reason": f"not comparable: {' and '.join(short_by[key])}",
         }
-        for key in (sorted(shared_keys) if incomplete_ids else [])
+        for key in sorted(shared_keys)
+        if short_by[key]
     ]
-    for key in shared_keys if not incomplete_ids else ():
+    for key in (key for key in shared_keys if not short_by[key]):
         ca, cb = a_map[key], b_map[key]
         if ca.max_duration_ms == 0 and cb.max_duration_ms == 0:
             stable += 1
@@ -1682,12 +1754,21 @@ def diff_sessions(
     # So, too, a side holding evidence it did not count -- the record it
     # started on, or ANRs --package could not attribute: the missing cluster
     # may be right there, uncounted (Codex review of PR #39: "improvement: 1
-    # resolved" against the same ANR kept only as ambiguous_tail).
+    # resolved" against the same ANR kept only as ambiguous_tail). And jank or
+    # StrictMode --package dropped because no `Start proc` named its process:
+    # it may be the package's, so a missing cluster of those kinds may be it
+    # (closure review of v0.8.0: the same jank, its process started before
+    # the capture, read as "improvement: 1 resolved"). An ANR is not one.
     uncounted = {s.session_id: _uncounted(s) for s in (summary_a, summary_b) if _uncounted(s)}
-    doubtful_a = summary_a.incomplete or summary_a.session_id in uncounted
-    doubtful_b = summary_b.incomplete or summary_b.session_id in uncounted
-    unconfirmed_resolved = resolved_keys - uncertain_resolved if doubtful_b else set()
-    unconfirmed_new = new_keys - uncertain_new if doubtful_a else set()
+
+    def unshown(cluster: Cluster, absent: SessionSummary) -> bool:
+        """Whether ``absent`` cannot show that it lacks ``cluster``."""
+        return absent.incomplete or bool(_uncounted(absent)) or _may_hold(absent, cluster)
+
+    unconfirmed_resolved = {
+        k for k in resolved_keys - uncertain_resolved if unshown(a_map[k], summary_b)
+    }
+    unconfirmed_new = {k for k in new_keys - uncertain_new if unshown(b_map[k], summary_a)}
     unconfirmed = [
         {
             **_cluster_to_dict(cluster_map[k]),
@@ -1733,14 +1814,20 @@ def diff_sessions(
         plural = "s" if len(unconfirmed) != 1 else ""
         caveats.append(
             f"{len(unconfirmed)} cluster{plural} missing only from an incomplete session"
-            if not uncounted
+            if not uncounted and not dropped
             else f"{len(unconfirmed)} cluster{plural} missing only from a session that is "
             f"incomplete or holds evidence it did not count"
         )
     caveats.extend(f"{sid} {why}" for sid, why in uncounted.items())
+    # Said whether or not anything is missing or shared: a dropped record may
+    # be a cluster the other session lacks -- one this side would have added.
+    short = list(dict.fromkeys(reason for key in sorted(short_by) for reason in short_by[key]))
+    caveats.extend(said for said in dropped if said not in short)
     if not_compared:
         plural = "s" if len(not_compared) != 1 else ""
-        caveats.append(f"{len(not_compared)} shared cluster{plural} not comparable: {because}")
+        caveats.append(
+            f"{len(not_compared)} shared cluster{plural} not comparable: {' and '.join(short)}"
+        )
     elif incomplete_ids:
         caveats.append(because)
     if caveats:
@@ -1776,6 +1863,31 @@ def _uncounted(summary: SessionSummary) -> str:
             f"dropped {summary.unattributed_anrs} ANR{plural} --package could not attribute"
         )
     return " and ".join(held)
+
+
+def _dropped_unnamed(summary: SessionSummary) -> str:
+    """What --package dropped of a summary's jank/StrictMode for want of a name, in words."""
+    count, pids = summary.unnamed_dropped, len(summary.unnamed_dropped_pids)
+    if count is None:
+        return (
+            f"{summary.session_id} does not record what --package dropped of its "
+            f"jank/StrictMode (saved by an earlier version)"
+        )
+    return (
+        f"{summary.session_id} dropped {count} jank/StrictMode record{'s' if count != 1 else ''} "
+        f"of {pids} pid{'s' if pids != 1 else ''} it never named, which --package could not "
+        f"attribute"
+    )
+
+
+def _may_hold(summary: SessionSummary, cluster: Cluster) -> bool:
+    """Whether what ``summary`` dropped for want of a name may be of ``cluster``.
+
+    Only jank and StrictMode are dropped so, so only a cluster of those kinds
+    may be among them: an ANR's absence, or its maximum, still shows. A
+    summary that does not say (None) may hold any number.
+    """
+    return summary.unnamed_dropped != 0 and cluster.sample_event.kind in PID_NAMED_KINDS
 
 
 def _signature(cluster: Cluster) -> str:
@@ -1833,6 +1945,12 @@ def summary_to_json(summary: SessionSummary) -> dict:
         "stream_restarts": summary.stream_restarts,
         "ambiguous_tail": summary.ambiguous_tail,
         "unattributed_anrs": summary.unattributed_anrs,
+        # null: not recorded (SessionSummary.unnamed_dropped).
+        "unnamed_dropped": (
+            None
+            if summary.unnamed_dropped is None
+            else {"records": summary.unnamed_dropped, "pids": summary.unnamed_dropped_pids}
+        ),
         "possible_duplicates": summary.possible_duplicates,
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
@@ -1842,6 +1960,9 @@ def summary_to_json(summary: SessionSummary) -> dict:
 def summary_from_json(payload: dict) -> SessionSummary:
     """Rehydrate a SessionSummary from disk JSON."""
     clusters = [_cluster_from_json(c) for c in payload.get("clusters", [])]
+    # Absent (a summary saved before drops were counted) or null: unknown, not 0.
+    dropped = payload.get("unnamed_dropped")
+    dropped = dropped if isinstance(dropped, dict) else None
     return SessionSummary(
         session_id=payload["session_id"],
         started_at=payload["started_at"],
@@ -1863,6 +1984,8 @@ def summary_from_json(payload: dict) -> SessionSummary:
         stream_restarts=payload.get("stream_restarts", 0),
         ambiguous_tail=list(payload.get("ambiguous_tail") or []),
         unattributed_anrs=payload.get("unattributed_anrs", 0),
+        unnamed_dropped=None if dropped is None else dropped.get("records", 0),
+        unnamed_dropped_pids=[] if dropped is None else list(dropped.get("pids", [])),
         possible_duplicates=payload.get("possible_duplicates", 0),
     )
 
