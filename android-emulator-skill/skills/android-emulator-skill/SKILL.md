@@ -747,14 +747,22 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       recorded pid is shown to still be it: the random token `--start` put on
       its command line, and the start time `ps` gave when it claimed the pid
       (a crashed worker's pid is also forgotten). Anything else holding that
-      pid is never signalled; stderr says "worker gone" and why
-    - `--stop` saves the summary only after the session's worker has exited
-      (it waits up to 5.5 s: a lookup under way, the drain, a margin; and,
+      pid is never signalled; stderr says "worker gone" and why. A live pid
+      that can be shown neither to be the worker nor not to be — `ps` could
+      not say, or the signal was refused — is not taken for a worker that
+      ended: `--stop` refuses (exit 1, naming the pid and why), saves
+      nothing and keeps the pid, for a later `--stop` (it used to save the
+      summary at exit 0 and forget the pid while the worker went on)
+    - `--stop` waits for the session's worker to exit before it saves the
+      summary (up to 5.5 s: a lookup under way, the drain, a margin; and,
       for a worker still deciding how its stream ended, until that decision's
       own bound, about 31 s from when it began — it answered before the
-      worker, at exit 0, while the worker went on to find the device gone. A
-      worker still undecided then is refused, exit 1: run `--stop` again).
-      The
+      worker, at exit 0, while the worker went on to find the device gone).
+      A worker still running at the end of its wait has its summary saved
+      while it runs, marked incomplete — and one still deciding is then
+      refused (exit 1: run `--stop` again). A decision the worker has begun
+      is finished whatever stop arrives meanwhile. A `--stop` repeated on a
+      stopped session keeps what the first said was missing. The
       summary is saved with `"incomplete": true`, and `incomplete_reason`
       saying why, whenever the capture may be missing events: the worker was
       still running then, it crashed or vanished without being stopped, the
@@ -843,10 +851,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       adb's other exit statuses are judged — and exit 3 when the device went,
       or refuse (exit 1) naming the framing error and how adb exited. Bytes
       that are not records at all are refused (exit 1) with no device
-      question — after what adb has said, read without waiting for it to
-      exit, which may name a device error (exit 3). adb's stderr is read from
-      its start and its end (64 KiB each): an error adb wrote first and then
-      chattered past was lost with a tail alone. A message shows it shortened.
+      question — after what adb has said, read once adb has had 0.5 s to
+      finish (the session worker's grace too), which may name a device error
+      (exit 3). adb's stderr is read from its start and its end (64 KiB
+      each): an error adb wrote first and then chattered past was lost with a
+      tail alone. An error only in the middle of more than 128 KiB of stderr
+      is not read, so it is not typed: exit 1 where it is 3. A message shows
+      adb's stderr shortened.
       A session's worker does not restart either kind of
       stream: it keeps each stream's stderr (it went to `/dev/null`) and reads
       what adb has said whether or not adb has exited, takes a device error
@@ -906,7 +917,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `--watch`, `--since` and `--start` ask `adb get-state` first (bounded,
       with or without `--serial`) and refuse at once, exit 3, when adb names
       no device in state `device` (several and no `--serial` is exit 1);
-      `--start` creates no session then
+      `--start` creates no session then. A worker that registers and ends
+      before `--start` looks — its stream broke at once — is not "did not
+      register" (exit 1, the race CI met): `--start` stops the session, so
+      its summary is saved, and refuses with what ended it, as `--stop`
+      would (exit 3 for a device that went). A worker that meets an error
+      nothing foresaw persists it as the session's stream failure and marks
+      the session crashed, where it left it `running` with nothing said
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
       it used to be raised to 1. A restart happens unless adb or `adb

@@ -1512,6 +1512,8 @@ for index, answer in enumerate(spec["answers"]):
     time.sleep(answer["delay"])
     streams = [("stdout", sys.stdout.buffer), ("stderr", sys.stderr.buffer)]
     for name, stream in (streams[::-1] if answer["stderr_first"] else streams):
+        if name == "stderr" and answer["stderr_after"]:
+            time.sleep(answer["stderr_after"])
         if answer[name]:
             with open(answer[name], "rb") as handle:
                 stream.write(handle.read())
@@ -1538,6 +1540,8 @@ class _Answer:
     stderr_first: bool = False
     # Answer the first matching call only; later ones go to the next answer.
     once: bool = False
+    # Seconds between writing stdout and writing stderr.
+    stderr_after: float = 0.0
 
 
 class _LiveDevice:
@@ -4622,3 +4626,262 @@ def test_start_answers_for_a_worker_that_registered_and_ended_before_it_looked(
     summary = store.load_summary(session.session_id)
     assert summary is not None and summary.incomplete, "the summary was not saved"
     assert bool(summary.stream_failure) == (said != "unsaid"), summary.stream_failure
+
+
+# ---------------------------------------------------------------------------
+# Third review of PR #42: a stop during a decision, a worker --stop cannot tell,
+# an unforeseen worker error, --watch's grace, and a repeated --stop
+# ---------------------------------------------------------------------------
+
+
+def _crash_dump_logcat(tmp_path, recorded, recorded_anywhere, said: str):
+    """A logcat stand-in replaying the recorded crash dump, whole; adb exits 255 having said ``said``.
+
+    ``said`` is "device not found" (the recorded text) or "nothing". Returns
+    the stand-in's class and the list of stdouts it opened, for the test to close.
+    """
+    stream_file = tmp_path / "crash.logcat"
+    stream_file.write_bytes(recorded.data(f"{CRASH_DUMP}.bin"))
+    opened: list = []
+
+    class _Logcat:
+        def __init__(self, _cmd, **kwargs):
+            self.stdout = open(stream_file, "rb", buffering=0)  # noqa: SIM115
+            opened.append(self.stdout)
+            if said == "device not found":
+                kwargs["stderr"].write(recorded_anywhere("adb_device_not_found").encode())
+                kwargs["stderr"].flush()
+
+        def poll(self):
+            return 255
+
+        def wait(self, timeout=None):
+            return 255
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    return _Logcat, opened
+
+
+def _stop_through_the_cli(monkeypatch, capsys, session_id: str) -> tuple[int, dict]:
+    """`anr_watcher.py --stop <id> --json` through main and the CLI boundary: (status, JSON)."""
+    monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", "--stop", session_id, "--json"])
+    with pytest.raises(SystemExit) as exc:
+        cli.run(anr_watcher.main)
+    return exc.value.code, json.loads(capsys.readouterr().out)
+
+
+def test_a_stop_that_comes_once_the_decision_has_begun_does_not_skip_it(
+    recorded, recorded_anywhere, store, tmp_path, monkeypatch, capsys
+):
+    """Third review of PR #42, REQUIRED 1 (P1): the decision read the stop flag twice.
+
+    The stream -- the recorded crash dump, whole; adb exits 255 having written
+    the recorded not-found text -- ends by itself, and the worker says in its
+    meta that it is deciding how. --stop's SIGTERM arrives right then: the
+    worker's own handler is called as that meta write returns. The second
+    read of the stop flag skipped the decision: worker exit 0, --stop exit 0,
+    no stream failure, the summary complete. A decision once begun is
+    finished: --stop answers with the device error, exit 3.
+
+    Replayed in process, with the real worker and --stop's CLI boundary: the
+    window is between two statements of the worker, which no separate
+    process can be made to hit every time.
+    """
+    from common import adb_exec
+
+    handlers: dict = {}
+    monkeypatch.setattr(
+        anr_watcher.signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler)
+    )
+    logcat_class, opened = _crash_dump_logcat(
+        tmp_path, recorded, recorded_anywhere, "device not found"
+    )
+    _logcat_through(monkeypatch, logcat_class)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
+    persist = store.persist_worker_counters
+
+    def persist_then_sigterm(session_id, counters):
+        persist(session_id, counters)
+        if counters.get("deciding"):
+            # --stop's SIGTERM, just after the meta says the worker is deciding.
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    monkeypatch.setattr(store, "persist_worker_counters", persist_then_sigterm)
+    meta = store.create({"serial": "emulator-5554", "package": None})
+    try:
+        anr_watcher.AnrBuster(store=store).run_worker(meta.session_id)
+    finally:
+        for stdout in opened:
+            stdout.close()
+
+    status, refusal = _stop_through_the_cli(monkeypatch, capsys, meta.session_id)
+
+    assert status == 3, refusal
+    assert refusal["success"] is False and "not attached" in refusal["error"], refusal
+    assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+
+
+def test_a_stop_that_cannot_tell_the_worker_from_another_process_refuses(
+    store, monkeypatch, capsys
+):
+    """Third review of PR #42, REQUIRED 2 (P1): not delivered was read as "the worker ended".
+
+    The session's pid is a live process carrying the session's worker token
+    -- it may be the worker -- and `ps` cannot be run, so it can be shown to
+    be the worker no more than shown not to be. signal_worker kept the pid
+    and sent nothing; --stop then took the worker for finished, saved a
+    summary at exit 0 and forgot the pid, while the worker went on. --stop
+    now refuses, exit 1, naming the pid and why; nothing is signalled, no
+    summary is saved, and the pid is kept for the next --stop.
+    """
+    from common import anr_sessions
+
+    meta = store.create({})
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; print('ready', flush=True); time.sleep(60)",
+            anr_watcher.WORKER_TOKEN_FLAG,
+            meta.worker_token,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    real_kill = os.kill
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        _hold_pid(store, meta.session_id, holder.pid, "running")
+
+        def no_ps(*_args, **_kwargs):
+            raise FileNotFoundError("ps")
+
+        monkeypatch.setattr(anr_sessions, "_ps", no_ps)
+        signalled: list[int] = []
+
+        def kill(pid, sig):
+            if pid == holder.pid and sig != 0:
+                signalled.append(sig)
+                return
+            real_kill(pid, sig)
+
+        monkeypatch.setattr(anr_sessions.os, "kill", kill)
+
+        status, refusal = _stop_through_the_cli(monkeypatch, capsys, meta.session_id)
+
+        alive = holder.poll() is None
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            real_kill(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=30)
+        holder.stdout.close()
+
+    assert status == 1, refusal
+    assert str(holder.pid) in refusal["error"] and "could not say" in refusal["error"], refusal
+    assert f"--stop {meta.session_id} again" in refusal["remedy"], refusal
+    assert (signalled, alive) == ([], True)
+    assert store.load_meta(meta.session_id).pid == holder.pid, "the pid was forgotten"
+    assert store.load_summary(meta.session_id) is None, "a summary was saved as the answer"
+
+
+def test_a_worker_that_meets_an_unforeseen_error_ends_the_session_as_a_failure(
+    recorded, recorded_anywhere, store, tmp_path, monkeypatch, capsys
+):
+    """Third review of PR #42, REQUIRED 3: an exception left the session `running`, unsaid.
+
+    Any error nothing foresaw -- here one raised in place of reading the
+    stream -- propagated out of the worker with its counters persisted and
+    the session still `running`: --start saw a worker at work, and --stop a
+    worker that had ended without being stopped, at exit 0. It is persisted
+    as the session's stream failure and the session marked crashed; --stop
+    refuses with it, exit 1. The error still reaches the worker's caller.
+    """
+    logcat_class, opened = _crash_dump_logcat(tmp_path, recorded, recorded_anywhere, "nothing")
+
+    def unforeseen(self, **_kwargs):
+        raise RuntimeError("an error nothing foresaw")
+
+    monkeypatch.setattr(anr_watcher.AnrBuster, "_read_stream_into_events", unforeseen)
+    monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
+    _logcat_through(monkeypatch, logcat_class)
+    meta = store.create({"serial": "emulator-5554", "package": None})
+    try:
+        with pytest.raises(RuntimeError):
+            anr_watcher.AnrBuster(store=store).run_worker(meta.session_id)
+    finally:
+        for stdout in opened:
+            stdout.close()
+
+    after = store.load_meta(meta.session_id)
+    assert after.status == "crashed", after.status
+    failure = after.extras["line_counters"]["stream_failure"]
+    assert "RuntimeError: an error nothing foresaw" in failure["error"], failure
+    status, refusal = _stop_through_the_cli(monkeypatch, capsys, meta.session_id)
+    assert status == 1, refusal
+    assert "abandoned by its worker" in refusal["error"], refusal
+
+
+def test_a_watch_gives_adb_the_workers_grace_before_reading_what_it_said(
+    recorded, recorded_anywhere, tmp_path
+):
+    """Third review of PR #42, OPTIONAL: --watch read adb's stderr at once, the worker after 0.5 s.
+
+    The same derived stream as the worker's (the recorded record with only
+    its header-size field set to 0), from an adb that writes the recorded
+    not-found text 0.1 s later and then holds. The worker waits for adb up to
+    0.5 s before reading what it said: exit 3. --watch read at once: exit 1.
+    """
+    raw = bytearray(frames(recorded.data(f"{CRASH_DUMP}.bin"))[0].raw)
+    raw[2:4] = (0).to_bytes(2, "little")
+    live = _LiveDevice(
+        tmp_path,
+        [
+            _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
+            _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+            _Answer(
+                ("logcat",),
+                stdout=bytes(raw),
+                stderr=recorded_anywhere("adb_device_not_found"),
+                stderr_after=0.1,
+                hold=True,
+            ),
+        ],
+    )
+
+    result = live.run("--watch", "--duration", "30", "--json")
+
+    refusal = assert_refusal(
+        result, json_mode=True, naming=("not attached",), status=3, streaming=True
+    )
+    assert refusal["remedy"] == NOT_FOUND_REMEDY, refusal
+
+
+def test_a_repeated_stop_keeps_what_the_first_said_was_missing(recorded, tmp_path, monkeypatch):
+    """Third review of PR #42, OPTIONAL: a second --stop turned incomplete into complete.
+
+    The first --stop signals the worker, which is still running when its wait
+    ends: the summary is saved incomplete. By the second, the worker has
+    exited (nothing to signal), and the summary was rebuilt complete -- as if
+    what it may not have written had come back.
+    """
+    store, session_id = _seed_session(recorded, tmp_path, [80])
+    buster = anr_watcher.AnrBuster(store=store)
+    delivered = iter([True, False])
+    monkeypatch.setattr(store, "signal_worker", lambda *_a, **_k: next(delivered))
+    monkeypatch.setattr(buster, "_wait_for_worker_exit", lambda *_a, **_k: False)
+
+    first = json.loads(buster.stop(session_id, json_mode=True))
+    second = json.loads(buster.stop(session_id, json_mode=True))
+
+    assert first["incomplete"] is True, first
+    assert (second["incomplete"], second["incomplete_reason"]) == (
+        True,
+        first["incomplete_reason"],
+    ), second

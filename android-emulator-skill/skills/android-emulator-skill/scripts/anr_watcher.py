@@ -119,6 +119,11 @@ STOP_DRAIN_SECONDS = 0.5
 SINCE_TIMEOUT_SECONDS = 60
 # Grace for a `--watch` stream that hit end-of-file to report its exit status.
 STREAM_EXIT_TIMEOUT_SECONDS = 5
+# How long a reader whose stream broke gives adb to finish, and to say why on
+# stderr, before it reads what adb said: the session worker's wait, now
+# --watch's too (an error written 0.1 s after the bad bytes was exit 1 in
+# --watch and 3 in a session; third review of PR #42).
+STREAM_END_GRACE_SECONDS = 0.5
 # How much of what adb wrote on stderr is read back, from its start and from
 # its end: adb's error may come first and chatter follow it, and a tail alone
 # lost it (second review of PR #42). A stream's stderr is a file of its own.
@@ -747,7 +752,7 @@ class AnrWatcher:
                                 # an open stream to end, as the session worker
                                 # reads it (second review of PR #42).
                                 returncode, said = _exit_and_stderr(
-                                    self._process, adb_stderr, timeout=0
+                                    self._process, adb_stderr, timeout=STREAM_END_GRACE_SECONDS
                                 )
                                 _raise_device_error_said(returncode, said, self.serial)
                                 raise _with_adb_exit(error, returncode, said) from None
@@ -1186,6 +1191,21 @@ class AnrBuster:
         """
         status = self.store.load_meta(session_id).status
         delivered = self.store.signal_worker(session_id, signal.SIGTERM)
+        if not delivered:
+            held = self.store.load_meta(session_id)
+            unresolved = held.extras.get("worker_unresolved")
+            if unresolved and held.pid and _alive(held.pid):
+                # Not shown to be the worker, nor shown not to be, and alive:
+                # it may be the worker, still recording. Answering with a
+                # summary forgot its pid and lost what it went on to find
+                # (third review of PR #42). Nothing is saved; the pid is kept.
+                cli.fail(
+                    f"Could not stop session {session_id}'s worker: {unresolved}, and pid "
+                    f"{held.pid} is still alive, so it may be the worker, still recording. "
+                    f"Nothing was signalled, and no summary is saved.",
+                    f"Run --stop {session_id} again; if it repeats, check that `ps` works on "
+                    f"this host, or end pid {held.pid} yourself once you know it is the worker.",
+                )
         finished = True
         if delivered:
             finished = self._wait_for_worker_exit(
@@ -1310,6 +1330,15 @@ class AnrBuster:
             )
             if applies
         ]
+        # A --stop repeated on a stopped session keeps what the first saved as
+        # missing: the worker it waited on has exited since, which does not
+        # bring back what it may not have written (third review of PR #42).
+        earlier = self.store.load_summary(session_id) if status == "stopped" else None
+        if earlier is not None and earlier.incomplete and earlier.incomplete_reason:
+            reasons = [
+                earlier.incomplete_reason,
+                *(reason for reason in reasons if reason not in earlier.incomplete_reason),
+            ]
         if reasons:
             summary = replace(summary, incomplete=True, incomplete_reason="; ".join(reasons))
         # Persist the complete summary BEFORE any capping. Top-N is a display
@@ -1678,9 +1707,14 @@ class AnrBuster:
                                         failure["error"] = _adb_exit_added(
                                             failure["error"], returncode, said
                                         )
-                                elif not stop_flag["value"]:
+                                elif decide:
                                     # Ended by itself, whole: a live read ends
                                     # only when it is stopped (_ended_by_itself).
+                                    # Decided on ``decide``, read once: a stop
+                                    # that came once the decision had begun,
+                                    # said so in the meta, skipped it, and the
+                                    # session read complete (third review of
+                                    # PR #42).
                                     returncode, said = _exit_and_stderr(proc, adb_stderr)
                                     note("stream_died", exit_code=returncode, attempt=attempt)
                                     ended = _ended_by_itself(
@@ -1706,9 +1740,19 @@ class AnrBuster:
 
                 with contextlib.suppress(OSError):
                     os.fsync(out_handle.fileno())
+        except Exception as error:
+            # Anything unforeseen ends the session as a failure of its own,
+            # persisted before the worker exits: it left the session
+            # `running` with nothing said, so --start and --stop read a worker
+            # that had died as one still at work (third review of PR #42).
+            counters.setdefault("stream_failure", _worker_failed(error))
+            crashed = True
+            raise
         finally:
             if proc is not None:
                 _reap(proc)
+            # Never left saying it is deciding: it no longer is.
+            counters.pop("deciding", None)
             # Counters first: marking the session crashed forgets this
             # worker's pid, and a --stop then reads the counters at once.
             self.store.persist_worker_counters(session_id, counters)
@@ -1840,7 +1884,7 @@ class AnrBuster:
                 records = read(STREAM_POLL_SECONDS)
                 if records is None:
                     with contextlib.suppress(subprocess.TimeoutExpired):
-                        proc.wait(timeout=0.5)
+                        proc.wait(timeout=STREAM_END_GRACE_SECONDS)
                     return proc.poll()
                 if records:
                     last_record_at = time.monotonic()
@@ -2134,6 +2178,27 @@ def _unfiltered(args: dict) -> bool:
     without it do not say, and what the session dropped stays unknown.
     """
     return "package" in args and not args["package"]
+
+
+def _worker_failed(error: Exception) -> dict:
+    """The stream failure of a worker that met an error nothing foresaw."""
+    return {
+        "error": f"the worker failed: {type(error).__name__}: {error}",
+        "truncated": False,
+        "what": "was abandoned by its worker",
+        "device": {"state": "not asked"},
+    }
+
+
+def _alive(pid: int) -> bool:
+    """Whether host process ``pid`` exists (one that may not be signalled counts)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _unstartable(error: OSError) -> dict:
