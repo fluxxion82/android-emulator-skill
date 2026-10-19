@@ -325,6 +325,7 @@ def test_the_watchdog_guard_accepts_a_bounded_unbuffered_read():
 DIRECT_SUBPROCESS_MODULES: frozenset[str] = frozenset(
     {
         "anr_watcher.py",  # streams `adb logcat` in a detached worker
+        "common/anr_sessions.py",  # asks the host's `ps` who holds a worker pid, not adb
         "common/sdk_tools.py",  # runs SDK binaries (emulator, avdmanager), not adb
         "emulator_boot.py",  # launches the emulator binary detached
         "emulator_create.py",  # avdmanager / sdkmanager

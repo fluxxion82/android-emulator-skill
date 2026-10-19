@@ -837,7 +837,7 @@ def transform_screenshot_coords(
 
 
 def get_system_server_pid(
-    serial: str | None = None, *, not_one_of: Iterable[str] = ()
+    serial: str | None = None, *, not_one_of: Iterable[str] = (), timeout: int | None = None
 ) -> str | None:
     """system_server's pid, or None when the device does not name exactly one.
 
@@ -852,6 +852,9 @@ def get_system_server_pid(
         not_one_of: Pids already known to be other processes (the app's own,
             from ``pidof <package>``). A pid is one process, so an answer naming
             one of these is not system_server's, and None is returned.
+        timeout: Seconds to allow the call; adb_exec's default when None. The
+            ANR session worker asks with a short bound, because --stop waits
+            for a call under way.
 
     Returns:
         The pid, or None when ``pidof`` fails or names none, several, or one of
@@ -859,8 +862,9 @@ def get_system_server_pid(
 
     Raises:
         adb_exec.DeviceError: The device could not be reached.
+        adb_exec.AdbTimeoutError: The call took longer than ``timeout``.
     """
-    result = run_adb("shell", serial, "pidof", "system_server")
+    result = run_adb("shell", serial, "pidof", "system_server", timeout=timeout)
     pids = result.stdout.split() if result.ok else []
     if len(pids) != 1 or not pids[0].isdigit() or pids[0] in set(not_one_of):
         return None
@@ -888,17 +892,29 @@ def parse_package_uids(output: str, package: str) -> frozenset[int] | None:
     return None
 
 
-def get_package_uids(serial: str | None, package: str) -> frozenset[int] | None:
+def get_package_uids(
+    serial: str | None, package: str, *, timeout: int | None = None
+) -> frozenset[int] | None:
     """The package's uids (one per user it is installed for), asked of the device.
 
-    One bounded adb call. Returns None when the device does not name the
-    package (not installed, or the command failed).
+    One bounded adb call -- ``timeout`` seconds, adb_exec's default when None.
+    Returns None when the device does not name the package (not installed, or
+    the command failed).
 
     Raises:
         adb_exec.DeviceError: The device could not be reached.
+        adb_exec.AdbTimeoutError: The call took longer than ``timeout``.
     """
     result = run_adb(
-        "shell", serial, "cmd", "package", "list", "packages", "-U", quote_for_device_shell(package)
+        "shell",
+        serial,
+        "cmd",
+        "package",
+        "list",
+        "packages",
+        "-U",
+        quote_for_device_shell(package),
+        timeout=timeout,
     )
     return parse_package_uids(result.stdout, package) if result.ok else None
 

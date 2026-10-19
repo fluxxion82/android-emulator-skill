@@ -40,11 +40,13 @@ import json
 import os
 import select
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import NoReturn
@@ -54,11 +56,22 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-from common import cli, logcat  # noqa: E402
-from common.adb_exec import AdbError, classify_device_error, run_adb  # noqa: E402
+from common import cli, log_lifecycle, logcat  # noqa: E402
+from common.adb_exec import (  # noqa: E402
+    AdbCommandError,
+    AdbError,
+    DeviceError,
+    DeviceNotFoundError,
+    DeviceOfflineError,
+    classify_device_error,
+    run_adb,
+    run_argv,
+)
 from common.anr_pipeline import (  # noqa: E402
+    VERIFICATION_UNKNOWN,
     AnrRecordAssembler,
     build_normalised_event,
+    cluster_to_json,
     compress_to_budget,
     diff_sessions,
     event_to_jsonl,
@@ -66,12 +79,14 @@ from common.anr_pipeline import (  # noqa: E402
     format_diff,
     format_l0,
     format_l2,
-    parse_process_age,
-    parse_start_proc,
     summary_to_json,
 )
-from common.anr_sessions import SessionStore  # noqa: E402
-from common.device_utils import quote_for_device_shell, resolve_device_identifier  # noqa: E402
+from common.anr_sessions import WORKER_TOKEN_FLAG, SessionStore  # noqa: E402
+from common.device_utils import (  # noqa: E402
+    get_package_uids,
+    get_system_server_pid,
+    resolve_device_identifier,
+)
 from common.env_config import env_int  # noqa: E402
 
 # === CONSTANTS ===
@@ -84,8 +99,8 @@ DEFAULT_MIN_FRAMES = 30
 DEFAULT_MAX_STREAM_RESTARTS = 3
 # Backoff between restart attempts. Short — logcat usually recovers fast.
 RESTART_BACKOFF_SECONDS = 2.0
-# How long the worker waits for a line before treating the stream as quiet:
-# an ANR record still open is then complete, and the events file is synced.
+# How long a reader waits for a record before treating the stream as quiet:
+# a held WindowManager report's quiet is counted, and the events file is synced.
 STREAM_POLL_SECONDS = 0.25
 # On a stop, how long the worker keeps reading what the stream has already
 # delivered before it closes the session.
@@ -95,16 +110,19 @@ STOP_DRAIN_SECONDS = 0.5
 SINCE_TIMEOUT_SECONDS = 60
 # Grace for a `--watch` stream that hit end-of-file to report its exit status.
 STREAM_EXIT_TIMEOUT_SECONDS = 5
-# Bound on the one device call the worker makes to name a janking pid. Short,
-# because --stop waits for it: a 10 s lookup outlasted the stop's wait and the
-# summary was saved before the worker had written (review of PR #26).
-PS_TIMEOUT = 3
-# A process's age (ELAPSED) is in whole seconds; this much slack, plus the
-# lookup's own measured latency, keeps a just-started owner from being refused.
-_AGE_SLACK_SECONDS = 1.0
+# Bound on each question the worker puts to the device while it reads: which
+# pid system_server is, and which uids a package has (see _ProcessNames).
+# Short, because --stop waits for a lookup under way: a 10 s lookup outlasted
+# the stop's wait and the summary was saved before the worker had written
+# (review of PR #26).
+LOOKUP_TIMEOUT_SECONDS = 3
 # How long --stop waits for the worker to finish before saving the summary: a
 # lookup already under way, the stop drain, and a margin to write and exit.
-WORKER_EXIT_TIMEOUT_SECONDS = PS_TIMEOUT + STOP_DRAIN_SECONDS + 2.0
+WORKER_EXIT_TIMEOUT_SECONDS = LOOKUP_TIMEOUT_SECONDS + STOP_DRAIN_SECONDS + 2.0
+# Bound on `adb get-state`, asked before any logcat read starts (see
+# _require_device). The adb server answers it from its own table; the margin
+# is for a server that has to start first.
+GET_STATE_TIMEOUT_SECONDS = 10
 
 _LOGCAT_REMEDY = (
     "Check the device is connected (`adb devices`) and, with more than one attached, "
@@ -131,8 +149,8 @@ def matches_package(event: dict, package: str) -> bool:
     Applied post-parse so ANR/jank events from system tags (ActivityManager,
     Choreographer) still flow through the pipeline; ``--package`` narrows the
     final output rather than the logcat filter. Matches against the ANR package,
-    the component, the process name the session worker found for the line's pid
-    (``app`` -- a jank line names no package, so without it ``--package``
+    the component, the process name the session worker found for the record's
+    pid (``app`` -- a jank record names no package, so without it ``--package``
     dropped every jank event), and the tag's app-name suffix.
     """
     needle = package.lower()
@@ -153,48 +171,95 @@ def _raise_logcat_failure(returncode: int, stderr: str, serial: str | None) -> N
     adb's own words decide the type, exactly as ``run_adb`` would have typed
     them: a device that is not there, offline or unauthorized is a device error
     (exit 3 at the CLI boundary); anything else is a failure naming the command.
+
+    Classified as adb wrote it, line by line. adb's own errors are recognised
+    only at the start of a line, so flattening first let anything adb wrote
+    before one -- its daemon starting, "- waiting for device -" -- push it off
+    the start of the one line left: exit 1 where run_adb, reading the same
+    text, says exit 3 (B7). Flattened only to be shown.
     """
-    detail = " ".join(stderr.split())
-    device_error = classify_device_error(detail, serial)
+    device_error = classify_device_error(stderr, serial)
     if device_error is not None:
         raise device_error
+    detail = " ".join(stderr.split())
     said = f": {detail}" if detail else ", and said nothing on stderr."
     cli.fail(f"`adb logcat` exited {returncode}{said}", _LOGCAT_REMEDY)
+
+
+def _require_device(serial: str | None) -> None:
+    """Refuse before any logcat read starts when adb has no device to give it (B4).
+
+    `adb logcat` does not fail when its device is not there: it writes "-
+    waiting for device -" and waits (recorded: adb_waiting_for_device),
+    with -d as well. With no --serial nothing was asked first, so `--watch
+    --duration N` exited 0 having printed nothing -- a quiet device -- and
+    `--start` started a worker that would wait forever. `adb get-state` asks
+    the adb server the same question and is answered at once (recorded:
+    adb_get_state, adb_device_not_found). It is answered for the device
+    logcat will go to, $ANDROID_SERIAL and all.
+
+    Raises:
+        DeviceError: adb names no available device (exit 3), or several
+            (MultipleDevicesError, exit 1).
+        DeviceOfflineError: adb names the device in a state other than
+            ``device`` -- logcat would wait for it too.
+        AdbError: adb could not be run, or did not answer in time.
+    """
+    result = run_adb("get-state", serial, timeout=GET_STATE_TIMEOUT_SECONDS, check=True)
+    state = result.stdout.strip()
+    if state != "device":
+        remedy = "Wait for the device to finish booting or reconnect it, then retry."
+        raise DeviceOfflineError(
+            f"adb reports the device as {state or 'nothing'!r}, not 'device', so a logcat "
+            f"read would wait for it rather than start. {remedy}",
+            remedy=remedy,
+        )
 
 
 # === STREAM READING ===
 
 
-class _FdLines:
-    """Complete lines from a child's stdout, read straight off its descriptor.
+class _FdRecords:
+    """logd's records (``logcat -B``) from a child's stdout, read straight off its descriptor.
 
-    N16: the worker select()ed the fd, then readline()d the file object.
-    readline() reads ahead into Python's buffer, so a burst came back as one
-    line with the rest parked in that buffer and the fd empty: select() then
-    reported nothing to read, and the parked lines waited for the next burst --
-    or, when --stop came first, were never read (four lines written, one kept).
-    ``os.read`` takes exactly what the fd holds, so what select() calls
-    readable is what is read, and nothing is ever parked anywhere select()
-    cannot see except a partial line, which is not yet a line.
+    Records, not text: a tag is the app's to choose and logcat prints it
+    verbatim, so in text one app's record could print a whole line headed
+    with system_server's pid and tag (recorded: logcat_tag_injection) -- an
+    ANR, a duplicate verdict, a ``Start proc``, all "system_server's". A
+    record carries the pid logd took from the writer's socket, which no tag
+    or message can forge. Decoding is ``common.logcat``'s (``parse_records``,
+    W3-L): this class only finds where each record ends.
 
-    Both live readers use it -- the session worker and ``--watch`` -- because
-    "the stream has gone quiet" is what completes an ANR record, and a blocking
-    readline() can never say so (review of PR #26).
+    N16: the worker select()ed the fd, then readline()d the file object, and
+    readline() read ahead into a buffer select() cannot see -- lines parked
+    there until the next burst, or lost at a stop. ``os.read`` takes exactly
+    what the fd holds, so what select() calls readable is what is read, and
+    nothing waits anywhere select() cannot see except a partial record, which
+    is not yet a record. Both live readers use it -- the session worker and
+    ``--watch`` -- because "the stream has gone quiet" is what lets a held
+    WindowManager report out, and a blocking read can never say so.
     """
 
     _CHUNK = 65536
+    _SIZES = struct.Struct("<HH")
 
     def __init__(self, stream) -> None:
         self._fd = stream.fileno()
-        self._partial = b""
+        self._pending = b""
+        # Bytes of the stream already handed over as records: where the
+        # pending ones start, for an error to say where the stream broke.
+        self._consumed = 0
 
-    def read(self, timeout: float) -> list[str] | None:
-        """The complete lines that arrive within ``timeout`` seconds.
+    def read(self, timeout: float) -> list[logcat.LogRecord] | None:
+        """The whole records that arrive within ``timeout`` seconds.
 
         Returns:
-            The lines, without their newlines; ``[]`` when no complete line
-            arrived in time (the stream is quiet); ``None`` at end of stream,
-            after a final unterminated line has been returned on its own.
+            The records; ``[]`` when no whole record arrived in time (the
+            stream is quiet); ``None`` at a clean end of stream.
+
+        Raises:
+            logcat.LogFramingError: The bytes are not logd's framing, or the
+                stream ended inside a record (``truncated``).
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -206,130 +271,217 @@ class _FdLines:
                 return []
             chunk = os.read(self._fd, self._CHUNK)
             if not chunk:
-                if self._partial:
-                    tail, self._partial = self._partial, b""
-                    return [_decode_line(tail)]
+                if self._pending:
+                    # Its sizes were checked as they arrived, so what is left
+                    # is the start of a record the stream never finished. The
+                    # error is its account; it is no longer pending.
+                    self._pending = b""
+                    raise logcat.LogFramingError(
+                        "the stream ended inside a record", offset=self._consumed, truncated=True
+                    )
                 return None
-            *complete, self._partial = (self._partial + chunk).split(b"\n")
-            if complete:
-                return [_decode_line(line) for line in complete]
+            self._pending += chunk
+            records = self._whole_records()
+            if records:
+                return records
 
+    @property
+    def partial(self) -> bool:
+        """Whether part of a record has arrived and the rest has not.
 
-def _decode_line(raw: bytes) -> str:
-    # Splitting on b"\n" before decoding is safe: in UTF-8 that byte is never
-    # part of a multi-byte character.
-    return raw.decode("utf-8", errors="replace").rstrip("\r")
+        A reader that stops an open stream never reads its end, so it asks
+        this instead: what is pending then is a record the stop cut.
+        """
+        return bool(self._pending)
+
+    def _whole_records(self) -> list[logcat.LogRecord]:
+        """Decode and remove every whole record at the front of what has arrived."""
+        end = 0
+        while len(self._pending) - end >= self._SIZES.size:
+            length, header = self._SIZES.unpack_from(self._pending, end)
+            if not (
+                logcat.MIN_ENTRY_HEADER <= header <= logcat.MAX_ENTRY_HEADER
+                and length <= logcat.MAX_ENTRY_PAYLOAD
+            ):
+                # Not logd's framing: let its reader refuse it, in its words.
+                logcat.parse_records(self._pending[end:])
+            if len(self._pending) - end < header + length:
+                break
+            end += header + length
+        whole, self._pending = self._pending[:end], self._pending[end:]
+        self._consumed += end
+        return logcat.parse_records(whole) if whole else []
 
 
 class _ProcessNames:
-    """pid -> process name, for the lines that name no process: jank above all.
+    """pid -> process name, for the records that name no process: jank above all.
 
-    A Choreographer line says only its pid, and a pid does not outlive a
+    A Choreographer record says only its pid, and a pid does not outlive a
     restart, so jank keyed by pid read as "1 resolved, 1 new, regression"
-    across one (review of PR #26). A pid is also RECYCLED, so a name counts
-    only with evidence that its owner already existed when the line was READ.
+    across one (review of PR #26). The one record that names a process
+    together with its pid is system_server's ``Start proc <pid>:<name>/<uid>``,
+    and a pid is named ONLY from such a record seen earlier in the same
+    stream. The device is never asked who holds a pid now: that answer (``ps
+    ... ELAPSED``) was judged against when a line was READ, and a line
+    buffered through a stall was read late, so a recycled pid's new owner was
+    accepted (B2).
 
-    That evidence is a comparison of DURATIONS on one clock -- the host's
-    ``time.monotonic()`` -- never of wall times. The reader is live (``-T 1``),
-    so each line's ``read_at`` is taken as it is read; the device reports its
-    owner's AGE (``ps -o PID,NAME,ELAPSED``), measured at ``lookup_at``. The
-    owner existed at the read if ``age >= (lookup_at - read_at) - slack``, slack
-    being 1 s (ELAPSED's whole seconds) plus the call's own measured latency.
-    Wall-clock comparison got DST fall-back, clock steps and the year wrong
-    (review of PR #26, round three); none of those can reach a monotonic
-    duration, which is why no test here builds a wall clock. Two sources:
+    The sentences are read by ``common.log_lifecycle``, the reading
+    ``log_monitor --app`` uses too (B1 and PR #34's review), from logd's
+    records: written by system_server -- the record's pid, logd's, against
+    system_server's pid asked of the device once, when the first sentence
+    arrives (unknown, none counts) -- the exact opening of the message, and,
+    before a name is given, a process that is exactly a package, running
+    under one of its uids (asked once per package, when a record first needs
+    the name; unknown, the pid stays unnamed). A private process
+    (``<package>:<name>``) is therefore never named. A name ends where
+    system_server says the process did (``Killing``, ``has died``), and
+    :meth:`reset` forgets every one when a stream (re)starts: a pid can change
+    hands in the gap, and ``-T 1`` does not replay the new owner's ``Start
+    proc``.
 
-    1. ActivityManager's ``Start proc <pid>:<name>/`` lines in the stream itself
-       (:meth:`observe`): the owner was born when that line was read.
-    2. One bounded device call per pid still unknown, only when ``ask_device``
-       (the session worker's resolver, which has the serial) and while
-       ``may_ask()`` holds -- the worker stops asking once a stop is requested.
-
-    :meth:`reset` forgets every owner: the worker calls it whenever a stream
-    (re)starts, because a pid can change hands in the gap and ``-T 1`` does
-    not replay the new owner's ``Start proc``. A line with no owner that
-    predates it stays unnamed: keyed by pid, identity "pid".
+    So only a process STARTED while the session ran is ever named: one
+    already running when it began -- an app warm in the background -- is
+    keyed by pid, identity "pid", and dropped under ``--package``. The pids
+    left unnamed are listed in the summary (``unnamed_pids``).
     """
 
     def __init__(
         self,
-        serial: str | None,
-        *,
-        ask_device: bool = True,
-        may_ask: Callable[[], bool] = lambda: True,
-        clock: Callable[[], float] = time.monotonic,
+        system_server_pid: Callable[[], str | None] = lambda: None,
+        package_uids: Callable[[str], Iterable[int] | None] = lambda _package: None,
     ) -> None:
-        self._serial = serial
-        self._ask_device = ask_device
-        self._may_ask = may_ask
-        self._clock = clock
-        # pid -> (name, latest monotonic time it can have been born, slack),
-        # or None when the device said nothing holds it.
-        self._owners: dict[int, tuple[str, float, float] | None] = {}
+        """Build a resolver over the device's answers to two questions.
+
+        Args:
+            system_server_pid: Asks the device for system_server's pid; None
+                when it cannot say. The default knows nothing, so nothing is
+                named.
+            package_uids: Asks the device for a package's uids; None when it
+                cannot say. Asked at most once per package for the session.
+        """
+        self._ask_system_server = system_server_pid
+        self._answers: dict[str, Iterable[int] | None] = {}
+
+        def known_uids(package: str) -> Iterable[int] | None:
+            if package not in self._answers:
+                self._answers[package] = package_uids(package)
+            return self._answers[package]
+
+        self._package_uids = known_uids
+        self._reader = log_lifecycle.LifecycleReader(system_server_pid, known_uids)
+        self._owners: dict[int, log_lifecycle.Sentence] = {}
         self._unnamed: set[int] = set()
 
     @property
-    def unnamed(self) -> int:
-        """How many pids had at least one line no owner could be found for."""
-        return len(self._unnamed)
+    def unnamed_pids(self) -> list[int]:
+        """The pids that had at least one record no owner could be found for."""
+        return sorted(self._unnamed)
+
+    def system_server_pid(self) -> str | None:
+        """system_server's pid as this stream asked it (once): for the ANR assembler too."""
+        return self._reader.system_server()
 
     def reset(self) -> None:
-        """Forget every owner (a new stream: pids may have changed hands)."""
+        """A new stream: forget every owner, and who system_server was."""
         self._owners.clear()
+        self._reader = log_lifecycle.LifecycleReader(self._ask_system_server, self._package_uids)
 
-    def observe(self, line: str, read_at: float) -> None:
-        """Learn a pid's owner from a ``Start proc`` line read at ``read_at``."""
-        started = parse_start_proc(line)
-        if started is not None:
-            pid, name = started
-            self._owners[pid] = (name, read_at, _AGE_SLACK_SECONDS)
+    def observe(self, record: logcat.LogRecord) -> None:
+        """Learn -- or forget -- a pid's owner from system_server's sentence about it."""
+        _writer, sentence = self._reader.read(record)
+        if sentence is None:
+            return
+        if sentence.what == log_lifecycle.STARTED:
+            self._owners[int(sentence.pid)] = sentence
+        else:
+            self._owners.pop(int(sentence.pid), None)
 
-    def name_of(self, pid: int, read_at: float) -> str | None:
-        """The name of the process that held ``pid`` when a line was read.
-
-        Args:
-            pid: The logcat pid column.
-            read_at: ``time.monotonic()`` when the line was read off the stream.
-        """
-        if pid not in self._owners:
-            if not (self._ask_device and self._may_ask()):
-                self._unnamed.add(pid)
-                return None
-            self._owners[pid] = self._ask(pid)
-        owner = self._owners[pid]
-        if owner is not None:
-            name, born_by, slack = owner
-            if born_by <= read_at + slack:
-                return name
+    def name_of(self, pid: int) -> str | None:
+        """The name of the process holding ``pid``, as this stream has shown it."""
+        owner = self._owners.get(pid)
+        if owner is not None and self._reader.is_package(owner):
+            return owner.name
         self._unnamed.add(pid)
         return None
 
-    def _ask(self, pid: int) -> tuple[str, float, float] | None:
-        asked_at = self._clock()
+
+def _device_lookups(
+    serial: str | None, may_ask: Callable[[], bool]
+) -> tuple[Callable[[], str | None], Callable[[str], frozenset[int] | None]]:
+    """The two questions a reader puts to the device, bounded and failing closed.
+
+    system_server's pid (for :class:`_ProcessNames` and for authenticating ANR
+    reports) and a package's uids. Each is bounded by
+    ``LOOKUP_TIMEOUT_SECONDS`` and asked only while ``may_ask()`` holds -- the
+    worker stops asking once a stop is requested. A failure is an unknown
+    answer, not an error: in the detached worker there is no caller to report
+    to, and a session must not end because a process could not be NAMED. The
+    cost is disclosed downstream: unnamed pids and unauthenticated ANR reports
+    are listed in the summary.
+    """
+
+    def system_server_pid() -> str | None:
+        if not may_ask():
+            return None
         try:
-            result = run_adb(
-                "shell",
-                self._serial,
-                "ps",
-                "-o",
-                "PID,NAME,ELAPSED",
-                "-p",
-                quote_for_device_shell(str(pid)),
-                timeout=PS_TIMEOUT,
-            )
+            return get_system_server_pid(serial, timeout=LOOKUP_TIMEOUT_SECONDS)
         except AdbError:
-            # Deliberately not raised: this runs in the detached worker, which
-            # has no caller to report to, and a session must not end because a
-            # process could not be NAMED. The cost is visible downstream -- the
-            # event is keyed by pid and marked identity "pid" -- and counted in
-            # the session's `unnamed_pids`.
             return None
-        lookup_at = self._clock()
-        owner = parse_process_age(result.stdout, pid)
-        if owner is None:
+
+    def package_uids(package: str) -> frozenset[int] | None:
+        if not may_ask():
             return None
-        born_by = lookup_at - owner.age.total_seconds()
-        return owner.name, born_by, _AGE_SLACK_SECONDS + (lookup_at - asked_at)
+        try:
+            return get_package_uids(serial, package, timeout=LOOKUP_TIMEOUT_SECONDS)
+        except AdbError:
+            return None
+
+    return system_server_pid, package_uids
+
+
+class _CaptureBoundary:
+    """What a session has consumed, so a restarted stream does not read it twice (B5).
+
+    A live stream starts with ``logcat -T 1``: the newest record already
+    buffered, then what follows (``-B -T 1`` composes, measured by W3-L).
+    ``-T 0`` would start with nothing, but logcat refuses it ("-T 0 invalid,
+    setting to 1", recorded: logcat_tail_zero). So:
+
+    - the FIRST stream's replayed record is read like any other. It may
+      predate the session -- one record at most -- but it may as well be the
+      session's first live one: after ``logcat -c`` there is nothing to
+      replay, and setting the first record aside lost a recorded ANR outright
+      (review of PR #34). A missed incident is worse than one old one;
+    - a RESTARTED stream's leading records that this session already consumed
+      are its replay, and are skipped -- a record is compared whole, writer,
+      time and text. One it never consumed was logged while no stream was up,
+      and is read. Nothing is compared by timestamp alone, so no clock -- a
+      year turning over, a clock stepped back -- can move the line.
+    """
+
+    # How many of the latest consumed records a restart's replay is held
+    # against. The replay is one record, the newest consumed.
+    REMEMBERED = 256
+
+    def __init__(self) -> None:
+        self._consumed: deque[logcat.LogRecord] = deque(maxlen=self.REMEMBERED)
+        self._skipping = False
+        self._streams = 0
+
+    def new_stream(self) -> None:
+        """A stream (re)starts: on a restart, its leading replay is skipped."""
+        self._streams += 1
+        self._skipping = self._streams > 1
+
+    def admit(self, record: logcat.LogRecord) -> bool:
+        """Whether ``record`` is the session's to read, rather than a replay of one it read."""
+        if self._skipping:
+            if record in self._consumed:
+                return False
+            self._skipping = False
+        self._consumed.append(record)
+        return True
 
 
 # === LEGACY WATCHER ===
@@ -348,12 +500,15 @@ class AnrWatcher:
         self.events: list[dict] = []
         self.interrupted = False
         self._process: subprocess.Popen | None = None
-        # One per watcher: an ANR record can span lines, so whether a line is
-        # an event depends on the lines before it (D5).
-        self._assembler = AnrRecordAssembler()
+        # One per watcher: whether a WindowManager report is an ANR of its own
+        # depends on the records around it (D5). It authenticates ANR reports
+        # against system_server's pid, asked of the device once, when the
+        # first report arrives.
+        system_server_pid, _ = _device_lookups(serial, may_ask=lambda: True)
+        self._assembler = AnrRecordAssembler(system_server_pid)
 
     def build_logcat_command(self, since: str | None = None) -> list[str]:
-        """Build the ``adb logcat -v threadtime`` command (pure arg→command map).
+        """Build the ``adb logcat -B`` command (pure arg→command map).
 
         A live stream starts at the END of the device's buffer: ``-T 1``.
         Without it `adb logcat` first replays the whole ring buffer, and every
@@ -361,8 +516,15 @@ class AnrWatcher:
         after a run of provoked ANRs reported every one of them, and every jank
         line still buffered, as happening in its first tenth of a second -- 33
         events for one ANR. ``-T 1`` is logcat's own "from now": it prints the
-        single most recent line, then follows (measured). That one line
-        predates the stream; it is read like any other.
+        single most recent record, then follows (measured; ``-T 0`` is refused
+        and treated as 1, recorded: logcat_tail_zero). That one record may
+        predate the read and is read like the rest (``_CaptureBoundary``).
+
+        Records, not text (``-B``, ``common.logcat``): logcat prints a tag
+        verbatim, so in text an app's record could print a line headed with
+        system_server's pid -- a forged ANR, duplicate verdict or ``Start
+        proc`` (recorded: logcat_tag_injection). A record carries the pid logd
+        took from the writing socket. ``-B -T 1`` composes (measured by W3-L).
 
         Args:
             since: If set, a ``MM-DD HH:MM:SS.mmm`` timestamp for a historical
@@ -372,8 +534,8 @@ class AnrWatcher:
             Complete adb command list ready for subprocess.
         """
         if since is not None:
-            return logcat.build_logcat_command(self.serial, since=since)
-        return [*logcat.build_logcat_command(self.serial), "-T", "1"]
+            return logcat.build_logcat_command(self.serial, since=since, binary=True)
+        return logcat.build_logcat_command(self.serial, binary=True, tail=1)
 
     def watch(
         self,
@@ -387,6 +549,9 @@ class AnrWatcher:
             DeviceError: adb ended the stream because the device is not
                 available (exit 3 at the CLI boundary).
             cli.Failure: adb ended the stream with any other failure status.
+            logcat.LogFramingError: The stream was not logd's records, or
+                ended inside one by itself while the device is still there.
+                Cut by our own stop, the lost record is said on stderr instead.
         """
         cmd = self.build_logcat_command()
         if not json_mode:
@@ -401,11 +566,11 @@ class AnrWatcher:
         # fills. It is the only account of WHY a stream ended (X6).
         with tempfile.TemporaryFile() as adb_stderr:
             try:
-                # Bytes, unbuffered, read through _FdLines: the same reader as
-                # the session worker. A blocking readline() could not notice the
-                # stream going quiet, so a complete ANR record sat unprinted
-                # until the next line or the end of the stream (review of PR
-                # #26); and select() on a buffered pipe loses lines (N16).
+                # Bytes, unbuffered, read through _FdRecords: the same reader
+                # as the session worker. A blocking read could not notice the
+                # stream going quiet, so a held report sat unprinted until the
+                # next record or the end of the stream (review of PR #26); and
+                # select() on a buffered pipe loses what it buffers (N16).
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -413,34 +578,61 @@ class AnrWatcher:
                     stdin=subprocess.DEVNULL,
                     bufsize=0,
                 )
-                stream = _FdLines(self._process.stdout)
+                stream = _FdRecords(self._process.stdout)
                 # Polling with a timeout also makes --duration exact on a quiet
                 # device, which blocked in readline() before (A2).
                 deadline = time.monotonic() + duration_seconds if duration_seconds else None
-                last_line_at = time.monotonic()
+                last_record_at = time.monotonic()
+                cut: logcat.LogFramingError | None = None
                 try:
                     while not self.interrupted:
                         if deadline is not None and time.monotonic() >= deadline:
                             stopped_by_us = True
                             break
-                        lines = stream.read(timeout=STREAM_POLL_SECONDS)
-                        if lines is None:
+                        try:
+                            records = stream.read(timeout=STREAM_POLL_SECONDS)
+                        except logcat.LogFramingError as error:
+                            if not error.truncated:
+                                # Not logd's records at all: refused.
+                                raise
+                            cut = error
                             break
-                        if not lines:
-                            self._flush(package, json_mode, time.monotonic() - last_line_at)
+                        if records is None:
+                            break
+                        if not records:
+                            self._flush(package, json_mode, time.monotonic() - last_record_at)
                             continue
-                        last_line_at = time.monotonic()
-                        for line in lines:
-                            self._handle_line(line, package, json_mode)
+                        last_record_at = time.monotonic()
+                        for record in records:
+                            self._handle_record(record, package, json_mode)
                 finally:
                     # Whatever is still held when the stream ends -- or breaks
                     # -- was seen, and goes out before anything else is said.
                     self._close(package, json_mode)
+                    self._disclose_unverified()
 
                 # A deadline and Ctrl-C end the stream themselves, so how adb
-                # exited then says nothing.
-                if not (stopped_by_us or self.interrupted):
-                    self._check_stream_exit(adb_stderr)
+                # exited then says nothing -- and a record cut by them is lost,
+                # and said (common.logcat's rule for a truncated record).
+                if stopped_by_us or self.interrupted:
+                    # Cut at the stream's end, or still arriving when we stopped
+                    # an open stream -- whose end we never read.
+                    if cut is not None or stream.partial:
+                        print(
+                            "warning: the watch was stopped while a record was arriving; "
+                            "that record is not shown.",
+                            file=sys.stderr,
+                        )
+                    return True
+                if cut is not None:
+                    # Ended inside a record by itself: if the device went, that
+                    # is the answer (exit 3); otherwise the read is refused for
+                    # its framing, with how adb exited added -- asked before the
+                    # exit status is judged, which would otherwise answer first
+                    # and skip both (Codex review of PR #34).
+                    _require_device(self.serial)
+                    raise _with_adb_exit(cut, *self._stream_exit(adb_stderr))
+                self._check_stream_exit(adb_stderr)
                 return True
             # No `except Exception` here any more: it printed and returned False,
             # so a missing adb or a vanished device exited 1 with no remedy and,
@@ -454,6 +646,22 @@ class AnrWatcher:
                 if self._process and self._process.stdout:
                     self._process.stdout.close()
 
+    def _stream_exit(self, adb_stderr) -> tuple[int | None, str]:
+        """``(adb's exit status, its stderr)`` once the stream has ended on its own.
+
+        The status is None when there is none to judge: no process, or its
+        stdout closed but it has not exited (the finally in watch() ends it).
+        """
+        process = self._process
+        if process is None:
+            return None, ""
+        try:
+            returncode = process.wait(timeout=STREAM_EXIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return None, ""
+        adb_stderr.seek(0)
+        return returncode, adb_stderr.read().decode("utf-8", errors="replace")
+
     def _check_stream_exit(self, adb_stderr) -> None:
         """Raise when a stream that ended on its own was ended by a failure (X6).
 
@@ -461,21 +669,10 @@ class AnrWatcher:
         exited, so a device that was not there read as a device that had no
         ANRs: exit 0, "No ANR/jank events detected."
         """
-        process = self._process
-        if process is None:
-            return
-        try:
-            returncode = process.wait(timeout=STREAM_EXIT_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            # Its stdout closed but it has not exited: there is no status to
-            # judge, and the finally in watch() ends it.
-            return
+        returncode, stderr = self._stream_exit(adb_stderr)
         if not returncode:
             return
-        adb_stderr.seek(0)
-        _raise_logcat_failure(
-            returncode, adb_stderr.read().decode("utf-8", errors="replace"), self.serial
-        )
+        _raise_logcat_failure(returncode, stderr, self.serial)
 
     def show_since(
         self,
@@ -490,28 +687,46 @@ class AnrWatcher:
                 boundary).
             AdbCommandError: logcat exited with any other failure status.
             AdbTimeoutError: the dump took longer than ``SINCE_TIMEOUT_SECONDS``.
+            logcat.LogFramingError: The dump is not whole records -- a dump
+                never ends inside one, so a cut dump is incomplete: the device
+                is asked again (gone: exit 3), and otherwise the read refused.
         """
         since = _compute_start_timestamp(since_duration)
         if not json_mode:
             print(f"Showing ANR/jank since {since}", file=sys.stderr)
-        # Through run_adb, with check=True: a failed read is a typed failure,
-        # where it was an empty dump read as "no ANRs" at exit 0 (X6).
-        result = run_adb(
-            "logcat",
-            self.serial,
-            *logcat.logcat_args(since=since),
-            timeout=SINCE_TIMEOUT_SECONDS,
-            check=True,
-        )
-        for raw_line in result.stdout.splitlines():
-            self._handle_line(raw_line.rstrip(), package, json_mode)
+        # logd's records, as bytes, through run_argv: bounded, adb's failures
+        # typed. A failed read is a failure, where it was an empty dump read as
+        # "no ANRs" at exit 0 (X6).
+        command = self.build_logcat_command(since=since)
+        completed = run_argv(command, serial=self.serial, timeout=SINCE_TIMEOUT_SECONDS)
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace")
+        try:
+            records = logcat.parse_records(completed.stdout or b"")
+        except logcat.LogFramingError as error:
+            # Before the exit status, as --watch: a dump cut short asks whether
+            # the device went (exit 3), and is otherwise refused for its
+            # framing, with how adb exited added.
+            if error.truncated:
+                _require_device(self.serial)
+            raise _with_adb_exit(error, completed.returncode, detail) from None
+        if completed.returncode != 0:
+            raise AdbCommandError(
+                f"`{' '.join(command)}` exited {completed.returncode}: "
+                f"{detail.strip() or 'no output'}",
+                command=command,
+            )
+        for record in records:
+            self._handle_record(record, package, json_mode)
         self._close(package, json_mode)
+        self._disclose_unverified()
         return True
 
     def get_summary(self) -> str:
         """Return token-efficient summary of captured events."""
         total = len(self.events)
         if total == 0:
+            if self._assembler.unverified:
+                return f"No verified ANR/jank events. {self._unverified_sentence()}"
             return "No ANR/jank events detected."
         tags: dict[str, int] = {}
         for event in self.events:
@@ -533,12 +748,27 @@ class AnrWatcher:
 
     # === PRIVATE ===
 
-    def _handle_line(self, line: str, package: str | None, json_mode: bool) -> None:
-        for event in self._assembler.feed(line):
+    def _unverified_sentence(self) -> str:
+        count = self._assembler.unverified
+        plural = "s" if count != 1 else ""
+        return (
+            f"Unverified: {VERIFICATION_UNKNOWN} ({count} report record{plural} set aside, "
+            f"not counted)."
+        )
+
+    def _disclose_unverified(self) -> None:
+        """Say so when ANR reports were set aside unauthenticated: never a silent "no ANRs"."""
+        if self._assembler.unverified:
+            print(f"warning: {self._unverified_sentence()}", file=sys.stderr)
+
+    def _handle_record(
+        self, record: logcat.LogRecord, package: str | None, json_mode: bool
+    ) -> None:
+        for event in self._assembler.feed(record):
             self._emit(event, package, json_mode)
 
     def _flush(self, package: str | None, json_mode: bool, quiet_seconds: float) -> None:
-        """The stream is quiet: emit what quiet completes (an open ANR record)."""
+        """The stream is quiet: emit what quiet completes (a report nothing answered)."""
         for event in self._assembler.flush(quiet_seconds):
             self._emit(event, package, json_mode)
 
@@ -624,12 +854,19 @@ class AnrBuster:
         if aggregate_cap_mb > 0:
             self.store.prune_to_aggregate_cap(aggregate_cap_mb * 1024 * 1024)
         resolved_serial = self._resolve_serial(serial)
+        # Before the session exists: a worker started without a device waits
+        # in `adb logcat` forever, and the id it was given names nothing (B4).
+        _require_device(resolved_serial)
         meta = self.store.create({**args, "serial": resolved_serial})
+        # The token on the worker's command line is how --stop knows the
+        # process at the recorded pid is still this worker (anr_sessions).
         cmd = [
             sys.executable,
             __file__,
             "--worker-session-id",
             meta.session_id,
+            WORKER_TOKEN_FLAG,
+            meta.worker_token,
         ]
         # The detached worker survives parent exit. ``start_new_session=True``
         # calls setsid() so the process group is independent of the TTY.
@@ -659,12 +896,19 @@ class AnrBuster:
         """Signal worker, wait for it to finish, build summary, return formatted output.
 
         The summary is built only once the worker has exited, so it holds what
-        the worker wrote on its way out -- the held ANR record, the line it was
-        naming. If the worker outlives ``WORKER_EXIT_TIMEOUT_SECONDS`` the
+        the worker wrote on its way out -- a held WindowManager report, the
+        record it was naming. If the worker outlives ``WORKER_EXIT_TIMEOUT_SECONDS`` the
         summary is still saved, marked ``incomplete``, and stderr says so: it
         used to be saved after a fixed 2 s with zero events while the worker
-        was mid-lookup, and nothing said it was short (review of PR #26).
+        was mid-lookup, and nothing said it was short (review of PR #26). It
+        is marked so too when the worker crashed or vanished, the stream
+        broke, or ANR reports could not be authenticated (``incomplete_reason``).
+
+        The worker is signalled only once the process at its recorded pid is
+        shown to still be it (``SessionStore.signal_worker``); otherwise stderr
+        says "worker gone" and nothing is signalled.
         """
+        status = self.store.load_meta(session_id).status
         delivered = self.store.signal_worker(session_id, signal.SIGTERM)
         finished = True
         if delivered:
@@ -673,6 +917,13 @@ class AnrBuster:
             )
         meta = self.store.load_meta(session_id)
         line_counters = meta.extras.get("line_counters", {})
+        # Not signalled: the pid is no longer the worker's (anr_sessions).
+        gone = None if delivered else meta.extras.pop("worker_gone", None)
+        if gone:
+            print(
+                f"warning: worker gone for {session_id}: {gone}; nothing was signalled.",
+                file=sys.stderr,
+            )
 
         summary = self.store.build_summary(
             session_id,
@@ -680,20 +931,67 @@ class AnrBuster:
             total_lines=line_counters.get("total", 0),
             dropped_below_threshold=line_counters.get("dropped", 0),
         )
+        # What the worker could not see, carried into the summary itself: ANR
+        # reports it could not authenticate, and pids it could not name.
+        unverified = int(line_counters.get("unverified_anr_lines", 0))
+        unnamed = line_counters.get("unnamed_pids", [])
+        failure = line_counters.get("stream_failure")
+        summary = replace(
+            summary,
+            verification=VERIFICATION_UNKNOWN if unverified else None,
+            unverified_anr_lines=unverified,
+            unnamed_pids=sorted(unnamed) if isinstance(unnamed, list) else [],
+            cut_records=int(line_counters.get("cut_records", 0)),
+            stream_failure=failure.get("error") if isinstance(failure, dict) else None,
+        )
         if not finished:
-            summary = replace(summary, incomplete=True)
             print(
                 f"warning: the worker for {session_id} was still running "
                 f"{WORKER_EXIT_TIMEOUT_SECONDS:.1f}s after it was asked to stop; this "
                 f"summary is marked incomplete and may miss what it wrote after that.",
                 file=sys.stderr,
             )
+        # Every way this capture can be missing events, so --diff concludes
+        # nothing from what is absent (Codex review of PR #34: a broken or
+        # unauthenticated capture was compared as complete -- "improvement:
+        # 1 resolved").
+        reasons = [
+            reason
+            for reason, applies in (
+                (
+                    "saved before the session's worker finished, so events it wrote later "
+                    "are missing",
+                    not finished,
+                ),
+                (
+                    f"the worker ended without being stopped ({gone}), so what it saw last "
+                    f"is missing",
+                    bool(gone) and status == "running",
+                ),
+                (
+                    "the worker gave up on the stream before --stop (crashed), so nothing "
+                    "after that is in here",
+                    status == "crashed" and not isinstance(failure, dict),
+                ),
+                ("the stream broke", isinstance(failure, dict)),
+                (VERIFICATION_UNKNOWN, bool(unverified)),
+            )
+            if applies
+        ]
+        if reasons:
+            summary = replace(summary, incomplete=True, incomplete_reason="; ".join(reasons))
         # Persist the complete summary BEFORE any capping. Top-N is a display
         # concern; truncating first destroyed every cluster past N on disk, so
         # `--get-details --cluster 4` could never resolve and `--diff` compared
         # two truncated sets, reporting clusters as new or resolved purely
         # because they fell outside the cap.
         self.store.stop(session_id, summary)
+        if finished:
+            # It has exited: its pid is the OS's to reuse, and no later --stop
+            # may signal it.
+            self.store.forget_worker(session_id)
+        if isinstance(failure, dict):
+            _refuse_broken_stream(session_id, failure)
 
         # `top_n or default` treated both None (no flag) and 0 (--all, "no cap")
         # as "unset", so --all returned exactly the default it was meant to lift.
@@ -763,11 +1061,23 @@ class AnrBuster:
             events = [
                 e for e in self.store.read_events(session_id) if e.fingerprint == target.fingerprint
             ]
+            # The drill says what the summary says: a cluster of an incomplete
+            # session may be missing events (B6).
             if json_mode:
-                from common.anr_pipeline import cluster_to_json
-
-                return json.dumps(cluster_to_json(target), indent=2)
-            return format_cluster_detail(target, events)
+                return json.dumps(
+                    {
+                        **cluster_to_json(target),
+                        "incomplete": summary.incomplete,
+                        "incomplete_reason": summary.incomplete_reason,
+                    },
+                    indent=2,
+                )
+            return format_cluster_detail(
+                target,
+                events,
+                incomplete=summary.incomplete,
+                incomplete_reason=summary.incomplete_reason,
+            )
         if json_mode:
             return json.dumps(summary_to_json(summary), indent=2)
         return format_l2(summary)
@@ -842,16 +1152,27 @@ class AnrBuster:
 
     # === WORKER ===
 
-    def run_worker(self, session_id: str) -> int:
+    def run_worker(self, session_id: str, token: str | None = None) -> int:
         """Long-running worker entrypoint. Returns exit code.
 
-        Layout: claim meta → build ``adb logcat -v threadtime`` command → open
+        Layout: claim meta → build ``adb logcat -B -T 1`` command → open
         events.jsonl line-buffered → for each restart attempt, spawn logcat and
-        read lines until EOF or subprocess death. SIGTERM flushes and exits
+        read records until EOF or subprocess death. SIGTERM flushes and exits
         cleanly. EOF / subprocess death triggers a bounded restart loop
         (``ANDROID_EMU_ANR_MAX_RESTARTS``); on exhaustion the session is marked
         ``crashed`` rather than left in stale ``running`` state.
+
+        A stream that is not logd's records, or ends inside one by itself, is
+        not restarted (common.logcat's rule for a ``LogFramingError``): the
+        device is asked whether it is still there, the answer is kept in the
+        counters (``stream_failure``), the session is marked crashed, and
+        ``--stop`` refuses -- exit 3 for a device that went, 1 otherwise. A
+        record cut by our own stop is lost and counted (``cut_records``).
         """
+        if token is not None and token != self.store.load_meta(session_id).worker_token:
+            # Not the worker this session's parent started: claiming would
+            # hand --stop a process it cannot tell from the real one.
+            return 2
         meta = self.store.claim_worker(session_id, pid=os.getpid())
         args = meta.args
         min_frames = int(
@@ -871,12 +1192,19 @@ class AnrBuster:
             "matched": 0,
             "dropped": 0,
             "stream_restarts": 0,
-            "unnamed_pids": 0,
+            "unnamed_pids": [],
+            "unverified_anr_lines": 0,
+            "cut_records": 0,
         }
         stop_flag = {"value": False}
-        # One for the whole session: a name learned before a stream restart
-        # still holds after it.
-        process_names = _ProcessNames(serial, may_ask=lambda: not stop_flag["value"])
+        # One of each for the whole session. The resolver forgets its owners
+        # on every stream (re)start but keeps what it learned of packages; the
+        # boundary remembers what was consumed, which a restart's replay is
+        # held against.
+        process_names = _ProcessNames(
+            *_device_lookups(serial, may_ask=lambda: not stop_flag["value"])
+        )
+        boundary = _CaptureBoundary()
 
         def _on_sigterm(_signum, _frame):
             stop_flag["value"] = True
@@ -887,8 +1215,8 @@ class AnrBuster:
         cmd = AnrWatcher(serial=serial).build_logcat_command()
 
         def _spawn_logcat() -> subprocess.Popen:
-            # Bytes, unbuffered: the reader takes lines straight off the fd, so
-            # there is no Python buffer for a line to wait in (N16).
+            # Bytes, unbuffered: the reader takes records straight off the fd,
+            # so there is no Python buffer for one to wait in (N16).
             return subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -935,11 +1263,32 @@ class AnrBuster:
                         min_frames=min_frames,
                         session_start_ms=meta.started_at_ms,
                         process_names=process_names,
+                        boundary=boundary,
                     )
                     # Read to its end or abandoned on a stop: either way this
                     # stream's pipe is done with, and a restart opens another.
                     if proc.stdout is not None:
                         proc.stdout.close()
+
+                    failure = counters.get("stream_failure")
+                    if failure is not None:
+                        # Not records, or cut by itself: no restart can trust
+                        # it. Whether the device is still there decides what
+                        # --stop says (exit 3, or a refusal).
+                        failure["device"] = _device_availability(serial)
+                        out_handle.write(
+                            json.dumps(
+                                {
+                                    "event": "stream_failed",
+                                    **failure,
+                                    "at_ms": int(time.time() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                        out_handle.flush()
+                        crashed = True
+                        break
 
                     if stop_flag["value"]:
                         out_handle.write(
@@ -974,9 +1323,11 @@ class AnrBuster:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            # Counters first: marking the session crashed forgets this
+            # worker's pid, and a --stop then reads the counters at once.
+            self.store.persist_worker_counters(session_id, counters)
             if crashed and not stop_flag["value"]:
                 self.store.mark_crashed(session_id)
-            self.store.persist_worker_counters(session_id, counters)
 
         return 2 if crashed else 0
 
@@ -991,35 +1342,43 @@ class AnrBuster:
         min_frames: int,
         session_start_ms: int,
         process_names: _ProcessNames | None = None,
+        boundary: _CaptureBoundary | None = None,
     ) -> int | None:
-        """Read lines until EOF / subprocess death / stop request.
+        """Read logd's records until EOF / subprocess death / stop request.
 
         Returns the subprocess exit code. Does not emit ``stream_died`` /
         ``stream_ended`` markers itself — the caller decides which to write.
 
-        ``process_names`` names the process behind a jank or StrictMode line
-        (the worker passes one that may ask the device). Without one, only the
-        stream's own ``Start proc`` lines name anything -- the device is never
-        asked.
+        ``process_names`` names the process behind a jank or StrictMode record
+        (the worker passes one that asks the device who system_server is).
+        Without one, nothing is named -- and no ANR report is authenticated,
+        so none counts: the assembler asks the resolver who system_server is.
+        ``boundary`` skips what a restarted stream replays of records the
+        session already read (the worker passes the session's); without one,
+        every record is read.
+
+        A ``LogFramingError`` ends the read (common.logcat's rule): cut by our
+        own stop, the lost record is counted (``cut_records``); otherwise the
+        failure is put in ``counters["stream_failure"]`` for the caller.
         """
         if proc.stdout is None:
             return proc.poll()
-        stream = _FdLines(proc.stdout)
-        assembler = AnrRecordAssembler()
-        names = process_names or _ProcessNames(None, ask_device=False)
+        stream = _FdRecords(proc.stdout)
+        names = process_names or _ProcessNames()
         # A new stream: any pid may have changed hands while there was none,
-        # and `-T 1` does not replay the new owner's Start proc line.
+        # and `-T 1` does not replay the new owner's Start proc record.
         names.reset()
+        assembler = AnrRecordAssembler(names.system_server_pid)
+        if boundary is not None:
+            boundary.new_stream()
 
-        def record(raw_events: list[dict], read_at: float | None = None) -> None:
+        def record(raw_events: list[dict], *, just_read: bool = False) -> None:
             for raw_event in raw_events:
-                # Both are logged from inside the app, so the logcat pid is the
-                # app's own -- and neither line says which app that is. Named
-                # only for a line just read: its read time is the evidence.
+                # Both are logged from inside the app, so the record's pid is
+                # the app's own -- and neither says which app that is. Named
+                # only as the record is read, by what the stream said before it.
                 if raw_event["kind"] in ("jank", "strictmode"):
-                    raw_event["app"] = (
-                        names.name_of(raw_event["pid"], read_at) if read_at is not None else None
-                    )
+                    raw_event["app"] = names.name_of(raw_event["pid"]) if just_read else None
                 if package and not matches_package(raw_event, package):
                     continue
                 counters["matched"] += 1
@@ -1036,30 +1395,44 @@ class AnrBuster:
                 if normalised is not None:
                     out_handle.write(event_to_jsonl(normalised) + "\n")
 
-        def take(lines: list[str]) -> None:
-            read_at = time.monotonic()
-            for line in lines:
+        def take(records: list[logcat.LogRecord]) -> None:
+            for log_record in records:
+                if boundary is not None and not boundary.admit(log_record):
+                    continue
                 counters["total"] += 1
-                names.observe(line, read_at)
-                record(assembler.feed(line), read_at)
+                names.observe(log_record)
+                record(assembler.feed(log_record), just_read=True)
+
+        def read(timeout: float) -> list[logcat.LogRecord] | None:
+            """The stream's next records; None once it has ended or broken."""
+            try:
+                return stream.read(timeout=timeout)
+            except logcat.LogFramingError as error:
+                if error.truncated and stop_flag["value"]:
+                    counters["cut_records"] = counters.get("cut_records", 0) + 1
+                else:
+                    counters["stream_failure"] = {
+                        "error": str(error),
+                        "truncated": error.truncated,
+                    }
+                return None
 
         try:
             last_fsync = time.time()
-            last_line_at = time.monotonic()
+            last_record_at = time.monotonic()
             while not stop_flag["value"]:
-                lines = stream.read(timeout=STREAM_POLL_SECONDS)
-                if lines is None:
+                records = read(STREAM_POLL_SECONDS)
+                if records is None:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         proc.wait(timeout=0.5)
                     return proc.poll()
-                if lines:
-                    last_line_at = time.monotonic()
-                    take(lines)
+                if records:
+                    last_record_at = time.monotonic()
+                    take(records)
                     continue
-                # Quiet. An ActivityManager ANR record arrives as one burst, so
-                # one still open now has ended: write it rather than hold it
-                # until the next unrelated line happens along.
-                record(assembler.flush(time.monotonic() - last_line_at))
+                # Quiet: a WindowManager report nothing answered for the whole
+                # correlation window is an ANR of its own.
+                record(assembler.flush(time.monotonic() - last_record_at))
                 if time.time() - last_fsync > 1.0:
                     out_handle.flush()
                     with contextlib.suppress(OSError):
@@ -1073,16 +1446,24 @@ class AnrBuster:
             # session: read it before closing, bounded, since logcat keeps writing.
             deadline = time.monotonic() + STOP_DRAIN_SECONDS
             while time.monotonic() < deadline:
-                lines = stream.read(timeout=0)
-                if not lines:
+                records = read(0)
+                if not records:
                     break
-                take(lines)
+                take(records)
+            if stream.partial:
+                # The rest of a record was still on its way when we stopped an
+                # open stream, whose end we never read: lost, and counted.
+                counters["cut_records"] = counters.get("cut_records", 0) + 1
             return proc.poll()
         finally:
             # However this stream ended, what the assembler still holds was
-            # seen: an open record, and a WindowManager report nothing answered.
+            # seen: a WindowManager report nothing answered.
             record(assembler.close())
-            counters["unnamed_pids"] = names.unnamed
+            # What this stream could not see, for the summary to disclose.
+            counters["unnamed_pids"] = names.unnamed_pids
+            counters["unverified_anr_lines"] = (
+                counters.get("unverified_anr_lines", 0) + assembler.unverified
+            )
 
     # === PRIVATE ===
 
@@ -1111,6 +1492,58 @@ class AnrBuster:
         # Not re-wrapped: a bare RuntimeError lost DeviceNotFoundError, so an
         # unavailable device exited 1 here and 3 everywhere else.
         return resolve_device_identifier(serial)
+
+
+def _refuse_broken_stream(session_id: str, failure: dict) -> NoReturn:
+    """--stop's answer for a session whose stream broke (common.logcat's framing rule).
+
+    The summary is saved first, so ``--get-details`` reads what was captured
+    before the break; what --stop answers is the refusal. A device the worker
+    found gone is exit 3; anything else is exit 1, naming the framing error.
+    """
+    device = str(failure.get("device", "unknown"))
+    error = failure.get("error", "the stream broke")
+    remedy = (
+        f"Reconnect the device; the summary of what was read before the break is saved -- "
+        f"read it with --get-details {session_id}."
+    )
+    if device.startswith("unavailable"):
+        raise DeviceNotFoundError(
+            f"Session {session_id}'s logcat stream broke ({error}) and the device is no "
+            f"longer available ({device.removeprefix('unavailable: ')}).",
+            remedy=remedy,
+        )
+    cli.fail(
+        f"Session {session_id}'s logcat stream was not logd's records to its end ({error}); "
+        f"the session stopped there, so it is incomplete.",
+        f"Read what was captured with --get-details {session_id}, and record the scenario "
+        f"again; if it repeats, restart adb (`adb kill-server && adb start-server`).",
+    )
+
+
+def _with_adb_exit(
+    error: logcat.LogFramingError, returncode: int | None, stderr: str
+) -> logcat.LogFramingError:
+    """``error``, saying how adb exited too when it exited with a failure."""
+    if not returncode:
+        return error
+    said = " ".join(stderr.split()) or "nothing on stderr"
+    return logcat.LogFramingError(
+        f"{error}; `adb logcat` exited {returncode}: {said}",
+        offset=error.offset,
+        truncated=error.truncated,
+    )
+
+
+def _device_availability(serial: str | None) -> str:
+    """``available``, ``unavailable: <adb's words>`` or ``unknown: <why>``, asked once."""
+    try:
+        _require_device(serial)
+    except DeviceError as error:
+        return f"unavailable: {' '.join(str(error).split())}"
+    except AdbError as error:
+        return f"unknown: {' '.join(str(error).split())}"
+    return "available"
 
 
 # === CLI ===
@@ -1149,6 +1582,7 @@ def _add_mode_args(parser: argparse.ArgumentParser) -> None:
     )
     # Internal worker entry — hidden from --help.
     mode_group.add_argument("--worker-session-id", metavar="ID", help=argparse.SUPPRESS)
+    parser.add_argument(WORKER_TOKEN_FLAG, metavar="TOKEN", help=argparse.SUPPRESS)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1256,7 +1690,7 @@ def main(argv: list[str] | None = None):
     # === ANRBuster worker entry ===
     if args.worker_session_id:
         buster = AnrBuster()
-        sys.exit(buster.run_worker(args.worker_session_id))
+        sys.exit(buster.run_worker(args.worker_session_id, token=args.worker_token))
 
     # === ANRBuster session subcommands ===
     if args.start:
@@ -1361,8 +1795,12 @@ def main(argv: list[str] | None = None):
     # Resolved before adb is asked anything: `adb -s <unknown> logcat` does not
     # fail, it prints "- waiting for device -" and blocks (measured), so a
     # mistyped --serial would read as a quiet device for as long as --watch
-    # ran. An unknown serial is DeviceNotFoundError here, exit 3.
+    # ran. An unknown serial is DeviceNotFoundError here, exit 3. With no
+    # --serial nothing is resolved, and `adb logcat` waits just the same for a
+    # device that is not there -- `--since` too, until its bound -- so adb is
+    # asked first, whichever device it would use (B4).
     watcher = AnrWatcher(serial=resolve_device_identifier(args.serial))
+    _require_device(watcher.serial)
     if args.watch:
         success = watcher.watch(
             duration_seconds=args.duration,

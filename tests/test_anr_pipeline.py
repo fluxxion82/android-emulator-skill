@@ -27,10 +27,14 @@ to order. They are varied by substitution into the recorded line
 from __future__ import annotations
 
 import re
+from dataclasses import replace
+from datetime import datetime
 
 import pytest
 
 from common import anr_pipeline as p
+from common import log_lifecycle, logcat
+from common.logcat import LogRecord
 
 # --- helpers ---------------------------------------------------------------
 
@@ -72,6 +76,47 @@ def _window_anr_line(recorded) -> str:
 def _strictmode_line(recorded) -> str:
     """The StrictMode violation HEADER, not one of its stack frames."""
     return _first(recorded.text("logcat_strictmode_violation"), "policy violation")
+
+
+BROADCAST = "logcat_anr_broadcast_records"
+INPUT = "logcat_anr_input_records"
+RESTART = "logcat_app_restart_records"
+INJECTION = "logcat_tag_injection_records"
+PACKAGE = "com.example.composefixture"
+
+
+def _records(recorded, name: str) -> list[LogRecord]:
+    """A recorded ``logcat -B`` dump, read by common.logcat -- what every ANR reader reads."""
+    return logcat.parse_records(recorded.data(f"{name}.bin"))
+
+
+def _entry(recorded, name: str) -> dict:
+    return next(e for e in recorded.manifest["fixtures"] if e["name"] == name)
+
+
+def _system_server(recorded, name: str) -> str:
+    """system_server's pid as `pidof system_server` answered in ``name``'s own run.
+
+    Checked, not assumed: every ActivityManager and WindowManager record in
+    the two ANR recordings must have been written by it.
+    """
+    measured = str(_entry(recorded, name).get("system_server_pid", ""))
+    if not measured.isdigit():
+        pytest.fail(f"{name} records no system_server pid; re-record it")
+    if name in (BROADCAST, INPUT):
+        writers = {
+            str(r.pid)
+            for r in _records(recorded, name)
+            if r.tag in ("ActivityManager", "WindowManager")
+        }
+        if writers != {measured}:
+            pytest.fail(f"{name} was written by {writers}, not system_server {measured}")
+    return measured
+
+
+def _stream(recorded, records: list[LogRecord], name: str = BROADCAST) -> list[dict]:
+    """``parse_logcat_stream`` over records, system_server as measured with ``name``."""
+    return p.parse_logcat_stream(records, system_server_pid=_system_server(recorded, name))
 
 
 def _norm(line: str, current_ms: int = 1000) -> p.NormalisedEvent:
@@ -254,59 +299,88 @@ def test_parse_ignores_unrelated_lines(recorded):
 
 # --- assemble: one stall is one event (D5) ----------------------------------
 #
-# The two *_stream recordings are everything ActivityManager and WindowManager
-# logged from the provocation on, so "how many ANRs is this?" is asked of what
-# a live reader actually sees -- not of a line picked out of it.
+# The two *_records recordings are every ActivityManager and WindowManager
+# record logged from the provocation on, as logd's records (`logcat -B`) --
+# what every ANR reader reads since PR #34 adopted common.logcat's reader --
+# so "how many ANRs is this?" is asked of what a reader actually sees.
 
 
-def _stated(lines: list[str], field: str) -> str:
-    """The value ActivityManager's record states for ``field`` (``PID``, ``Reason``)."""
-    return _first("\n".join(lines), f"ActivityManager: {field}: ").split(f"{field}: ", 1)[1]
+def _report(recorded, name: str = BROADCAST) -> LogRecord:
+    """ActivityManager's ANR report: ONE record, its PID and Reason lines in its message."""
+    return next(
+        r
+        for r in _records(recorded, name)
+        if r.tag == "ActivityManager" and r.message.startswith("ANR in ")
+    )
+
+
+def _window(recorded, name: str = BROADCAST) -> LogRecord:
+    """WindowManager's report of the same stall, one record."""
+    return next(r for r in _records(recorded, name) if r.tag == "WindowManager")
+
+
+def _verdict(recorded) -> LogRecord:
+    """ActivityManager's "Skipping duplicate ANR" verdict on WindowManager's report."""
+    return next(
+        r for r in _records(recorded, BROADCAST) if r.message.startswith("Skipping duplicate ANR")
+    )
+
+
+def _stated(record: LogRecord, field: str) -> str:
+    """The value the report states for ``field`` (``PID``, ``Reason``), on its own line."""
+    match = re.search(rf"\n{field}: ([^\n]*)", record.message)
+    if match is None:
+        pytest.fail(f"the recorded report states no {field}; the fixture has changed shape")
+    return match.group(1)
+
+
+def _later(record: LogRecord, seconds: float) -> LogRecord:
+    """The recorded record with only its time (logd's sec/nsec) moved ``seconds`` later."""
+    total = record.sec * 1_000_000_000 + record.nsec + round(seconds * 1_000_000_000)
+    return replace(record, sec=total // 1_000_000_000, nsec=total % 1_000_000_000)
 
 
 def test_a_broadcast_anr_record_is_one_event_with_its_pid_and_reason(recorded):
-    lines = recorded.lines("logcat_anr_broadcast")
+    report = _report(recorded)
 
-    events = p.parse_logcat_stream(lines)
+    events = _stream(recorded, [report])
 
     assert len(events) == 1, [e["message"] for e in events]
     (event,) = events
-    assert event["anr_package"] == "com.example.composefixture"
-    assert event["app_pid"] == int(_stated(lines, "PID"))
-    assert event["app_pid"] != event["pid"], "the header pid is system_server's"
-    assert event["reason"] == _stated(lines, "Reason").strip()
+    assert event["anr_package"] == PACKAGE
+    assert event["app_pid"] == int(_stated(report, "PID"))
+    assert event["app_pid"] != event["pid"], "the record's pid is system_server's"
+    assert event["reason"] == _stated(report, "Reason").strip()
 
 
 def test_one_broadcast_anr_as_the_stream_carries_it_is_one_event(recorded):
-    """ActivityManager's record, WindowManager's report, and "Skipping duplicate".
+    """ActivityManager's report, WindowManager's report, and "Skipping duplicate".
 
-    Three places a line-at-a-time reader found an ANR, and one stall.
+    Three places a record-at-a-time reader found an ANR, and one stall.
     """
-    lines = recorded.lines("logcat_anr_broadcast_stream")
-    assert any("ANR in Window{" in line for line in lines), "WindowManager's report is gone"
-    assert any("Skipping duplicate ANR" in line for line in lines), "no duplicate verdict"
+    records = _records(recorded, BROADCAST)
+    assert _window(recorded) in records and _verdict(recorded) in records
 
-    events = p.parse_logcat_stream(lines)
+    events = _stream(recorded, records)
 
     assert [e["kind"] for e in events] == ["anr"], [e["message"] for e in events]
     assert events[0]["process"] == "ActivityManager"
     assert "Broadcast of Intent" in events[0]["reason"]
-    assert events[0]["app_pid"] == int(_stated(lines, "PID"))
+    assert events[0]["app_pid"] == int(_stated(_report(recorded), "PID"))
 
 
 def test_an_input_anr_is_one_event_and_comes_from_activitymanager(recorded):
-    """WindowManager reports first here, and ActivityManager's record follows.
+    """WindowManager reports first here, and ActivityManager's report follows.
 
-    Dropping WindowManager's line is only safe because ActivityManager always
-    logs the incident itself; this is the recording that shows it does when
-    the ANR is new, as logcat_anr_broadcast_stream shows the duplicate case.
+    Dropping WindowManager's report is only safe because ActivityManager
+    always records the incident itself; this is the recording that shows it
+    does when the ANR is new, as the broadcast recording shows the duplicate.
     """
-    lines = recorded.lines("logcat_anr_input_stream")
-    window = next(i for i, line in enumerate(lines) if "WindowManager: ANR in Window{" in line)
-    record = next(i for i, line in enumerate(lines) if "ActivityManager: ANR in " in line)
-    assert window < record, "the recording no longer has WindowManager reporting first"
+    records = _records(recorded, INPUT)
+    window, report = _window(recorded, INPUT), _report(recorded, INPUT)
+    assert records.index(window) < records.index(report), "WindowManager no longer reports first"
 
-    events = p.parse_logcat_stream(lines)
+    events = _stream(recorded, records, INPUT)
 
     assert len(events) == 1, [e["message"] for e in events]
     (event,) = events
@@ -315,71 +389,58 @@ def test_an_input_anr_is_one_event_and_comes_from_activitymanager(recorded):
     assert event["reason"].startswith("Input dispatching timed out")
 
 
+def _input_cut_before_the_report(recorded) -> list[LogRecord]:
+    records = _records(recorded, INPUT)
+    return records[: records.index(_report(recorded, INPUT))]
+
+
 def test_an_input_anr_cut_off_before_activitymanager_reports_still_counts(recorded):
     """WindowManager's report is a fallback, not noise (review of PR #26).
 
     The recorded input-only ANR, cut where a stop or a --since window can cut
-    it: after WindowManager's line, before ActivityManager's record. Dropping
-    WindowManager's line unconditionally made that ZERO ANRs -- a missed ANR,
-    which is worse than a duplicate.
+    it: after WindowManager's report, before ActivityManager's. Dropping
+    WindowManager's report unconditionally made that ZERO ANRs -- a missed
+    ANR, which is worse than a duplicate.
     """
-    lines = recorded.lines("logcat_anr_input_stream")
-    record = next(i for i, line in enumerate(lines) if "ActivityManager: ANR in " in line)
-    cut = lines[:record]
-    assert any("WindowManager: ANR in Window{" in line for line in cut)
+    cut = _input_cut_before_the_report(recorded)
+    assert _window(recorded, INPUT) in cut
 
-    events = p.parse_logcat_stream(cut)
+    events = _stream(recorded, cut, INPUT)
 
     assert [e["kind"] for e in events] == ["anr"], events
-    assert events[0]["anr_package"] == "com.example.composefixture"
+    assert events[0]["anr_package"] == PACKAGE
     assert events[0]["reason"].startswith("Input dispatching timed out")
 
 
 def test_a_broadcast_anr_cut_off_after_windowmanagers_report_is_still_one(recorded):
     """The duplicate case, cut before ActivityManager's "Skipping duplicate" verdict.
 
-    WindowManager reported 5.06 s after ActivityManager's record (recorded);
-    the correlation window reaches back far enough to know it is that stall.
+    WindowManager reported ~5 s after ActivityManager's report (recorded); the
+    correlation window reaches back far enough to know it is that stall.
     """
-    lines = recorded.lines("logcat_anr_broadcast_stream")
-    window = next(i for i, line in enumerate(lines) if "WindowManager: ANR in Window{" in line)
+    records = _records(recorded, BROADCAST)
 
-    events = p.parse_logcat_stream(lines[: window + 1])
+    events = _stream(recorded, records[: records.index(_window(recorded)) + 1])
 
     assert len(events) == 1, [e["message"] for e in events]
     assert events[0]["process"] == "ActivityManager"
 
 
-def test_an_anr_records_own_lines_are_not_anrs_on_their_own(recorded):
-    """``PID:``, ``Reason:`` and "Skipping duplicate ANR" are never an ANR alone.
+def test_only_a_reports_opening_is_an_anr(recorded):
+    """``PID:`` and ``Reason:`` are lines INSIDE the report; nothing else here is an ANR.
 
-    The removed follow-on branch made each a second ANR (D5). The assembler
-    attaches the first two and settles on the third, so in a whole stream the
-    branch would hide -- but a stream that starts after a record's head (a
-    recording cut, a reader joining mid-burst) hands it the tail alone.
+    In text they were lines of their own, and the removed follow-on branch
+    made each a second ANR (D5). As records they cannot arrive alone: they
+    are the report's own message. Every other record of the stall --
+    "Broadcasting", "Enqueued", "Completed ANR" and the duplicate verdict --
+    is no event.
     """
-    text = recorded.text("logcat_anr_broadcast_stream")
-    for needle in ("ActivityManager: PID: ", "ActivityManager: Reason: ", "Skipping duplicate ANR"):
-        line = _first(text, needle)
-        assert p.parse_logcat_anr(line) is None, line
+    report = _report(recorded)
+    assert "\nPID: " in report.message and "\nReason: " in report.message
+    others = [r for r in _records(recorded, BROADCAST) if not r.message.startswith("ANR in ")]
+    assert len(others) >= 4, "the recording no longer holds the stall's other records"
 
-    lines = text.splitlines()
-    head = next(i for i, line in enumerate(lines) if "ActivityManager: ANR in " in line)
-    assert p.parse_logcat_stream(lines[head + 1 : head + 4]) == []
-
-
-def _later(line: str, seconds: float) -> str:
-    """The recorded line with only its timestamp moved ``seconds`` later."""
-    from datetime import datetime, timedelta
-
-    stamp = line[:18]
-    moved = datetime.strptime(f"2026-{stamp}", "%Y-%m-%d %H:%M:%S.%f") + timedelta(seconds=seconds)
-    return moved.strftime("%m-%d %H:%M:%S.%f")[:-3] + line[18:]
-
-
-def _input_stream_cut_before_the_record(recorded) -> list[str]:
-    lines = recorded.lines("logcat_anr_input_stream")
-    return lines[: next(i for i, line in enumerate(lines) if "ActivityManager: ANR in " in line)]
+    assert _stream(recorded, others) == []
 
 
 def test_a_report_activitymanager_calls_a_duplicate_is_not_counted_however_late(recorded):
@@ -388,35 +449,34 @@ def test_a_report_activitymanager_calls_a_duplicate_is_not_counted_however_late(
     WindowManager reports again, past the correlation window, and
     ActivityManager answers "Skipping duplicate ANR" naming the window. That
     verdict, not the clock, is what settles it. Derived from the recorded
-    broadcast stream with only the timestamps of those two lines moved 20 s on.
+    broadcast records with only the times of those two moved 20 s on.
     """
-    lines = recorded.lines("logcat_anr_broadcast_stream")
-    report = next(i for i, line in enumerate(lines) if "WindowManager: ANR in Window{" in line)
-    verdict = next(i for i, line in enumerate(lines) if "Skipping duplicate ANR" in line)
-    assert report < verdict
-    stream = [*lines[:report], _later(lines[report], 20), _later(lines[verdict], 20)]
+    records = _records(recorded, BROADCAST)
+    window, verdict = _window(recorded), _verdict(recorded)
+    assert records.index(window) < records.index(verdict)
+    stream = [*records[: records.index(window)], _later(window, 20), _later(verdict, 20)]
 
-    events = p.parse_logcat_stream(stream)
+    events = _stream(recorded, stream)
 
     assert [e["process"] for e in events] == ["ActivityManager"], events
 
 
 def test_a_held_report_is_released_by_log_time_not_only_at_the_end(recorded):
-    """A WindowManager report nothing answers is an event once 10 s of log pass."""
-    cut = _input_stream_cut_before_the_record(recorded)
-    assembler = p.AnrRecordAssembler()
-    assert [event for line in cut for event in assembler.feed(line)] == []
+    """A WindowManager report nothing answers is an event once 10 s of log pass.
 
-    released = assembler.feed(_later(cut[-1], p.ANR_CORRELATION_MS / 1000 + 1))
+    The record that passes them: the recorded "Broadcasting" record with only
+    its time set 11 s after WindowManager's report.
+    """
+    cut = _input_cut_before_the_report(recorded)
+    window = _window(recorded, INPUT)
+    assembler = p.AnrRecordAssembler(_system_server(recorded, INPUT))
+    assert [event for record in cut for event in assembler.feed(record)] == []
+    later = replace(cut[0], sec=window.sec + p.ANR_CORRELATION_MS // 1000 + 1, nsec=window.nsec)
+
+    released = assembler.feed(later)
 
     assert [(e["process"], e["kind"]) for e in released] == [("WindowManager", "anr")]
     assert assembler.close() == []
-
-
-def _report_and_verdict(recorded) -> tuple[str, str]:
-    """WindowManager's report and ActivityManager's duplicate verdict, as recorded."""
-    text = recorded.text("logcat_anr_broadcast_stream")
-    return _first(text, "WindowManager: ANR in Window{"), _first(text, "Skipping duplicate ANR")
 
 
 def test_a_duplicate_verdict_settles_only_the_package_it_names(recorded):
@@ -426,10 +486,10 @@ def test_a_duplicate_verdict_settles_only_the_package_it_names(recorded):
     settled a held report for a different app, ``example.composefixture``, and
     that ANR vanished. The recorded report with only its package changed.
     """
-    report, verdict = _report_and_verdict(recorded)
-    other_app = report.replace("com.example.composefixture", "example.composefixture")
+    window = _window(recorded)
+    other_app = replace(window, message=window.message.replace(PACKAGE, "example.composefixture"))
 
-    events = p.parse_logcat_stream([other_app, verdict])
+    events = _stream(recorded, [other_app, _verdict(recorded)])
 
     assert [(e["process"], e["anr_package"]) for e in events] == [
         ("WindowManager", "example.composefixture")
@@ -437,17 +497,14 @@ def test_a_duplicate_verdict_settles_only_the_package_it_names(recorded):
 
 
 def test_a_duplicate_verdict_settles_the_report_it_names(recorded):
-    report, verdict = _report_and_verdict(recorded)
-
-    assert p.parse_logcat_stream([report, verdict]) == []
+    assert _stream(recorded, [_window(recorded), _verdict(recorded)]) == []
 
 
 def test_a_duplicate_verdict_past_the_window_settles_nothing(recorded):
     """The 10 s bound holds on the verdict path too."""
-    report, verdict = _report_and_verdict(recorded)
-    late = _later(verdict, p.ANR_CORRELATION_MS / 1000 + 1)
+    late = _later(_verdict(recorded), p.ANR_CORRELATION_MS / 1000 + 1)
 
-    events = p.parse_logcat_stream([report, late])
+    events = _stream(recorded, [_window(recorded), late])
 
     assert [e["process"] for e in events] == ["WindowManager"]
 
@@ -456,65 +513,58 @@ def test_a_duplicate_verdict_logged_long_before_the_report_settles_nothing(recor
     """The bound is checked on the verdict path itself, in both directions.
 
     A verdict LATER than the window never reaches it -- the report is released
-    first -- so the test that can tell is one logged earlier: logcat interleaves
-    buffers, and a line can arrive after one stamped later (seen in this
-    session's own dumps, by milliseconds). Here by 11 s, derived from the
-    recorded verdict with only its timestamp moved.
+    first -- so the test that can tell is one logged earlier: logcat
+    interleaves buffers, and a record can arrive after one stamped later. Here
+    by 11 s, derived from the recorded verdict with only its time moved.
     """
-    report, verdict = _report_and_verdict(recorded)
-    early = _later(report, -(p.ANR_CORRELATION_MS / 1000 + 1))
-    early_verdict = early[:18] + verdict[18:]
+    window = _window(recorded)
+    early = replace(
+        _verdict(recorded), sec=window.sec - p.ANR_CORRELATION_MS // 1000 - 1, nsec=window.nsec
+    )
 
-    events = p.parse_logcat_stream([report, early_verdict])
+    events = _stream(recorded, [window, early])
 
     assert [e["process"] for e in events] == ["WindowManager"]
 
 
 def test_a_held_report_waits_out_a_short_quiet_and_not_a_long_one(recorded):
-    """ActivityManager's record can follow WindowManager's by a quiet moment.
+    """ActivityManager's report can follow WindowManager's by a quiet moment.
 
-    Measured 0.35 s, with the stack dump between them. A quarter-second of
-    quiet must not release the report as an ANR of its own; a quiet as long
-    as the whole correlation window means no record is coming.
+    Recorded: 0.46 s. A quarter-second of quiet must not release the report
+    as an ANR of its own; a quiet as long as the whole correlation window
+    means no report is coming.
     """
-    assembler = p.AnrRecordAssembler()
-    for line in _input_stream_cut_before_the_record(recorded):
-        assembler.feed(line)
+    assembler = p.AnrRecordAssembler(_system_server(recorded, INPUT))
+    for record in _input_cut_before_the_report(recorded):
+        assembler.feed(record)
 
     assert assembler.flush(quiet_seconds=0.25) == []
     released = assembler.flush(quiet_seconds=p.ANR_CORRELATION_MS / 1000)
     assert [e["process"] for e in released] == ["WindowManager"]
 
 
-def test_an_open_anr_record_is_emitted_only_when_it_ends(recorded):
-    """The assembler cannot know a record is complete until its header changes.
+def test_an_anr_report_is_an_event_the_moment_it_is_read(recorded):
+    """One record, so nothing waits for a header to change, or for quiet.
 
-    That is why every live reader flushes when the stream goes quiet.
+    In text a report was many lines, complete only when something else
+    followed -- every reader had to flush on quiet. A jank record that follows
+    is its own event, on its own.
     """
-    lines = recorded.lines("logcat_anr_broadcast")
-    assembler = p.AnrRecordAssembler()
+    jank = next(
+        r
+        for r in _records(recorded, RESTART)
+        if r.tag == "Choreographer" and r.message.startswith("Skipped")
+    )
+    assembler = p.AnrRecordAssembler(_system_server(recorded, BROADCAST))
 
-    assert [event for line in lines for event in assembler.feed(line)] == []
-    flushed = assembler.flush()
-    assert len(flushed) == 1
-    assert assembler.flush() == [], "a flushed record is not emitted twice"
-
-
-def test_a_jank_line_ends_an_open_anr_record(recorded):
-    lines = recorded.lines("logcat_anr_broadcast")
-    jank = _jank_line(recorded, 80)
-    assembler = p.AnrRecordAssembler()
-    for line in lines:
-        assembler.feed(line)
-
-    completed = assembler.feed(jank)
-
-    assert [e["kind"] for e in completed] == ["anr", "jank"]
-    assert assembler.flush() == []
+    assert [e["kind"] for e in assembler.feed(_report(recorded))] == ["anr"]
+    assert [e["kind"] for e in assembler.feed(jank)] == ["jank"]
+    assert assembler.flush(quiet_seconds=p.ANR_CORRELATION_MS / 1000) == []
+    assert assembler.close() == []
 
 
-def test_the_assembled_reason_reaches_the_normalised_event(recorded):
-    (raw,) = p.parse_logcat_stream(recorded.lines("logcat_anr_broadcast"))
+def test_the_reports_reason_reaches_the_normalised_event(recorded):
+    (raw,) = _stream(recorded, [_report(recorded)])
     event = p.build_normalised_event(raw, session_start_ms=0, current_ms=5000)
 
     assert event is not None
@@ -522,6 +572,190 @@ def test_the_assembled_reason_reaches_the_normalised_event(recorded):
     assert event.app_pid == raw["app_pid"]
     restored = p.event_from_jsonl(p.event_to_jsonl(event))
     assert (restored.reason, restored.app_pid) == (event.reason, event.app_pid)
+
+
+def test_an_events_time_is_the_records_own_to_the_microsecond(recorded):
+    """The timestamp is logd's sec/nsec as ``-v usec`` prints it, never a parsed header."""
+    report = _report(recorded)
+
+    (event,) = _stream(recorded, [report])
+
+    stamp = datetime.fromtimestamp(report.sec)
+    assert event["timestamp"] == f"{stamp:%m-%d %H:%M:%S}.{report.nsec // 1000:06d}"
+
+
+# --- assemble: an ANR report counts only as system_server wrote it ----------
+#
+# Review of PR #34: any app may log under ActivityManager's or WindowManager's
+# tag, and the assembler took an app's word for an ANR -- and for the verdict
+# that settles one. Each forgery below is the recorded record with only the
+# field an app controls changed; system_server's pid is the device's answer.
+# The writer is the record's pid: logd's, from the writing socket.
+
+
+def _app_pid(recorded) -> int:
+    """The stalled app's own pid, as the report states it (its ``PID:`` line)."""
+    return int(_stated(_report(recorded), "PID"))
+
+
+def test_system_servers_own_record_counts(recorded):
+    """The control: the recorded report, written by system_server, is one ANR."""
+    events = _stream(recorded, [_report(recorded)])
+
+    assert [e["anr_package"] for e in events] == [PACKAGE]
+
+
+def test_an_anr_record_written_by_an_app_is_not_counted(recorded):
+    """The reviewer's forgery: an app writes ``ANR in <another package>`` itself.
+
+    Derived: the recorded report with only its writer -- the record's pid --
+    changed to the stalled app's own pid.
+    """
+    forged = replace(_report(recorded), pid=_app_pid(recorded))
+
+    assert _stream(recorded, [forged]) == []
+
+
+def test_an_app_written_duplicate_verdict_does_not_settle_a_real_report(recorded):
+    """The reviewer's second forgery: a fake "Skipping duplicate ANR" made an ANR vanish.
+
+    WindowManager's recorded report, with no ActivityManager report behind
+    it, is an ANR of its own. Followed by ActivityManager's recorded verdict,
+    it is settled; followed by the same verdict written by the app, it must
+    not be.
+    """
+    window, verdict = _window(recorded), _verdict(recorded)
+
+    genuine = _stream(recorded, [window, verdict])
+    forged = _stream(recorded, [window, replace(verdict, pid=_app_pid(recorded))])
+
+    assert genuine == []
+    assert [e["process"] for e in forged] == ["WindowManager"]
+
+
+def test_a_report_counts_only_under_activity_or_window_managers_tag(recorded):
+    """system_server writes under many tags; a report is ActivityManager's or WindowManager's.
+
+    Derived: ActivityManager's recorded report with only its tag changed to
+    another of system_server's, ActivityTaskManager.
+    """
+    other_tag = replace(_report(recorded), tag="ActivityTaskManager")
+
+    assert _stream(recorded, [other_tag]) == []
+
+
+def test_a_duplicate_verdict_counts_only_under_activitymanagers_tag(recorded):
+    """The verdict is ActivityManager's, not any system_server record that reads like one.
+
+    Derived: ActivityManager's recorded verdict with only its tag changed to
+    WindowManager's. The report it would have settled stands.
+    """
+    other_tag = replace(_verdict(recorded), tag="WindowManager")
+
+    events = _stream(recorded, [_window(recorded), other_tag])
+
+    assert [e["process"] for e in events] == ["WindowManager"]
+
+
+def test_an_anr_phrase_inside_a_system_server_message_is_not_a_report(recorded):
+    """Only the opening counts: system_server's messages carry an app's text further on.
+
+    Derived: system_server's recorded ``Broadcasting:`` record with only the
+    broadcast's action -- the app's own string -- replaced by an ANR phrase.
+    """
+    record = next(r for r in _records(recorded, BROADCAST) if r.message.startswith("Broadcasting:"))
+    action = re.search(r"act=(\S+)", record.message).group(1)
+    forged = replace(record, message=record.message.replace(action, "x ANR in com.example.victim"))
+
+    assert _stream(recorded, [forged]) == []
+
+
+def test_a_report_in_a_later_line_of_a_message_is_not_a_report(recorded):
+    """A later line of a system_server message starts with whatever an app put in it.
+
+    An app's broadcast action with a newline in it puts a line of the app's
+    choosing inside system_server's report. Derived: the recorded report with
+    one more line after its ``Reason:`` line -- ``ANR in com.example.victim``.
+    One ANR, the real one.
+    """
+    report = _report(recorded)
+    lines = report.message.split("\n")
+    reason = next(i for i, line in enumerate(lines) if line.startswith("Reason: "))
+    lines.insert(reason + 1, "ANR in com.example.victim")
+    forged = replace(report, message="\n".join(lines))
+
+    events = _stream(recorded, [forged])
+
+    assert [e["anr_package"] for e in events] == [PACKAGE]
+
+
+def _forging(recorded) -> LogRecord:
+    """The recorded tag-injection record: the shell's, a system_server header in its TAG.
+
+    logcat_tag_injection_records: its tag is ``x:``, a newline, and a
+    threadtime header claiming system_server's pid and the tag ActivityManager.
+    Printed as text, that is a whole line of system_server's (the text twin,
+    logcat_tag_injection, shows it so).
+    """
+    forger = int(_entry(recorded, INJECTION)["injection"]["forger_pid"])
+    forging = next(r for r in _records(recorded, INJECTION) if r.pid == forger)
+    if "\n" not in forging.tag or "ActivityManager" not in forging.tag:
+        pytest.fail("the recorded forging record no longer carries its header in its tag")
+    return forging
+
+
+def test_a_system_server_header_forged_in_a_tag_is_not_an_anr(recorded):
+    """The tag-injection regression for ANR events (A1, adopted from W3-L).
+
+    Derived: the recorded forging record with only its message -- the
+    forger's own text -- replaced by an ANR report for the fixture package.
+    The record's tag is not ActivityManager, and its writer is the shell.
+    """
+    forged = replace(_forging(recorded), message=f"ANR in {PACKAGE}")
+
+    assert _stream(recorded, [forged], INJECTION) == []
+
+
+def test_a_duplicate_verdict_forged_in_a_tag_settles_nothing(recorded):
+    """The tag-injection regression for duplicate verdicts (A1, adopted from W3-L).
+
+    WindowManager's recorded report, moved to a second before the forgery so
+    the verdict falls inside its window, then the recorded forging record with
+    only its message replaced by ActivityManager's recorded verdict. The
+    report stands as the ANR.
+    """
+    forging = _forging(recorded)
+    held = replace(_window(recorded), sec=forging.sec - 1, nsec=forging.nsec)
+    forged = replace(forging, message=_verdict(recorded).message)
+
+    events = _stream(recorded, [held, forged], INJECTION)
+
+    assert [(e["process"], e["anr_package"]) for e in events] == [("WindowManager", PACKAGE)]
+
+
+def test_with_system_servers_pid_unknown_no_report_counts_and_it_says_so(recorded):
+    """Fail closed -- and countably: ``unverified`` is what a reader discloses."""
+    assembler = p.AnrRecordAssembler(lambda: None)
+
+    records = _records(recorded, BROADCAST)
+    events = [event for r in records for event in assembler.feed(r)] + assembler.close()
+
+    assert [e for e in events if e["kind"] == "anr"] == []
+    assert assembler.unverified == 3, "the report, WindowManager's and the verdict were set aside"
+
+
+def test_system_servers_pid_is_asked_only_when_a_report_arrives(recorded):
+    """ActivityManager's other records -- Start proc, Killing, has died -- ask nothing."""
+    asked: list[str] = []
+    assembler = p.AnrRecordAssembler(lambda: asked.append("asked") or None)
+    records = _records(recorded, RESTART)
+    assert any(r.tag == "ActivityManager" for r in records)
+
+    for record in records:
+        assembler.feed(record)
+    assembler.close()
+
+    assert asked == []
 
 
 # --- threshold -------------------------------------------------------------
@@ -568,60 +802,36 @@ def test_jank_fingerprint_is_the_process_not_the_frame_count(recorded):
 
 
 def _restart_jank(recorded) -> list[dict]:
-    """The three jank lines of logcat_app_restart: one app, three processes."""
+    """The three jank records of logcat_app_restart_records: one app, three processes."""
     raws = [
-        p.parse_logcat_anr(line)
-        for line in recorded.lines("logcat_app_restart")
-        if "Choreographer: Skipped" in line
+        p.event_from_record(r)
+        for r in _records(recorded, RESTART)
+        if r.tag == "Choreographer" and r.message.startswith("Skipped")
     ]
     if len({raw["pid"] for raw in raws if raw}) != 3:
-        pytest.fail("logcat_app_restart no longer holds one jank line per process")
+        pytest.fail("logcat_app_restart_records no longer holds one jank record per process")
     return raws
 
 
 def _restart_names(recorded) -> dict[int, str]:
-    """pid -> process name, from the recording's own ActivityManager lines."""
-    return dict(
-        named
-        for named in (p.parse_start_proc(line) for line in recorded.lines("logcat_app_restart"))
-        if named
-    )
+    """pid -> process name, from system_server's `Start proc` records in the recording.
+
+    Read by common.log_lifecycle, the session worker's reader, with
+    system_server's pid as the device answered it in that run.
+    """
+    reader = log_lifecycle.LifecycleReader(_system_server(recorded, RESTART), lambda _p: None)
+    names = {}
+    for record in _records(recorded, RESTART):
+        _writer, sentence = reader.read(record)
+        if sentence is not None and sentence.what == log_lifecycle.STARTED:
+            names[int(sentence.pid)] = sentence.name
+    return names
 
 
 def test_start_proc_names_each_process_of_the_restarted_app(recorded):
     names = _restart_names(recorded)
 
     assert {names[raw["pid"]] for raw in _restart_jank(recorded)} == {"com.example.composefixture"}
-
-
-def test_ps_age_gives_the_owners_name_and_age(recorded):
-    """ps_lifetime: a header, then the row; ELAPSED as HH:MM:SS."""
-    text = recorded.text("ps_lifetime")
-    row = text.splitlines()[1].split()
-    hours, minutes, seconds = (int(part) for part in row[-1].split(":"))
-
-    owner = p.parse_process_age(text, int(row[0]))
-
-    assert owner.name == "com.android.systemui"
-    assert owner.age.total_seconds() == hours * 3600 + minutes * 60 + seconds
-    assert p.parse_process_age(text, int(row[0]) + 1) is None
-
-
-def test_ps_age_reads_the_short_form_of_a_young_process(recorded):
-    """ps_lifetime_just_started: under an hour old, ELAPSED is MM:SS."""
-    text = recorded.text("ps_lifetime_just_started")
-    row = text.splitlines()[1].split()
-    minutes, seconds = (int(part) for part in row[-1].split(":"))
-
-    owner = p.parse_process_age(text, int(row[0]))
-
-    assert owner.name == "com.example.composefixture"
-    assert owner.age.total_seconds() == minutes * 60 + seconds
-
-
-def test_ps_age_for_a_pid_nothing_holds_is_nothing(recorded):
-    """Header only (exit 1): the header is not a process called NAME."""
-    assert p.parse_process_age(recorded.text("ps_lifetime_not_running"), 999999) is None
 
 
 def test_one_apps_jank_is_one_site_across_its_restarts(recorded):
@@ -723,25 +933,103 @@ def test_a_diff_that_could_not_compare_says_inconclusive_not_no_change(recorded)
     assert "inconclusive" in p.format_diff(result)
 
 
+def _incomplete(summary: p.SessionSummary) -> p.SessionSummary:
+    summary.incomplete = True
+    return summary
+
+
 def test_a_diff_against_an_incomplete_session_says_so(recorded):
     """A summary saved before its worker finished may be missing events.
 
-    Nothing changed: the diff cannot call that "no change". Something changed:
-    the verdict stands, and says what it stands on.
+    Nothing changed: the diff cannot call that "no change".
     """
     anr = _norm(_anr_line(recorded), current_ms=5000)
-    short = _summary([anr])
-    short.incomplete = True
-    empty_short = _summary([])
-    empty_short.incomplete = True
+    short = _incomplete(_summary([anr]))
 
     unchanged = p.diff_sessions(short, _summary([anr]))
-    changed = p.diff_sessions(_summary([anr]), empty_short)
 
-    assert unchanged["verdict"] == f"inconclusive: {short.session_id} is incomplete"
-    assert changed["verdict"] == (
-        f"improvement: 1 resolved; {empty_short.session_id} is incomplete"
+    assert unchanged["verdict"] == (
+        f"inconclusive: 1 shared cluster not comparable: {short.session_id} is incomplete"
     )
+
+    nothing = p.diff_sessions(_incomplete(_summary([])), _summary([]))
+
+    assert nothing["verdict"] == f"inconclusive: {short.session_id} is incomplete"
+
+
+@pytest.mark.parametrize("incomplete_side", ["first", "second"])
+def test_absence_from_an_incomplete_session_is_never_resolved_or_new(incomplete_side, recorded):
+    """B3: a cluster missing from a partial capture may simply be unwritten.
+
+    The diff said "improvement: 1 resolved; B is incomplete" for an ANR that
+    the complete session A saw and the incomplete session B did not -- and
+    this test used to assert exactly that. Absence is the one thing an
+    incomplete summary cannot show, so a cluster absent from the incomplete
+    side is listed as unconfirmed: neither resolved (B incomplete) nor new
+    (A incomplete), and the verdict is inconclusive.
+    """
+    anr = _norm(_anr_line(recorded), current_ms=5000)
+    has, lacks = _summary([anr]), _incomplete(_summary([]))
+    a, b = (has, lacks) if incomplete_side == "second" else (lacks, has)
+
+    result = p.diff_sessions(a, b)
+
+    assert result["resolved_clusters"] == [] and result["new_clusters"] == [], result["verdict"]
+    assert [c["fingerprint"] for c in result["unconfirmed"]] == [anr.fingerprint]
+    assert result["verdict"].startswith("inconclusive: "), result["verdict"]
+    assert "Unconfirmed (1)" in p.format_diff(result)
+
+
+def _named_jank(recorded, frames: int) -> p.NormalisedEvent:
+    """The recorded jank line at ``frames``, named for the restarted app (as a session names it)."""
+    (app,) = set(_restart_names(recorded).values())
+    raw = p.parse_logcat_anr(_jank_line(recorded, frames))
+    return p.build_normalised_event({**raw, "app": app}, 0, current_ms=1000)
+
+
+def test_what_a_complete_session_lacks_is_still_resolved(recorded):
+    """Presence is evidence even in a partial capture; only absence is not.
+
+    A cluster the incomplete session A holds and the complete session B does
+    not is still resolved -- B, which is complete, really lacks it.
+    """
+    anr = _norm(_anr_line(recorded), current_ms=5000)
+    a = _incomplete(_summary([anr]))
+
+    result = p.diff_sessions(a, _summary([]))
+
+    assert [c["fingerprint"] for c in result["resolved_clusters"]] == [anr.fingerprint]
+    assert result["unconfirmed"] == []
+
+
+@pytest.mark.parametrize(
+    ("frames_a", "frames_b", "incomplete_side"),
+    [(120, 35, "second"), (35, 120, "first")],
+    ids=["improved-because-b-is-short", "worsened-because-a-is-short"],
+)
+def test_a_shared_cluster_does_not_drift_against_an_incomplete_side(
+    frames_a, frames_b, incomplete_side, recorded
+):
+    """Review of PR #34: an incomplete summary's maximum is only a lower bound.
+
+    The events it is missing could raise it, so comparing it read as
+    "improved" when the incomplete side was B and "worsened" when it was A --
+    the reviewer's two reproductions, here with the recorded jank line at two
+    substituted frame counts. With either side incomplete no shared cluster
+    drifts or counts as stable; each is listed as not compared, and why.
+    """
+    a, b = _summary([_named_jank(recorded, frames_a)]), _summary([_named_jank(recorded, frames_b)])
+    short = _incomplete(b if incomplete_side == "second" else a)
+
+    result = p.diff_sessions(a, b)
+
+    assert result["drift"] == [] and result["stable_count"] == 0, result["verdict"]
+    (entry,) = result["not_compared"]
+    assert entry["reason"] == f"not comparable: {short.session_id} is incomplete"
+    assert result["verdict"] == (
+        f"inconclusive: 1 shared cluster not comparable: {short.session_id} is incomplete"
+    )
+    assert "Not compared (1)" in p.format_diff(result)
 
 
 def test_a_named_cluster_with_no_unnamed_lookalike_is_still_new(recorded):
@@ -819,6 +1107,93 @@ def test_format_l0_single_line(recorded):
 def test_format_l0_empty():
     summary = _summary([])
     assert "no ANR/jank" in p.format_l0(summary)
+
+
+_FORMATS = {
+    "l0": p.format_l0,
+    "l1": p.format_l1,
+    "l2": p.format_l2,
+    "budget-60": lambda s: p.compress_to_budget(s, max_tokens=60),
+}
+
+
+@pytest.mark.parametrize("fmt", list(_FORMATS))
+@pytest.mark.parametrize("empty", [True, False], ids=["empty", "events"])
+def test_every_text_format_says_the_summary_is_incomplete(fmt, empty, recorded):
+    """B6: `incomplete: true` was in the JSON and nowhere in the text.
+
+    `--get-details ID` on a summary saved before its worker finished printed
+    "no ANR/jank ≥ threshold" and never the flag; the warning that said so
+    went to stderr once, at the stop, and is not there when it is read later.
+    """
+    events = [] if empty else [_norm(_jank_line(recorded, 120))]
+    summary = _incomplete(_summary(events))
+
+    out = _FORMATS[fmt](summary)
+
+    assert "incomplete" in out.lower(), out
+    assert "incomplete" not in _FORMATS[fmt](_summary(events)).lower()
+
+
+@pytest.mark.parametrize("fmt", ["l0", "l1", "l2"])
+def test_an_empty_incomplete_summary_does_not_say_there_was_nothing(fmt):
+    """ "No ANR/jank" about a partial capture is a claim about what it missed.
+
+    The empty statement is qualified as an observation of the part captured.
+    """
+    out = _FORMATS[fmt](_incomplete(_summary([])))
+
+    assert "in the part captured" in out, out
+
+
+@pytest.mark.parametrize("fmt", ["l0", "budget-60", "budget-10"])
+@pytest.mark.parametrize("empty", [True, False], ids=["empty", "events"])
+def test_no_budget_cuts_what_the_summary_could_not_see(fmt, empty, recorded):
+    """Codex review of PR #34: L0, and a budget that falls back to it, dropped every disclosure.
+
+    With a record cut, a pid unnamed, ANR reports unverified and the stream
+    broken, the one-liner printed only "no ANR/jank above threshold". The
+    budget cuts clusters; each disclosure survives, as a sentence or a marker.
+    """
+    events = [] if empty else [_norm(_jank_line(recorded, 120))]
+    summary = replace(
+        _summary(events),
+        cut_records=1,
+        unnamed_pids=[4242],
+        verification=p.VERIFICATION_UNKNOWN,
+        unverified_anr_lines=2,
+        stream_failure="the stream ended inside a record",
+    )
+    render = {
+        "l0": p.format_l0,
+        "budget-60": lambda s: p.compress_to_budget(s, max_tokens=60),
+        "budget-10": lambda s: p.compress_to_budget(s, max_tokens=10),
+    }[fmt]
+
+    out = render(summary).lower()
+
+    for disclosed in ("cut", "unnamed", "unverified", "broke"):
+        assert disclosed in out, (disclosed, out)
+
+
+def test_an_incomplete_summary_says_why(recorded):
+    """The reason the capture may be missing events is in the text, not only the flag."""
+    summary = replace(_summary([]), incomplete=True, incomplete_reason="the stream broke")
+
+    out = p.format_l1(summary)
+
+    assert "Incomplete: the stream broke" in out, out
+    assert p.summary_from_json(p.summary_to_json(summary)).incomplete_reason == "the stream broke"
+
+
+def test_the_cluster_drill_says_the_session_is_incomplete(recorded):
+    events = [_norm(_jank_line(recorded, 120)), _norm(_jank_line(recorded, 125))]
+    (cluster,) = p.cluster_events(events)
+
+    detail = p.format_cluster_detail(cluster, events, incomplete=True)
+
+    assert "incomplete" in detail.lower(), detail
+    assert "incomplete" not in p.format_cluster_detail(cluster, events).lower()
 
 
 def test_format_l1_includes_drill_hint(recorded):

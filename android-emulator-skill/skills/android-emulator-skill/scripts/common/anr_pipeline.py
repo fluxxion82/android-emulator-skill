@@ -7,13 +7,15 @@ Stages: parse → assemble → normalise → threshold → bucket → cluster �
 Each function is independently testable; the worker and the ``--stop`` path both
 compose them. The clustering / session / formatting machinery is ported nearly
 verbatim from the iOS HangBuster pipeline (``hang_pipeline.py``); only the
-*parse* layer (``parse_logcat_anr`` for one line, ``AnrRecordAssembler`` for
-the stream) and the severity bands are Android-native.
+*parse* layer (``parse_logcat_anr`` for one line of text, ``event_from_record``
+for one of logd's records, ``AnrRecordAssembler`` for the stream) and the
+severity bands are Android-native.
 
-Every reader of a log goes through ``AnrRecordAssembler`` (or
-``parse_logcat_stream`` for a finite dump), never ``parse_logcat_anr`` line by
-line: one stall is several lines in two subsystems' words, and only the
-assembler knows which of them are the same incident (D5).
+Every reader of a log reads logd's records (``logcat -B``, ``common.logcat``)
+and goes through ``AnrRecordAssembler`` (or ``parse_logcat_stream`` for a
+finite dump): one stall is reported by two subsystems, and only the assembler
+knows which reports are the same incident (D5) -- and which were written by
+system_server at all.
 
 Token budgets are enforced via a documented char/4 heuristic
 (``estimate_tokens``) — accurate to within ~10% of real tokenizers and
@@ -27,10 +29,14 @@ import itertools
 import json
 import math
 import re
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, tzinfo
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from common.logcat import LogRecord
 
 # === CONSTANTS ===
 
@@ -76,10 +82,11 @@ _SYMBOL_PATTERNS = [
     re.compile(r"\b([A-Z][A-Za-z0-9_$]+\.[A-Za-z_][\w$]+)\b"),
 ]
 
-# logcat threadtime format:
-#   MM-DD HH:MM:SS.mmm  PID  TID  PRIORITY  TAG: message
+# logcat threadtime format, at millisecond or (``-v usec``, what the live
+# readers ask for) microsecond precision:
+#   MM-DD HH:MM:SS.mmm[uuu]  PID  TID  PRIORITY  TAG: message
 _LOG_LINE_PATTERN = re.compile(
-    r"^(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})"
+    r"^(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}(?:\d{3})?)"
     r"\s+(\d+)"  # pid
     r"\s+(\d+)"  # tid
     r"\s+([VDIWEF])"  # priority
@@ -97,10 +104,9 @@ _SKIPPED_FRAMES_RE = re.compile(r"Skipped\s+(\d+)\s+frames", re.IGNORECASE)
 _FRAME_COUNT = re.compile(r"(Skipped\s+)\d+(\s+frames)", re.IGNORECASE)
 
 # ActivityManager writes one ANR as ONE log record of many lines -- "ANR in",
-# "PID:", "Reason:", "ErrorId:", "Frozen:", load, pressure, CPU usage -- and
-# logcat prints every line of a record under the identical header: timestamp,
-# pid, tid, priority and tag (recorded: logcat_anr_broadcast_stream). That
-# header is the only thing that says the lines belong together.
+# "PID:", "Reason:", "ErrorId:", "Frozen:", load, pressure, CPU usage -- one
+# message to logd (recorded: logcat_anr_broadcast_records), which logcat's text
+# prints as many lines under one header (logcat_anr_broadcast_stream).
 _ANR_RECORD_PID_RE = re.compile(r"^PID:\s*(\d+)\s*$")
 _ANR_RECORD_REASON_RE = re.compile(r"^Reason:\s*(.+?)\s*$")
 
@@ -129,21 +135,12 @@ _ANR_DUPLICATE_PREFIX = "Skipping duplicate ANR:"
 # What WindowManager's line says timed out: "...}. Reason:Input dispatching ..."
 _WINDOW_REASON_RE = re.compile(r"\.\s*Reason:\s*(.+?)\s*$")
 
-# "ActivityManager: Start proc 14407:com.example.composefixture/u0a205 for ..."
-# (recorded: logcat_app_restart) -- a pid and its process name, together.
-_START_PROC_RE = re.compile(r"\bStart proc (\d+):([^/\s]+)/")
-
 # A package as a whole token followed by its component's slash -- "(62056f6
 # com.example.composefixture/com.example..." in a duplicate verdict. Bounded on
 # the left so "example.composefixture" is not found inside
 # "com.example.composefixture" (review of PR #26: a substring match let one
 # app's verdict settle another app's ANR).
 _PACKAGE_TOKEN_RE = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.\w+)+)/")
-
-# ps's ELAPSED, in the two shapes recorded: MM:SS (ps_lifetime_just_started)
-# and HH:MM:SS (ps_lifetime). toybox documents a days form too; none has been
-# seen, so it is not read -- an age that cannot be read is no evidence.
-_ELAPSED_RE = re.compile(r"^(?:(\d+):)?(\d{2}):(\d{2})$")
 
 # One stalled app is reported by TWO subsystems in two different shapes. Both
 # are recorded: logcat_anr_broadcast and logcat_anr_input_dispatch.
@@ -246,9 +243,28 @@ class SessionSummary:
     clusters: list[Cluster]
     aggregates: dict
     fingerprint_version: int = FINGERPRINT_VERSION
-    # True when --stop gave up waiting for the worker: whatever it wrote after
-    # that is not in here (review of PR #26 -- never a silently short summary).
+    # True when the capture may be missing events: --stop gave up waiting for
+    # the worker (review of PR #26 -- never a silently short summary), the
+    # worker crashed or vanished, the stream broke, or ANR reports could not be
+    # authenticated (Codex review of PR #34). ``--diff`` then concludes nothing
+    # from what is absent. ``incomplete_reason`` says which, for the text forms.
     incomplete: bool = False
+    incomplete_reason: str | None = None
+    # Set when ANR reports could not be authenticated (system_server's pid was
+    # unknown) and were set aside: ``VERIFICATION_UNKNOWN``, with the count.
+    verification: str | None = None
+    unverified_anr_lines: int = 0
+    # Pids with records no process name could be given to: keyed by pid, and
+    # dropped under --package (review of PR #34).
+    unnamed_pids: list[int] = field(default_factory=list)
+    # Records a stop cut off mid-arrival (lost, and said), and the framing
+    # error a stream broke on, if one did (common.logcat's LogFramingError).
+    cut_records: int = 0
+    stream_failure: str | None = None
+
+
+# What a summary says when its ANR reports could not be authenticated.
+VERIFICATION_UNKNOWN = "system_server pid unknown — ANR records could not be authenticated"
 
 
 # === STAGE 1: PARSE ===
@@ -397,62 +413,138 @@ def is_anr_message(tag: str, message: str) -> bool:
 # === STAGE 1b: ASSEMBLE (lines -> incidents) ===
 
 
+def _printable_tag(tag: str) -> str:
+    """A tag with its non-printable characters escaped, as ``LogRecord.lines`` prints it."""
+    return "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in tag)
+
+
+def event_from_record(record: LogRecord, tz: tzinfo | None = None) -> dict | None:
+    """Classify ONE of logd's records (``logcat -B``) as an ANR/jank signal, else None.
+
+    The record's text is taken from :meth:`LogRecord.lines` -- printed as
+    ``-v threadtime -v usec`` would, its control characters escaped -- so what
+    an event stores and prints is what a reader of the log can see, and no
+    message can carry a line of its own. The classification is
+    :func:`parse_logcat_anr`'s, on the record's first line. A record is one
+    log message whole, so an ActivityManager ANR report arrives as ONE record:
+    its ``PID:`` and ``Reason:`` lines (recorded: logcat_anr_broadcast_records)
+    are read off it here, not assembled from later lines.
+
+    Who wrote the record is ``record.pid`` -- logd's, from the socket's
+    credentials -- never text. Whether an ANR report counts is
+    :class:`AnrRecordAssembler`'s to decide.
+
+    Args:
+        record: One record.
+        tz: The zone to print its time in (default: this host's, as
+            ``LogRecord.lines``).
+    """
+    prefix = replace(record, message="").lines(tz)[0]
+    pieces = [line[len(prefix) :] for line in record.lines(tz)]
+    tag = _printable_tag(record.tag)
+    classified = _classify_anr(tag, pieces[0].strip())
+    if classified is None:
+        return None
+    event: dict = {
+        # "MM-DD HH:MM:SS.uuuuuu": the head of the printed header.
+        "timestamp": prefix[:21],
+        "pid": record.pid,
+        "process": tag,
+        "message": pieces[0].strip(),
+        "kind": classified["kind"],
+        "duration_ms": classified["duration_ms"],
+    }
+    for key in ("frames", "component", "anr_package"):
+        if classified.get(key) is not None:
+            event[key] = classified[key]
+    if classified["kind"] == "anr":
+        for piece in pieces[1:]:
+            pid = _ANR_RECORD_PID_RE.match(piece)
+            if pid and "app_pid" not in event:
+                event["app_pid"] = int(pid.group(1))
+            reason = _ANR_RECORD_REASON_RE.match(piece)
+            if reason and "reason" not in event:
+                event["reason"] = reason.group(1)
+    return event
+
+
 class AnrRecordAssembler:
-    """Turn a logcat stream into ANR/jank events, one per incident.
+    """Turn logd's records into ANR/jank events, one per incident.
 
-    ``parse_logcat_anr`` answers "what does this line say"; this answers "which
-    lines are the same stall", which no single line can:
+    ``event_from_record`` answers "what does this record say"; this answers
+    "which records are the same stall", which no single record can:
 
-    - **One ANR is one record.** ActivityManager's ``ANR in`` line opens it, and
-      every following line under the identical header (timestamp, pid, tid,
-      priority, tag) is the same log record -- ``PID:`` is the stalled app's
-      own pid (the header's pid is system_server's), ``Reason:`` is the only
-      statement of what timed out. They are attached to the event instead of
-      becoming events (D5). So an ANR is held until the header changes, or
-      until the stream goes quiet (:meth:`flush`) or ends (:meth:`close`).
-    - **WindowManager's ANR line is a fallback.** It is a report to
+    - **One ANR is one record.** ActivityManager writes its report -- ``ANR
+      in``, ``PID:`` (the stalled app's own pid; the record's pid is
+      system_server's), ``Reason:`` (the only statement of what timed out),
+      and the load and CPU tables -- as ONE log message (recorded:
+      logcat_anr_broadcast_records), so it is one event with ``app_pid`` and
+      ``reason`` (D5).
+    - **WindowManager's ANR report is a fallback.** It is a report to
       ActivityManager, which normally records the incident itself, before or
       after it (see ``_ANR_PRECURSOR_TAGS``). It is dropped when ActivityManager
       records -- or calls a duplicate -- an ANR of the same package within
-      ``ANR_CORRELATION_MS`` of it, by logcat time; otherwise it is the event,
-      emitted once that window has passed (later lines, or a quiet stream) or
-      the stream ends. Emitted late, so it can follow events logged after it.
+      ``ANR_CORRELATION_MS`` of it, by log time; otherwise it is the event,
+      emitted once that window has passed (later records, or a quiet stream)
+      or the stream ends. Emitted late, so it can follow events logged after it.
 
-    Jank and StrictMode lines are single-line incidents and come straight out.
+    Jank and StrictMode records are single incidents and come straight out.
     Every reader -- ``--watch``, ``--since`` and the session worker -- feeds its
-    lines through one of these, so they agree on what one ANR is.
+    records through one of these, so they agree on what one ANR is.
+
+    **An ANR report counts only as system_server wrote it** (review of PR #34).
+    Any app may log under ActivityManager's or WindowManager's tag: one wrote
+    ``ANR in <another package>`` and was counted, and one wrote ``Skipping
+    duplicate ANR: <package>/…`` and settled a real WindowManager report, so
+    that ANR vanished. An ``ANR in`` record and a duplicate verdict count only
+    with all of: the tag exactly, the sentence as the exact opening of the
+    record's message (a later line of a system_server message is whatever an
+    app put there -- a broadcast's action), and the record's pid -- logd's,
+    from the writing socket, which no tag or message can forge (recorded:
+    logcat_tag_injection_records) -- being system_server's
+    (``system_server_pid``, asked once, when the first such record arrives).
+    When that pid is unknown nothing is authenticated, so nothing counts --
+    and :attr:`unverified` says how many such records were set aside, for the
+    reader to disclose: a reader that could not authenticate has not found
+    "no ANRs".
+
+    Args:
+        system_server_pid: system_server's pid, or a function returning it
+            (None when the device cannot say). None: no report counts.
     """
 
-    def __init__(self) -> None:
-        self._pending: dict | None = None
-        self._header: tuple[str, ...] | None = None
-        # WindowManager reports waiting for ActivityManager: (logcat ms, event).
+    def __init__(self, system_server_pid: str | Callable[[], str | None] | None = None) -> None:
+        # WindowManager reports waiting for ActivityManager: (log ms, event).
         self._held: list[tuple[int, dict]] = []
-        # package -> logcat ms of ActivityManager's latest record for it.
+        # package -> log ms of ActivityManager's latest record for it.
         self._recorded: dict[str, int] = {}
+        self._system_server = system_server_pid
+        self._system_server_asked = not callable(system_server_pid)
+        # Report records set aside because system_server's pid was unknown.
+        self.unverified = 0
 
-    def feed(self, line: str) -> list[dict]:
-        """Take one line; return the events it completes (often none)."""
-        match = _LOG_LINE_PATTERN.match(line.rstrip("\r\n"))
-        header = match.groups()[:5] if match else None
-        message = match.group(6).strip() if match else ""
-        completed: list[dict] = []
-        if self._pending is not None:
-            if header == self._header and not message.startswith("ANR in "):
-                self._attach(message)
+    def _written_by_system_server(self, writer: int) -> bool | None:
+        """True or False -- or None when system_server's pid is unknown."""
+        if not self._system_server_asked:
+            self._system_server_asked = True
+            self._system_server = self._system_server()
+        if self._system_server is None:
+            self.unverified += 1
+            return None
+        return str(writer) == str(self._system_server)
+
+    def feed(self, record: LogRecord) -> list[dict]:
+        """Take one record; return the events it completes (often none)."""
+        at_ms = record.sec * 1000 + record.nsec // 1_000_000
+        completed = self._release(lambda held_ms: at_ms - held_ms > ANR_CORRELATION_MS)
+        tag = record.tag
+        if tag == "ActivityManager" and record.message.startswith(_ANR_DUPLICATE_PREFIX):
+            if not self._written_by_system_server(record.pid):
                 return completed
-            completed.extend(self._close_record())
-        if match is None:
-            return completed
-
-        at_ms = _timestamp_to_ms(match.group(1))
-        completed.extend(self._release(lambda held_ms: at_ms - held_ms > ANR_CORRELATION_MS))
-        tag = match.group(5).strip()
-        if tag == "ActivityManager" and message.startswith(_ANR_DUPLICATE_PREFIX):
             # ActivityManager's own word that a report belongs to a stall it
             # has already recorded. It settles a held report only for a
             # package it names exactly, and only within the window.
-            named = set(_PACKAGE_TOKEN_RE.findall(message))
+            named = set(_PACKAGE_TOKEN_RE.findall(record.message))
             self._held = [
                 (ms, e)
                 for ms, e in self._held
@@ -460,17 +552,23 @@ class AnrRecordAssembler:
             ]
             return completed
 
-        event = parse_logcat_anr(line)
+        event = event_from_record(record)
         if event is None:
             return completed
         if event["kind"] != "anr":
             completed.append(event)
             return completed
+        if not (
+            tag in ("ActivityManager", *_ANR_PRECURSOR_TAGS)
+            and record.message.startswith("ANR in ")
+            and self._written_by_system_server(record.pid)
+        ):
+            return completed
         package = event.get("anr_package") or ""
-        if event["process"] in _ANR_PRECURSOR_TAGS:
+        if tag in _ANR_PRECURSOR_TAGS:
             recorded_ms = self._recorded.get(package)
             if recorded_ms is None or abs(at_ms - recorded_ms) > ANR_CORRELATION_MS:
-                reason = _WINDOW_REASON_RE.search(message)
+                reason = _WINDOW_REASON_RE.search(event["message"])
                 if reason:
                     event["reason"] = reason.group(1)
                 self._held.append((at_ms, event))
@@ -481,34 +579,26 @@ class AnrRecordAssembler:
             for ms, e in self._held
             if e.get("anr_package") != package or abs(at_ms - ms) > ANR_CORRELATION_MS
         ]
-        self._pending, self._header = event, header
+        completed.append(event)
         return completed
 
     def flush(self, quiet_seconds: float = 0.0) -> list[dict]:
         """The stream has gone quiet: emit what quiet completes.
 
-        An open ActivityManager record is complete (it arrives as one burst).
-        A held WindowManager report is not, unless the stream has been quiet for
-        the whole correlation window -- ActivityManager logs in real time, so
-        a record that has not come by then is not coming.
+        A held WindowManager report is complete only once the stream has been
+        quiet for the whole correlation window -- ActivityManager logs in real
+        time, so a record that has not come by then is not coming.
 
         Args:
             quiet_seconds: How long the stream has delivered nothing.
         """
-        completed = self._close_record()
         if quiet_seconds * 1000 >= ANR_CORRELATION_MS:
-            completed.extend(self._release(lambda _held_ms: True))
-        return completed
+            return self._release(lambda _held_ms: True)
+        return []
 
     def close(self) -> list[dict]:
         """The stream has ended: emit everything still held."""
-        return [*self._close_record(), *self._release(lambda _held_ms: True)]
-
-    def _close_record(self) -> list[dict]:
-        if self._pending is None:
-            return []
-        event, self._pending, self._header = self._pending, None, None
-        return [event]
+        return self._release(lambda _held_ms: True)
 
     def _release(self, due) -> list[dict]:
         """Emit, as events, the held WindowManager reports ``due`` says are due."""
@@ -516,80 +606,21 @@ class AnrRecordAssembler:
         self._held = [(ms, event) for ms, event in self._held if not due(ms)]
         return released
 
-    def _attach(self, message: str) -> None:
-        """Fold one line of the open ANR record into its event.
 
-        Only the fields worth carrying are kept; ``ErrorId:``, ``Frozen:``, the
-        load and CPU tables are the same record and are simply not events.
-        """
-        pending = self._pending
-        if pending is None:
-            return
-        pid = _ANR_RECORD_PID_RE.match(message)
-        if pid and "app_pid" not in pending:
-            pending["app_pid"] = int(pid.group(1))
-            return
-        reason = _ANR_RECORD_REASON_RE.match(message)
-        if reason and "reason" not in pending:
-            pending["reason"] = reason.group(1)
+def parse_logcat_stream(
+    records: Iterable[LogRecord], system_server_pid: str | Callable[[], str | None] | None = None
+) -> list[dict]:
+    """Every ANR/jank incident in a finite run of records (a ``logcat -d -B`` dump).
 
-
-def parse_logcat_stream(lines: Iterable[str]) -> list[dict]:
-    """Every ANR/jank incident in a finite run of logcat lines (a ``-d`` dump)."""
-    assembler = AnrRecordAssembler()
+    ``system_server_pid`` authenticates the ANR reports (see
+    :class:`AnrRecordAssembler`); without it none counts.
+    """
+    assembler = AnrRecordAssembler(system_server_pid)
     events: list[dict] = []
-    for line in lines:
-        events.extend(assembler.feed(line))
+    for record in records:
+        events.extend(assembler.feed(record))
     events.extend(assembler.close())
     return events
-
-
-def parse_start_proc(line: str) -> tuple[int, str] | None:
-    """``(pid, process name)`` from ActivityManager's ``Start proc`` line, else None.
-
-    Recorded in logcat_app_restart: ``Start proc 14407:com.example.composefixture/
-    u0a205 for next-top-activity {...}``. The one line that names a process and
-    its pid together as the process starts, so a session sees it for every app
-    (re)started while it runs.
-    """
-    match = _LOG_LINE_PATTERN.match(line.rstrip("\r\n"))
-    if not match or match.group(5).strip() != "ActivityManager":
-        return None
-    started = _START_PROC_RE.search(match.group(6))
-    return (int(started.group(1)), started.group(2)) if started else None
-
-
-@dataclass(frozen=True)
-class ProcessAge:
-    """Who holds a pid now, and for how long they have held it."""
-
-    name: str
-    age: timedelta
-
-
-def parse_process_age(text: str, pid: int) -> ProcessAge | None:
-    """Read ``ps -o PID,NAME,ELAPSED -p <pid>``.
-
-    Recorded as ``ps_lifetime`` (ELAPSED as HH:MM:SS), ``ps_lifetime_just_started``
-    (MM:SS) and ``ps_lifetime_not_running`` (the header alone, exit 1). ELAPSED
-    is the age of the pid's CURRENT owner -- a duration, so comparing it needs
-    no clock on the device and no wall time on either side. Only a row whose
-    PID is ``pid`` counts, so the header is never a process. None when nothing
-    holds the pid, or its age is in a shape not recorded (days).
-    """
-    for row in text.splitlines():
-        fields = row.split()
-        if len(fields) < 3 or fields[0] != str(pid):
-            continue
-        elapsed = _ELAPSED_RE.match(fields[-1])
-        if elapsed is None:
-            return None
-        hours, minutes, seconds = (int(part or 0) for part in elapsed.groups())
-        return ProcessAge(
-            name=" ".join(fields[1:-1]),
-            age=timedelta(hours=hours, minutes=minutes, seconds=seconds),
-        )
-    return None
 
 
 # === STAGE 2: NORMALISE ===
@@ -858,32 +889,141 @@ def rank_clusters(clusters: list[Cluster], top_n: int | None = None) -> list[Clu
 # === STAGE 9: FORMAT ===
 
 
+# What every text form says of a summary saved before its worker finished
+# (``SessionSummary.incomplete``). It was in the JSON alone: `--get-details`
+# read such a summary back as "no ANR/jank ≥ threshold", and the warning that
+# said otherwise went to stderr once, at the stop (B6).
+INCOMPLETE_NOTE = (
+    "Incomplete: saved before the session's worker finished, so events it wrote "
+    "later are missing -- what is absent here may simply be unwritten."
+)
+
+
+def _session_label(summary: SessionSummary) -> str:
+    """``Session <id>``, marked when the summary is incomplete."""
+    marker = " (incomplete)" if summary.incomplete else ""
+    return f"Session {summary.session_id}{marker}"
+
+
+def _nothing_found(summary: SessionSummary, threshold: str) -> str:
+    """'No ANR/jank', qualified by what the summary could and could not see."""
+    verified = " verified" if summary.verification else ""
+    where = " in the part captured" if summary.incomplete else ""
+    return f"no{verified} ANR/jank {threshold} threshold{where}"
+
+
+def _unverified_note(summary: SessionSummary) -> str:
+    """The disclosure for ANR reports set aside unauthenticated (empty when none were)."""
+    if not summary.verification:
+        return ""
+    plural = "s" if summary.unverified_anr_lines != 1 else ""
+    return (
+        f"Unverified: {summary.verification} ({summary.unverified_anr_lines} report "
+        f"record{plural} set aside, not counted)."
+    )
+
+
+def _unnamed_note(summary: SessionSummary) -> str:
+    """One sentence on the pids no process name was found for (empty when none)."""
+    pids = summary.unnamed_pids
+    if not pids:
+        return ""
+    shown = ", ".join(str(pid) for pid in pids[:8]) + (", …" if len(pids) > 8 else "")
+    plural = "s" if len(pids) != 1 else ""
+    return (
+        f"Unnamed: {len(pids)} pid{plural} ({shown}) -- only a process whose verified "
+        f"Start proc this session saw is named; the rest are keyed by pid, and "
+        f"--package drops them."
+    )
+
+
+def _framing_note(summary: SessionSummary) -> str:
+    """What the stream itself lost: a record cut by the stop, or a break (empty when neither)."""
+    notes = []
+    if summary.stream_failure:
+        notes.append(
+            f"Broken: the stream stopped being logd's records ({summary.stream_failure}); "
+            f"nothing after that is in here."
+        )
+    if summary.cut_records:
+        plural = "s" if summary.cut_records != 1 else ""
+        notes.append(
+            f"Cut: {summary.cut_records} record{plural} arriving when the session stopped "
+            f"{'are' if plural else 'is'} not in here."
+        )
+    return " ".join(notes)
+
+
+def _incomplete_note(reason: str | None) -> str:
+    """The Incomplete: line, saying why when the summary recorded why."""
+    if not reason:
+        return INCOMPLETE_NOTE
+    return f"Incomplete: {reason} -- what is absent here may simply be unseen."
+
+
+def _disclosures(summary: SessionSummary) -> list[str]:
+    """What the summary could not see, one line each, for the text forms."""
+    notes = [_incomplete_note(summary.incomplete_reason)] if summary.incomplete else []
+    found = (_framing_note(summary), _unverified_note(summary), _unnamed_note(summary))
+    return [*notes, *(note for note in found if note)]
+
+
+def _markers(summary: SessionSummary) -> str:
+    """The disclosures as one bracketed clause, for the one-line form.
+
+    L0 is what a tight token budget falls back to, so it is the form a
+    disclosure must survive in: a budget cuts clusters, never what the
+    summary could not see (Codex review of PR #34).
+    """
+
+    def counted(count: int, noun: str, what: str) -> str:
+        return f"{count} {noun}{'s' if count != 1 else ''} {what}"
+
+    marks = []
+    if summary.stream_failure:
+        marks.append("stream broken")
+    if summary.cut_records:
+        marks.append(counted(summary.cut_records, "record", "cut by the stop"))
+    if summary.verification:
+        marks.append(counted(summary.unverified_anr_lines, "ANR record", "unverified"))
+    if summary.unnamed_pids:
+        marks.append(counted(len(summary.unnamed_pids), "pid", "unnamed"))
+    return f" [{'; '.join(marks)}]" if marks else ""
+
+
 def format_l0(summary: SessionSummary) -> str:
     """Single-line status (~20 tokens). Cache-friendly for agent context."""
+    marks = _markers(summary)
     if not summary.clusters:
-        return f"Session {summary.session_id}: no ANR/jank above threshold."
+        return f"{_session_label(summary)}: {_nothing_found(summary, 'above')}.{marks}"
     top = summary.clusters[0]
     critical = sum(
         1 for c in summary.clusters if c.severity in (Severity.CRITICAL, Severity.FROZEN)
     )
     return (
-        f"Session {summary.session_id}: {summary.duration_ms / 1000:.1f}s, "
+        f"{_session_label(summary)}: {summary.duration_ms / 1000:.1f}s, "
         f"{summary.event_count} events ({critical} critical), top: "
-        f"{top.symbol_or_prefix} {top.max_duration_ms:.0f}ms ×{top.count}"
+        f"{top.symbol_or_prefix} {top.max_duration_ms:.0f}ms ×{top.count}{marks}"
     )
 
 
 def format_l1(summary: SessionSummary, top_n: int = 3) -> str:
     """Default ~80-120 token output: header + top-N clusters + drill hint."""
+    note = _disclosures(summary)
     if not summary.clusters:
-        return (
-            f"Session {summary.session_id}: {summary.duration_ms / 1000:.1f}s, "
-            f"no ANR/jank ≥ threshold (scanned {summary.matched_lines}/{summary.total_lines} lines).\n"
-            f"Drill: anr_watcher.py --get-details {summary.session_id}"
+        return "\n".join(
+            [
+                f"{_session_label(summary)}: {summary.duration_ms / 1000:.1f}s, "
+                f"{_nothing_found(summary, '≥')} "
+                f"(scanned {summary.matched_lines}/{summary.total_lines} lines).",
+                *note,
+                f"Drill: anr_watcher.py --get-details {summary.session_id}",
+            ]
         )
     lines = [
-        f"Session {summary.session_id}: {summary.duration_ms / 1000:.1f}s captured, "
-        f"{len(summary.clusters)} clusters ({summary.event_count} events)"
+        f"{_session_label(summary)}: {summary.duration_ms / 1000:.1f}s captured, "
+        f"{len(summary.clusters)} clusters ({summary.event_count} events)",
+        *note,
     ]
     icons = {
         Severity.MINOR: "·",
@@ -929,8 +1069,21 @@ def format_l2(summary: SessionSummary) -> str:
     return "\n".join(parts)
 
 
-def format_cluster_detail(cluster: Cluster, events: list[NormalisedEvent]) -> str:
-    """L3: per-event detail for a single cluster."""
+def format_cluster_detail(
+    cluster: Cluster,
+    events: list[NormalisedEvent],
+    incomplete: bool = False,
+    incomplete_reason: str | None = None,
+) -> str:
+    """L3: per-event detail for a single cluster.
+
+    Args:
+        cluster: The cluster.
+        events: Its events, as the session stored them.
+        incomplete: The session's summary was saved incomplete, so the
+            cluster may be missing events and its counts be low.
+        incomplete_reason: Why, as the summary recorded it.
+    """
     lines = [
         f"Cluster: {cluster.symbol_or_prefix}",
         f"  fingerprint={cluster.fingerprint} severity={cluster.severity.value} "
@@ -938,6 +1091,8 @@ def format_cluster_detail(cluster: Cluster, events: list[NormalisedEvent]) -> st
         f"  count={cluster.count} max={cluster.max_duration_ms:.0f}ms "
         f"total={cluster.total_duration_ms:.0f}ms first@{cluster.first_delta_ms}ms",
     ]
+    if incomplete:
+        lines.append(f"  {_incomplete_note(incomplete_reason)}")
     for event in events[:20]:
         frame_str = f" frames={event.frames}" if event.frames is not None else ""
         lines.append(
@@ -1003,6 +1158,29 @@ def format_diff(diff: dict) -> str:
                 f"{cluster['max_duration_ms']:.0f}ms × {cluster['count']} — "
                 f"{cluster['symbol_or_prefix']}"
             )
+    unconfirmed = diff.get("unconfirmed", [])
+    if unconfirmed:
+        lines.append(
+            f"Unconfirmed ({len(unconfirmed)}): missing only from an incomplete session, "
+            f"which may simply not have written them:"
+        )
+        for cluster in unconfirmed[:5]:
+            lines.append(
+                f"  ? {cluster['session']}, absent from {cluster['absent_from']}: "
+                f"{cluster['severity']} {cluster['max_duration_ms']:.0f}ms × "
+                f"{cluster['count']} — {cluster['symbol_or_prefix']}"
+            )
+    not_compared = diff.get("not_compared", [])
+    if not_compared:
+        lines.append(
+            f"Not compared ({len(not_compared)}): in both sessions, but a maximum from an "
+            f"incomplete one is only a lower bound -- {not_compared[0]['reason']}:"
+        )
+        for entry in not_compared[:5]:
+            lines.append(
+                f"  ? {entry['symbol_or_prefix']}: {entry['max_duration_ms_a']:.0f} / "
+                f"{entry['max_duration_ms_b']:.0f}ms"
+            )
     return "\n".join(lines)
 
 
@@ -1064,6 +1242,13 @@ def diff_sessions(
     ``Infinity`` -- not JSON, so ``--diff --json`` handed a strict parser a
     document it could not read, at precisely the moment something got worse
     (N9). A 0 → N cluster counts as worsened.
+
+    ``unconfirmed`` holds the clusters one session has and the other, saved
+    ``incomplete``, lacks -- each with ``session`` (where it is) and
+    ``absent_from`` -- in place of calling them resolved or new. With either
+    side incomplete, ``not_compared`` holds the clusters both have, in place of
+    a drift or stability verdict: an incomplete side's maximum is only a lower
+    bound.
     """
     if summary_a.fingerprint_version != summary_b.fingerprint_version:
         return {
@@ -1091,7 +1276,26 @@ def diff_sessions(
     shared_keys = a_map.keys() & b_map.keys()
     drift: list[dict] = []
     stable = 0
-    for key in shared_keys:
+    # An incomplete summary's maximum is only a lower bound: the events it is
+    # missing could raise it. Compared anyway, it read as "improved" one way
+    # round and "worsened" the other (review of PR #34). So with either side
+    # incomplete, no shared cluster drifts or holds stable; each is listed as
+    # not compared, and why.
+    incomplete_ids = list(
+        dict.fromkeys(s.session_id for s in (summary_a, summary_b) if s.incomplete)
+    )
+    because = " and ".join(f"{sid} is incomplete" for sid in incomplete_ids)
+    not_compared = [
+        {
+            "fingerprint": key,
+            "symbol_or_prefix": b_map[key].symbol_or_prefix,
+            "max_duration_ms_a": a_map[key].max_duration_ms,
+            "max_duration_ms_b": b_map[key].max_duration_ms,
+            "reason": f"not comparable: {because}",
+        }
+        for key in (sorted(shared_keys) if incomplete_ids else [])
+    ]
+    for key in shared_keys if not incomplete_ids else ():
         ca, cb = a_map[key], b_map[key]
         if ca.max_duration_ms == 0 and cb.max_duration_ms == 0:
             stable += 1
@@ -1137,8 +1341,31 @@ def diff_sessions(
         )
         for cluster in (cluster_map[k] for k in sorted(keys))
     )
-    new_clusters = [_cluster_to_dict(b_map[k]) for k in new_keys - uncertain_new]
-    resolved_clusters = [_cluster_to_dict(a_map[k]) for k in resolved_keys - uncertain_resolved]
+    # Absence is the one thing an incomplete summary cannot show: a cluster
+    # missing from a session saved before its worker finished may simply be
+    # unwritten. "improvement: 1 resolved; B is incomplete" concluded it
+    # anyway (B3). So a cluster absent from the incomplete side is neither
+    # resolved (B incomplete) nor new (A incomplete) but unconfirmed; what both
+    # sides hold still compares, and so does what the complete side lacks.
+    unconfirmed_resolved = resolved_keys - uncertain_resolved if summary_b.incomplete else set()
+    unconfirmed_new = new_keys - uncertain_new if summary_a.incomplete else set()
+    unconfirmed = [
+        {
+            **_cluster_to_dict(cluster_map[k]),
+            "session": present.session_id,
+            "absent_from": absent.session_id,
+        }
+        for keys, cluster_map, present, absent in (
+            (unconfirmed_resolved, a_map, summary_a, summary_b),
+            (unconfirmed_new, b_map, summary_b, summary_a),
+        )
+        for k in sorted(keys)
+    ]
+    new_clusters = [_cluster_to_dict(b_map[k]) for k in new_keys - uncertain_new - unconfirmed_new]
+    resolved_clusters = [
+        _cluster_to_dict(a_map[k])
+        for k in resolved_keys - uncertain_resolved - unconfirmed_resolved
+    ]
     new_critical = sum(
         1 for c in new_clusters if c["severity"] in (Severity.CRITICAL.value, Severity.FROZEN.value)
     )
@@ -1159,14 +1386,20 @@ def diff_sessions(
     # the same (review of PR #26). A summary saved before its worker finished
     # may be missing events the same way. Nothing else changed: inconclusive.
     # Something did: the verdict stands, and names what it stands on.
-    caveats = [
-        f"{summary.session_id} is incomplete"
-        for summary in (summary_a, summary_b)
-        if summary.incomplete
-    ]
+    caveats = []
     if not_comparable:
         plural = "s" if len(not_comparable) != 1 else ""
-        caveats.insert(0, f"{len(not_comparable)} cluster{plural} could not be compared")
+        caveats.append(f"{len(not_comparable)} cluster{plural} could not be compared")
+    if unconfirmed:
+        plural = "s" if len(unconfirmed) != 1 else ""
+        caveats.append(
+            f"{len(unconfirmed)} cluster{plural} missing only from an incomplete session"
+        )
+    if not_compared:
+        plural = "s" if len(not_compared) != 1 else ""
+        caveats.append(f"{len(not_compared)} shared cluster{plural} not comparable: {because}")
+    elif incomplete_ids:
+        caveats.append(because)
     if caveats:
         verdict = (
             "inconclusive: " + "; ".join(dict.fromkeys(caveats))
@@ -1182,6 +1415,8 @@ def diff_sessions(
         "drift": drift,
         "stable_count": stable,
         "not_comparable": not_comparable,
+        "unconfirmed": unconfirmed,
+        "not_compared": not_compared,
         "incomplete": [s.session_id for s in (summary_a, summary_b) if s.incomplete],
         "verdict": verdict,
     }
@@ -1227,6 +1462,12 @@ def summary_to_json(summary: SessionSummary) -> dict:
         "total_lines": summary.total_lines,
         "fingerprint_version": summary.fingerprint_version,
         "incomplete": summary.incomplete,
+        "incomplete_reason": summary.incomplete_reason,
+        "verification": summary.verification,
+        "unverified_anr_lines": summary.unverified_anr_lines,
+        "unnamed_pids": {"count": len(summary.unnamed_pids), "pids": summary.unnamed_pids},
+        "cut_records": summary.cut_records,
+        "stream_failure": summary.stream_failure,
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
     }
@@ -1247,6 +1488,12 @@ def summary_from_json(payload: dict) -> SessionSummary:
         aggregates=payload.get("aggregates", {}),
         fingerprint_version=payload.get("fingerprint_version", 1),
         incomplete=payload.get("incomplete", False),
+        incomplete_reason=payload.get("incomplete_reason"),
+        verification=payload.get("verification"),
+        unverified_anr_lines=payload.get("unverified_anr_lines", 0),
+        unnamed_pids=list((payload.get("unnamed_pids") or {}).get("pids", [])),
+        cut_records=payload.get("cut_records", 0),
+        stream_failure=payload.get("stream_failure"),
     )
 
 

@@ -721,64 +721,96 @@ def test_d4_the_fake_device_filters_by_pid_like_a_real_one(toolchain, recorded):
 # ===========================================================================
 
 
-def _pipeline(lines: list[str]):
-    """Recorded lines -> (events, clusters), as the session path composes them.
+BROADCAST_RECORDS = "logcat_anr_broadcast_records"
+
+
+def _records(recorded, name: str):
+    """A recorded ``logcat -B`` dump, read by common.logcat as every ANR reader reads it."""
+    from common import logcat
+
+    return logcat.parse_records(recorded.data(f"{name}.bin"))
+
+
+def _measured_system_server(recorded, name: str) -> str:
+    """system_server's pid as `pidof system_server` answered in ``name``'s own run."""
+    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == name)
+    pid = str(entry.get("system_server_pid", ""))
+    if not pid.isdigit():
+        pytest.fail(f"{name} records no system_server pid; re-record it")
+    return pid
+
+
+def _pipeline(records, system_server_pid: str | None = None):
+    """Recorded records -> (events, clusters), as the session path composes them.
 
     What each of ``anr_watcher``'s readers actually runs:
 
-    - the legacy ``--since``/``--watch`` reader (``AnrWatcher._handle_line``)
-      feeds each line to an ``AnrRecordAssembler`` and prints the events it
+    - the legacy ``--since``/``--watch`` reader (``AnrWatcher._handle_record``)
+      feeds each record to an ``AnrRecordAssembler`` and prints the events it
       completes. Its count is pinned through the CLI below.
     - the session worker (``_read_stream_into_events``) feeds the same
       assembler and normalises (``build_normalised_event``); ``--stop``
       clusters when it builds the summary (``SessionStore.build_summary`` ->
       ``cluster_events`` via ``SummaryBuilder``).
 
-    This helper is the session composition, run over recorded lines without a
-    stream. D5's fix introduced the multi-line entry point, so the readers and
-    this helper go through it (``parse_logcat_stream`` is the assembler over a
-    finite run of lines); the assertions below did not change.
+    This helper is the session composition, run over recorded records (logd's,
+    `logcat -B`, which every reader reads since PR #34) without a stream.
+    ``parse_logcat_stream`` is the assembler over a finite run of records; an
+    ANR report counts only as system_server wrote it, so its pid is passed as
+    the recording's run measured it.
     """
     from common import anr_pipeline as p
 
     events = []
-    for raw in p.parse_logcat_stream(lines):
+    for raw in p.parse_logcat_stream(records, system_server_pid=system_server_pid):
         event = p.build_normalised_event(raw, session_start_ms=0, current_ms=1000)
         if event is not None:
             events.append(event)
     return events, p.cluster_events(events)
 
 
-def _jank_lines(recorded, frame_counts, pid: str | None = None) -> list[str]:
-    """The recorded Choreographer line once per count, with only the count changed.
+def _jank_records(recorded, frame_counts, pid: int | None = None) -> list:
+    """The recorded Choreographer record once per count, with only the count changed.
 
-    ``pid`` substitutes the PID and TID columns as well -- a second process
-    janking, which is a different site. Everything else stays the recording.
+    ``pid`` substitutes the writer's pid as well -- a second process janking,
+    which is a different site. Everything else stays the recording.
     """
+    from dataclasses import replace
+
     template = next(
-        (line for line in recorded.lines("logcat_choreographer_jank") if "Skipped" in line), None
+        (
+            r
+            for r in _records(recorded, "logcat_app_restart_records")
+            if r.tag == "Choreographer" and r.message.startswith("Skipped")
+        ),
+        None,
     )
     if template is None:
-        pytest.fail("logcat_choreographer_jank holds no Skipped line")
-    lines = []
+        pytest.fail("logcat_app_restart_records holds no Skipped record")
+    records = []
     for n in frame_counts:
-        line = re.sub(r"Skipped \d+ frames", f"Skipped {n} frames", template)
-        if pid is not None:
-            line = re.sub(r"^(\S+ \S+\s+)\d+(\s+)\d+", rf"\g<1>{pid}\g<2>{pid}", line)
-        lines.append(line)
-    return lines
+        record = replace(
+            template, message=re.sub(r"Skipped \d+ frames", f"Skipped {n} frames", template.message)
+        )
+        records.append(replace(record, pid=pid) if pid is not None else record)
+    return records
 
 
 def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(recorded):
     """D5: ``common/anr_pipeline.py:258-266``.
 
-    ActivityManager reports one ANR as four lines under one tag: ``ANR in``,
-    ``PID:``, ``Reason:``, ``ErrorId:`` (recorded: logcat_anr_broadcast). The
-    follow-on branch classifies a line as an ANR if it holds "anr" and
-    "reason:" -- and this Reason line names the intent action ``PROVOKE_ANR``
-    -- so one stall arrives as two events in two clusters.
+    ActivityManager reports one ANR as one message of many lines: ``ANR in``,
+    ``PID:``, ``Reason:``, ``ErrorId:`` (recorded: logcat_anr_broadcast, and as
+    ONE record in logcat_anr_broadcast_records). The follow-on branch
+    classified a line as an ANR if it held "anr" and "reason:" -- and this
+    Reason line names the intent action ``PROVOKE_ANR`` -- so one stall
+    arrived as two events in two clusters. The records here are the whole
+    stall: WindowManager's report and the duplicate verdict too.
     """
-    events, clusters = _pipeline(recorded.lines("logcat_anr_broadcast"))
+    events, clusters = _pipeline(
+        _records(recorded, BROADCAST_RECORDS),
+        _measured_system_server(recorded, BROADCAST_RECORDS),
+    )
     assert len(events) == 1, [e.raw_message for e in events]
     assert len(clusters) == 1, [c.symbol_or_prefix for c in clusters]
 
@@ -786,14 +818,21 @@ def test_d5_a_broadcast_anr_is_one_event_and_one_cluster(recorded):
 def test_d5_since_reports_a_broadcast_anr_once(toolchain, recorded):
     """D5 through the CLI, in the finite mode: ``--since 1m --json``.
 
-    ``--since`` reads a ``logcat -d`` dump to the end and prints one JSON line
-    per event, so the count an agent sees is the count of lines.
+    ``--since`` reads a ``logcat -d -B`` dump to the end and prints one JSON
+    line per event, so the count an agent sees is the count of lines.
     """
     toolchain.install(
         "adb",
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
-            Rule(("logcat",), stdout=recorded.text("logcat_anr_broadcast")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            # Who system_server is, for the ANR report to count: as `pidof`
+            # answered in the recording's own run.
+            Rule(
+                ("pidof", "system_server"),
+                stdout=_measured_system_server(recorded, BROADCAST_RECORDS) + "\n",
+            ),
+            Rule(("logcat",), stdout=recorded.data(f"{BROADCAST_RECORDS}.bin")),
         ],
     )
     result = toolchain.run("anr_watcher.py", "--since", "1m", "--json")
@@ -809,13 +848,14 @@ def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(recorded):
 
     So the frame count of ``Skipped N frames!`` stays in the normalised prefix,
     and the same process dropping 31, 45, 52 and 120 frames fingerprints four
-    ways. The lines are the recorded Choreographer line with only the count
-    substituted (counts cannot be recorded to order; everything else can).
+    ways. The records are the recorded Choreographer record with only the
+    count substituted (counts cannot be recorded to order; everything else can).
     """
-    events, clusters = _pipeline(_jank_lines(recorded, (31, 45, 52, 120)))
+    events, clusters = _pipeline(_jank_records(recorded, (31, 45, 52, 120)))
     if len(events) != 4:
         pytest.fail(
-            f"four recorded jank lines gave {len(events)} events: {[e.raw_message for e in events]}"
+            f"four recorded jank records gave {len(events)} events: "
+            f"{[e.raw_message for e in events]}"
         )
     assert len(clusters) == 1, [c.symbol_or_prefix for c in clusters]
 
@@ -823,17 +863,16 @@ def test_a5_one_janking_screen_is_one_cluster_whatever_it_dropped(recorded):
 def test_a5_two_janking_processes_stay_two_sites(recorded):
     """A5's other direction, unmarked: unrelated jank is not one cluster.
 
-    Collapsing EVERY Choreographer line into one fingerprint also satisfies
+    Collapsing EVERY Choreographer record into one fingerprint also satisfies
     the spec above, and would report two apps' jank as one site (review of
-    PR #20). Here two processes -- the recorded line, and the same line with
-    its PID/TID columns substituted -- jank twice each; no fingerprint may
+    PR #20). Here two processes -- the recorded record, and the same record
+    with its writer's pid substituted -- jank twice each; no fingerprint may
     hold both. Green today only because the counts differ; the A5 fix must
     keep it green by telling the processes apart, not by keeping the counts.
     """
-    first = _jank_lines(recorded, (31, 45))
-    pid = first[0].split()[2]
-    other = str(int(pid) + 1)
-    events, _ = _pipeline(first + _jank_lines(recorded, (52, 120), pid=other))
+    first = _jank_records(recorded, (31, 45))
+    other = first[0].pid + 1
+    events, _ = _pipeline(first + _jank_records(recorded, (52, 120), pid=other))
     if len(events) != 4:
         pytest.fail(f"expected four jank events, got {len(events)}")
 
@@ -880,6 +919,10 @@ def test_x6_a_device_that_is_not_there_is_not_a_quiet_watch(
         "adb",
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            # Asked before any logcat read (B4); the device is up when asked --
+            # and gone after, as adb answers the same question once logcat has
+            # failed (#32: a device verdict is confirmed by `get-state`).
+            Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=True),
             Rule((), stderr=recorded_anywhere("adb_shell_device_not_found"), exit=1),
         ],
     )
