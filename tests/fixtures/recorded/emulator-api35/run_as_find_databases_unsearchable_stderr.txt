@@ -1,0 +1,4 @@
+find: '/data/data/com.example.composefixture/databases/.': Permission denied
+find: '/data/data/com.example.composefixture/databases/..': Permission denied
+find: '/data/data/com.example.composefixture/databases/fixture.db': Permission denied
+find: '/data/data/com.example.composefixture/databases/fixture.db-journal': Permission denied

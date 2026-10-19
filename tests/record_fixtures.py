@@ -81,6 +81,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -552,6 +553,30 @@ def _redact_private_packages(text: str, mapping: dict[str, str]) -> str:
     return _PACKAGE_RE.sub(alias, text)
 
 
+# Any alias _redact_private_packages (or a binary fixture's own aliasing) wrote.
+_ALIAS_RE = re.compile(rb"\bcom\.example\.app\d+\b")
+
+
+def _aliases_present(recorded_dir: Path) -> int:
+    """How many distinct ``com.example.appN`` aliases this profile's fixtures hold.
+
+    MANIFEST.json's ``redacted_package_count`` was the CURRENT run's count, so a
+    partial re-record (``--only``) that aliased nothing wrote 0 over a corpus
+    still holding nine aliases. It is counted over every fixture file instead,
+    as bytes (some are binary). Each run numbers its aliases from app1, so two
+    runs can reuse a number for different packages: this is a lower bound on
+    the packages redacted, and exact for a corpus recorded in one run.
+    """
+    return len(
+        {
+            alias
+            for path in recorded_dir.iterdir()
+            if path.is_file() and path.name != "MANIFEST.json"
+            for alias in _ALIAS_RE.findall(path.read_bytes())
+        }
+    )
+
+
 # The Compose scaffold under tests/fixtures/scaffold/compose. Two exported
 # activities render the same screen; only the root Modifier differs. See that
 # directory's AndroidManifest.xml for the build-and-install commands.
@@ -1020,6 +1045,83 @@ def _app_dir_restored(directory: str, holds: str) -> Callable[[str | None], None
         _device_path_absent(moved)(serial)
 
     return verify
+
+
+def _all_of(*verifies: Callable[[str | None], None]) -> Callable[[str | None], None]:
+    """One ``teardown_verify`` running each of ``verifies``, for a setup that moved two things."""
+
+    def verify(serial: str | None) -> None:
+        for each in verifies:
+            each(serial)
+
+    return verify
+
+
+# --- Listing a directory: the skill's own command -----------------------------
+#
+# container.py and model_inspector.py list an app directory with
+# common.run_as.listing_command (toybox find, NUL-terminated fields). These
+# fixtures run exactly that argv, built and quoted by the skill's own code, so
+# the recorder and the scripts cannot disagree about what was run.
+
+
+def _listing(directory: str) -> list[str]:
+    """`adb shell run-as <fixture app> <the skill's listing of directory>`, quoted as the scripts quote it."""
+    _make_scripts_importable()
+    from common.device_utils import quote_for_device_shell
+    from common.run_as import listing_command
+
+    argv = [quote_for_device_shell(arg) for arg in listing_command(directory)]
+    return ["shell", "run-as", COMPOSE_PACKAGE, *argv]
+
+
+def _both_streams(args: list[str], name: str) -> Callable[[Path, str | None, dict], Capture]:
+    """Capture ``adb <args>`` once; stdout is fixture ``name``, stderr its twin ``name``_stderr.
+
+    A find that fails after printing prints on BOTH streams -- an unreadable
+    directory's own record, or a record cut at an escape it does not know, on
+    stdout, then the reason on stderr -- and a fixture file holds one stream.
+    Both come from this one run; the stderr is written by the twin fixture that
+    follows this one.
+    """
+
+    def capture(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+        result = _run(args, serial)
+        if not (result.stdout and result.stderr) or result.returncode == 0:
+            raise CaptureError(
+                f"expected a failure on both streams, got exit {result.returncode}, "
+                f"stdout {result.stdout[:80]!r}, stderr {result.stderr[:200]!r}"
+            )
+        _stash_twin(
+            f"{name}_stderr",
+            result.stderr.encode("utf-8"),
+            {"first_half": name, "exit_status": result.returncode, "stream": "stderr"},
+        )
+        return result
+
+    return capture
+
+
+# A scratch directory in the fixture app's files/, made by the names fixtures
+# and removed after. It holds the names a listing has to keep whole: one with a
+# newline followed by a complete `ls -la` line for ghost.db (the final review's
+# forgery), one with a backslash, one with a space, a symlink to that, a symlink
+# whose TARGET holds a newline, a subdirectory holding one file, and a symlink
+# to that subdirectory. run-as's shell has a umask of 0, so the files are 0666
+# and the directories 0777.
+NAMES_DIR = f"{COMPOSE_DATA_DIR}/files/aes_names"
+_NAMES_SETUP = (
+    f"rm -rf {NAMES_DIR} && mkdir {NAMES_DIR} && cd {NAMES_DIR} && "
+    "touch \"$(printf 'x.db\\n-rw-rw---- 1 u0_a205 u0_a205 32768 2026-10-18 22:28 ghost.db')\" && "
+    "touch 'c\\d.db' 'e f.db' && ln -s 'e f.db' link && "
+    "ln -s \"$(printf 'dangling\\ntarget')\" lflink && mkdir sub && touch sub/inner && "
+    "ln -s sub dirlink"
+)
+_NAMES_MADE = [["shell", "run-as", COMPOSE_PACKAGE, "sh", "-c", shlex.quote(_NAMES_SETUP)]]
+_NAMES_REMOVED = [["shell", "run-as", COMPOSE_PACKAGE, "rm", "-rf", NAMES_DIR]]
+_NAMES_GONE = _device_path_absent(["shell", "run-as", COMPOSE_PACKAGE, "ls", NAMES_DIR])
+# The listing with its last escape, %P, swapped for one this find does not have.
+_UNKNOWN_ESCAPE = [arg.replace("%P", "%Q") for arg in _listing(f"{COMPOSE_DATA_DIR}/databases")]
 
 
 # --- am profile: sampling a hung app without root ----------------------------
@@ -3923,12 +4025,13 @@ FIXTURES: list[Fixture] = [
         description=(
             "`run-as ls -la` of a directory holding a filename with a space and "
             "a symlink to it, made for the purpose in the fixture app's files/ "
-            "and removed after. The three things parse_ls_output documents and "
-            "no other recording had. What the device actually prints: toybox's "
+            "and removed after. The three things the `ls -la` parser documented "
+            "and no other recording had (both inspectors list with find now: "
+            "run_as_find_names). What the device actually prints: toybox's "
             "ISO layout ('YYYY-MM-DD HH:MM', two tokens) -- NOT the coreutils "
-            "'Mon DD YYYY' layout the parser also claims, which this device's "
-            "`ls` does not produce and no caller of the parser feeds it (all "
-            "three run `run-as ... ls -la` on the device); the symlink as "
+            "'Mon DD YYYY' layout the parser also claimed, which this device's "
+            "`ls` does not produce and no caller of the parser fed it (all "
+            "three ran `run-as ... ls -la` on the device); the symlink as "
             "'link -> a b.txt', size 7 (the "
             "length of the target string), mode lrwxrwxrwx; and the spaced "
             "name printed bare, unquoted and unescaped, so the name is "
@@ -3971,8 +4074,9 @@ FIXTURES: list[Fixture] = [
         name="run_as_ls_data_dir_seeded",
         args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", COMPOSE_DATA_DIR],
         description=(
-            "The fixture app's data dir listed as container.py lists it (by its "
-            "absolute path), after the app has run: shared_prefs/ and databases/ "
+            "The fixture app's data dir listed as container.py listed it until it "
+            "listed with find (run_as_find_data_dir), by its absolute path, after "
+            "the app has run: shared_prefs/ and databases/ "
             "are in it. run_as_ls_data_dir was recorded before the app first ran "
             "and holds neither -- the listing of an app with no prefs and no "
             "databases, which --export reports as absent, not as a failure."
@@ -3984,7 +4088,7 @@ FIXTURES: list[Fixture] = [
         args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", f"{COMPOSE_DATA_DIR}/shared_prefs"],
         description=(
             "`ls -la` of the fixture app's shared_prefs/, as --shared-prefs and "
-            "--export list it: one prefs file, fixture_settings.xml (the file "
+            "--export listed it before find: one prefs file, fixture_settings.xml (the file "
             "shared_prefs_settings_xml holds)."
         ),
         post=_requires(" fixture_settings.xml\n"),
@@ -4065,7 +4169,7 @@ FIXTURES: list[Fixture] = [
         name="run_as_ls_1_databases",
         args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-1", f"{COMPOSE_DATA_DIR}/databases"],
         description=(
-            "`ls -1` of databases/, as model_inspector's live mode lists it: one "
+            "`ls -1` of databases/, as model_inspector's live mode first listed it: one "
             "name per line, no `.`/`..`, and the zero-byte fixture.db-journal "
             "beside fixture.db -- not the -wal/-shm pair a hand-written listing "
             "had in its place."
@@ -4080,7 +4184,7 @@ FIXTURES: list[Fixture] = [
         description=(
             "model_inspector's `ls -1` of databases/ with the owner's read bit "
             "taken off it (`chmod u-r`, `u+r` after; run_as_ls_databases_unreadable "
-            "is the `ls -la` container.py runs): exit 1, stdout EMPTY, `ls: <path>: "
+            "is the `ls -la` container.py ran): exit 1, stdout EMPTY, `ls: <path>: "
             "Permission denied` on stderr -- which matched the run-as denial "
             "marker 'permission denied' and was answered with the debug-build hint."
         ),
@@ -4088,6 +4192,321 @@ FIXTURES: list[Fixture] = [
         teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+r", "databases"]],
         teardown_verify=_app_dir_restored("databases", "fixture.db"),
         post=_requires("Permission denied"),
+    ),
+    # --- The listing both inspectors run now (common.run_as.listing_command) ---
+    Fixture(
+        name="run_as_find_databases",
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        description=(
+            "The fixture app's databases/ as container.py --databases and model_inspector's "
+            "live mode list it: toybox find, six NUL-terminated fields per record (mode, "
+            "owner, group, size, symlink target, name), the directory's own record first "
+            "with an EMPTY name, then fixture.db and the zero-byte fixture.db-journal in "
+            "directory order. Exit 0, stderr empty."
+        ),
+        post=_requires("\0\0\0", "\0fixture.db\0", "\0fixture.db-journal\0"),
+    ),
+    Fixture(
+        name="run_as_find_data_dir",
+        record_both_streams=True,
+        args=_listing(COMPOSE_DATA_DIR),
+        description=(
+            "The fixture app's data dir as container.py --ls and --export list it, after "
+            "the app has run: shared_prefs/ and databases/ are in it, and cache/ and "
+            "code_cache/ have a group (u0_aNNN_cache) that is not their owner."
+        ),
+        post=_requires("\0shared_prefs\0", "\0databases\0", "\0cache\0", "_cache\0"),
+    ),
+    Fixture(
+        name="run_as_find_shared_prefs",
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/shared_prefs"),
+        description=(
+            "shared_prefs/ as --shared-prefs and --export list it: the directory's own "
+            "record and fixture_settings.xml (the file shared_prefs_settings_xml holds)."
+        ),
+        post=_requires("\0fixture_settings.xml\0"),
+    ),
+    Fixture(
+        name="run_as_find_data_dir_bare",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(COMPOSE_DATA_DIR),
+        description=(
+            "The data-dir listing with shared_prefs/ AND databases/ moved aside (renamed "
+            "<dir>.aes_moved, the app force-stopped first, and both moved back after): a "
+            "real listing that names neither directory -- what --export reads for an app "
+            "with no prefs and no databases, and reports as absent, not as a failure."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            [
+                "shell",
+                "run-as",
+                COMPOSE_PACKAGE,
+                "mv",
+                "-T",
+                "shared_prefs",
+                "shared_prefs.aes_moved",
+            ],
+            ["shell", "run-as", COMPOSE_PACKAGE, "mv", "-T", "databases", "databases.aes_moved"],
+        ],
+        teardown=[
+            [
+                "shell",
+                "run-as",
+                COMPOSE_PACKAGE,
+                "mv",
+                "-T",
+                "shared_prefs.aes_moved",
+                "shared_prefs",
+            ],
+            ["shell", "run-as", COMPOSE_PACKAGE, "mv", "-T", "databases.aes_moved", "databases"],
+        ],
+        teardown_verify=_all_of(
+            _app_dir_restored("shared_prefs", "fixture_settings.xml"),
+            _app_dir_restored("databases", "fixture.db"),
+        ),
+        post=_requires(
+            "\0shared_prefs.aes_moved\0",
+            "\0databases.aes_moved\0",
+            absent=("\0shared_prefs\0", "\0databases\0"),
+        ),
+    ),
+    Fixture(
+        name="run_as_find_names",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(NAMES_DIR),
+        description=(
+            "The listing of a scratch directory in the fixture app's files/ (made for the "
+            "purpose, removed after) holding the names a listing must keep whole: "
+            "`x.db` + LF + a complete `ls -la` line for ghost.db, `c\\d.db`, `e f.db`, "
+            "`link -> e f.db`, `lflink` whose target holds a LF, `sub/` and `dirlink -> "
+            "sub`. Each is ONE "
+            "record here, its name the last of six NUL-terminated fields; the forged line "
+            "is inside x.db's name, and no record names ghost.db. Compare run_as_ls_names, "
+            "the same directory through `ls -la`."
+        ),
+        setup=_NAMES_MADE,
+        teardown=_NAMES_REMOVED,
+        teardown_verify=_NAMES_GONE,
+        post=_requires(
+            "\0x.db\n-rw-rw---- 1 u0_a205 u0_a205 32768 2026-10-18 22:28 ghost.db\0",
+            "\0c\\d.db\0",
+            "\0e f.db\0link\0",
+            "\0dangling\ntarget\0lflink\0",
+            "\0sub\0",
+        ),
+    ),
+    Fixture(
+        name="run_as_find_names_dirlink",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(f"{NAMES_DIR}/dirlink"),
+        description=(
+            "The listing aimed at run_as_find_names's `dirlink`, a symlink to its `sub/` "
+            "(which holds `inner`): find's -H follows the named path, so the first record is "
+            "the directory's own -- mode d, its %l still the link's target `sub` -- and "
+            "`inner` follows, as `ls sub` would list. Without -H find printed the link's "
+            "record alone (mode l), which would read as not a directory."
+        ),
+        setup=_NAMES_MADE,
+        teardown=_NAMES_REMOVED,
+        teardown_verify=_NAMES_GONE,
+        post=_requires("\0sub\0\0", "\0inner\0"),
+    ),
+    Fixture(
+        name="run_as_ls_names",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", NAMES_DIR],
+        description=(
+            "run_as_find_names's directory through `ls -la`, what both inspectors listed "
+            "with until it was replaced: x.db's name prints as two lines, and the second "
+            "is a complete, well-formed entry for ghost.db, a file that does not exist -- "
+            "the forgery the final review of v0.8.0 reproduced (REQUIRED 4). lflink's "
+            "target prints as two lines too."
+        ),
+        setup=_NAMES_MADE,
+        teardown=_NAMES_REMOVED,
+        teardown_verify=_NAMES_GONE,
+        post=_requires(" x.db\n-rw-rw---- 1 u0_a205 u0_a205 32768 2026-10-18 22:28 ghost.db\n"),
+    ),
+    Fixture(
+        name="run_as_find_shared_prefs_absent",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/shared_prefs"),
+        description=(
+            "The shared_prefs/ listing while the directory is moved aside (renamed "
+            "shared_prefs.aes_moved, and back after): exit 1, stdout EMPTY, and on stderr "
+            "`find: '<path>': No such file or directory` -- the path in single quotes, "
+            "which ls never printed. The first line names the path the listing named."
+        ),
+        setup=[
+            [
+                "shell",
+                "run-as",
+                COMPOSE_PACKAGE,
+                "mv",
+                "-T",
+                "shared_prefs",
+                "shared_prefs.aes_moved",
+            ]
+        ],
+        teardown=[
+            [
+                "shell",
+                "run-as",
+                COMPOSE_PACKAGE,
+                "mv",
+                "-T",
+                "shared_prefs.aes_moved",
+                "shared_prefs",
+            ]
+        ],
+        teardown_verify=_app_dir_restored("shared_prefs", "fixture_settings.xml"),
+        post=_requires("No such file or directory"),
+    ),
+    Fixture(
+        name="run_as_find_shared_prefs_unreadable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/shared_prefs"),
+        description=(
+            "The shared_prefs/ listing with the owner's read bit taken off it (`chmod u-r`, "
+            "`u+r` after): exit 1, and find prints on BOTH streams -- the directory's own "
+            "record on stdout (it could stat it), then `find: <path>: Permission denied`, "
+            "unquoted, on stderr (run_as_find_shared_prefs_unreadable_stderr, same run)."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-r", "shared_prefs"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+r", "shared_prefs"]],
+        teardown_verify=_app_dir_restored("shared_prefs", "fixture_settings.xml"),
+        capture_with=_both_streams(
+            _listing(f"{COMPOSE_DATA_DIR}/shared_prefs"), "run_as_find_shared_prefs_unreadable"
+        ),
+        post=_requires("\0\0\0"),
+    ),
+    Fixture(
+        name="run_as_find_shared_prefs_unreadable_stderr",
+        emulator_only=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/shared_prefs"),
+        command="recorded in run_as_find_shared_prefs_unreadable's run: its stderr",
+        description="The stderr of run_as_find_shared_prefs_unreadable's one run, byte for byte.",
+        capture_bytes=_twin(
+            "run_as_find_shared_prefs_unreadable_stderr", "run_as_find_shared_prefs_unreadable"
+        ),
+    ),
+    Fixture(
+        name="run_as_find_databases_unreadable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        description=(
+            "run_as_find_shared_prefs_unreadable for databases/ (`chmod u-r`, `u+r` after; "
+            "the directory stays searchable, so an open database is undisturbed): exit 1, "
+            "the directory's own record on stdout, `find: <path>: Permission denied` on "
+            "stderr (run_as_find_databases_unreadable_stderr, same run)."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-r", "databases"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+r", "databases"]],
+        teardown_verify=_app_dir_restored("databases", "fixture.db"),
+        capture_with=_both_streams(
+            _listing(f"{COMPOSE_DATA_DIR}/databases"), "run_as_find_databases_unreadable"
+        ),
+        post=_requires("\0\0\0"),
+    ),
+    Fixture(
+        name="run_as_find_databases_unreadable_stderr",
+        emulator_only=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        command="recorded in run_as_find_databases_unreadable's run: its stderr",
+        description="The stderr of run_as_find_databases_unreadable's one run, byte for byte.",
+        capture_bytes=_twin(
+            "run_as_find_databases_unreadable_stderr", "run_as_find_databases_unreadable"
+        ),
+    ),
+    Fixture(
+        name="run_as_find_databases_unsearchable",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        description=(
+            "The databases/ listing with the owner's SEARCH bit taken off it (`chmod u-x`, "
+            "`u+x` after): find can read the directory's names but not stat them, so it "
+            "exits 1 with the directory's own record on stdout and, on stderr "
+            "(run_as_find_databases_unsearchable_stderr, same run), one line per entry, "
+            "`find: '<dir>/<entry>': Permission denied` -- quoted, and naming the entry, "
+            "not the directory. Its first line is the listing failing AT an entry."
+        ),
+        setup=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u-x", "databases"]],
+        teardown=[["shell", "run-as", COMPOSE_PACKAGE, "chmod", "u+x", "databases"]],
+        teardown_verify=_app_dir_restored("databases", "fixture.db"),
+        capture_with=_both_streams(
+            _listing(f"{COMPOSE_DATA_DIR}/databases"), "run_as_find_databases_unsearchable"
+        ),
+        post=_requires("\0\0\0"),
+    ),
+    Fixture(
+        name="run_as_find_databases_unsearchable_stderr",
+        emulator_only=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/databases"),
+        command="recorded in run_as_find_databases_unsearchable's run: its stderr",
+        description="The stderr of run_as_find_databases_unsearchable's one run, byte for byte.",
+        capture_bytes=_twin(
+            "run_as_find_databases_unsearchable_stderr", "run_as_find_databases_unsearchable"
+        ),
+    ),
+    Fixture(
+        name="run_as_find_not_a_directory",
+        record_both_streams=True,
+        args=_listing(f"{COMPOSE_DATA_DIR}/shared_prefs/fixture_settings.xml"),
+        description=(
+            "The listing aimed at a FILE (the fixture app's prefs file): exit 0, stderr "
+            "empty, and one record -- the file's own, mode `-rw-...`, empty name. Without "
+            "that record's mode to check, a listing of a file reads as an empty directory."
+        ),
+        post=_requires("\0\0\0"),
+    ),
+    Fixture(
+        name="run_as_find_unknown_primary",
+        record_both_streams=True,
+        args=[
+            "-printfx" if arg == "-printf" else arg
+            for arg in _listing(f"{COMPOSE_DATA_DIR}/databases")
+        ],
+        description=(
+            "The listing with `-printf` replaced by `-printfx`, a primary this find does "
+            "not know -- the nearest measurable stand-in for a toybox without -printf: exit "
+            "1, stdout EMPTY, `find: bad arg '<format>'` on stderr. It names no path; an "
+            "older toybox's own wording is not measured."
+        ),
+        post=_requires("find: bad arg "),
+    ),
+    Fixture(
+        name="run_as_find_unknown_escape",
+        emulator_only=True,
+        record_both_streams=True,
+        args=_UNKNOWN_ESCAPE,
+        description=(
+            "The listing with its last escape, %P, replaced by %Q, which this find does not "
+            "have -- the stand-in for a find lacking one of the six. find checks an escape "
+            "only when it reaches it: exit 1, the directory's own record printed up to the "
+            "bad escape (five fields) on stdout, then `find: bad -printf %Q` on stderr "
+            "(run_as_find_unknown_escape_stderr, same run)."
+        ),
+        capture_with=_both_streams(_UNKNOWN_ESCAPE, "run_as_find_unknown_escape"),
+        post=_requires("\0\0"),
+    ),
+    Fixture(
+        name="run_as_find_unknown_escape_stderr",
+        emulator_only=True,
+        args=_UNKNOWN_ESCAPE,
+        command="recorded in run_as_find_unknown_escape's run: its stderr",
+        description="The stderr of run_as_find_unknown_escape's one run, byte for byte.",
+        capture_bytes=_twin("run_as_find_unknown_escape_stderr", "run_as_find_unknown_escape"),
     ),
     Fixture(
         name="adb_version",
@@ -5126,11 +5545,13 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "recorded_on": platform.platform(),
         "device": device,
-        "redacted_package_count": len(redactions),
+        "redacted_package_count": _aliases_present(recorded_dir),
         "redaction_note": (
             "Non-AOSP package names were replaced with stable com.example.appN "
             "aliases so a developer's own apps are not published. Line shape is "
-            "unchanged, so parsers exercise identical code paths."
+            "unchanged, so parsers exercise identical code paths. The count is of "
+            "the distinct aliases this profile's fixtures hold; a partial re-record "
+            "numbers its own from app1, so it is a lower bound on packages redacted."
         ),
         "fixtures": entries,
     }

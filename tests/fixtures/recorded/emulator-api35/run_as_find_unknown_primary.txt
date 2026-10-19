@@ -1,0 +1,1 @@
+find: bad arg '%M\0%u\0%g\0%s\0%l\0%P\0'

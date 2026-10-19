@@ -14,7 +14,7 @@ reports when ``run-as`` is denied (release / non-debuggable app, or package not
 installed) instead of failing cryptically.
 
 Key features:
-- List the data dir (--ls) via ``run-as ls -la``.
+- List the data dir (--ls) via ``run-as find`` (common.run_as.listing_command).
 - Read a file (--cat) via ``run-as cat`` with a size cap + truncation note.
 - Inspect shared_prefs/ XML (--shared-prefs), parsed into key/value JSON.
 - Inspect databases/ (--databases), dumping the SQLite schema for a named DB.
@@ -39,16 +39,16 @@ from common.device_utils import build_adb_command, quote_for_device_shell, resol
 from common.env_config import env_int
 
 # The shell -T transport and its client guard moved to common.run_as when
-# model_inspector became the second script to read app files, and the `ls -la`
-# parser followed when model_inspector's databases listing was made to read
-# names as this script does. The names are bound here: `adb_client_version` is
-# what require_adb_for_reads asks (and what a test replaces); `parse_adb_version`,
-# `LsListing` and `parse_ls_output` are where the tests found them.
+# model_inspector became the second script to read app files, and the listing
+# followed when model_inspector's databases listing was made to read names as
+# this script does. The names are bound here: `adb_client_version` is what
+# require_adb_for_reads asks (and what a test replaces); `parse_adb_version`,
+# `LsListing` and `parse_listing` are where the tests find them.
 from common.run_as import (  # noqa: F401
     LsListing,
     adb_client_version,
     parse_adb_version,
-    parse_ls_output,
+    parse_listing,
 )
 from common.run_as import rejections as _rejections
 
@@ -107,7 +107,7 @@ class ContainerInspector:
         return f"/data/data/{package}"
 
     def list_dir(self, package: str, subpath: str = "") -> tuple[bool, dict]:
-        """List the app data dir (or a sub-path) via ``run-as ls -la``.
+        """List the app data dir (or a sub-path) via ``run-as find`` (:meth:`_list`).
 
         Args:
             package: App package name.
@@ -122,13 +122,12 @@ class ContainerInspector:
 
         target = _join_remote(self.data_dir(package), rel)
         try:
-            output = self._run_as_bytes(package, ["ls", "-la", target])
+            listing = self._list(package, target)
         except RunAsDeniedError as exc:
             return False, _denied_result(package, exc)
-        except _RunAsError as exc:
-            return False, _path_failure(package, target, exc)
+        except _ListingFailedError as exc:
+            return False, exc.result
 
-        listing = parse_ls_output(output)
         return True, {
             "package": package,
             "data_dir": self.data_dir(package),
@@ -218,12 +217,11 @@ class ContainerInspector:
 
         if name is None:
             try:
-                output = self._run_as_bytes(package, ["ls", "-la", prefs_dir])
+                listing = self._list(package, prefs_dir)
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
-            except _RunAsError as exc:
-                return False, _path_failure(package, prefs_dir, exc)
-            listing = parse_ls_output(output)
+            except _ListingFailedError as exc:
+                return False, exc.result
             files = [e["name"] for e in listing.entries if e["name"].endswith(".xml")]
             return True, {
                 "package": package,
@@ -279,12 +277,11 @@ class ContainerInspector:
 
         if name is None:
             try:
-                output = self._run_as_bytes(package, ["ls", "-la", db_dir])
+                listing = self._list(package, db_dir)
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
-            except _RunAsError as exc:
-                return False, _path_failure(package, db_dir, exc)
-            listing = parse_ls_output(output)
+            except _ListingFailedError as exc:
+                return False, exc.result
             files = [
                 e
                 for e in listing.entries
@@ -458,6 +455,32 @@ class ContainerInspector:
 
     # === COMMAND EXECUTION ===
 
+    def _list(self, package: str, directory: str) -> LsListing:
+        """List ``directory`` with common.run_as's listing command, parsed.
+
+        The listing is toybox find's NUL-terminated records (common.run_as),
+        where it was ``ls -la`` split on newlines: a name holding a newline and
+        a whole ``ls`` line after it listed an entry the app does not have
+        (final review of v0.8.0, REQUIRED 4; recorded: run_as_ls_names).
+
+        Raises:
+            RunAsDeniedError: run-as refused the package.
+            _ListingFailedError: run-as ran and the listing did not -- find
+                failed (the result's remedy says whether on the path or on the
+                command), or answered with something that is not a listing of
+                a directory. Carries the failure result.
+        """
+        try:
+            output = self._run_as_bytes(package, run_as.listing_command(directory))
+        except _RunAsError as exc:
+            raise _ListingFailedError(
+                run_as.listing_failure(package, directory, str(exc), exc.stderr)
+            ) from exc
+        try:
+            return parse_listing(output)
+        except run_as.ListingError as exc:
+            raise _ListingFailedError(run_as.unreadable_listing(package, directory, exc)) from exc
+
     def _run_as(self, package: str, argv: list[str]) -> str:
         """Run ``adb shell run-as <package> <argv...>`` and return stdout as text.
 
@@ -475,8 +498,9 @@ class ContainerInspector:
         """Run ``adb shell run-as <package> <argv...>`` and return stdout's bytes.
 
         Bytes, with no universal-newlines translation: ``text=True`` turned a CR
-        inside a file name into a line break before parse_ls_output saw it, and
-        a crafted name then forged a second ``ls`` line.
+        inside a file name into a line break before the listing was parsed, and
+        a crafted name then forged a second ``ls`` line. A listing's NULs are
+        bytes too.
 
         Raises:
             RunAsDeniedError: run-as refused (non-debuggable / missing package).
@@ -491,7 +515,7 @@ class ContainerInspector:
         stderr = result.stderr.decode("utf-8", errors="replace")
         self._raise_if_refused(package, stderr, result.returncode)
         if result.returncode != 0:
-            raise _RunAsError(_describe_failure(argv, result.returncode, stdout, stderr))
+            raise _RunAsError(_describe_failure(argv, result.returncode, stdout, stderr), stderr)
         return result.stdout
 
     def _read_run_as(self, package: str, argv: list[str]) -> bytes:
@@ -616,7 +640,19 @@ def require_adb_for_reads() -> None:
 
 
 class _RunAsError(RuntimeError):
-    """Generic run-as / adb command failure (not a denial)."""
+    """Generic run-as / adb command failure (not a denial), with the command's stderr."""
+
+    def __init__(self, message: str, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
+
+
+class _ListingFailedError(RuntimeError):
+    """A directory listing run-as let run that did not list; carries the failure result."""
+
+    def __init__(self, result: dict) -> None:
+        super().__init__(result["error"])
+        self.result = result
 
 
 def _raise_if_denied(package: str, stderr: str, returncode: int) -> None:
@@ -723,7 +759,7 @@ def _refuse_unknown_presence(package: str, unseen: list[str], refused: list[str]
 def _host_path_inside(directory: Path, name: str) -> Path:
     """``directory / name`` resolved -- refused unless it lands directly in ``directory``.
 
-    ``name`` was chosen by the app on the device. parse_ls_output already drops
+    ``name`` was chosen by the app on the device. parse_listing already refuses
     names that are not plain file names; this is the check at the point the
     name becomes a host path, so a listing that reached export() another way
     cannot write outside the snapshot either.
@@ -1047,7 +1083,7 @@ def _report_rejections(success: bool, result: dict) -> tuple[bool, dict]:
         reasons.append(
             f"refused {refused} entr{'y' if refused == 1 else 'ies'} the app named with "
             f"bytes that are not UTF-8 or a character no plain file name carries (/, \\, "
-            f"NUL, CR, LF), or in a layout ls does not print: {shown}"
+            f"NUL, CR, LF), or in a record find does not print: {shown}"
         )
     if unread:
         shown = ", ".join(

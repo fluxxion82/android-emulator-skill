@@ -16,7 +16,8 @@ stderr apart, and keeps stdout's bytes as exec-out delivers them -- fixture.db,
 32768 bytes, cmp-identical over both (recorded: ``run_as_cat_missing``, exit 1,
 stdout empty, the reason on stderr). Two scripts read app files now, so the
 transport and its guard live here once -- and so do what a run-as refusal is
-(:func:`refused`) and how a directory listing is read (:func:`parse_ls_output`).
+(:func:`refused`) and how a directory is listed (:func:`listing_command`,
+:func:`parse_listing`).
 
 The client guard
 ----------------
@@ -34,8 +35,9 @@ a newline, a carriage return, or a line of its own -- ``run-as: package not
 debuggable``, ``adb: device offline``. Nothing here decides anything from a
 line a name could have printed: a refusal is the FIRST line of stderr (a
 command that ran names itself first), confirmed by a probe that names no file;
-a listing is split on ``\\n`` only, and a name no plain file name carries is
-refused and reported, never split into two.
+a listing is records of NUL-terminated fields, the name last -- NUL is the one
+byte no name can hold -- and a name no plain file name carries is refused and
+reported, never split into two.
 """
 
 from __future__ import annotations
@@ -232,7 +234,8 @@ def path_failure_remedy(package: str, path: str) -> str:
     return (
         f"run-as works for this app; the device refused {path} itself. Check that it "
         f"exists and that the app may read it: `adb shell run-as {package} ls -ld {path}` "
-        "(a directory needs its owner's r bit to be listed, a file its r bit to be read)."
+        "(a directory needs its owner's r bit to be listed and its x bit for what is in it "
+        "to be reached; a file needs its r bit to be read)."
     )
 
 
@@ -251,135 +254,317 @@ def read_command(serial: str | None, package: str, argv: list[str]) -> list[str]
 
 # === READING A LISTING =======================================================
 #
-# Both inspectors list an app's directory with `run-as <pkg> ls -la`, read as
-# bytes, and parse it here. model_inspector listed databases/ with `ls -1` in
-# text mode and `splitlines()`: the transport turned a CR in a name into a line
-# break, and `x\ry.db` became two databases, `x` and `y.db` (final review of
-# v0.8.0). container.py's parser had already been made to refuse such a name;
-# it moved here so both read a listing one way.
+# Both inspectors list an app's directory with `run-as <pkg>` running
+# listing_command(), read as bytes, and parse it here. It was `ls -la`, split
+# on `\n`: a file name may hold a newline, and `fixture.db` + LF + a whole
+# `ls -la` line for `ghost.db` listed a database the app does not have, at exit
+# 0 with nothing refused (final review of v0.8.0, REQUIRED 4; recorded:
+# run_as_ls_names shows the forged line, run_as_find_names the one name). Before
+# that, model_inspector's `ls -1` in text mode made a CR a line break too.
+#
+# toybox find prints each field the format names and then the NUL after it, so
+# a record is a FIXED number of NUL-terminated fields with the name last. NUL is
+# the one byte no path component can hold, so splitting on it and taking six
+# fields at a time is unambiguous whatever a name or a symlink's target holds --
+# LF, CR, a tab, spaces, or the text of another record. Measured on
+# emulator-5554, toybox 0.8.11-android (API 35); recorded: run_as_find_*.
+#
+#   %M  the type and mode as ls prints them, ten characters (`-rw-rw----`)
+#   %u  the owner's name (`u0_a205`)
+#   %g  the group's name -- not always the owner's (`u0_a205_cache` on cache/)
+#   %s  the size in bytes; a symlink's is its target's length (6 for `e f.db`)
+#   %l  a symlink's target, and empty for anything that is not a symlink
+#   %P  the path minus the directory named: the entry's name, and EMPTY for the
+#       directory itself, which find prints first
+#
+# `-maxdepth 1` stops find below the directory's own entries. There is no
+# `-mindepth 1`: the directory's own record is how a listing shows it listed a
+# DIRECTORY (find on a file prints the file's record alone, at exit 0 --
+# run_as_find_not_a_directory) and that find printed at all, so nothing is ever
+# read as an empty directory by default. `-H` follows the named path when it is a
+# symlink, as `ls <dir>` does; without it find prints the link's record alone
+# (measured: a link to a directory holding `inner` listed only the link).
+#
+# A toybox without `-printf`, or without one of these escapes, is not measured:
+# this one answers an option it does not know with `find: bad arg '<format>'` and
+# an escape with `find: bad -printf %Q`, exit 1 (run_as_find_unknown_primary,
+# run_as_find_unknown_escape). Output that is not whole records is refused
+# (ListingError), never read some other way and never handed to `ls`.
+#
+# Two limits, both the transport's rather than the parse's:
+#
+# - A listing is only as complete as its exit status says. The framing has no
+#   end marker, so an answer cut after any COMPLETE record -- even right after
+#   the directory's own -- parses as a directory with fewer entries. A cut that
+#   adb or find reports (a non-zero exit, a device error) is refused before
+#   anything is parsed; a cut at exit 0 cannot be seen here.
+# - `-H` follows the named path's own symlink to any directory the app's uid
+#   may search, inside its data dir or not (SELinux permitting): `--ls files/x`,
+#   where the app planted `x` -> /some/dir, lists /some/dir. A listing reads
+#   names and modes, never contents. container.py --export's reads of the files
+#   a listing names follow those files' symlinks too; that predates this
+#   transport.
 
-# toybox `ls -l` -- what every caller's `run-as <pkg> ls -la` runs -- prints
-# mode, links, owner, group and size separated by runs of spaces, the timestamp
-# as two columns, `%F %H:%M` (recorded: run_as_ls_symlink_space), then ONE space
-# and the name exactly as printed: it may hold spaces, start or end with one, or
-# look like a date.
-_LS_ENTRY = re.compile(
-    r"(?P<mode>\S+) +(?P<links>\S+) +(?P<owner>\S+) +(?P<group>\S+) +(?P<size>\S+) +"
-    r"(?P<day>[0-9]{4}-[0-9]{2}-[0-9]{2}) (?P<clock>[0-9]{2}:[0-9]{2}) (?P<name>.+)"
-)
+LISTING_FORMAT = "%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0"
+LISTING_FIELDS = 6
 
 # A name is chosen by the app on the device, so it is untrusted input to the
 # host: container.py's export() turns it into a host path. None of these belongs
-# in a single directory entry -- `/` and NUL cannot occur in one at all, so
-# seeing them means the line is not what it claims; `\` is a separator on a
-# Windows host; a newline is how a crafted name forges a second `ls` line.
+# in a single directory entry -- `/` and NUL cannot occur in one at all; `\` is a
+# separator on a Windows host; a newline or a CR is printed raw to a terminal,
+# and was how a crafted name forged a second `ls` line.
 _NAME_FORBIDDEN = frozenset("/\\\0\n\r")
-# A symlink's target is a device path, so `/` is expected there; a CR or NUL is
-# not, and the target is printed to the caller.
+# A symlink's target is a device path, so `/` is expected there; a newline, CR
+# or NUL is not, and the target is printed to the caller.
 _TARGET_FORBIDDEN = frozenset("\0\n\r")
 
 
-class LsListing(NamedTuple):
-    """What an ``ls -la`` listing held: the entries read, and the ones refused.
+def listing_command(directory: str) -> list[str]:
+    """The device argv that lists ``directory``: toybox find, one NUL-framed record per entry.
 
-    ``rejected`` holds each refused name -- or the whole line, when its columns
-    could not be placed -- as ``repr()``, so a control character in it is
-    shown escaped rather than reaching a terminal or a log raw. Every caller
-    reports them: dropping them silently answered "nothing there" for
-    "refused to read it".
+    Run it as ``run-as <package> <argv...>``, each argument quoted for the
+    device shell, and hand its stdout's bytes to :func:`parse_listing`. The
+    format string's ``\\0`` is find's own escape, so it reaches find intact
+    inside single quotes.
+    """
+    return ["find", "-H", directory, "-maxdepth", "1", "-printf", LISTING_FORMAT]
+
+
+class LsListing(NamedTuple):
+    """What a directory listing held: the entries read, and the ones refused.
+
+    ``rejected`` holds each refused name -- or the name and its target, for a
+    symlink whose target was refused -- as ``repr()``, so a control character
+    in it is shown escaped rather than reaching a terminal or a log raw. Every
+    caller reports them: dropping them silently answered "nothing there" for
+    "refused to read it". (The name is from when this held an ``ls -la``; the
+    shape is the one both inspectors return.)
     """
 
     entries: list[dict]
     rejected: list[str]
 
 
-def parse_ls_output(output: bytes | str) -> LsListing:
-    r"""Parse ``ls -la`` output into structured entries.
+class ListingError(ValueError):
+    """A listing's stdout that is not what :func:`listing_command` prints, refused whole.
 
-        Reads toybox's layout by position -- every caller runs ``run-as <pkg> ls
-        -la`` on the device, and the device's ``ls`` is toybox (recorded:
-        ``run_as_ls_symlink_space``):
-
-            drwx------ 4 u0_a123 u0_a123 4096 2024-01-02 03:04 shared_prefs
-            -rw------- 1 u0_a123 u0_a123  220 2024-01-02 03:04 prefs.xml
-            lrwxrwxrwx 1 root    root       11 2024-01-02 03:04 lib -> /data/app
-
-        The name is everything after the two timestamp columns, so a file named
-        ``2026-10-16``, ``03:04`` or ``May`` keeps its name. (Skipping every
-        date-looking token instead -- and, before that, coreutils' month names and
-        bare years -- made such names vanish from the listing.)
-
-        Every line is an entry, refused, or one of three skips: a blank line, the
-        ``total N`` line, and the directory's own ``.`` / ``..``. Refused, and
-        returned in ``rejected`` (never dropped silently):
-
-        - a line that is not UTF-8 -- decoding it with replacement would hand on
-          a name that is not the file's, and the read of it would fail;
-        - a line that is not that layout: an unknown mode (``??????????``), a
-          device node, whose size is ``major, minor`` (measured: ``1,   3``) and
-          takes two columns, or any other text;
-        - a name that is not a plain file name (see ``_NAME_FORBIDDEN``), or a
-          symlink target holding a CR or NUL.
-
-        The names come from the app, and container.py's export makes host paths
-        of them.
-
-        Lines are split on ``\n`` only -- what ``ls`` separates entries with --
-        not ``str.splitlines``, which also breaks on ``\r``, ``\x1c``-``\x1e``,
-        ``\x85`` and ``
-    ``/``
-    ``, any of which a name may hold and
-        would then forge a line without a newline. (The transport keeps a CR a CR
-        for the same reason: both callers read the listing as bytes.) A name
-        holding a real newline still can: ``ls -1b`` or ``find -print0`` would
-        make names unambiguous, and is not done here.
-
-        Args:
-            output: Raw ``ls -la`` stdout: bytes from the device, or text already
-                decoded (the recorded fixtures).
-
-        Returns:
-            :class:`LsListing`: ``entries`` as dicts {name, mode, kind, size_bytes,
-            owner, group, symlink_target}, and the ``rejected`` names.
+    Nothing in it is read: output that is not whole records of
+    ``LISTING_FIELDS`` NUL-terminated fields, headed by the directory's own,
+    cannot say which bytes are a name. ``not_a_directory`` marks the one case
+    that is the path's rather than the tool's: find listed a file, or something
+    else that is not a directory.
     """
-    raw = output.encode("utf-8") if isinstance(output, str) else output
+
+    def __init__(self, message: str, *, not_a_directory: bool = False) -> None:
+        super().__init__(message)
+        self.not_a_directory = not_a_directory
+
+
+def parse_listing(output: bytes) -> LsListing:
+    r"""Parse :func:`listing_command`'s stdout into structured entries.
+
+    Records of ``LISTING_FIELDS`` NUL-terminated fields -- mode, owner, group,
+    size, symlink target, name (see the field notes above) -- the first the
+    directory's own, with an empty name. Recorded: run_as_find_databases,
+    run_as_find_data_dir, run_as_find_names.
+
+    Refused whole (:class:`ListingError`), with nothing read from it: output
+    that does not end in NUL (empty, or cut short), a field count that is not a
+    multiple of six, a first record that is not the directory's own (an
+    empty name and a mode), and -- ``not_a_directory`` -- a first record whose
+    mode is not a directory's.
+
+    Every other record is an entry or refused, and refused ones are returned in
+    ``rejected`` (never dropped silently):
+
+    - a name that is not UTF-8 -- decoded with replacement it would be a name
+      no file has, and the read of it would fail;
+    - a name that is not a plain file name (``_NAME_FORBIDDEN``: ``/``, ``\``,
+      NUL, LF, CR; or ``.``/``..``, which find never prints for an entry);
+    - a mode that is not ten ls characters, a size that is not digits, or a
+      target on an entry that is not a symlink -- none of which find prints;
+    - a symlink whose target is empty, not UTF-8, or holds a LF, CR or NUL.
+
+    A newline in a name no longer forges anything: it is inside one field, and
+    the name holding it is refused and reported as itself. What the framing
+    cannot show is a cut after a complete record: such an answer reads as a
+    shorter directory, so its completeness is the exit status's, which both
+    callers check before they parse.
+
+    Entries are sorted by name, as ``ls`` sorted them; find prints directory
+    order.
+
+    Args:
+        output: Raw stdout of :func:`listing_command`, as bytes from the device.
+
+    Returns:
+        :class:`LsListing`: ``entries`` as dicts {name, mode, kind, size_bytes,
+        owner, group, symlink_target}, and the ``rejected`` names.
+
+    Raises:
+        ListingError: the output is not a listing of a directory.
+    """
+    if not output.endswith(b"\0"):
+        raise ListingError(
+            f"find's answer is not NUL-terminated records: {_shown(output)}, "
+            f"{len(output)} bytes"
+        )
+    fields = output[:-1].split(b"\0")
+    if len(fields) % LISTING_FIELDS:
+        raise ListingError(
+            f"find's answer holds {len(fields)} fields, not whole records of {LISTING_FIELDS}"
+        )
+    records = [fields[at : at + LISTING_FIELDS] for at in range(0, len(fields), LISTING_FIELDS)]
+    own, *children = records
+    mode = own[0].decode("utf-8", errors="replace")
+    if own[-1] != b"" or not _looks_like_mode(mode):
+        shown = _shown(b"\0".join(own))
+        raise ListingError(
+            "find's answer does not start with the directory's own record (a mode and an "
+            f"empty name): {shown}"
+        )
+    if mode[0] != "d":
+        raise ListingError(
+            f"it is not a directory: find listed it with the mode {mode}", not_a_directory=True
+        )
     entries: list[dict] = []
     rejected: list[str] = []
-    for raw_line in raw.split(b"\n"):
-        try:
-            line = raw_line.decode("utf-8")
-        except UnicodeDecodeError:
-            rejected.append(repr(raw_line))
-            continue
-        if not line.strip() or line.startswith("total "):
-            continue
-        match = _LS_ENTRY.fullmatch(line)
-        if match is None or not _looks_like_mode(match["mode"]):
-            rejected.append(repr(line))
-            continue
-        kind = _kind_from_mode(match["mode"])
-        name, symlink_target = _extract_name(match["name"], kind)
-        if name in (".", ".."):
-            continue
-        if not is_plain_file_name(name):
-            rejected.append(repr(name))
-            continue
-        if symlink_target is not None and _TARGET_FORBIDDEN.intersection(symlink_target):
-            rejected.append(repr(match["name"]))
-            continue
-
-        entries.append(
-            {
-                "name": name,
-                "mode": match["mode"],
-                "kind": kind,
-                "size_bytes": int(match["size"]) if match["size"].isdigit() else 0,
-                "owner": match["owner"],
-                "group": match["group"],
-                "symlink_target": symlink_target,
-            }
-        )
+    for record in sorted(children, key=lambda fields: fields[-1]):
+        entry = _entry(record)
+        if isinstance(entry, str):
+            rejected.append(entry)
+        else:
+            entries.append(entry)
     return LsListing(entries, rejected)
+
+
+def _entry(record: list[bytes]) -> dict | str:
+    """One entry's record as an entry dict, or the ``repr`` it is refused as."""
+    raw_name = record[-1]
+    try:
+        name = raw_name.decode("utf-8")
+    except UnicodeDecodeError:
+        return repr(raw_name)
+    if not is_plain_file_name(name):
+        return repr(name)
+    try:
+        target = record[4].decode("utf-8")
+    except UnicodeDecodeError:
+        return repr(raw_name + b" -> " + record[4])
+    try:
+        mode, owner, group, size = (field.decode("utf-8") for field in record[:4])
+    except UnicodeDecodeError:
+        return repr(name)
+    if not _looks_like_mode(mode) or not (size.isascii() and size.isdigit()):
+        return repr(name)
+    kind = _kind_from_mode(mode)
+    if kind == "symlink":
+        if not target or _TARGET_FORBIDDEN.intersection(target):
+            return repr(f"{name} -> {target}")
+    elif target:
+        return repr(name)
+    return {
+        "name": name,
+        "mode": mode,
+        "kind": kind,
+        "size_bytes": int(size),
+        "owner": owner,
+        "group": group,
+        "symlink_target": target if kind == "symlink" else None,
+    }
+
+
+def _shown(output: bytes) -> str:
+    """The head of an answer that is not a listing, escaped, for an error message."""
+    return repr(output[:80]) + ("..." if len(output) > 80 else "")
+
+
+def listing_failure(package: str, directory: str, error: str, stderr: str) -> dict:
+    """The result for a listing that find ran and that exited non-zero, run-as having let it run.
+
+    Not a run-as denial (see :func:`refused`). Which remedy it gets is read off
+    the FIRST line of stderr, find's own, which is one of three:
+
+    - the directory itself: ``find: <dir>: Permission denied``, unquoted
+      (run_as_find_databases_unreadable), or ``find: '<dir>': No such file or
+      directory``, quoted (run_as_find_shared_prefs_absent) -- the path's
+      failure, with :func:`path_failure_remedy`;
+    - an entry in it: ``find: '<dir>/<entry>': Permission denied`` -- the
+      directory could be read but not searched, so find could not stat what it
+      holds (`chmod u-x`: run_as_find_databases_unsearchable, whose first line
+      names ``.``). The listing failed AT that entry, and the remedy says so,
+      naming it escaped (the app chose it) and the directory's r and x bits,
+      rather than claiming the directory itself was refused;
+    - neither: find refusing the command itself (run_as_find_unknown_primary,
+      run_as_find_unknown_escape) -- this device's find cannot list this way,
+      and the path is not the problem.
+
+    An entry's name is printed after the directory's, so it cannot change which
+    of the three a line is; a newline in it only ends the line early, and the
+    entry named is the part before it.
+
+    Args:
+        package: The package run-as ran as.
+        directory: The directory :func:`listing_command` named.
+        error: The caller's message for the failure (it carries stderr).
+        stderr: The listing's stderr, decoded.
+    """
+    first = stderr.split("\n", 1)[0]
+    if first.startswith((f"find: {directory}: ", f"find: '{directory}': ")):
+        remedy = path_failure_remedy(package, directory)
+    elif first.startswith((f"find: {directory}/", f"find: '{directory}/")):
+        remedy = _entry_failure_remedy(package, directory, _failed_entry(first, directory))
+    else:
+        remedy = _listing_tool_remedy(package, directory)
+    return {"error": error, "path": directory, "remedy": remedy}
+
+
+def _failed_entry(first: str, directory: str) -> str:
+    """The entry find's first stderr line names below ``directory``, its reason dropped.
+
+    find quotes an entry's path (`find: '<dir>/<entry>': <reason>`), so the
+    reason follows the LAST `': ` -- a name may hold `': ` itself, the reasons
+    find prints do not. Without that separator (an unquoted line, or one a
+    newline in the name cut short) the rest of the line is the entry.
+    """
+    quoted = first.startswith(f"find: '{directory}/")
+    rest = first.removeprefix(f"find: '{directory}/" if quoted else f"find: {directory}/")
+    entry, separator, _reason = rest.rpartition("': " if quoted else ": ")
+    return entry if separator else rest
+
+
+def _entry_failure_remedy(package: str, directory: str, entry: str) -> str:
+    """Listing ``directory`` failed at ``entry``: say so, and which bits a listing needs."""
+    return (
+        f"run-as works for this app; listing {directory} failed at the entry {entry!r}, "
+        "which find could not read. A directory needs its owner's r bit to be listed and "
+        "its x bit for its entries to be reached: check it with "
+        f"`adb shell run-as {package} ls -ld {directory}`, and its entries with "
+        f"`adb shell run-as {package} ls -lab {directory}`."
+    )
+
+
+def unreadable_listing(package: str, directory: str, exc: ListingError) -> dict:
+    """The result for a listing whose stdout :func:`parse_listing` refused."""
+    if exc.not_a_directory:
+        remedy = (
+            f"Name a directory to list. `adb shell run-as {package} ls -ld {directory}` "
+            f"shows what {directory} is."
+        )
+    else:
+        remedy = _listing_tool_remedy(package, directory)
+    return {"error": f"cannot list {directory}: {exc}", "path": directory, "remedy": remedy}
+
+
+def _listing_tool_remedy(package: str, directory: str) -> str:
+    """Nothing was listed: this device's find does not print the records the listing reads."""
+    return (
+        "Nothing was listed. These scripts list a directory with toybox find's -H, "
+        "-maxdepth and -printf (%M %u %g %s %l %P), measured on toybox 0.8.11 "
+        "(Android 15); this device's find did not answer that way. "
+        f"`adb shell run-as {package} ls -lab {directory}` shows the directory, "
+        "with its names escaped."
+    )
 
 
 def rejections(listing: LsListing) -> dict:
@@ -393,10 +578,10 @@ def is_plain_file_name(name: str) -> bool:
 
 
 def _looks_like_mode(token: str) -> bool:
-    """True if a token looks like a 10-char ls permission string."""
-    if len(token) < 10:
+    """True if a token is a 10-character ls permission string, as find's %M prints one."""
+    if len(token) != 10:
         return False
-    return token[0] in "-dlcbsp" and all(c in "rwxsStTl-" for c in token[1:10])
+    return token[0] in "-dlcbsp" and all(c in "rwxsStTl-" for c in token[1:])
 
 
 def _kind_from_mode(mode: str) -> str:
@@ -407,21 +592,3 @@ def _kind_from_mode(mode: str) -> str:
     if head == "l":
         return "symlink"
     return "file"
-
-
-def _extract_name(rest: str, kind: str) -> tuple[str, str | None]:
-    """Split the name column into the name and, for a symlink, its target.
-
-    Args:
-        rest: Everything after the time column. toybox prints a name bare
-            (unquoted, unescaped) and a symlink as ``name -> target``.
-        kind: Entry kind (symlinks split on " -> ").
-
-    Returns:
-        (name, symlink_target) — target is None for non-symlinks.
-    """
-    if kind == "symlink" and " -> " in rest:
-        # Not stripped: a CR or space at either end belongs to the name.
-        name, _, symlink_target = rest.partition(" -> ")
-        return name, symlink_target
-    return rest, None

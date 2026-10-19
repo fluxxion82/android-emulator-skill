@@ -1,0 +1,12 @@
+total 48
+drwxrwxrwx 3 u0_a205 u0_a205 4096 2026-10-18 23:31 .
+drwxrwx--x 3 u0_a205 u0_a205 4096 2026-10-18 23:31 ..
+-rw-rw-rw- 1 u0_a205 u0_a205    0 2026-10-18 23:31 c\d.db
+lrwxrwxrwx 1 u0_a205 u0_a205    3 2026-10-18 23:31 dirlink -> sub
+-rw-rw-rw- 1 u0_a205 u0_a205    0 2026-10-18 23:31 e f.db
+lrwxrwxrwx 1 u0_a205 u0_a205   15 2026-10-18 23:31 lflink -> dangling
+target
+lrwxrwxrwx 1 u0_a205 u0_a205    6 2026-10-18 23:31 link -> e f.db
+drwxrwxrwx 2 u0_a205 u0_a205 4096 2026-10-18 23:31 sub
+-rw-rw-rw- 1 u0_a205 u0_a205    0 2026-10-18 23:31 x.db
+-rw-rw---- 1 u0_a205 u0_a205 32768 2026-10-18 22:28 ghost.db

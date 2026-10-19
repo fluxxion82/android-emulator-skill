@@ -53,9 +53,9 @@ DB_MAX_BYTES = env_int("ANDROID_EMU_MODEL_DB_MAX_BYTES", 50_000_000, min_value=4
 # Timeout (seconds) for a single run-as adb invocation in LIVE mode.
 RUN_AS_TIMEOUT = env_int("ANDROID_EMU_MODEL_TIMEOUT", 30, min_value=5)
 
-# What a run-as refusal is, and how a directory listing is read, are decided
-# once, in common.run_as (refused, parse_ls_output), for this script and
-# container.py alike.
+# What a run-as refusal is, and how a directory is listed, are decided once,
+# in common.run_as (refused, listing_command, parse_listing), for this script
+# and container.py alike.
 
 SCOPING_NOTE = (
     "Room is backed by SQLite. This inspector covers Room (annotations + "
@@ -627,21 +627,25 @@ class LiveInspector:
         db_dir = f"/data/data/{package}/databases"
 
         if db_name is None:
-            # `ls -la` as bytes, parsed as container.py parses a listing
-            # (common.run_as.parse_ls_output). This was `ls -1` in text mode
-            # with splitlines() and strip(): the transport made a CR in a name
-            # a line break, and `x\ry.db` was listed as two databases, `x` and
-            # `y.db`, at exit 0 (final review of v0.8.0). A name no plain file
-            # name carries, or that is not UTF-8, is refused and reported.
+            # Listed as container.py lists a directory: common.run_as's find,
+            # NUL-terminated records read as bytes. This was `ls -1` in text
+            # mode, where a CR in a name made `x\ry.db` two databases (final
+            # review of v0.8.0), then `ls -la` split on newlines, where
+            # `fixture.db` + LF + a whole `ls` line listed `ghost.db`, a
+            # database the app does not have, at exit 0 (REQUIRED 4; recorded:
+            # run_as_ls_names). A name no plain file name carries, or that is
+            # not UTF-8, is refused and reported -- as itself, whole.
             try:
-                output = self._run_as_bytes(package, ["ls", "-la", db_dir])
+                output = self._run_as_bytes(package, run_as.listing_command(db_dir))
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
             except _RunAsError as exc:
-                # run-as ran; the device refused the directory itself.
-                remedy = run_as.path_failure_remedy(package, db_dir)
-                return False, {"error": str(exc), "path": db_dir, "remedy": remedy}
-            listing = run_as.parse_ls_output(output)
+                # run-as ran; find failed on the directory, or on the command.
+                return False, run_as.listing_failure(package, db_dir, str(exc), exc.stderr)
+            try:
+                listing = run_as.parse_listing(output)
+            except run_as.ListingError as exc:
+                return False, run_as.unreadable_listing(package, db_dir, exc)
             names = [
                 entry["name"]
                 for entry in listing.entries
@@ -715,7 +719,7 @@ class LiveInspector:
         if result.returncode != 0:
             stdout = result.stdout.decode("utf-8", errors="replace")
             detail = stderr.strip() or stdout.strip() or f"exit {result.returncode}"
-            raise _RunAsError(f"Command failed ({' '.join(argv)}): {detail}")
+            raise _RunAsError(f"Command failed ({' '.join(argv)}): {detail}", stderr)
         return result.stdout
 
     def _read_run_as(self, package: str, argv: list[str]) -> bytes:
@@ -744,7 +748,7 @@ class LiveInspector:
         stderr_text = result.stderr.decode("utf-8", errors="replace")
         self._raise_if_refused(package, stderr_text, result.returncode)
         if result.returncode != 0:
-            raise _RunAsError(stderr_text.strip() or f"exit code {result.returncode}")
+            raise _RunAsError(stderr_text.strip() or f"exit code {result.returncode}", stderr_text)
         return result.stdout
 
     def _raise_if_refused(self, package: str, stderr: str, returncode: int) -> None:
@@ -839,7 +843,11 @@ def require_adb_for_reads() -> None:
 
 
 class _RunAsError(RuntimeError):
-    """Generic run-as / adb command failure (not a denial)."""
+    """Generic run-as / adb command failure (not a denial), with the command's stderr."""
+
+    def __init__(self, message: str, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
 
 
 def _denied_result(package: str, exc: RunAsDeniedError) -> dict:
@@ -1283,7 +1291,7 @@ def _refuse_incomplete_listing(result: dict, args: argparse.Namespace) -> None:
     error = (
         f"refused {refused} entr{'y' if refused == 1 else 'ies'} of {result['databases_dir']} "
         f"the app named with bytes that are not UTF-8 or a character no plain file name "
-        f"carries (/, \\, NUL, CR, LF), or in a layout ls does not print: {shown}"
+        f"carries (/, \\, NUL, CR, LF), or in a record find does not print: {shown}"
     )
     remedy = (
         "The databases that could be read are listed. Inspect the refused entries on the "

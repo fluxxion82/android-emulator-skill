@@ -31,7 +31,8 @@ from model_inspector import (
     strip_comments,
 )
 
-from common.run_as import parse_adb_version
+from common.device_utils import quote_for_device_shell
+from common.run_as import listing_command, parse_adb_version
 
 
 @pytest.fixture(autouse=True)
@@ -380,20 +381,20 @@ def test_live_dump_schema_via_device_sqlite3(monkeypatch, recorded):
 
 
 def test_live_list_databases_skips_sidecars(monkeypatch, recorded):
-    """The fixture app's `ls -la databases/`, recorded: the journal is not a database.
+    """The fixture app's databases/ listing, recorded: the journal is not a database.
 
     This listing was hand-written as `app.db`, `-wal`, `-shm` and `other.db`;
-    the device's is fixture.db beside a zero-byte fixture.db-journal, with
-    `total`, `.` and `..` (run_as_ls_databases). It is read as container.py
-    reads a listing (common.run_as.parse_ls_output), where it was `ls -1`.
+    the device's is fixture.db beside a zero-byte fixture.db-journal, after the
+    directory's own record (run_as_find_databases). It is read as container.py
+    reads a listing (common.run_as.parse_listing).
     """
-    listing = recorded.text("run_as_ls_databases")
-    assert " fixture.db\n" in listing and " fixture.db-journal\n" in listing, "it changed"
+    listing = recorded.data("run_as_find_databases.txt")
+    assert b"\0fixture.db\0" in listing and b"\0fixture.db-journal\0" in listing, "it changed"
     captured: list[list[str]] = []
 
     def fake_run(cmd, *args, **kwargs):
         captured.append(cmd)
-        return _completed(cmd, stdout=listing)
+        return subprocess.CompletedProcess(cmd, 0, stdout=listing, stderr=b"")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -402,8 +403,8 @@ def test_live_list_databases_skips_sidecars(monkeypatch, recorded):
     assert result["databases"] == ["fixture.db"]
     assert result["total_databases"] == 1
     assert (result["rejected"], result["rejected_entries"]) == (0, [])
-    # The recording is of this listing: `ls -la` of the databases directory.
-    assert captured[0][-3:] == ["ls", "-la", "/data/data/com.example.composefixture/databases"]
+    # The recording is of this listing: the listing command, aimed at databases/.
+    assert _listed(captured[0]) == DATABASES_DIR
 
 
 def test_live_falls_back_to_host_sqlite3(monkeypatch, tmp_path):
@@ -666,17 +667,24 @@ DATABASES_DIR = "/data/data/com.example.composefixture/databases"
 def _device_answering_the_listing(
     tmp_path, recorded, recording: str, probe: str | None = None
 ) -> FakeToolchain:
-    """adb whose `ls -la` answers as ``recording`` did: stdout empty, the reason on stderr.
+    """adb whose listing answers as ``recording`` did, each stream where the manifest says.
 
-    ``probe`` names the recording that answers `run-as <pkg> id`, the probe
-    common.run_as asks before it calls a failure a run-as refusal.
+    A run-as refusal is all on stderr; find failing on an unreadable directory
+    printed its own record on stdout first, its stderr recorded in the twin
+    ``<recording>_stderr`` (same run). ``probe`` names the recording that
+    answers `run-as <pkg> id`, the probe common.run_as asks before it calls a
+    failure a run-as refusal.
     """
     status = {f["name"]: f for f in recorded.manifest["fixtures"]}
     entry = status[recording]
-    assert (entry["stream"], entry["stdout_bytes"]) == ("stderr", 0), entry
+    if entry["stream"] == "stderr":
+        assert entry["stdout_bytes"] == 0, entry
+        stdout, stderr = "", recorded.text(recording)
+    else:
+        stdout, stderr = recorded.text(recording), recorded.text(f"{recording}_stderr")
     rules = [
         Rule(("devices",), stdout=recorded.text("adb_devices_single")),
-        Rule(("ls", "-la"), stderr=recorded.text(recording), exit=entry["exit_status"]),
+        Rule(("find", "-printf"), stdout=stdout, stderr=stderr, exit=entry["exit_status"]),
     ]
     if probe is not None:
         rules.append(
@@ -692,8 +700,8 @@ def _device_answering_the_listing(
 def test_an_unreadable_databases_dir_is_a_filesystem_failure_not_a_run_as_denial(
     tmp_path, recorded, json_mode
 ):
-    """run_as_ls_databases_unreadable is this script's own `ls -la`, recorded with `chmod u-r`."""
-    chain = _device_answering_the_listing(tmp_path, recorded, "run_as_ls_databases_unreadable")
+    """run_as_find_databases_unreadable is this script's own listing, recorded with `chmod u-r`."""
+    chain = _device_answering_the_listing(tmp_path, recorded, "run_as_find_databases_unreadable")
     argv = ["--package", "com.example.composefixture", "--serial", "emulator-5554"]
 
     result = chain.run("model_inspector.py", *argv, *(["--json"] if json_mode else []))
@@ -706,8 +714,8 @@ def test_an_unreadable_databases_dir_is_a_filesystem_failure_not_a_run_as_denial
     if payload is not None:
         assert "run_as_denied" not in payload and "hint" not in payload, payload
         assert remedy in payload["remedy"]
-    (listing,) = [call for call in chain.calls("adb") if "ls" in call]
-    assert listing[-3:] == ["ls", "-la", DATABASES_DIR], "the recording is not of this command"
+    (listing,) = [call for call in chain.calls("adb") if "find" in call]
+    assert _listed(listing) == DATABASES_DIR, "the recording is not of this command"
     assert not [call for call in chain.calls("adb") if call[-1] == "id"], "probed for ls's refusal"
 
 
@@ -728,7 +736,7 @@ def test_a_refusal_run_as_printed_is_still_a_run_as_denial(
     """The two recorded refusals keep the debug-build remedy, the probe agreeing.
 
     Recorded for `run-as <pkg> ls`; run-as refuses before it runs any command,
-    so the same refusal answers this script's `ls -la`, and the probe's
+    so the same refusal answers this script's listing, and the probe's
     `run-as <pkg> id` is answered with its own recording.
     """
     chain = _device_answering_the_listing(tmp_path, recorded, recording, probe)
@@ -771,30 +779,47 @@ def test_a_database_name_cannot_forge_an_offline_verdict(tmp_path, recorded, sep
 
 
 # ---------------------------------------------------------------------------
-# The databases listing, read as container.py reads one (W4-D item 3).
+# The databases listing, read as container.py reads one.
 #
 # It was `ls -1` in text mode, split with `splitlines()` and each name
 # `strip()`ped: the transport turned a CR in a name into a line break, so
-# `x\ry.db` came back as two databases, `x` and `y.db`, at exit 0. It is now
-# `ls -la` read as bytes and parsed by common.run_as.parse_ls_output -- the
-# parser container.py lists with -- which splits on `\n` only and refuses, and
-# reports, a name no plain file name carries or that is not UTF-8.
+# `x\ry.db` came back as two databases, `x` and `y.db`, at exit 0 (W4-D item
+# 3). Then `ls -la` split on `\n`: `fixture.db` + LF + a whole `ls -la` line
+# for ghost.db listed ghost.db, at exit 0 with nothing refused (final review
+# of v0.8.0, REQUIRED 4). It is now common.run_as's find, NUL-terminated
+# fields read as bytes by parse_listing -- the parser container.py lists with
+# -- which refuses, and reports, a name no plain file name carries or that is
+# not UTF-8, whole.
 # ---------------------------------------------------------------------------
 
 
-def _with_name(recorded, name: bytes) -> dict[tuple[str, ...], bytes]:
-    """Both recorded databases listings, ``fixture.db`` renamed ``name`` and nothing else.
+def _listed(argv: list[str]) -> str | None:
+    """The directory an adb argv lists, when it ends in the WHOLE listing command; else None."""
+    if "find" not in argv or argv.index("find") + 2 >= len(argv):
+        return None
+    at = argv.index("find")
+    directory = argv[at + 2]
+    command = [quote_for_device_shell(arg) for arg in listing_command(directory)]
+    return directory if argv[at:] == command else None
 
-    `ls -1` (run_as_ls_1_databases) is what the script ran before; `ls -la`
-    (run_as_ls_databases) what it runs now. Each answers its own command, so
-    the spec reads the same on either.
+
+def _with_name(recorded, name: bytes) -> dict[tuple[str, ...], bytes]:
+    """Each recorded databases listing, ``fixture.db`` renamed ``name`` and nothing else.
+
+    `ls -1` (run_as_ls_1_databases) and `ls -la` (run_as_ls_databases) are
+    what the script ran before; find (run_as_find_databases) what it runs
+    now, where the name is the last of six NUL-terminated fields. Each answers
+    its own command, so the spec reads the same on any of them.
     """
     one = recorded.text("run_as_ls_1_databases").encode()
     long = recorded.text("run_as_ls_databases").encode()
+    find = recorded.data("run_as_find_databases.txt")
     assert one.startswith(b"fixture.db\n") and b" fixture.db\n" in long, "the recordings moved"
+    assert find.count(b"\0fixture.db\0") == 1, "the recording moved"
     return {
         ("ls", "-1"): name + one.removeprefix(b"fixture.db"),
         ("ls", "-la"): long.replace(b" fixture.db\n", b" " + name + b"\n", 1),
+        ("find", "-printf"): find.replace(b"\0fixture.db\0", b"\0" + name + b"\0", 1),
     }
 
 
@@ -838,17 +863,15 @@ def test_a_database_name_that_is_not_a_plain_file_name_is_refused_not_split(
     else:
         # What was read, then the refusal: never "No databases found".
         assert result.stdout == "databases (0, 1 refused):\n", result.stdout
-    (listing,) = [call for call in chain.calls("adb") if "ls" in call]
-    assert listing[-2:] == ["-la", DATABASES_DIR], listing
+    (listing,) = [call for call in chain.calls("adb") if "find" in call]
+    assert _listed(listing) == DATABASES_DIR, listing
 
 
-def test_a_newline_in_a_database_name_makes_the_listing_a_failure(tmp_path, recorded):
-    """`x\\ny.db`: `ls -la` prints `x` as an entry and `y.db` as a line of its own.
+def test_a_newline_in_a_database_name_is_one_refused_name(tmp_path, recorded):
+    """`x\\ny.db`: `ls -la` printed `x` as an entry and `y.db` as a line of its own.
 
-    The second line is not ls's layout, so it is refused -- and a listing that
-    refused a line is incomplete: exit 1, with what was read and the refused
-    line named. (A name can still forge a WHOLE `ls -la` line after its
-    newline; parse_ls_output's docstring says so, and container.py shares it.)
+    Now it is one name, refused as itself: exit 1, with the journal's sidecar
+    status intact and nothing listed as a database.
     """
     chain = _device_listing(tmp_path, recorded, b"x\ny.db")
     argv = ["--package", "com.example.composefixture", "--serial", "emulator-5554"]
@@ -856,4 +879,90 @@ def test_a_newline_in_a_database_name_makes_the_listing_a_failure(tmp_path, reco
     result = chain.run("model_inspector.py", *argv, "--json")
 
     payload = assert_refusal(result, json_mode=True, naming=("refused 1 entry",), status=1)
-    assert payload["rejected_entries"] == [repr("y.db")], payload
+    assert payload["rejected_entries"] == [repr("x\ny.db")], payload
+    assert payload["databases"] == [], payload
+
+
+# The final review's reproduction (REQUIRED 4): the recorded databases listing
+# with ONLY fixture.db's name replaced by `fixture.db` + LF + the listing's own
+# `ls -la` line for fixture.db renamed ghost.db -- one legal Unix file name.
+# Through `ls -la` it listed ["fixture.db", "ghost.db"], total 2, rejected 0, at
+# exit 0.
+
+
+def _reviewers_forged_name(recorded) -> bytes:
+    """`fixture.db` + LF + run_as_ls_databases's own fixture.db line, its name made ghost.db."""
+    long = recorded.text("run_as_ls_databases")
+    (line,) = [line for line in long.split("\n") if line.endswith(" fixture.db")]
+    return ("fixture.db\n" + line.removesuffix("fixture.db") + "ghost.db").encode()
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_name_forging_a_whole_ls_line_lists_no_ghost_database(tmp_path, recorded, json_mode):
+    """REQUIRED 4: the forged line is inside one name, refused whole; ghost.db is not a database."""
+    name = _reviewers_forged_name(recorded)
+    chain = _device_listing(tmp_path, recorded, name)
+    argv = ["--package", "com.example.composefixture", "--serial", "emulator-5554"]
+
+    result = chain.run("model_inspector.py", *argv, *(["--json"] if json_mode else ["--verbose"]))
+
+    payload = assert_refusal(result, json_mode=json_mode, naming=("refused 1 entry",), status=1)
+    if payload is not None:
+        assert (payload["databases"], payload["total_databases"]) == ([], 0), payload
+        assert payload["rejected_entries"] == [repr(name.decode())], payload
+    else:
+        assert result.stdout.startswith("databases (0, 1 refused):\n"), result.stdout
+        assert f"  refused: {name.decode()!r}" in result.stdout, result.stdout
+    assert "ghost.db\n" not in result.stdout
+
+
+def test_the_recorded_forging_name_lists_no_ghost_database(tmp_path, recorded):
+    """The same forgery recorded on the device: a names directory made in the fixture app's files/.
+
+    Its find listing (run_as_find_names) and `ls -la` (run_as_ls_names) answer
+    this script's listing of databases/ -- a substitution of which recording
+    answers which directory; find's names do not carry the directory. Through
+    `ls -la`, x.db and ghost.db were both databases.
+    """
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    chain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("find", "-printf"), stdout=recorded.text("run_as_find_names")),
+            Rule(("ls", "-la"), stdout=recorded.text("run_as_ls_names")),
+        ],
+        default_exit=127,
+    )
+    argv = ["--package", "com.example.composefixture", "--serial", "emulator-5554", "--json"]
+
+    result = chain.run("model_inspector.py", *argv)
+
+    payload = assert_refusal(result, json_mode=True, naming=("refused 3 entries",), status=1)
+    assert payload["databases"] == ["e f.db"], payload
+    forged = "x.db\n-rw-rw---- 1 u0_a205 u0_a205 32768 2026-10-18 22:28 ghost.db"
+    assert repr(forged) in payload["rejected_entries"], payload["rejected_entries"]
+
+
+@pytest.mark.parametrize(
+    ("recording", "remedy"),
+    [
+        ("run_as_find_databases_unreadable", "ls -ld"),
+        ("run_as_find_databases_unsearchable", "failed at the entry '.'"),
+        ("run_as_find_unknown_primary", "toybox find"),
+        ("run_as_find_unknown_escape", "toybox find"),
+    ],
+)
+def test_a_failed_listing_names_the_path_or_the_command_by_finds_first_line(
+    tmp_path, recorded, recording, remedy
+):
+    """`find: <dir>: ...` is the directory's failure; `find: bad ...` names no path, and is find's."""
+    chain = _device_answering_the_listing(tmp_path, recorded, recording)
+    argv = ["--package", "com.example.composefixture", "--serial", "emulator-5554", "--json"]
+
+    result = chain.run("model_inspector.py", *argv)
+
+    payload = assert_refusal(result, json_mode=True, naming=("find: ",), status=1)
+    assert remedy in payload["remedy"], payload["remedy"]
+    assert payload["path"] == DATABASES_DIR
