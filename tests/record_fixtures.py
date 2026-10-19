@@ -1982,6 +1982,156 @@ def _anr_records(*, requires: tuple[str, ...]) -> Callable[[str | None, dict], b
     return capture
 
 
+# The process the fixture app's ForeignProcessAnrReceiver runs in: named after
+# another package (android:process), under the fixture app's own uid.
+_FOREIGN_PROCESS = "com.example.victim"
+_FOREIGN_ACTION = f"{COMPOSE_PACKAGE}.PROVOKE_FOREIGN_PROCESS_ANR"
+
+
+def _poll(check: Callable[[], str | None], seconds: int) -> str | None:
+    """``check()`` once a second until it answers, for at most ``seconds``."""
+    for _ in range(seconds):
+        answer = check()
+        if answer:
+            return answer
+        time.sleep(1)
+    return None
+
+
+def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
+    """An ANR ActivityManager names after ANOTHER package: the app's own, in a process so named.
+
+    The fixture app declares ForeignProcessAnrReceiver with
+    ``android:process="com.example.victim"``, a global process name any app may
+    choose, which runs under the app's own uid. Its block is AnrReceiver's, so
+    ActivityManager reports ``ANR in com.example.victim`` -- the process name,
+    ``mApp.processName``, not a package. While the process is alive (between
+    system_server's ``Start proc`` and the ANR, which kills a background
+    process at once: ``Killing … bg anr``), ``ps -o PID,UID -p <pid>`` is asked,
+    in the recorded ps_pid_uid syntax; both packages' uid listings are asked
+    too (the claimed one is not installed). Kept: ActivityManager's and
+    WindowManager's records naming the process or the provoking action, from
+    the provoking broadcast on, all written by system_server.
+    """
+    # --async: `am broadcast` otherwise waits for the broadcast to finish --
+    # here, for the ANR that kills the process -- so nothing could be asked of
+    # the process while it lived (measured: every question came too late).
+    _run(
+        [
+            "shell",
+            "am",
+            "broadcast",
+            "--async",
+            "-f",
+            "0x10000000",
+            "-n",
+            f"{COMPOSE_PACKAGE}/.ForeignProcessAnrReceiver",
+            "-a",
+            _FOREIGN_ACTION,
+        ],
+        serial,
+        timeout=30,
+    )
+    started = re.compile(rf"Start proc (\d+):{re.escape(_FOREIGN_PROCESS)}/(\S+) ")
+
+    def started_pid() -> str | None:
+        text = _run(["logcat", "-d", "-s", "ActivityManager:I"], serial, timeout=30).text
+        found = started.findall(text)
+        return found[-1][0] if found else None
+
+    pid = _poll(started_pid, 20)
+    if pid is None:
+        raise CaptureError(f"no `Start proc <pid>:{_FOREIGN_PROCESS}` within 20 s")
+    # Asked while the process lives: its Killing record must come after the
+    # device's clock read here.
+    ps = _run(["shell", "ps", "-o", "PID,UID", "-p", pid], serial, timeout=15)
+    asked_at = _run(["shell", "date", "+%s"], serial, timeout=15).text.strip()
+    listings = {
+        package: _run(
+            ["shell", "cmd", "package", "list", "packages", "-U", package], serial, timeout=15
+        )
+        for package in (COMPOSE_PACKAGE, _FOREIGN_PROCESS)
+    }
+    owner = re.search(
+        rf"package:{re.escape(COMPOSE_PACKAGE)} uid:(\d+)", listings[COMPOSE_PACKAGE].text
+    )
+    row = re.search(rf"^\s*{pid}\s+(\d+)\s*$", ps.text, re.MULTILINE)
+    if not (asked_at.isdigit() and owner and row and row.group(1) == owner.group(1)):
+        raise CaptureError(
+            f"pid {pid} was not shown alive under {COMPOSE_PACKAGE}'s uid at {asked_at!r}: "
+            f"ps {ps.text.strip()!r}, listing {listings[COMPOSE_PACKAGE].text.strip()!r}"
+        )
+
+    def reported() -> str | None:
+        text = _run(["logcat", "-d", "-s", "ActivityManager:E"], serial, timeout=30).text
+        return "yes" if f"ANR in {_FOREIGN_PROCESS}" in text else None
+
+    if _poll(reported, 30) is None:
+        raise CaptureError(f"ActivityManager reported no `ANR in {_FOREIGN_PROCESS}` within 30 s")
+    time.sleep(2)
+
+    system_server = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
+    if not system_server.isdigit():
+        raise CaptureError(f"pidof system_server named no single pid: {system_server!r}")
+    records = _split_records(_run_bytes(["logcat", "-d", "-B"], serial, timeout=60))
+    marker = f"Broadcasting: Intent {{ act={_FOREIGN_ACTION}"
+    starts = [
+        index
+        for index, (_pid, raw) in enumerate(records)
+        if _tag_and_message(raw)[0] == "ActivityManager"
+        and _tag_and_message(raw)[1].startswith(marker)
+    ]
+    if not starts:
+        raise CaptureError("no provoking broadcast in the buffer")
+    kept = [
+        (writer, raw)
+        for writer, raw in records[starts[-1] :]
+        if _tag_and_message(raw)[0] in ("ActivityManager", "WindowManager")
+        and (
+            _FOREIGN_PROCESS in _tag_and_message(raw)[1]
+            or _FOREIGN_ACTION in _tag_and_message(raw)[1]
+        )
+    ]
+    messages = "\n".join(_tag_and_message(raw)[1] for _writer, raw in kept)
+    for needle in (
+        f"Start proc {pid}:{_FOREIGN_PROCESS}/",
+        f"ANR in {_FOREIGN_PROCESS}\nPID: {pid}\n",
+        f"Killing {pid}:{_FOREIGN_PROCESS}/",
+    ):
+        if needle not in messages:
+            raise CaptureError(f"the provoked ANR's records do not hold {needle!r}")
+    writers = {str(writer) for writer, _raw in kept}
+    if writers != {system_server}:
+        raise CaptureError(f"system_server is {system_server}; the records came from {writers}")
+    killed = [
+        struct.unpack_from("<I", raw, 12)[0]
+        for _writer, raw in kept
+        if _tag_and_message(raw)[1].startswith(f"Killing {pid}:")
+    ]
+    if not killed or int(asked_at) >= killed[-1]:
+        raise CaptureError(f"ps was asked at {asked_at}, not before pid {pid} was killed {killed}")
+    extra["system_server_pid"] = system_server
+    extra["stalled_pid"] = pid
+    extra["ps_alive"] = {
+        "command": f"adb shell ps -o PID,UID -p {pid}",
+        "exit_status": ps.returncode,
+        "output": _strip_cr(ps.text),
+        "device_epoch": int(asked_at),
+    }
+    extra["package_uid_listing"] = {
+        "command": f"adb shell cmd package list packages -U {COMPOSE_PACKAGE}",
+        "exit_status": listings[COMPOSE_PACKAGE].returncode,
+        "output": _strip_cr(listings[COMPOSE_PACKAGE].text),
+    }
+    extra["claimed_package_uid_listing"] = {
+        "command": f"adb shell cmd package list packages -U {_FOREIGN_PROCESS}",
+        "exit_status": listings[_FOREIGN_PROCESS].returncode,
+        "output": _strip_cr(listings[_FOREIGN_PROCESS].text),
+    }
+    extra.update(_device_zone(serial))
+    return b"".join(_aliased_record(raw) for _writer, raw in kept)
+
+
 # The marker the injection's records carry, so they can be kept and found.
 _INJECTION_MARKER = "w3l-tag-injection"
 
@@ -2680,6 +2830,42 @@ FIXTURES: list[Fixture] = [
                 "\nReason: Input dispatching timed out",
             )
         ),
+    ),
+    Fixture(
+        name="logcat_anr_foreign_process_records",
+        emulator_only=True,
+        ext="bin",
+        catches=("W4-N",),
+        args=["logcat", "-d", "-B"],
+        command=(
+            "adb logcat -c; am start -W the fixture app; adb shell am broadcast --async "
+            "-f 0x10000000 "
+            "-n com.example.composefixture/.ForeignProcessAnrReceiver (android:process="
+            "com.example.victim, AnrReceiver's 40 s block); once system_server logs its "
+            "`Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' "
+            "cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, "
+            "host-filtered to ActivityManager and WindowManager records naming the process or "
+            "the provoking action"
+        ),
+        description=(
+            "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, "
+            "in a process it named com.example.victim (android:process), under its own uid. "
+            "ActivityManager prints the PROCESS name -- 'ANR in com.example.victim', its "
+            "'\\nPID: <pid>' that process's -- and system_server's `Start proc <pid>:"
+            "com.example.victim/u0a205` and `Killing <pid>:com.example.victim/u0a205 ... bg anr` "
+            "carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p "
+            "<pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture "
+            "app's uid) and `claimed_package_uid_listing` (com.example.victim is not "
+            "installed), `system_server_pid`."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["logcat", "-c"],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+            ["shell", "sleep", "2"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_bytes=_foreign_process_anr,
     ),
     Fixture(
         name="logcat_crash_tail",

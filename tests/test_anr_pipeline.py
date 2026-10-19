@@ -31,9 +31,11 @@ from dataclasses import replace
 from datetime import datetime
 
 import pytest
+from fake_toolchain import recorded_ps_answer
 
 from common import anr_pipeline as p
 from common import log_lifecycle, logcat
+from common.device_utils import parse_package_uids, parse_ps_uids
 from common.logcat import LogRecord
 
 # --- helpers ---------------------------------------------------------------
@@ -114,9 +116,36 @@ def _system_server(recorded, name: str) -> str:
     return measured
 
 
-def _stream(recorded, records: list[LogRecord], name: str = BROADCAST) -> list[dict]:
-    """``parse_logcat_stream`` over records, system_server as measured with ``name``."""
-    return p.parse_logcat_stream(records, system_server_pid=_system_server(recorded, name))
+def _owner(recorded):
+    """Whose process a pid is, as the device answers: ``(pid, package) -> bool | None``.
+
+    The recorded answers: ``ps -o PID,UID -p <pid>`` is ps_pid_uid with only
+    its app row's pid substituted (fake_toolchain.recorded_ps_answer: the
+    fixture app's process, alive under its uid), and the package's uids are
+    package_list_uid's. A package that listing does not name has no uid, so
+    nothing is shown -- None.
+    """
+
+    def owns(pid: int, package: str) -> bool | None:
+        uids = parse_package_uids(recorded.text("package_list_uid"), package)
+        uid = parse_ps_uids(recorded_ps_answer(recorded, str(pid))).get(str(pid))
+        return None if uids is None or uid is None else uid in uids
+
+    return owns
+
+
+def _stream(recorded, records: list[LogRecord], name: str = BROADCAST, owner=_owner) -> list[dict]:
+    """``parse_logcat_stream`` over records, system_server as measured with ``name``.
+
+    ``owner`` answers whose process a report's pid is (default: the recorded
+    answers, :func:`_owner`); None asks nothing, so no ANR is filed under a
+    package.
+    """
+    return p.parse_logcat_stream(
+        records,
+        system_server_pid=_system_server(recorded, name),
+        subject_owner=owner(recorded) if owner else None,
+    )
 
 
 def _norm(line: str, current_ms: int = 1000) -> p.NormalisedEvent:
@@ -214,31 +243,36 @@ def test_the_anr_pid_column_is_not_the_stalled_apps_pid(recorded):
     assert parsed["pid"] != reported
 
 
-def test_parse_window_anr_names_the_app_and_not_the_word_window(recorded):
-    r"""WindowManager's form, where the package lives inside the braces.
+def test_parse_window_anr_names_neither_the_word_window_nor_its_title(recorded):
+    r"""WindowManager's form: what follows the window's hash is its TITLE.
 
     ``ANR in Window{67a8d77 u0 com.pkg/com.pkg.MainActivity}`` also matches the
     generic ``ANR in ([\w.]+)`` pattern, which read the package as "Window".
+    Read off the braces instead, the title made the package -- and the title
+    is the app's to set (wave 4). It is kept as display text, ``window``.
     """
     raw = p.parse_logcat_anr(_window_anr_line(recorded))
 
     assert raw is not None
     assert raw["kind"] == "anr"
-    assert raw["anr_package"] == "com.example.composefixture"
-    assert raw["component"] == (
+    assert (raw.get("anr_package"), raw.get("component")) == (None, None)
+    assert raw["window"] == (
         "com.example.composefixture/com.example.composefixture.DefaultActivity"
     )
 
 
-def test_parse_window_anr_uses_its_component_as_the_symbol(recorded):
+def test_parse_window_anr_takes_no_symbol_from_its_title(recorded):
     event = _norm(_window_anr_line(recorded), current_ms=5000)
-    assert event.symbol == "com.example.composefixture/com.example.composefixture.DefaultActivity"
+    assert (event.symbol, event.identity, event.app) == (None, "window", None)
+    assert event.message_prefix.startswith("ANR in a window titled ")
 
 
 def test_one_stall_is_reported_by_two_subsystems(recorded):
     """Both recordings are of the same 40s block, under different tags.
 
     Anything counting ANRs has to know that, or one hang is two incidents.
+    ActivityManager names the package; WindowManager names a window, whose
+    title here is that package's activity -- as the app left it.
     """
     am = p.parse_logcat_anr(_anr_line(recorded))
     wm = p.parse_logcat_anr(_window_anr_line(recorded))
@@ -246,7 +280,7 @@ def test_one_stall_is_reported_by_two_subsystems(recorded):
     assert am is not None and wm is not None
     assert am["process"] == "ActivityManager"
     assert wm["process"] == "WindowManager"
-    assert am["anr_package"] == wm["anr_package"]
+    assert wm["window"].startswith(f"{am['anr_package']}/")
 
 
 def test_parse_strictmode_reads_the_violations_own_duration(recorded):
@@ -408,22 +442,50 @@ def test_an_input_anr_cut_off_before_activitymanager_reports_still_counts(record
     events = _stream(recorded, cut, INPUT)
 
     assert [e["kind"] for e in events] == ["anr"], events
-    assert events[0]["anr_package"] == PACKAGE
+    # An ANR of a window: its title is the app's text, so it names no package (wave 4).
+    assert (events[0]["anr_package"], events[0]["window"]) == (None, RECORDED_TITLE)
     assert events[0]["reason"].startswith("Input dispatching timed out")
 
 
-def test_a_broadcast_anr_cut_off_after_windowmanagers_report_is_still_one(recorded):
+def test_a_broadcast_anr_cut_off_after_windowmanagers_report_says_it_may_be_one(recorded):
     """The duplicate case, cut before ActivityManager's "Skipping duplicate" verdict.
 
-    WindowManager reported ~5 s after ActivityManager's report (recorded); the
-    correlation window reaches back far enough to know it is that stall.
+    WindowManager reported ~5 s after ActivityManager's report of the
+    broadcast ANR (recorded), and that report names no window; only the
+    window's title -- the app's text -- could tie the two. It used to settle
+    the report by that title, which let any title make a separate ANR vanish
+    (Codex review of PR #39). Both are kept; the window's says it may be the
+    same stall. The verdict, recorded 2 ms later, settles it by hash.
     """
     records = _records(recorded, BROADCAST)
 
     events = _stream(recorded, records[: records.index(_window(recorded)) + 1])
 
-    assert len(events) == 1, [e["message"] for e in events]
-    assert events[0]["process"] == "ActivityManager"
+    assert [(e["process"], e.get("possible_duplicate", False)) for e in events] == [
+        ("ActivityManager", False),
+        ("WindowManager", True),
+    ], events
+    assert _stream(recorded, records[: records.index(_verdict(recorded)) + 1]) == events[:1]
+
+
+def test_a_title_naming_the_reported_package_settles_nothing(recorded):
+    """The reviewer's replay: an ANR of B, then a separate window whose title names B.
+
+    The recorded broadcast ANR's report (an ANR of the fixture app), then
+    WindowManager's recorded report with only its window hash changed -- a
+    different window -- and its title still the fixture app's activity. It
+    vanished, settled by the title's package; a plain title kept it. It is
+    kept either way, marked a possible duplicate.
+    """
+    window = _window(recorded)
+    other = replace(window, message=window.message.replace("3e3de09", "5a5a5a5"))
+    if other == window:
+        pytest.fail("the recorded report no longer names window 3e3de09")
+    plain = _retitled([other], "plain title")[0]
+
+    for report in (other, plain):
+        events = _stream(recorded, [_report(recorded), report])
+        assert [e["process"] for e in events] == ["ActivityManager", "WindowManager"], events
 
 
 def test_only_a_reports_opening_is_an_anr(recorded):
@@ -477,23 +539,6 @@ def test_a_held_report_is_released_by_log_time_not_only_at_the_end(recorded):
 
     assert [(e["process"], e["kind"]) for e in released] == [("WindowManager", "anr")]
     assert assembler.close() == []
-
-
-def test_a_duplicate_verdict_settles_only_the_package_it_names(recorded):
-    """The verdict names an app EXACTLY (review of PR #26).
-
-    Matched by substring, a verdict naming ``com.example.composefixture``
-    settled a held report for a different app, ``example.composefixture``, and
-    that ANR vanished. The recorded report with only its package changed.
-    """
-    window = _window(recorded)
-    other_app = replace(window, message=window.message.replace(PACKAGE, "example.composefixture"))
-
-    events = _stream(recorded, [other_app, _verdict(recorded)])
-
-    assert [(e["process"], e["anr_package"]) for e in events] == [
-        ("WindowManager", "example.composefixture")
-    ]
 
 
 def test_a_duplicate_verdict_settles_the_report_it_names(recorded):
@@ -730,7 +775,8 @@ def test_a_duplicate_verdict_forged_in_a_tag_settles_nothing(recorded):
 
     events = _stream(recorded, [held, forged], INJECTION)
 
-    assert [(e["process"], e["anr_package"]) for e in events] == [("WindowManager", PACKAGE)]
+    # It stands as an ANR of its window, which names no package (wave 4).
+    assert [(e["process"], e["anr_package"]) for e in events] == [("WindowManager", None)]
 
 
 def test_with_system_servers_pid_unknown_no_report_counts_and_it_says_so(recorded):
@@ -756,6 +802,236 @@ def test_system_servers_pid_is_asked_only_when_a_report_arrives(recorded):
     assembler.close()
 
     assert asked == []
+
+
+# --- assemble: a window's title is the app's text (final review, wave 4) -----
+#
+# WindowManager's report prints the window as WindowState does: "Window{<hash>
+# u<user> <title>}". The hash and user are system_server's; the TITLE is the
+# window's, which the app sets (an activity's defaults to its component, which
+# is what the recordings show). The same title is in the input channel's name,
+# so every "Input dispatching timed out (<hash> <title> (server) ..." reason
+# carries it too -- WindowManager's own, ActivityManager's report's and its
+# duplicate verdict's. Each attack below is the recorded records with ONLY
+# that title replaced, wherever it is printed (``_retitled``).
+
+# The window's title as recorded: the fixture activity's default, its component.
+RECORDED_TITLE = f"{PACKAGE}/{PACKAGE}.DefaultActivity"
+VICTIM_TITLE = "com.example.victim/com.example.victim.DefaultActivity"
+
+
+def _retitled(records: list[LogRecord], title: str) -> list[LogRecord]:
+    """The records with only the window's title -- the app's own text -- replaced."""
+    if not any(RECORDED_TITLE in r.message for r in records):
+        pytest.fail("the recorded records no longer print the window's title")
+    return [replace(r, message=r.message.replace(RECORDED_TITLE, title)) for r in records]
+
+
+def _named(events: list[dict]) -> list[tuple[str, str | None]]:
+    """``(tag, package)`` of each event -- the package being what it would be filed under."""
+    return [(e["process"], e.get("anr_package")) for e in events]
+
+
+def test_a_title_naming_another_app_does_not_make_an_anr_of_it(recorded):
+    """The reviewer's first replay: the app titles its window as another app's activity.
+
+    The recorded input ANR -- WindowManager's report, then ActivityManager's
+    -- with only the title replaced by ``com.example.victim/…``. It came out
+    as TWO ANRs: the real app's, and one of the victim's. The title names
+    nothing; ActivityManager's report names the window it timed out on by
+    its hash, so the two reports are one incident, the real app's.
+    """
+    records = _retitled(_records(recorded, INPUT), VICTIM_TITLE)
+
+    events = _stream(recorded, records, INPUT)
+
+    assert _named(events) == [("ActivityManager", PACKAGE)], events
+    assert not any("victim" in str(e.get("component")) for e in events), events
+
+
+def test_a_title_reading_like_jank_does_not_make_the_report_jank(recorded):
+    """The reviewer's second replay: a title holding ``Skipped 80 frames!``.
+
+    The jank classifier matched it anywhere in WindowManager's message, and
+    the report came out as 80 frames of jank -- beside the real ANR. A report
+    is read for its opening only; nothing after it is classified.
+    """
+    records = _retitled(_records(recorded, INPUT), "Skipped 80 frames!")
+
+    events = _stream(recorded, records, INPUT)
+
+    assert [(e["process"], e["kind"]) for e in events] == [("ActivityManager", "anr")], events
+
+
+@pytest.mark.parametrize("title", [RECORDED_TITLE, VICTIM_TITLE, "Skipped 80 frames!"])
+def test_a_report_nothing_answers_is_an_anr_of_a_window_not_of_a_package(title, recorded):
+    """The fallback names no package: only ActivityManager's own record could, and none came.
+
+    The recorded input ANR cut after WindowManager's report, as a stop or a
+    --since window can cut it, its title as recorded, a victim's component,
+    or jank-like text. Each is one ANR of a WINDOW: ``anr_package`` null,
+    ``identity: "window"``, the title kept as display text, and no symbol
+    taken from it.
+    """
+    cut = _retitled(_input_cut_before_the_report(recorded), title)
+
+    events = _stream(recorded, cut, INPUT)
+
+    assert [(e["kind"], e.get("anr_package"), e.get("window")) for e in events] == [
+        ("anr", None, title)
+    ], events
+    event = p.build_normalised_event(events[0], session_start_ms=0, current_ms=5000)
+    assert (event.app, event.identity, event.window, event.symbol) == (None, "window", title, None)
+
+
+def test_a_verdict_settles_only_the_window_it_names(recorded):
+    """A duplicate verdict names the window by its hash: another window's report stands.
+
+    Derived: WindowManager's recorded report with only its window replaced by
+    another -- a different identity hash, as another window has -- then the
+    recorded verdict on the original window. The other window's report is an
+    ANR of its own.
+    """
+    window = _window(recorded)
+    other = replace(window, message=window.message.replace("3e3de09", "5a5a5a5"))
+    if other == window:
+        pytest.fail("the recorded report no longer names window 3e3de09")
+
+    events = _stream(recorded, [other, _verdict(recorded)])
+
+    assert [(e["process"], e.get("anr_package")) for e in events] == [("WindowManager", None)]
+
+
+# --- assemble: ActivityManager names a process, not a package (W4-N) --------
+#
+# logcat_anr_foreign_process_records: the fixture app's own stall, in a
+# process it named com.example.victim (android:process), under its own uid.
+# ActivityManager reports "ANR in com.example.victim" -- mApp.processName --
+# and its PID: line is that process. The device's answers in the same run:
+# `ps -o PID,UID -p <pid>` while it lived, and each package's uid listing (the
+# claimed one is not installed).
+
+FOREIGN = "logcat_anr_foreign_process_records"
+FOREIGN_PROCESS = "com.example.victim"
+
+
+def _recorded_owner(recorded, name: str = FOREIGN):
+    """``(pid, package) -> bool | None`` from the answers recorded in ``name``'s own run."""
+    entry = _entry(recorded, name)
+    listing = (
+        entry["package_uid_listing"]["output"] + entry["claimed_package_uid_listing"]["output"]
+    )
+    uids_alive = parse_ps_uids(entry["ps_alive"]["output"])
+
+    def owns(pid: int, package: str) -> bool | None:
+        uids, uid = parse_package_uids(listing, package), uids_alive.get(str(pid))
+        return None if uids is None or uid is None else uid in uids
+
+    return owns
+
+
+def test_an_anr_of_a_process_named_after_another_package_is_not_filed_under_it(recorded):
+    """The process ActivityManager names is the app's to choose: shown, never filed under.
+
+    It was ``anr_package: com.example.victim`` -- an ANR of a package that
+    did not stall, which passed ``--package com.example.victim``. The pid's
+    uid (ps, while it lived) is the fixture app's, and the claimed package
+    has none: unverified, kept as an ANR of a process.
+    """
+    stalled = _entry(recorded, FOREIGN)["stalled_pid"]
+
+    events = _stream(recorded, _records(recorded, FOREIGN), FOREIGN, lambda r: _recorded_owner(r))
+
+    (event,) = events
+    assert (event["anr_package"], event.get("component")) == (None, None), event
+    assert (event["process_name"], event["attribution"]) == (FOREIGN_PROCESS, "unverified")
+    assert event["app_pid"] == int(stalled)
+    normalised = p.build_normalised_event(event, session_start_ms=0, current_ms=5000)
+    assert (normalised.app, normalised.identity, normalised.symbol) == (None, "process", None)
+
+
+def test_a_process_shown_to_be_its_packages_is_filed_under_it(recorded):
+    """The control: the recorded broadcast ANR, its pid's uid the package's -- verified."""
+    (event,) = _stream(recorded, [_report(recorded)])
+
+    assert (event["anr_package"], event["attribution"]) == (PACKAGE, "verified")
+
+
+def test_with_no_owner_shown_no_anr_is_filed_under_a_package(recorded):
+    """Fail closed: a reader that can show nothing files nothing under a package."""
+    (event,) = _stream(recorded, [_report(recorded)], owner=None)
+
+    assert (event["anr_package"], event["process_name"]) == (None, PACKAGE)
+    assert event["attribution"] == "unverified"
+
+
+# --- assemble: only system_server's records move the log clock --------------
+
+
+def test_an_apps_timestamp_does_not_flush_a_held_report(recorded):
+    """A record's time is the WRITER's: an app stamping one 60 s ahead released a held report.
+
+    logd takes the time from the client's header (AOSP LogListener), unlike
+    the pid. The reviewer's replay: WindowManager's recorded report, then an
+    app's record dated 60 s after it -- the recorded jank record with only its
+    time set so -- then ActivityManager's recorded report. One incident was
+    counted twice. Only a record system_server wrote moves the clock that
+    releases a held report.
+    """
+    cut = _input_cut_before_the_report(recorded)
+    window = _window(recorded, INPUT)
+    jank = next(r for r in _records(recorded, RESTART) if r.tag == "Choreographer")
+    ahead = replace(jank, sec=window.sec + 60, nsec=window.nsec)
+
+    events = _stream(recorded, [*cut, ahead, _report(recorded, INPUT)], INPUT)
+
+    assert sorted(e["kind"] for e in events) == ["anr", "jank"], _named(events)
+    assert [e["process"] for e in events if e["kind"] == "anr"] == ["ActivityManager"]
+
+
+def test_system_servers_own_later_record_still_releases_a_held_report(recorded):
+    """The clock still moves: system_server's own record 11 s on releases the report.
+
+    The recorded "Broadcasting" record -- system_server's -- with only its
+    time set 11 s after WindowManager's report; and the same record with its
+    writer set to the stalled app's pid first, which must move nothing.
+    """
+    cut = _input_cut_before_the_report(recorded)
+    window = _window(recorded, INPUT)
+    assembler = p.AnrRecordAssembler(_system_server(recorded, INPUT))
+    assert [event for record in cut for event in assembler.feed(record)] == []
+    later = replace(cut[0], sec=window.sec + p.ANR_CORRELATION_MS // 1000 + 1, nsec=window.nsec)
+    app_later = replace(later, pid=_app_pid(recorded))
+
+    assert assembler.feed(app_later) == [], "an app's record moved the clock"
+    released = assembler.feed(later)
+
+    assert [(e["process"], e["kind"]) for e in released] == [("WindowManager", "anr")]
+
+
+# --- diff: a window is not an identity --------------------------------------
+
+
+def test_an_anr_known_only_by_its_window_is_not_compared_across_sessions(recorded):
+    """A WindowManager-only ANR names no package, so a diff cannot place it.
+
+    Session A holds the recorded broadcast ANR (ActivityManager's record);
+    session B the recorded input ANR cut before ActivityManager reported it.
+    The window ANR may be A's app again: A's ANR is neither resolved nor B's
+    window a new one, and the verdict says the diff could not decide.
+    """
+    named = p.build_normalised_event(
+        _stream(recorded, [_report(recorded)])[0], session_start_ms=0, current_ms=5000
+    )
+    (window_raw,) = _stream(recorded, _input_cut_before_the_report(recorded), INPUT)
+    window = p.build_normalised_event(window_raw, session_start_ms=0, current_ms=5000)
+
+    result = p.diff_sessions(_summary([named]), _summary([window]))
+
+    assert result["new_clusters"] == [] and result["resolved_clusters"] == [], result["verdict"]
+    assert sorted(str(c["identity"]) for c in result["not_comparable"]) == ["None", "window"]
+    assert result["verdict"].startswith("inconclusive"), result["verdict"]
+    assert "window" in p.format_diff(result)
 
 
 # --- threshold -------------------------------------------------------------
@@ -1163,6 +1439,11 @@ def test_no_budget_cuts_what_the_summary_could_not_see(fmt, empty, recorded):
         verification=p.VERIFICATION_UNKNOWN,
         unverified_anr_lines=2,
         stream_failure="the stream ended inside a record",
+        # Wave 4: a restart's gap, an ANR --package could not attribute, and
+        # the record the session started on (the recorded jank line, parsed).
+        stream_restarts=1,
+        unattributed_anrs=1,
+        ambiguous_tail=[p.parse_logcat_anr(_jank_line(recorded, 120))],
     )
     render = {
         "l0": p.format_l0,
@@ -1172,8 +1453,19 @@ def test_no_budget_cuts_what_the_summary_could_not_see(fmt, empty, recorded):
 
     out = render(summary).lower()
 
-    for disclosed in ("cut", "unnamed", "unverified", "broke"):
+    for disclosed in (
+        "cut",
+        "unnamed",
+        "unverified",
+        "broke",
+        "restart",
+        "unattributed",
+        "predate",
+    ):
         assert disclosed in out, (disclosed, out)
+    restored = p.summary_from_json(p.summary_to_json(summary))
+    assert (restored.stream_restarts, restored.unattributed_anrs) == (1, 1)
+    assert restored.ambiguous_tail == summary.ambiguous_tail
 
 
 def test_an_incomplete_summary_says_why(recorded):
