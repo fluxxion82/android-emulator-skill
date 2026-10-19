@@ -954,6 +954,11 @@ def _seed_session(store, events) -> str:
     with open(store.events_path(meta.session_id), "w", encoding="utf-8") as handle:
         for event in events:
             handle.write(event_to_jsonl(event) + "\n")
+    # As its worker leaves a session it was asked to stop: claimed, then
+    # `stopped`. --stop of a session no worker claimed cancels it instead.
+    pid = os.getpid()
+    store.claim_worker(meta.session_id, pid=pid, token=meta.worker_token)
+    store.finish_worker(meta.session_id, pid, {})
     AnrBuster(store=store).stop(meta.session_id)
     return meta.session_id
 

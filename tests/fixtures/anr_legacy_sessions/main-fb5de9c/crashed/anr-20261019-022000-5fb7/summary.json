@@ -1,0 +1,34 @@
+{
+  "session_id": "anr-20261019-022000-5fb7",
+  "started_at": "2026-10-19T02:20:00.865247",
+  "duration_ms": 142,
+  "event_count": 0,
+  "dropped_below_threshold": 0,
+  "matched_lines": 0,
+  "total_lines": 2,
+  "fingerprint_version": 3,
+  "incomplete": true,
+  "incomplete_reason": "the stream ended by itself",
+  "verification": null,
+  "unverified_anr_lines": 0,
+  "unnamed_pids": {
+    "count": 0,
+    "pids": []
+  },
+  "cut_records": 0,
+  "stream_failure": "the stream ended by itself; `adb logcat` exited 255: error: device 'no-such-serial-xyz' not found",
+  "stream_restarts": 0,
+  "ambiguous_tail": [],
+  "unattributed_anrs": 0,
+  "unnamed_dropped": {
+    "records": 0,
+    "pids": []
+  },
+  "possible_duplicates": 0,
+  "clusters": [],
+  "aggregates": {
+    "bursts": [],
+    "quiet_periods": [],
+    "process_distribution": {}
+  }
+}

@@ -7,15 +7,49 @@ prefix, and session-id prefix are retargeted for Android.
 
 Each session is a directory under
 ``~/.android-emulator-skill/anr-sessions/<id>/`` containing ``meta.json``
-(config + pid + status), ``events.jsonl`` (append-only normalised events), and
-``summary.json`` (post-stop).
+(config + pid + status), ``events.jsonl`` (append-only normalised events),
+``summary.json`` (post-stop) and ``lock``.
+
+The lifecycle (fourth review of PR #42: four rounds of closing one timing
+window at a time did not converge, so it is serialised instead)::
+
+    pending --claim (worker)--> running <--> deciding (worker)
+       |                          |  \\          |
+       | cancel (--stop,          |   \\---------+--> stopped  (worker: stopped on request)
+       |  or --start giving up)   |              \\--> crashed  (worker: its stream failed)
+       v                          |
+    cancelled                     +-- abandon (--stop --abandon) --> abandoned
+
+Every read-modify-write of a session's meta.json and summary.json happens
+under its lock (``fcntl.flock`` on ``<dir>/lock``; how long a writer waits
+for it is bounded, not how long it is held), by exactly one owner per
+transition, and only from the state the transition expects -- anything else
+is refused (:class:`TransitionRefusedError`), not applied. The worker owns
+its claim, ``deciding``, its counters and its end (``stopped`` / ``crashed``,
+which it publishes before it exits, with the counters and any failure in the
+same write -- unless the lock cannot be had in
+``WORKER_END_LOCK_TIMEOUT_SECONDS`` or the session was deleted); the CLI
+owns ``cancelled``, ``abandoned`` and ``summary.json``, and writes no field
+the worker owns. Those writes go to a temporary file of their own
+(``mkstemp``) and are renamed into place. ``events.jsonl`` is the
+exception: the worker appends to it without the lock, so an abandoned worker
+may still append; the abandonment records how much of it the session's
+answers read (``extras["abandoned_events_bytes"]``), and they read no more.
+
+``flock`` needs a filesystem that implements it: a local one. A home on a
+network filesystem serialises only as far as its server and mount options
+honour ``flock``. Telling the worker from another process needs ``ps``.
+
+A session an earlier version wrote has no ``lifecycle`` key: its worker took
+no lock and checked no state, and its --stop could save ``stopped`` while
+the worker ran on. --stop (anr_watcher) fences such a worker before trusting
+what the session says.
 
 The parent creates the directory and writes initial meta, with a random
-``worker_token`` it hands the worker on its command line. The detached worker
-updates meta with its own pid and start time (avoids pidfile race) and appends
-to events.jsonl. ``--stop`` SIGTERMs the worker -- only once the process at
-that pid has been shown to still be it -- drains events, builds a
-``SessionSummary``, and writes ``summary.json``.
+``worker_token`` it hands the worker on its command line. ``--stop``
+SIGTERMs the worker -- only once the process at that pid has been shown to
+still be it -- waits for the end it publishes, builds a ``SessionSummary``,
+and writes ``summary.json``.
 
 Storage root is overridable for tests via the ``ANDROID_EMU_ANR_HOME`` env var
 or the ``SessionStore(base_dir=...)`` constructor argument, so the suite never
@@ -25,15 +59,19 @@ touches the real home directory.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
 import secrets
-import signal
 import subprocess
+import tempfile
+import threading
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from common.anr_pipeline import (
@@ -48,10 +86,22 @@ from common.env_config import env_int
 
 # === CONSTANTS ===
 
-_STATUS_PENDING = "pending"
-_STATUS_RUNNING = "running"
-_STATUS_STOPPED = "stopped"
-_STATUS_CRASHED = "crashed"
+PENDING = "pending"
+RUNNING = "running"
+DECIDING = "deciding"
+STOPPED = "stopped"
+CRASHED = "crashed"
+CANCELLED = "cancelled"
+ABANDONED = "abandoned"
+# A worker is at work: it may still write, and how it ends is not yet known.
+LIVE_STATES = frozenset({RUNNING, DECIDING})
+# Nothing writes the session's meta again (a --stop only saves its summary).
+TERMINAL_STATES = frozenset({STOPPED, CRASHED, CANCELLED, ABANDONED})
+
+# The lifecycle above. Sessions written before it (v0.8.0 main) have no
+# ``lifecycle`` key: their worker never said how it ended, and their CLI wrote
+# ``stopped`` itself.
+LIFECYCLE_VERSION = 2
 
 _DURATION_RE = re.compile(r"(\d+)([smhd])$")
 
@@ -59,6 +109,17 @@ _DURATION_RE = re.compile(r"(\d+)([smhd])$")
 WORKER_TOKEN_FLAG = "--worker-token"
 # One `ps` question about the host's process table.
 PS_TIMEOUT_SECONDS = 5
+# How long the CLI waits for a session's lock -- the wait, not the hold: a
+# --stop holds it while it asks `ps` twice (2 x PS_TIMEOUT_SECONDS) and while
+# it builds the summary from the events file, a --get-details while it reads;
+# a worker's writes are milliseconds.
+CLI_LOCK_TIMEOUT_SECONDS = 30
+# How long the worker waits for it: past any --stop's hold.
+WORKER_LOCK_TIMEOUT_SECONDS = 60
+# And for its last write, how the session ended: longer still, since without
+# it the session can only be refused, or abandoned (review of PR #44).
+WORKER_END_LOCK_TIMEOUT_SECONDS = 300
+_LOCK_POLL_SECONDS = 0.02
 
 
 def _default_sessions_dir() -> Path:
@@ -78,6 +139,40 @@ def _default_ttl_hours() -> int:
     return env_int("ANDROID_EMU_ANR_SESSION_TTL_HOURS", 24)
 
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+# === ERRORS ===
+
+
+class SessionBusyError(RuntimeError):
+    """The session's lock was held past the bound by another writer; nothing was written."""
+
+    def __init__(self, session_id: str, seconds: float) -> None:
+        super().__init__(
+            f"Session {session_id} is being written by another process: its lock was "
+            f"held for {seconds:g}s."
+        )
+        self.remedy = (
+            "Run the same command again; the other writer -- a --stop, or the session's "
+            "worker -- finishes in seconds."
+        )
+
+
+class TransitionRefusedError(RuntimeError):
+    """The session is not in a state the transition starts from, so it was not applied.
+
+    Attributes:
+        found: The session's status as it was found, under the lock.
+    """
+
+    def __init__(self, session_id: str, transition: str, found: str, why: str = "") -> None:
+        reason = why or f"it is {found}"
+        super().__init__(f"Session {session_id} was not {transition}: {reason}.")
+        self.found = found
+
+
 # === TYPES ===
 
 
@@ -90,7 +185,7 @@ class SessionMeta:
     started_at_ms: int
     args: dict
     pid: int | None = None
-    status: str = _STATUS_PENDING
+    status: str = PENDING
     stopped_at: str | None = None
     stopped_at_ms: int | None = None
     extras: dict = field(default_factory=dict)
@@ -103,6 +198,12 @@ class SessionMeta:
     # this session's worker, and is never signalled.
     worker_token: str | None = None
     worker_started: str | None = None
+    # The lifecycle the session's writers follow (``LIFECYCLE_VERSION``);
+    # None for a session written before there was one.
+    lifecycle: int | None = None
+    # When a worker presenting the session's token claimed it: --start's
+    # evidence that its worker registered, and nothing else is.
+    claimed_at_ms: int | None = None
 
     def to_json(self) -> dict:
         return {
@@ -118,6 +219,8 @@ class SessionMeta:
             "fingerprint_version": self.fingerprint_version,
             "worker_token": self.worker_token,
             "worker_started": self.worker_started,
+            "lifecycle": self.lifecycle,
+            "claimed_at_ms": self.claimed_at_ms,
         }
 
     @classmethod
@@ -128,14 +231,22 @@ class SessionMeta:
             started_at_ms=payload["started_at_ms"],
             args=payload.get("args", {}),
             pid=payload.get("pid"),
-            status=payload.get("status", _STATUS_PENDING),
+            status=payload.get("status", PENDING),
             stopped_at=payload.get("stopped_at"),
             stopped_at_ms=payload.get("stopped_at_ms"),
             extras=payload.get("extras", {}),
             fingerprint_version=payload.get("fingerprint_version", 1),
             worker_token=payload.get("worker_token"),
             worker_started=payload.get("worker_started"),
+            lifecycle=payload.get("lifecycle"),
+            claimed_at_ms=payload.get("claimed_at_ms"),
         )
+
+    @property
+    def counters(self) -> dict:
+        """The worker's line counters, as it last wrote them ({} before it has)."""
+        counters = self.extras.get("line_counters", {})
+        return counters if isinstance(counters, dict) else {}
 
 
 def _ps(pid: int, field: str) -> str | None:
@@ -168,34 +279,74 @@ def process_started(pid: int) -> str | None:
         return None
 
 
-def worker_mismatch(meta: SessionMeta) -> str | None:
-    """Why the process at ``meta.pid`` is not (or cannot be shown to be) the session's worker.
+def _exists(pid: int) -> bool:
+    """Whether host process ``pid`` exists (one this user may not signal counts)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
-    None when it is: alive, its command line carrying the session's
-    ``worker_token``, and started when the worker claimed the pid. A crashed
-    or killed worker's pid is the OS's to give to anything; signalling it
-    without this check sent SIGTERM to whatever held the pid by then (Codex
-    review of PR #34).
+
+class Identity(StrEnum):
+    """What the process at a session's recorded pid is."""
+
+    # Shown to be the worker: its token on its command line, started when it claimed.
+    WORKER = "worker"
+    # Shown not to be: no such process, or one that is not the worker. The
+    # worker has exited -- a pid is reused only after its process has gone.
+    GONE = "gone"
+    # Neither: it may be the worker, still at work, and must not be taken for gone.
+    UNRESOLVED = "unresolved"
+
+
+def worker_identity(meta: SessionMeta) -> tuple[Identity, str]:
+    """Whether the process at ``meta.pid`` is the session's worker, and why it reads so.
+
+    The worker is shown only by a live process whose command line carries the
+    session's ``worker_token`` and that started when the worker claimed the
+    pid. A crashed or killed worker's pid is the OS's to give to anything;
+    signalling it without this check sent SIGTERM to whatever held the pid by
+    then (Codex review of PR #34).
+
+    A start time the claim could not record (`ps` did not answer then) proves
+    nothing either way: a live process with the token is UNRESOLVED, not a
+    later process -- taking it for one, --stop forgot a live worker and
+    saved a summary at exit 0 (fourth review of PR #42).
     """
     pid = meta.pid
+    if not pid:
+        return Identity.GONE, "no worker pid is recorded"
     try:
         command = _ps(pid, "command")
         started = _ps(pid, "lstart")
     except (OSError, subprocess.SubprocessError) as error:
-        return f"`ps` could not say what pid {pid} is ({error})"
+        if not _exists(pid):
+            return Identity.GONE, f"pid {pid} has exited"
+        return Identity.UNRESOLVED, f"`ps` could not say what pid {pid} is ({error})"
     if command is None or started is None:
-        return f"pid {pid} has exited"
+        if _exists(pid):
+            return Identity.UNRESOLVED, f"`ps` lists no pid {pid}, yet a process has it"
+        return Identity.GONE, f"pid {pid} has exited"
     if not meta.worker_token or f"{WORKER_TOKEN_FLAG} {meta.worker_token}" not in command:
-        return (
+        return Identity.GONE, (
             f"pid {pid} is another process now (its command line has no "
             f"{WORKER_TOKEN_FLAG} for this session)"
         )
-    if started != meta.worker_started:
-        return (
-            f"pid {pid} started at {started}, not when this session's worker did "
-            f"({meta.worker_started or 'unrecorded'})"
+    if meta.worker_started is None:
+        return Identity.UNRESOLVED, (
+            f"pid {pid} carries this session's worker token, but the worker's start time "
+            f"was not recorded when it claimed the session (`ps` did not answer then), so "
+            f"it cannot be told from a later process"
         )
-    return None
+    if started != meta.worker_started:
+        return Identity.GONE, (
+            f"pid {pid} started at {started}, not when this session's worker did "
+            f"({meta.worker_started})"
+        )
+    return Identity.WORKER, f"pid {pid} is the session's worker"
 
 
 # === SESSION STORE ===
@@ -207,6 +358,9 @@ class SessionStore:
     def __init__(self, base_dir: Path | str | None = None):
         self.base_dir = Path(base_dir).expanduser() if base_dir else _default_sessions_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # (thread, session id) for each lock this store holds: a write checks
+        # its writer holds the session's lock (``_require_lock``).
+        self._held: set[tuple[int, str]] = set()
 
     # === PUBLIC API ===
 
@@ -223,138 +377,190 @@ class SessionStore:
             started_at=now.isoformat(),
             started_at_ms=int(now.timestamp() * 1000),
             args=args,
-            status=_STATUS_PENDING,
+            status=PENDING,
             # The worker this session's events come from is spawned from the
             # same code, so this is the version they are fingerprinted under.
             fingerprint_version=FINGERPRINT_VERSION,
             worker_token=secrets.token_hex(8),
+            lifecycle=LIFECYCLE_VERSION,
         )
-        self._write_meta(meta)
+        with self._lock(session_id, CLI_LOCK_TIMEOUT_SECONDS):
+            self._write_meta(meta)
         return meta
 
-    def wait_for_worker(self, session_id: str, timeout_seconds: float = 2.0) -> SessionMeta:
-        """Poll meta.json until the worker has registered, or time out. Raises on timeout.
+    @contextlib.contextmanager
+    def transaction(
+        self, session_id: str, timeout: float = CLI_LOCK_TIMEOUT_SECONDS
+    ) -> Iterator[SessionMeta]:
+        """Hold the session's lock, and yield its meta as it is now.
 
-        Registered is running -- or crashed after it claimed the session: a
-        worker can claim and be marked crashed between two polls, and read as
-        one that never started ("did not register", exit 1) where its own
-        failure was the answer (CI on PR #42). The claim left
-        ``worker_started`` (kept by ``mark_crashed``), and the worker persists
-        its counters before it marks the session crashed; either shows it.
+        Every read-modify-write of a session goes through here: what is read
+        inside is what is written over, so no writer puts back a meta another
+        has changed since it read it (fourth review of PR #42: --stop wrote
+        the meta it had loaded after the worker had persisted a device loss,
+        erasing it). The lock is not re-entrant: nothing inside takes it again.
+
+        Raises:
+            SessionBusyError: The lock was held past ``timeout`` seconds.
+            FileNotFoundError: The session does not exist.
+            ValueError: ``session_id`` is not a plain session id.
+        """
+        with self._lock(session_id, timeout):
+            yield self.load_meta(session_id)
+
+    def wait_for_worker(self, session_id: str, timeout_seconds: float = 2.0) -> SessionMeta:
+        """Poll meta.json until a worker has claimed the session, or time out. Raises on timeout.
+
+        Claimed is ``claimed_at_ms``, which only ``claim_worker`` writes -- of a
+        pending session, for a worker presenting the session's token, in the
+        same write that makes it running -- so the evidence is this session's
+        own worker, whatever it has done since (it may have ended already:
+        CI on PR #42). Counters or a start time lying in the meta are not:
+        they were evidence before, whoever wrote them (fourth review of PR #42).
         """
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             meta = self.load_meta(session_id)
-            if meta.status == _STATUS_RUNNING and meta.pid:
-                return meta
-            if meta.status == _STATUS_CRASHED and (
-                meta.worker_started or "line_counters" in meta.extras
-            ):
+            if meta.claimed_at_ms is not None and meta.status not in (PENDING, CANCELLED):
                 return meta
             time.sleep(0.05)
         raise TimeoutError(f"Worker for {session_id} did not register within {timeout_seconds}s")
 
-    def claim_worker(self, session_id: str, pid: int) -> SessionMeta:
-        """Called by worker on startup. Writes pid, its start time and status=running."""
-        meta = self.load_meta(session_id)
-        meta.pid = pid
-        meta.worker_started = process_started(pid)
-        meta.status = _STATUS_RUNNING
-        self._write_meta(meta)
-        return meta
+    # --- the worker's transitions --------------------------------------------
 
-    def persist_worker_counters(self, session_id: str, counters: dict) -> None:
-        """Worker calls this at shutdown to flush its line counters into meta.
+    def claim_worker(self, session_id: str, pid: int, token: str | None) -> SessionMeta:
+        """pending -> running, for the worker presenting the session's token.
 
-        Re-reads meta from disk so a concurrent terminal status — ``stopped``
-        from the parent's ``stop()`` or ``crashed`` from this worker's own
-        ``mark_crashed`` — is not clobbered back to ``running``.
+        Records the pid, its start time and when it claimed. A session that is
+        not pending -- cancelled by a --stop or a --start that gave up on its
+        worker, or claimed already -- is refused, as is a token that is not
+        the session's: a worker that claimed a session already stopped went
+        on to persist a device loss into it (fourth review of PR #42).
+
+        Raises:
+            TransitionRefusedError: Not pending, or not this session's token.
         """
-        meta = self.load_meta(session_id)
-        meta.extras["line_counters"] = counters
-        if meta.status not in (_STATUS_STOPPED, _STATUS_CRASHED):
-            meta.status = _STATUS_RUNNING
+        # Asked before the lock: `ps` can take its bound, and the worker's
+        # start time is its own whenever it is asked.
+        started = process_started(pid)
+        with self.transaction(session_id, WORKER_LOCK_TIMEOUT_SECONDS) as meta:
+            if not token or token != meta.worker_token:
+                raise TransitionRefusedError(
+                    session_id, "claimed", meta.status, "the worker's token is not the session's"
+                )
+            if meta.status != PENDING:
+                raise TransitionRefusedError(session_id, "claimed", meta.status)
+            meta.pid = pid
+            meta.worker_started = started
+            meta.claimed_at_ms = _now_ms()
+            meta.status = RUNNING
+            self._write_meta(meta)
+            return meta
+
+    def persist_worker_counters(
+        self,
+        session_id: str,
+        pid: int,
+        counters: dict,
+        timeout: float = WORKER_LOCK_TIMEOUT_SECONDS,
+    ) -> SessionMeta:
+        """The worker's counters, while it is at work: written, its status unchanged.
+
+        Raises:
+            TransitionRefusedError: The session is no longer this worker's at work
+                (it was abandoned, or its pid is not ``pid``).
+            SessionBusyError: The lock was held past ``timeout``.
+        """
+        return self._worker_write(session_id, pid, counters, LIVE_STATES, None, timeout)
+
+    def worker_deciding(self, session_id: str, pid: int, counters: dict) -> SessionMeta:
+        """running -> deciding: the worker is deciding how its stream ended.
+
+        --stop waits for a deciding worker to its own bound: the answer may be
+        the session's refusal (second review of PR #42).
+        """
+        return self._worker_write(session_id, pid, counters, {RUNNING}, DECIDING)
+
+    def worker_resumed(self, session_id: str, pid: int, counters: dict) -> SessionMeta:
+        """deciding -> running: decided, and the stream is restarted."""
+        return self._worker_write(session_id, pid, counters, {DECIDING}, RUNNING)
+
+    def finish_worker(
+        self,
+        session_id: str,
+        pid: int,
+        counters: dict,
+        timeout: float = WORKER_LOCK_TIMEOUT_SECONDS,
+    ) -> SessionMeta:
+        """running | deciding -> crashed (counters hold a stream failure) | stopped.
+
+        The worker's last write, before it exits, on every path that can take
+        the lock (``timeout``: the worker passes
+        ``WORKER_END_LOCK_TIMEOUT_SECONDS``): the end, its
+        counters and any failure in one write, so nothing ever reads a failure
+        under a status that says the session is still recording (fourth review
+        of PR #42: --start answered `{"success": true}` between the two writes
+        that published them). Its pid is cleared: the OS may reuse it now.
+        """
+        end = CRASHED if counters.get("stream_failure") else STOPPED
+        return self._worker_write(session_id, pid, counters, LIVE_STATES, end, timeout)
+
+    # --- the CLI's transitions (inside a ``transaction``) --------------------
+
+    def mark_cancelled(self, meta: SessionMeta) -> None:
+        """pending -> cancelled: no worker claimed it, and none may now.
+
+        Raises:
+            TransitionRefusedError: The session is not pending (a worker claimed it).
+        """
+        if meta.status != PENDING:
+            raise TransitionRefusedError(meta.session_id, "cancelled", meta.status)
+        meta.status = CANCELLED
+        self._mark_ended(meta)
         self._write_meta(meta)
+
+    def mark_abandoned(self, meta: SessionMeta, why: str) -> None:
+        """running | deciding -> abandoned: --stop --abandon gives up on the worker.
+
+        Whatever meta write the worker would still make is refused from now
+        on. Its event appends are not locked, so it may still append; the
+        session's events are fixed at what the file held now, to its last
+        whole line (``abandoned_events_bytes``), and every later answer reads
+        that much only -- every --stop rebuilt the summary from the file as
+        it had grown (review of PR #44).
+
+        Raises:
+            TransitionRefusedError: The worker is not at work (it has ended, or never began).
+        """
+        if meta.status not in LIVE_STATES:
+            raise TransitionRefusedError(meta.session_id, "abandoned", meta.status)
+        meta.status = ABANDONED
+        meta.extras["abandoned"] = why
+        meta.extras["abandoned_events_bytes"] = _whole_lines(self._events_path(meta.session_id))
+        self._mark_ended(meta)
+        self._write_meta(meta)
+
+    def save_summary(self, meta: SessionMeta, summary: SessionSummary) -> None:
+        """Persist the summary --stop computed, for a session that has ended.
+
+        Raises:
+            TransitionRefusedError: The session has not ended: its worker may still
+                write what the summary would miss.
+        """
+        if meta.status not in TERMINAL_STATES:
+            raise TransitionRefusedError(meta.session_id, "summarised", meta.status)
+        self._write_summary(meta.session_id, summary)
 
     def stop(self, session_id: str, summary: SessionSummary) -> SessionMeta:
-        """Mark session stopped and persist the computed summary."""
-        meta = self.load_meta(session_id)
-        meta.status = _STATUS_STOPPED
-        now = datetime.now()
-        meta.stopped_at = now.isoformat()
-        meta.stopped_at_ms = int(now.timestamp() * 1000)
-        self._write_meta(meta)
-        self._write_summary(session_id, summary)
-        return meta
+        """Persist ``summary`` for a session that has ended (:meth:`save_summary`), under its lock."""
+        with self.transaction(session_id) as meta:
+            self.save_summary(meta, summary)
+            return meta
 
-    def mark_crashed(self, session_id: str) -> None:
-        """Best-effort: tag a session whose worker exited without a summary.
-
-        Records ``stopped_at`` / ``stopped_at_ms`` so capture-duration math in
-        ``build_summary`` and ``--list-sessions`` reflects when the worker
-        actually died, not when the session was finally inspected. Clears the
-        pid: the worker is exiting, and its pid is about to be the OS's to reuse.
-        """
-        try:
-            meta = self.load_meta(session_id)
-        except FileNotFoundError:
-            return
-        meta.status = _STATUS_CRASHED
-        meta.pid = None
-        now = datetime.now()
-        meta.stopped_at = now.isoformat()
-        meta.stopped_at_ms = int(now.timestamp() * 1000)
-        self._write_meta(meta)
-
-    def forget_worker(self, session_id: str) -> None:
-        """The worker has exited: drop its pid, which the OS may now give to anything."""
-        meta = self.load_meta(session_id)
-        if meta.pid is not None:
-            meta.pid = None
-            self._write_meta(meta)
-
-    def signal_worker(self, session_id: str, sig: int = signal.SIGTERM) -> bool:
-        """Send ``sig`` to the session's worker, once it is shown to be it. True if delivered.
-
-        A recorded pid that is not the worker (:func:`worker_mismatch`) is never
-        signalled: the reason is kept in ``extras["worker_gone"]`` for the
-        caller to say, and the pid is forgotten -- unless `ps` could not answer,
-        when the worker may still be alive and its pid is kept.
-
-        When the pid is kept and may still be the worker -- `ps` could not say,
-        or the signal was refused -- why is kept in
-        ``extras["worker_unresolved"]`` too: not delivered is then not "gone",
-        and --stop must not answer as if the worker had ended (review of PR
-        #42: it saved a summary at exit 0 while the worker went on).
-        """
-        meta = self.load_meta(session_id)
-        if not meta.pid:
-            return False
-        unresolved = meta.extras.pop("worker_unresolved", None)
-        mismatch = worker_mismatch(meta)
-        if mismatch is not None:
-            meta.extras["worker_gone"] = mismatch
-            if mismatch.startswith("`ps`"):
-                meta.extras["worker_unresolved"] = mismatch
-            else:
-                meta.pid = None
-            self._write_meta(meta)
-            return False
-        try:
-            os.kill(meta.pid, sig)
-        except ProcessLookupError:
-            if unresolved is not None:
-                self._write_meta(meta)
-            return False
-        except PermissionError as error:
-            meta.extras["worker_unresolved"] = f"pid {meta.pid} could not be signalled ({error})"
-            self._write_meta(meta)
-            return False
-        if unresolved is not None:
-            self._write_meta(meta)
-        return True
+    # --- reading --------------------------------------------------------------
 
     def load_meta(self, session_id: str) -> SessionMeta:
+        """meta.json as it is now. A whole file always: every write is a rename into place."""
         path = self._meta_path(session_id)
         if not path.exists():
             raise FileNotFoundError(f"No meta.json for session {session_id}")
@@ -368,31 +574,42 @@ class SessionStore:
         with open(path) as handle:
             return summary_from_json(json.load(handle))
 
-    def read_events(self, session_id: str) -> list:
-        """Read all events.jsonl lines, returning NormalisedEvent instances.
+    def read_raw_events(self, session_id: str) -> str:
+        """events.jsonl as the session's answers read it: all of it, or an abandoned one's prefix.
 
-        Skips non-event sentinel lines (e.g. ``{"event": "stream_ended"}``).
+        An abandoned session's events end where its abandonment fixed them
+        (``abandoned_events_bytes``): its worker may still append, unlocked.
         """
         path = self._events_path(session_id)
         if not path.exists():
-            return []
+            return ""
+        with open(path, "rb") as handle:
+            data = handle.read(self._events_limit(session_id))
+        return data.decode("utf-8", errors="replace")
+
+    def read_events(self, session_id: str) -> list:
+        """Read events.jsonl lines, returning NormalisedEvent instances.
+
+        Skips non-event sentinel lines (e.g. ``{"event": "stream_ended"}``),
+        and reads an abandoned session's events only as far as its
+        abandonment fixed them (:meth:`read_raw_events`).
+        """
         events = []
-        with open(path) as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                # Skip non-event sentinel lines (e.g. {"event": "stream_ended"}).
-                if "event" in payload and "fingerprint" not in payload:
-                    continue
-                try:
-                    events.append(event_from_jsonl(line))
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        for raw in self.read_raw_events(session_id).splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Skip non-event sentinel lines (e.g. {"event": "stream_ended"}).
+            if "event" in payload and "fingerprint" not in payload:
+                continue
+            try:
+                events.append(event_from_jsonl(line))
+            except (json.JSONDecodeError, KeyError):
+                continue
         return events
 
     def events_path(self, session_id: str) -> Path:
@@ -519,10 +736,11 @@ class SessionStore:
     ) -> SessionSummary:
         """Convenience: read events.jsonl and run the pipeline through SummaryBuilder.
 
-        Duration prefers ``meta.stopped_at_ms`` (set on both ``stop()`` and
-        ``mark_crashed()``) so summaries for crashed/stopped sessions reflect
-        the actual capture window, not the time of inspection. Live sessions
-        without ``stopped_at_ms`` fall back to ``now`` as before.
+        Duration prefers ``meta.stopped_at_ms`` (set when the session ended:
+        by its worker, or by the CLI that cancelled or abandoned it) so
+        summaries reflect the actual capture window, not the time of
+        inspection. Live sessions without ``stopped_at_ms`` fall back to
+        ``now`` as before.
         """
         meta = self.load_meta(session_id)
         events = self.read_events(session_id)
@@ -554,25 +772,122 @@ class SessionStore:
     def _summary_path(self, session_id: str) -> Path:
         return self.session_dir(session_id) / "summary.json"
 
+    def _events_limit(self, session_id: str) -> int:
+        """How many bytes of events.jsonl the session's answers read: -1 for all of it."""
+        try:
+            meta = self.load_meta(session_id)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return -1
+        limit = meta.extras.get("abandoned_events_bytes")
+        return limit if meta.status == ABANDONED and isinstance(limit, int) else -1
+
+    @contextlib.contextmanager
+    def _lock(self, session_id: str, timeout: float) -> Iterator[None]:
+        """Hold ``<session dir>/lock`` exclusively, waiting at most ``timeout`` seconds.
+
+        ``flock`` belongs to the open file, so two holders conflict whether
+        they are two processes or two threads of one; it is released when the
+        file is closed -- here, or by the kernel when a holder dies.
+        """
+        path = self.session_dir(session_id) / "lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        key = (threading.get_ident(), session_id)
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise SessionBusyError(session_id, timeout) from None
+                    time.sleep(_LOCK_POLL_SECONDS)
+            self._held.add(key)
+            try:
+                yield
+            finally:
+                self._held.discard(key)
+        finally:
+            os.close(fd)
+
+    def _require_lock(self, session_id: str) -> None:
+        """A write is only ever made by a holder of the session's lock (``transaction``)."""
+        if (threading.get_ident(), session_id) not in self._held:
+            raise RuntimeError(
+                f"session {session_id} written without its lock; this is a defect in the skill"
+            )
+
+    def _worker_write(
+        self,
+        session_id: str,
+        pid: int,
+        counters: dict,
+        expected: Iterable[str],
+        to: str | None,
+        timeout: float = WORKER_LOCK_TIMEOUT_SECONDS,
+    ) -> SessionMeta:
+        """One write of the worker's: its counters, and ``to`` (None: the status kept).
+
+        Applied only while the session is in one of ``expected`` and still
+        claimed by ``pid``; refused otherwise, so a worker the CLI has given up
+        on, or one that is not the session's, changes nothing.
+        """
+        with self.transaction(session_id, timeout) as meta:
+            if meta.status not in expected or meta.pid != pid:
+                why = (
+                    f"it is {meta.status}"
+                    if meta.status not in expected
+                    else f"pid {pid} is not its worker"
+                )
+                raise TransitionRefusedError(
+                    session_id, f"written by its worker ({to})", meta.status, why
+                )
+            meta.extras["line_counters"] = counters
+            if to is not None:
+                meta.status = to
+                if to in TERMINAL_STATES:
+                    self._mark_ended(meta)
+                    # The worker is exiting: its pid is about to be the OS's to reuse.
+                    meta.pid = None
+            self._write_meta(meta)
+            return meta
+
+    @staticmethod
+    def _mark_ended(meta: SessionMeta) -> None:
+        """When capture ended, for the summary's duration and --list-sessions."""
+        now = datetime.now()
+        meta.stopped_at = now.isoformat()
+        meta.stopped_at_ms = int(now.timestamp() * 1000)
+
     def _write_meta(self, meta: SessionMeta) -> None:
-        path = self._meta_path(meta.session_id)
-        tmp = path.with_suffix(".json.tmp")
-        # Atomic write — concurrent reads (e.g. the parent polling) never see a half-file.
-        # fsync before replace makes the new contents durable, not just atomically renamed.
-        with open(tmp, "w") as handle:
-            json.dump(meta.to_json(), handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(path)
+        self._require_lock(meta.session_id)
+        self._replace(self._meta_path(meta.session_id), meta.to_json())
 
     def _write_summary(self, session_id: str, summary: SessionSummary) -> None:
-        path = self._summary_path(session_id)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w") as handle:
-            json.dump(summary_to_json(summary), handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(path)
+        self._require_lock(session_id)
+        self._replace(self._summary_path(session_id), summary_to_json(summary))
+
+    @staticmethod
+    def _replace(path: Path, payload: dict) -> None:
+        """Write ``payload`` to ``path`` atomically, through a temporary file of its own.
+
+        Concurrent readers (--start polling, --list-sessions) never see a
+        half-file. The temporary name is unique to the write (``mkstemp``): a
+        fixed ``<name>.tmp`` let a second writer truncate and rename the first's
+        file. fsync before the rename makes the new contents durable, not just
+        atomically renamed.
+        """
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            Path(tmp).replace(path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                Path(tmp).unlink()
+            raise
 
     def _clear_older_than_ms(self, cutoff_ms: int) -> int:
         deleted = 0
@@ -616,6 +931,18 @@ def _resolve_cutoff_ms(duration_str: str) -> int:
     seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
     cutoff = datetime.now() - timedelta(seconds=seconds)
     return int(cutoff.timestamp() * 1000)
+
+
+def _whole_lines(path: Path) -> int:
+    """The length of ``path`` up to and including its last newline (0 when there is none).
+
+    A line still being appended -- unlocked, by a worker -- is not a whole one yet.
+    """
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return 0
+    return data.rfind(b"\n") + 1
 
 
 def _remove_tree(path: Path) -> None:

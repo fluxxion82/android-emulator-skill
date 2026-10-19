@@ -20,6 +20,7 @@ Display truncation is fine. Storage truncation is data loss.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from anr_watcher import AnrBuster
@@ -59,7 +60,19 @@ def session_with_many_clusters(store) -> str:
                 )
                 + "\n"
             )
+    _worker_finished(store, meta.session_id)
     return meta.session_id
+
+
+def _worker_finished(store, session_id: str) -> None:
+    """Leave the session as its worker leaves it when asked to stop: claimed, then ``stopped``.
+
+    A session no worker claimed is cancelled by --stop, which answers with no
+    summary; these sessions are ones a worker recorded.
+    """
+    pid = os.getpid()
+    store.claim_worker(session_id, pid=pid, token=store.load_meta(session_id).worker_token)
+    store.finish_worker(session_id, pid, {})
 
 
 def _stop(store, session_id: str, **kwargs) -> str:
@@ -168,6 +181,7 @@ def _write_session(store, durations: dict[str, float]) -> str:
                 )
                 + "\n"
             )
+    _worker_finished(store, meta.session_id)
     return meta.session_id
 
 

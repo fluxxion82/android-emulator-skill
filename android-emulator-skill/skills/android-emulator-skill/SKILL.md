@@ -658,7 +658,56 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
     - Session mode: `--start [--package PKG]` → id (the bare id as text, for
-      `SID=$(...)`; `{"success": true, "session_id": ...}` under `--json`); `--stop ID` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
+      `SID=$(...)`; `{"success": true, "session_id": ...}` under `--json`); `--stop ID [--abandon]` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
+    - **A session's lifecycle is serialised** (`common/anr_sessions.py`):
+      `pending` → (the worker claims it) `running` ⇄ `deciding` → `stopped` |
+      `crashed`, or `pending` → `cancelled` (a `--stop` or a `--start` that
+      gave up on its worker), or `running`/`deciding` → `abandoned` (`--stop
+      --abandon`). Every read-modify-write of a session's `meta.json` and
+      `summary.json` is made under its lock (`flock` on `<session>/lock`; the
+      wait for it is bounded, not the hold, and a wait past the bound is a
+      refusal, exit 1, "run the same command again"), by one owner per
+      transition, and only from the state it expects — otherwise it is
+      refused, never applied — and goes to a temporary file of its own,
+      renamed into place. The worker owns its claim, `deciding`, its
+      counters and its end, which it publishes before it exits (a stop, a
+      device lost, restarts exhausted, a stream that broke, an error nothing
+      foresaw; a SIGTERM meanwhile only asks for a stop): `stopped`, or
+      `crashed` with its failure, in one write — unless it cannot have the
+      lock within 5 minutes or the session was deleted, when `--stop` finds
+      it gone without having said, and `--abandon` is the way out. The CLI
+      owns `cancelled`, `abandoned` and `summary.json`. `events.jsonl` is not
+      locked: the worker appends to it as it reads. A worker whose claim is
+      refused — its session cancelled, already claimed, or not its token —
+      exits writing nothing; one whose session is abandoned or deleted stops
+      at its next meta write (a counter write while its stream is quiet, at
+      most every 5 s and skipped when the lock is busy, or its next
+      transition), and may append events until then, which the session's
+      answers ignore (below). The lock needs a filesystem that implements
+      `flock` — a local one; a home on a network filesystem serialises only as
+      far as its server and mount options honour it — and telling the worker
+      from another process needs `ps`. A worker of an earlier version (a
+      session with no `lifecycle` in its meta) takes none of these locks:
+      while its recorded pid may be it, `--stop` trusts nothing the session
+      says — it signals it and waits until it is gone, and refuses (exit 1,
+      `--abandon` included, which cannot fence it) while it lives or cannot
+      be identified; `--get-details` and `--diff` refuse such a session too
+      (exit 1, naming the pid: they answered 0 from a snapshot the old worker
+      could still change), and `--list-sessions` marks it `provisional`
+      (`"provisional": true` and `provisional_reason` in JSON, a
+      `provisional:` note in text). Refused rather than answered as
+      provisional, because an exit 0 is what an agent acts on. Four
+      reviews had closed one timing window at a time: a stop
+      during the reader's end-of-stream grace skipped the decision (exit 0
+      over a device loss); `--stop` answered at exit 0 while the worker was
+      still to publish a failure, wrote back a meta it had read after the
+      worker had persisted one, and took an unrecorded start time for
+      another process; a worker claimed a session `--stop` had already
+      answered for; `--start` took a failure published under `running` for
+      a started session; a fifth found a `stopped` meta trusted while that
+      version's worker ran on (exit 0, then the device loss it persisted),
+      and an abandoned session's answer growing with every event appended
+      after the abandonment
     - An unknown session, a session with no summary yet, or a `--cluster` past
       the end exits 1 and says what to run instead (the refusal object under
       `--json`) — it does not print the sentence and exit 0
@@ -769,33 +818,54 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       the same kind and text
     - `--stop` signals the session's worker only once the process at its
       recorded pid is shown to still be it: the random token `--start` put on
-      its command line, and the start time `ps` gave when it claimed the pid
-      (a crashed worker's pid is also forgotten). Anything else holding that
-      pid is never signalled; stderr says "worker gone" and why. A live pid
-      that can be shown neither to be the worker nor not to be — `ps` could
-      not say, or the signal was refused — is not taken for a worker that
-      ended: `--stop` refuses (exit 1, naming the pid and why), saves
-      nothing and keeps the pid, for a later `--stop` (it used to save the
-      summary at exit 0 and forget the pid while the worker went on)
-    - `--stop` waits for the session's worker to exit before it saves the
-      summary (up to 5.5 s: a lookup under way, the drain, a margin; and,
-      for a worker still deciding how its stream ended, until that decision's
-      own bound, about 31 s from when it began — it answered before the
-      worker, at exit 0, while the worker went on to find the device gone).
-      A worker still running at the end of its wait has its summary saved
-      while it runs, marked incomplete — and one still deciding is then
-      refused (exit 1: run `--stop` again). A decision the worker has begun
-      is finished whatever stop arrives meanwhile. A `--stop` repeated on a
-      stopped session keeps what the first said was missing. The
-      summary is saved with `"incomplete": true`, and `incomplete_reason`
-      saying why, whenever the capture may be missing events: the worker was
-      still running then, it crashed or vanished without being stopped, the
-      stream broke, a record was cut by the stop (`cut_records`), the stream
-      died and was restarted (`stream_restarts`: `-T 1` replays only the
-      newest record logged while it was down), or ANR reports could not be
-      authenticated — so `--diff` concludes nothing from what such a capture
-      lacks. A session whose stream failed is also refused (below): the
-      summary is saved, and `--stop` exits 3 or 1. Every text form of an
+      its command line, and the start time `ps` gave when it claimed the pid.
+      Anything else holding that pid is never signalled. A live pid that can
+      be shown neither to be the worker nor not to be — `ps` could not say,
+      the signal was refused, or the claim's start time was not recorded
+      (`ps` did not answer then; that is no proof of a later process) — is
+      not taken for a worker that ended: `--stop` refuses (exit 1, naming the
+      pid and why), saves nothing and keeps the pid, for a later `--stop`
+    - `--stop` answers with a summary only once the session has ended: its
+      worker published `stopped` or `crashed`, or the session was cancelled
+      or abandoned. It waits for the signalled worker to publish its end (up
+      to 5.5 s: a lookup under way, the drain, a margin; and, for a worker
+      deciding how its stream ended, until that decision's own bound, about
+      31 s from when it began). How reading ended is fixed when it ends, so
+      a stop that arrives during the reader's end-of-stream grace no longer
+      skips deciding how the stream ended. A worker still at work at the end
+      of the wait is refused (exit 1: "had not finished", run `--stop`
+      again), and so is a worker gone without having said how its capture
+      ended — killed, or dead before it could, so whether its stream failed
+      is unknown (exit 1) — and nothing is saved either way: a summary saved
+      then answered at exit 0 while the worker went on to persist a device
+      loss. `--stop --abandon` is the way out when this version's worker
+      never will say (gone, stuck, or a pid that cannot be identified) — not
+      for an earlier version's worker while it may be alive (below): the
+      session is
+      marked `abandoned` — no meta write of the worker's is applied after
+      that — and what was read is saved with `"incomplete": true`, the
+      reason beginning "abandoned with --abandon", at exit 0. The worker may
+      still append raw event lines after the fence (that file is not
+      locked); the abandonment records how much of `events.jsonl` was
+      there, to its last whole line, and every answer of the session —
+      `--stop`, `--get-details`, `--cluster`, `--raw` — reads that much
+      only, so a later `--stop` gives the same answer (it rebuilt the
+      summary from the grown file: event count 1, then 2). It never claims
+      completeness. A pending
+      session (no worker has claimed it) is cancelled: `--stop` saves an
+      empty summary marked incomplete and refuses (exit 1), and a worker
+      that claims it later is refused. Two `--stop`s of a session that has
+      ended give the same answer, and a repeated `--stop` keeps what the
+      first said was missing. The summary is saved with `"incomplete": true`,
+      and `incomplete_reason` saying why, whenever the capture may be
+      missing events: the stream broke or ended by itself unrestarted, a
+      record was cut by the stop (`cut_records`), the stream died and was
+      restarted (`stream_restarts`: `-T 1` replays only the newest record
+      logged while it was down), ANR reports could not be authenticated, or
+      the session was abandoned or cancelled — so `--diff` concludes nothing
+      from what such a capture lacks. A session whose stream failed is also
+      refused (below): the summary is saved, and `--stop` exits 3 or 1.
+      Every text form of an
       incomplete summary says so too (`--stop`, `--get-details`,
       `--get-details --cluster N`, whose JSON carries `incomplete`), and "no
       ANR/jank" there reads "… in the part captured". A token budget or
@@ -941,13 +1011,37 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `--watch`, `--since` and `--start` ask `adb get-state` first (bounded,
       with or without `--serial`) and refuse at once, exit 3, when adb names
       no device in state `device` (several and no `--serial` is exit 1);
-      `--start` creates no session then. A worker that registers and ends
-      before `--start` looks — its stream broke at once — is not "did not
-      register" (exit 1, the race CI met): `--start` stops the session, so
-      its summary is saved, and refuses with what ended it, as `--stop`
-      would (exit 3 for a device that went). A worker that meets an error
-      nothing foresaw persists it as the session's stream failure and marks
-      the session crashed, where it left it `running` with nothing said
+      `--start` creates no session then. `--start` succeeds only on a
+      worker that has claimed the session and is `running` — which holds no
+      failure, since a failure is published only with the session's end. A
+      worker deciding how its stream ended is waited for; one that registers
+      and ends before `--start` answers — its stream broke at once — is not
+      "did not register" (exit 1, the race CI met): `--start` stops the
+      session, so its summary is saved, and refuses with what ended it, as
+      `--stop` would (exit 3 for a device that went). A worker that has not
+      claimed the session within 3 s is given up on: the session is
+      cancelled (exit 1), so a worker that starts late records nothing into
+      it. A worker that meets an error nothing foresaw ends the session
+      `crashed` with it as the stream failure — beside the stream's own
+      failure when there was one, not in its place — where it left it
+      `running` with nothing said. Sessions written by v0.8.0 main load
+      unchanged (the same files and keys; this version only adds keys): a
+      stopped one is answered as saved, a crashed one is refused as before,
+      and a `running` one whose worker is gone is refused with `--abandon`
+      named, since that version's worker never said how a session ended
+    - **Compatibility boundary.** Upgrade quiescently: stop every ANR session
+      with the old version before installing this one. A worker of v0.8.0
+      main still recording is fenced only by waiting for it (above), and a
+      `--start` of that version still in flight can claim a session this
+      version cancelled — that version's claim checks nothing. Sessions this
+      version writes are not for older binaries (no forward compatibility),
+      and two versions writing one session is unsupported. While an earlier
+      version's worker may be alive or cannot be identified, `--stop` and
+      `--stop --abandon` both refuse; with `ps` unavailable and the pid
+      present that lasts until `ps` works again or the process exits —
+      otherwise the only recovery is outside the skill: delete the session's
+      directory (or `--clear-sessions`) once you have established yourself
+      that the worker has ended
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
       it used to be raised to 1. A restart happens unless adb or `adb
@@ -956,7 +1050,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
       `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,
       `--duration`, `--min-frames`, `--top`, `--all`, `--budget-tokens`,
-      `--cluster`, `--raw`, `--older-than`, `--terse`, `--json`
+      `--cluster`, `--raw`, `--older-than`, `--terse`, `--abandon`, `--json`
 
 32. **sms.py** ⭐ NEW - Deliver an inbound SMS to an emulator and **prove it arrived**. Emulator-only.
     - `--send` reads the inbox back and reports `accepted` and `delivered` separately: the console's `OK` means the command was taken, not that a message exists. Delivery is asynchronous (~2s measured), so it polls.
@@ -1302,7 +1396,17 @@ recorded fixture, and was red before the fix.
   ends by itself is a refusal, and a session's is restarted, while a restart
   is left, unless adb or `adb get-state` names a device error, then refused
   at `--stop` — adb's own words typed first (a device error is exit 3), in
-  `--watch`, `--since` and the session worker alike.
+  `--watch`, `--since` and the session worker alike. A session's lifecycle
+  is serialised under a per-session lock (meta and summary; events are
+  appended unlocked), each transition owned by the worker or the CLI and
+  applied only from the state it expects: the worker publishes how it ended
+  before it exits (unless it cannot have the lock in 5 minutes),
+  `--stop` answers with a summary only once the session has ended
+  (otherwise it refuses, exit 1, and `--stop --abandon` saves what was
+  read, marked incomplete, its events frozen at the abandonment), and
+  `--start` succeeds only on a worker that is recording. A worker of the
+  previous version, which takes no lock, is waited for until it is gone
+  before its session is answered.
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
   now read through `adb shell -T` and refuse an adb client too old to honour

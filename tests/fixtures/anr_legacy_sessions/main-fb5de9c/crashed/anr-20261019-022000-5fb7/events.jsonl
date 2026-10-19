@@ -1,0 +1,2 @@
+{"event": "stream_died", "exit_code": 255, "attempt": 0, "at_ms": 1792401600975}
+{"event": "stream_failed", "error": "the stream ended by itself; `adb logcat` exited 255: error: device 'no-such-serial-xyz' not found", "truncated": false, "what": "ended by itself", "device": {"state": "unavailable", "message": "Device 'emulator-5554' is not attached. Attached: none. Run `adb devices` to see what is available.", "error_class": "DeviceNotFoundError", "remedy": "Run `adb devices` to see what is available.", "source": "logcat"}, "at_ms": 1792401601006}
