@@ -119,9 +119,12 @@ STOP_DRAIN_SECONDS = 0.5
 SINCE_TIMEOUT_SECONDS = 60
 # Grace for a `--watch` stream that hit end-of-file to report its exit status.
 STREAM_EXIT_TIMEOUT_SECONDS = 5
-# How much of what adb wrote on stderr is read back: its last words, which is
-# where a device error is. A stream's stderr is kept in a file of its own.
+# How much of what adb wrote on stderr is read back, from its start and from
+# its end: adb's error may come first and chatter follow it, and a tail alone
+# lost it (second review of PR #42). A stream's stderr is a file of its own.
 STDERR_KEPT_BYTES = 64 * 1024
+# How much of it a message shows, first and last: the rest is in no refusal.
+STDERR_SHOWN_CHARS = 200
 # Bound on each question the worker puts to the device while it reads: which
 # pid system_server is, and which uids a package has (see _ProcessNames).
 # Short, because --stop waits for a lookup under way: a 10 s lookup outlasted
@@ -135,6 +138,22 @@ WORKER_EXIT_TIMEOUT_SECONDS = LOOKUP_TIMEOUT_SECONDS + STOP_DRAIN_SECONDS + 2.0
 # _require_device). The adb server answers it from its own table; the margin
 # is for a server that has to start first.
 GET_STATE_TIMEOUT_SECONDS = 10
+# Bound on the `adb devices` a device error's message lists the serials from
+# (adb_exec._attached_serials), asked once for each such error.
+DEVICE_LIST_TIMEOUT_SECONDS = 10
+# How long a worker may take to decide how a stream that ended by itself ended
+# (_ended_by_itself): adb's exit, then `adb get-state`, each device error's
+# serial list, and ending the stream's process -- each bounded. --stop waits
+# this long for a worker it finds deciding: answering before it, it saved a
+# summary with no stream failure and exited 0 while the worker went on to
+# find the device gone (second review of PR #42).
+DECIDING_TIMEOUT_SECONDS = (
+    STREAM_EXIT_TIMEOUT_SECONDS
+    + GET_STATE_TIMEOUT_SECONDS
+    + DEVICE_LIST_TIMEOUT_SECONDS
+    + 2 * 2.0  # _reap: terminate, then kill
+    + 2.0
+)
 
 _LOGCAT_REMEDY = (
     "Check the device is connected (`adb devices`) and, with more than one attached, "
@@ -193,7 +212,7 @@ def _raise_logcat_failure(returncode: int, stderr: str, serial: str | None) -> N
     device_error = classify_device_error(stderr, serial)
     if device_error is not None:
         raise device_error
-    detail = " ".join(stderr.split())
+    detail = _shown(stderr)
     said = f": {detail}" if detail else ", and said nothing on stderr."
     cli.fail(f"`adb logcat` exited {returncode}{said}", _LOGCAT_REMEDY)
 
@@ -723,8 +742,15 @@ class AnrWatcher:
                             records = stream.read(timeout=STREAM_POLL_SECONDS)
                         except logcat.LogFramingError as error:
                             if not error.truncated:
-                                # Not logd's records at all: refused.
-                                raise
+                                # Not logd's records at all: refused -- after
+                                # what adb has said, read without waiting for
+                                # an open stream to end, as the session worker
+                                # reads it (second review of PR #42).
+                                returncode, said = _exit_and_stderr(
+                                    self._process, adb_stderr, timeout=0
+                                )
+                                _raise_device_error_said(returncode, said, self.serial)
+                                raise _with_adb_exit(error, returncode, said) from None
                             cut = error
                             break
                         if records is None:
@@ -1154,8 +1180,18 @@ class AnrBuster:
             finished = self._wait_for_worker_exit(
                 session_id, timeout_seconds=WORKER_EXIT_TIMEOUT_SECONDS
             )
+            deciding = self._deciding_since(session_id)
+            if not finished and deciding is not None:
+                # Deciding how its stream ended: the answer may be the
+                # session's refusal, so it is waited for, to its bound
+                # (looked at at least once more).
+                left = deciding + DECIDING_TIMEOUT_SECONDS - time.time()
+                finished = self._wait_for_worker_exit(
+                    session_id, timeout_seconds=max(STREAM_POLL_SECONDS, left)
+                )
         meta = self.store.load_meta(session_id)
         line_counters = meta.extras.get("line_counters", {})
+        undecided = not finished and bool(line_counters.get("deciding"))
         # Not signalled: the pid is no longer the worker's (anr_sessions).
         gone = None if delivered else meta.extras.pop("worker_gone", None)
         if gone:
@@ -1189,8 +1225,8 @@ class AnrBuster:
             # Not counted by the worker that wrote these counters -- an
             # earlier version's, or none wrote any. Under --package that is
             # unknown, not zero (review of PR #42); without it nothing is
-            # ever dropped so.
-            unnamed_dropped = None if meta.args.get("package") else 0
+            # ever dropped so. A meta that does not say is unknown too.
+            unnamed_dropped = 0 if _unfiltered(meta.args) else None
             dropped_pids = []
         summary = replace(
             summary,
@@ -1205,7 +1241,7 @@ class AnrBuster:
             unnamed_dropped=unnamed_dropped,
             unnamed_dropped_pids=dropped_pids,
         )
-        if not finished:
+        if not finished and not undecided:
             print(
                 f"warning: the worker for {session_id} was still running "
                 f"{WORKER_EXIT_TIMEOUT_SECONDS:.1f}s after it was asked to stop; this "
@@ -1241,6 +1277,15 @@ class AnrBuster:
                 ),
                 (f"the stream {failed}", failed is not None),
                 (
+                    "the worker had not decided how its stream ended when this was saved",
+                    undecided,
+                ),
+                (
+                    "the stream ended by itself before the stop and was not restarted, so "
+                    "what was logged after it ended is missing",
+                    bool(line_counters.get("ended_unrestarted")),
+                ),
+                (
                     f"{cut} record{'s' if cut_plural else ''} arriving when it stopped "
                     f"{'were' if cut_plural else 'was'} cut off",
                     bool(cut),
@@ -1268,6 +1313,16 @@ class AnrBuster:
             self.store.forget_worker(session_id)
         if isinstance(failure, dict):
             _refuse_broken_stream(session_id, failure)
+        if undecided:
+            # Never a summary at exit 0 while the worker may yet find the
+            # stream's end a failure (second review of PR #42).
+            cli.fail(
+                f"The worker for {session_id} was still deciding how its logcat stream ended "
+                f"{WORKER_EXIT_TIMEOUT_SECONDS + DECIDING_TIMEOUT_SECONDS:.0f}s after it was "
+                f"asked to stop, so nothing is concluded from this session yet.",
+                f"Run --stop {session_id} again: it reads what the worker decided. The "
+                f"summary of what was read is saved -- --get-details {session_id}.",
+            )
 
         # `top_n or default` treated both None (no flag) and 0 (--all, "no cap")
         # as "unset", so --all returned exactly the default it was meant to lift.
@@ -1518,6 +1573,8 @@ class AnrBuster:
 
         proc: subprocess.Popen | None = None
         crashed = False
+        # A stream ended by itself and is to be restarted, which has not happened yet.
+        restart_due = False
         try:
             with open(events_path, "a", buffering=1) as out_handle:
 
@@ -1526,15 +1583,32 @@ class AnrBuster:
                     out_handle.write(json.dumps(record) + "\n")
                     out_handle.flush()
 
+                def deciding(now: bool) -> None:
+                    # In the meta, for --stop: a worker deciding how its
+                    # stream ended is waited for, not answered for.
+                    if now:
+                        counters["deciding"] = int(time.time() * 1000)
+                    else:
+                        counters.pop("deciding", None)
+                    self.store.persist_worker_counters(session_id, counters)
+
+                def stopped() -> bool:
+                    # A stop before the restart a stream that ended was due:
+                    # what was logged after it ended is missing, and said.
+                    if stop_flag["value"] and restart_due:
+                        counters["ended_unrestarted"] = True
+                    return stop_flag["value"]
+
                 for attempt in range(max_restarts + 1):
-                    if stop_flag["value"]:
+                    if stopped():
                         break
                     if attempt > 0:
                         counters["stream_restarts"] = attempt
                         note("stream_restart", attempt=attempt)
                         time.sleep(RESTART_BACKOFF_SECONDS)
-                        if stop_flag["value"]:
+                        if stopped():
                             break
+                    restart_due = False
                     # One per stream, closed -- and its process reaped -- before
                     # the next starts: what an earlier stream said is not this
                     # one's, and no earlier process outlives its stream (review
@@ -1564,6 +1638,9 @@ class AnrBuster:
                                 if proc.stdout is not None:
                                     proc.stdout.close()
                                 failure = counters.get("stream_failure")
+                                decide = failure is not None or not stop_flag["value"]
+                                if decide:
+                                    deciding(True)
                                 if failure is not None:
                                     # Not records, or cut by itself: no restart
                                     # can trust it. Whether the device is still
@@ -1600,15 +1677,19 @@ class AnrBuster:
                                     )
                                     if ended is not None:
                                         counters["stream_failure"] = ended
+                                    else:
+                                        restart_due = True
                             finally:
                                 _reap(proc)
+                                if counters.get("deciding"):
+                                    deciding(False)
 
                     failure = counters.get("stream_failure")
                     if failure is not None:
                         note("stream_failed", **failure)
                         crashed = True
                         break
-                    if stop_flag["value"]:
+                    if stopped():
                         note("stream_ended")
                         break
 
@@ -1824,10 +1905,16 @@ class AnrBuster:
         if summary is None or summary.unnamed_dropped is not None:
             return summary
         try:
-            filtered = bool(self.store.load_meta(session_id).args.get("package"))
+            unfiltered = _unfiltered(self.store.load_meta(session_id).args)
         except (FileNotFoundError, ValueError):
-            filtered = True
-        return summary if filtered else replace(summary, unnamed_dropped=0)
+            unfiltered = False
+        return replace(summary, unnamed_dropped=0) if unfiltered else summary
+
+    def _deciding_since(self, session_id: str) -> float | None:
+        """When the worker began deciding how its stream ended (epoch s), if it is."""
+        counters = self.store.load_meta(session_id).extras.get("line_counters", {})
+        deciding = counters.get("deciding")
+        return deciding / 1000 if isinstance(deciding, int | float) else None
 
     def _resolve_serial(self, serial: str | None) -> str | None:
         # Not re-wrapped: a bare RuntimeError lost DeviceNotFoundError, so an
@@ -1943,8 +2030,9 @@ def _exit_and_stderr(
     read either way: the file is there, and an adb still exiting has already
     written its error -- read only after an exit, it was lost (review of PR
     #42). Read with ``pread``, which leaves the file's offset -- shared with
-    adb, still writing at it -- where it is, and only its last
-    ``STDERR_KEPT_BYTES``, from a whole line.
+    adb, still writing at it -- where it is: its first and its last
+    ``STDERR_KEPT_BYTES``, in whole lines. Its last alone lost an error adb
+    wrote first and then chattered past (second review of PR #42).
     """
     try:
         returncode = process.wait(timeout=timeout)
@@ -1952,16 +2040,26 @@ def _exit_and_stderr(
         returncode = None
     fd = adb_stderr.fileno()
     size = os.fstat(fd).st_size
-    start = max(0, size - STDERR_KEPT_BYTES)
-    said = os.pread(fd, size - start, start)
-    if start:
-        said = said.partition(b"\n")[2]
+    if size <= 2 * STDERR_KEPT_BYTES:
+        said = os.pread(fd, size, 0)
+    else:
+        head = os.pread(fd, STDERR_KEPT_BYTES, 0).rpartition(b"\n")[0]
+        tail = os.pread(fd, STDERR_KEPT_BYTES, size - STDERR_KEPT_BYTES).partition(b"\n")[2]
+        said = head + b"\n" + tail
     return returncode, said.decode("utf-8", errors="replace")
+
+
+def _shown(stderr: str) -> str:
+    """adb's stderr on one line for a message: its start and its end, when it is long."""
+    said = " ".join(stderr.split())
+    if len(said) <= 2 * STDERR_SHOWN_CHARS:
+        return said
+    return f"{said[:STDERR_SHOWN_CHARS]} … {said[-STDERR_SHOWN_CHARS:]}"
 
 
 def _adb_exit_added(error: str, returncode: int | None, stderr: str) -> str:
     """``error``, saying how adb ended too when that says anything: a failure, or its words."""
-    said = " ".join(stderr.split())
+    said = _shown(stderr)
     if returncode is None:
         return f"{error}; `adb logcat` had not exited, and had said: {said}" if said else error
     if returncode == 0:
@@ -1981,7 +2079,7 @@ def _with_adb_exit(
 
 def _how_adb_ended(returncode: int | None, stderr: str) -> str:
     """How adb ended a stream that ended by itself, in words: its status, and what it said."""
-    said = " ".join(stderr.split())
+    said = _shown(stderr)
     if returncode is None:
         ended = f"`adb logcat` gave no exit status within {STREAM_EXIT_TIMEOUT_SECONDS}s"
         return f"{ended}, and had said: {said}" if said else ended
@@ -2016,6 +2114,15 @@ def _ended_by_itself(
         f"restart left (ANDROID_EMU_ANR_MAX_RESTARTS={max_restarts}); the last time {how}"
     )
     return {"error": error, "truncated": False, "what": "ended by itself", "device": device}
+
+
+def _unfiltered(args: dict) -> bool:
+    """Whether a session's args say it did not filter by package.
+
+    --start always writes ``package`` -- None without --package -- so args
+    without it do not say, and what the session dropped stays unknown.
+    """
+    return "package" in args and not args["package"]
 
 
 def _unstartable(error: OSError) -> dict:

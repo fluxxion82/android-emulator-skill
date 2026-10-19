@@ -749,7 +749,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       (a crashed worker's pid is also forgotten). Anything else holding that
       pid is never signalled; stderr says "worker gone" and why
     - `--stop` saves the summary only after the session's worker has exited
-      (it waits up to 5.5 s: a lookup under way, the drain, a margin). The
+      (it waits up to 5.5 s: a lookup under way, the drain, a margin; and,
+      for a worker still deciding how its stream ended, until that decision's
+      own bound, about 31 s from when it began — it answered before the
+      worker, at exit 0, while the worker went on to find the device gone. A
+      worker still undecided then is refused, exit 1: run `--stop` again).
+      The
       summary is saved with `"incomplete": true`, and `incomplete_reason`
       saying why, whenever the capture may be missing events: the worker was
       still running then, it crashed or vanished without being stopped, the
@@ -837,8 +842,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       then makes `--watch` and `--since` ask `adb get-state` again — before
       adb's other exit statuses are judged — and exit 3 when the device went,
       or refuse (exit 1) naming the framing error and how adb exited. Bytes
-      that are not records at all are refused outright (exit 1), with no
-      device question. A session's worker does not restart either kind of
+      that are not records at all are refused (exit 1) with no device
+      question — after what adb has said, read without waiting for it to
+      exit, which may name a device error (exit 3). adb's stderr is read from
+      its start and its end (64 KiB each): an error adb wrote first and then
+      chattered past was lost with a tail alone. A message shows it shortened.
+      A session's worker does not restart either kind of
       stream: it keeps each stream's stderr (it went to `/dev/null`) and reads
       what adb has said whether or not adb has exited, takes a device error
       adb wrote as the answer, and asks the device only without one; the
@@ -849,13 +858,15 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       went, 1 for several devices and no `--serial` (naming the serials to
       pass) or anything else. A session's stream that ends by itself, whole,
       is asked about the same way: a device error — adb's words, or `adb
-      get-state`'s — ends the session as that error (exit 3 at `--stop`),
-      and with the device there the stream is restarted
-      (`ANDROID_EMU_ANR_MAX_RESTARTS`, default 3) until no restart is left,
-      when the session ends as a stream failure `--stop` refuses (exit 1,
-      saying how adb ended it). Either used to be restarted, then saved as an
-      incomplete summary at exit 0. Each stream's process is ended before the
-      next starts
+      get-state`'s — ends the session as that error (exit 3 at `--stop`);
+      otherwise — the device there, or `adb get-state` unanswered — the
+      stream is restarted (`ANDROID_EMU_ANR_MAX_RESTARTS`, default 3) until
+      no restart is left, when the session ends as a stream failure `--stop`
+      refuses (exit 1, saying how adb ended it). Either used to be restarted,
+      then saved as an incomplete summary at exit 0. A stop that comes before
+      a restart that was due saves the summary incomplete (what was logged
+      after the stream ended is missing). Each stream's process is ended
+      before the next starts
     - `--package PKG` keeps an event only when its package is exactly PKG, by
       the identity the reader established: the package ActivityManager's ANR
       report names (or its component's), or the name a session verified for
@@ -898,8 +909,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `--start` creates no session then
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
-      it used to be raised to 1. A restart happens only with the device still
-      there; with `0`, a stream that ends by itself ends the session at once
+      it used to be raised to 1. A restart happens unless adb or `adb
+      get-state` names a device error; with `0`, a stream that ends by itself
+      ends the session at once
     - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
       `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,
       `--duration`, `--min-frames`, `--top`, `--all`, `--budget-tokens`,
@@ -1246,9 +1258,10 @@ recorded fixture, and was red before the fix.
   verdict: "inconclusive" when nothing else changed, the change with its
   caveats otherwise. It never emits `Infinity`. The live readers no longer
   swallow adb's exit status: losses are disclosed; a `--watch` stream that
-  ends by itself is a refusal, and a session's is restarted only while the
-  device is there and a restart is left, then refused at `--stop` — adb's
-  own words typed first (a device error is exit 3).
+  ends by itself is a refusal, and a session's is restarted, while a restart
+  is left, unless adb or `adb get-state` names a device error, then refused
+  at `--stop` — adb's own words typed first (a device error is exit 3), in
+  `--watch`, `--since` and the session worker alike.
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
   now read through `adb shell -T` and refuse an adb client too old to honour
