@@ -261,6 +261,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       (A streaming `adb logcat` aimed at a device that is not attached waits
       instead of failing, so `--duration` used to report it as zero lines.)
       Unavailable is exit 3, as everywhere else
+    - A `--last` dump has a deadline of its own: twice `ANDROID_EMU_ADB_TIMEOUT`
+      (60 s by default). A dump that has not ended by then -- a device lost after
+      the first question (`logcat -d` waits for it too), a stream that stalls
+      mid-record -- is stopped, the device is asked again (gone: exit 3), and
+      otherwise the dump is refused (exit 1), never reported as the window. It
+      used to wait for as long as the stall lasted. `--follow` (and no mode
+      flag) reads until interrupted
     - Identity is the uid (every user's uid for the package). A process
       another package runs under the same shared uid, named after this
       package, counts as this app's: the device does not tell them apart
@@ -420,8 +427,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       are counted from the priority column, lines split at `\n` only, and a
       message's line-ending and terminal controls are saved escaped (`\r` as
       `\\r`), so `app-logs.txt` reads back as the lines that were counted. A
-      dump that ends inside a record fails the logs. An app with no process
-      in the window fails the logs rather than returning the whole device's
+      dump that ends inside a record, or does not finish in 60 s, asks `adb
+      get-state` again, as `log_monitor` does: gone is exit 3 with what arrived;
+      still there, the cut or the timeout fails the logs (exit 1). The cut is
+      judged before adb's exit status, which a transport loss also sets (255).
+      An app with no process in the window fails the logs rather than
+      returning the whole device's
     - Lines of the package's uid left out for want of evidence (a crash whose
       start is older than `--logs`) are counted and named: `logs.attribution`
       (`complete: false`, `unresolved_lines`, `unresolved_pids`) in the

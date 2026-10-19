@@ -17,15 +17,21 @@ deliberate act that shows up in review. There are exactly two legitimate shapes:
   applies to a call that runs to completion.
 
 A streaming exemption is only honest if the module really does enforce a
-deadline, so that is asserted too.
+deadline, so that is asserted too -- and, where the deadline is a timer, by
+running each mode that is meant to end (a ``--duration``, a ``--last`` dump)
+against a device that never writes: a timer bounds only the runs that arm it,
+and only if it is started and its callback stops the read.
 """
 
 from __future__ import annotations
 
 import ast
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from fake_toolchain import FakeToolchain, Rule
 
 SCRIPTS = (
     Path(__file__).resolve().parents[1]
@@ -311,6 +317,337 @@ def test_the_watchdog_guard_accepts_a_bounded_unbuffered_read():
         "    return os.read(fd, 65536) if ready else b''\n"
     )
     assert _bounds_its_reads(tree)
+
+
+# The modes of a timer-bounded streaming module: what bounds each, and how it ends.
+#
+# A Timer is armed per run, by the mode the run is in, so "the module constructs
+# a Timer" -- the check above -- says nothing about the next mode: log_monitor
+# passed it while `--last` armed none, and a dump whose pipe stalled (three bytes
+# of a record's header, then nothing) blocked until something outside closed it
+# (review 2 of v0.8.0, item 10). Nor does finding the mode's bound in some
+# Timer's interval prove the timer works: an unreachable branch, a timer never
+# started and a callback that does nothing all pass that (review of PR #36). So
+# each mode -- each flag of the module's mutually exclusive mode group -- is
+# listed here and RUN: the real CLI, with its bound shortened, over a device
+# that answers `get-state` and then writes nothing, must end within HUNG_AFTER
+# times that bound, as the mode ends there. A mode with no bound is listed in
+# UNTIMED_MODES with why.
+#
+# A module whose reads cannot block (anr_watcher: select() bounded in the
+# source, then os.read; see _bounds_its_reads) is bounded per read, in every
+# mode that reads, so it is not listed; its `--since` dump goes through
+# common.adb_exec.run_argv, bounded by subprocess's own timeout.
+
+
+@dataclass(frozen=True)
+class TimedMode:
+    """One mode of a timer-bounded stream: what bounds it, and how it ends at its bound.
+
+    Attributes:
+        bound: The name its Timer's interval is computed from (the secondary,
+            AST check).
+        argv: Arguments that select the mode with a short bound.
+        seconds: The bound ``argv`` and ``env`` give.
+        status: The exit status the mode ends with at that bound, over a device
+            that answers ``get-state`` and then writes nothing.
+        says: Text its stdout carries then.
+        env: Environment that shortens the bound.
+    """
+
+    bound: str
+    argv: tuple[str, ...]
+    seconds: float
+    status: int
+    says: str
+    env: dict[str, str] = field(default_factory=dict)
+
+
+TIMED_MODES: dict[str, dict[str, TimedMode]] = {
+    "log_monitor.py": {
+        # The caller's own deadline: the capture ends there, empty, at exit 0.
+        "--duration": TimedMode(
+            bound="duration",
+            argv=("--duration", "2s", "--json"),
+            seconds=2,
+            status=0,
+            says='"total_lines": 0',
+        ),
+        # A dump's: twice ANDROID_EMU_ADB_TIMEOUT. It ends by itself, or it is
+        # refused once the device is asked again.
+        "--last": TimedMode(
+            bound="DUMP_TIMEOUT",
+            argv=("--last", "5m", "--json"),
+            seconds=2,
+            status=1,
+            says="did not finish within 2s",
+            env={"ANDROID_EMU_ADB_TIMEOUT": "1"},
+        ),
+    },
+}
+UNTIMED_MODES: dict[str, dict[str, str]] = {
+    "log_monitor.py": {
+        # As does a run with no mode flag at all.
+        "--follow": "streams until the caller interrupts it; no end was asked for",
+    },
+}
+
+# A mode's run counts as hung past this many times its bound: room for the
+# interpreter and the stubs to start, and for the stopped read to be reaped.
+HUNG_AFTER = 3
+
+
+def _mode_flags(tree: ast.Module) -> set[str]:
+    """The flags added to any ``add_mutually_exclusive_group()`` group in ``tree``.
+
+    Through the name the group is bound to: ``time_group =
+    parser.add_mutually_exclusive_group()``, then ``time_group.add_argument(...)``.
+    """
+    groups = {
+        node.targets[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "attr", None) == "add_mutually_exclusive_group"
+    }
+    return {
+        arg.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "add_argument"
+        and getattr(getattr(node.func, "value", None), "id", None) in groups
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and str(arg.value).startswith("--")
+    }
+
+
+def _timer_interval_names(tree: ast.Module) -> set[str]:
+    """Every name some constructed ``Timer``'s interval is computed from.
+
+    ``threading.Timer(float(DUMP_TIMEOUT), stop)`` gives ``{"float", "DUMP_TIMEOUT"}``.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or "Timer" not in (
+            getattr(node.func, "attr", None),
+            getattr(node.func, "id", None),
+        ):
+            continue
+        interval = (
+            node.args[0]
+            if node.args
+            else next((k.value for k in node.keywords if k.arg == "interval"), None)
+        )
+        if interval is not None:
+            names.update(name.id for name in ast.walk(interval) if isinstance(name, ast.Name))
+    return names
+
+
+def _bindings(tree: ast.Module) -> set[str]:
+    """Module-level assignment targets and every function parameter in ``tree``."""
+    module_level = {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    parameters = {
+        arg.arg
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+    }
+    return module_level | parameters
+
+
+def _parse(module: str) -> ast.Module:
+    return ast.parse((SCRIPTS / module).read_text(encoding="utf-8"), filename=module)
+
+
+@pytest.fixture
+def toolchain(tmp_path) -> FakeToolchain:
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    return chain
+
+
+def _why_it_did_not_end(
+    toolchain: FakeToolchain, recorded, script: Path, mode: TimedMode, **env: str
+) -> str | None:
+    """Run ``script`` in ``mode`` over a device that never writes; why it did not end on time.
+
+    The device answers ``get-state`` as recorded (adb_get_state), and its
+    ``logcat`` prints adb_waiting_for_device's banner and never exits (``hang``),
+    so only the mode's own deadline can end the read.
+
+    Returns:
+        None when the run ended within ``HUNG_AFTER`` times the mode's bound, with
+        the mode's status and words; otherwise what it did instead.
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
+        ],
+    )
+    limit = HUNG_AFTER * mode.seconds
+    try:
+        result = toolchain.run(script, *mode.argv, timeout=limit, **mode.env, **env)
+    except subprocess.TimeoutExpired:
+        return f"still running {limit}s into its {mode.seconds}s bound"
+    shown = f"stdout {result.stdout[-300:]!r}, stderr {result.stderr[-300:]!r}"
+    if result.returncode != mode.status:
+        return f"exit {result.returncode}, not {mode.status}; {shown}"
+    if mode.says not in result.stdout:
+        return f"stdout does not say {mode.says!r}; {shown}"
+    return None
+
+
+_TIMED = [(module, mode) for module, modes in TIMED_MODES.items() for mode in modes]
+
+
+@pytest.mark.parametrize(("module", "mode"), _TIMED, ids=[f"{m}{mode}" for m, mode in _TIMED])
+def test_each_timed_mode_ends_at_its_bound(module: str, mode: str, toolchain, recorded):
+    """The guard proper: the real CLI in that mode, over a device that never writes, ends on time."""
+    spec = TIMED_MODES[module][mode]
+    reason = _why_it_did_not_end(toolchain, recorded, SCRIPTS / module, spec)
+    assert reason is None, (
+        f"{module} {mode} did not end at its {spec.seconds}s bound: {reason}. Its own timer "
+        f"must be armed, started and able to stop the read; another mode's does not bound it."
+    )
+
+
+# Three ways a deadline can be there in name and not in fact. The review of PR
+# #36 passed each through the name check below; the run must refuse every one.
+# Applied to a copy of log_monitor.py, which imports `common` from the real
+# scripts/ through PYTHONPATH -- and the copy unchanged must still end on time,
+# so a control cannot pass because the copy cannot run. Each replaced text must
+# be in log_monitor.py exactly once: a control that no longer matches fails
+# rather than going quietly vacuous. Python source, not tool output.
+_DEAD_DEADLINES: dict[str, tuple[str, str]] = {
+    "unchanged": ("", ""),
+    "unreachable-branch": (
+        "            if last_minutes is not None:\n"
+        "                deadline_timer = threading.Timer(float(DUMP_TIMEOUT),",
+        "            if last_minutes is not None and False:\n"
+        "                deadline_timer = threading.Timer(float(DUMP_TIMEOUT),",
+    ),
+    "never-started": ("                deadline_timer.start()\n", ""),
+    "no-op-callback": (
+        "threading.Timer(float(DUMP_TIMEOUT), _stop_overrun_dump)",
+        "threading.Timer(float(DUMP_TIMEOUT), lambda: None)",
+    ),
+}
+
+
+@pytest.mark.parametrize("mutation", list(_DEAD_DEADLINES))
+def test_the_run_refuses_a_deadline_there_only_in_name(
+    mutation: str, toolchain, recorded, tmp_path
+):
+    old, new = _DEAD_DEADLINES[mutation]
+    source = (SCRIPTS / "log_monitor.py").read_text(encoding="utf-8")
+    if old:
+        assert source.count(old) == 1, f"{mutation}: its text is not in log_monitor.py once"
+    copy = tmp_path / "log_monitor.py"
+    copy.write_text(source.replace(old, new) if old else source, encoding="utf-8")
+    tree = ast.parse(copy.read_text(encoding="utf-8"))
+    assert "DUMP_TIMEOUT" in _timer_interval_names(tree), "the name check passes every one"
+
+    reason = _why_it_did_not_end(
+        toolchain,
+        recorded,
+        copy,
+        TIMED_MODES["log_monitor.py"]["--last"],
+        PYTHONPATH=str(SCRIPTS),
+    )
+    if old:
+        assert reason is not None, f"{mutation} ended at its bound: the run cannot see it"
+    else:
+        assert reason is None, f"the unchanged copy did not end at its bound: {reason}"
+
+
+@pytest.mark.parametrize(
+    ("module", "mode", "bound"),
+    [
+        (module, mode, spec.bound)
+        for module, modes in TIMED_MODES.items()
+        for mode, spec in modes.items()
+    ],
+    ids=lambda value: value,
+)
+def test_each_timed_mode_names_its_bound_in_a_timer(module: str, mode: str, bound: str):
+    """Secondary to the run: the mode's bound is the interval of a Timer the module builds.
+
+    Cheap and specific when it fails, but a name proves nothing about the timer
+    working (the controls above), so the run is the guard.
+    """
+    tree = _parse(module)
+    assert bound in _bindings(tree), (
+        f"TIMED_MODES says {module} {mode} is bounded by {bound!r}, which {module} does not "
+        f"define (a module constant or a parameter): the entry guards nothing."
+    )
+    assert bound in _timer_interval_names(tree), (
+        f"{module} {mode} arms no watchdog: no Timer's interval is computed from {bound!r}. "
+        f"Another mode's timer does not bound this one's read, which blocks until something "
+        f"outside closes the pipe."
+    )
+
+
+@pytest.mark.parametrize("module", sorted(TIMED_MODES))
+def test_every_mode_of_a_timed_stream_is_listed(module: str):
+    """Exact, both ways: a new mode must say how it ends, and a removed one leaves the list."""
+    flags = _mode_flags(_parse(module))
+    assert flags, f"found no mode group in {module}: this guard would read nothing"
+    listed = set(TIMED_MODES[module]) | set(UNTIMED_MODES.get(module, {}))
+    assert flags == listed, (
+        f"{module}'s modes are {sorted(flags)}; TIMED_MODES / UNTIMED_MODES list "
+        f"{sorted(listed)}. Give each new mode its own bound (or the reason it has none) "
+        f"and delete the entries of modes that are gone."
+    )
+
+
+@pytest.mark.parametrize("module", STREAMING)
+def test_a_stream_bounded_by_a_timer_lists_its_modes(module: str):
+    """A Timer bounds only the modes that arm it, so a module that uses one is listed by mode."""
+    if _arms_a_watchdog_timer(_parse(module)):
+        assert module in TIMED_MODES, (
+            f"{module} bounds its stream with a Timer: list each of its modes in TIMED_MODES "
+            f"(or UNTIMED_MODES, with the reason) so a mode that arms none is caught."
+        )
+
+
+# The shape log_monitor had: `--duration` armed a Timer and `--last` none. Python
+# source, not tool output: the guard reads code.
+_ONE_MODE_ARMED = (
+    "import threading\n"
+    "DUMP_TIMEOUT = 60\n"
+    "def stream(duration, last_minutes, stop):\n"
+    "    if duration:\n"
+    "        threading.Timer(float(duration), stop).start()\n"
+)
+
+
+def test_the_per_mode_guard_refuses_what_the_module_check_passed():
+    tree = ast.parse(_ONE_MODE_ARMED)
+    assert _arms_a_watchdog_timer(tree), "the module-level check passes this shape"
+    assert "duration" in _timer_interval_names(tree)
+    assert "DUMP_TIMEOUT" not in _timer_interval_names(tree)
+
+
+def test_the_mode_reader_reads_the_group_and_nothing_else():
+    tree = ast.parse(
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "modes = parser.add_mutually_exclusive_group()\n"
+        "modes.add_argument('--follow', action='store_true')\n"
+        "modes.add_argument('--last', dest='window')\n"
+        "parser.add_argument('--json', action='store_true')\n"
+    )
+    assert _mode_flags(tree) == {"--follow", "--last"}
 
 
 # The modules allowed to call subprocess directly, by path under scripts/.

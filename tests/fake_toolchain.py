@@ -43,7 +43,8 @@ Two more behaviours are simulated: ``hang=True`` answers and then does not
 exit until it is killed, as a streaming ``adb logcat`` aimed at a device that is
 not attached waits (recorded: adb_waiting_for_device); and ``once=True``
 answers the first call it matches only, so a device can be there for one
-question and gone for the next.
+question and gone for the next. A script that never stops such a stub is
+stopped by :meth:`FakeToolchain.run`'s limit, which takes the stub with it.
 
 Every invocation of every stub is appended to a log, so a spec can say both
 "the script answered X" and "the script asked the device Y" -- and so a spec
@@ -57,9 +58,11 @@ every one of these scripts would otherwise drive it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -73,6 +76,9 @@ SCRIPTS = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-sk
 
 # The stubs exit immediately, so a run that takes longer than this is hung.
 RUN_TIMEOUT_SECONDS = 60
+# How long a killed run's pipes may take to close. Only a process outside its
+# group (a detached worker, which writes to neither) could hold them open.
+REAP_TIMEOUT_SECONDS = 10
 
 # Directories that must stay reachable for the interpreter and coreutils, and
 # that hold no Android tool on the machines this suite runs on (asserted by
@@ -96,6 +102,9 @@ with open({spec!r}, encoding="utf-8") as handle:
 argv = sys.argv[1:]
 with open(spec["log"], "a", encoding="utf-8") as log:
     log.write(json.dumps([spec["name"], *argv]) + "\\n")
+# Its pid beside it, so a spec can ask whether a stub outlived the run.
+with open(spec["log"] + ".pids", "a", encoding="utf-8") as pids:
+    pids.write(json.dumps([os.getpid(), spec["name"], *argv]) + "\\n")
 
 # A threadtime header: everything before the message. A run of lines sharing
 # one is one record.
@@ -356,26 +365,48 @@ class FakeToolchain:
 
     def run(
         self,
-        script: str,
+        script: str | Path,
         *argv: str,
         cwd: Path | None = None,
         stdin: str | None = None,
         timeout: float = RUN_TIMEOUT_SECONDS,
         **extra_env: str,
     ) -> subprocess.CompletedProcess:
-        """Run one skill script with this toolchain and nothing else on PATH."""
-        path = SCRIPTS / script
-        interpreter = ["/bin/bash"] if script.endswith(".sh") else [sys.executable]
-        return subprocess.run(
-            [*interpreter, str(path), *argv],
+        """Run one skill script with this toolchain and nothing else on PATH.
+
+        ``script`` is a name under scripts/, or the path of a copy elsewhere.
+
+        The script runs in a process group of its own. Past ``timeout`` the
+        whole group is killed -- the script and every stub it started -- and
+        the script reaped, before ``TimeoutExpired`` is raised. ``subprocess.run``
+        killed the script alone: a ``hang`` stub it had started slept on for an
+        hour after every run that timed out (review of PR #36).
+        """
+        path = script if isinstance(script, Path) else SCRIPTS / script
+        interpreter = ["/bin/bash"] if path.suffix == ".sh" else [sys.executable]
+        command = [*interpreter, str(path), *argv]
+        with subprocess.Popen(
+            command,
             env=self.env(**extra_env),
             cwd=str(cwd or self.tmp),
-            input=stdin if stdin is not None else "",
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
-        )
+            start_new_session=True,
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(
+                    stdin if stdin is not None else "", timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                # Reaped, and its pipes drained: they close once the group is gone.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.communicate(timeout=REAP_TIMEOUT_SECONDS)
+                raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     # --- reading back -------------------------------------------------------
 
@@ -387,6 +418,16 @@ class FakeToolchain:
             if line.strip()
         ]
         return [entry[1:] for entry in entries if tool is None or entry[0] == tool]
+
+    def stub_pids(self, tool: str | None = None) -> list[tuple[int, list[str]]]:
+        """``(pid, argv)`` of every stub invocation so far, optionally for one tool."""
+        path = Path(f"{self.log}.pids")
+        if not path.exists():
+            return []
+        entries = [
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+        ]
+        return [(entry[0], entry[2:]) for entry in entries if tool is None or entry[1] == tool]
 
     def assert_isolated(self) -> None:
         """No real Android tool is reachable from the PATH this harness hands out."""

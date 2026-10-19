@@ -1468,6 +1468,81 @@ def test_a_live_read_cut_by_itself_with_the_device_there_is_refused(toolchain, r
     assert_refusal(result, json_mode=False, naming=("inside a record",), status=1)
 
 
+# --- a dump has a deadline of its own (review 2 of v0.8.0, item 10) -------------
+#
+# `--last` passes no --duration, so it armed no watchdog: a dump whose pipe
+# stalled blocked in its read until something outside closed it, and the
+# preflight cannot protect a read from a device lost after it. The stubs below
+# never exit by themselves (`hang`); a run that outlives STALL_LIMIT is that
+# hang, and the harness kills its whole process group, stub and all
+# (FakeToolchain.run). ANDROID_EMU_ADB_TIMEOUT=1 makes the dump's deadline two
+# seconds.
+
+STALL_LIMIT = 30
+
+
+def _stalled_dump(recorded) -> Rule:
+    """`logcat -d` that sends three bytes of a record's header, then nothing, and never exits.
+
+    Derived: the first three bytes of logcat_crash_buffer_records (a record's
+    header is longer); then the stub waits until it is killed.
+    """
+    return Rule(("logcat",), stdout=recorded.data("logcat_crash_buffer_records.bin")[:3], hang=True)
+
+
+def _waiting_dump(recorded) -> Rule:
+    """`logcat -d` for a device that is not there: adb's banner on stderr, and it waits.
+
+    Measured: `adb -s <unknown> logcat -d -B` prints adb_waiting_for_device's
+    banner, nothing on stdout, and does not exit.
+    """
+    return Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True)
+
+
+def _read_last(toolchain) -> subprocess.CompletedProcess:
+    """``--last 5m --json`` with a two-second dump deadline, or a failure if it hangs."""
+    try:
+        return toolchain.run(
+            "log_monitor.py",
+            "--last",
+            "5m",
+            "--json",
+            timeout=STALL_LIMIT,
+            ANDROID_EMU_ADB_TIMEOUT="1",
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"--last was still reading a stalled dump after {STALL_LIMIT}s: the dump arms "
+            "no deadline of its own"
+        )
+
+
+def test_a_stalled_dump_is_stopped_at_its_deadline_and_refused(toolchain, recorded):
+    """Three header bytes, then silence, the device still attached: refused, exit 1.
+
+    The device is asked again first -- gone would be the answer -- and, there,
+    what the dump read is not reported as the window.
+    """
+    toolchain.install(
+        "adb",
+        [Rule(("get-state",), stdout=recorded.text("adb_get_state")), _stalled_dump(recorded)],
+    )
+    result = _read_last(toolchain)
+    assert_refusal(result, json_mode=True, naming=("did not finish",), status=1)
+    asked = [call for call in toolchain.calls("adb") if "get-state" in call]
+    assert len(asked) == 2, "the device was not asked again at the deadline"
+
+
+@pytest.mark.parametrize(
+    "dump", [_stalled_dump, _waiting_dump], ids=["stalled-mid-record", "waiting-for-device"]
+)
+def test_a_dump_whose_device_went_is_exit_three_at_its_deadline(dump, toolchain, recorded):
+    """The device answers the preflight and is then gone; at its deadline the dump asks again."""
+    _gone_after_one_read(toolchain, recorded, dump(recorded))
+    result = _read_last(toolchain)
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+
+
 # --- A5: adb's error is read line by line ---------------------------------------
 
 
