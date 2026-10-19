@@ -27,12 +27,40 @@ def toolchain(tmp_path) -> FakeToolchain:
     return chain
 
 
-def _project(toolchain: FakeToolchain, tmp_path: Path, rule: Rule) -> Path:
+def _project(
+    toolchain: FakeToolchain,
+    tmp_path: Path,
+    rule: Rule,
+    project_dir_answer: str = "gradle_properties_project_dir",
+) -> Path:
+    """A project whose gradlew answers ``rule`` and the builder's projectDir question.
+
+    A ``--module`` test run first asks ``<module>:properties --property
+    projectDir``. The answers are recorded (flavored scaffold, Gradle 8.13), with
+    the recorder's ``/scaffold`` put back as this project: ``:app`` gets
+    ``project_dir_answer``; ``:nope`` gets Gradle's refusal, on stderr as measured.
+    """
     project = tmp_path / "proj"
     project.mkdir(parents=True, exist_ok=True)
     (project / "app").mkdir(exist_ok=True)
-    toolchain.install("gradlew", [rule], directory=project)
+    recorded = _recorded_gradle_text
+    answers = [
+        Rule(
+            (":app:properties", "projectDir"),
+            stdout=recorded(project_dir_answer).replace("/scaffold", str(project)),
+        ),
+        Rule(
+            (":nope:properties", "projectDir"),
+            stderr=recorded("gradle_properties_unknown_project").replace("/scaffold", str(project)),
+            exit=1,
+        ),
+    ]
+    toolchain.install("gradlew", [*answers, rule], directory=project)
     return project
+
+
+def _recorded_gradle_text(name: str) -> str:
+    return (RECORDED_ROOT / "gradle-8.13" / f"{name}.txt").read_text(encoding="utf-8")
 
 
 def _results_dir(project: Path) -> Path:
@@ -171,34 +199,99 @@ def test_rerun_reaches_gradle_right_after_the_test_task(toolchain, tmp_path, rec
         "--json",
     )
 
-    (argv,) = toolchain.calls("gradlew")
+    question, argv = toolchain.calls("gradlew")
+    assert ":app:properties" in question, question
     task = argv.index(":app:testDebugUnitTest")
     assert argv[task + 1] == "--rerun", argv
     assert argv[argv.index("--tests") + 1] == "com.example.PassingTest", argv
 
 
-def test_a_missing_selected_module_is_refused_before_gradle(toolchain, tmp_path, recorded_gradle):
-    """The shared boundary reports the resolved directory at exit 1 without starting Gradle."""
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_module_gradle_does_not_know_is_refused_before_its_tests(
+    json_mode, toolchain, tmp_path, recorded_gradle
+):
+    """Gradle's own "not found in root project" is the refusal; the test task never starts."""
     project = _silent_green_run(toolchain, tmp_path, recorded_gradle)
+    stale = _results_dir(project) / "TEST-stale.xml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(recorded_gradle("junit_xml_passing_case"), encoding="utf-8")
 
     result = toolchain.run(
         "build_and_test.py",
         "--project",
         str(project),
         "--module",
-        ":missing",
+        ":nope",
         "--test",
-        "--json",
+        *(["--json"] if json_mode else []),
     )
 
     payload = assert_refusal(
         result,
-        json_mode=True,
-        naming=(str(project / "missing"), "does not exist"),
+        json_mode=json_mode,
+        naming=("not found in root project",),
         status=1,
     )
-    assert payload is not None and "projectDir" in payload["remedy"], payload
-    assert toolchain.calls("gradlew") == [], "Gradle started before module validation"
+    if payload is not None:
+        assert "module :nope" in payload["error"], payload
+        assert "./gradlew projects" in payload["remedy"], payload
+        assert ":nope:properties" in payload["command"], payload
+    calls = toolchain.calls("gradlew")
+    assert calls and all(":nope:properties" in argv for argv in calls), calls
+    assert stale.exists(), "a report was deleted for a module Gradle does not have"
+
+
+def test_a_remapped_module_is_cleaned_and_read_where_gradle_put_it(
+    toolchain, tmp_path, recorded_gradle
+):
+    """End to end: Gradle answers mobile/, the run passes on mobile/'s report alone.
+
+    The answer is the recording from a scaffold copy with
+    ``project(':app').projectDir = file('mobile')`` appended to its settings.
+    app/ holds a stale FAILING report: reading it would fail the run.
+    """
+    project = tmp_path / "proj"
+    mobile = project / "mobile" / "build" / "test-results" / "testDebugUnitTest"
+    rule = Rule(
+        # A stub matches whole argv elements; a --module run names the scoped task.
+        (":app:testDebugUnitTest",),
+        stdout=recorded_gradle("gradle_build_successful"),
+        exit=0,
+        writes=(
+            (
+                str(mobile / "TEST-com.example.PassingTest.xml"),
+                recorded_gradle("junit_xml_passing_case"),
+            ),
+        ),
+    )
+    project = _project(
+        toolchain, tmp_path, rule, project_dir_answer="gradle_properties_project_dir_remapped"
+    )
+    mobile_stale = mobile / "TEST-stale.xml"
+    app_stale = _results_dir(project) / "TEST-stale.xml"
+    for stale, text in (
+        (mobile_stale, "junit_xml_error_case"),
+        (app_stale, "junit_xml_error_case"),
+    ):
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text(recorded_gradle(text), encoding="utf-8")
+
+    result = toolchain.run(
+        "build_and_test.py", "--project", str(project), "--module", ":app", "--test", "--json"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["test_results"] == {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+    assert not mobile_stale.exists(), "cleanup missed the directory Gradle named"
+    assert app_stale.exists(), "cleanup reached app/, which Gradle did not name"
 
 
 @pytest.mark.parametrize(

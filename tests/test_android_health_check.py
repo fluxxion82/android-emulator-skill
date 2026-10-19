@@ -600,20 +600,34 @@ def _shell_function(name: str) -> str:
 def test_python_document_guard_requires_the_report_keys():
     """A JSON object is not enough: it must have the health report's required fields."""
     functions = f'{_shell_function("is_json_object")}\n{_shell_function("run_bounded")}'
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            f'{functions}\nPYTHON_RUNS=true\nis_json_object "$1"',
-            "json-guard",
-            "{}",
-        ],
+    # Use pytest's interpreter so PATH and shell discovery cannot bypass validation.
+    command = f'{functions}\nPYTHON_RUNS=true\nPYTHON_BIN="$2"\nis_json_object "$1"'
+
+    rejected = subprocess.run(
+        ["bash", "-c", command, "json-guard", "{}", sys.executable],
         capture_output=True,
         text=True,
         check=False,
+        timeout=20,
+    )
+    complete_report = json.dumps(
+        {
+            "ok": True,
+            "success": True,
+            "checks": [],
+            "summary": {"passed": 0, "warnings": 0, "failed": 0},
+        }
+    )
+    accepted = subprocess.run(
+        ["bash", "-c", command, "json-guard", complete_report, sys.executable],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
     )
 
-    assert result.returncode != 0, "the Python guard accepted an object without report keys"
+    assert rejected.returncode == 1, "the Python guard accepted an object without report keys"
+    assert accepted.returncode == 0, "the Python guard rejected a complete health report"
 
 
 def test_bash_document_guard_rejects_concatenated_objects():

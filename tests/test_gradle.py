@@ -704,6 +704,31 @@ def test_cache_missing_id(tmp_path: Path):
 # --- BuildRunner (subprocess mocked) ----------------------------------------
 
 
+import gradle.builder as _builder_mod  # noqa: E402 -- the real query, kept for one test
+
+_REAL_GRADLE_QUERY = getattr(_builder_mod, "_gradle_query", None)
+
+
+@pytest.fixture(autouse=True)
+def _gradle_answers_the_conventional_project_dir(monkeypatch, recorded_gradle):
+    """Every --module test run first asks Gradle where the module lives.
+
+    Tests about something else get Gradle's recorded answer for an unmapped
+    scaffold (gradle_properties_project_dir: projectDir: /scaffold/app),
+    with its scrubbed root put back as the project the builder asked about.
+    The tests of that question below replace this with their own answer.
+    """
+    answer = recorded_gradle("gradle_properties_project_dir")
+
+    def query(command, cwd, timeout):
+        stdout = answer.replace("/scaffold", str(cwd))
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    # raising=False: the same specs run against the settings scanner this
+    # replaced, which has no such seam, so its red is a wrong directory.
+    monkeypatch.setattr(_builder_mod, "_gradle_query", query, raising=False)
+
+
 def _make_project(tmp_path: Path) -> Path:
     project = tmp_path / "proj"
     project.mkdir()
@@ -832,15 +857,78 @@ def _results(project: Path, module: str = "app") -> Path:
     return project / module / "build" / "test-results" / "testDebugUnitTest"
 
 
+# --- Where a --module's reports live: Gradle's answer ------------------------
+#
+# A test run scoped to a module cleans and reads that module's reports, so it
+# must know the module's directory. That is Gradle's answer to
+# `<module>:properties --property projectDir`, recorded on 8.13 and 7.5.1 from
+# a copy of the flavored scaffold (tests/record_gradle_fixtures.py); the
+# settings script is never read. Every answer below is a recorded file. The
+# only edit is the one the recorder's scrub made in reverse -- "/scaffold"
+# becomes the test's project -- plus the substitutions named where they occur.
+
+
+def _answer(recorded_gradle, name: str, version: str, project: Path) -> str:
+    """A recorded projectDir answer, its scrubbed root put back as ``project``."""
+    return recorded_gradle(name, version=version).replace("/scaffold", str(project))
+
+
+def _gradle_answers(monkeypatch, *, stdout: str = "", stderr: str = "", returncode: int = 0):
+    """Answer the builder's projectDir question; return the commands it asked."""
+    import gradle.builder as builder_mod
+
+    asked: list[list[str]] = []
+
+    def query(command, cwd, timeout):
+        asked.append(command)
+        return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(builder_mod, "_gradle_query", query, raising=False)
+    return asked
+
+
+def _stale_reports(project: Path, recorded_gradle, *roots: str) -> list[Path]:
+    """A previous run's report under each module root, for cleanup to keep or delete."""
+    reports = []
+    for root in roots:
+        report = _results(project, root) / "TEST-stale.xml"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(recorded_gradle("junit_xml_passing_case"), encoding="utf-8")
+        reports.append(report)
+    return reports
+
+
+def _test_task_never_started(monkeypatch) -> list:
+    """Record any call that reaches the test task; the refusal must come first."""
+    import gradle.builder as builder_mod
+
+    started: list = []
+
+    def fake_run(cmd, **_kwargs):
+        started.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    return started
+
+
+GRADLE_VERSIONS = [pytest.param("8.13", id="gradle-8.13"), pytest.param("7.5.1", id="gradle-7.5.1")]
+
+
+@pytest.mark.parametrize("version", GRADLE_VERSIONS)
 def test_a_module_without_project_dir_keeps_the_default_directory(
-    tmp_path: Path, monkeypatch, recorded_gradle
+    version, tmp_path: Path, monkeypatch, recorded_gradle
 ):
-    """The recorded scaffold has no projectDir override, so :app remains app/."""
+    """(a) Gradle answers app/ for the unmapped scaffold, so app/ is cleaned and read."""
     from gradle import BuildRunner
 
     project = _make_project(tmp_path)
-    (project / "settings.gradle").write_text(
-        recorded_gradle("settings_gradle_compose"), encoding="utf-8"
+    stale = _results(project) / "TEST-stale.xml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(recorded_gradle("junit_xml_error_case"), encoding="utf-8")
+    asked = _gradle_answers(
+        monkeypatch,
+        stdout=_answer(recorded_gradle, "gradle_properties_project_dir", version, project),
     )
     _gradle_that_writes(
         monkeypatch,
@@ -858,40 +946,40 @@ def test_a_module_without_project_dir_keeps_the_default_directory(
 
     assert result.success is True
     assert result.results_dir == str(_results(project))
+    assert result.test_results["total"] == 1, "the stale failing report was read"
+    assert not stale.exists()
+    (command,) = asked
+    assert command[0] == str(project / "gradlew")
+    assert command[1:] == [
+        "--console=plain",
+        "-q",
+        "-p",
+        str(project),
+        ":app:properties",
+        "--property",
+        "projectDir",
+    ]
 
 
-@pytest.mark.parametrize(
-    ("settings_name", "assignment"),
-    [
-        pytest.param(
-            "settings.gradle",
-            "project(':app').projectDir = file('mobile')",
-            id="groovy-file",
-        ),
-        pytest.param(
-            "settings.gradle.kts",
-            'project(":app").projectDir = File("mobile")',
-            id="kotlin-file-constructor",
-        ),
-    ],
-)
-def test_a_module_project_dir_override_selects_its_reports(
-    settings_name, assignment, tmp_path: Path, monkeypatch, recorded_gradle
+@pytest.mark.parametrize("version", GRADLE_VERSIONS)
+def test_gradles_remapped_project_dir_selects_cleanup_and_reports(
+    version, tmp_path: Path, monkeypatch, recorded_gradle
 ):
-    """The appended assignment forms are documented Gradle DSL, not invented tool output."""
+    """(b) settings maps :app to mobile/, Gradle says so, and only mobile/ is touched.
+
+    The recorded answer came from a scaffold copy whose settings.gradle ended
+    with `project(':app').projectDir = file('mobile')`. Nothing here writes a
+    settings file: the builder no longer reads one.
+    """
     from gradle import BuildRunner
 
     project = _make_project(tmp_path)
-    settings = recorded_gradle("settings_gradle_compose")
-    if settings_name.endswith(".kts"):
-        # Mechanical Groovy-to-Kotlin spelling changes from Gradle's documented
-        # settings DSL; the rest stays byte-for-byte from the recorded scaffold.
-        settings = settings.replace(
-            "rootProject.name = 'compose-scaffold'", 'rootProject.name = "compose-scaffold"'
-        ).replace("include ':app'", 'include(":app")')
-    settings = f"{settings.rstrip()}\n{assignment}\n"
-    (project / settings_name).write_text(settings, encoding="utf-8")
     (project / "mobile").mkdir()
+    mobile_stale, app_stale = _stale_reports(project, recorded_gradle, "mobile", "app")
+    _gradle_answers(
+        monkeypatch,
+        stdout=_answer(recorded_gradle, "gradle_properties_project_dir_remapped", version, project),
+    )
     _gradle_that_writes(
         monkeypatch,
         0,
@@ -908,165 +996,270 @@ def test_a_module_project_dir_override_selects_its_reports(
 
     assert result.success is True
     assert result.results_dir == str(_results(project, "mobile"))
+    assert result.test_results["total"] == 1
+    assert not mobile_stale.exists(), "cleanup did not target Gradle's projectDir"
+    assert app_stale.exists(), "cleanup deleted a report outside the module Gradle named"
+
+
+def _reviewed_construct(name: str):
+    import record_gradle_fixtures
+
+    (fixture,) = [f for f in record_gradle_fixtures.FIXTURES if f.name == name]
+    return fixture
 
 
 @pytest.mark.parametrize(
-    "commented_assignment",
+    ("fixture_name", "expected", "untouched"),
     [
-        pytest.param(
-            "// project(':app').projectDir = file('old-mobile')",
-            id="line-comment",
-        ),
-        pytest.param(
-            "/*\nproject(':app').projectDir = file('old-mobile')\n*/",
-            id="block-comment",
-        ),
+        pytest.param("gradle_properties_slashy_dead_branch", "app", "mobile", id="slashy-if-false"),
+        pytest.param("gradle_properties_unbraced_dead_branch", "app", "mobile", id="unbraced-if"),
+        pytest.param("gradle_properties_interpolated_module", "mobile", "app", id="gstring-module"),
+        pytest.param("gradle_properties_set_project_dir", "mobile", "app", id="setter"),
     ],
 )
-def test_commented_project_dir_assignment_keeps_default_directory(
-    commented_assignment, tmp_path: Path, monkeypatch, recorded_gradle
+def test_the_reviewed_settings_constructs_resolve_as_gradle_evaluated_them(
+    fixture_name, expected, untouched, tmp_path: Path, monkeypatch, recorded_gradle
 ):
-    """Comment text cannot redirect cleanup or report collection away from app/."""
+    """The PR #41 review's four scanner bypasses: the settings script is never consulted.
+
+    The project's settings.gradle is the flavored scaffold's plus the construct
+    the recorder appended before Gradle answered (one definition, in
+    record_gradle_fixtures.FIXTURES), so a builder that read it would see what
+    Gradle saw.
+    """
     from gradle import BuildRunner
 
+    fixture = _reviewed_construct(fixture_name)
     project = _make_project(tmp_path)
-    settings = f'{recorded_gradle("settings_gradle_compose").rstrip()}\n{commented_assignment}\n'
-    (project / "settings.gradle").write_text(settings, encoding="utf-8")
-    (project / "old-mobile").mkdir()
-    _gradle_that_writes(
-        monkeypatch,
-        0,
-        recorded_gradle("gradle_build_successful"),
-        [
-            (
-                _results(project) / "TEST-com.example.PassingTest.xml",
-                recorded_gradle("junit_xml_passing_case"),
-            )
-        ],
-    )
-
-    result = BuildRunner(str(project), module=":app").test()
-
-    assert result.success is True
-    assert result.results_dir == str(_results(project))
-
-
-def test_settings_gradle_takes_precedence_over_kotlin_settings(
-    tmp_path: Path, monkeypatch, recorded_gradle
-):
-    """Gradle executes settings.gradle when both settings script variants exist."""
-    from gradle import BuildRunner
-
-    project = _make_project(tmp_path)
-    groovy = (
-        f'{recorded_gradle("settings_gradle_compose").rstrip()}\n'
-        "project(':app').projectDir = file('groovy-mobile')\n"
-    )
-    kotlin = 'include(":app")\nproject(":app").projectDir = file("kotlin-mobile")\n'
-    (project / "settings.gradle").write_text(groovy, encoding="utf-8")
-    (project / "settings.gradle.kts").write_text(kotlin, encoding="utf-8")
-    (project / "groovy-mobile").mkdir()
-    (project / "kotlin-mobile").mkdir()
-    _gradle_that_writes(
-        monkeypatch,
-        0,
-        recorded_gradle("gradle_build_successful"),
-        [
-            (
-                _results(project, "groovy-mobile") / "TEST-com.example.PassingTest.xml",
-                recorded_gradle("junit_xml_passing_case"),
-            )
-        ],
-    )
-
-    result = BuildRunner(str(project), module=":app").test()
-
-    assert result.success is True
-    assert result.results_dir == str(_results(project, "groovy-mobile"))
-
-
-@pytest.mark.parametrize(
-    ("assignment", "assignment_line"),
-    [
-        pytest.param(
-            "project(':app').projectDir = new File(rootDir, 'mobile')",
-            0,
-            id="dynamic-rhs",
-        ),
-        pytest.param(
-            "if (providers.gradleProperty('mobile').isPresent()) {\n"
-            "    project(':app').projectDir = file('mobile')\n"
-            "}",
-            1,
-            id="conditional-literal",
-        ),
-    ],
-)
-def test_unsupported_project_dir_assignment_is_refused_before_gradle(
-    assignment, assignment_line, tmp_path: Path, monkeypatch, recorded_gradle
-):
-    """An explicit mapping the resolver cannot prove is never treated as absent."""
-    from common import cli
-    from gradle import BuildRunner
-
-    project = _make_project(tmp_path)
-    base = recorded_gradle("settings_gradle_compose").rstrip()
-    settings = f"{base}\n{assignment}\n"
-    (project / "settings.gradle").write_text(settings, encoding="utf-8")
     (project / "mobile").mkdir()
-    gradle_started = False
+    scaffold_settings = fixture.scaffold / "settings.gradle"
+    (project / "settings.gradle").write_text(
+        scaffold_settings.read_text(encoding="utf-8") + fixture.settings_append, encoding="utf-8"
+    )
+    expected_stale, untouched_stale = _stale_reports(project, recorded_gradle, expected, untouched)
+    _gradle_answers(monkeypatch, stdout=_answer(recorded_gradle, fixture_name, "8.13", project))
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project, expected) / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
 
-    def fake_run(cmd, **_kwargs):
-        nonlocal gradle_started
-        gradle_started = True
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    result = BuildRunner(str(project), module=":app").test()
 
-    import gradle.builder as builder_mod
-
-    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
-
-    with pytest.raises(cli.Failure) as refused:
-        BuildRunner(str(project), module=":app").test()
-
-    line_number = len(base.splitlines()) + 1 + assignment_line
-    assert f"settings.gradle:{line_number}" in str(refused.value)
-    assert ":app" in str(refused.value)
-    assert "file('relative/path')" in refused.value.remedy
-    assert 'File("relative/path")' in refused.value.remedy
-    assert gradle_started is False, "Gradle started before the assignment was refused"
+    assert result.results_dir == str(_results(project, expected))
+    assert not expected_stale.exists(), f"cleanup missed {expected}/, where Gradle put :app"
+    assert untouched_stale.exists(), f"cleanup deleted a report under {untouched}/"
+    assert result.success is True
 
 
-def test_a_missing_resolved_module_directory_refuses_before_gradle(
-    tmp_path: Path, monkeypatch, recorded_gradle
+@pytest.mark.parametrize("version", GRADLE_VERSIONS)
+def test_a_module_gradle_does_not_know_is_refused_by_name(
+    version, tmp_path: Path, monkeypatch, recorded_gradle
 ):
-    """A bad projectDir is a settings error, not a successful run with no reports."""
+    """(c) Gradle's own "not found in root project" reaches the refusal; nothing is cleaned.
+
+    Recorded for :nope; Gradle writes its failure to stderr (measured).
+    """
     from common import cli
     from gradle import BuildRunner
 
     project = _make_project(tmp_path)
-    settings = (
-        f'{recorded_gradle("settings_gradle_compose").rstrip()}\n'
-        "project(':app').projectDir = file('missing-mobile')\n"
+    (stale,) = _stale_reports(project, recorded_gradle, "app")
+    _gradle_answers(
+        monkeypatch,
+        stderr=_answer(recorded_gradle, "gradle_properties_unknown_project", version, project),
+        returncode=1,
     )
-    (project / "settings.gradle").write_text(settings, encoding="utf-8")
-    gradle_started = False
+    started = _test_task_never_started(monkeypatch)
 
-    def fake_run(cmd, **_kwargs):
-        nonlocal gradle_started
-        gradle_started = True
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":nope").test()
 
-    import gradle.builder as builder_mod
+    assert "module :nope" in str(refused.value)
+    # 8.13: "... as project 'nope' not found in root project ..."; 7.5.1:
+    # "Project 'nope' not found in root project ..." -- both reach the caller.
+    assert "'nope' not found in root project 'flavored-scaffold'" in str(refused.value)
+    assert "./gradlew projects" in refused.value.remedy
+    assert ":nope:properties" in refused.value.details["command"]
+    assert started == [], "the test task started after Gradle refused the module"
+    assert stale.exists()
 
-    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+
+@pytest.mark.parametrize("version", GRADLE_VERSIONS)
+def test_an_answer_without_a_project_dir_line_is_refused(
+    version, tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """(d) Exit 0 with no projectDir line is no answer; app/ is not assumed.
+
+    Recorded honestly: a property filter that matches nothing
+    (gradle_properties_no_such_property) prints the banner and ``<name>: null``.
+    """
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (stale,) = _stale_reports(project, recorded_gradle, "app")
+    _gradle_answers(
+        monkeypatch,
+        stdout=_answer(recorded_gradle, "gradle_properties_no_such_property", version, project),
+    )
+    started = _test_task_never_started(monkeypatch)
 
     with pytest.raises(cli.Failure) as refused:
         BuildRunner(str(project), module=":app").test()
 
-    expected = project / "missing-mobile"
-    assert str(expected) in str(refused.value)
-    assert "projectDir" in refused.value.remedy
-    assert gradle_started is False, "Gradle started before the module directory was validated"
+    assert "0 projectDir lines" in str(refused.value)
+    assert "expected exactly one" in str(refused.value)
+    assert started == []
+    assert stale.exists(), "a report was deleted on a guessed directory"
+
+
+def test_two_project_dir_lines_are_refused(tmp_path: Path, monkeypatch, recorded_gradle):
+    """(d) More than one answer is ambiguous, even if the first looks right.
+
+    Derived: the recorded app/ answer followed by the recorded mobile/ answer --
+    the shape an init script printing its own ``projectDir:`` line would add.
+    """
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (project / "mobile").mkdir()
+    stale = _stale_reports(project, recorded_gradle, "app", "mobile")
+    _gradle_answers(
+        monkeypatch,
+        stdout=_answer(recorded_gradle, "gradle_properties_project_dir", "8.13", project)
+        + _answer(recorded_gradle, "gradle_properties_project_dir_remapped", "8.13", project),
+    )
+    started = _test_task_never_started(monkeypatch)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    assert "2 projectDir lines" in str(refused.value)
+    assert started == []
+    assert all(report.exists() for report in stale)
+
+
+def test_a_project_dir_outside_the_project_is_refused(tmp_path: Path, monkeypatch, recorded_gradle):
+    """(e) Gradle may put a module anywhere; cleanup stays inside --project.
+
+    Derived: the recorded remapped answer with its path substituted by a real
+    directory beside the project (``project(':app').projectDir =
+    file('../outside')`` is legal Gradle).
+    """
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    outside = tmp_path / "outside"
+    (outside_stale,) = _stale_reports(tmp_path, recorded_gradle, "outside")
+    (app_stale,) = _stale_reports(project, recorded_gradle, "app")
+    answer = _answer(recorded_gradle, "gradle_properties_project_dir_remapped", "8.13", project)
+    _gradle_answers(monkeypatch, stdout=answer.replace(str(project / "mobile"), str(outside)))
+    started = _test_task_never_started(monkeypatch)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    assert "resolves outside the project" in str(refused.value)
+    assert str(outside) in str(refused.value)
+    assert started == []
+    assert outside_stale.exists(), "cleanup reached a directory outside the project"
+    assert app_stale.exists()
+
+
+def test_a_project_dir_that_is_not_a_directory_is_refused(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Belt: Gradle 8.13 itself fails on a missing projectDir ("Basedir ... does not exist").
+
+    Derived: the recorded remapped answer with no mobile/ directory created.
+    """
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    _gradle_answers(
+        monkeypatch,
+        stdout=_answer(recorded_gradle, "gradle_properties_project_dir_remapped", "8.13", project),
+    )
+    started = _test_task_never_started(monkeypatch)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    assert str(project / "mobile") in str(refused.value)
+    assert "does not exist" in str(refused.value)
+    assert started == []
+
+
+def test_a_gradle_that_does_not_answer_in_time_is_refused(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """(f) The question is bounded by ANDROID_EMU_BUILD_TIMEOUT and says so."""
+    import gradle.builder as builder_mod
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (stale,) = _stale_reports(project, recorded_gradle, "app")
+    bounds: list[int] = []
+
+    def time_out(command, cwd, timeout):
+        bounds.append(timeout)
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(builder_mod, "_gradle_query", time_out)
+    monkeypatch.setattr(builder_mod, "BUILD_TIMEOUT", 7)
+    started = _test_task_never_started(monkeypatch)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    assert bounds == [7]
+    assert "within 7s" in str(refused.value)
+    assert ":app:properties" in str(refused.value)
+    assert "ANDROID_EMU_BUILD_TIMEOUT" in refused.value.remedy
+    assert started == []
+    assert stale.exists()
+
+
+def test_a_wrapper_that_cannot_start_is_refused(tmp_path: Path, monkeypatch, recorded_gradle):
+    """The real query, against a gradlew the OS will not execute (no interpreter line)."""
+    import gradle.builder as builder_mod
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (project / "gradlew").write_bytes(b"\x00\x01 not an executable\n")
+    monkeypatch.setattr(builder_mod, "_gradle_query", _REAL_GRADLE_QUERY)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    assert "could not start the Gradle wrapper" in str(refused.value)
+    assert "./gradlew --version" in refused.value.remedy
+
+
+def test_a_build_does_not_ask_gradle_for_the_module_directory(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """An assemble reads no report, so it pays for no extra configuration."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    asked = _gradle_answers(monkeypatch, stdout="")
+    _gradle_that_writes(monkeypatch, 0, recorded_gradle("gradle_build_successful"))
+
+    assert BuildRunner(str(project), module=":app").build().success is True
+    assert asked == []
 
 
 def test_x7_failing_tests_fail_the_run_when_gradle_exits_zero(

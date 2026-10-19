@@ -198,11 +198,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 10. **build_and_test.py** - Gradle build/test automation with progressive disclosure (backed by the `gradle/` subpackage)
     - One-line summary + a result ID by default; drill in on demand
     - Parses JUnit XML for pass/fail counts + failed test names; extracts Gradle/Kotlin/Java errors & warnings
-    - Resolves a selected module's report directory from an unconditional, single-line
-      `project(...).projectDir = file(...)` or `File(...)` in the settings file Gradle selects
-      (`settings.gradle` takes precedence); comments are ignored, unsupported assignments and a
-      missing or outside-project directory are refused before Gradle starts, and no assignment
-      keeps the conventional module path
+    - For `--module ... --test`, the module's report directory is Gradle's own answer: it runs
+      `./gradlew -q <module>:properties --property projectDir` first (one extra configuration of the
+      build per such run; a build without `--test` does not ask) and never reads the settings script
+      itself, so any `projectDir`/`setProjectDir`/`includeFlat`/settings-plugin mapping is honoured.
+      A module Gradle does not know, a Gradle failure or timeout (`ANDROID_EMU_BUILD_TIMEOUT`), an
+      answer without exactly one `projectDir:` line, and a directory that is missing or outside
+      `--project` are refused by name before any report is deleted or the test task starts
     - `--test` reads only the reports *this* run wrote: it deletes the test task's old `TEST-*.xml` reports
       first, after proving their resolved paths stay inside the selected module and exact task directory,
       and reruns the task (`--rerun`, Gradle 7.6+; an older wrapper is refused by name). It passes only
