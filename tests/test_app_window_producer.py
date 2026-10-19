@@ -462,13 +462,19 @@ def _injection_device(toolchain, recorded) -> None:
             Rule(("shell", "pidof", "system_server"), stdout=oracle["system_server"]),
             *uid_rules(recorded, PACKAGE, oracle["alive"]),
             Rule(("shell", "pidof"), stdout=oracle["alive"]),
-            Rule(("logcat", "-B"), stdout=recorded.data(f"{INJECTION}.bin"), filter_pid=True),
+            # A live read follows: it replays, then waits until --duration stops it.
+            Rule(
+                ("logcat", "-B"),
+                stdout=recorded.data(f"{INJECTION}.bin"),
+                filter_pid=True,
+                follows=True,
+            ),
             Rule(("logcat",), stdout=recorded.text("logcat_tag_injection"), filter_pid=True),
         ],
     )
 
 
-@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "30s")], ids=["last", "live"])
+@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "2s")], ids=["last", "live"])
 def test_a1_log_monitor_keeps_a_forging_tag_out_of_the_apps_window(read, toolchain, recorded):
     """A1, end to end: the recorded injection does not add its victim to the app.
 
@@ -518,7 +524,8 @@ def _install(toolchain, recorded, window: list[Frame], *, system_server: str | N
     rules += uid_rules(recorded, PACKAGE, alive)
     rules += [
         Rule(("shell", "pidof"), stdout=alive),
-        Rule(("logcat",), stdout=framed(window), filter_pid=True),
+        # A live read follows: it replays, then waits until --duration stops it.
+        Rule(("logcat",), stdout=framed(window), filter_pid=True, follows=True),
     ]
     toolchain.install("adb", rules)
 
@@ -699,7 +706,7 @@ def _carriage_return_forgery(recorded) -> tuple[list[Frame], str]:
     return window, forger
 
 
-@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "30s")], ids=["last", "live"])
+@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "2s")], ids=["last", "live"])
 def test_log_monitor_reads_a_carriage_return_as_part_of_its_record(read, toolchain, recorded):
     """A "\\r" inside an app's message does not start a line system_server wrote.
 
@@ -710,7 +717,7 @@ def test_log_monitor_reads_a_carriage_return_as_part_of_its_record(read, toolcha
     window, forger = _carriage_return_forgery(recorded)
     _install(toolchain, recorded, window, system_server=_system_server(recorded))
     replayed = subprocess.run(
-        ["adb", "logcat", "-B"], env=toolchain.env(), capture_output=True, check=False
+        ["adb", "logcat", "-d", "-B"], env=toolchain.env(), capture_output=True, check=False
     ).stdout
     if replayed != framed(window):
         pytest.fail("the fake adb does not replay the forgery byte for byte")

@@ -44,6 +44,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
 
 from common import cli, logcat
 from common.adb_exec import (
@@ -667,8 +668,10 @@ class LogMonitor:
                 read, or when a live read ended by itself or a dump did not
                 end in ``DUMP_TIMEOUT`` (exit 3 at the boundary, never an
                 empty capture).
-            cli.Failure: A dump did not end in ``DUMP_TIMEOUT`` and the device
-                is still there: what it read is not the window.
+            cli.Failure: A dump did not end in ``DUMP_TIMEOUT``, or a live read
+                ended without being stopped, and the device is still there:
+                what it read is not the window (a live read hands it over under
+                ``partial``).
             common.logcat.LogFramingError: The stream is not logd's records.
         """
         self._verify_device_available()
@@ -916,7 +919,12 @@ class LogMonitor:
             stopped_by_us: True if the duration elapsed or the user interrupted,
                 in which case a terminated process is the expected outcome.
             live: A following read (``-T``), which never ends by itself while
-                its device is there. A dump (``--last``) always does.
+                its device is there. A dump (``--last``) always does. A live
+                read that ends without being stopped -- however adb exited, and
+                cut or not -- is asked about its device (gone: exit 3) and is
+                otherwise refused, with what it read under ``partial``: it
+                cannot show it observed what was asked. It used to be the
+                capture, with a note on stderr.
             cut: The stream ended inside a record. After a stop of ours that
                 record is lost and the loss disclosed (``cut_records``). A dump
                 or a stream that ended by itself never cuts a record: the
@@ -936,8 +944,9 @@ class LogMonitor:
                 for a read that ended by itself or a dump that overran --
                 ``get-state`` says the device is no longer available. Exit 3,
                 never a quiet capture.
-            cli.Failure: logcat exited non-zero, or a dump overran, and the
-                device is still there.
+            cli.Failure: logcat exited non-zero, a dump overran, or a live read
+                ended by itself, and the device is still there. A live read's
+                refusal carries what it read (``details["partial"]``).
 
         Never waits without a timeout: a streaming `adb logcat` does not exit on
         its own, so an unbounded ``wait()`` here is an unconditional hang.
@@ -1011,25 +1020,59 @@ class LogMonitor:
             message = f"adb logcat exited with status {returncode}."
             if detail:
                 message += f" {detail}"
-            cli.fail(
+            self._refuse(
                 message,
                 "Check the device is connected (`adb devices`) and, with more than one "
                 "attached, pass --serial.",
+                live=live,
             )
         if cut is not None:
-            cli.fail(
+            self._refuse(
                 f"adb logcat's output ended inside a record ({cut}), so the capture is "
                 "incomplete: what it read is not reported as the window.",
                 "Retry; if it repeats, the adb connection is cutting the stream -- restart it "
                 "with `adb kill-server && adb start-server`.",
+                live=live,
             )
         if live:
-            print(
-                "adb logcat ended by itself before it was stopped; the device is still "
-                "attached, so what it read is the capture.",
-                file=sys.stderr,
+            # Ended by itself, no failure status, the device still there. That used
+            # to be the capture -- success, with a note on stderr -- but a live
+            # read ends only when it is stopped, so an end of its own cannot
+            # show the observation asked for was made: a refusal, as
+            # anr_watcher --watch refuses the same end (wave 4's rule).
+            status = (
+                "exit status 0"
+                if returncode == 0
+                else f"no exit status within {STREAM_SHUTDOWN_TIMEOUT}s"
+            )
+            self._refuse(
+                f"adb logcat ended the live read by itself ({status}) while the device is "
+                "still attached. A live read ends only when it is stopped (--duration, an "
+                "interrupt), so what it read is not the capture asked for.",
+                "Retry; if it repeats, restart adb (`adb kill-server && adb start-server`).",
+                live=True,
             )
         return True
+
+    def _refuse(self, error: str, remedy: str, *, live: bool) -> NoReturn:
+        """Refuse the capture -- a live read handing over what it read, under ``partial``.
+
+        A live read that ended by itself cannot show it observed what was asked,
+        but what it did read is evidence and is kept: the JSON summary, its
+        attribution settled, in the refusal object (``--json``), and the count
+        in the error itself, since the text form prints no details. A dump's
+        refusal is its own words alone: what it read is not the window.
+        """
+        if not live:
+            cli.fail(error, remedy)
+        if self.app_package and self.attribution is None:
+            self._settle_attribution(None)
+        cli.fail(
+            f"{error} It had read {self.total_lines} line(s): under `partial` (--json), "
+            "not reported as the capture.",
+            remedy,
+            details={"partial": self.get_json_output()},
+        )
 
     def get_summary(self, verbose: bool = False) -> str:
         """

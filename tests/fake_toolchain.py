@@ -39,9 +39,11 @@ Replayed text is byte-exact: a carriage return inside a recorded line stays
 inside it, as it does on the device, whose logcat ends a line only at ``\\n``.
 Replayed records are byte-exact too: bytes are written as they were recorded.
 
-Two more behaviours are simulated: ``hang=True`` answers and then does not
+More behaviours are simulated: ``hang=True`` answers and then does not
 exit until it is killed, as a streaming ``adb logcat`` aimed at a device that is
-not attached waits (recorded: adb_waiting_for_device); and ``once=True``
+not attached waits (recorded: adb_waiting_for_device); ``follows=True`` does
+the same for a following ``logcat`` only (no ``-d``), as a device's live read
+never ends by itself, so its reader has to stop it; and ``once=True``
 answers the first call it matches only, so a device can be there for one
 question and gone for the next. A script that never stops such a stub is
 stopped by :meth:`FakeToolchain.run`'s limit, which takes the stub with it.
@@ -205,8 +207,9 @@ for index, rule in enumerate(spec["rules"]):
     if rule["stderr"]:
         sys.stderr.buffer.write(read(rule["stderr"]))
         sys.stderr.flush()
-    if rule["hang"]:
-        # Waits like `adb logcat` for a device that is not there, until killed.
+    if rule["hang"] or (rule["follows"] and "-d" not in argv):
+        # Waits like `adb logcat` for a device that is not there, or -- a
+        # following read -- for records that are not coming, until killed.
         time.sleep(3600)
     sys.exit(rule["exit"])
 
@@ -245,6 +248,10 @@ class Rule:
     # Answer, then wait until killed instead of exiting -- a streaming `adb
     # logcat` aimed at a device that is not attached (adb_waiting_for_device).
     hang: bool = False
+    # A following `logcat` (no `-d`): answer, then wait until killed, as a
+    # device's does -- a live read ends only when its reader stops it. A dump
+    # (`-d`) answers and exits as before.
+    follows: bool = False
     # Answer only the first call it matches; later ones go to the next rule --
     # a device that answers `get-state` once, then is gone.
     once: bool = False
@@ -315,6 +322,7 @@ class FakeToolchain:
                     "writes": [[str(path), self._stage(text)] for path, text in rule.writes],
                     "pull_from": rule.pull_from,
                     "hang": rule.hang,
+                    "follows": rule.follows,
                     "once": rule.once,
                 }
                 for rule in rules
@@ -370,11 +378,15 @@ class FakeToolchain:
         cwd: Path | None = None,
         stdin: str | None = None,
         timeout: float = RUN_TIMEOUT_SECONDS,
+        interrupt_after: float | None = None,
         **extra_env: str,
     ) -> subprocess.CompletedProcess:
         """Run one skill script with this toolchain and nothing else on PATH.
 
         ``script`` is a name under scripts/, or the path of a copy elsewhere.
+        ``interrupt_after`` sends the script SIGINT (Ctrl-C) once that many
+        seconds have passed, for a mode that runs until it is interrupted
+        (``log_monitor --follow`` over a device that ``follows``).
 
         The script runs in a process group of its own. Past ``timeout`` the
         whole group is killed -- the script and every stub it started -- and
@@ -396,9 +408,18 @@ class FakeToolchain:
             start_new_session=True,
         ) as process:
             try:
-                stdout, stderr = process.communicate(
-                    stdin if stdin is not None else "", timeout=timeout
-                )
+                if interrupt_after is None:
+                    stdout, stderr = process.communicate(
+                        stdin if stdin is not None else "", timeout=timeout
+                    )
+                else:
+                    try:
+                        stdout, stderr = process.communicate(
+                            stdin if stdin is not None else "", timeout=interrupt_after
+                        )
+                    except subprocess.TimeoutExpired:
+                        process.send_signal(signal.SIGINT)
+                        stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
