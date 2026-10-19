@@ -608,6 +608,9 @@ def test_n14_max_restarts_zero_spawns_the_stream_once(tmp_path, monkeypatch):
             return None
 
     _logcat_through(monkeypatch, _StreamThatEnds)
+    # The device answers `device` whenever the worker asks -- it asks when a
+    # stream ends by itself (review of PR #42): these streams end, it stays.
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
     store = SessionStore(base_dir=tmp_path / "anr-sessions")
     meta = store.create({"serial": "emulator-5554"})
     try:
@@ -1502,7 +1505,8 @@ for answer in spec["answers"]:
         with open(answer["asked"], "a", encoding="utf-8") as marker:
             marker.write(argv[-1] + "\\n")
     time.sleep(answer["delay"])
-    for name, stream in (("stdout", sys.stdout.buffer), ("stderr", sys.stderr.buffer)):
+    streams = [("stdout", sys.stdout.buffer), ("stderr", sys.stderr.buffer)]
+    for name, stream in (streams[::-1] if answer["stderr_first"] else streams):
         if answer[name]:
             with open(answer[name], "rb") as handle:
                 stream.write(handle.read())
@@ -1525,6 +1529,8 @@ class _Answer:
     delay: float = 0.0
     hold: bool = False
     asked: str = ""
+    # Write stderr before stdout: what adb said is there before its stdout is read.
+    stderr_first: bool = False
 
 
 class _LiveDevice:
@@ -1968,6 +1974,9 @@ def test_a_stream_restart_forgets_who_held_each_pid(
         "get_package_uids",
         lambda _serial, package, **_k: parse_package_uids(listing, package),
     )
+    # The device answers `device` whenever the worker asks -- it asks when a
+    # stream ends by itself (review of PR #42): these streams end, it stays.
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
     store = SessionStore(base_dir=tmp_path / "anr-sessions")
     meta = store.create({"serial": "emulator-5554"})
     try:
@@ -2093,6 +2102,9 @@ def _worker_over_streams(store, streams: list[list[Frame]], tmp_path, monkeypatc
     monkeypatch.setattr(anr_watcher, "RESTART_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
     _logcat_through(monkeypatch, _next_stream)
+    # The device answers `device` whenever the worker asks -- it asks when a
+    # stream ends by itself (review of PR #42): these streams end, it stays.
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
     meta = store.create({"serial": "emulator-5554"})
     try:
         anr_watcher.AnrBuster(store=store).run_worker(meta.session_id)
@@ -3733,10 +3745,22 @@ def _launch(recorded, index: int) -> tuple[Frame, Frame]:
 
 
 def _package_session(store, records: list[Frame], recorded, tmp_path) -> str:
-    """A ``--package`` session over ``records``, read as the worker reads its first stream."""
-    return _session_starting_on(
-        store, records, tmp_path, package=PACKAGE, process_names=_names(recorded)
+    """A ``--package`` session over ``records``, read as the worker reads its first stream.
+
+    Its meta records the package, as --start records it.
+    """
+    meta = store.create({"package": PACKAGE})
+    counters = _run_worker_over(
+        store,
+        meta.session_id,
+        records,
+        tmp_path,
+        boundary=anr_watcher._CaptureBoundary(),
+        package=PACKAGE,
+        process_names=_names(recorded),
     )
+    store.persist_worker_counters(meta.session_id, counters)
+    return meta.session_id
 
 
 @pytest.mark.parametrize("absent_from", ["second", "first"])
@@ -3935,21 +3959,9 @@ def test_a_session_cut_by_itself_keeps_what_adb_said(
     _cut_stream(toolchain, recorded, recorded_anywhere, adb_exit, said)
     store = SessionStore(base_dir=toolchain.home / "anr-sessions")
 
-    started = toolchain.run("anr_watcher.py", "--start", "--serial", "emulator-5554", "--json")
-    assert started.returncode == 0, started.stdout + started.stderr
-    session_id = json.loads(started.stdout)["session_id"]
-    try:
-        deadline = time.monotonic() + 30
-        while store.load_meta(session_id).status != "crashed":
-            if time.monotonic() > deadline:
-                pytest.fail(f"the worker never marked the session crashed: {session_id}")
-            time.sleep(0.05)
-        stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--json")
-    finally:
-        worker = store.load_meta(session_id).pid
-        if worker:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(worker, signal.SIGKILL)
+    session_id, stopped = _session_until_crashed(
+        lambda *argv: toolchain.run("anr_watcher.py", *argv), store
+    )
 
     naming = ("not attached",) if said == "device not found" else ("ended inside a record",)
     refusal = assert_refusal(stopped, json_mode=True, naming=naming, status=status)
@@ -3960,3 +3972,323 @@ def test_a_session_cut_by_itself_keeps_what_adb_said(
     else:
         assert f"`adb logcat` exited {adb_exit}: nothing on stderr" in refusal["error"], refusal
     assert store.load_summary(session_id).stream_failure, "the summary was not saved"
+
+
+# ---------------------------------------------------------------------------
+# Codex review of PR #42: a session's stream that ends by itself, older summaries,
+# and what adb said before it exited
+# ---------------------------------------------------------------------------
+
+
+def _session_until_crashed(run, store) -> tuple[str, subprocess.CompletedProcess]:
+    """--start, wait until the worker has marked the session crashed, then --stop --json.
+
+    The id handed to --stop is the one --start printed. ``run`` runs
+    anr_watcher.py with the argv it is given.
+    """
+    started = run("--start", "--serial", "emulator-5554", "--json")
+    assert started.returncode == 0, started.stdout + started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    try:
+        deadline = time.monotonic() + 30
+        while store.load_meta(session_id).status != "crashed":
+            if time.monotonic() > deadline:
+                pytest.fail(f"the worker never marked the session crashed: {session_id}")
+            time.sleep(0.05)
+        stopped = run("--stop", session_id, "--json")
+    finally:
+        worker = store.load_meta(session_id).pid
+        if worker:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(worker, signal.SIGKILL)
+    return session_id, stopped
+
+
+def _logcat_spawns(toolchain) -> int:
+    return len([call for call in toolchain.calls("adb") if "logcat" in call])
+
+
+@pytest.mark.parametrize("adb_exit", [1, 255])
+def test_a_session_whose_stream_ends_saying_the_device_went_refuses_with_it(
+    adb_exit, toolchain, recorded, recorded_anywhere
+):
+    """Codex review of PR #42, REQUIRED 1 (P1): a stream that ENDS by itself, cleanly.
+
+    The reviewer's replay through the real binary: every logcat the worker
+    starts replays the recorded crash dump -- whole records, a clean end --
+    and adb writes the recorded device-not-found text and exits 1 or 255.
+    Only a framing failure was classified, so the worker restarted the
+    stream until no restart was left, the session was marked crashed with no
+    stream failure, and --stop answered with the summary: exit 0. adb's
+    words now end the session as the error they name, at the first end:
+    --stop refuses, exit 3, with its remedy, and the stream is not restarted.
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(
+                ("logcat",),
+                stdout=recorded.data(f"{CRASH_DUMP}.bin"),
+                stderr=recorded_anywhere("adb_device_not_found"),
+                exit=adb_exit,
+            ),
+        ],
+    )
+    store = SessionStore(base_dir=toolchain.home / "anr-sessions")
+
+    session_id, stopped = _session_until_crashed(
+        lambda *argv: toolchain.run("anr_watcher.py", *argv, ANDROID_EMU_ANR_MAX_RESTARTS="1"),
+        store,
+    )
+
+    refusal = assert_refusal(stopped, json_mode=True, naming=("not attached",), status=3)
+    assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+    assert f"--get-details {session_id}" in refusal["remedy"], refusal
+    assert "ended by itself" in refusal["error"], refusal
+    assert _logcat_spawns(toolchain) == 1, "a stream adb said had lost its device was restarted"
+
+
+@pytest.mark.parametrize(
+    ("device", "status", "spawns"), [("stays", 1, 2), ("goes", 3, 1)], ids=["stays", "goes"]
+)
+def test_a_session_whose_stream_keeps_ending_by_itself_is_never_a_quiet_success(
+    device, status, spawns, toolchain, recorded, recorded_anywhere
+):
+    """REQUIRED 1's other half: adb ends the stream cleanly and says nothing.
+
+    Each logcat replays the recorded crash dump and exits 0, silent. The
+    worker asks `adb get-state` when a stream ends: answered `device` (the
+    recorded answer) it restarts it, and once no restart is left (one,
+    here) --stop refuses, exit 1, saying how adb ended it; answered with the
+    recorded not-found refusal after the preflight, it restarts nothing and
+    --stop refuses, exit 3. Both used to be an incomplete summary at exit 0.
+    """
+    get_state = [Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=device == "goes")]
+    if device == "goes":
+        get_state.append(
+            Rule(("get-state",), stderr=recorded_anywhere("adb_device_not_found"), exit=1)
+        )
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            *get_state,
+            Rule(("logcat",), stdout=recorded.data(f"{CRASH_DUMP}.bin"), exit=0),
+        ],
+    )
+    store = SessionStore(base_dir=toolchain.home / "anr-sessions")
+
+    session_id, stopped = _session_until_crashed(
+        lambda *argv: toolchain.run("anr_watcher.py", *argv, ANDROID_EMU_ANR_MAX_RESTARTS="1"),
+        store,
+    )
+
+    naming = ("not attached",) if device == "goes" else ("ended by itself",)
+    refusal = assert_refusal(stopped, json_mode=True, naming=naming, status=status)
+    assert f"--get-details {session_id}" in refusal["remedy"], refusal
+    if device == "stays":
+        assert "`adb logcat` exited 0" in refusal["error"], refusal
+    assert _logcat_spawns(toolchain) == spawns
+    summary = store.load_summary(session_id)
+    assert summary.incomplete and summary.stream_failure, "the summary was not saved"
+
+
+def test_a_session_keeps_what_adb_said_before_it_exited(recorded, recorded_anywhere, tmp_path):
+    """Codex review of PR #42, REQUIRED 3: adb's words are read whether or not it has exited.
+
+    A stream that is not logd's records -- derived: the recorded crash dump's
+    first record with only its header-size field set to 0, which logd never
+    writes -- from an adb that has already written the recorded not-found
+    text and has not exited (it holds until killed). The worker does not wait
+    for an open stream's exit, and so read none of what it said: `adb
+    get-state` answered `device`, and --stop refused the framing, exit 1.
+    """
+    raw = bytearray(frames(recorded.data(f"{CRASH_DUMP}.bin"))[0].raw)
+    raw[2:4] = (0).to_bytes(2, "little")
+    device = _LiveDevice(
+        tmp_path,
+        [
+            _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
+            _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+            _Answer(
+                ("logcat",),
+                stdout=bytes(raw),
+                stderr=recorded_anywhere("adb_device_not_found"),
+                hold=True,
+                stderr_first=True,
+            ),
+        ],
+    )
+    try:
+        session_id, stopped = _session_until_crashed(device.run, device.store)
+    finally:
+        device.kill_workers()
+
+    refusal = assert_refusal(stopped, json_mode=True, naming=("not attached",), status=3)
+    assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+    assert f"--get-details {session_id}" in refusal["remedy"], refusal
+    assert "as it ended, `adb logcat` said" in refusal["error"], refusal
+
+
+def _forget_drop_metadata(store, session_id: str) -> None:
+    """Delete ``unnamed_dropped`` from a saved summary.json: the shape main b159fe0 saved.
+
+    That version wrote no such field, so a summary it saved -- still
+    fingerprint version 3, so compared -- reads as if nothing was dropped.
+    """
+    path = store.session_dir(session_id) / "summary.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "unnamed_dropped" in payload, "the summary no longer has the field this derives"
+    del payload["unnamed_dropped"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize("shape", ["absence", "maximum"])
+def test_a_package_summary_saved_without_drop_metadata_shows_nothing_about_jank(
+    shape, recorded, store, tmp_path, no_device
+):
+    """Codex review of PR #42, REQUIRED 2: an older summary has no ``unnamed_dropped``.
+
+    Derived from the reviewer's sessions: B is the replay session B (or, for
+    the maximum, the session that also read the second process's jank),
+    stopped, then saved again with only ``unnamed_dropped`` deleted from its
+    summary.json -- what main saved for it. Read as "nothing dropped", the
+    replay said "improvement: 1 resolved" and the shared cluster "stable".
+    What it dropped is unknown, so it shows neither, and the reason names the
+    missing field.
+    """
+    start, jank = _launch(recorded, 0)
+    _, other_jank = _launch(recorded, 1)
+    buster = anr_watcher.AnrBuster(store=store)
+    if shape == "absence":
+        a = _package_session(store, [start, jank], recorded, tmp_path)
+        b = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    else:
+        a = _package_session(store, [_neutral(recorded), start, jank], recorded, tmp_path)
+        b = _package_session(
+            store, [_neutral(recorded), start, jank, other_jank], recorded, tmp_path
+        )
+    buster.stop(a)
+    buster.stop(b)
+    _forget_drop_metadata(store, b)
+
+    result = json.loads(buster.diff(a, b, json_mode=True))
+
+    said = f"{b} does not record what --package dropped"
+    assert said in result["verdict"], result["verdict"]
+    assert (result["resolved_clusters"], result["drift"], result["stable_count"]) == ([], [], 0)
+    if shape == "absence":
+        assert [c["absent_from"] for c in result["unconfirmed"]] == [b], result
+    else:
+        (shared,) = result["not_compared"]
+        assert said in shared["reason"], shared
+    assert "Dropped: not recorded" in buster.get_details(b)
+
+
+def test_stopping_an_older_workers_package_session_records_drops_as_unknown(
+    recorded, store, tmp_path, no_device
+):
+    """REQUIRED 2's other half: --stop of a session whose worker counted no drops.
+
+    An earlier version's worker persisted counters without ``unnamed_dropped``
+    -- derived: the replay session B's counters with only that key removed.
+    --stop read that as zero; it is unknown now (``null``), and --diff shows
+    no jank absence from it. A's worker, this version's, dropped nothing and
+    says so: zero, not unknown.
+    """
+    start, jank = _launch(recorded, 0)
+    buster = anr_watcher.AnrBuster(store=store)
+    a = _package_session(store, [start, jank], recorded, tmp_path)
+    b = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    counters = store.load_meta(b).extras["line_counters"]
+    del counters["unnamed_dropped"]
+    store.persist_worker_counters(b, counters)
+
+    counted = json.loads(buster.stop(a, json_mode=True))
+    payload = json.loads(buster.stop(b, json_mode=True))
+    result = json.loads(buster.diff(a, b, json_mode=True))
+
+    assert counted["unnamed_dropped"] == {"records": 0, "pids": []}, counted
+    assert payload["unnamed_dropped"] is None, payload
+    assert result["resolved_clusters"] == [], result["verdict"]
+    assert [c["absent_from"] for c in result["unconfirmed"]] == [b], result
+
+
+def test_an_unfiltered_summary_without_drop_metadata_still_compares(
+    recorded, store, tmp_path, no_device
+):
+    """The control: a session without --package dropped nothing, recorded or not.
+
+    The same two streams read without --package (its meta names no
+    package), B's summary saved without ``unnamed_dropped``: B's jank is kept,
+    keyed by pid, so nothing is unconfirmed for want of the field.
+    """
+    start, jank = _launch(recorded, 0)
+    buster = anr_watcher.AnrBuster(store=store)
+    names = {"process_names": _names(recorded)}
+    a = _session_starting_on(store, [start, jank], tmp_path, **names)
+    b = _session_starting_on(store, [_neutral(recorded), jank], tmp_path, **names)
+    buster.stop(a)
+    buster.stop(b)
+    _forget_drop_metadata(store, b)
+
+    result = json.loads(buster.diff(a, b, json_mode=True))
+
+    assert "does not record what --package dropped" not in result["verdict"], result["verdict"]
+    assert result["unconfirmed"] == [], result
+    assert "Dropped:" not in buster.get_details(b)
+
+
+def test_a_stream_whose_process_outlives_it_is_reaped_before_the_next_starts(
+    recorded, tmp_path, monkeypatch
+):
+    """Codex review of PR #42, OPTIONAL: each stream is closed, and its process reaped, in turn.
+
+    A logcat whose stdout reaches its end while the process lives on (the
+    recorded history record, then EOF; alive until terminated). Every
+    stream's stderr file stayed open for the whole session, and the next
+    stream's process replaced this one's, which nothing then ended: only the
+    last was terminated. Each is now ended before the next starts.
+    """
+    stream_file = tmp_path / "history.logcat"
+    stream_file.write_bytes(framed([_history(recorded)]))
+    events: list[tuple[str, int]] = []
+
+    class _Lingering:
+        def __init__(self, cmd, **_kwargs):
+            self.index = len([e for e in events if e[0] == "spawn"])
+            events.append(("spawn", self.index))
+            # The worker closes it, once the stream has ended.
+            self.stdout = open(stream_file, "rb", buffering=0)  # noqa: SIM115
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else -signal.SIGTERM
+
+        def wait(self, timeout=None):
+            if self.alive:
+                raise subprocess.TimeoutExpired("adb logcat", timeout)
+            return -signal.SIGTERM
+
+        def terminate(self):
+            if self.alive:
+                events.append(("terminate", self.index))
+            self.alive = False
+
+        def kill(self):
+            self.terminate()
+
+    monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "1")
+    monkeypatch.setattr(anr_watcher, "RESTART_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(anr_watcher, "STREAM_EXIT_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
+    _logcat_through(monkeypatch, _Lingering)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    store = SessionStore(base_dir=tmp_path / "anr-sessions")
+    meta = store.create({"serial": "emulator-5554"})
+
+    anr_watcher.AnrBuster(store=store).run_worker(meta.session_id)
+
+    assert events == [("spawn", 0), ("terminate", 0), ("spawn", 1), ("terminate", 1)], events

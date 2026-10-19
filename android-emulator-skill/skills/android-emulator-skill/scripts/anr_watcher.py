@@ -74,6 +74,7 @@ from common.anr_pipeline import (  # noqa: E402
     PID_NAMED_KINDS,
     VERIFICATION_UNKNOWN,
     AnrRecordAssembler,
+    SessionSummary,
     attribution_markers,
     build_normalised_event,
     cluster_to_json,
@@ -101,8 +102,9 @@ from common.env_config import env_int  # noqa: E402
 # Skipped-frame events below this frame count are dropped before clustering.
 DEFAULT_MIN_FRAMES = 30
 # How many times the worker re-spawns ``adb logcat`` after an EOF / subprocess
-# death before giving up and marking the session crashed. 0 is a real setting:
-# no restarts, so a dead stream marks the session crashed at once.
+# death, the device still there, before giving up: the session is marked
+# crashed, and --stop refuses it. 0 is a real setting: no restarts, so a dead
+# stream ends the session at once.
 DEFAULT_MAX_STREAM_RESTARTS = 3
 # Backoff between restart attempts. Short — logcat usually recovers fast.
 RESTART_BACKOFF_SECONDS = 2.0
@@ -117,6 +119,9 @@ STOP_DRAIN_SECONDS = 0.5
 SINCE_TIMEOUT_SECONDS = 60
 # Grace for a `--watch` stream that hit end-of-file to report its exit status.
 STREAM_EXIT_TIMEOUT_SECONDS = 5
+# How much of what adb wrote on stderr is read back: its last words, which is
+# where a device error is. A stream's stderr is kept in a file of its own.
+STDERR_KEPT_BYTES = 64 * 1024
 # Bound on each question the worker puts to the device while it reads: which
 # pid system_server is, and which uids a package has (see _ProcessNames).
 # Short, because --stop waits for a lookup under way: a 10 s lookup outlasted
@@ -200,10 +205,12 @@ def _raise_device_error_said(returncode: int | None, stderr: str, serial: str | 
     device is asked again or the read refused for how it ended: a device that
     went and is back by the time `adb get-state` is asked would otherwise read
     as a read refused for its framing, exit 1, where adb had said why (closure
-    review of v0.8.0; log_monitor types it first too). Only with a failure
-    status, as run_adb types adb's words.
+    review of v0.8.0; log_monitor types it first too). Not after a success,
+    as run_adb types adb's words; but an adb that has not exited yet
+    (``returncode`` None) has said what it said, and is read too (review of
+    PR #42: a worker that did not wait for an open stream read none of it).
     """
-    if returncode:
+    if returncode != 0:
         device_error = classify_device_error(stderr, serial)
         if device_error is not None:
             raise device_error
@@ -1175,7 +1182,16 @@ class AnrBuster:
         restarts = int(line_counters.get("stream_restarts", 0))
         tail = line_counters.get("ambiguous_tail", [])
         dropped = line_counters.get("unnamed_dropped")
-        dropped = dropped if isinstance(dropped, dict) else {}
+        if isinstance(dropped, dict):
+            unnamed_dropped = int(dropped.get("records", 0))
+            dropped_pids = sorted(int(pid) for pid in dropped.get("pids", []))
+        else:
+            # Not counted by the worker that wrote these counters -- an
+            # earlier version's, or none wrote any. Under --package that is
+            # unknown, not zero (review of PR #42); without it nothing is
+            # ever dropped so.
+            unnamed_dropped = None if meta.args.get("package") else 0
+            dropped_pids = []
         summary = replace(
             summary,
             verification=VERIFICATION_UNKNOWN if unverified else None,
@@ -1186,8 +1202,8 @@ class AnrBuster:
             stream_restarts=restarts,
             ambiguous_tail=tail if isinstance(tail, list) else [],
             unattributed_anrs=int(line_counters.get("unattributed_anrs", 0)),
-            unnamed_dropped=int(dropped.get("records", 0)),
-            unnamed_dropped_pids=sorted(int(pid) for pid in dropped.get("pids", [])),
+            unnamed_dropped=unnamed_dropped,
+            unnamed_dropped_pids=dropped_pids,
         )
         if not finished:
             print(
@@ -1203,6 +1219,8 @@ class AnrBuster:
         # are losses too, and were saved complete (wave 4): `-T 1` replays
         # only the newest record logged while no stream was up.
         cut_plural = cut != 1
+        # How the stream failed, if it did: "broke", "ended by itself", "could not start".
+        failed = failure.get("what", "broke") if isinstance(failure, dict) else None
         reasons = [
             reason
             for reason, applies in (
@@ -1221,7 +1239,7 @@ class AnrBuster:
                     "after that is in here",
                     status == "crashed" and not isinstance(failure, dict),
                 ),
-                ("the stream broke", isinstance(failure, dict)),
+                (f"the stream {failed}", failed is not None),
                 (
                     f"{cut} record{'s' if cut_plural else ''} arriving when it stopped "
                     f"{'were' if cut_plural else 'was'} cut off",
@@ -1299,7 +1317,7 @@ class AnrBuster:
                 f"Unknown session: {session_id}. Run --list-sessions to see the "
                 f"sessions this host has stored."
             ) from error
-        summary = self.store.load_summary(session_id)
+        summary = self._load_summary(session_id)
         if summary is None:
             raise SessionError(
                 f"No summary for {session_id}. Run --stop {session_id} first; a "
@@ -1383,8 +1401,8 @@ class AnrBuster:
                 each, and every cluster would read as resolved in one and new in
                 the other.
         """
-        summary_a = self.store.load_summary(session_a)
-        summary_b = self.store.load_summary(session_b)
+        summary_a = self._load_summary(session_a)
+        summary_b = self._load_summary(session_b)
         if summary_a is None or summary_b is None:
             missing = [s for s, x in [(session_a, summary_a), (session_b, summary_b)] if x is None]
             raise SessionError(
@@ -1416,9 +1434,13 @@ class AnrBuster:
         Layout: claim meta → build ``adb logcat -B -T 1`` command → open
         events.jsonl line-buffered → for each restart attempt, spawn logcat and
         read records until EOF or subprocess death. SIGTERM flushes and exits
-        cleanly. EOF / subprocess death triggers a bounded restart loop
-        (``ANDROID_EMU_ANR_MAX_RESTARTS``); on exhaustion the session is marked
-        ``crashed`` rather than left in stale ``running`` state.
+        cleanly. A stream that ends by itself is asked about as --watch asks
+        (``_ended_by_itself``): a device error in adb's words, or from `adb
+        get-state`, ends the session as that error; with the device there, it
+        is restarted (``ANDROID_EMU_ANR_MAX_RESTARTS``), and once no restart is
+        left the session ends as a stream failure. Either way it is marked
+        ``crashed`` -- never left in a stale ``running`` state -- and ``--stop``
+        refuses it (review of PR #42: it answered with the summary, exit 0).
 
         A stream that is not logd's records, or ends inside one by itself, is
         not restarted (common.logcat's rule for a ``LogFramingError``): the
@@ -1497,117 +1519,104 @@ class AnrBuster:
         proc: subprocess.Popen | None = None
         crashed = False
         try:
-            with (
-                open(events_path, "a", buffering=1) as out_handle,
-                contextlib.ExitStack() as stderr_files,
-            ):
+            with open(events_path, "a", buffering=1) as out_handle:
+
+                def note(event: str, **fields) -> None:
+                    record = {"event": event, **fields, "at_ms": int(time.time() * 1000)}
+                    out_handle.write(json.dumps(record) + "\n")
+                    out_handle.flush()
+
                 for attempt in range(max_restarts + 1):
                     if stop_flag["value"]:
                         break
                     if attempt > 0:
                         counters["stream_restarts"] = attempt
-                        out_handle.write(
-                            json.dumps(
-                                {
-                                    "event": "stream_restart",
-                                    "attempt": attempt,
-                                    "at_ms": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                        out_handle.flush()
+                        note("stream_restart", attempt=attempt)
                         time.sleep(RESTART_BACKOFF_SECONDS)
                         if stop_flag["value"]:
                             break
-                    # One per stream: what an earlier one said is not this one's.
-                    adb_stderr = stderr_files.enter_context(tempfile.TemporaryFile())
-                    try:
-                        proc = _spawn_logcat(adb_stderr)
-                    except FileNotFoundError:
-                        crashed = True
-                        break
-
-                    exit_code = self._read_stream_into_events(
-                        proc=proc,
-                        out_handle=out_handle,
-                        stop_flag=stop_flag,
-                        counters=counters,
-                        package=package,
-                        min_frames=min_frames,
-                        session_start_ms=meta.started_at_ms,
-                        process_names=process_names,
-                        boundary=boundary,
-                    )
-                    # Read to its end or abandoned on a stop: either way this
-                    # stream's pipe is done with, and a restart opens another.
-                    if proc.stdout is not None:
-                        proc.stdout.close()
+                    # One per stream, closed -- and its process reaped -- before
+                    # the next starts: what an earlier stream said is not this
+                    # one's, and no earlier process outlives its stream (review
+                    # of PR #42: every file stayed open, and a process still
+                    # alive after its stream ended was dropped for the next).
+                    with tempfile.TemporaryFile() as adb_stderr:
+                        try:
+                            proc = _spawn_logcat(adb_stderr)
+                        except FileNotFoundError as error:
+                            counters["stream_failure"] = _unstartable(error)
+                            proc = None
+                        if proc is not None:
+                            try:
+                                self._read_stream_into_events(
+                                    proc=proc,
+                                    out_handle=out_handle,
+                                    stop_flag=stop_flag,
+                                    counters=counters,
+                                    package=package,
+                                    min_frames=min_frames,
+                                    session_start_ms=meta.started_at_ms,
+                                    process_names=process_names,
+                                    boundary=boundary,
+                                )
+                                # Read to its end or abandoned on a stop: either
+                                # way this stream's pipe is done with.
+                                if proc.stdout is not None:
+                                    proc.stdout.close()
+                                failure = counters.get("stream_failure")
+                                if failure is not None:
+                                    # Not records, or cut by itself: no restart
+                                    # can trust it. Whether the device is still
+                                    # there decides what --stop says (exit 3, or
+                                    # a refusal): as adb said it, else as `adb
+                                    # get-state` says it now -- the order --watch
+                                    # asks in. Only a stream that ended is waited
+                                    # for: one that is not records may still be
+                                    # open, and a stop waits for this worker; what
+                                    # it has said is read either way.
+                                    returncode, said = _exit_and_stderr(
+                                        proc,
+                                        adb_stderr,
+                                        timeout=(
+                                            STREAM_EXIT_TIMEOUT_SECONDS
+                                            if failure["truncated"]
+                                            else 0
+                                        ),
+                                    )
+                                    failure["device"] = _device_answer_after(
+                                        returncode, said, serial
+                                    )
+                                    if failure["device"].get("source") != "logcat":
+                                        failure["error"] = _adb_exit_added(
+                                            failure["error"], returncode, said
+                                        )
+                                elif not stop_flag["value"]:
+                                    # Ended by itself, whole: a live read ends
+                                    # only when it is stopped (_ended_by_itself).
+                                    returncode, said = _exit_and_stderr(proc, adb_stderr)
+                                    note("stream_died", exit_code=returncode, attempt=attempt)
+                                    ended = _ended_by_itself(
+                                        returncode, said, serial, attempt, max_restarts
+                                    )
+                                    if ended is not None:
+                                        counters["stream_failure"] = ended
+                            finally:
+                                _reap(proc)
 
                     failure = counters.get("stream_failure")
                     if failure is not None:
-                        # Not records, or cut by itself: no restart can trust
-                        # it. Whether the device is still there decides what
-                        # --stop says (exit 3, or a refusal): as adb said it as
-                        # the stream ended, else as `adb get-state` says it now
-                        # -- the order --watch asks in. Only a stream that ended
-                        # is waited for: one that is not records may still be
-                        # open, and a stop waits for this worker.
-                        returncode, said = _exit_and_stderr(
-                            proc,
-                            adb_stderr,
-                            timeout=STREAM_EXIT_TIMEOUT_SECONDS if failure["truncated"] else 0,
-                        )
-                        failure["device"] = _device_answer_after(returncode, said, serial)
-                        if failure["device"].get("source") != "logcat":
-                            failure["error"] = _adb_exit_added(failure["error"], returncode, said)
-                        out_handle.write(
-                            json.dumps(
-                                {
-                                    "event": "stream_failed",
-                                    **failure,
-                                    "at_ms": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                        out_handle.flush()
+                        note("stream_failed", **failure)
                         crashed = True
                         break
-
                     if stop_flag["value"]:
-                        out_handle.write(
-                            json.dumps({"event": "stream_ended", "at_ms": int(time.time() * 1000)})
-                            + "\n"
-                        )
-                        out_handle.flush()
+                        note("stream_ended")
                         break
-
-                    out_handle.write(
-                        json.dumps(
-                            {
-                                "event": "stream_died",
-                                "exit_code": exit_code,
-                                "attempt": attempt,
-                                "at_ms": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-                    out_handle.flush()
-                else:
-                    # for/else: ran every restart without a clean break — exhausted.
-                    crashed = True
 
                 with contextlib.suppress(OSError):
                     os.fsync(out_handle.fileno())
         finally:
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            if proc is not None:
+                _reap(proc)
             # Counters first: marking the session crashed forgets this
             # worker's pid, and a --stop then reads the counters at once.
             self.store.persist_worker_counters(session_id, counters)
@@ -1656,6 +1665,9 @@ class AnrBuster:
         """
         if proc.stdout is None:
             return proc.poll()
+        # Declared, not only grown: --stop reads a missing count as one this
+        # worker did not keep (an earlier version's), not as zero.
+        counters.setdefault("unnamed_dropped", {"records": 0, "pids": []})
         stream = _FdRecords(proc.stdout)
         names = process_names or _ProcessNames()
         # A new stream: any pid may have changed hands while there was none,
@@ -1800,6 +1812,23 @@ class AnrBuster:
         with open(path) as handle:
             return handle.read()
 
+    def _load_summary(self, session_id: str) -> SessionSummary | None:
+        """The stored summary, its unrecorded drop count read as what it can be.
+
+        A summary saved before drops were counted says nothing of them
+        (``unnamed_dropped`` None: unknown). A session that did not filter by
+        package dropped none, so for it that is 0; under --package it stays
+        unknown, and --diff concludes nothing about jank from it.
+        """
+        summary = self.store.load_summary(session_id)
+        if summary is None or summary.unnamed_dropped is not None:
+            return summary
+        try:
+            filtered = bool(self.store.load_meta(session_id).args.get("package"))
+        except (FileNotFoundError, ValueError):
+            filtered = True
+        return summary if filtered else replace(summary, unnamed_dropped=0)
+
     def _resolve_serial(self, serial: str | None) -> str | None:
         # Not re-wrapped: a bare RuntimeError lost DeviceNotFoundError, so an
         # unavailable device exited 1 here and 3 everywhere else.
@@ -1869,6 +1898,9 @@ def _refuse_broken_stream(session_id: str, failure: dict) -> NoReturn:
     """
     device = failure.get("device")
     error = failure.get("error", "the stream broke")
+    # "broke" (not logd's records), "ended by itself", or "could not start";
+    # a failure persisted before the field was kept broke.
+    what = failure.get("what", "broke")
     saved = (
         f"The summary of what was read before the break is saved -- read it with "
         f"--get-details {session_id}."
@@ -1882,13 +1914,13 @@ def _refuse_broken_stream(session_id: str, failure: dict) -> NoReturn:
             else "asked then, adb said"
         )
         raise _DEVICE_ERRORS[device["error_class"]](
-            f"Session {session_id}'s logcat stream broke ({error}); {when}: {said}",
+            f"Session {session_id}'s logcat stream {what} ({error}); {when}: {said}",
             remedy=f"{remedy} {saved}",
         )
+    how = "was not logd's records to its end" if what == "broke" else what
     cli.fail(
-        f"Session {session_id}'s logcat stream was not logd's records to its end ({error}); "
-        f"the session stopped there, so it is incomplete. The device, asked then: "
-        f"{_availability_text(device)}.",
+        f"Session {session_id}'s logcat stream {how} ({error}); the session stopped there, "
+        f"so it is incomplete. The device, asked then: {_availability_text(device)}.",
         f"Read what was captured with --get-details {session_id}, and record the scenario "
         f"again; if it repeats, restart adb (`adb kill-server && adb start-server`).",
     )
@@ -1905,38 +1937,108 @@ def _availability_text(device) -> str:
 def _exit_and_stderr(
     process, adb_stderr, timeout: float = STREAM_EXIT_TIMEOUT_SECONDS
 ) -> tuple[int | None, str]:
-    """``(adb's exit status, its stderr)`` once a stream has ended, waiting ``timeout`` at most.
+    """``(adb's exit status, what it has said on stderr)``, waiting ``timeout`` at most.
 
-    The status is None when there is none to judge -- adb has not exited --
-    and adb's stderr is then not read: it may still be writing.
+    The status is None when adb has not exited by then. What it has said is
+    read either way: the file is there, and an adb still exiting has already
+    written its error -- read only after an exit, it was lost (review of PR
+    #42). Read with ``pread``, which leaves the file's offset -- shared with
+    adb, still writing at it -- where it is, and only its last
+    ``STDERR_KEPT_BYTES``, from a whole line.
     """
     try:
         returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, ""
-    adb_stderr.seek(0)
-    return returncode, adb_stderr.read().decode("utf-8", errors="replace")
+        returncode = None
+    fd = adb_stderr.fileno()
+    size = os.fstat(fd).st_size
+    start = max(0, size - STDERR_KEPT_BYTES)
+    said = os.pread(fd, size - start, start)
+    if start:
+        said = said.partition(b"\n")[2]
+    return returncode, said.decode("utf-8", errors="replace")
 
 
 def _adb_exit_added(error: str, returncode: int | None, stderr: str) -> str:
-    """``error``, saying how adb exited too when it exited with a failure."""
-    if not returncode:
+    """``error``, saying how adb ended too when that says anything: a failure, or its words."""
+    said = " ".join(stderr.split())
+    if returncode is None:
+        return f"{error}; `adb logcat` had not exited, and had said: {said}" if said else error
+    if returncode == 0:
         return error
-    said = " ".join(stderr.split()) or "nothing on stderr"
-    return f"{error}; `adb logcat` exited {returncode}: {said}"
+    return f"{error}; `adb logcat` exited {returncode}: {said or 'nothing on stderr'}"
 
 
 def _with_adb_exit(
     error: logcat.LogFramingError, returncode: int | None, stderr: str
 ) -> logcat.LogFramingError:
-    """``error``, saying how adb exited too when it exited with a failure."""
-    if not returncode:
+    """``error``, saying how adb ended too when that says anything (``_adb_exit_added``)."""
+    said = _adb_exit_added(str(error), returncode, stderr)
+    if said == str(error):
         return error
-    return logcat.LogFramingError(
-        _adb_exit_added(str(error), returncode, stderr),
-        offset=error.offset,
-        truncated=error.truncated,
+    return logcat.LogFramingError(said, offset=error.offset, truncated=error.truncated)
+
+
+def _how_adb_ended(returncode: int | None, stderr: str) -> str:
+    """How adb ended a stream that ended by itself, in words: its status, and what it said."""
+    said = " ".join(stderr.split())
+    if returncode is None:
+        ended = f"`adb logcat` gave no exit status within {STREAM_EXIT_TIMEOUT_SECONDS}s"
+        return f"{ended}, and had said: {said}" if said else ended
+    return f"`adb logcat` exited {returncode}" + (f": {said}" if said else "")
+
+
+def _ended_by_itself(
+    returncode: int | None, stderr: str, serial: str | None, attempt: int, max_restarts: int
+) -> dict | None:
+    """A session stream that ended by itself, whole: the session's end, or None to restart it.
+
+    A live read ends only when it is stopped (wave 4's rule), so the worker
+    asks what --watch asks: adb's own words first, then `adb get-state`. A
+    device error either way ends the session as that error -- --stop
+    raises it again, exit 3 for a device that went -- where the stream used to
+    be restarted until no restart was left and --stop answered with the
+    summary, exit 0 (review of PR #42). With the device there it is
+    restarted while a restart is left (``ANDROID_EMU_ANR_MAX_RESTARTS``);
+    after the last, the session ends as a stream failure --stop refuses
+    (exit 1), saying how adb ended it.
+    """
+    device = _device_answer_after(returncode, stderr, serial)
+    gone = "error_class" in device
+    if not gone and attempt < max_restarts:
+        return None
+    how = _how_adb_ended(returncode, stderr)
+    times = attempt + 1
+    error = (
+        f"the stream ended by itself; {how}"
+        if gone
+        else f"the stream ended by itself {times} time{'s' if times != 1 else ''}, with no "
+        f"restart left (ANDROID_EMU_ANR_MAX_RESTARTS={max_restarts}); the last time {how}"
     )
+    return {"error": error, "truncated": False, "what": "ended by itself", "device": device}
+
+
+def _unstartable(error: OSError) -> dict:
+    """The stream failure of a worker that could not run `adb logcat` at all."""
+    return {
+        "error": f"`adb logcat` could not be run: {error}",
+        "truncated": False,
+        "what": "could not start",
+        "device": {"state": "unknown", "message": "adb could not be run"},
+    }
+
+
+def _reap(process) -> None:
+    """End a stream's process if it outlived its stream, and collect it -- bounded."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=2)
 
 
 def _device_answer_after(returncode: int | None, stderr: str, serial: str | None) -> dict:

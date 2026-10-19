@@ -757,7 +757,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       died and was restarted (`stream_restarts`: `-T 1` replays only the
       newest record logged while it was down), or ANR reports could not be
       authenticated — so `--diff` concludes nothing from what such a capture
-      lacks. Every text form of an
+      lacks. A session whose stream failed is also refused (below): the
+      summary is saved, and `--stop` exits 3 or 1. Every text form of an
       incomplete summary says so too (`--stop`, `--get-details`,
       `--get-details --cluster N`, whose JSON carries `incomplete`), and "no
       ANR/jank" there reads "… in the part captured". A token budget or
@@ -784,7 +785,14 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       jank, its process started before the capture, read as "improvement: 1
       resolved"), and the verdict says what it dropped, even when nothing is
       missing — the dropped record may be a cluster the other session lacks.
-      Its ANR clusters still compare: a dropped jank record is no ANR.
+      Its ANR clusters still compare: a dropped jank record is no ANR. A
+      `--package` summary saved before drops were counted has no
+      `unnamed_dropped` (`--stop` of a session an earlier version's worker
+      ran gives `"unnamed_dropped": null`, and a `Dropped: not recorded`
+      line): what it dropped is unknown, so it is read the same way, the
+      verdict saying "`<id>` does not record what --package dropped". A
+      session that did not filter by package dropped nothing, recorded or
+      not.
       A cluster both hold does not drift either when one side is incomplete —
       its maximum there is only a lower bound — but is listed under
       `not_compared` with `"reason": "not comparable: <id> is incomplete"`;
@@ -831,14 +839,23 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       or refuse (exit 1) naming the framing error and how adb exited. Bytes
       that are not records at all are refused outright (exit 1), with no
       device question. A session's worker does not restart either kind of
-      stream: it keeps adb's stderr (it went to `/dev/null`), takes a device
-      error adb wrote as the answer, and asks the device only without one;
-      the session is marked crashed, and `--stop` saves what was read
+      stream: it keeps each stream's stderr (it went to `/dev/null`) and reads
+      what adb has said whether or not adb has exited, takes a device error
+      adb wrote as the answer, and asks the device only without one; the
+      session is marked crashed, and `--stop` saves what was read
       (`stream_failure` in the summary, a `Broken:` line in text, readable
-      with `--get-details`, saying how adb exited) and then refuses with that
-      answer, raised again as the error it was — exit 3 when the device went,
-      1 for several devices and no `--serial` (naming the serials to pass) or
-      anything else
+      with `--get-details`, saying how adb ended it) and then refuses with
+      that answer, raised again as the error it was — exit 3 when the device
+      went, 1 for several devices and no `--serial` (naming the serials to
+      pass) or anything else. A session's stream that ends by itself, whole,
+      is asked about the same way: a device error — adb's words, or `adb
+      get-state`'s — ends the session as that error (exit 3 at `--stop`),
+      and with the device there the stream is restarted
+      (`ANDROID_EMU_ANR_MAX_RESTARTS`, default 3) until no restart is left,
+      when the session ends as a stream failure `--stop` refuses (exit 1,
+      saying how adb ended it). Either used to be restarted, then saved as an
+      incomplete summary at exit 0. Each stream's process is ended before the
+      next starts
     - `--package PKG` keeps an event only when its package is exactly PKG, by
       the identity the reader established: the package ActivityManager's ANR
       report names (or its component's), or the name a session verified for
@@ -853,7 +870,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       package's: `"unnamed_dropped": {"records": N, "pids": [...]}` in the
       summary (records at or above the frame threshold), a `Dropped:` line in
       text, and `--diff` concludes nothing about jank from such a session
-      (above). **`--watch` and `--since` do not name processes**: a
+      (above). **The cost:** under `--package`, one such jank or StrictMode
+      record from ANY process the session did not see start — an unrelated
+      app already running, SystemUI, the launcher, the app itself warm —
+      makes that session's jank/StrictMode conclusions in `--diff`
+      inconclusive; its ANR conclusions stand. Start the session before the
+      app, on a device with little else running, to keep them.
+      **`--watch` and `--since` do not name processes**: a
       Choreographer or StrictMode record names no package, so under `--package`
       they drop all jank and StrictMode events, and say how many on stderr
       (`warning: --package dropped N jank/StrictMode records`; the `--since`
@@ -875,7 +898,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `--start` creates no session then
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
-      it used to be raised to 1
+      it used to be raised to 1. A restart happens only with the device still
+      there; with `0`, a stream that ends by itself ends the session at once
     - Options: `--watch`, `--since`, `--start`, `--stop`, `--get-details`,
       `--list-sessions`, `--clear-sessions`, `--diff`, `--package`, `--serial`,
       `--duration`, `--min-frames`, `--top`, `--all`, `--budget-tokens`,
@@ -1215,12 +1239,16 @@ recorded fixture, and was red before the fix.
   stream; `--package` matches that identity whole. A session's capture
   losses — a record cut by the stop, a stream restart's gap — mark it
   incomplete, and the one record `-T 1` replays when it starts is shown,
-  never counted. `--diff` says "inconclusive" when it could not compare
-  sessions, or a side holds evidence it did not count — jank `--package`
-  dropped for want of a name included — and never emits `Infinity`. The live
-  readers no longer swallow adb's exit status: losses are disclosed, and a
-  stream that ends unexpectedly is a refusal, typed from adb's own words
-  first (a device error is exit 3, in `--watch` and in a session).
+  never counted. `--diff` calls nothing resolved, new or stable on the
+  strength of a side that may lack it — saved incomplete, or holding
+  evidence it did not count (for jank and StrictMode, what `--package`
+  dropped for want of a name, or did not record) — and says so in its
+  verdict: "inconclusive" when nothing else changed, the change with its
+  caveats otherwise. It never emits `Infinity`. The live readers no longer
+  swallow adb's exit status: losses are disclosed; a `--watch` stream that
+  ends by itself is a refusal, and a session's is restarted only while the
+  device is there and a restart is left, then refused at `--stop` — adb's
+  own words typed first (a device error is exit 3).
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
   now read through `adb shell -T` and refuse an adb client too old to honour

@@ -322,8 +322,11 @@ class SessionSummary:
     # proc` in the session named their process (one already running when it
     # began), and their pids. They may be the package's, so this session shows
     # neither the absence of such a cluster nor its maximum (closure review of
-    # v0.8.0: the dropped jank read as "improvement: 1 resolved").
-    unnamed_dropped: int = 0
+    # v0.8.0: the dropped jank read as "improvement: 1 resolved"). None when the
+    # summary does not say -- a --package session saved by a version that did
+    # not count them -- and then it shows neither either (review of PR #42: read
+    # as zero, an older summary still said "improvement: 1 resolved").
+    unnamed_dropped: int | None = 0
     unnamed_dropped_pids: list[int] = field(default_factory=list)
     # ANRs of a window that a broadcast ANR's report nearby may already
     # account for: counted, and said (``NormalisedEvent.possible_duplicate``).
@@ -1176,10 +1179,9 @@ def _framing_note(summary: SessionSummary) -> str:
     """What the stream itself lost: a record cut by the stop, or a break (empty when neither)."""
     notes = []
     if summary.stream_failure:
-        notes.append(
-            f"Broken: the stream stopped being logd's records ({summary.stream_failure}); "
-            f"nothing after that is in here."
-        )
+        # The failure says itself: a framing error, or a stream that ended by
+        # itself and was not restarted (review of PR #42).
+        notes.append(f"Broken: {summary.stream_failure}; nothing after that is in here.")
     if summary.cut_records:
         plural = "s" if summary.cut_records != 1 else ""
         notes.append(
@@ -1232,6 +1234,12 @@ def _pids_shown(pids: list[int]) -> str:
 def _dropped_note(summary: SessionSummary) -> str:
     """The jank/StrictMode --package dropped for want of a name (empty when none was)."""
     count = summary.unnamed_dropped
+    if count is None:
+        return (
+            "Dropped: not recorded -- this summary was saved by a version that did not count "
+            "the jank/StrictMode --package dropped for want of a name, so --diff takes no "
+            "jank/StrictMode cluster as absent here, nor a maximum here as whole."
+        )
     if not count:
         return ""
     pids = summary.unnamed_dropped_pids
@@ -1302,7 +1310,9 @@ def _markers(summary: SessionSummary) -> str:
         marks.append(counted(summary.unverified_anr_lines, "ANR record", "unverified"))
     if summary.unnamed_pids:
         marks.append(counted(len(summary.unnamed_pids), "pid", "unnamed"))
-    if summary.unnamed_dropped:
+    if summary.unnamed_dropped is None:
+        marks.append("jank/StrictMode drops not recorded")
+    elif summary.unnamed_dropped:
         marks.append(counted(summary.unnamed_dropped, "jank/StrictMode record", "dropped unnamed"))
     if summary.unattributed_anrs:
         marks.append(counted(summary.unattributed_anrs, "ANR", "unattributed"))
@@ -1659,7 +1669,7 @@ def diff_sessions(
     because = " and ".join(f"{sid} is incomplete" for sid in incomplete_ids)
     # Each side's drops, said once; a side is read off its summary, not its id.
     dropped = list(
-        dict.fromkeys(_dropped_unnamed(s) for s in (summary_a, summary_b) if s.unnamed_dropped)
+        dict.fromkeys(_dropped_unnamed(s) for s in (summary_a, summary_b) if s.unnamed_dropped != 0)
     )
     short_by = {
         key: list(
@@ -1858,6 +1868,11 @@ def _uncounted(summary: SessionSummary) -> str:
 def _dropped_unnamed(summary: SessionSummary) -> str:
     """What --package dropped of a summary's jank/StrictMode for want of a name, in words."""
     count, pids = summary.unnamed_dropped, len(summary.unnamed_dropped_pids)
+    if count is None:
+        return (
+            f"{summary.session_id} does not record what --package dropped of its "
+            f"jank/StrictMode (saved by an earlier version)"
+        )
     return (
         f"{summary.session_id} dropped {count} jank/StrictMode record{'s' if count != 1 else ''} "
         f"of {pids} pid{'s' if pids != 1 else ''} it never named, which --package could not "
@@ -1869,9 +1884,10 @@ def _may_hold(summary: SessionSummary, cluster: Cluster) -> bool:
     """Whether what ``summary`` dropped for want of a name may be of ``cluster``.
 
     Only jank and StrictMode are dropped so, so only a cluster of those kinds
-    may be among them: an ANR's absence, or its maximum, still shows.
+    may be among them: an ANR's absence, or its maximum, still shows. A
+    summary that does not say (None) may hold any number.
     """
-    return bool(summary.unnamed_dropped) and cluster.sample_event.kind in PID_NAMED_KINDS
+    return summary.unnamed_dropped != 0 and cluster.sample_event.kind in PID_NAMED_KINDS
 
 
 def _signature(cluster: Cluster) -> str:
@@ -1929,10 +1945,12 @@ def summary_to_json(summary: SessionSummary) -> dict:
         "stream_restarts": summary.stream_restarts,
         "ambiguous_tail": summary.ambiguous_tail,
         "unattributed_anrs": summary.unattributed_anrs,
-        "unnamed_dropped": {
-            "records": summary.unnamed_dropped,
-            "pids": summary.unnamed_dropped_pids,
-        },
+        # null: not recorded (SessionSummary.unnamed_dropped).
+        "unnamed_dropped": (
+            None
+            if summary.unnamed_dropped is None
+            else {"records": summary.unnamed_dropped, "pids": summary.unnamed_dropped_pids}
+        ),
         "possible_duplicates": summary.possible_duplicates,
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
@@ -1942,6 +1960,9 @@ def summary_to_json(summary: SessionSummary) -> dict:
 def summary_from_json(payload: dict) -> SessionSummary:
     """Rehydrate a SessionSummary from disk JSON."""
     clusters = [_cluster_from_json(c) for c in payload.get("clusters", [])]
+    # Absent (a summary saved before drops were counted) or null: unknown, not 0.
+    dropped = payload.get("unnamed_dropped")
+    dropped = dropped if isinstance(dropped, dict) else None
     return SessionSummary(
         session_id=payload["session_id"],
         started_at=payload["started_at"],
@@ -1963,8 +1984,8 @@ def summary_from_json(payload: dict) -> SessionSummary:
         stream_restarts=payload.get("stream_restarts", 0),
         ambiguous_tail=list(payload.get("ambiguous_tail") or []),
         unattributed_anrs=payload.get("unattributed_anrs", 0),
-        unnamed_dropped=(payload.get("unnamed_dropped") or {}).get("records", 0),
-        unnamed_dropped_pids=list((payload.get("unnamed_dropped") or {}).get("pids", [])),
+        unnamed_dropped=None if dropped is None else dropped.get("records", 0),
+        unnamed_dropped_pids=[] if dropped is None else list(dropped.get("pids", [])),
         possible_duplicates=payload.get("possible_duplicates", 0),
     )
 
