@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 import anr_watcher
 import pytest
 from fake_toolchain import (
+    SCRIPTS,
     FakeToolchain,
     Frame,
     Rule,
@@ -48,7 +49,7 @@ from fake_toolchain import (
 
 from common import cli, env_config, logcat
 from common.anr_pipeline import build_normalised_event, event_to_jsonl, parse_logcat_anr
-from common.anr_sessions import SessionStore
+from common.anr_sessions import Identity, SessionStore, worker_identity
 from common.device_utils import parse_package_uids, parse_ps_uids
 
 # --- logcat command construction (no shell=True) ---------------------------
@@ -5695,11 +5696,15 @@ def test_sessions_an_earlier_version_saved_still_load_and_answer(tmp_path, monke
 
 # The stress test's adb, in sh so that it starts in milliseconds. One device,
 # which a cycle's logcat may lose: it replays the recorded records it is
-# handed, then -- after ``dies_after`` seconds, when that file exists -- marks
-# the device gone, writes the recorded not-found text adb writes, and exits
-# 255; from then `get-state` answers with that text too. Without
-# ``dies_after`` the stream stays open until it is ended. Everything it
-# prints is a file the test copied from tests/fixtures/recorded/.
+# handed, then dies -- marks the device gone (``dead``), writes the recorded
+# not-found text adb writes, and exits 255; from then `get-state` answers with
+# that text too. It dies ``dies_after`` seconds after it started, or -- with
+# ``dies_on_stop`` -- that many seconds after the test has started the
+# cycle's --stop (the ``stop-0`` marker, written once the --stop process
+# exists), ignoring SIGTERM meanwhile so that the worker it streams to
+# cannot end it first: its death falls inside that --stop by construction.
+# With neither, the stream stays open until it is ended. Everything it prints
+# is a file the test copied from tests/fixtures/recorded/.
 _STRESS_ADB = """#!/bin/sh
 d="$ANR_STRESS_CYCLE"
 case " $* " in
@@ -5709,8 +5714,15 @@ case " $* " in
   *" devices "*) cat "$d/devices"; exit 0 ;;
   *" logcat "*)
     cat "$d/records"
-    if [ ! -e "$d/dies_after" ]; then exec sleep 60; fi
-    sleep "$(cat "$d/dies_after")"
+    if [ -e "$d/dies_on_stop" ]; then
+      trap '' TERM
+      while [ ! -e "$d/stop-0" ]; do sleep 0.01; done
+      sleep "$(cat "$d/dies_on_stop")"
+    elif [ -e "$d/dies_after" ]; then
+      sleep "$(cat "$d/dies_after")"
+    else
+      exec sleep 60
+    fi
     : > "$d/dead"
     cat "$d/not_found" >&2
     exit 255 ;;
@@ -5721,39 +5733,70 @@ STRESS_LANES = 3
 STRESS_CYCLES = 8
 # About how long a --stop takes to start and signal the worker (measured: 0.2-0.3 s).
 STOP_LEAD_SECONDS = 0.25
-# How many cycles must have had their device die while a --stop was running, for
-# the run to have exercised the window it is about (review of PR #44).
+# Cycles whose device dies inside their --stop by construction (``dies_on_stop``):
+# every lane has two, so a run has six, of which at least this many must have
+# started (second review of PR #44: an overlap left to timing could not happen at all).
 STRESS_MIN_OVERLAPS = 3
 _ENDED = ("stopped", "crashed", "cancelled", "abandoned")
 
 
-def _stress_cycle(toolchain, store, device, dies_after: float | None, stop_after: float) -> dict:
+def _run_stop(toolchain, device, session_id: str, attempt: int, env: dict) -> tuple:
+    """One --stop through the real CLI: (status, JSON, its window's start, its end).
+
+    Run as ``FakeToolchain.run`` runs a script, but started by hand so that,
+    once the process exists, the ``stop-<attempt>`` marker can be written: its
+    time is the window's start, on the clock the stub's ``dead`` marker is
+    stamped with, and the first one is what a ``dies_on_stop`` stub waits for.
+    """
+    with subprocess.Popen(
+        [sys.executable, str(SCRIPTS / "anr_watcher.py"), "--stop", session_id, "--json"],
+        env=toolchain.env(**env),
+        cwd=str(toolchain.tmp),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        marker = device / f"stop-{attempt}"
+        marker.touch()
+        try:
+            stdout, _stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            raise
+    return process.returncode, json.loads(stdout), marker.stat().st_mtime, time.time()
+
+
+def _stress_cycle(toolchain, store, device, kind: str, stop_after: float) -> dict:
     """One cycle: --start, a wait, --stop (again while the worker is unfinished), --stop once more.
 
-    Records when each --stop ran and when the device died -- the stub's
-    ``dead`` marker, written as it dies -- so the run can show a death fell
-    inside a --stop. The session's worker is killed, with its stream's
-    process, however the cycle ends.
+    Records each --stop's window and when the device died -- the stub's
+    ``dead`` marker, stamped as it dies -- so the run can show a death fell
+    inside a --stop. The worker --start reported is killed, with its
+    stream's process, however the cycle ends -- the pid kept here, since the
+    meta forgets it once the worker has published its end.
     """
     env = {"ANR_STRESS_CYCLE": str(device)}
     known = {meta.session_id for meta in store.list_sessions()}
-    session_id = None
+    worker = None
     try:
         started = toolchain.run(
             "anr_watcher.py", "--start", "--serial", "emulator-5554", "--json", **env
         )
         (session_id,) = {meta.session_id for meta in store.list_sessions()} - known
+        claimed = store.load_meta(session_id)
+        worker = claimed if claimed.pid else None
         if started.returncode == 0:
             time.sleep(stop_after)
         stops = []
         windows = []
-        for _attempt in range(4):
-            began = time.time()
-            stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--json", **env)
-            windows.append((began, time.time()))
-            stops.append((stopped.returncode, json.loads(stopped.stdout)))
-            unfinished = stopped.returncode == 1 and "not finished" in stops[-1][1].get("error", "")
-            if not unfinished:
+        for attempt in range(4):
+            status, answer, began, ended = _run_stop(toolchain, device, session_id, attempt, env)
+            stops.append((status, answer))
+            windows.append((began, ended))
+            if not (status == 1 and "not finished" in answer.get("error", "")):
                 break
         deadline = time.monotonic() + 20
         while store.load_meta(session_id).status not in _ENDED:
@@ -5765,7 +5808,7 @@ def _stress_cycle(toolchain, store, device, dies_after: float | None, stop_after
         dead = device / "dead"
         died = dead.stat().st_mtime if dead.exists() else None
         return {
-            "dies_after": dies_after,
+            "kind": kind,
             "stop_after": stop_after,
             "start": started.returncode,
             "stops": [status for status, _ in stops],
@@ -5775,20 +5818,21 @@ def _stress_cycle(toolchain, store, device, dies_after: float | None, stop_after
             "died_during_stop": died is not None and any(a <= died <= b for a, b in windows),
         }
     finally:
-        pid = store.load_meta(session_id).pid if session_id else None
-        if pid:
+        if worker is not None and worker_identity(worker)[0] is Identity.WORKER:
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pid, signal.SIGKILL)
+                os.killpg(worker.pid, signal.SIGKILL)
 
 
 def _stress_lane(lane: int, seed: int, root, recorded, recorded_anywhere) -> list[dict]:
     """``STRESS_CYCLES`` start/stop cycles through the real CLI, each against a device that may die.
 
     The schedule is drawn from ``seed``, stratified so that every lane has
-    streams that never end, ones that die at once, and ones whose death and
-    --stop's signal come within 0.2 s of each other either way round: --stop
-    is run ``STOP_LEAD_SECONDS`` before the stream dies, which is about how
-    long its interpreter takes to start and reach the worker.
+    streams that never end, ones that die at once, ones whose death and
+    --stop's signal come within 0.2 s of each other either way round (--stop
+    is run ``STOP_LEAD_SECONDS`` before the stream dies, about how long its
+    interpreter takes to start and reach the worker) -- and ones whose death
+    waits for the --stop to have started (``dies_on_stop``), then comes 0 to
+    0.4 s later, before or after its signal.
     """
     toolchain = FakeToolchain(root / f"lane-{lane}")
     toolchain.assert_isolated()
@@ -5805,18 +5849,17 @@ def _stress_lane(lane: int, seed: int, root, recorded, recorded_anywhere) -> lis
         (device / "not_found").write_text(recorded_anywhere("adb_device_not_found"))
         (device / "get_state").write_text(recorded.text("adb_get_state"))
         (device / "devices").write_text(recorded.text("adb_devices_single"))
-        kind = cycle % 4
-        dies_after = (
-            None if kind == 0 else rng.uniform(0.0, 0.1) if kind == 1 else rng.uniform(0.2, 0.9)
-        )
-        if dies_after is not None:
+        kind = ("never", "at once", "near", "on stop")[cycle % 4]
+        if kind == "on stop":
+            (device / "dies_on_stop").write_text(f"{rng.uniform(0.0, 0.4):.3f}")
+            stop_after = rng.uniform(0.0, 0.3)
+        elif kind == "never":
+            stop_after = rng.uniform(0.0, 0.8)
+        else:
+            dies_after = rng.uniform(0.0, 0.1) if kind == "at once" else rng.uniform(0.2, 0.9)
             (device / "dies_after").write_text(f"{dies_after:.3f}")
-        stop_after = (
-            rng.uniform(0.0, 0.8)
-            if dies_after is None
-            else max(0.0, dies_after - STOP_LEAD_SECONDS + rng.uniform(-0.2, 0.2))
-        )
-        outcome = _stress_cycle(toolchain, store, device, dies_after, stop_after)
+            stop_after = max(0.0, dies_after - STOP_LEAD_SECONDS + rng.uniform(-0.2, 0.2))
+        outcome = _stress_cycle(toolchain, store, device, kind, stop_after)
         outcomes.append({"lane": lane, "cycle": cycle, **outcome})
     return outcomes
 
@@ -5829,17 +5872,21 @@ def test_stop_never_exits_0_for_a_session_whose_device_loss_is_or_will_be_persis
     Each cycle is the CLI a user runs -- --start, a wait, --stop (again
     while it says the worker is unfinished), and once more -- with the
     worker detached as --start detaches it, against an adb whose logcat
-    replays the recorded crash dump and then may die at a random moment,
-    writing the recorded not-found text (``_STRESS_ADB``). Lanes run at once,
-    so the host is loaded as an agent's would be. Once the worker has ended,
-    its meta says whether the device loss was persisted; whenever it was, no
-    --stop of that session exited 0 -- before or after the loss reached the
-    meta -- and the last two --stops gave one answer. A failure names the
-    seed: rerun with ``ANR_STRESS_SEED=<seed>``. The run must also show it
-    exercised the window it is about: at least ``STRESS_MIN_OVERLAPS``
-    devices died while a --stop was running (the stub's marker time against
-    each --stop's start and end) -- without it, every loss could have come
-    before any stop and the run still passed (review of PR #44).
+    replays the recorded crash dump and then may die, writing the recorded
+    not-found text (``_STRESS_ADB``). Lanes run at once, so the host is
+    loaded as an agent's would be. Once the worker has ended, its meta says
+    whether the device loss was persisted; whenever it was, no --stop of
+    that session exited 0 -- before or after the loss reached the meta --
+    and the last two --stops gave one answer. A failure names the seed:
+    rerun with ``ANR_STRESS_SEED=<seed>``.
+
+    The window it is about is exercised by construction, not by timing: in
+    every ``dies_on_stop`` cycle that started, the device died inside the
+    cycle's --stop (the stub's ``dead`` stamp between the ``stop-0`` stamp
+    and the --stop's return), and there are at least ``STRESS_MIN_OVERLAPS``
+    of them. Without the handshake, every loss could have come before any
+    stop on a loaded runner, and the run still passed (reviews of PR #44).
+    The randomised near-race cycles may overlap too, as extra.
     """
     seed = int(os.environ.get("ANR_STRESS_SEED", time.time_ns() % 2**32))
     lanes: list[list[dict]] = [[] for _ in range(STRESS_LANES)]
@@ -5869,10 +5916,12 @@ def test_stop_never_exits_0_for_a_session_whose_device_loss_is_or_will_be_persis
     assert unended == [], f"{rerun}; a worker never published its end: {unended}"
     assert any(o["device_lost"] for o in outcomes), f"{rerun}; no device was lost: {outcomes}"
     assert any(0 in o["stops"] for o in outcomes), f"{rerun}; no --stop answered: {outcomes}"
-    overlapping = [o for o in outcomes if o["died_during_stop"]]
-    assert len(overlapping) >= STRESS_MIN_OVERLAPS, (
-        f"{rerun}; only {len(overlapping)} device(s) died while a --stop ran, so the window "
-        f"this test is about was not exercised: {outcomes}"
+    handshakes = [o for o in outcomes if o["kind"] == "on stop" and o["start"] == 0]
+    missed = [o for o in handshakes if not o["died_during_stop"]]
+    assert missed == [], f"{rerun}; a device that waits for --stop died outside it: {missed}"
+    assert len(handshakes) >= STRESS_MIN_OVERLAPS, (
+        f"{rerun}; only {len(handshakes)} cycle(s) whose device dies inside its --stop started, "
+        f"so the window this test is about was not exercised: {outcomes}"
     )
 
 
@@ -5946,15 +5995,54 @@ class _LegacyWorker:
         self.env = {"ANR_LEGACY_DEVICE": str(device)}
         self.store = SessionStore(base_dir=self.toolchain.home / "anr-sessions")
         self.session_id: str | None = None
+        # Isolated (-I): no current-directory or user-site entry on the path,
+        # so what the old scripts import is what the archive holds -- shown,
+        # not assumed: every module of theirs resolves inside the extraction.
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import anr_watcher, common.anr_sessions, common.anr_pipeline\n"
+                "print(anr_watcher.__file__)\n"
+                "print(common.anr_sessions.__file__)\n"
+                "print(common.anr_pipeline.__file__)\n",
+                str(self.scripts),
+            ],
+            env=self.toolchain.env(),
+            cwd=str(self.toolchain.tmp),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stderr
+        extracted = self.scripts.resolve()
+        for imported in probe.stdout.split():
+            assert Path(imported).resolve().is_relative_to(extracted), imported
 
     def start(self) -> str:
-        started = self.toolchain.run(
-            self.scripts / "anr_watcher.py",
-            "--start",
-            "--serial",
-            "emulator-5554",
-            "--json",
-            **self.env,
+        # Run as FakeToolchain.run runs a script, but isolated (-I); the
+        # script puts its own directory first on the path, as it always has.
+        started = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(self.scripts / "anr_watcher.py"),
+                "--start",
+                "--serial",
+                "emulator-5554",
+                "--json",
+            ],
+            env=self.toolchain.env(**self.env),
+            cwd=str(self.toolchain.tmp),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         )
         assert started.returncode == 0, started.stdout + started.stderr
         self.session_id = json.loads(started.stdout)["session_id"]
@@ -6116,3 +6204,64 @@ def test_an_abandoned_sessions_answers_ignore_what_its_worker_appends_after(
     assert again == abandoned, "a later --stop answered from what was appended after"
     assert details_again == details
     assert raw_again == raw
+
+
+@pytest.mark.parametrize("reader", ["details", "diff", "list"])
+def test_no_reader_answers_from_a_session_a_previous_versions_worker_may_still_write(
+    reader, recorded, recorded_anywhere, tmp_path, monkeypatch, capsys
+):
+    """Second review of PR #44, REQUIRED 1 (P2): the fence held for --stop, not for its readers.
+
+    fb5de9c's own worker, LIVE, its stream open, its session saved
+    `stopped` by that version's own SessionStore.stop with the pid kept --
+    what its --stop leaves when the worker outlives the wait. --stop refused
+    it (exit 1); --get-details and --diff answered 0 from the snapshot the
+    old worker may still change (a device loss included), and
+    --list-sessions showed it as any other. Readers refuse as --stop does
+    (exit 1, naming the pid) while the pid may be the worker, and the
+    listing marks the session provisional; once the worker has ended, each
+    answers as usual.
+
+    In process for the new CLI; the old worker is a real process.
+    """
+    legacy = _LegacyWorker(tmp_path, recorded, recorded_anywhere, ends_after=None)
+    monkeypatch.setenv("ANDROID_EMU_ANR_HOME", str(legacy.toolchain.home))
+    session_id = legacy.start()
+    other = legacy.store.create({"package": None})
+    _worker_finished(legacy.store, other.session_id)
+    legacy.store.stop(other.session_id, legacy.store.build_summary(other.session_id))
+    argv = {
+        "details": ("--get-details", session_id),
+        "diff": ("--diff", session_id, other.session_id),
+        "list": ("--list-sessions",),
+    }[reader]
+    try:
+        legacy.legacy_stop_save("saved before the session's worker finished")
+        old = legacy.store.load_meta(session_id)
+        assert (old.status, old.lifecycle) == ("stopped", None) and old.pid
+        while_alive = _cli_json(monkeypatch, capsys, *argv)
+        if reader == "list":
+            monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", "--list-sessions"])
+            with pytest.raises(SystemExit):
+                cli.run(anr_watcher.main)
+            listed_text = capsys.readouterr().out
+    finally:
+        legacy.kill()
+    _wait_until(lambda: not anr_watcher._alive(old.pid), "the old worker ended")
+    once_gone = _cli_json(monkeypatch, capsys, *argv)
+
+    status, answer = while_alive
+    if reader == "list":
+        entries = {m["session_id"]: m for m in answer}
+        assert status == 0, answer
+        assert entries[session_id]["provisional"] is True, entries[session_id]
+        assert str(old.pid) in entries[session_id]["provisional_reason"], entries[session_id]
+        assert entries[other.session_id]["provisional"] is False, entries[other.session_id]
+        line = next(ln for ln in listed_text.splitlines() if session_id in ln)
+        assert "provisional" in line, listed_text
+        assert {m["session_id"]: m["provisional"] for m in once_gone[1]}[session_id] is False
+    else:
+        assert status == 1, answer
+        assert "earlier version" in answer["error"] and str(old.pid) in answer["error"], answer
+        assert f"--stop {session_id}" in answer["remedy"], answer
+        assert once_gone[0] == 0, once_gone

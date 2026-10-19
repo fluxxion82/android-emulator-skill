@@ -40,8 +40,11 @@ These are written by the skill, not by a device, so they live outside
 ``--archive COMMIT`` also keeps that version's worker itself, to be run LIVE
 by the tests: ``<out>/<label>/scripts.tar.gz`` is ``git archive
 --format=tar.gz COMMIT`` of its ``anr_watcher.py`` and ``common/`` -- the
-whole import closure of the worker, byte for byte as committed (git writes
-the archive without a timestamp, so the same commit gives the same file). A
+whole import closure of the worker, byte for byte as committed. Its gzip
+header carries no time (mtime 0) and each tar entry the commit's own time,
+so this git, archiving this commit, gives the same bytes again (checked
+twice); another git or configuration may compress differently, which
+changes the file, not what it holds. A
 session store outlives an upgrade, and so can a worker still recording into
 it: one that takes none of this version's locks (fourth review of PR #44).
 

@@ -691,7 +691,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       while its recorded pid may be it, `--stop` trusts nothing the session
       says — it signals it and waits until it is gone, and refuses (exit 1,
       `--abandon` included, which cannot fence it) while it lives or cannot
-      be identified. Four reviews had closed one timing window at a time: a stop
+      be identified; `--get-details` and `--diff` refuse such a session too
+      (exit 1, naming the pid: they answered 0 from a snapshot the old worker
+      could still change), and `--list-sessions` marks it `provisional`
+      (`"provisional": true` and `provisional_reason` in JSON, a
+      `provisional:` note in text). Refused rather than answered as
+      provisional, because an exit 0 is what an agent acts on. Four
+      reviews had closed one timing window at a time: a stop
       during the reader's end-of-stream grace skipped the decision (exit 0
       over a device loss); `--stop` answered at exit 0 while the worker was
       still to publish a failure, wrote back a meta it had read after the
@@ -832,8 +838,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       ended — killed, or dead before it could, so whether its stream failed
       is unknown (exit 1) — and nothing is saved either way: a summary saved
       then answered at exit 0 while the worker went on to persist a device
-      loss. `--stop --abandon` is the way out when the worker never will say
-      (gone, stuck, or a pid that cannot be identified): the session is
+      loss. `--stop --abandon` is the way out when this version's worker
+      never will say (gone, stuck, or a pid that cannot be identified) — not
+      for an earlier version's worker while it may be alive (below): the
+      session is
       marked `abandoned` — no meta write of the worker's is applied after
       that — and what was read is saved with `"incomplete": true`, the
       reason beginning "abandoned with --abandon", at exit 0. The worker may
@@ -1021,6 +1029,19 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       stopped one is answered as saved, a crashed one is refused as before,
       and a `running` one whose worker is gone is refused with `--abandon`
       named, since that version's worker never said how a session ended
+    - **Compatibility boundary.** Upgrade quiescently: stop every ANR session
+      with the old version before installing this one. A worker of v0.8.0
+      main still recording is fenced only by waiting for it (above), and a
+      `--start` of that version still in flight can claim a session this
+      version cancelled — that version's claim checks nothing. Sessions this
+      version writes are not for older binaries (no forward compatibility),
+      and two versions writing one session is unsupported. While an earlier
+      version's worker may be alive or cannot be identified, `--stop` and
+      `--stop --abandon` both refuse; with `ps` unavailable and the pid
+      present that lasts until `ps` works again or the process exits —
+      otherwise the only recovery is outside the skill: delete the session's
+      directory (or `--clear-sessions`) once you have established yourself
+      that the worker has ended
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
       it used to be raised to 1. A restart happens unless adb or `adb

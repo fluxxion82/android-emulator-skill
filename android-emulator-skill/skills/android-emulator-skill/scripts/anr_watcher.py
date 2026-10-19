@@ -1562,6 +1562,8 @@ class AnrBuster:
 
         Read under the session's lock, so the summary and the events it is
         drilled into are one --stop's, never one half-way through another's.
+        A session an earlier version's worker may still write is refused, as
+        --stop refuses it (``_refuse_reading_a_live_legacy_session``).
 
         Raises:
             SessionError: The session is unknown, has no summary yet, or the
@@ -1572,7 +1574,8 @@ class AnrBuster:
                 usage error before reaching here.
         """
         try:
-            with self.store.transaction(session_id):
+            with self.store.transaction(session_id) as meta:
+                _refuse_reading_a_live_legacy_session(meta, "--get-details")
                 return self._details(session_id, cluster, raw, json_mode)
         except FileNotFoundError as error:
             raise SessionError(
@@ -1623,9 +1626,27 @@ class AnrBuster:
         return format_l2(summary)
 
     def list_sessions(self, json_mode: bool = False) -> str:
+        """Every stored session, newest first.
+
+        A session an earlier version's worker may still write is listed as
+        ``provisional`` (with ``provisional_reason``; a mark in text): what
+        its meta says may still change. The other modes refuse it (review of
+        PR #44); a listing of every session cannot.
+        """
         metas = self.store.list_sessions()
+        provisional = {meta.session_id: _provisional(meta) for meta in metas}
         if json_mode:
-            return json.dumps([m.to_json() for m in metas], indent=2)
+            return json.dumps(
+                [
+                    {
+                        **m.to_json(),
+                        "provisional": provisional[m.session_id] is not None,
+                        "provisional_reason": provisional[m.session_id],
+                    }
+                    for m in metas
+                ],
+                indent=2,
+            )
         if not metas:
             return "No sessions stored."
         lines = [f"Sessions: {len(metas)}"]
@@ -1638,9 +1659,11 @@ class AnrBuster:
             )
             duration_str = f"  capture={duration_s:.1f}s" if duration_s is not None else ""
             restart_str = f"  restarts={restarts}" if restarts else ""
+            reason = provisional[meta.session_id]
+            provisional_str = f"  provisional: {reason}" if reason else ""
             lines.append(
                 f"  {meta.session_id}  {meta.status:8s}  started={meta.started_at}  "
-                f"stopped={stopped}{duration_str}{restart_str}"
+                f"stopped={stopped}{duration_str}{restart_str}{provisional_str}"
             )
         if len(metas) > 20:
             lines.append(f"  ... {len(metas) - 20} more")
@@ -1667,6 +1690,9 @@ class AnrBuster:
         """
         summary_a = self._load_summary(session_a)
         summary_b = self._load_summary(session_b)
+        for session_id, summary in ((session_a, summary_a), (session_b, summary_b)):
+            if summary is not None:
+                _refuse_reading_a_live_legacy_session(self.store.load_meta(session_id), "--diff")
         if summary_a is None or summary_b is None:
             missing = [s for s, x in [(session_a, summary_a), (session_b, summary_b)] if x is None]
             raise SessionError(
@@ -2271,6 +2297,58 @@ def _legacy_worker(meta: SessionMeta) -> bool:
     return meta.lifecycle is None and bool(meta.pid)
 
 
+def _legacy_writer(meta: SessionMeta) -> tuple[Identity, str] | None:
+    """For a session an earlier version's worker may still write: that pid's identity, and why.
+
+    None when the session is not an earlier version's, names no pid, or the
+    pid is shown not to be the worker (it has gone): nothing more will change it.
+    """
+    if not _legacy_worker(meta):
+        return None
+    identity, why = worker_identity(meta)
+    return None if identity is Identity.GONE else (identity, why)
+
+
+def _provisional(meta: SessionMeta) -> str | None:
+    """Why --list-sessions marks a session provisional, or None."""
+    held = _legacy_writer(meta)
+    if held is None:
+        return None
+    identity, why = held
+    if identity is Identity.WORKER:
+        return f"an earlier version's worker, pid {meta.pid}, is still running and may change it"
+    return f"pid {meta.pid} may be an earlier version's worker, still writing it ({why})"
+
+
+def _refuse_reading_a_live_legacy_session(meta: SessionMeta, mode: str) -> None:
+    """A reader's refusal while an earlier version's worker may still write the session.
+
+    --stop refuses such a session (``_refuse_legacy_worker``); --get-details
+    and --diff answered 0 from the same snapshot, and after the old worker
+    persisted a device loss --get-details still showed the summary without it
+    (second review of PR #44). Refused, not marked provisional: an exit 0 is
+    what an agent acts on, and only data nothing can change any more earns it.
+    """
+    held = _legacy_writer(meta)
+    if held is None:
+        return
+    identity, why = held
+    state = (
+        f"its worker, pid {meta.pid}, is still running"
+        if identity is Identity.WORKER
+        else f"pid {meta.pid} may be its worker ({why})"
+    )
+    cli.fail(
+        f"Session {meta.session_id} was recorded by an earlier version, and {state}. That "
+        f"version's worker takes none of this version's locks, so what the session holds -- "
+        f"`{meta.status}`, and its summary -- may still change, a device loss included: "
+        f"{mode} answers nothing from it yet.",
+        f"Run --stop {meta.session_id}: it asks that worker to stop, waits for it to end, and "
+        f"then answers. If it never ends, end pid {meta.pid} yourself once you know it is the "
+        f"worker.",
+    )
+
+
 def _refuse_legacy_worker(meta: SessionMeta, identity: Identity, why: str) -> NoReturn:
     """--stop's refusal while an earlier version's worker may still write its session: no summary."""
     session_id = meta.session_id
@@ -2287,7 +2365,10 @@ def _refuse_legacy_worker(meta: SessionMeta, identity: Identity, why: str) -> No
         f"`{meta.status}` -- it may still change, a device loss included: nothing is concluded, "
         f"no summary is saved, and --abandon cannot fence it.",
         f"Run --stop {session_id} again once the worker has ended; if it never does, end pid "
-        f"{meta.pid} yourself once you know it is the worker, then --stop {session_id}.",
+        f"{meta.pid} yourself once you know it is the worker, then --stop {session_id}. If "
+        f"`ps` cannot say what pid {meta.pid} is and it stays, nothing here can tell: restore "
+        f"`ps`, or delete the session's directory once you have established yourself that the "
+        f"worker has ended.",
     )
 
 
@@ -2314,7 +2395,8 @@ def _refuse_unconcluded(
     session_id = meta.session_id
     abandon = (
         f"--stop {session_id} --abandon saves what was read, marked incomplete and abandoned "
-        f"(the worker can write nothing to the session after that)"
+        f"(no meta write of the worker's is applied after that; events it still appends "
+        f"are ignored)"
     )
     if identity is Identity.WORKER:
         asked = (
