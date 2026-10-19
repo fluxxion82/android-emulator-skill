@@ -40,9 +40,9 @@ from common.device_utils import (
 from common.env_config import env_int
 
 # One app's log window is read the same way here and in log_monitor, through
-# common.logcat. These two are re-exported under the names this module has
-# always offered (parse_package_pids is no longer called here).
-from common.logcat import parse_package_pids, parse_threadtime  # noqa: F401
+# common.logcat. These are re-exported under the names this module has always
+# offered (parse_package_pids is no longer called here).
+from common.logcat import parse_package_pids, parse_threadtime, split_log_lines  # noqa: F401
 from common.screenshot_utils import capture_screenshot
 
 # Tunable defaults (override via ANDROID_EMU_* env vars).
@@ -99,19 +99,24 @@ def analyze_logcat(text: str) -> dict:
     line such as ``startWCT=... errorCallbackToken=null`` (logcat_threadtime)
     was an error, and a snapshot could report three where its own log held one.
 
+    Split on ``\n`` only (``common.logcat.split_log_lines``), as logcat frames
+    lines: ``str.splitlines`` also breaks at a ``\r`` an app left inside its
+    message, so one attributed I line ending ``\r<an E header>`` counted as two
+    lines and an error the device never logged (review of v0.8.0, A2).
+
     Args:
-        text: ``logcat -v threadtime`` output -- the format ``_capture_logs``
-            asks for, so the column this reads is the column it got.
+        text: ``logcat -v threadtime`` text -- what ``_capture_logs`` saves,
+            the app's records printed that way -- so the column this reads is
+            the column it got.
 
     Returns:
         Dict with ``lines`` (non-blank lines), ``errors`` (E and F: a fatal is
         an error the agent wants to see) and ``warnings`` (W).
     """
-    priorities = [
-        parsed[1] for parsed in map(parse_threadtime, text.splitlines()) if parsed is not None
-    ]
+    lines = split_log_lines(text)
+    priorities = [parsed[1] for parsed in map(parse_threadtime, lines) if parsed is not None]
     return {
-        "lines": sum(1 for line in text.splitlines() if line.strip()),
+        "lines": sum(1 for line in lines if line.strip()),
         "errors": sum(1 for p in priorities if p in ("E", "F")),
         "warnings": sum(1 for p in priorities if p == "W"),
     }
@@ -130,6 +135,16 @@ class AppStateCapture:
         """
         self.package = package
         self.serial = serial
+        # The first component failure that was the device being unavailable
+        # (not found, offline, unauthorized): the snapshot's refusal carries
+        # it, so it exits 3 as the same fact does everywhere else (A7).
+        self.device_failure: adb_exec.DeviceError | None = None
+
+    def _failed(self, failures: list[str], what: str, exc: Exception) -> None:
+        """Record one component's failure, noting a device that is not there."""
+        failures.append(f"{what} ({exc})")
+        if self.device_failure is None and isinstance(exc, cli.DEVICE_UNAVAILABLE):
+            self.device_failure = exc
 
     def capture(
         self,
@@ -203,7 +218,7 @@ class AppStateCapture:
             if screenshot_result.get("file_path"):
                 artifacts.append("screenshot.png")
         except Exception as exc:
-            failures.append(f"the screenshot failed ({exc})")
+            self._failed(failures, "the screenshot failed", exc)
 
         # 2. Capture UI hierarchy
         try:
@@ -214,7 +229,7 @@ class AppStateCapture:
             artifacts.append("ui-hierarchy.json")
             element_count = count_ui_elements(hierarchy)
         except Exception as exc:
-            failures.append(f"the UI hierarchy failed ({exc})")
+            self._failed(failures, "the UI hierarchy failed", exc)
 
         # 3. Capture app info
         try:
@@ -224,7 +239,7 @@ class AppStateCapture:
                 json.dump(app_info, f, indent=2)
             artifacts.append("app-info.json")
         except Exception as exc:
-            failures.append(f"reading the app info failed ({exc})")
+            self._failed(failures, "reading the app info failed", exc)
 
         # 4. Capture device info
         try:
@@ -234,7 +249,7 @@ class AppStateCapture:
                 json.dump(device_info, f, indent=2)
             artifacts.append("device-info.json")
         except Exception as exc:
-            failures.append(f"reading the device info failed ({exc})")
+            self._failed(failures, "reading the device info failed", exc)
 
         # 5. Capture logs if requested
         if include_logs:
@@ -251,8 +266,11 @@ class AppStateCapture:
                 # `_capture_logs` re-raises a device error rather than writing
                 # "logs unavailable" into the summary. That is right at the
                 # method level and wrong here: the artifacts collected before
-                # it are on disk and still worth handing over.
+                # it are on disk and still worth handing over. A device that
+                # is not there is still that fact, at exit 3 (A7).
                 log_stats = {"captured": False, "error": str(exc)}
+                if self.device_failure is None and isinstance(exc, cli.DEVICE_UNAVAILABLE):
+                    self.device_failure = exc
             if not log_stats.get("captured"):
                 reason = log_stats.get("reason") or log_stats.get("error") or "log capture failed"
                 failures.append(f"logs were requested and {reason}")
@@ -473,21 +491,28 @@ class AppStateCapture:
             owners = get_pid_uids(self.serial, candidates)
             running = {pid for pid in candidates if owners.get(pid) in package_uids()}
 
+        # logd's records (`-B`), never text: a tag is the app's to choose and
+        # logcat prints it verbatim, so in text one app's record could print a
+        # line headed with system_server's pid and pull another process into
+        # this window (common.logcat; recorded: logcat_tag_injection). Bytes,
+        # through run_argv: bounded, adb's own failures typed as everywhere.
+        command = logcat.build_logcat_command(self.serial, since=since, binary=True)
         try:
-            # threadtime, explicitly: the PID and priority columns read below
-            # are the ones it prints, whatever the device's default format is.
-            # Microsecond headers tell a continuation line from a new message
-            # (common.logcat.USEC_FORMAT).
-            # Bytes, split on "\n" only: text mode would turn an app's raw "\r"
-            # into a line break and let it forge a line (common.logcat.app_window).
-            result = adb_exec.run_adb(
-                "logcat",
-                self.serial,
-                *logcat.logcat_args(since=since, usec=True),
-                timeout=LOGCAT_TIMEOUT_SECONDS,
-                check=True,
-                raw_text=True,
+            completed = adb_exec.run_argv(
+                command, serial=self.serial, timeout=LOGCAT_TIMEOUT_SECONDS
             )
+            if completed.returncode != 0:
+                stderr = completed.stderr or b""
+                detail = (
+                    stderr.decode("utf-8", errors="replace")
+                    if isinstance(stderr, bytes)
+                    else stderr
+                ).strip() or "no output"
+                raise adb_exec.AdbCommandError(
+                    f"`{' '.join(command)}` exited {completed.returncode}: {detail}",
+                    command=command,
+                )
+            records = logcat.parse_records(completed.stdout or b"")
         except adb_exec.DeviceError:
             # Nothing reached the device. A snapshot that merely notes "logs
             # unavailable" would hide a problem main() can state with a remedy.
@@ -497,12 +522,13 @@ class AppStateCapture:
                 f.write(f"Error capturing logs: {e}\n")
             return {"captured": False, "error": str(e)}
 
-        # The app's lines: those of each process the device vouches for (its
-        # uid the package's), inside that process's life -- the same rule
-        # log_monitor --app reads by (common.logcat.app_window). system_server's
-        # pid is asked of the device only if the window holds a sentence.
+        # The app's records: those of each process the device vouches for (its
+        # uid the package's), inside that process's life, stamped by logd with
+        # the package's uid -- the same rule log_monitor --app reads by
+        # (common.logcat.app_window). system_server's pid is asked of the
+        # device only if the window holds a sentence.
         window = logcat.app_window(
-            result.stdout,
+            records,
             self.package,
             system_server_pid=lambda: get_system_server_pid(self.serial, not_one_of=candidates),
             package_uids=package_uids,
@@ -519,18 +545,39 @@ class AppStateCapture:
                 "if it ran earlier, or pass --no-logs.",
             )
 
-        lines = window.lines
+        lines = window.lines()
         # Cap retained lines (keep the most recent) for token efficiency.
         if log_lines > 0 and len(lines) > log_lines:
             lines = lines[-log_lines:]
 
         text = "".join(f"{line}\n" for line in lines)
-        with open(output_path, "w") as f:
+        # newline="": a "\r" an app left inside its message is written as it
+        # is, not translated, so the saved log reads back as it was counted.
+        with open(output_path, "w", newline="") as f:
             f.write(text)
 
         stats = analyze_logcat(text)
         stats["captured"] = True
         stats["pids"] = sorted(pids, key=int)
+        # What the window could not show (A3): lines logd stamped with the
+        # package's uid whose process nothing in the window ties to the
+        # package -- typically a crash whose `Start proc` is older than the
+        # window. Left out, and said: the counts above are of what is shown.
+        unresolved_pids = sorted(window.unresolved_pids or (), key=int)
+        stats["attribution"] = {
+            "complete": window.complete,
+            "unresolved_lines": window.unresolved_lines,
+            "unresolved_pids": unresolved_pids,
+        }
+        if not window.complete:
+            print(
+                f"Incomplete: {window.unresolved_lines} line(s) logged under {self.package}'s "
+                f"uid by pid(s) {', '.join(unresolved_pids)} are left out of the snapshot's "
+                f"logs: nothing in the last {duration} shows those processes were the app's (a "
+                "process started before the window opened and gone by its end, such as a "
+                "crash read too late). Widen --logs to include its start.",
+                file=sys.stderr,
+            )
         return stats
 
     def _write_summary_md(self, snapshot_dir: Path, summary: dict) -> None:
@@ -572,7 +619,15 @@ class AppStateCapture:
                     f.write(f"- Processes: {', '.join(logs['pids'])}\n")
                 f.write(f"- Lines: {logs.get('lines', 0)}\n")
                 f.write(f"- Errors: {logs.get('errors', 0)}\n")
-                f.write(f"- Warnings: {logs.get('warnings', 0)}\n\n")
+                f.write(f"- Warnings: {logs.get('warnings', 0)}\n")
+                attribution = logs.get("attribution") or {}
+                if attribution and not attribution.get("complete", True):
+                    f.write(
+                        f"- Attribution: INCOMPLETE -- {attribution.get('unresolved_lines', 0)} "
+                        f"line(s) of the app's uid left out (pids: "
+                        f"{', '.join(attribution.get('unresolved_pids', []))})\n"
+                    )
+                f.write("\n")
             else:
                 f.write(f"- {logs.get('reason', logs.get('error', 'Not captured'))}\n\n")
 
@@ -590,22 +645,52 @@ CAPTURE_REMEDY = (
 )
 
 
-def _report_failure(message: str, partial: dict) -> None:
-    """Report a failed capture through common.cli (exit 1), handing over what arrived.
+@functools.cache
+def _device_refusal_type(device_error: type[adb_exec.DeviceError]) -> type[cli.Failure]:
+    """A refusal that is both a ``cli.Failure`` and ``device_error``.
+
+    ``common.cli`` hands ``details`` over only for a Failure, and exits 3 only
+    for a device-unavailable error. A snapshot whose device went away after
+    some artifacts arrived is both at once: the device fact (exit 3, its
+    remedy) and what arrived (``partial``). Built per error class so
+    ``except DeviceNotFoundError`` and the like still see it as what it is.
+    """
+    return type(
+        f"PartialSnapshot{device_error.__name__}",
+        (cli.Failure, device_error),
+        {"__doc__": f"A partial snapshot refused because of a {device_error.__name__}."},
+    )
+
+
+def _report_failure(
+    message: str, partial: dict, device_failure: adb_exec.DeviceError | None = None
+) -> None:
+    """Report a failed capture through common.cli, handing over what arrived.
 
     It printed ``{"error", "partial"}`` itself -- no ``success``, no remedy --
     and exited; the exit-code sweep's payload check (N5) found it. ``partial``
     still rides in the refusal object, so the agent can use the artifacts that
     did arrive.
 
+    Exit 1, or 3 when a component failed because the device is unavailable:
+    that turned into text here and exited 1, where the same fact through
+    log_monitor exits 3 (review of v0.8.0, A7).
+
     Args:
         message: What failed, already carrying its remedy.
         partial: The snapshot summary as far as it got; ``{}`` when nothing was
             written.
+        device_failure: The device-unavailable error a component met, if any.
 
     Raises:
-        cli.Failure: always.
+        cli.Failure: always -- for a device failure, one that is also that
+            device error, carrying its remedy.
     """
+    if device_failure is not None:
+        remedy = getattr(device_failure, "remedy", None) or CAPTURE_REMEDY
+        raise _device_refusal_type(type(device_failure))(
+            message, f"{remedy} {CAPTURE_REMEDY}", {"partial": partial}
+        ) from device_failure
     cli.fail(message, CAPTURE_REMEDY, details={"partial": partial})
 
 
@@ -690,17 +775,24 @@ Examples:
         # X8: a missing component used to be reported under "State captured"
         # with exit 0. What WAS captured is still handed over, under `partial`,
         # so the agent can use the screenshot it did get -- but the run failed.
-        _report_failure(message, partial)
+        _report_failure(message, partial, capturer.device_failure)
 
+    logs = partial.get("logs") or {}
+    attribution = logs.get("attribution") or {}
     if args.json:
-        print(
-            json.dumps(
-                {"success": success, "message": message, "snapshot_path": snapshot_path},
-                indent=2,
-            )
-        )
+        payload = {"success": success, "message": message, "snapshot_path": snapshot_path}
+        if attribution:
+            payload["log_attribution"] = attribution
+        print(json.dumps(payload, indent=2))
     else:
         print(message)
+        if attribution and not attribution.get("complete", True):
+            # The text form says it too, not only stderr and the summary file.
+            print(
+                f"Log attribution INCOMPLETE: {attribution['unresolved_lines']} line(s) of "
+                f"{args.package}'s uid left out (pids: "
+                f"{', '.join(attribution['unresolved_pids'])}); see summary.md."
+            )
 
     sys.exit(0)
 

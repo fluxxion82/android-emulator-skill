@@ -82,6 +82,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1694,6 +1695,18 @@ def _app_restart_window(
         "exit_status": ps.returncode,
         "output": _strip_cr(ps.text),
     }
+    if usec:
+        # The same window as logd's records, dumped right after the text: what
+        # log_monitor and app_state_capture now read (common.logcat). Filtered
+        # the same way, a RECORD at a time: one that names the package or
+        # comes from one of its pids is kept whole.
+        records = _run_bytes(["logcat", "-d", "-B"], serial, timeout=60)
+        _stash_twin(
+            "logcat_app_restart_records",
+            _keep_records(records, pids, [COMPOSE_PACKAGE]),
+            {**extra, "text_twin": "logcat_app_restart_usec", **_device_zone(serial)},
+        )
+        return Capture(_alias_pair_text("".join(kept)), window.stderr, window.returncode)
     return Capture("".join(kept), window.stderr, window.returncode)
 
 
@@ -1756,6 +1769,332 @@ def _ps_two_owners(_scratch: Path, serial: str | None, extra: dict) -> Capture:
     extra["pids"] = {"app": app, "system_server": system_server}
     extra["argv"] = ["adb", "shell", "ps", "-o", "PID,UID", "-p", "<app>,<system_server>"]
     return capture
+
+
+# --- logd's records, and the device's own text for the same records ----------
+#
+# log_monitor and app_state_capture read `logcat -B` (common.logcat): records
+# whole, with the pid and uid logd took from the writer's socket credentials
+# (the tid and time are the writer's own header's). Each binary
+# fixture is one half of a PAIR recorded in one run: the device's threadtime
+# text, dumped first, and the records, dumped right after. The text is the
+# oracle the reader's printing is held against, and the pair lets one test run
+# red over text (what v0.8.0 read) and green over records.
+
+# struct logger_entry as `logcat -B` writes it (measured, API 35): u16 payload
+# length, u16 header size (28), i32 pid, u32 tid, sec, nsec, log id, uid.
+_LOGGER_ENTRY = struct.Struct("<HHiIIIII")
+
+# A second half, captured inside its first half's run and written by the
+# fixture listed after it (`_twin`).
+_TWINS: dict[str, tuple[bytes, dict]] = {}
+
+
+def _split_records(data: bytes) -> list[tuple[int, bytes]]:
+    """``(pid, raw record)`` for every record of a ``logcat -B`` dump.
+
+    Raises:
+        CaptureError: The dump is not whole records.
+    """
+    records: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < _LOGGER_ENTRY.size:
+            raise CaptureError(f"`logcat -B` ended inside a record header at byte {offset}")
+        length, header, pid, *_ = _LOGGER_ENTRY.unpack_from(data, offset)
+        if header < _LOGGER_ENTRY.size or offset + header + length > len(data):
+            raise CaptureError(f"`logcat -B` is not whole records at byte {offset}")
+        records.append((pid, data[offset : offset + header + length]))
+        offset += header + length
+    return records
+
+
+def _record_payload(raw: bytes) -> bytes:
+    """``<priority><tag>NUL<message>NUL`` of one raw record."""
+    return raw[struct.unpack_from("<H", raw, 2)[0] :]
+
+
+# Aliases for the record pairs, shared by both halves of a pair so they name
+# the same alias for the same package (record()'s own mapping never sees the
+# binary half). ``com.example.privateN``, so they cannot be read as the
+# ``com.example.appN`` aliases record() gives other fixtures in the same run.
+_PAIR_ALIASES: dict[str, str] = {}
+
+
+def _alias_pair_text(text: str) -> str:
+    """``text`` with non-AOSP package names aliased the way its binary half is."""
+
+    def alias(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token.startswith(_PUBLIC_PACKAGE_PREFIXES):
+            return token
+        return _PAIR_ALIASES.setdefault(token, f"com.example.private{len(_PAIR_ALIASES) + 1}")
+
+    return _PACKAGE_RE.sub(alias, text)
+
+
+def _aliased_record(raw: bytes) -> bytes:
+    """``raw`` with its tag's and message's private package names aliased.
+
+    The payload is rebuilt and its length field rewritten, so the record is
+    framed exactly as logd frames one holding that text: the substitution is
+    of text, the way the text halves' aliasing is, never of the framing. A
+    record naming no private package is returned byte for byte.
+    """
+    header = struct.unpack_from("<H", raw, 2)[0]
+    payload = raw[header:]
+    tag, _, rest = payload[1:].partition(b"\0")
+    message, _, trailer = rest.partition(b"\0")
+    try:
+        fields = [part.decode("utf-8") for part in (tag, message)]
+    except UnicodeDecodeError as exc:
+        raise CaptureError(f"a kept record is not UTF-8 text: {raw[:80]!r}") from exc
+    aliased = [_alias_pair_text(part) for part in fields]
+    if aliased == fields:
+        return raw
+    body = payload[:1] + aliased[0].encode() + b"\0" + aliased[1].encode() + b"\0" + trailer
+    return struct.pack("<H", len(body)) + raw[2:header] + body
+
+
+def _keep_records(data: bytes, pids: list[str], needles: list[str]) -> bytes:
+    """The records of ``data`` from ``pids`` or naming one of ``needles``, whole.
+
+    The binary counterpart of the line filter the text halves use: the full
+    window carries every other app's free text, which is not ours to publish.
+    A kept record that names a package outside the public prefixes has it
+    aliased (:func:`_aliased_record`), as the text half has (measured: on a
+    developer's emulator system_server's AppsFilter records name their apps).
+    """
+    kept = [
+        _aliased_record(raw)
+        for pid, raw in _split_records(data)
+        if str(pid) in pids or any(n.encode() in _record_payload(raw) for n in needles)
+    ]
+    if not kept:
+        raise CaptureError("no record of the window is the fixture's")
+    return b"".join(kept)
+
+
+def _device_zone(serial: str | None) -> dict:
+    """The device's time zone, which its threadtime text is printed in.
+
+    A test printing a binary half's records to compare with its text half has
+    to use this zone, whatever zone the machine running the test is in.
+    """
+    zone = _run(["shell", "getprop", "persist.sys.timezone"], serial, timeout=15).text.strip()
+    if not zone:
+        raise CaptureError("the device names no time zone (persist.sys.timezone)")
+    return {"timezone": zone}
+
+
+def _stash_twin(name: str, data: bytes, provenance: dict) -> None:
+    _TWINS[name] = (data, provenance)
+
+
+def _twin(name: str, first_half: str) -> Callable[[str | None, dict], bytes]:
+    """A ``capture_bytes`` writing what ``first_half``'s run captured for ``name``."""
+
+    def capture(_serial: str | None, extra: dict) -> bytes:
+        if name not in _TWINS:
+            raise CaptureError(
+                f"{name} is captured in the same run as {first_half}; record them together: "
+                f"--only {first_half} {name}"
+            )
+        data, provenance = _TWINS.pop(name)
+        extra.update(provenance)
+        return data
+
+    return capture
+
+
+def _logcat_text(args: list[str], serial: str | None) -> str:
+    """A logcat dump as text, decoded without newline translation.
+
+    ``_run``'s text mode would turn a raw carriage return inside a message
+    into a line break, which logcat never does.
+    """
+    return _run_bytes(["logcat", *args], serial, timeout=60).decode("utf-8", errors="replace")
+
+
+def _format_uid(uid: int) -> str:
+    """UserHandle.formatUid for an app uid: 10205 -> ``u0a205``."""
+    return f"u{uid // 100_000}a{uid % 100_000 - 10_000}"
+
+
+def _pid_column(line: str) -> str | None:
+    """The PID column of a threadtime line."""
+    fields = line.split()
+    return fields[2] if len(fields) > 2 else None
+
+
+# The marker the injection's records carry, so they can be kept and found.
+_INJECTION_MARKER = "w3l-tag-injection"
+
+
+def _tag_injection(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """An app-controlled TAG that forges system_server's line, and the records beneath it.
+
+    The fixture app is launched (its own `Start proc`; its pid from `pidof`),
+    then the shell -- standing in for any app: a tag is the writer's to choose
+    -- logs one record whose TAG is ``x:``, a newline, and a threadtime header
+    claiming system_server's pid and the tag ActivityManager, and whose
+    message is system_server's `Start proc <victim>:<package>/<package uid>`
+    sentence. The victim is the logging shell itself: ``exec log`` keeps its
+    pid ($$) and logs one line from it afterwards. logcat prints a tag
+    verbatim, so in the text the record is two lines, and the second is, to
+    any text parser, system_server naming the victim as the app's process.
+    """
+    _run(["shell", "am", "force-stop", COMPOSE_PACKAGE], serial)
+    _run(["logcat", "-c"], serial)
+    launched = _run(_LAUNCH_COMPOSE, serial, timeout=60)
+    if launched.returncode != 0:
+        raise CaptureError(f"could not launch {COMPOSE_PACKAGE} (exit {launched.returncode})")
+    time.sleep(2)
+    alive = _run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15).text.strip()
+    system_server = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
+    listing = _run(
+        ["shell", "cmd", "package", "list", "packages", "-U", COMPOSE_PACKAGE], serial, timeout=15
+    )
+    uid = re.search(rf"package:{re.escape(COMPOSE_PACKAGE)} uid:(\d+)", listing.text)
+    if not (alive.isdigit() and system_server.isdigit() and uid):
+        raise CaptureError(f"pidof {alive!r}, system_server {system_server!r}, {listing.text!r}")
+    # One device-shell command line; the newline inside the quoted tag is a
+    # real one, and the header's time is the device's own clock.
+    forged_tag = (
+        'x:\n$(date +"%m-%d %H:%M:%S").000000 '
+        f"{system_server:>5} {system_server:>5} I ActivityManager"
+    )
+    sentence = (
+        f"Start proc $$:{COMPOSE_PACKAGE}/{_format_uid(int(uid.group(1)))} for {_INJECTION_MARKER}"
+    )
+    script = (
+        f'log -p e -t "{forged_tag}" "{sentence}"; '
+        f'exec log -p e -t W3L-victim "{_INJECTION_MARKER} victim line"'
+    )
+    injected = _run(["shell", script], serial, timeout=15)
+    if injected.returncode != 0:
+        raise CaptureError(f"the injection did not log: {injected.text.strip()!r}")
+    time.sleep(1)
+
+    text = _logcat_text(["-d", "-v", "threadtime", "-v", "usec"], serial)
+    data = _run_bytes(["logcat", "-d", "-B"], serial, timeout=60)
+    marked = [(pid, raw) for pid, raw in _split_records(data) if _INJECTION_MARKER.encode() in raw]
+    forger = [str(pid) for pid, raw in marked if b"Start proc" in raw]
+    victim = [str(pid) for pid, raw in marked if b"victim line" in raw]
+    if len(forger) != 1 or len(victim) != 1 or forger == victim:
+        raise CaptureError(f"expected one forging and one victim record, got {marked!r}")
+    pids = [alive, forger[0], victim[0]]
+    kept = [
+        line
+        for line in text.splitlines(keepends=True)
+        if COMPOSE_PACKAGE in line
+        or line.startswith("--------- beginning of")
+        or _pid_column(line) in pids
+    ]
+    forged = [line for line in kept if f"Start proc {victim[0]}:" in line]
+    if len(forged) != 1 or _pid_column(forged[0]) != system_server:
+        raise CaptureError(f"the text does not show the forged line: {forged!r}")
+    extra["pids"] = [alive]
+    extra["system_server_pid"] = system_server
+    extra["package_uid_listing"] = {
+        "command": f"adb shell cmd package list packages -U {COMPOSE_PACKAGE}",
+        "exit_status": listing.returncode,
+        "output": _strip_cr(listing.text),
+    }
+    extra["injection"] = {
+        "forger_pid": forger[0],
+        "victim_pid": victim[0],
+        "command": f"adb shell {script!r}",
+    }
+    _stash_twin(
+        "logcat_tag_injection_records",
+        _keep_records(data, pids, [COMPOSE_PACKAGE]),
+        {**extra, "text_twin": "logcat_tag_injection", **_device_zone(serial)},
+    )
+    return Capture(_alias_pair_text("".join(kept)), "", 0)
+
+
+def _crash_tail(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """`logcat -T 1` against a buffer whose last record is a many-line crash.
+
+    The crash buffer is cleared and the fixture app crashed twice (`am
+    crash`), so it holds exactly two records, each a FATAL EXCEPTION of many
+    lines. Recorded in one run: the whole buffer as text and as records, and
+    `-T 1` as text and as records. logd tails RECORDS, so `-T 1` is the whole
+    last crash, every line -- not its last line.
+    """
+    _run(["logcat", "-b", "crash", "-c"], serial)
+    pids = []
+    for _ in range(2):
+        launched = _run(_LAUNCH_COMPOSE, serial, timeout=60)
+        if launched.returncode != 0:
+            raise CaptureError(f"could not launch {COMPOSE_PACKAGE} (exit {launched.returncode})")
+        time.sleep(2)
+        pids.append(_run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15).text.strip())
+        _run(["shell", "am", "crash", COMPOSE_PACKAGE], serial)
+        # Gone before the next launch, or that launch finds the dying process.
+        for _ in range(15):
+            time.sleep(1)
+            if not _run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15).text.strip():
+                break
+        else:
+            raise CaptureError(f"{COMPOSE_PACKAGE} was still running 15 s after `am crash`")
+    usec = ["-v", "threadtime", "-v", "usec"]
+    whole = _logcat_text(["-b", "crash", "-d", *usec], serial)
+    whole_records = _run_bytes(["logcat", "-b", "crash", "-d", "-B"], serial, timeout=60)
+    tail = _logcat_text(["-b", "crash", "-d", *usec, "-T", "1"], serial)
+    tail_records = _run_bytes(["logcat", "-b", "crash", "-d", "-B", "-T", "1"], serial, timeout=60)
+    records = _split_records(whole_records)
+    if [str(pid) for pid, _ in records] != pids:
+        raise CaptureError(f"the crash buffer holds {[p for p, _ in records]}, not {pids}")
+    if tail_records != records[-1][1]:
+        raise CaptureError("`-T 1` as records is not the buffer's last record")
+    extra["pids"] = pids
+    provenance = {**extra, **_device_zone(serial)}
+    _stash_twin(
+        "logcat_crash_buffer", whole.encode(), {**provenance, "first_half": "logcat_crash_tail"}
+    )
+    _stash_twin(
+        "logcat_crash_buffer_records",
+        _keep_records(whole_records, pids, []),
+        {**provenance, "text_twin": "logcat_crash_buffer"},
+    )
+    _stash_twin(
+        "logcat_crash_tail_records",
+        _keep_records(tail_records, pids, []),
+        {**provenance, "text_twin": "logcat_crash_tail"},
+    )
+    return Capture(tail, "", 0)
+
+
+def _waiting_for_device(_scratch: Path, _serial: str | None, _extra: dict) -> Capture:
+    """What a streaming `adb logcat` says while its device is not there: it waits.
+
+    Host adb, aimed at a serial that is not attached through ANDROID_SERIAL --
+    how a caller that passed no --serial reaches one -- and stopped after a
+    few seconds, since it does not stop by itself. It prints a banner on
+    stderr and nothing on stdout. No device is touched.
+    """
+    env = {**os.environ, "ANDROID_SERIAL": "no-such-serial-xyz"}
+    try:
+        child = subprocess.Popen(
+            ["adb", "logcat", "-B", "-T", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise CaptureError("adb is not installed on this host") from exc
+    try:
+        out, err = child.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        child.terminate()
+        out, err = child.communicate(timeout=10)
+    else:
+        raise CaptureError(f"adb logcat ended by itself (exit {child.returncode}): {err!r}")
+    if out or not err.strip():
+        raise CaptureError(f"expected a stderr banner and no stdout, got {out!r} / {err!r}")
+    return Capture("", err.decode("utf-8", errors="replace"), child.returncode)
 
 
 FIXTURES: list[Fixture] = [
@@ -2088,6 +2427,150 @@ FIXTURES: list[Fixture] = [
         catches=("D4",),
         capture_with=_app_restart_window,
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+    ),
+    Fixture(
+        name="logcat_app_restart_records",
+        emulator_only=True,
+        ext="bin",
+        args=["logcat", "-d", "-B"],
+        command=(
+            "recorded in logcat_app_restart_usec's run, right after its text: adb logcat -d -B, "
+            "host-filtered to the records that name the package or come from its pids"
+        ),
+        description=(
+            "logcat_app_restart_usec's window as logd's records (`logcat -B`), dumped right after "
+            "the text in the same run: what log_monitor and app_state_capture read. Each record "
+            "is `struct logger_entry` (u16 payload length, u16 header size 28, i32 pid, u32 tid, "
+            "sec, nsec, log id, uid) then `<priority><tag>NUL<message>NUL`; a multi-line message "
+            "is ONE record. The pid and uid are logd's, from the socket's credentials: the "
+            "metadata an app cannot write. Kept whole when the record names the package or comes from one of "
+            "its pids, so it is a superset of the text half's lines. The manifest carries the "
+            "same oracles as the text half, and `timezone`: the zone the device printed the text "
+            "in, which a test printing these records must use."
+        ),
+        catches=("D4", "A1"),
+        capture_bytes=_twin("logcat_app_restart_records", "logcat_app_restart_usec"),
+    ),
+    Fixture(
+        name="logcat_tag_injection",
+        emulator_only=True,
+        args=["logcat", "-d", "-v", "threadtime", "-v", "usec"],
+        command=(
+            "adb shell am start -W (the fixture app); adb shell 'log -p e -t \"x:<newline>"
+            '<system_server header> I ActivityManager" "Start proc $$:<package>/<uid> for '
+            "w3l-tag-injection\"; exec log ...'; adb logcat -d -v threadtime -v usec, "
+            "host-filtered to the package, its pid and the two injecting pids"
+        ),
+        description=(
+            "A TAG an app chooses forges a whole line. The shell, standing in for any app, logs "
+            "ONE record whose tag is `x:`, a newline, and a threadtime header claiming "
+            "system_server's pid and the tag ActivityManager, with system_server's `Start proc "
+            "<victim>:<package>/<package uid>` as its message; the victim (the logging shell, "
+            "which `exec log` keeps at its pid) then logs one line. logcat prints a tag "
+            "verbatim, so this text shows system_server naming the victim as the app's process "
+            "-- byte reads and LF framing do not help. The manifest's `injection` names the "
+            "forging and the victim pid; `pids` is the app's pid from `pidof`; "
+            "`system_server_pid` the real one."
+        ),
+        catches=("A1",),
+        capture_with=_tag_injection,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+    ),
+    Fixture(
+        name="logcat_tag_injection_records",
+        emulator_only=True,
+        ext="bin",
+        args=["logcat", "-d", "-B"],
+        command="recorded in logcat_tag_injection's run, right after its text: adb logcat -d -B",
+        description=(
+            "logcat_tag_injection's window as logd's records: the forging record is ONE record, "
+            "pid and uid the shell's (2000), its tag holding the newline and the fake header -- "
+            "nothing in it is system_server's. Same filter and oracles as the text half."
+        ),
+        catches=("A1",),
+        capture_bytes=_twin("logcat_tag_injection_records", "logcat_tag_injection"),
+    ),
+    Fixture(
+        name="logcat_crash_tail",
+        emulator_only=True,
+        args=["logcat", "-b", "crash", "-d", "-v", "threadtime", "-v", "usec", "-T", "1"],
+        command=(
+            "adb logcat -b crash -c; (am start -W, am crash) x2; adb logcat -b crash -d "
+            "-v threadtime -v usec -T 1"
+        ),
+        description=(
+            "`-T 1` against a crash buffer holding two crashes: the WHOLE last crash, every "
+            "line under one header, after the buffer's separator -- not its last line. logd "
+            "tails records, and a multi-line message is one record. The buffer itself is "
+            "logcat_crash_buffer (text) and logcat_crash_buffer_records; this tail as records "
+            "is logcat_crash_tail_records. All four in one run."
+        ),
+        catches=("A8",),
+        capture_with=_crash_tail,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+    ),
+    Fixture(
+        name="logcat_crash_buffer",
+        emulator_only=True,
+        args=["logcat", "-b", "crash", "-d", "-v", "threadtime", "-v", "usec"],
+        command="recorded in logcat_crash_tail's run: adb logcat -b crash -d -v threadtime -v usec",
+        description=(
+            "The crash buffer logcat_crash_tail tails: two FATAL EXCEPTION records of the "
+            "fixture app, as text."
+        ),
+        catches=("A8",),
+        capture_bytes=_twin("logcat_crash_buffer", "logcat_crash_tail"),
+    ),
+    Fixture(
+        name="logcat_crash_buffer_records",
+        emulator_only=True,
+        ext="bin",
+        args=["logcat", "-b", "crash", "-d", "-B"],
+        command="recorded in logcat_crash_tail's run: adb logcat -b crash -d -B",
+        description="logcat_crash_buffer as logd's records: two records, one per crash.",
+        catches=("A8",),
+        capture_bytes=_twin("logcat_crash_buffer_records", "logcat_crash_tail"),
+    ),
+    Fixture(
+        name="logcat_crash_tail_records",
+        emulator_only=True,
+        ext="bin",
+        args=["logcat", "-b", "crash", "-d", "-B", "-T", "1"],
+        command="recorded in logcat_crash_tail's run: adb logcat -b crash -d -B -T 1",
+        description=(
+            "`-T 1` as records: exactly the buffer's last record, byte for byte (checked at "
+            "capture), its message many lines long."
+        ),
+        catches=("A8",),
+        capture_bytes=_twin("logcat_crash_tail_records", "logcat_crash_tail"),
+    ),
+    Fixture(
+        name="adb_get_state",
+        args=["get-state"],
+        description=(
+            "`adb get-state` for an attached device: `device`, exit 0. log_monitor asks it before "
+            "every read, and again when a live read ends by itself: a streaming `adb logcat` "
+            "aimed at a device that is not there waits instead of failing "
+            "(adb_waiting_for_device), so its silence cannot tell a quiet device from a missing "
+            "one. For a serial that is not attached, see adb_device_not_found."
+        ),
+        catches=("A4",),
+    ),
+    Fixture(
+        name="adb_waiting_for_device",
+        args=[],
+        command=(
+            "ANDROID_SERIAL=no-such-serial-xyz adb logcat -B -T 1 (host adb), stopped after 3 s"
+        ),
+        description=(
+            "What a streaming `adb logcat` prints while its device is not attached: the banner "
+            "`- waiting for device -` on STDERR, nothing on stdout, and it does not exit "
+            "(recorded exit status: terminated). The case log_monitor --duration used to "
+            "report as a quiet device, and a banner that pushes adb's own error off the start "
+            "of the stream's stderr (A5)."
+        ),
+        catches=("A4", "A5"),
+        capture_with=_waiting_for_device,
     ),
     Fixture(
         name="package_list_uid",

@@ -191,15 +191,15 @@ MODES: tuple[Mode, ...] = (
     ),
     # --- X8: app_state_capture ----------------------------------------------
     # The partial-capture policy catches a device error on purpose (common/cli's
-    # list of deliberate catches), so the refusal is exit 1 even when adb says
-    # the device is not there. Red when N5 first ran it: its own
-    # `{"error", "partial"}` object, no `success`, no remedy.
+    # list of deliberate catches) to keep what arrived, and its refusal is still
+    # the device error: exit 3 when adb says the device is not there (W3-L, A7;
+    # it was exit 1). Red when N5 first ran it: its own `{"error", "partial"}`
+    # object, no `success`, no remedy.
     _adb(
         "app_state_capture.py",
         ("--package", "com.example.app", "--output", f"{WORKDIR}/snapshots", "--json"),
         "whole-capture failure; the partial-capture case (X8) is out of reach here",
         naming=("adb", "device"),
-        broken_status=FAILURE,
     ),
     # --- X3 / L8 / N1: the lifecycle scripts with no SDK ---------------------
     _adb("device_list.py", ("--json",), "device and AVD inventory"),

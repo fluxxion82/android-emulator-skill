@@ -3,20 +3,22 @@
 Four defects live in one block of `stream_logs`, and they compound: the tool
 parses nothing, cannot be stopped, can deadlock, and reports success either way.
 
-  A1  `build_logcat_command` requests `-v time` while `parse_logcat_line`
-      expects threadtime, so every line falls into the unparsed branch and
-      `--follow` prints nothing at all.
+  A1  `build_logcat_command` requested `-v time` while `parse_logcat_line`
+      expects threadtime, so every line fell into the unparsed branch and
+      `--follow` printed nothing at all. (It now reads logd's records, `-B`,
+      and prints each as threadtime: the format question is the printer's.)
   A2  `--duration` never returns: the loop breaks, then `.wait()` blocks on a
       streaming `adb logcat` that never exits. The duration check also only runs
-      after `readline()` returns, so a quiet device never trips it either.
+      after a read returns, so a quiet device never trips it either.
   R3  `Popen(stderr=PIPE)` is never read, so ~64KB on stderr blocks the child.
   --  `stream_logs` returns True unconditionally, so a failed logcat is
       indistinguishable from a quiet device.
 
-The fake-process harness below drives the loop without a device: `readline()`
-drains a scripted list then returns b"", and `poll()` reports the exit code only
-once drained, mirroring a real pipe. Its pipes carry bytes, as the real
-`Popen` (opened without `text=`) does.
+The fake-process harness below drives the loop without a device: its stdout
+serves recorded ``logcat -B`` records and then ends, and `poll()` reports the
+exit code only once drained, mirroring a real pipe. Its pipes carry bytes, as
+the real `Popen` (opened without `text=`) does. Every read also asks adb
+``get-state`` first (A4); that is answered as recorded for an attached device.
 """
 
 from __future__ import annotations
@@ -24,47 +26,72 @@ from __future__ import annotations
 import io
 import subprocess
 from datetime import timedelta
-from pathlib import Path
 
 import log_monitor
 import pytest
+from fake_toolchain import frames
 
-from common import adb_exec, cli
+from common import adb_exec, cli, logcat
 from common.adb_exec import DeviceNotFoundError
 
-RECORDED = Path(__file__).resolve().parent / "fixtures" / "recorded" / "emulator-api35"
+RECORDS = "logcat_app_restart_records.bin"
 
 
-def _real_log_lines(fmt: str, limit: int = 40) -> list[str]:
-    """Real logcat body lines in the given format."""
-    text = (RECORDED / f"logcat_{fmt}.txt").read_text(encoding="utf-8")
-    return [
-        line
-        for line in text.splitlines()
-        if line.strip() and not line.startswith("--------- beginning of")
-    ][:limit]
+def _real_records(recorded, limit: int = 40) -> list[bytes]:
+    """Real logd records, raw, as `adb logcat -B` streams them."""
+    return [frame.raw for frame in frames(recorded.data(RECORDS))[:limit]]
+
+
+def _shown(records: list[bytes]) -> int:
+    """Lines log_monitor's default filter (floor D) keeps of ``records``."""
+    order = logcat.PRIORITY_ORDER
+    return sum(
+        len(record.lines())
+        for record in logcat.parse_records(b"".join(records))
+        if record.priority in order and order.index(record.priority) >= order.index("D")
+    )
+
+
+@pytest.fixture(autouse=True)
+def attached(monkeypatch, recorded):
+    """adb answering ``get-state`` as recorded for an attached device (A4's preflight)."""
+    asked: list[list[str]] = []
+
+    def run(cmd, **_kwargs):
+        asked.append(cmd)
+        if "get-state" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, recorded.text("adb_get_state"), "")
+        raise AssertionError(f"unexpected adb call {cmd}")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", run)
+    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
+    return asked
 
 
 class FakeProc:
-    """A stand-in for a streaming `adb logcat` process.
+    """A stand-in for a streaming `adb logcat -B` process.
 
     Deliberately models the two behaviours that broke the real code: the stream
-    does not end on its own while lines remain, and the process does not exit
+    does not end on its own while records remain, and the process does not exit
     until it is terminated.
     """
 
+    # Safety cap for the never-ending stream. A correct duration check breaks
+    # out long before this; hitting it means the duration was never enforced.
+    MAX_RECORDS = 5000
+
     def __init__(
         self,
-        lines: list[str],
+        records: list[bytes],
         returncode: int = 0,
         never_ends: bool = False,
         stderr_text: str = "",
     ):
-        self._lines = list(lines)
+        self._stream = io.BytesIO(b"".join(records))
+        self._filler = records[0] if records else b""
         self._returncode = returncode
         self._never_ends = never_ends
         self._emitted = 0
-        self._filler = ((lines[0] if lines else "01-01 00:00:00.000 1 1 I Tag: x") + "\n").encode()
         self.terminated = False
         self.killed = False
         self.waited_without_timeout = False
@@ -72,27 +99,23 @@ class FakeProc:
         self.stderr = io.BytesIO(stderr_text.encode())
         self.returncode = None
 
-    # Safety cap for the never-ending stream. A correct duration check breaks
-    # out long before this; hitting it means the duration was never enforced.
-    MAX_LINES = 5000
-
-    def readline(self) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         if self.terminated:
             return b""
-        if self._lines:
-            return (self._lines.pop(0) + "\n").encode()
-        if self._never_ends:
-            # A busy device streams continuously and the pipe never closes.
-            # Blocking for real would hang the suite, so emit endlessly instead
-            # and let the safety cap catch a missing duration check.
-            self._emitted += 1
-            if self._emitted > self.MAX_LINES:
-                raise AssertionError(
-                    f"stream produced {self.MAX_LINES} lines without stopping: "
-                    "the duration deadline is never enforced"
-                )
-            return self._filler
-        return b""
+        chunk = self._stream.read(size)
+        if chunk or not self._never_ends:
+            return chunk
+        # A busy device streams continuously and the pipe never closes.
+        # Blocking for real would hang the suite, so emit endlessly instead and
+        # let the safety cap catch a missing duration check.
+        self._emitted += 1
+        if self._emitted > self.MAX_RECORDS:
+            raise AssertionError(
+                f"stream produced {self.MAX_RECORDS} records without stopping: "
+                "the duration deadline is never enforced"
+            )
+        self._stream = io.BytesIO(self._filler)
+        return self._stream.read(size)
 
     def poll(self):
         return self.returncode
@@ -121,9 +144,9 @@ def fake_popen(monkeypatch):
     """Install a FakeProc factory and expose the instance it creates."""
     created = {}
 
-    def _install(lines, returncode=0, never_ends=False, stderr_text=""):
+    def _install(records, returncode=0, never_ends=False, stderr_text=""):
         proc = FakeProc(
-            lines, returncode=returncode, never_ends=never_ends, stderr_text=stderr_text
+            records, returncode=returncode, never_ends=never_ends, stderr_text=stderr_text
         )
         created["proc"] = proc
         created["kwargs"] = {}
@@ -141,30 +164,28 @@ def fake_popen(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# A1 — the requested format must be the one the parser understands.
+# A1 — the requested format must be one the parser understands.
 # ---------------------------------------------------------------------------
 
 
-def test_command_requests_the_format_the_parser_understands():
-    """The `-v` argument and `parse_logcat_line` must agree."""
+def test_command_requests_records_and_the_parser_reads_how_they_print(recorded):
+    """`-B`, and `parse_logcat_line` reads what a record prints as."""
     monitor = log_monitor.LogMonitor()
-    cmd = monitor.build_logcat_command()
-    requested = cmd[cmd.index("-v") + 1]
+    assert logcat.BINARY_FLAG in monitor.build_logcat_command()
 
-    lines = _real_log_lines(requested)
+    records = logcat.parse_records(recorded.data(RECORDS))
+    lines = [line for record in records[:40] for line in record.lines()]
     parsed = [monitor.parse_logcat_line(line) for line in lines]
-    assert any(p is not None for p in parsed), (
-        f"command requests '-v {requested}' but the parser matched none of "
-        f"{len(lines)} real lines in that format"
-    )
+    assert len([p for p in parsed if p is not None]) == len(
+        lines
+    ), "parse_logcat_line does not read every line a recorded record prints as"
 
 
-def test_severity_counts_reflect_real_output(fake_popen):
+def test_severity_counts_reflect_real_output(fake_popen, recorded):
     """The whole point of the tool: real logs must produce real counts."""
-    monitor = log_monitor.LogMonitor()
-    requested = monitor.build_logcat_command()[monitor.build_logcat_command().index("-v") + 1]
-    fake_popen(_real_log_lines(requested))
+    fake_popen(_real_records(recorded))
 
+    monitor = log_monitor.LogMonitor()
     monitor.stream_logs()
     counted = monitor.error_count + monitor.warning_count + monitor.info_count
     assert counted > 0, "streamed real device output and classified nothing"
@@ -175,14 +196,14 @@ def test_severity_counts_reflect_real_output(fake_popen):
 # ---------------------------------------------------------------------------
 
 
-def test_duration_stops_a_stream_that_never_ends(fake_popen, monkeypatch):
+def test_duration_stops_a_stream_that_never_ends(fake_popen, monkeypatch, recorded):
     """A live logcat never closes its pipe; the duration must stop it.
 
     The fake clock jumps past the deadline immediately, so a correct
     implementation exits at once. Without a working deadline the fake stream
     runs to its safety cap and fails the test.
     """
-    proc = fake_popen(_real_log_lines("threadtime", limit=3), never_ends=True)
+    proc = fake_popen(_real_records(recorded, limit=3), never_ends=True)
 
     real_datetime = log_monitor.datetime
 
@@ -203,9 +224,9 @@ def test_duration_stops_a_stream_that_never_ends(fake_popen, monkeypatch):
     assert proc.terminated, "process was never stopped; --duration would hang"
 
 
-def test_never_waits_on_a_streaming_process_without_a_timeout(fake_popen):
+def test_never_waits_on_a_streaming_process_without_a_timeout(fake_popen, recorded):
     """`.wait()` with no timeout on a live logcat is the A2 hang itself."""
-    proc = fake_popen(_real_log_lines("threadtime", limit=3))
+    proc = fake_popen(_real_records(recorded, limit=3))
 
     log_monitor.LogMonitor().stream_logs()
 
@@ -220,35 +241,32 @@ def test_never_waits_on_a_streaming_process_without_a_timeout(fake_popen):
 # ---------------------------------------------------------------------------
 
 
-def test_adb_errors_are_not_counted_as_device_log_lines(fake_popen):
+def test_adb_errors_are_not_counted_as_device_log_lines(fake_popen, recorded):
     """adb's own stderr must not be ingested as device output.
 
     Merging stderr into stdout avoids the deadlock but feeds text like
-    "device 'x' not found" through the log parser, which then reports it as a
+    "device 'x' not found" through the log reader, which then reports it as a
     captured log line. Draining stderr separately keeps the two apart.
     """
-    fake_popen(
-        _real_log_lines("threadtime", limit=3),
-        stderr_text="adb: device 'no-such-device' not found\n",
-    )
+    records = _real_records(recorded, limit=3)
+    fake_popen(records, stderr_text=recorded.text("adb_shell_device_not_found"))
     monitor = log_monitor.LogMonitor()
     monitor.stream_logs()
 
-    assert monitor.total_lines == 3, (
-        f"expected only the 3 device log lines, got {monitor.total_lines}; "
+    assert monitor.total_lines == _shown(records), (
+        f"expected only the device's {_shown(records)} lines, got {monitor.total_lines}; "
         f"adb's stderr is being counted as log output"
     )
 
 
-def test_adb_error_text_is_surfaced_on_failure(fake_popen, monkeypatch, recorded_anywhere):
+def test_adb_error_text_is_surfaced_on_failure(fake_popen, recorded):
     """A failure must say what adb reported, not just that it failed.
 
     adb's recorded words for an unknown serial, classified the way run_adb
     classifies them: a streaming logcat cannot go through run_adb, but a device
     that is not there is the same typed error -- exit 3 at the boundary.
     """
-    monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
-    fake_popen([], returncode=1, stderr_text=recorded_anywhere("adb_shell_device_not_found"))
+    fake_popen([], returncode=1, stderr_text=recorded.text("adb_shell_device_not_found"))
 
     with pytest.raises(DeviceNotFoundError) as raised:
         log_monitor.LogMonitor().stream_logs()
@@ -262,11 +280,13 @@ def test_adb_error_text_is_surfaced_on_failure(fake_popen, monkeypatch, recorded
 # ---------------------------------------------------------------------------
 
 
-def test_failed_logcat_is_reported_as_failure(fake_popen):
+def test_failed_logcat_is_reported_as_failure(fake_popen, attached):
     """`adb logcat` exiting non-zero must not read as success.
 
     Raised as cli.Failure, where it was printed and returned False: under
-    --json that exited 1 with nothing on stdout.
+    --json that exited 1 with nothing on stdout. The device is asked again
+    first (A4) and is still attached, so it is logcat's failure, not the
+    device's.
     """
     fake_popen([], returncode=1)
     with pytest.raises(cli.Failure) as raised:
@@ -274,11 +294,41 @@ def test_failed_logcat_is_reported_as_failure(fake_popen):
 
     assert "exited with status 1" in str(raised.value)
     assert "--serial" in raised.value.remedy
+    assert [cmd[-1] for cmd in attached] == ["get-state", "get-state"]
 
 
-def test_successful_logcat_is_reported_as_success(fake_popen):
+def test_a_read_we_stopped_inside_a_record_loses_it_and_says_so(fake_popen, recorded, capsys):
+    """A stop of ours (an interrupt, the deadline) can cut the record arriving.
+
+    That is the one truncation that is not a failure -- and it is disclosed:
+    ``statistics.cut_records``, a stderr note, a line in the summary (review of
+    PR #35). Derived: three recorded records, then the first 10 bytes of a
+    fourth; the interrupt arrives as those bytes do.
+    """
+    records = _real_records(recorded, limit=4)
+    complete = b"".join(records[:3])
+    proc = fake_popen([*records[:3], records[3][:10]])
+    monitor = log_monitor.LogMonitor()
+    read = proc.read
+
+    def interrupted_read(size=-1):
+        if proc._stream.tell() >= len(complete):
+            monitor.interrupted = True
+        return read(size)
+
+    proc.read = interrupted_read
+
+    assert monitor.stream_logs() is True
+    assert monitor.cut_records == 1
+    assert monitor.total_lines == _shown(records[:3])
+    assert "stopped while a record was arriving" in capsys.readouterr().err
+    assert monitor.get_json_output()["statistics"]["cut_records"] == 1
+    assert "INCOMPLETE" in monitor.get_summary()
+
+
+def test_successful_logcat_is_reported_as_success(fake_popen, recorded):
     """Guard against over-correcting into always-False."""
-    fake_popen(_real_log_lines("threadtime", limit=3), returncode=0)
+    fake_popen(_real_records(recorded, limit=3), returncode=0)
     assert log_monitor.LogMonitor().stream_logs() is True
 
 
@@ -287,17 +337,21 @@ def test_successful_logcat_is_reported_as_success(fake_popen):
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_serial_fails_before_streaming(monkeypatch, capsys):
+def test_unknown_serial_fails_before_streaming(monkeypatch, recorded):
     """`adb -s <unknown> logcat` blocks waiting for the device to appear.
 
     With --duration set that is indistinguishable from a device that logged
     nothing: the capture ends on time and reports success with zero lines. Exit
-    status cannot tell them apart, so the serial is checked up front.
+    status cannot tell them apart, so the device is asked first: `get-state`,
+    which answers at once (recorded: adb_device_not_found, exit 1).
     """
+    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == "adb_device_not_found")
     monkeypatch.setattr(
-        log_monitor,
-        "get_connected_devices",
-        lambda: [{"serial": "emulator-5554", "state": "device"}],
+        adb_exec.subprocess,
+        "run",
+        lambda cmd, **_k: subprocess.CompletedProcess(
+            cmd, entry["exit_status"], "", recorded.text("adb_device_not_found")
+        ),
     )
 
     def _no_popen(*_a, **_k):
@@ -315,14 +369,9 @@ def test_unknown_serial_fails_before_streaming(monkeypatch, capsys):
     assert "emulator-5554" in str(raised.value), "the error should name what IS available"
 
 
-def test_known_serial_proceeds(monkeypatch, fake_popen):
+def test_known_serial_proceeds(fake_popen, recorded):
     """Guard against the check rejecting a device that is present."""
-    monkeypatch.setattr(
-        log_monitor,
-        "get_connected_devices",
-        lambda: [{"serial": "emulator-5554", "state": "device"}],
-    )
-    fake_popen(_real_log_lines("threadtime", limit=3))
+    fake_popen(_real_records(recorded, limit=3))
 
     monitor = log_monitor.LogMonitor(device_serial="emulator-5554")
     assert monitor.stream_logs() is True

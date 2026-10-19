@@ -82,7 +82,9 @@ MODES = (
     Mode(
         "app_state_capture.py",
         ("--package", "com.example.app", "--output", f"{WORKDIR}/snap", "--json", "--verbose"),
-        1,
+        # Every adb call answers "device not found": the refusal is that, exit 3
+        # (W3-L, A7; the partial-capture path made it 1).
+        3,
         "verbose progress ahead of the partial-capture refusal",
     ),
     Mode("accessibility_audit.py", ("--json",), 3, "a failed audit left stdout empty"),

@@ -13,6 +13,18 @@
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
+      "name": "adb_device_not_found",
+      "file": "adb_device_not_found.txt",
+      "command": "adb -s no-such-serial-xyz get-state",
+      "description": "What adb prints for an unknown serial, using a non-blocking command. Note the prefix is 'error:', not 'adb:'. `adb -s <unknown> shell` does NOT print this -- it blocks waiting for the device to appear, which is why log_monitor validates the serial up front instead of inferring from exit status.",
+      "catches": [
+        "R5"
+      ],
+      "bytes": 45,
+      "exit_status": 1,
+      "stream": "stderr"
+    },
+    {
       "name": "adb_devices_multiple",
       "file": "adb_devices_multiple.txt",
       "command": "adb devices -l",
@@ -29,6 +41,18 @@
       "description": "`adb devices -l` with exactly one device attached.",
       "catches": [],
       "bytes": 142
+    },
+    {
+      "name": "adb_get_state",
+      "file": "adb_get_state.txt",
+      "command": "adb get-state",
+      "description": "`adb get-state` for an attached device: `device`, exit 0. log_monitor asks it before every read, and again when a live read ends by itself: a streaming `adb logcat` aimed at a device that is not there waits instead of failing (adb_waiting_for_device), so its silence cannot tell a quiet device from a missing one. For a serial that is not attached, see adb_device_not_found.",
+      "catches": [
+        "A4"
+      ],
+      "bytes": 7,
+      "exit_status": 0,
+      "stream": "stdout"
     },
     {
       "name": "adb_more_than_one_device",
@@ -55,6 +79,19 @@
       "bytes": 159,
       "exit_status": 0,
       "stream": "stdout"
+    },
+    {
+      "name": "adb_waiting_for_device",
+      "file": "adb_waiting_for_device.txt",
+      "command": "ANDROID_SERIAL=no-such-serial-xyz adb logcat -B -T 1 (host adb), stopped after 3 s",
+      "description": "What a streaming `adb logcat` prints while its device is not attached: the banner `- waiting for device -` on STDERR, nothing on stdout, and it does not exit (recorded exit status: terminated). The case log_monitor --duration used to report as a quiet device, and a banner that pushes adb's own error off the start of the stream's stderr (A5).",
+      "catches": [
+        "A4",
+        "A5"
+      ],
+      "bytes": 23,
+      "exit_status": -15,
+      "stream": "stderr"
     },
     {
       "name": "am_broadcast_missing_receiver",
@@ -602,20 +639,19 @@
       ]
     },
     {
-      "name": "logcat_app_restart_usec",
-      "file": "logcat_app_restart_usec.txt",
-      "command": "adb shell am start -W (x3, ended by am crash, then am force-stop, then left running), then adb logcat -d -v threadtime -v usec, host-filtered to the lines that name the package or come from its pids",
-      "description": "One app, three processes, one window: the fixture app launched, crashed (`am crash`), relaunched, force-stopped, relaunched. The manifest's `pids` are what `pidof` answered while each was alive, in order. This is the evidence that ties a pid to a package when the process is gone and `pidof` can no longer say: what system_server and the app itself write about a process. Note that most lines naming the package come from processes that are NOT the app (system_server, the launcher, the IME), so naming the package says nothing about which process wrote the line. Host-filtered to lines that name the package or carry one of its pids; other apps' free text is not recorded. `system_server_pid` is `pidof system_server` read in the same run: the only process whose ActivityManager lines may say which pids were the app's, since any app can log under that tag. `package_uid_listing` and `ps_alive` are the uid oracles from the same run: `cmd package list packages -U` for the package, `ps -o PID,UID` for the live pid. Microsecond headers (`-v usec`): the lines of one multi-line message share their header to the microsecond; separate messages in one millisecond do not.",
+      "name": "logcat_app_restart_records",
+      "file": "logcat_app_restart_records.bin",
+      "command": "recorded in logcat_app_restart_usec's run, right after its text: adb logcat -d -B, host-filtered to the records that name the package or come from its pids",
+      "description": "logcat_app_restart_usec's window as logd's records (`logcat -B`), dumped right after the text in the same run: what log_monitor and app_state_capture read. Each record is `struct logger_entry` (u16 payload length, u16 header size 28, i32 pid, u32 tid, sec, nsec, log id, uid) then `<priority><tag>NUL<message>NUL`; a multi-line message is ONE record. The pid and uid are logd's, from the socket's credentials: the metadata an app cannot write. Kept whole when the record names the package or comes from one of its pids, so it is a superset of the text half's lines. The manifest carries the same oracles as the text half, and `timezone`: the zone the device printed the text in, which a test printing these records must use.",
       "catches": [
-        "D4"
+        "D4",
+        "A1"
       ],
-      "bytes": 44586,
-      "exit_status": 0,
-      "stream": "stdout",
+      "bytes": 47782,
       "pids": [
-        "21149",
-        "21205",
-        "21274"
+        "32437",
+        "32483",
+        "32523"
       ],
       "pid_endings": [
         "am crash",
@@ -629,9 +665,44 @@
         "output": "package:com.example.composefixture uid:10205\n"
       },
       "ps_alive": {
-        "command": "adb shell ps -o PID,UID -p 21274",
+        "command": "adb shell ps -o PID,UID -p 32523",
         "exit_status": 0,
-        "output": "  PID   UID\n21274 10205\n"
+        "output": "  PID   UID\n32523 10205\n"
+      },
+      "text_twin": "logcat_app_restart_usec",
+      "timezone": "America/Los_Angeles"
+    },
+    {
+      "name": "logcat_app_restart_usec",
+      "file": "logcat_app_restart_usec.txt",
+      "command": "adb shell am start -W (x3, ended by am crash, then am force-stop, then left running), then adb logcat -d -v threadtime -v usec, host-filtered to the lines that name the package or come from its pids",
+      "description": "One app, three processes, one window: the fixture app launched, crashed (`am crash`), relaunched, force-stopped, relaunched. The manifest's `pids` are what `pidof` answered while each was alive, in order. This is the evidence that ties a pid to a package when the process is gone and `pidof` can no longer say: what system_server and the app itself write about a process. Note that most lines naming the package come from processes that are NOT the app (system_server, the launcher, the IME), so naming the package says nothing about which process wrote the line. Host-filtered to lines that name the package or carry one of its pids; other apps' free text is not recorded. `system_server_pid` is `pidof system_server` read in the same run: the only process whose ActivityManager lines may say which pids were the app's, since any app can log under that tag. `package_uid_listing` and `ps_alive` are the uid oracles from the same run: `cmd package list packages -U` for the package, `ps -o PID,UID` for the live pid. Microsecond headers (`-v usec`): the lines of one multi-line message share their header to the microsecond; separate messages in one millisecond do not.",
+      "catches": [
+        "D4"
+      ],
+      "bytes": 45719,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": [
+        "32437",
+        "32483",
+        "32523"
+      ],
+      "pid_endings": [
+        "am crash",
+        "am force-stop",
+        "running when the window was read"
+      ],
+      "system_server_pid": "598",
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10205\n"
+      },
+      "ps_alive": {
+        "command": "adb shell ps -o PID,UID -p 32523",
+        "exit_status": 0,
+        "output": "  PID   UID\n32523 10205\n"
       }
     },
     {
@@ -641,6 +712,38 @@
       "description": "Real Choreographer jank: 'I Choreographer: Skipped N frames!  The application may be doing too much work on its main thread.' TWO spaces after the exclamation mark, and the tag carries the janking app's own pid in the logcat columns -- unlike the ActivityManager ANR lines, whose pid is system_server's. Recorded because every skipped-frame test in this repo built its input from an f-string, which proves only that the parser matches the f-string. Provoked by a cold start of the fixture app, which reliably drops ~30 frames on this profile; a fixed frame COUNT is not something a recording can pin, so the severity-boundary tests derive their counts from this line rather than typing a new one.",
       "catches": [],
       "bytes": 133
+    },
+    {
+      "name": "logcat_crash_buffer",
+      "file": "logcat_crash_buffer.txt",
+      "command": "recorded in logcat_crash_tail's run: adb logcat -b crash -d -v threadtime -v usec",
+      "description": "The crash buffer logcat_crash_tail tails: two FATAL EXCEPTION records of the fixture app, as text.",
+      "catches": [
+        "A8"
+      ],
+      "bytes": 2991,
+      "pids": [
+        "32646",
+        "32692"
+      ],
+      "timezone": "America/Los_Angeles",
+      "first_half": "logcat_crash_tail"
+    },
+    {
+      "name": "logcat_crash_buffer_records",
+      "file": "logcat_crash_buffer_records.bin",
+      "command": "recorded in logcat_crash_tail's run: adb logcat -b crash -d -B",
+      "description": "logcat_crash_buffer as logd's records: two records, one per crash.",
+      "catches": [
+        "A8"
+      ],
+      "bytes": 1700,
+      "pids": [
+        "32646",
+        "32692"
+      ],
+      "timezone": "America/Los_Angeles",
+      "text_twin": "logcat_crash_buffer"
     },
     {
       "name": "logcat_crash_java",
@@ -659,12 +762,96 @@
       "bytes": 4355
     },
     {
+      "name": "logcat_crash_tail",
+      "file": "logcat_crash_tail.txt",
+      "command": "adb logcat -b crash -c; (am start -W, am crash) x2; adb logcat -b crash -d -v threadtime -v usec -T 1",
+      "description": "`-T 1` against a crash buffer holding two crashes: the WHOLE last crash, every line under one header, after the buffer's separator -- not its last line. logd tails records, and a multi-line message is one record. The buffer itself is logcat_crash_buffer (text) and logcat_crash_buffer_records; this tail as records is logcat_crash_tail_records. All four in one run.",
+      "catches": [
+        "A8"
+      ],
+      "bytes": 1510,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": [
+        "32646",
+        "32692"
+      ]
+    },
+    {
+      "name": "logcat_crash_tail_records",
+      "file": "logcat_crash_tail_records.bin",
+      "command": "recorded in logcat_crash_tail's run: adb logcat -b crash -d -B -T 1",
+      "description": "`-T 1` as records: exactly the buffer's last record, byte for byte (checked at capture), its message many lines long.",
+      "catches": [
+        "A8"
+      ],
+      "bytes": 850,
+      "pids": [
+        "32646",
+        "32692"
+      ],
+      "timezone": "America/Los_Angeles",
+      "text_twin": "logcat_crash_tail"
+    },
+    {
       "name": "logcat_strictmode_violation",
       "file": "logcat_strictmode_violation.txt",
       "command": "adb shell logcat -d -v threadtime | grep -E '[VDIWEF] StrictMode: '",
       "description": "What StrictMode actually logs, against what anr_pipeline was written for. The real header is 'D StrictMode: StrictMode policy violation; ~duration=27 ms: android.os.strictmode.DiskReadViolation'; the invented sample was 'D StrictMode: Slow operation detected on main thread', which StrictMode prints in no form at all (it borrows the wording of ActivityManager's own 'Slow operation:' bookkeeping, a different subsystem entirely). Two consequences visible in this file. The violation states its OWN duration, which _classify_anr discards in favour of a hard-coded WARN_FRAMES * FRAME_MS. And every frame of the stack trace that follows is logged under the same StrictMode tag, so a tag-only match turns one violation into one event per stack frame -- about thirty. Provoked by StrictModeActivity, which enables the policy and then reads and writes a file on the main thread.",
       "catches": [],
       "bytes": 32991
+    },
+    {
+      "name": "logcat_tag_injection",
+      "file": "logcat_tag_injection.txt",
+      "command": "adb shell am start -W (the fixture app); adb shell 'log -p e -t \"x:<newline><system_server header> I ActivityManager\" \"Start proc $$:<package>/<uid> for w3l-tag-injection\"; exec log ...'; adb logcat -d -v threadtime -v usec, host-filtered to the package, its pid and the two injecting pids",
+      "description": "A TAG an app chooses forges a whole line. The shell, standing in for any app, logs ONE record whose tag is `x:`, a newline, and a threadtime header claiming system_server's pid and the tag ActivityManager, with system_server's `Start proc <victim>:<package>/<package uid>` as its message; the victim (the logging shell, which `exec log` keeps at its pid) then logs one line. logcat prints a tag verbatim, so this text shows system_server naming the victim as the app's process -- byte reads and LF framing do not help. The manifest's `injection` names the forging and the victim pid; `pids` is the app's pid from `pidof`; `system_server_pid` the real one.",
+      "catches": [
+        "A1"
+      ],
+      "bytes": 13312,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": [
+        "32586"
+      ],
+      "system_server_pid": "598",
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10205\n"
+      },
+      "injection": {
+        "forger_pid": "32622",
+        "victim_pid": "32619",
+        "command": "adb shell 'log -p e -t \"x:\\n$(date +\"%m-%d %H:%M:%S\").000000   598   598 I ActivityManager\" \"Start proc $$:com.example.composefixture/u0a205 for w3l-tag-injection\"; exec log -p e -t W3L-victim \"w3l-tag-injection victim line\"'"
+      }
+    },
+    {
+      "name": "logcat_tag_injection_records",
+      "file": "logcat_tag_injection_records.bin",
+      "command": "recorded in logcat_tag_injection's run, right after its text: adb logcat -d -B",
+      "description": "logcat_tag_injection's window as logd's records: the forging record is ONE record, pid and uid the shell's (2000), its tag holding the newline and the fake header -- nothing in it is system_server's. Same filter and oracles as the text half.",
+      "catches": [
+        "A1"
+      ],
+      "bytes": 14446,
+      "pids": [
+        "32586"
+      ],
+      "system_server_pid": "598",
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10205\n"
+      },
+      "injection": {
+        "forger_pid": "32622",
+        "victim_pid": "32619",
+        "command": "adb shell 'log -p e -t \"x:\\n$(date +\"%m-%d %H:%M:%S\").000000   598   598 I ActivityManager\" \"Start proc $$:com.example.composefixture/u0a205 for w3l-tag-injection\"; exec log -p e -t W3L-victim \"w3l-tag-injection victim line\"'"
+      },
+      "text_twin": "logcat_tag_injection",
+      "timezone": "America/Los_Angeles"
     },
     {
       "name": "logcat_threadtime",

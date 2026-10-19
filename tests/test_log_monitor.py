@@ -4,9 +4,16 @@ Covers the two curated deltas:
   1. ``--last DURATION`` historical window built via ``logcat -d -t "<timestamp>"``.
   2. Output caps made env-configurable via ``ANDROID_EMU_LOG_*`` (defaults preserved).
 
-And, at the end, the v0.8.0 Inc 1 fixes driven through the real CLI against a
-fake adb that answers with recorded output: D1 (``--severity``), N15 (line
-counts beside unique counts) and D4 (an app filter that survives a restart).
+And, at the end, the v0.8.0 fixes driven through the real CLI against a fake
+adb that answers with recorded output: D1 (``--severity``), N15 (line counts
+beside unique counts), D4 (an app filter that survives a restart), and the
+review of v0.8.0: A3 (a window that leaves the app's lines out says so), A4 (a
+device that is not there is never a quiet capture), A5 (adb's error is read
+line by line) and A8 (the fake device tails records, as logd does).
+
+log_monitor reads logd's records (``logcat -B``), so the fake device replays
+recorded records; a window the device did not record is derived from a
+recorded one a record at a time (``fake_toolchain.Frame``).
 
 All adb/subprocess interaction is mocked, so these run without a device.
 """
@@ -17,11 +24,20 @@ import importlib
 import io
 import json
 import re
+import subprocess
 from datetime import datetime
 
 import log_monitor
 import pytest
-from fake_toolchain import FakeToolchain, Rule, assert_refusal, uid_rules
+from fake_toolchain import (
+    FakeToolchain,
+    Frame,
+    Rule,
+    assert_refusal,
+    framed,
+    frames,
+    uid_rules,
+)
 
 from common import logcat
 from common.device_utils import parse_package_uids
@@ -40,11 +56,14 @@ def test_build_command_base_streaming():
     assert cmd[0] == "adb"
     assert "-d" not in cmd
     assert "-t" not in cmd
-    # threadtime, not time: parse_logcat_line needs the PID/TID columns.
-    # This previously asserted "time", locking in a parser that matched
-    # nothing (A1).
-    assert cmd[cmd.index("-v") + 1] == "threadtime"
+    # logd's records, not text: a tag can forge a whole line of text (A1).
+    # (The text layout the parser reads is what LogRecord.lines prints; the
+    # `-v time` layout this once asked for matched nothing.)
+    assert logcat.BINARY_FLAG in cmd
+    assert "-v" not in cmd
     assert cmd.index("logcat") == 1
+    # A live read starts at the end of the buffer.
+    assert cmd[cmd.index("-T") + 1] == "1"
 
 
 def test_build_command_includes_serial():
@@ -53,28 +72,35 @@ def test_build_command_includes_serial():
 
 
 @pytest.mark.parametrize(
-    ("severities", "kept"),
-    [(["error"], True), (["error", "warning"], True), (None, False), (["info"], False)],
+    "severities",
+    [["error"], ["error", "warning"], None, ["info"]],
     ids=["error", "error,warning", "default", "info"],
 )
-def test_an_app_filter_keeps_the_lines_that_name_its_processes(severities, kept):
-    """``ActivityManager:I`` rides under a floor above I, ahead of ``*:P``.
+def test_no_filterspec_is_sent_with_a_binary_read(severities):
+    """``-B`` ignores filterspecs (measured: ``*:E`` still returned I and D records).
 
-    The lines that say which pids were the app's are I (recorded:
-    logcat_app_restart_usec), so ``*:W`` alone would drop them and a killed
-    process's lines would go with them. At I and below they already arrive.
+    Sending one would only suggest a device-side filter that is not applied;
+    the floor is applied on the host (``_above_floor``), after attribution.
     """
     cmd = _monitor(app_package="com.myapp", severity_filter=severities).build_logcat_command()
-    floor = next(part for part in cmd if part.startswith("*:"))
-    if kept:
-        assert cmd.index("ActivityManager:I") < cmd.index(floor), cmd
-    else:
-        assert "ActivityManager:I" not in cmd, cmd
+    assert not [part for part in cmd if ":" in part and not part.startswith("-")], cmd
 
 
-def test_no_process_term_without_an_app():
-    cmd = _monitor(severity_filter=["error"]).build_logcat_command()
-    assert [part for part in cmd if ":" in part and not part.startswith("-")] == ["*:E"]
+@pytest.mark.parametrize(
+    ("severities", "kept", "dropped"),
+    [
+        (["error"], ["E", "F", "S"], ["W", "I", "D", "V", "?"]),
+        (["error", "warning"], ["W", "E"], ["I", "V"]),
+        (None, ["D", "I", "W", "E"], ["V", "?"]),
+        (["verbose"], ["V", "D", "E"], ["?"]),
+    ],
+    ids=["error", "error,warning", "default", "verbose"],
+)
+def test_the_floor_is_the_one_a_filterspec_applied(severities, kept, dropped):
+    """``*:<P>`` showed P and everything above it; so does the host floor."""
+    monitor = _monitor(severity_filter=severities)
+    assert all(monitor._above_floor(p) for p in kept)
+    assert not any(monitor._above_floor(p) for p in dropped)
 
 
 # --- delta 1: --last historical window (logcat -d -t) ---------------------------
@@ -88,6 +114,7 @@ def test_build_command_last_window_uses_dump_and_tail():
     t_index = cmd.index("-t")
     # Timestamp is "MM-DD HH:MM:SS.000" for now - 5 minutes => 12:25:00.
     assert cmd[t_index + 1] == "06-17 12:25:00.000"
+    assert "-T" not in cmd
 
 
 def test_build_command_last_window_hour_offset():
@@ -123,21 +150,32 @@ def test_severity_min_priority_verbose():
     assert _monitor(severity_filter=["verbose"])._severity_min_priority() == "V"
 
 
-def test_severity_filter_appended_to_command():
-    cmd = _monitor(severity_filter=["error"]).build_logcat_command()
-    assert "*:E" in cmd
-
-
 # --- stream_logs integration: --last builds the historical command --------------
 
 
-def test_stream_logs_last_window_runs_dump_command(monkeypatch):
+def _state_answers(monkeypatch, recorded) -> list[list[str]]:
+    """adb (through adb_exec) answering `get-state` as recorded for an attached device."""
+    from common import adb_exec
+
+    asked: list[list[str]] = []
+
+    def run(cmd, **_kwargs):
+        asked.append(cmd)
+        if "get-state" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, recorded.text("adb_get_state"), "")
+        raise AssertionError(f"unexpected adb call {cmd}")
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", run)
+    return asked
+
+
+def test_stream_logs_last_window_runs_dump_command(monkeypatch, recorded):
     captured: dict = {}
 
     class _FakePopen:
         def __init__(self, cmd, **_kwargs):
             captured["cmd"] = cmd
-            # Empty stream: readline() returns b"" immediately (EOF).
+            # Empty stream: the first read returns b"" immediately (EOF).
             self.stdout = io.BytesIO(b"")
             self.stderr = io.BytesIO(b"")
 
@@ -155,25 +193,25 @@ def test_stream_logs_last_window_runs_dump_command(monkeypatch):
         def kill(self):
             return None
 
-    # No app package -> _resolve_app_pid returns None without calling adb.
+    # No app package -> no pidof; the device is asked whether it is there.
+    asked = _state_answers(monkeypatch, recorded)
     monkeypatch.setattr(log_monitor.subprocess, "Popen", _FakePopen)
 
     ok = _monitor().stream_logs(last_minutes=5)
     assert ok is True
     assert "-d" in captured["cmd"]
     assert "-t" in captured["cmd"]
+    assert [cmd[-1] for cmd in asked] == ["get-state"], "a dump that ends is not re-checked"
 
 
 def _pidof_answers(monkeypatch, returncode: int, stdout: str) -> None:
     # adb now goes through common.adb_exec, so that is where the fake belongs.
-    import subprocess as real_subprocess
-
     from common import adb_exec
 
     monkeypatch.setattr(
         adb_exec.subprocess,
         "run",
-        lambda cmd, **_k: real_subprocess.CompletedProcess(cmd, returncode, stdout, ""),
+        lambda cmd, **_k: subprocess.CompletedProcess(cmd, returncode, stdout, ""),
     )
 
 
@@ -309,8 +347,10 @@ def test_a_bad_duration_never_reaches_the_device(monkeypatch):
 # =============================================================================
 
 PACKAGE = "com.example.composefixture"
+RECORDS = "logcat_app_restart_records"
 
-# The threadtime layout, read for its PRIORITY and PID columns only.
+# The threadtime layout, read for its PRIORITY and PID columns only -- what
+# log_monitor prints a record as (common.logcat.LogRecord.lines).
 _THREADTIME = re.compile(r"^\d{2}-\d{2}\s+\S+\s+(?P<pid>\d+)\s+\d+\s+(?P<priority>[VDIWEF])\s")
 
 
@@ -328,26 +368,32 @@ def toolchain(tmp_path) -> FakeToolchain:
 def _device(
     toolchain,
     recorded,
-    logcat_text: str,
+    window: bytes,
     *,
     pidof: Rule | None = None,
     system_server: str | None = None,
     uids: bool = True,
-    buffered: str = "",
+    buffered: bytes = b"",
 ) -> None:
-    """A device that lists itself, answers ``pidof`` as told, and replays ``logcat_text``.
+    """A device that is attached, answers ``pidof`` as told, and replays ``window``.
 
-    ``buffered`` is what the device already held when a read began: a dump
-    gets it whole before ``logcat_text``, a live read under ``-T N`` only its
-    last N lines (fake_toolchain's ``-T`` simulation).
+    ``window`` is recorded ``logcat -B`` records. ``buffered`` is what the
+    device already held when a read began: a dump gets it whole before
+    ``window``, a live read under ``-T N`` only its last N records
+    (fake_toolchain's ``-T`` simulation).
 
-    ``system_server`` answers ``pidof system_server``; its rule goes first, as
-    the stub takes the first rule whose tokens all appear. Without it, that
-    question gets the app's ``pidof`` answer like any other. With ``uids``,
-    the package's uid and the ``pidof`` pid's uid are the recorded package uid
-    (fake_toolchain.uid_rules); without, those questions get no answer.
+    ``get-state`` answers as recorded for an attached device (adb_get_state):
+    log_monitor asks before every read. ``system_server`` answers ``pidof
+    system_server``; its rule goes first, as the stub takes the first rule
+    whose tokens all appear. Without it, that question gets the app's
+    ``pidof`` answer like any other. With ``uids``, the package's uid and the
+    ``pidof`` pid's uid are the recorded package uid (fake_toolchain.uid_rules);
+    without, those questions get no answer.
     """
-    rules = [Rule(("devices",), stdout=recorded.text("adb_devices_single"))]
+    rules = [
+        Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+        Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+    ]
     if system_server is not None:
         rules.append(Rule(("shell", "pidof", "system_server"), stdout=system_server))
     if uids:
@@ -355,7 +401,7 @@ def _device(
         rules += uid_rules(recorded, PACKAGE, answered if answered.isdigit() else None)
     if pidof is not None:
         rules.append(pidof)
-    rules.append(Rule(("logcat",), stdout=logcat_text, buffered=buffered, filter_pid=True))
+    rules.append(Rule(("logcat",), stdout=window, buffered=buffered, filter_pid=True))
     toolchain.install("adb", rules)
 
 
@@ -368,38 +414,68 @@ def _not_running(recorded) -> Rule:
     )
 
 
-# How each process in logcat_app_restart_usec ended, as its MANIFEST entry words it.
+# How each process in the restart window ended, as its MANIFEST entry words it.
 CRASHED, STOPPED, ALIVE = "am crash", "am force-stop", "running when the window was read"
 
 
-def _restart_pids(recorded) -> dict[str, str]:
-    """``pidof`` for each process in logcat_app_restart_usec, keyed by how it ended.
+def _entry(recorded) -> dict:
+    return next(e for e in recorded.manifest["fixtures"] if e["name"] == RECORDS)
 
-    The recording (made for app_state_capture's half of D4) stores the pids in
-    launch order under ``pids`` and their endings under ``pid_endings``.
+
+def _restart_pids(recorded) -> dict[str, str]:
+    """``pidof`` for each process in the restart window, keyed by how it ended.
+
+    The recording stores the pids in launch order under ``pids`` and their
+    endings under ``pid_endings``.
     """
-    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == "logcat_app_restart_usec")
+    entry = _entry(recorded)
     pids = dict(zip(entry["pid_endings"], entry["pids"], strict=True))
     if set(pids) != {CRASHED, STOPPED, ALIVE} or len(set(pids.values())) != 3:
-        pytest.fail(f"logcat_app_restart_usec no longer records a crash and a restart: {pids}")
+        pytest.fail(f"{RECORDS} no longer records a crash and a restart: {pids}")
     return pids
 
 
 def _system_server(recorded) -> str:
-    """``pidof system_server``, read in the run that recorded logcat_app_restart_usec."""
-    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == "logcat_app_restart_usec")
+    """``pidof system_server``, read in the run that recorded the restart window."""
+    entry = _entry(recorded)
     if not str(entry.get("system_server_pid", "")).isdigit():
-        pytest.fail("logcat_app_restart_usec no longer records system_server's pid; re-record it")
+        pytest.fail(f"{RECORDS} no longer records system_server's pid; re-record it")
     return entry["system_server_pid"]
 
 
 def _oracles(recorded) -> dict:
     """system_server's pid and the package's uid, both recorded with the window."""
-    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == "logcat_app_restart_usec")
-    uid = parse_package_uids(entry["package_uid_listing"]["output"], PACKAGE)
+    uid = parse_package_uids(_entry(recorded)["package_uid_listing"]["output"], PACKAGE)
     if uid is None:
-        pytest.fail("logcat_app_restart_usec no longer records the package's uid; re-record it")
+        pytest.fail(f"{RECORDS} no longer records the package's uid; re-record it")
     return {"system_server_pid": _system_server(recorded), "package_uids": uid}
+
+
+def _window(recorded) -> list[Frame]:
+    return frames(recorded.data(f"{RECORDS}.bin"))
+
+
+def _records(window) -> list[logcat.LogRecord]:
+    return logcat.parse_records(window if isinstance(window, bytes) else framed(window))
+
+
+def _lines(window, pids: set[str] | None = None, floor: str = "D") -> list[str]:
+    """The lines log_monitor prints for the records of ``pids`` at or above ``floor``.
+
+    ``floor`` is the default severity filter's (error,warning,info,debug ->
+    D): a ``*:D`` filterspec never let V through, and the host floor that
+    replaced it does not either. Printed by common.logcat, whose printing is
+    held against the device's own text in test_log_records.py.
+    """
+    order = logcat.PRIORITY_ORDER
+    return [
+        line
+        for record in _records(window)
+        if (pids is None or str(record.pid) in pids)
+        and record.priority in order
+        and order.index(record.priority) >= order.index(floor)
+        for line in record.lines()
+    ]
 
 
 # --- D1: --severity is a closed vocabulary --------------------------------------
@@ -446,43 +522,60 @@ def test_n15_warnings_count_lines_and_unique_warnings_count_messages(mode, toolc
     The priority column is the ground truth: a reader counting W down it gets
     one number, and ``warnings`` must be that number. The deduplicated count
     is still worth having, so it is ``unique_warnings``, equal to the length of
-    the deduplicated list.
+    the deduplicated list -- which is the recording's W messages, read off its
+    lines, the same message counted once whatever numbers it carries (a pid, a
+    count), in the order they first appear.
     """
-    lines = recorded.lines("logcat_threadtime")
+    window = recorded.data(f"{RECORDS}.bin")
+    lines = _lines(window, floor="W")
     priorities = _column(lines, "priority")
     warned = priorities.count("W")
-    distinct = {line[m.end() :] for line in lines if (m := _THREADTIME.match(line)) and m[2] == "W"}
-    if warned <= len(distinct):
+    listed: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        m = _THREADTIME.match(line)
+        if not m or m["priority"] != "W":
+            continue
+        tag, _, message = line[m.end() :].partition(":")
+        # The same message whatever its numbers, and however it is spaced.
+        signature = " ".join(re.sub(r"\d+", "", f"{tag.strip()}:{message.strip()}").split())
+        if signature not in seen:
+            seen.add(signature)
+            listed.append(f"[{tag.strip()}] {message.strip()}")
+    if warned <= len(listed):
         pytest.fail("the recording has no repeated warning; N15 would be vacuous")
 
-    _device(toolchain, recorded, recorded.text("logcat_threadtime"))
+    _device(toolchain, recorded, window)
     argv = ["--severity", "error,warning", "--last", "1m"] + (["--json"] if mode == "json" else [])
-    result = toolchain.run("log_monitor.py", *argv)
+    result = toolchain.run("log_monitor.py", *argv, ANDROID_EMU_LOG_JSON_CAP="1000")
     assert result.returncode == 0, result.stderr
 
     if mode == "json":
         payload = json.loads(result.stdout)
         stats = payload["statistics"]
         assert stats["warnings"] == warned
-        assert stats["unique_warnings"] == len(payload["warnings"]) == len(distinct)
+        assert stats["unique_warnings"] == len(listed) < warned
+        assert payload["warnings"] == listed
         assert stats["errors"] == priorities.count("E") + priorities.count("F")
         assert stats["unique_errors"] == len(payload["errors"])
     else:
         counts = _counts_in_text(result.stdout)
-        assert counts["warnings"] == (warned, len(distinct)), result.stdout
+        assert counts["warnings"][0] == warned, result.stdout
+        assert counts["warnings"] == (warned, len(listed)), result.stdout
         assert counts["errors"][0] == priorities.count("E") + priorities.count("F")
 
 
 def test_n15_errors_count_every_line_of_a_crash_loop(toolchain, recorded):
-    """The same shape for errors: three crashes of 13 E lines are 39 errors.
+    """The same shape for errors: two crashes of many E lines are that many errors.
 
-    Only the line count can be compared with what ``app_state_capture`` (D3) and
-    a grep of the priority column report; the unique count says how many
-    distinct messages that was.
+    Only the line count can be compared with what ``app_state_capture`` (D3)
+    and a grep of the priority column report; the unique count says how many
+    distinct messages that was. Recorded: logcat_crash_buffer_records, two
+    crashes of the fixture app, each one record.
     """
-    lines = recorded.lines("logcat_crash_loop")
-    errors = sum(1 for p in _column(lines, "priority") if p in "EF")
-    _device(toolchain, recorded, recorded.text("logcat_crash_loop"))
+    window = recorded.data("logcat_crash_buffer_records.bin")
+    errors = sum(1 for p in _column(_lines(window, floor="E"), "priority") if p in "EF")
+    _device(toolchain, recorded, window)
 
     result = toolchain.run("log_monitor.py", "--severity", "error", "--last", "5m", "--json")
     assert result.returncode == 0, result.stderr
@@ -497,21 +590,17 @@ def test_n15_errors_count_every_line_of_a_crash_loop(toolchain, recorded):
 def test_parse_package_pids_reads_the_apps_processes_from_the_log(recorded):
     """Each pid `pidof` read while that process was alive, and no other.
 
-    The force-stopped process is the case a crash line cannot cover: only
-    ActivityManager's `Start proc` / `Killing` lines say it was the app's.
+    The force-stopped process is the case a crash record cannot cover: only
+    ActivityManager's `Start proc` / `Killing` records say it was the app's.
     """
     pids = set(_restart_pids(recorded).values())
-    text = recorded.text("logcat_app_restart_usec")
-    checked = logcat.parse_package_pids(text, PACKAGE, **_oracles(recorded))
-    assert checked == pids, "system_server's own lines must pass the producer check"
+    checked = logcat.parse_package_pids(_records(_window(recorded)), PACKAGE, **_oracles(recorded))
+    assert checked == pids, "system_server's own records must pass the producer check"
 
 
 @pytest.mark.parametrize(
     ("statement", "ending"),
-    [
-        (" ActivityManager: Start proc ", ALIVE),
-        (" ActivityManager: Killing ", STOPPED),
-    ],
+    [("Start proc ", ALIVE), ("Killing ", STOPPED)],
     ids=["start", "force-stop"],
 )
 def test_each_statement_names_the_pid_on_its_own(statement, ending, recorded):
@@ -519,38 +608,39 @@ def test_each_statement_names_the_pid_on_its_own(statement, ending, recorded):
 
     Every launch logs `Start proc`; the force-stop logs `Killing`. (`has died`
     carries no uid and only ends a life already confirmed; the crash's own
-    AndroidRuntime `Process:` line names nothing alone -- both in
+    AndroidRuntime `Process:` record names nothing alone -- both in
     tests/test_app_window_producer.py.)
     """
-    lines = [line for line in recorded.lines("logcat_app_restart_usec") if statement in line]
-    if not lines:
-        pytest.fail(f"the recording has no {statement.strip()!r} line")
+    chosen = [
+        f
+        for f in _window(recorded)
+        if f.tag == "ActivityManager" and f.message.startswith(statement)
+    ]
+    if not chosen:
+        pytest.fail(f"the recording has no {statement.strip()!r} record")
     pids = _restart_pids(recorded)
-    found = logcat.parse_package_pids("\n".join(lines), PACKAGE, **_oracles(recorded))
-    assert pids[ending] in found, lines
+    found = logcat.parse_package_pids(_records(chosen), PACKAGE, **_oracles(recorded))
+    assert pids[ending] in found, [f.message for f in chosen]
     assert found <= set(pids.values()), found
 
 
-def test_parse_package_pids_finds_nothing_in_crash_lines_alone(recorded):
-    """The crash buffer has no system_server line, and a crash line is no source.
+def test_parse_package_pids_finds_nothing_in_crash_records_alone(recorded):
+    """The crash buffer has no system_server record, and a crash record is no source.
 
     Any app can write AndroidRuntime's `Process: <pkg>, PID: <its pid>` for
     another package (Codex review of #27, ruling A); a real crash is named by
-    system_server's `Start proc` / `has died` instead.
+    system_server's `Start proc` instead.
     """
-    crash = recorded.text("logcat_crash_loop")
-    if not _column(crash.splitlines(), "pid"):
-        pytest.fail("the crash loop recording no longer holds a crash")
-    found = logcat.parse_package_pids(crash, PACKAGE, **_oracles(recorded))
-    assert found == set()
+    crash = _records(recorded.data("logcat_crash_buffer_records.bin"))
+    if not crash:
+        pytest.fail("the crash buffer recording no longer holds a crash")
+    assert logcat.parse_package_pids(crash, PACKAGE, **_oracles(recorded)) == set()
 
 
 def test_parse_package_pids_does_not_claim_a_longer_package_name(recorded):
     """``com.example.compose`` is not ``com.example.composefixture``."""
     found = logcat.parse_package_pids(
-        recorded.text("logcat_app_restart_usec"),
-        PACKAGE[:-7],
-        **_oracles(recorded),
+        _records(_window(recorded)), PACKAGE[:-7], **_oracles(recorded)
     )
     assert found == set()
 
@@ -561,13 +651,16 @@ def test_parse_package_pids_reads_only_the_tag_that_owns_the_statement(recorded)
     Derived from the recording by substituting the tag for another one the
     same process logs under in it.
     """
-    lines = recorded.lines("logcat_app_restart_usec")
-    start = next((line for line in lines if " I ActivityManager: Start proc " in line), None)
-    if start is None or not any(" ActivityTaskManager: " in line for line in lines):
+    window = _window(recorded)
+    start = next(
+        (f for f in window if f.tag == "ActivityManager" and f.message.startswith("Start proc")),
+        None,
+    )
+    if start is None or not any(f.tag == "ActivityTaskManager" for f in window):
         pytest.fail("the recording no longer has the two tags this substitution needs")
-    forged = start.replace(" ActivityManager: ", " ActivityTaskManager: ")
-    assert logcat.parse_package_pids(start, PACKAGE, **_oracles(recorded))
-    assert logcat.parse_package_pids(forged, PACKAGE, **_oracles(recorded)) == set()
+    assert logcat.parse_package_pids(_records([start]), PACKAGE, **_oracles(recorded))
+    forged = start.replace(tag="ActivityTaskManager")
+    assert logcat.parse_package_pids(_records([forged]), PACKAGE, **_oracles(recorded)) == set()
 
 
 def test_parse_threadtime_reads_pid_and_priority_and_skips_separators(recorded):
@@ -590,7 +683,7 @@ def test_d4_an_app_filter_is_never_a_device_side_pid(toolchain, recorded):
     _device(
         toolchain,
         recorded,
-        recorded.text("logcat_app_restart_usec"),
+        recorded.data(f"{RECORDS}.bin"),
         pidof=Rule(("shell", "pidof"), stdout=alive),
         system_server=_system_server(recorded),
     )
@@ -601,37 +694,25 @@ def test_d4_an_app_filter_is_never_a_device_side_pid(toolchain, recorded):
     assert not [arg for call in sent for arg in call if arg.startswith("--pid")], sent
 
 
-def _apps_lines(text: str, pids: set[str]) -> list[str]:
-    """The lines of ``text`` from ``pids``, as log_monitor keeps them.
-
-    rstrip: some device lines end in spaces, and log_monitor strips each line.
-    """
-    return [
-        line.rstrip()
-        for line in text.splitlines()
-        if (m := _THREADTIME.match(line)) and m[1] in pids
-    ]
-
-
 def test_d4_a_force_stopped_process_stays_in_the_apps_window(toolchain, tmp_path, recorded):
-    """D4 beyond a crash: a force-stopped process leaves no crash line.
+    """D4 beyond a crash: a force-stopped process leaves no crash record.
 
     The window -- the JSON's ``sample_logs`` and the saved log alike -- is
-    every line of every process `pidof` saw, crashed, stopped and alive, in
+    every record of every process `pidof` saw, crashed, stopped and alive, in
     order, and nothing else: not system_server or the other processes whose
-    lines name the package, not a buffer separator. The same window
-    app_state_capture saves for this recording.
+    records name the package. The same window app_state_capture saves for
+    this recording.
     """
     pids = set(_restart_pids(recorded).values())
-    text = recorded.text("logcat_threadtime") + recorded.text("logcat_app_restart_usec")
-    unrelated = set(_column(text.splitlines(), "pid")) - pids
+    window = recorded.data(f"{RECORDS}.bin")
+    unrelated = {str(record.pid) for record in _records(window)} - pids
     if not unrelated:
-        pytest.fail("the window has no line from another process; exclusion is untested")
+        pytest.fail("the window has no record from another process; exclusion is untested")
     alive = _restart_pids(recorded)[ALIVE]
     _device(
         toolchain,
         recorded,
-        text,
+        window,
         pidof=Rule(("shell", "pidof"), stdout=alive),
         system_server=_system_server(recorded),
     )
@@ -650,43 +731,47 @@ def test_d4_a_force_stopped_process_stays_in_the_apps_window(toolchain, tmp_path
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["sample_logs"] == _apps_lines(text, pids)
+    assert payload["sample_logs"] == _lines(window, pids)
     assert payload["app_pids"] == sorted(pids, key=int)
     logs = sorted(saved.glob("*.log"))
     if len(logs) != 1:
         pytest.fail(f"expected one saved log under {saved}, found {logs}")
-    assert logs[0].read_text(encoding="utf-8").splitlines() == _apps_lines(text, pids)
+    assert logs[0].read_bytes().decode("utf-8").split("\n") == _lines(window, pids)
+
+
+def _without_start_of(recorded, pid: str) -> list[Frame]:
+    """The restart window as if ``pid`` had started before the window opened."""
+    window = _window(recorded)
+    starts = [f for f in window if f.message.startswith(f"Start proc {pid}:")]
+    if len(starts) != 1:
+        pytest.fail(f"the recording no longer starts {pid} exactly once")
+    return [f for f in window if f not in starts]
 
 
 def test_d4_a_process_already_running_when_the_window_opened_is_kept_whole(toolchain, recorded):
-    """Its only naming line, `Killing`, comes AFTER all of its own lines.
+    """Its only naming record, `Killing`, comes AFTER all of its own records.
 
     A window that opens mid-life has no `Start proc` for that process. Derived
     from the recording by deleting the force-stopped process's `Start proc`
-    line, so system_server's `Killing <pid>` is the one line that names it,
-    and every line of the process precedes it. A window filtered as it is read
-    -- or a held window parsed without system_server's pid -- loses them all.
+    record, so system_server's `Killing <pid>` is the one record that names
+    it, and every record of the process precedes it. A window filtered as it
+    is read -- or a held window parsed without system_server's pid -- loses
+    them all.
 
     Run with the live hold capped at 5 lines: a historical read is not a live
     one, holds the whole window, and must keep all of them whatever that cap.
     """
     pids = _restart_pids(recorded)
     stopped = pids[STOPPED]
-    lines = recorded.text("logcat_app_restart_usec").splitlines(keepends=True)
-    start = [line for line in lines if f"ActivityManager: Start proc {stopped}:" in line]
-    killing = [line for line in lines if f"ActivityManager: Killing {stopped}:" in line]
-    if len(start) != 1 or len(killing) != 1:
-        pytest.fail("the recording no longer starts and kills the stopped process once each")
-    window = "".join(line for line in lines if line not in start)
-    first_own = next(
-        i for i, line in enumerate(window.splitlines()) if line.split()[2:3] == [stopped]
-    )
-    if first_own > window.splitlines().index(killing[0].rstrip("\n")):
-        pytest.fail("the stopped process logged nothing before its Killing line")
+    window = _without_start_of(recorded, stopped)
+    killing = next(i for i, f in enumerate(window) if f.message.startswith(f"Killing {stopped}:"))
+    first_own = next(i for i, f in enumerate(window) if f.pid == stopped)
+    if first_own > killing:
+        pytest.fail("the stopped process logged nothing before its Killing record")
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
@@ -702,14 +787,16 @@ def test_d4_a_process_already_running_when_the_window_opened_is_kept_whole(toolc
         ANDROID_EMU_LOG_PENDING_CAP="5",
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["sample_logs"] == _apps_lines(window, set(pids.values()))
+    assert json.loads(result.stdout)["sample_logs"] == _lines(window, set(pids.values()))
 
 
 def _historical_and_live(toolchain, *app_args: str) -> tuple[dict, dict]:
     """The same device read with ``--last`` and with a live ``--duration``.
 
     The stub's logcat prints its recording and exits, so the live read ends at
-    the end of the recording -- the same lines a historical read sees.
+    the end of the recording -- the same records a historical read sees. (A
+    live read that ends by itself asks ``get-state`` again; the device still
+    answers ``device``, so what it read is the capture.)
     """
     runs = []
     for window in (("--last", "5m"), ("--duration", "30s")):
@@ -721,34 +808,25 @@ def _historical_and_live(toolchain, *app_args: str) -> tuple[dict, dict]:
     return runs[0], runs[1]
 
 
-def _without_start_of(recorded, pid: str) -> str:
-    """logcat_app_restart_usec as if ``pid`` had started before the window opened."""
-    lines = recorded.text("logcat_app_restart_usec").splitlines(keepends=True)
-    starts = [line for line in lines if f"ActivityManager: Start proc {pid}:" in line]
-    if len(starts) != 1:
-        pytest.fail(f"the recording no longer starts {pid} exactly once")
-    return "".join(line for line in lines if line not in starts)
+def _until_the_crash_is_over(recorded) -> list[Frame]:
+    """The restart window up to the crashed process's `has died`: no relaunch yet.
 
-
-def _until_the_crash_is_over(recorded) -> str:
-    """logcat_app_restart_usec up to the crashed process's `has died`: no relaunch yet.
-
-    A prefix of the recording, so every line is as recorded; it ends where an
-    agent looking at a crash that was not restarted would read.
+    A prefix of the recording, so every record is as recorded; it ends where
+    an agent looking at a crash that was not restarted would read.
     """
     crashed = _restart_pids(recorded)[CRASHED]
-    lines = recorded.text("logcat_app_restart_usec").splitlines(keepends=True)
+    window = _window(recorded)
     died = next(
         (
             i
-            for i, line in enumerate(lines)
-            if f"ActivityManager: Process {PACKAGE} (pid {crashed}) has died" in line
+            for i, f in enumerate(window)
+            if f.message.startswith(f"Process {PACKAGE} (pid {crashed}) has died")
         ),
         None,
     )
     if died is None:
         pytest.fail("the recording no longer holds the crashed process's `has died`")
-    return "".join(lines[: died + 1])
+    return window[: died + 1]
 
 
 def test_d4_parity_a_crash_read_live_counts_what_last_counts(toolchain, recorded):
@@ -759,10 +837,11 @@ def test_d4_parity_a_crash_read_live_counts_what_last_counts(toolchain, recorded
     ruling A a crash is named by system_server's uid-carrying `Start proc` for
     its pid, recorded here before the crash, so nothing waits: both reads keep
     the whole trace. (A crash whose start predates the read is named by no
-    uid-carrying line -- `has died` has none -- and is in neither read.)
+    uid-carrying record -- `has died` has none -- and is in neither read; A3
+    below: it is reported as left out.)
     """
     pids = _restart_pids(recorded)
-    window = recorded.text("logcat_app_restart_usec")
+    window = recorded.data(f"{RECORDS}.bin")
     _device(
         toolchain,
         recorded,
@@ -773,11 +852,9 @@ def test_d4_parity_a_crash_read_live_counts_what_last_counts(toolchain, recorded
     historical, live = _historical_and_live(toolchain, "--app", PACKAGE, "--severity", "error")
 
     app = set(pids.values())
-    expected = sum(
-        1 for line in _apps_lines(window, app) if _THREADTIME.match(line)["priority"] in "EF"
-    )
+    expected = sum(1 for p in _column(_lines(window, app, "E"), "priority") if p in "EF")
     if not expected:
-        pytest.fail("the derived window holds no E line of the app; parity would be vacuous")
+        pytest.fail("the window holds no E record of the app; parity would be vacuous")
     assert historical["statistics"]["errors"] == expected
     assert live["statistics"]["errors"] == expected
     assert sorted(live["sample_logs"]) == sorted(historical["sample_logs"])
@@ -786,26 +863,22 @@ def test_d4_parity_a_crash_read_live_counts_what_last_counts(toolchain, recorded
 def test_d4_parity_a_process_named_only_when_it_dies(toolchain, recorded):
     """A process already running when the read began is named only by `Killing`.
 
-    Derived from the recording by deleting its `Start proc` line. Every one of
-    its lines arrives before the line that names it, so a live read holds them
-    all back and replays them.
+    Derived from the recording by deleting its `Start proc` record. Every one
+    of its records arrives before the record that names it, so a live read
+    holds them all back and replays them.
     """
     pids = _restart_pids(recorded)
-    stopped = pids[STOPPED]
-    lines = recorded.text("logcat_app_restart_usec").splitlines(keepends=True)
-    window = "".join(
-        line for line in lines if f"ActivityManager: Start proc {stopped}:" not in line
-    )
+    window = _without_start_of(recorded, pids[STOPPED])
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
     historical, live = _historical_and_live(toolchain, "--app", PACKAGE)
 
-    assert historical["sample_logs"] == _apps_lines(window, set(pids.values()))
+    assert historical["sample_logs"] == _lines(window, set(pids.values()))
     assert sorted(live["sample_logs"]) == sorted(historical["sample_logs"])
     assert live["statistics"] == historical["statistics"]
 
@@ -813,23 +886,24 @@ def test_d4_parity_a_process_named_only_when_it_dies(toolchain, recorded):
 def test_d4_the_live_hold_is_bounded(toolchain, recorded):
     """Lines older than ``ANDROID_EMU_LOG_PENDING_CAP`` are dropped, not held without limit.
 
-    The window of the test above: every line of the stopped process waits for
-    its `Killing` line, among every other process's unattributed lines. With
-    a cap of 5, at most five of its lines can still be waiting there.
+    The window of the test above: every record of the stopped process waits
+    for its `Killing` record. Only records of the package's uid are held (one
+    under any other uid can never be the app's), so the hold is the stopped
+    process's own. With a cap of 5 lines, at most five of them can still be
+    waiting when `Killing` arrives. Read at ``--severity verbose``, so every
+    line of the process that survives the hold is in the output, where it is
+    counted -- independently of what the reader says it dropped.
     """
     pids = _restart_pids(recorded)
     stopped = pids[STOPPED]
-    lines = recorded.text("logcat_app_restart_usec").splitlines(keepends=True)
-    window = "".join(
-        line for line in lines if f"ActivityManager: Start proc {stopped}:" not in line
-    )
-    own = len(_apps_lines(window, {stopped}))
+    window = _without_start_of(recorded, stopped)
+    own = len(_lines(window, {stopped}, floor="V"))
     if own <= 5:
         pytest.fail(f"the stopped process logged only {own} lines; the cap is untested")
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
@@ -837,6 +911,8 @@ def test_d4_the_live_hold_is_bounded(toolchain, recorded):
         "log_monitor.py",
         "--app",
         PACKAGE,
+        "--severity",
+        "verbose",
         "--duration",
         "30s",
         "--json",
@@ -846,16 +922,19 @@ def test_d4_the_live_hold_is_bounded(toolchain, recorded):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     kept = _column(payload["sample_logs"], "pid").count(stopped)
-    # Other processes' lines share the hold, so on this recording none of the
-    # stopped process's survive; the guard is the upper bound.
-    assert kept <= 5 < own, f"{kept} of the stopped process's {own} lines survived a cap of 5"
+    assert 0 < kept <= 5 < own, f"{kept} of the stopped process's {own} lines survived a cap of 5"
+    # They are its newest: the hold drops the oldest first.
+    assert [line for line in payload["sample_logs"] if line.split()[2] == stopped] == _lines(
+        window, {stopped}, floor="V"
+    )[-kept:]
 
-    # ...and the loss is counted, in the JSON and on stderr (Codex review v2):
-    # every one of the stopped process's lines that is missing was evicted.
-    assert payload["attribution"]["pending_evicted"] == own - kept
+    # ...and the loss is counted, in the JSON and on stderr (Codex review v2),
+    # and the window says it is incomplete (A3).
+    attribution = payload["attribution"]
+    assert attribution["pending_evicted"] == own - kept
     assert f"{own - kept} line(s) of {PACKAGE}'s processes were dropped" in result.stderr
-    assert payload["attribution"]["unattributed_at_end"] > 0
-    assert "were still held when the read ended" in result.stderr
+    assert attribution["complete"] is False
+    assert attribution["unattributed_at_end"] == 0
 
 
 def test_d4_a_historical_read_reports_what_decided_it(toolchain, recorded):
@@ -863,13 +942,14 @@ def test_d4_a_historical_read_reports_what_decided_it(toolchain, recorded):
 
     Everything known, on the recorded window: system_server's pid and the
     package's uid as recorded, the live pid from `pidof` (uid-checked), all
-    three processes named by the log, nothing held back.
+    three processes named by the log, nothing held back, nothing of the
+    package's uid left out -- complete.
     """
     pids = _restart_pids(recorded)
     _device(
         toolchain,
         recorded,
-        recorded.text("logcat_app_restart_usec"),
+        recorded.data(f"{RECORDS}.bin"),
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
@@ -887,45 +967,47 @@ def test_d4_a_historical_read_reports_what_decided_it(toolchain, recorded):
         "pids_from_log": sorted(pids.values(), key=int),
         "pending_evicted": 0,
         "unattributed_at_end": 0,
+        "unresolved_lines": 0,
+        "unresolved_pids": [],
+        "complete": True,
     }
 
 
-def _another_process_first(recorded, ending: str = STOPPED) -> tuple[str, list[str], str]:
-    """logcat_app_restart_usec where one app process's pid was another process's first.
+def _another_process_first(recorded, ending: str = STOPPED) -> tuple[list[Frame], list[str], str]:
+    """The restart window where one app process's pid was another process's first.
 
-    Derived: the lines of one unrelated process logged before the `Start proc`
-    of the app process that ended as ``ending`` get that process's pid in their
-    PID column (pid reuse: the pid was that process's, then the app's). Returns
-    the window, the substituted lines, and the pid.
+    Derived: the records of one unrelated process logged before the `Start
+    proc` of the app process that ended as ``ending`` get that process's pid
+    as their writer (pid reuse: the pid was that process's, then the app's).
+    Returns the window, the substituted records' lines, and the pid.
     """
-    stopped = _restart_pids(recorded)[ending]
-    lines = recorded.text("logcat_app_restart_usec").splitlines()
-    start = next(i for i, line in enumerate(lines) if f"Start proc {stopped}:" in line)
+    pid = _restart_pids(recorded)[ending]
+    window = _window(recorded)
+    start = next(i for i, f in enumerate(window) if f.message.startswith(f"Start proc {pid}:"))
     app = set(_restart_pids(recorded).values())
-    others = [m["pid"] for m in map(_THREADTIME.match, lines[:start]) if m]
     other = next(
-        (pid for pid in others if pid not in app and pid != _system_server(recorded)), None
+        (f.pid for f in window[:start] if f.pid not in app and f.pid != _system_server(recorded)),
+        None,
     )
     if other is None:
-        pytest.fail("no other process logs before the stopped process starts")
-    reused: list[str] = []
-    for index, line in enumerate(lines[:start]):
-        match = _THREADTIME.match(line)
-        if match and match["pid"] == other:
-            lines[index] = line[: match.start("pid")] + stopped + line[match.end("pid") :]
-            reused.append(lines[index].rstrip())
-    return "\n".join(lines) + "\n", reused, stopped
+        pytest.fail("no other process logs before the app process starts")
+    for index in range(start):
+        if window[index].pid == other:
+            window[index] = window[index].replace(pid=pid)
+    reused = [
+        line for f in window[:start] if f.pid == pid for line in _lines(framed([f]), floor="V")
+    ]
+    return window, reused, pid
 
 
-def _split_after_start(window: str, pid: str) -> tuple[str, str]:
+def _split_after_start(window: list[Frame], pid: str) -> tuple[bytes, bytes]:
     """``window`` cut after ``pid``'s `Start proc`: what was buffered, what came after.
 
     A process ``pidof`` names when a live read begins was started before it,
     so its `Start proc` is already in the device's buffer.
     """
-    lines = window.splitlines(keepends=True)
-    start = next(i for i, line in enumerate(lines) if f"Start proc {pid}:" in line)
-    return "".join(lines[: start + 1]), "".join(lines[start + 1 :])
+    start = next(i for i, f in enumerate(window) if f.message.startswith(f"Start proc {pid}:"))
+    return framed(window[: start + 1]), framed(window[start + 1 :])
 
 
 @pytest.mark.parametrize("ending", [STOPPED, ALIVE], ids=["stopped", "running"])
@@ -934,12 +1016,12 @@ def test_d4_a_reused_pid_is_the_apps_only_inside_its_life(read, ending, toolchai
     """One pid, first another process's, then the app's: only the app's life counts.
 
     The pid of an app process logs as another process before its `Start
-    proc`; those lines are not the app's, in a historical read and live. The
-    process running when the read began is the hard case live (Codex review
-    v3): a live read keeps its lines from the first one it sees, so it must
-    not see the buffer's older lines at all -- it starts at the end (`-T 1`).
-    For it, the device holds everything up to its `Start proc` in its buffer;
-    a dump reads that whole, a live read only from the end.
+    proc`; those records are not the app's, in a historical read and live.
+    The process running when the read began is the hard case live (Codex
+    review v3): a live read keeps its records from the first one it sees, so
+    it must not see the buffer's older records at all -- it starts at the end
+    (`-T 1`). For it, the device holds everything up to its `Start proc` in
+    its buffer; a dump reads that whole, a live read only from the end.
     """
     window, reused, pid = _another_process_first(recorded, ending)
     pids = _restart_pids(recorded)
@@ -947,7 +1029,7 @@ def test_d4_a_reused_pid_is_the_apps_only_inside_its_life(read, ending, toolchai
         buffered, after = _split_after_start(window, pid)
     else:
         # The read began before this process started: all of it arrives live.
-        buffered, after = "", window
+        buffered, after = b"", framed(window)
     _device(
         toolchain,
         recorded,
@@ -961,31 +1043,31 @@ def test_d4_a_reused_pid_is_the_apps_only_inside_its_life(read, ending, toolchai
     )
     assert result.returncode == 0, result.stderr
     kept = json.loads(result.stdout)["sample_logs"]
-    assert not set(reused) & set(kept), "lines of the pid's earlier owner are in the window"
+    assert not set(reused) & set(kept), "records of the pid's earlier owner are in the window"
     assert pid in _column(kept, "pid"), "the app's own life under that pid is missing"
     reads = [call for call in toolchain.calls("adb") if "logcat" in call]
     tails = [call[call.index("-T") + 1] for call in reads if "-T" in call]
     assert tails == (["1"] if read[0] == "--duration" else [])
 
 
-def _killed_last(recorded) -> str:
+def _killed_last(recorded) -> list[Frame]:
     """A window where the stopped process is named only at its very end.
 
     Derived: its `Start proc` deleted (it was running when the read began) and
-    its `Killing` line moved to the end, after the live process's lines -- so a
-    live read keeps the live process's lines first and the stopped process's,
-    which are OLDER, only when the window ends.
+    its `Killing` record moved to the end, after the live process's records --
+    so a live read keeps the live process's records first and the stopped
+    process's, which are OLDER, only when the window ends.
     """
     stopped = _restart_pids(recorded)[STOPPED]
-    lines = _without_start_of(recorded, stopped).splitlines(keepends=True)
-    killing = [line for line in lines if f"ActivityManager: Killing {stopped}:" in line]
+    window = _without_start_of(recorded, stopped)
+    killing = [f for f in window if f.message.startswith(f"Killing {stopped}:")]
     if len(killing) != 1:
         pytest.fail("the recording no longer kills the stopped process once")
-    return "".join(line for line in lines if line not in killing) + killing[0]
+    return [f for f in window if f not in killing] + killing
 
 
 def test_d4_a_live_read_stores_lines_in_input_order(toolchain, tmp_path, recorded):
-    """Held lines are decided late; the saved log keeps the device's order.
+    """Held records are decided late; the saved log keeps the device's order.
 
     Codex (review v2) reproduced replayed lines stored after newer ones, which
     also changed what survived the `sample_logs` tail. The saved log of a live
@@ -996,7 +1078,7 @@ def test_d4_a_live_read_stores_lines_in_input_order(toolchain, tmp_path, recorde
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
@@ -1017,13 +1099,13 @@ def test_d4_a_live_read_stores_lines_in_input_order(toolchain, tmp_path, recorde
 
 
 def test_d4_follow_marks_a_held_line_when_it_prints_it(toolchain, recorded):
-    """`--follow` prints a held line when it is decided -- after newer ones -- marked."""
+    """`--follow` prints a held record when it is decided -- after newer ones -- marked."""
     window = _killed_last(recorded)
     pids = _restart_pids(recorded)
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
@@ -1039,16 +1121,17 @@ def test_d4_follow_marks_a_held_line_when_it_prints_it(toolchain, recorded):
 def test_d4_a_live_capture_follows_the_app_through_its_restarts(toolchain, recorded):
     """Streaming: not running at the start, three processes by the end.
 
-    Each start is announced before the new process's first line (recorded),
-    so a live read learns every pid in time. ``pidof`` answers as recorded for
-    an app that is not running; the stub's logcat then exits, ending the read.
+    Each start is announced before the new process's first record
+    (recorded), so a live read learns every pid in time. ``pidof`` answers as
+    recorded for an app that is not running; the stub's logcat then exits,
+    ending the read.
     """
     pids = _restart_pids(recorded)
-    text = recorded.text("logcat_app_restart_usec")
+    window = recorded.data(f"{RECORDS}.bin")
     _device(
         toolchain,
         recorded,
-        text,
+        window,
         pidof=_not_running(recorded),
         system_server=_system_server(recorded),
     )
@@ -1063,7 +1146,7 @@ def test_d4_a_live_capture_follows_the_app_through_its_restarts(toolchain, recor
         ANDROID_EMU_LOG_TAIL="1000",
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["sample_logs"] == _apps_lines(text, set(pids.values()))
+    assert json.loads(result.stdout)["sample_logs"] == _lines(window, set(pids.values()))
 
 
 def test_d4_follow_prints_only_the_apps_lines(toolchain, recorded):
@@ -1071,7 +1154,7 @@ def test_d4_follow_prints_only_the_apps_lines(toolchain, recorded):
     _device(
         toolchain,
         recorded,
-        recorded.text("logcat_app_restart_usec"),
+        recorded.data(f"{RECORDS}.bin"),
         pidof=_not_running(recorded),
         system_server=_system_server(recorded),
     )
@@ -1085,7 +1168,7 @@ def test_d4_a_crashed_app_that_is_not_running_keeps_its_window(toolchain, record
     """The case an agent reaches for after a crash: nothing is running any more.
 
     Refusing here would hide the crash; widening would bury it in every other
-    process. The window is logcat_app_restart_usec up to the crashed process's
+    process. The window is the restart recording up to the crashed process's
     `has died` -- the moment after the crash, before any relaunch -- and
     system_server's `Start proc` / `has died` name it. The whole crash, every
     line in order, is the assertion.
@@ -1095,7 +1178,7 @@ def test_d4_a_crashed_app_that_is_not_running_keeps_its_window(toolchain, record
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=_not_running(recorded),
         system_server=_system_server(recorded),
     )
@@ -1103,7 +1186,7 @@ def test_d4_a_crashed_app_that_is_not_running_keeps_its_window(toolchain, record
         "log_monitor.py", "--app", PACKAGE, "--last", "5m", "--json", ANDROID_EMU_LOG_TAIL="1000"
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["sample_logs"] == _apps_lines(window, {crashed})
+    assert json.loads(result.stdout)["sample_logs"] == _lines(window, {crashed})
 
 
 @pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
@@ -1111,8 +1194,14 @@ def test_d4_an_app_with_no_process_in_the_window_is_refused(json_mode, toolchain
     """Not running, and nothing in the window names it: refused, not widened.
 
     Before D4 this read every process on the device and called it the app's.
+    The window is the crash buffer: the app's own crashes, which name nothing.
     """
-    _device(toolchain, recorded, recorded.text("logcat_threadtime"), pidof=_not_running(recorded))
+    _device(
+        toolchain,
+        recorded,
+        recorded.data("logcat_crash_buffer_records.bin"),
+        pidof=_not_running(recorded),
+    )
     argv = ["--app", PACKAGE, "--last", "1m"] + (["--json"] if json_mode else [])
     result = toolchain.run("log_monitor.py", *argv)
     assert_refusal(result, json_mode=json_mode, naming=(PACKAGE,), status=1)
@@ -1128,15 +1217,15 @@ def test_d4_a_failed_pidof_alone_is_not_a_refusal(toolchain, recorded):
     """The window names the app's crashed process, so it is read.
 
     The rule app_state_capture follows too: `pidof` is one witness, and
-    system_server's lines are another; only when neither names a process is the
-    capture refused.
+    system_server's records are another; only when neither names a process is
+    the capture refused.
     """
     window = _until_the_crash_is_over(recorded)
     crashed = _restart_pids(recorded)[CRASHED]
     _device(
         toolchain,
         recorded,
-        window,
+        framed(window),
         pidof=_PIDOF_CANNOT_RUN,
         system_server=_system_server(recorded),
     )
@@ -1144,13 +1233,298 @@ def test_d4_a_failed_pidof_alone_is_not_a_refusal(toolchain, recorded):
         "log_monitor.py", "--app", PACKAGE, "--last", "5m", "--json", ANDROID_EMU_LOG_TAIL="1000"
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["sample_logs"] == _apps_lines(window, {crashed})
+    assert json.loads(result.stdout)["sample_logs"] == _lines(window, {crashed})
 
 
 @pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
 def test_d4_a_failed_pidof_and_a_window_without_the_app_is_refused(json_mode, toolchain, recorded):
     """...and the refusal says `pidof` failed, not that the app was not running."""
-    _device(toolchain, recorded, recorded.text("logcat_threadtime"), pidof=_PIDOF_CANNOT_RUN)
+    _device(
+        toolchain,
+        recorded,
+        recorded.data("logcat_crash_buffer_records.bin"),
+        pidof=_PIDOF_CANNOT_RUN,
+    )
     argv = ["--app", PACKAGE, "--last", "1m"] + (["--json"] if json_mode else [])
     result = toolchain.run("log_monitor.py", *argv)
     assert_refusal(result, json_mode=json_mode, naming=("`pidof` failed",), status=1)
+
+
+def test_d4_the_floor_still_reads_the_records_that_name_the_apps_processes(toolchain, recorded):
+    """``--severity error``: the I records naming the app's processes still decide.
+
+    ``*:E`` on the device used to need ``ActivityManager:I`` beside it, or the
+    `Start proc` / `Killing` records never arrived and the crashed and stopped
+    processes were lost. The floor is now applied on the host, after
+    attribution: all three processes are named, and only E/F lines are kept.
+    """
+    pids = _restart_pids(recorded)
+    _device(
+        toolchain,
+        recorded,
+        recorded.data(f"{RECORDS}.bin"),
+        pidof=_not_running(recorded),
+        system_server=_system_server(recorded),
+    )
+    result = toolchain.run(
+        "log_monitor.py", "--app", PACKAGE, "--severity", "error", "--last", "5m", "--json"
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["attribution"]["pids_from_log"] == sorted(pids.values(), key=int)
+    assert set(_column(payload["sample_logs"], "priority")) <= {"E", "F"}
+    assert payload["sample_logs"], "the crash's E lines are missing"
+
+
+# --- A3: a window that leaves the app's lines out says so -----------------------
+
+
+@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "30s")], ids=["last", "live"])
+def test_a3_a_crash_whose_start_predates_the_window_is_reported(read, toolchain, recorded):
+    """The crash is left out -- and the result says so, with how much.
+
+    Derived: the restart window without the crashed process's `Start proc`
+    (the window opened after the process started). Nothing uid-carrying names
+    it -- `has died` carries no uid -- so its records stay out of the window.
+    They were silently gone: ``errors: 0``, every oracle ``known``, every loss
+    counter zero (review of v0.8.0, A3). logd stamped them with the package's
+    uid, so the result now counts them, names their pid, and calls itself
+    incomplete, in the JSON, on stderr and in the text summary.
+    """
+    pids = _restart_pids(recorded)
+    crashed = pids[CRASHED]
+    window = _without_start_of(recorded, crashed)
+    left_out = len(_lines(window, {crashed}, floor="V"))
+    if not left_out or "E" not in _column(_lines(window, {crashed}), "priority"):
+        pytest.fail("the crashed process logged no error; the omission would be vacuous")
+    _device(
+        toolchain,
+        recorded,
+        framed(window),
+        pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
+        system_server=_system_server(recorded),
+    )
+    result = toolchain.run(
+        "log_monitor.py", "--app", PACKAGE, *read, "--json", ANDROID_EMU_LOG_TAIL="1000"
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    attribution = payload["attribution"]
+    assert crashed not in payload["app_pids"]
+    assert attribution.get("complete") is False, attribution
+    assert attribution.get("unresolved_pids") == [crashed]
+    assert attribution.get("unresolved_lines") == left_out
+    assert f"Incomplete: {left_out} line(s)" in result.stderr
+
+    text = toolchain.run("log_monitor.py", "--app", PACKAGE, *read, ANDROID_EMU_LOG_TAIL="1000")
+    assert text.returncode == 0, text.stderr
+    assert "Attribution: INCOMPLETE" in text.stdout, text.stdout
+
+
+# --- A4: a device that is not there is never a quiet capture -------------------
+
+
+def _absent_device(toolchain, recorded, *, logcat: Rule) -> None:
+    """adb aimed at a serial that is not attached: get-state says so, logcat as given.
+
+    ``get-state`` answers as recorded for that serial (adb_device_not_found:
+    `error: device '...' not found`, exit 1).
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(
+                ("get-state",),
+                stderr=recorded.text("adb_device_not_found"),
+                exit=_recorded_exit(recorded, "adb_device_not_found"),
+            ),
+            logcat,
+        ],
+    )
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a4_a_live_read_of_a_device_that_is_not_there_is_refused(json_mode, toolchain, recorded):
+    """No ``--serial``, no device: adb waits, and the deadline made it a quiet capture.
+
+    ``adb logcat`` aimed at a device that is not attached prints ``- waiting
+    for device -`` and waits (recorded: adb_waiting_for_device; the stub
+    hangs as it does). With no --serial nothing was checked first, so
+    ``--duration`` ended on schedule and reported success with zero lines.
+    The serial adb targets comes from ANDROID_SERIAL here, as it would for a
+    caller that passed none. Now ``get-state`` is asked first: exit 3, and
+    logcat is never started.
+    """
+    _absent_device(
+        toolchain,
+        recorded,
+        logcat=Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
+    )
+    argv = ["--duration", "2s"] + (["--json"] if json_mode else [])
+    result = toolchain.run("log_monitor.py", *argv, ANDROID_SERIAL="no-such-serial-xyz")
+    assert_refusal(result, json_mode=json_mode, naming=("not attached", "device"), status=3)
+    assert not [call for call in toolchain.calls("adb") if "logcat" in call]
+
+
+def test_a4_every_mode_asks_first(toolchain, recorded):
+    """``--last`` and ``--follow`` too: the same question before the same read."""
+    _absent_device(
+        toolchain,
+        recorded,
+        logcat=Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
+    )
+    for mode in (["--last", "1m"], ["--follow"], ["--app", PACKAGE, "--duration", "2s"]):
+        result = toolchain.run("log_monitor.py", *mode, "--json", ANDROID_SERIAL="no-such-xyz")
+        assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+
+
+def _gone_after_one_read(toolchain, recorded, logcat: Rule) -> None:
+    """A device that answers get-state once, streams, and is then gone.
+
+    The first ``get-state`` is the recorded attached answer; every later one
+    is the recorded answer for a serial that is not attached.
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=True),
+            Rule(
+                ("get-state",),
+                stderr=recorded.text("adb_device_not_found"),
+                exit=_recorded_exit(recorded, "adb_device_not_found"),
+            ),
+            logcat,
+        ],
+    )
+
+
+@pytest.mark.parametrize("status", [0, 255], ids=["older-adb-exit-0", "current-adb-exit-255"])
+def test_a4_a_live_read_that_ends_by_itself_asks_whether_the_device_went(
+    status, toolchain, recorded
+):
+    """A live logcat ends only when something went away; if it was the device, say so.
+
+    The stream delivers records, then ends by itself -- exit 0 (older adb on a
+    transport EOF) or 255 (current adb), nothing on stderr. It reported
+    success, or a generic exit 1 with no device check. ``get-state`` is asked
+    again, the device is gone: exit 3.
+    """
+    _gone_after_one_read(
+        toolchain,
+        recorded,
+        Rule(("logcat",), stdout=recorded.data(f"{RECORDS}.bin"), exit=status),
+    )
+    result = toolchain.run("log_monitor.py", "--duration", "30s", "--json")
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+    assert [call[-1] for call in toolchain.calls("adb") if "get-state" in call] == [
+        "get-state",
+        "get-state",
+    ]
+
+
+def test_a4_a_live_read_that_ends_while_the_device_is_still_there_is_the_capture(
+    toolchain, recorded
+):
+    """The control: asked again, the device answers -- what was read stands, and is said."""
+    _device(toolchain, recorded, recorded.data(f"{RECORDS}.bin"))
+    result = toolchain.run("log_monitor.py", "--duration", "30s", "--json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["statistics"]["total_lines"] > 0
+    assert "ended by itself" in result.stderr
+
+
+# --- a stream cut inside a record is not a complete capture (review of PR #35) ---
+
+
+def test_a_dump_cut_inside_a_record_is_refused_not_half_counted(toolchain, recorded):
+    """The recorded two-crash dump, short by its last byte: refused, not 13 errors of 26.
+
+    A dump always ends at a record boundary, so one that does not is a
+    capture that lost data on the way; every truncation used to be read as a
+    clean end. Derived: logcat_crash_buffer_records without its final byte.
+    The device is still attached (asked again), so it is exit 1.
+    """
+    window = recorded.data("logcat_crash_buffer_records.bin")
+    _device(toolchain, recorded, window[:-1])
+    result = toolchain.run("log_monitor.py", "--severity", "error", "--last", "5m", "--json")
+    assert_refusal(result, json_mode=True, naming=("inside a record",), status=1)
+    asked = [call for call in toolchain.calls("adb") if "get-state" in call]
+    assert len(asked) == 2, "the device was not asked again after the cut"
+
+
+def test_a_live_read_cut_by_itself_with_the_device_gone_is_exit_three(toolchain, recorded):
+    """The stream ends inside a record and the device is gone: that is the answer."""
+    window = recorded.data("logcat_crash_buffer_records.bin")
+    _gone_after_one_read(toolchain, recorded, Rule(("logcat",), stdout=window[:-1]))
+    result = toolchain.run("log_monitor.py", "--duration", "30s", "--json")
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+
+
+def test_a_live_read_cut_by_itself_with_the_device_there_is_refused(toolchain, recorded):
+    window = recorded.data("logcat_crash_buffer_records.bin")
+    _device(toolchain, recorded, window[:-1])
+    result = toolchain.run("log_monitor.py", "--app", PACKAGE, "--duration", "30s")
+    assert_refusal(result, json_mode=False, naming=("inside a record",), status=1)
+
+
+# --- A5: adb's error is read line by line ---------------------------------------
+
+
+def test_a5_adbs_error_after_a_banner_is_still_a_device_error(toolchain, recorded):
+    """A banner first, then adb's own error: still the device, still exit 3.
+
+    The stream's stderr was joined with spaces before it was classified, so
+    the error no longer began a line and the anchored classifier (#29) missed
+    it: a generic exit 1. Two recorded adb stderr outputs in sequence -- the
+    waiting banner, then `adb: device '...' not found` -- with the stream's
+    exit 1.
+    """
+    stderr = recorded.text("adb_waiting_for_device") + recorded.text("adb_shell_device_not_found")
+    toolchain.install(
+        "adb",
+        [
+            Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=True),
+            Rule(("logcat",), stderr=stderr, exit=1),
+        ],
+    )
+    result = toolchain.run("log_monitor.py", "--duration", "30s", "--json")
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+
+
+# --- A8: the fake device tails records, as logd does ----------------------------
+
+
+def _ask_the_fake(toolchain, *argv: str) -> bytes:
+    return subprocess.run(
+        [str(toolchain.bin / "adb"), *argv],
+        env=toolchain.env(),
+        capture_output=True,
+        timeout=30,
+        check=True,
+    ).stdout
+
+
+def test_a8_the_fake_tails_text_by_record(toolchain, recorded):
+    """`-T 1` over a buffer whose last record is a crash: every line of it.
+
+    Recorded in one run: the crash buffer (two crashes) and the device's own
+    `-T 1` of it. The fake tailed physical lines, so it answered the crash's
+    last line only.
+    """
+    toolchain.install("adb", [Rule(("logcat",), buffered=recorded.text("logcat_crash_buffer"))])
+    tail = _ask_the_fake(toolchain, "logcat", "-d", "-T", "1")
+    assert tail.decode("utf-8") == recorded.text("logcat_crash_tail")
+    whole = _ask_the_fake(toolchain, "logcat", "-d")
+    assert whole.decode("utf-8") == recorded.text("logcat_crash_buffer")
+
+
+def test_a8_the_fake_tails_records_by_record(toolchain, recorded):
+    """The same over records: `-T 1` is the buffer's last record, byte for byte."""
+    toolchain.install(
+        "adb",
+        [Rule(("logcat",), buffered=recorded.data("logcat_crash_buffer_records.bin"))],
+    )
+    tail = _ask_the_fake(toolchain, "logcat", "-d", "-B", "-T", "1")
+    assert tail == recorded.data("logcat_crash_tail_records.bin")
+    assert len(frames(tail)) == 1 and len(_lines(tail, floor="V")) > 1

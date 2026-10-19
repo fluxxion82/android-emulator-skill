@@ -206,42 +206,66 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring
-    - Filter by app package: the lines of each process the device vouches was
-      the app's, inside that process's life. A pid counts when its uid is the
-      package's: the one `pidof` names (its uid checked with `ps`), or one
-      system_server's `Start proc` / `Killing` line names with the package's
-      uid (`has died`, which has no uid, only ends a life). Only system_server's
-      own lines count (checked against `pidof system_server`), only as the
-      opening of a message, never a continuation line; unknown system_server
-      or uid, nothing counts. A crash's own `Process: <pkg>, PID: N` line is
+    - Reads logd's records (`logcat -B`), never text: each record whole, with
+      the pid and uid logd took from the writing socket's credentials -- the
+      only metadata an app cannot write (the tid and time are the writer's
+      own). In text, a tag an app chooses can hold a newline and a whole
+      header, so one app record printed a second line "from" system_server.
+      Each record is printed back as `-v threadtime -v usec` would print it,
+      in this host's local time, with the control characters of its tag and
+      the line-ending and terminal controls of its message escaped (`\r` as
+      `\\r`, ESC as `\\x1b`; TAB is kept) -- so what it prints or saves reads
+      back as the same lines in any reader
+    - A stream that ends inside a record is never a complete capture: on a
+      `--last` dump, or a live read that ended by itself, the device is asked
+      again (gone: exit 3) and otherwise the capture is refused (exit 1). Only
+      when the read was stopped by its own `--duration` or an interrupt is
+      the record that was arriving dropped -- and counted
+      (`statistics.cut_records`, `attribution.complete: false`, a stderr
+      note, an `INCOMPLETE` line in the text summary)
+    - Filter by app package: the records of each process the device vouches
+      was the app's, inside that process's life, that logd stamped with one of
+      the package's uids. A pid counts when its uid is the package's: the one
+      `pidof` names (its uid checked with `ps`), or one system_server's
+      `Start proc` / `Killing` record names with the package's uid (`has
+      died`, which has no uid, only ends a life). Only system_server's own
+      records count (logd's pid, checked against `pidof system_server`), and
+      only a sentence that opens the record's message; unknown system_server
+      or uid, nothing counts. A crash's own `Process: <pkg>, PID: N` record is
       not evidence: any app can write one. So a crash before a restart stays
       in the window (`app_pids`, and `attribution` -- what decided it -- in the
-      JSON). A live read holds back the lines of a pid not yet named, keeps
-      them if it is (stored in input order; marked `[held back]` under
-      `--follow`), up to `ANDROID_EMU_LOG_PENDING_CAP` (2000) lines, and counts
-      what it dropped. An app with no process in the window is refused, not
-      widened to the whole device
+      JSON). A live read holds back the package uid's records of a pid not
+      yet named, keeps them if it is (stored in input order; marked `[held
+      back]` under `--follow`), up to `ANDROID_EMU_LOG_PENDING_CAP` (2000)
+      lines, and counts what it dropped. An app with no process in the window
+      is refused, not widened to the whole device
+    - Says when the window is incomplete: records logd stamped with the
+      package's uid whose process nothing in the window ties to the package
+      -- a process that started before a `--last` window and is gone by its
+      end, such as a crash read too late (`has died` names no uid) -- are
+      left out, counted and named (`attribution.unresolved_lines` /
+      `unresolved_pids`, `attribution.complete: false`, a stderr note, and an
+      `Attribution: INCOMPLETE` line in the text summary). Counts are of what
+      is shown; widen `--last` to include the start
     - A live read (`--follow`, `--duration`) starts at the end of the device's
-      buffer (`logcat -T 1`, which first prints the one most recent line) and
-      reads what happens from then on; it used to replay the whole buffer
-      first. Use `--last` for history. A process already running when a live
-      read begins counts from the first line the read sees, so a replayed
-      buffer could hand it the older lines of another process that had the
-      same pid
-    - Lines are split at `\n` only, as logcat ends them: a `\r` inside an
-      app's message cannot start a line that looks like system_server's
+      buffer (`logcat -T 1`, which first prints the one most recent record,
+      every line of it) and reads what happens from then on; it used to replay
+      the whole buffer first. Use `--last` for history. A process already
+      running when a live read begins counts from the first record the read
+      sees, so a replayed buffer could hand it the older records of another
+      process that had the same pid
+    - A device that is not there is never a quiet capture: every mode asks
+      `adb get-state` first, and a live read that ends by itself asks again.
+      (A streaming `adb logcat` aimed at a device that is not attached waits
+      instead of failing, so `--duration` used to report it as zero lines.)
+      Unavailable is exit 3, as everywhere else
     - Identity is the uid (every user's uid for the package). A process
       another package runs under the same shared uid, named after this
       package, counts as this app's: the device does not tell them apart
-    - Not attributed: a process that started before a `--last` window and is
-      not running when it is read, unless system_server names it with its uid
-      (`Killing`) inside the window -- a crash's `has died` names no uid
-    - Timestamps carry microseconds (`-v usec`): it is how a continuation line
-      of a multi-line message is told from a new message. Two of
-      system_server's messages with the very same header would read as one,
-      which can only drop the second one's evidence, never add any
     - Filter by severity: `error`, `warning`, `info`, `debug`, `verbose`; any
-      other name (`warn`) is a usage error (exit 2)
+      other name (`warn`) is a usage error (exit 2). The floor is applied on
+      the host (`-B` ignores filterspecs), after attribution, so
+      `--severity error` still sees the records that name the app's processes
     - Smart deduplication. In the JSON, `statistics.errors` /
       `statistics.warnings` count LINES (E/F, W); `statistics.unique_errors` /
       `unique_warnings` count distinct messages; the top-level `errors` /
@@ -382,13 +406,27 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Create timestamped snapshots, by default under
       `~/.android-emulator-skill/cache/app-state-snapshots/` (never the working
       directory); the snapshot's path is printed, and is `snapshot_path` under `--json`
-    - Logs are the app's own: the running pid plus each pid the log itself ties
-      to the package (`Start proc`, `has died`, `Killing`, and AndroidRuntime's
-      `Process: <pkg>, PID:`), so one that crashed before a restart is kept.
-      `<pkg>:remote` sub-processes and pid reuse within the window are not
-      handled. Errors and warnings are counted from the priority column. An app
-      with no process in the window fails the logs rather than returning the
-      whole device's
+    - Logs are the app's own, read from logd's records (`logcat -B`) by the
+      same rule as `log_monitor --app`: the running pid (uid checked with
+      `ps`) plus each pid system_server's own `Start proc` / `Killing` record
+      names with the package's uid, inside that process's life -- a pid
+      reused by another process is not the app's outside it -- and only
+      records logd stamped with the package's uid. A crash before a restart
+      is kept, by its `Start proc`. Not evidence: `has died` (no uid; it only
+      ends a life), AndroidRuntime's `Process: <pkg>, PID:` (any app can write
+      it), any line an app's tag or message could forge. Errors and warnings
+      are counted from the priority column, lines split at `\n` only, and a
+      message's line-ending and terminal controls are saved escaped (`\r` as
+      `\\r`), so `app-logs.txt` reads back as the lines that were counted. A
+      dump that ends inside a record fails the logs. An app with no process
+      in the window fails the logs rather than returning the whole device's
+    - Lines of the package's uid left out for want of evidence (a crash whose
+      start is older than `--logs`) are counted and named: `logs.attribution`
+      (`complete: false`, `unresolved_lines`, `unresolved_pids`) in the
+      summary, `log_attribution` under `--json`, a line in `summary.md` and in
+      the text output, and a stderr note
+    - A device that becomes unavailable during the capture is exit 3, as
+      everywhere else, with what did arrive under `partial`
     - All-in-one debugging artifact
     - Options: `--package`, `--output`, `--serial`, `--logs`, `--no-logs`, `--log-lines`, `--screenshot-size`, `--json`
 
@@ -943,9 +981,11 @@ recorded fixture, and was red before the fix.
 - **Log windows belong to the app.** `log_monitor --app` and
   `app_state_capture` keep every process of the app and no other, including a
   crashed one that has since restarted. A pid counts only on evidence that
-  system_server wrote and whose uid matches the package; app-written lines
-  cannot forge attribution. `--severity` validates its names, and counts are
-  line counts. Snapshots no longer land in the caller's working directory.
+  system_server wrote and whose uid matches the package; both read logd's
+  records (`-B`), so no tag or message an app writes can forge attribution,
+  and a window that had to leave the app's lines out says so
+  (`complete: false`). `--severity` validates its names, and counts are line
+  counts. Snapshots no longer land in the caller's working directory.
 - **One ANR is one event.** The `Reason:`/`PID:` lines attach to their record,
   and a WindowManager-only ANR still counts. Jank is keyed by process, and a
   pid is named only when its owner was running at the time.
@@ -1011,7 +1051,8 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     foreground-activity lookup (`device_utils.get_current_activity`), the
     emulator-console survey (`emu_console`), and the partial-capture policy of
     `test_recorder` steps and `app_state_capture` (what arrived is kept and
-    handed over).
+    handed over -- by `app_state_capture` in a refusal that is still exit 3
+    when the device was unavailable).
   - Checked, not just promised: `tests/test_exit_code_sweep.py` runs every
     Quick Start command and the modes its table lists twice — with the Android
     tools present and failing, and with none on PATH at all — and

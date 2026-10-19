@@ -296,33 +296,35 @@ def test_no_documented_flag_disappeared(script, flags):
 def test_shared_builder_requests_a_format_the_parser_can_read(recorded):
     """A1: `-v time` was requested while the parser understood only threadtime.
 
-    Asserted against both recorded formats, so it fails whichever way the
-    mismatch is introduced -- a changed default here, or a changed regex there.
+    log_monitor now asks for logd's records (`-B`, W3-L) and prints each as
+    threadtime (`LogRecord.lines`), so the agreement to hold is between that
+    printing and the parser -- checked over recorded records -- and the parser
+    must still tell threadtime from `-v time`, so a regression to text is
+    caught whichever side moves.
     """
     import log_monitor
 
     monitor = log_monitor.LogMonitor()
     cmd = monitor.build_logcat_command()
-    requested = cmd[cmd.index("-v") + 1]
-    assert requested == logcat.DEFAULT_FORMAT
+    assert logcat.BINARY_FLAG in cmd and "-v" not in cmd, cmd
 
-    parsed = [
-        monitor.parse_logcat_line(line)
-        for line in _content_lines(recorded.text(f"logcat_{requested}"))[:50]
+    printed = [
+        line
+        for record in logcat.parse_records(recorded.data("logcat_app_restart_records.bin"))[:50]
+        for line in record.lines()
     ]
-    assert any(p is not None for p in parsed), (
-        f"the shared builder requests '-v {requested}', which parse_logcat_line "
-        f"matched in none of the recorded lines of that format"
-    )
+    parsed = [monitor.parse_logcat_line(line) for line in printed]
+    assert all(
+        p is not None for p in parsed
+    ), "parse_logcat_line does not read every line a recorded record prints as"
 
-    other = "time" if requested == "threadtime" else "threadtime"
     wrong = [
         monitor.parse_logcat_line(line)
-        for line in _content_lines(recorded.text(f"logcat_{other}"))[:50]
+        for line in _content_lines(recorded.text("logcat_time"))[:50]
     ]
     assert not any(w is not None for w in wrong), (
-        f"parse_logcat_line also matches '-v {other}', so this test can no "
-        f"longer tell the two formats apart"
+        "parse_logcat_line also matches '-v time', so this test can no "
+        "longer tell the two formats apart"
     )
 
 

@@ -48,12 +48,11 @@ from pathlib import Path
 from common import cli, logcat
 from common.adb_exec import (
     AdbCommandError,
-    DeviceNotFoundError,
+    DeviceOfflineError,
     classify_device_error,
     run_adb,
 )
 from common.device_utils import (
-    get_connected_devices,
     get_package_uids,
     get_pid_uids,
     get_system_server_pid,
@@ -81,6 +80,10 @@ LOG_PENDING_CAP = env_int("ANDROID_EMU_LOG_PENDING_CAP", 2000)
 # Grace period for a terminated logcat to exit before it is killed. Bounded
 # so shutdown can never become the hang it is meant to prevent.
 STREAM_SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_LOG_SHUTDOWN_TIMEOUT", 5)
+# Budget for `adb get-state`, asked before every read and again when a live
+# read ends by itself. It answers at once either way (measured: `device`, or
+# `error: device '...' not found` exit 1); the bound is for a wedged server.
+STATE_TIMEOUT = env_int("ANDROID_EMU_LOG_STATE_TIMEOUT", 15)
 
 
 class LogMonitor:
@@ -122,6 +125,11 @@ class LogMonitor:
             raise ValueError(
                 f"unknown severity {unknown[0]!r}; accepted: {', '.join(logcat.SEVERITY_NAMES)}"
             )
+        # The floor a `*:<P>` filterspec used to apply on the device. A binary
+        # read cannot take one (`-B` ignores filterspecs, measured), so it is
+        # applied here -- after attribution, which needs ActivityManager's I
+        # records whatever the floor.
+        self._floor = logcat.min_priority_for(self.severity_filter)
 
         # Log storage
         self.log_lines = []
@@ -139,6 +147,10 @@ class LogMonitor:
         self.debug_count = 0
         self.verbose_count = 0
         self.total_lines = 0
+        # Records a stopped read cut in half: the read was ended by us (its
+        # deadline, an interrupt) while a record was arriving. Disclosed, not
+        # silently dropped; a cut the stream made by itself fails the capture.
+        self.cut_records = 0
 
         # Deduplication, per severity, so a warning cannot hide an error with
         # the same text.
@@ -355,18 +367,20 @@ class LogMonitor:
         The argv shape itself comes from ``common.logcat``, which every logcat
         reader in this skill shares.
 
-        ``-v threadtime`` (the shared default) is mandatory, not cosmetic:
-        ``parse_logcat_line`` expects "MM-DD HH:MM:SS.mmm PID TID P Tag: msg".
-        The ``time`` format omits the PID/TID columns and writes "P/Tag( PID):"
-        instead, which that regex cannot match -- so every line landed in the
-        unparsed branch, severity counts stayed at zero and ``--follow`` printed
-        nothing at all.
+        ``-B``: logd's records whole (``common.logcat.read_record``), never
+        text. A tag is the app's to choose and logcat prints it verbatim, so in
+        text one app's record could print a second line headed with
+        system_server's pid -- a forged ``Start proc`` that put another
+        process's lines in the app's window (logcat_tag_injection). Each
+        record is printed back as ``-v threadtime -v usec`` would print it
+        (``LogRecord.lines``), the layout ``parse_logcat_line`` reads; the
+        ``time`` layout it once asked for matched nothing (A1).
 
-        No ``--pid``: ``--app`` is filtered here, on the host (``_is_apps``).
-        One ``--pid`` is one process, so after a crash and restart it kept only
-        the new process and dropped the one that crashed (D4). Under a severity
-        floor above I, ``ActivityManager:I`` is kept so the lines that name the
-        app's processes still arrive.
+        No ``--pid``: ``--app`` is filtered here, on the host. One ``--pid`` is
+        one process, so after a crash and restart it kept only the new process
+        and dropped the one that crashed (D4). No ``*:<P>`` either: ``-B``
+        ignores filterspecs (measured), so the severity floor is applied on the
+        host, after the records that name the app's processes were read.
 
         Args:
             last_minutes: If set, dump a historical window with ``-d -t`` instead
@@ -381,30 +395,16 @@ class LogMonitor:
         if last_minutes is not None:
             since = logcat.window_start(last_minutes * 60, now=now)
 
-        min_priority = self._severity_min_priority()
-        tag_priorities: tuple[tuple[str, str], ...] = ()
-        if (
-            self.app_package
-            and min_priority is not None
-            and logcat.PRIORITY_ORDER.index(min_priority)
-            > logcat.PRIORITY_ORDER.index(logcat.PROCESS_TAG_PRIORITY)
-        ):
-            tag_priorities = ((logcat.PROCESS_TAG, logcat.PROCESS_TAG_PRIORITY),)
-
-        # `-v usec` on every read, so a line's header tells a continuation of
-        # a multi-line message apart from a new message (common.logcat
-        # USEC_FORMAT) -- and so one read has one format, with --app or not.
-        # A live read starts at the end of the buffer (`-T 1`, as anr_watcher's
-        # live stream does): without it `adb logcat` first replays the whole
-        # ring buffer, and an --app read opened the running pid's life before
-        # that history, so an EARLIER owner of the pid had its lines kept
-        # (security review of #27). History is --last's job.
+        # One format for every read, with --app or not. A live read starts at
+        # the end of the buffer (`-T 1`, as anr_watcher's live stream does):
+        # without it `adb logcat` first replays the whole ring buffer, and an
+        # --app read opened the running pid's life before that history, so an
+        # EARLIER owner of the pid had its lines kept (security review of #27).
+        # History is --last's job.
         return logcat.build_logcat_command(
             self.device_serial,
             since=since,
-            min_priority=min_priority,
-            tag_priorities=tag_priorities,
-            usec=True,
+            binary=True,
             tail=1 if last_minutes is None else None,
         )
 
@@ -439,21 +439,22 @@ class LogMonitor:
             return set()
         return {token for token in result.stdout.split() if token.isdigit()}
 
-    def _take(self, line: str, echo: bool) -> None:
-        """Take one line of a live read into the capture.
+    def _take(self, record: logcat.LogRecord, echo: bool) -> None:
+        """Take one record of a live read into the capture.
 
-        Without ``--app`` every line is the capture's. With it, the live
-        reader (``common.logcat.AppWindowStream``) decides: a line from one of
-        the app's processes, inside that process's life, is kept; a line from
-        a pid not yet decided is held back and kept later if the pid is named
-        (a process already running when the read began is named only when it
-        is killed). Held lines arrive late and are stored at their place in
-        input order; ``--follow`` prints them when they are decided, marked.
+        Without ``--app`` every record is the capture's. With it, the live
+        reader (``common.logcat.AppWindowStream``) decides: a record of one of
+        the app's processes, inside that process's life, is kept; one of the
+        package's uid from a pid not yet decided is held back and kept later
+        if the pid is named (a process already running when the read began is
+        named only when it is killed). Held records arrive late and are stored
+        at their place in input order; ``--follow`` prints them when they are
+        decided, marked.
         """
         if self._stream is None:
-            self._keep(line, echo)
+            self._keep(record, echo)
             return
-        for sequence, kept, replayed in self._stream.feed(line):
+        for sequence, kept, replayed in self._stream.feed(record):
             self._keep(kept, echo, sequence=sequence, replayed=replayed)
 
     def _system_server_pid(self) -> str | None:
@@ -517,31 +518,40 @@ class LogMonitor:
             )
         return verified
 
-    def _settle_attribution(self, held: list[str] | None) -> None:
+    def _settle_attribution(self, held: list[logcat.LogRecord] | None) -> None:
         """Decide a held (historical) window, and record what decided the window.
 
-        Sets ``app_pids`` and ``attribution``. The live counts are reported on
-        stderr when nonzero: lines of the app that the live hold dropped at its
-        cap before the app's process was named (``pending_evicted``), and lines
-        still held when the read ended, from processes it never decided
-        (``unattributed_at_end`` -- mostly other processes' lines; it says how
-        much the read could not decide, not how much of the app was lost).
+        Sets ``app_pids`` and ``attribution``. Reported on stderr when nonzero:
+        lines of the app that the live hold dropped at its cap before the
+        app's process was named (``pending_evicted``), and lines logd stamped
+        with the package's uid that were left out because nothing in the
+        window ties their process to the package (``unresolved_lines``; of
+        them, ``unattributed_at_end`` were still held when a live read ended).
+        Either makes the window incomplete (``complete: false``): its counts
+        are of what it shows, and the app logged more.
         """
-        evicted = unattributed = 0
+        evicted = unattributed = unresolved = 0
+        cut = self.cut_records
+        unresolved_pids: set[str] = set()
         if held is not None:
             window = logcat.app_window(
-                "\n".join(held),
+                held,
                 self.app_package,
                 system_server_pid=self._system_server_pid,
                 package_uids=self._package_uid_lookup,
                 running=self._running,
             )
-            for line in window.lines:
-                self._keep(line, echo=False)
+            for record in window.records:
+                self._keep(record, echo=False)
             self.app_pids, from_log = window.pids, window.pids_from_log
+            unresolved, unresolved_pids = window.unresolved_lines, window.unresolved_pids or set()
         elif self._stream is not None:
             self.app_pids, from_log = set(self._stream.pids), self._stream.pids_from_log
             evicted, unattributed = self._stream.pending_evicted, self._stream.unattributed
+            unresolved, unresolved_pids = (
+                self._stream.unresolved_lines,
+                self._stream.unresolved_pids,
+            )
         else:
             from_log = set()
 
@@ -558,6 +568,9 @@ class LogMonitor:
             "pids_from_log": sorted(from_log, key=int),
             "pending_evicted": evicted,
             "unattributed_at_end": unattributed,
+            "unresolved_lines": unresolved,
+            "unresolved_pids": sorted(unresolved_pids, key=int),
+            "complete": not (evicted or unresolved or cut),
         }
         if evicted:
             print(
@@ -566,23 +579,54 @@ class LogMonitor:
                 "(ANDROID_EMU_LOG_PENDING_CAP).",
                 file=sys.stderr,
             )
-        if unattributed:
+        if unresolved:
+            held_note = (
+                f", {unattributed} of them still held when the read ended" if unattributed else ""
+            )
             print(
-                f"{unattributed} line(s) were still held when the read ended, from processes "
-                f"never shown to be {self.app_package}'s; not shown.",
+                f"Incomplete: {unresolved} line(s) logged under {self.app_package}'s uid by "
+                f"pid(s) {', '.join(sorted(unresolved_pids, key=int))} are left out{held_note}. "
+                "Nothing in the window shows those processes were the app's -- a process "
+                "started before the window opened and gone by its end, such as a crash read "
+                "too late. The counts are of what is shown; widen --last to include its start.",
                 file=sys.stderr,
             )
 
     def _keep(
-        self, line: str, echo: bool, sequence: int | None = None, replayed: bool = False
+        self,
+        record: logcat.LogRecord,
+        echo: bool,
+        sequence: int | None = None,
+        replayed: bool = False,
     ) -> None:
-        """Process one line of the capture, and print it in follow mode."""
-        self.process_log_line(line, sequence)
-        if echo:
-            parsed = self.parse_logcat_line(line)
-            if parsed and self.classify_log_line(parsed) in self.severity_filter:
-                # A held line is printed when it is decided, after newer ones.
-                print(f"[held back] {line}" if replayed else line)
+        """Process one record of the capture, a line at a time, and print it in follow mode.
+
+        A record below the severity floor is not the capture's: the floor a
+        ``*:<P>`` filterspec applied on the device before reads went binary.
+        """
+        if not self._above_floor(record.priority):
+            return
+        for line in record.lines():
+            self.process_log_line(line, sequence)
+            if echo:
+                parsed = self.parse_logcat_line(line)
+                if parsed and self.classify_log_line(parsed) in self.severity_filter:
+                    # A held record is printed when it is decided, after newer ones.
+                    print(f"[held back] {line}" if replayed else line)
+
+    def _above_floor(self, priority: str) -> bool:
+        """Whether ``*:<floor>`` would have shown a record of ``priority``.
+
+        logcat's order is V < D < I < W < E < F < S; a priority it cannot name
+        (printed ``?``) is below every floor.
+        """
+        if self._floor is None:
+            return True
+        if priority == "S":
+            return True
+        if priority not in logcat.PRIORITY_ORDER:
+            return False
+        return logcat.PRIORITY_ORDER.index(priority) >= logcat.PRIORITY_ORDER.index(self._floor)
 
     def stream_logs(
         self,
@@ -606,9 +650,13 @@ class LogMonitor:
 
         Raises:
             cli.Failure: ``--app`` was given and no process of the app was found
-                -- not by ``pidof``, and not in any line read. The capture is
+                -- not by ``pidof``, and not in any record read. The capture is
                 refused rather than reported as an empty (or, before D4, a
                 whole-device) window.
+            adb_exec.DeviceError: The device is not available -- before the
+                read, or when a live read ended by itself (exit 3 at the
+                boundary, never an empty capture).
+            common.logcat.LogFramingError: The stream is not logd's records.
         """
         self._verify_device_available()
 
@@ -636,11 +684,14 @@ class LogMonitor:
 
         # A historical window is read whole before it is filtered: a process
         # already running when the window opens is named only at its end, by
-        # system_server's `Killing` (recorded: logcat_app_restart_usec), after every
-        # line it logged. A live stream cannot wait for the end; it learns pids
-        # as lines arrive and holds back the lines of pids not yet named, up to
-        # LOG_PENDING_CAP, to keep them if one is (see _take).
-        held: list[str] | None = [] if self.app_package and last_minutes is not None else None
+        # system_server's `Killing` (recorded: logcat_app_restart_records),
+        # after every record it logged. A live stream cannot wait for the end;
+        # it learns pids as records arrive and holds back the package uid's
+        # records of pids not yet named, up to LOG_PENDING_CAP lines, to keep
+        # them if one is (see _take).
+        held: list[logcat.LogRecord] | None = (
+            [] if self.app_package and last_minutes is not None else None
+        )
         self._stream = (
             logcat.AppWindowStream(
                 self.app_package,
@@ -670,10 +721,8 @@ class LogMonitor:
             # stdout instead would feed adb's own error text through the log
             # parser and count it as device output. Draining it on a thread
             # avoids both, and keeps the text for diagnosis on failure.
-            # Bytes, split on b"\n" only (readline on a binary pipe): a text
-            # pipe also breaks lines at "\r", which logcat leaves raw inside an
-            # app's message -- an app could append "\r<forged header>" and have
-            # it read as a line of its own (security review of #27).
+            # stdout is bytes: logd's records, read a whole record at a time
+            # (common.logcat.read_record), never split as text.
             self.log_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -689,7 +738,7 @@ class LogMonitor:
                 if self.log_process:
                     self.log_process.terminate()
 
-            # A live `adb logcat` never closes its pipe, so readline() blocks
+            # A live `adb logcat` never closes its pipe, so a read blocks
             # indefinitely on a quiet device. Checking the clock inside the loop
             # only helps while lines keep arriving; the timer is what guarantees
             # --duration actually returns.
@@ -700,15 +749,25 @@ class LogMonitor:
 
             start_time = datetime.now()
 
-            for raw in iter(self.log_process.stdout.readline, b""):
-                if not raw:
+            cut: logcat.LogFramingError | None = None
+            while True:
+                try:
+                    record = logcat.read_record(self.log_process.stdout)
+                except logcat.LogFramingError as error:
+                    # Ended inside a record: judged in _finish_stream -- a
+                    # stop of ours loses that record, said so; anything else
+                    # fails the capture. Not records at all: refused here.
+                    if not error.truncated:
+                        raise
+                    cut = error
                     break
-                line = logcat.decode_log_line(raw).rstrip()
+                if record is None:
+                    break
 
                 if held is not None:
-                    held.append(line)
+                    held.append(record)
                 else:
-                    self._take(line, echo=follow)
+                    self._take(record, echo=follow)
 
                 if duration and (datetime.now() - start_time).total_seconds() >= duration:
                     stopped_by_us = True
@@ -718,7 +777,10 @@ class LogMonitor:
                     stopped_by_us = True
                     break
 
-            finished = self._finish_stream(stopped_by_us)
+            # An interrupt terminates logcat, which can end the read before the
+            # loop sees the flag: still a stop, not a stream that ended itself.
+            stopped_by_us = stopped_by_us or self.interrupted
+            finished = self._finish_stream(stopped_by_us, live=last_minutes is None, cut=cut)
 
         # No `except Exception` here any more: it printed the error and returned
         # False, so a device that vanished mid-stream exited 1 with no remedy
@@ -742,43 +804,42 @@ class LogMonitor:
             )
             cli.fail(
                 f"{self.app_package} had no process in this capture: {running}, and no "
-                f"line read names one of its processes.",
+                f"record read names one of its processes.",
                 "Launch the app and retry (or widen --last to when it ran); drop --app to "
                 "read every process.",
             )
         return finished
 
     def _verify_device_available(self) -> None:
-        """Check an explicitly requested serial is actually attached.
+        """Ask adb whether the device this read targets is there, before trusting a read.
 
-        ``adb -s <serial> logcat`` does not fail when the serial is unknown --
-        it blocks waiting for that device to appear. With ``--duration`` set,
-        that looks exactly like a device which simply logged nothing: the
-        capture ends on schedule and reports success with zero lines. Exit
-        status cannot distinguish the two, so the check has to happen up front.
+        A streaming ``adb logcat`` aimed at a device that is not attached does
+        not fail: it prints ``- waiting for device -`` and waits (recorded:
+        adb_waiting_for_device). With ``--duration`` that looked exactly like
+        a device that logged nothing -- the deadline stopped it and the capture
+        reported success with zero lines, with or without ``--serial``. So
+        every mode asks ``adb get-state`` first (bounded), and asks again when
+        a live read ends by itself: older adb exits 0 when the transport goes,
+        current adb 255.
 
         Raises:
-            DeviceNotFoundError: The serial is not attached -- exit 3 at the CLI
-                boundary, like an unavailable device in every other script.
-                (This printed a line and returned False, which exited 1.)
-            RuntimeError: The device list itself could not be read.
+            DeviceNotFoundError, DeviceOfflineError, DeviceUnauthorizedError:
+                Typed from adb's own words by ``run_adb`` -- exit 3 at the CLI
+                boundary (recorded: adb_device_not_found). A state other than
+                ``device`` (recovery, bootloader) is offline for logcat's
+                purposes.
+            MultipleDevicesError: Several attached and no serial (exit 1).
+            AdbCommandError: get-state failed in a way adb did not name.
         """
-        if not self.device_serial:
-            return
-
-        attached = [
-            device["serial"]
-            for device in get_connected_devices()
-            if device.get("state") == "device"
-        ]
-        if self.device_serial in attached:
-            return
-
-        available = ", ".join(attached) if attached else "none"
-        raise DeviceNotFoundError(
-            f"Device '{self.device_serial}' is not attached. Available: {available}.",
-            remedy="Pass --serial with one of the available devices, or start the one you named.",
-        )
+        result = run_adb("get-state", self.device_serial, check=True, timeout=STATE_TIMEOUT)
+        state = result.stdout.strip()
+        if state != "device":
+            target = f"Device {self.device_serial!r}" if self.device_serial else "The device"
+            raise DeviceOfflineError(
+                f"{target} is in state {state or 'unknown'!r}, not `device`; logcat cannot "
+                f"read it.",
+                remedy="Wait for it to boot into Android (`adb wait-for-device`), then retry.",
+            )
 
     def _start_stderr_drain(self) -> None:
         """Continuously read the child's stderr on a daemon thread.
@@ -802,15 +863,34 @@ class LogMonitor:
         thread.start()
         self._stderr_thread = thread
 
-    def _finish_stream(self, stopped_by_us: bool) -> bool:
+    def _finish_stream(
+        self,
+        stopped_by_us: bool,
+        live: bool = True,
+        cut: logcat.LogFramingError | None = None,
+    ) -> bool:
         """Reap the logcat process and decide whether the capture succeeded.
 
         Args:
             stopped_by_us: True if the duration elapsed or the user interrupted,
                 in which case a terminated process is the expected outcome.
+            live: A following read (``-T``), which never ends by itself while
+                its device is there. A dump (``--last``) always does.
+            cut: The stream ended inside a record. After a stop of ours that
+                record is lost and the loss disclosed (``cut_records``). A dump
+                or a stream that ended by itself never cuts a record: the
+                device is asked again (gone: exit 3), and otherwise the
+                capture is refused -- the recorded two-crash dump short by one
+                byte was a success with half its errors (review of PR #35).
 
         Returns:
             True if the capture completed as intended.
+
+        Raises:
+            adb_exec.DeviceError: adb's stderr names a device problem, or --
+                for a read that ended by itself -- ``get-state`` says the device
+                is no longer available. Exit 3, never a quiet capture.
+            cli.Failure: logcat exited non-zero and the device is still there.
 
         Never waits without a timeout: a streaming `adb logcat` does not exit on
         its own, so an unbounded ``wait()`` here is an unconditional hang.
@@ -831,20 +911,37 @@ class LogMonitor:
             returncode = process.poll()
 
         # We terminated it deliberately, so its exit status says nothing about
-        # whether the capture worked.
+        # whether the capture worked; a record it was sending is lost, and said.
         if stopped_by_us:
+            if cut is not None:
+                self.cut_records += 1
+                print(
+                    "The read was stopped while a record was arriving; that record is not "
+                    "in the capture.",
+                    file=sys.stderr,
+                )
             return True
 
+        # The drain thread may still be reading what adb said on the way out.
+        if (returncode or live) and self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=STREAM_SHUTDOWN_TIMEOUT)
+        # adb's own words, typed as run_adb would type them: a device that is
+        # not there is exit 3 at the boundary here too. Classified with its
+        # line breaks: adb's error is recognised only at the start of a line,
+        # and a banner before it (`- waiting for device -`) moved it off the
+        # start when the lines were joined with spaces first (A5).
+        stderr = "\n".join(self._stderr_lines)
         if returncode:
-            # The drain thread may still be reading what adb said on the way out.
-            if self._stderr_thread is not None:
-                self._stderr_thread.join(timeout=STREAM_SHUTDOWN_TIMEOUT)
-            detail = " ".join(self._stderr_lines).strip()
-            # adb's own words, typed as run_adb would type them: a device that
-            # is not there is exit 3 at the boundary here too.
-            device_error = classify_device_error(detail, self.device_serial)
+            device_error = classify_device_error(stderr, self.device_serial)
             if device_error is not None:
                 raise device_error
+        if returncode or live or cut is not None:
+            # Ended by itself: a dump that failed or was cut, or a live read,
+            # which ends only when something went away. If the device did,
+            # that is the answer (exit 3), not an empty or partial capture.
+            self._verify_device_available()
+        if returncode:
+            detail = " ".join(stderr.split())
             # Raised, not printed: under --json this exited 1 with no object.
             message = f"adb logcat exited with status {returncode}."
             if detail:
@@ -853,6 +950,19 @@ class LogMonitor:
                 message,
                 "Check the device is connected (`adb devices`) and, with more than one "
                 "attached, pass --serial.",
+            )
+        if cut is not None:
+            cli.fail(
+                f"adb logcat's output ended inside a record ({cut}), so the capture is "
+                "incomplete: what it read is not reported as the window.",
+                "Retry; if it repeats, the adb connection is cutting the stream -- restart it "
+                "with `adb kill-server && adb start-server`.",
+            )
+        if live:
+            print(
+                "adb logcat ended by itself before it was stopped; the device is still "
+                "attached, so what it read is the capture.",
+                file=sys.stderr,
             )
         return True
 
@@ -881,6 +991,22 @@ class LogMonitor:
             f"Warnings: {self.warning_count} ({len(self.warnings)} unique), "
             f"Info: {self.info_count}"
         )
+        # In the summary itself, not only on stderr: counts that leave the app's
+        # lines out must not read as the app's whole window (A3).
+        left_out = self.attribution and (
+            self.attribution["unresolved_lines"] + self.attribution["pending_evicted"]
+        )
+        if left_out:
+            pids = ", ".join(self.attribution["unresolved_pids"]) or "the held ones"
+            lines.append(
+                f"Attribution: INCOMPLETE -- {left_out} line(s) of the app's uid left out "
+                f"(pids: {pids}); the counts above are of what is shown."
+            )
+        if self.cut_records:
+            lines.append(
+                f"INCOMPLETE: the read was stopped inside {self.cut_records} record(s), "
+                "which are not counted."
+            )
 
         # Top issues
         if self.errors:
@@ -915,8 +1041,12 @@ class LogMonitor:
         than one after a restart -- and null without ``--app``. ``attribution``
         says what decided it (see ``_settle_attribution``): whether
         system_server's pid and the package's uid were known, which pids came
-        from ``pidof`` (uid-checked) and which from the log, and how many lines
-        a live read dropped or never decided. Null without ``--app``.
+        from ``pidof`` (uid-checked) and which from the log, how many lines a
+        live read dropped, and how many lines of the package's uid were left
+        out for want of evidence (``unresolved_lines`` / ``unresolved_pids``).
+        ``complete`` is false when either is nonzero, or when the read was
+        stopped inside a record (``statistics.cut_records``, in every mode).
+        Null without ``--app``.
         """
         return {
             "app_package": self.app_package,
@@ -932,6 +1062,7 @@ class LogMonitor:
                 "info": self.info_count,
                 "debug": self.debug_count,
                 "verbose": self.verbose_count,
+                "cut_records": self.cut_records,
             },
             "errors": self.errors[:LOG_JSON_CAP],
             "warnings": self.warnings[:LOG_JSON_CAP],

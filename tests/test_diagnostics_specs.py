@@ -291,12 +291,43 @@ def test_n6_a_run_that_wrote_no_results_is_not_a_pass(toolchain, tmp_path, recor
 ACCEPTED_SEVERITIES = ("error", "warning", "info", "debug", "verbose")
 
 
+# The window the log specs read since the readers went binary (W3-L): the
+# restart recording, whose records half (logcat_app_restart_records) was
+# dumped in the same run as its text. logcat_threadtime has no records half.
+RESTART_LOG = "logcat_app_restart_usec"
+
+
+def _records_half(recorded, transcript: str) -> bytes:
+    """The ``logcat -B`` half recorded in the same run as the text ``transcript``.
+
+    log_monitor and app_state_capture read logd's records (``-B``), not text,
+    so a device that answers them with a recorded transcript must answer
+    ``-B`` with the records of the same window. The MANIFEST names each
+    records half's text twin.
+    """
+    for entry in recorded.manifest["fixtures"]:
+        twin = entry.get("text_twin")
+        if twin and recorded.text(twin) == transcript:
+            return recorded.data(entry["file"])
+    pytest.fail("this transcript has no records half recorded with it; record the pair")
+
+
 def _logcat_device(toolchain: FakeToolchain, recorded, fixture: str) -> None:
-    """An adb whose device answers ``devices`` and ``logcat`` from recordings."""
+    """An adb whose device answers ``devices``, ``get-state`` and ``logcat`` from recordings.
+
+    ``logcat -B`` gets the fixture's records half, any other ``logcat`` its
+    text. ``get-state`` is asked before every read (W3-L, A4).
+    """
     toolchain.install(
         "adb",
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(
+                ("logcat", "-B"),
+                stdout=_records_half(recorded, recorded.text(fixture)),
+                filter_pid=True,
+            ),
             Rule(("logcat",), stdout=recorded.text(fixture), filter_pid=True),
         ],
     )
@@ -321,7 +352,7 @@ def test_d1_an_unknown_severity_name_is_a_usage_error(severity, toolchain, recor
     as an alias would be a deliberate change to this spec, not a way to pass
     it. ``bogus`` is the case no vocabulary decision can rescue.
     """
-    _logcat_device(toolchain, recorded, "logcat_threadtime")
+    _logcat_device(toolchain, recorded, RESTART_LOG)
     result = toolchain.run("log_monitor.py", "--severity", severity, "--last", "1m", "--json")
 
     assert (
@@ -341,9 +372,15 @@ def test_d1_a_known_severity_list_keeps_every_warning(toolchain, recorded):
     fake ignores priority filters, so the answer alone cannot show a device
     dropping warnings -- the command it was sent can.
     """
-    _logcat_device(toolchain, recorded, "logcat_threadtime")
+    _logcat_device(toolchain, recorded, RESTART_LOG)
     result = toolchain.run(
-        "log_monitor.py", "--severity", "error,warning", "--last", "1m", "--json"
+        "log_monitor.py",
+        "--severity",
+        "error,warning",
+        "--last",
+        "1m",
+        "--json",
+        ANDROID_EMU_LOG_JSON_CAP="1000",
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -353,7 +390,7 @@ def test_d1_a_known_severity_list_keeps_every_warning(toolchain, recorded):
     # must not do is drop a message (review of PR #20: tags alone let one of
     # two messages under a tag go missing unnoticed).
     expected = set()
-    for line in recorded.lines("logcat_threadtime"):
+    for line in recorded.lines(RESTART_LOG):
         m = _THREADTIME.match(line)
         if m and m["priority"] == "W":
             tag, _, message = line[m.end() :].partition(":")
@@ -374,10 +411,14 @@ def test_d1_a_known_severity_list_keeps_every_warning(toolchain, recorded):
 # D3 -- app_state_capture counts errors by priority, in the format it asked for.
 # ===========================================================================
 
-# The process whose lines the D3 snapshot reads. 551 is system_server in the
-# recording: it logged the one E line, and also a V line whose text contains
-# "errorCallbackToken" -- prose that a word-match counts as an error.
-D3_PID = "551"
+
+# The process the snapshot specs take as the app's. It was 551, system_server
+# in logcat_threadtime, which logged one E line and a V line whose text says
+# "errorCallbackToken". That recording has no records half, so since the
+# capture reads records (W3-L) it is the restart recording's crashed process:
+# a crash of E lines amid its I, W, D and V lines.
+def _snapshot_pid(recorded) -> str:
+    return _restart_pids(recorded)[0]
 
 
 # The recorded `adb exec-out screencap -p` of the emulator-api35 screen, which
@@ -419,6 +460,8 @@ def _snapshot_device(
         pytest.fail(f"recorded screenshot missing: {RECORDED_SCREENSHOT}")
     rules = [
         Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+        # log_monitor asks before every read (W3-L, A4).
+        Rule(("get-state",), stdout=recorded.text("adb_get_state")),
         Rule(("exec-out", "uiautomator"), stdout=recorded.text("uiautomator_dump_raw")),
         Rule(("shell", "screencap"), exit=0),
         Rule(("pull",), pull_from=str(RECORDED_SCREENSHOT)),
@@ -429,6 +472,8 @@ def _snapshot_device(
     rules += [
         Rule(("shell", "pidof"), stdout=pid_answer),
         Rule(("shell", "wm", "density"), stdout=recorded.text("wm_density_physical")),
+        # The capture reads records (W3-L): the same window's records half.
+        Rule(("logcat", "-B"), stdout=_records_half(recorded, logcat), filter_pid=True),
         Rule(("logcat",), stdout=logcat, filter_pid=True),
     ]
     toolchain.install("adb", rules)
@@ -457,8 +502,14 @@ def test_d3_error_count_is_the_priority_column(toolchain, tmp_path, recorded):
     parser reads it) is not pinned: the review of PR #20 rejected the first
     version's exact ``-v threadtime`` argv check as an implementation
     constraint. ``:420`` passing ``fmt=None`` remains the likely cause.
+
+    Input changed in W3-L, assertion not: logcat_threadtime has no records
+    half, and the capture now reads records (``-B``), so the window is the
+    restart recording and the app its crashed process (``_snapshot_pid``).
     """
-    _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
+    _snapshot_device(
+        toolchain, recorded, recorded.text(RESTART_LOG), pid_answer=_snapshot_pid(recorded)
+    )
     output = tmp_path / "snapshots"
     toolchain.run(
         "app_state_capture.py",
@@ -949,7 +1000,9 @@ def test_the_snapshot_device_supports_a_complete_capture(toolchain, tmp_path, re
     So the N12 spec below fails only on WHERE the snapshot goes. Every
     artifact comes from the corpus; see ``_snapshot_device``.
     """
-    _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
+    _snapshot_device(
+        toolchain, recorded, recorded.text(RESTART_LOG), pid_answer=_snapshot_pid(recorded)
+    )
     cwd = tmp_path / "agent-cwd"
     cwd.mkdir()
     output = tmp_path / "explicit"
@@ -974,7 +1027,9 @@ def test_n12_a_default_snapshot_succeeds_outside_the_callers_cwd(toolchain, tmp_
     that simply refuses to capture without ``--output`` writes nothing into
     cwd too, and must not pass (review of PR #20).
     """
-    _snapshot_device(toolchain, recorded, recorded.text("logcat_threadtime"), pid_answer=D3_PID)
+    _snapshot_device(
+        toolchain, recorded, recorded.text(RESTART_LOG), pid_answer=_snapshot_pid(recorded)
+    )
     cwd = tmp_path / "agent-cwd"
     cwd.mkdir()
     result = toolchain.run("app_state_capture.py", "--package", PACKAGE, "--json", cwd=cwd)
