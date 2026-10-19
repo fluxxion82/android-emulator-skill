@@ -1041,7 +1041,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       present that lasts until `ps` works again or the process exits —
       otherwise the only recovery is outside the skill: delete the session's
       directory (or `--clear-sessions`) once you have established yourself
-      that the worker has ended
+      that the worker has ended. A session of the earlier version whose
+      worker is gone answers from the summary it saved; run `--stop` first to
+      rebuild it from what that worker persisted
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
       it used to be raised to 1. A restart happens unless adb or `adb
@@ -1367,18 +1369,24 @@ recorded fixture, and was red before the fix.
   exit 0 with no `<failure>`/`<error>`. A run that wrote no results is refused,
   never reported as "0 passed". A Gradle older than 7.6 is refused by name.
 - **Log windows belong to the app.** `log_monitor --app` and
-  `app_state_capture` keep every process of the app and no other, including a
-  crashed one that has since restarted. A pid counts only on evidence that
-  system_server wrote and whose uid matches the package; both read logd's
-  records (`-B`), so no tag or message an app writes can forge attribution,
-  and a window that had to leave the app's lines out says so
-  (`complete: false`). `--severity` validates its names, and counts are line
-  counts. Snapshots no longer land in the caller's working directory.
+  `app_state_capture` keep only lines from processes shown to be the app's,
+  including a crashed one that has since restarted. A pid counts only on
+  evidence that system_server wrote and whose uid matches the package; both
+  read logd's records (`-B`), so no tag or message an app writes can forge
+  attribution. The price is coverage: a process the window saw no such
+  evidence for -- one started before the read, a private `pkg:name` process
+  -- is left out, and the window says so (`attribution.complete: false`,
+  `unresolved_pids`) rather than guessing. `--severity` validates its names,
+  and counts are line counts. Snapshots no longer land in the caller's working
+  directory.
 - **One ANR is one event.** `anr_watcher` reads logd's records too, so the
   `Reason:`/`PID:` lines arrive inside their report, and a WindowManager-only
   ANR still counts, but only as system_server wrote it — the record's pid,
   which no tag can forge — and as an ANR of a window: the window's title is
-  the app's text, so it names, classifies and settles nothing. An ANR is
+  the app's text, so it names, classifies and settles nothing. A window's
+  report that ActivityManager's report of the same broadcast ANR may already
+  account for is counted and marked `possible_duplicate`, never merged on
+  the strength of a title. An ANR is
   filed under a package only when its process is shown to run as that
   package's uid (ActivityManager names the process, which an app may name
   after another package). Jank is keyed by process, and a pid is named only
@@ -1418,8 +1426,10 @@ recorded fixture, and was red before the fix.
   on any skip, exits 3 with diagnostics when the device is lost, retries only
   that case once, and counts the retry in the step summary.
 
-Tests: 1,653 → 2,619, and 0 xfailed. Fixture-policy debt is down to two
-entries, and the boundary guard's debt list is empty.
+Tests: 1,653 → 3,110, and 0 xfailed. Fourteen fix PRs landed between the
+version bump and publication, each from an independent review of the merged
+code; the entries above describe what shipped. Fixture-policy debt is down to
+two entries, and the boundary guard's debt list is empty.
 
 The correction remains fixture-driven: `tests/fixtures/recorded/` holds verbatim
 output captured from real devices on two API levels, parser tests consume it,
@@ -1435,8 +1445,9 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
 - `anr_watcher --watch` / `--since` with `--package` drop every jank and
-  StrictMode event: those lines name no package, and only session mode names
-  the process behind a pid. Use `--start`/`--stop` to keep an app's jank.
+  StrictMode event, and say how many they dropped: those lines name no
+  package, and only session mode names the process behind a pid. Use
+  `--start`/`--stop` to keep an app's jank.
 - An ANR session names only a process started while it runs (system_server's
   `Start proc` is the only evidence it takes); an app already running when
   `--start` is called is keyed by pid, listed under `unnamed_pids`, and its
