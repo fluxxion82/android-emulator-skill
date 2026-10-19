@@ -39,6 +39,8 @@ HOST_ONLY = frozenset(
         "avdmanager_delete_missing",
         "sdkmanager_java_list_installed",
         "sdkmanager_java_list",
+        # Host adb aimed at a serial that is not attached: it reaches no device.
+        "adb_waiting_for_device",
     }
 )
 

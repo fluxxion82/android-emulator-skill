@@ -83,22 +83,25 @@ def test_logcat_produces_lines_the_monitor_can_parse(adb: str, live_device: str)
     """
     from log_monitor import LogMonitor
 
-    monitor = LogMonitor(device_serial=live_device)
-    cmd = monitor.build_logcat_command()
-    requested = cmd[cmd.index("-v") + 1]
+    from common import logcat
 
-    result = _adb(adb, live_device, "logcat", "-d", "-v", requested, "-t", "200")
-    lines = [
-        line
-        for line in result.stdout.splitlines()
-        if line.strip() and not line.startswith("--------- beginning of")
-    ]
-    assert lines, "device produced no log lines"
+    monitor = LogMonitor(device_serial=live_device)
+    assert logcat.BINARY_FLAG in monitor.build_logcat_command()
+
+    # Records, as log_monitor reads them (W3-L): bytes, framed by logd.
+    raw = subprocess.run(
+        [adb, "-s", live_device, "logcat", "-d", logcat.BINARY_FLAG, "-t", "200"],
+        capture_output=True,
+        timeout=30,
+        check=True,
+    ).stdout
+    lines = [line for record in logcat.parse_records(raw) for line in record.lines()]
+    assert lines, "device produced no log records"
 
     parsed = [monitor.parse_logcat_line(line) for line in lines]
     assert any(
         p is not None for p in parsed
-    ), f"log_monitor requests '-v {requested}' but parsed 0 of {len(lines)} real lines"
+    ), f"log_monitor reads records but parsed 0 of the {len(lines)} lines they print as"
 
 
 def test_effective_display_geometry_is_reported(adb: str, live_device: str):

@@ -25,19 +25,52 @@ select options rather than re-deriving them:
 which is the union of what the four produced before, in the order they produced
 it, so the migration changed no command any of them sends. (``-v usec``, ``-T``
 and ``TAG:P`` came later, for the app-window readers: see :func:`app_window`.)
+A binary read (``-B``, :func:`logcat_args` ``binary=True``) takes the place of
+the ``-v`` terms and drops the filterspecs, which ``-B`` ignores (measured).
 
-This module is pure: it builds argv and parses strings, and never touches a
-device. Execution stays with ``common.adb_exec.run_adb`` (bounded, typed errors)
-or, for the two streaming readers, their own watchdog-terminated ``Popen``.
+**One app's window is read from logd's records, not from text.** Text has no
+framing an app cannot forge: logcat prints a tag verbatim, so a tag of
+``"x:\\n<a system_server header> I ActivityManager"`` makes one record print as
+two lines, the second one system_server's to any text parser (recorded:
+logcat_tag_injection). ``logcat -B`` hands over each record whole, with the
+pid and uid logd took from the writing socket's credentials -- the only
+metadata an app cannot write (the tid and the time come from the writer's own
+header; AOSP logd LogListener). :func:`read_record` / :func:`parse_records`
+read it; :meth:`LogRecord.lines` prints a record as ``-v threadtime -v usec``
+would, with the control characters of its tag and message escaped.
+``log_monitor`` and ``app_state_capture`` read this way; **the ANR readers are
+meant to adopt the same reader** for their streams rather than grow their own.
+
+For a reader adopting it, two rules:
+
+- ``main``, ``system``, ``crash`` (and ``radio``, ``kernel``) hold text
+  records: a priority byte, a tag and a message. The ``events``, ``stats`` and
+  ``security`` buffers hold BINARY payloads (an event tag number and typed
+  values), which :class:`LogRecord`'s ``priority`` / ``tag`` / ``message``
+  do not describe; read those with another decoder, or not at all.
+- A :class:`LogFramingError` with ``truncated`` set is the stream ending
+  inside a record. It is tolerable only when the caller stopped the stream
+  itself (a deadline, an interrupt) -- and then the lost record is disclosed,
+  not silently dropped. On a dump, or a stream that ended by itself, it means
+  the capture is incomplete: re-check the device (gone: exit 3) and refuse
+  otherwise. Any other framing error is not records at all: refuse.
+
+This module is pure: it builds argv and parses bytes and strings, and never
+touches a device. Execution stays with ``common.adb_exec`` (bounded, typed
+errors) or, for the two streaming readers, their own watchdog-terminated
+``Popen``.
 """
 
 from __future__ import annotations
 
 import re
+import struct
+import unicodedata
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
+from typing import BinaryIO
 
 from common.device_utils import build_adb_command
 
@@ -83,30 +116,292 @@ SEVERITY_NAMES = ("error", "warning", "info", "debug", "verbose")
 
 # `logcat -v threadtime`: "MM-DD HH:MM:SS.mmm  PID  TID P Tag: message", one
 # header per line (a multi-line message is several headed lines). With
-# `-v usec` the fraction has six digits. app_state_capture and log_monitor read
-# one app's window through this and app_window / AppWindowStream, so the two
-# agree on what that window is (v0.8.0 D4). Recorded: logcat_threadtime (ms),
-# logcat_app_restart_usec.
+# `-v usec` the fraction has six digits. What :meth:`LogRecord.lines` prints,
+# so the text a snapshot saves is read back by the same pattern (D3).
+# Recorded: logcat_threadtime (ms), logcat_app_restart_usec.
 _THREADTIME = re.compile(
-    r"^(?P<head>\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}(?:\d{3})?\s+(?P<pid>\d+)\s+\d+\s+"
-    r"(?P<priority>[VDIWEF])\s+(?P<tag>[^:]*?)\s*):(?P<message>.*)$"
+    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}(?:\d{3})?\s+(?P<pid>\d+)\s+\d+\s+"
+    r"(?P<priority>[VDIWEF])\s+(?P<tag>[^:]*?)\s*:(?P<message>.*)$"
 )
 
-# The extra format term the app-window readers ask for: microsecond headers.
-# The lines of ONE multi-line message share their header to the microsecond;
-# two messages written in one millisecond need not differ at millisecond
-# precision -- recorded: system_server's `Force stopping` and `Killing` lines
-# once shared `16:14:16.651`. A continuation is told apart by its header only
-# at microsecond precision (measured: a crash trace's lines all `.125686`).
+# Microsecond headers, for a TEXT reader: the lines of ONE multi-line message
+# share their header to the microsecond, while two messages written in one
+# millisecond need not differ at millisecond precision -- recorded:
+# system_server's `Force stopping` and `Killing` lines once shared
+# `16:14:16.651`. The app-window readers no longer need it: they read records
+# (`-B`), which say where a message ends without any header comparison.
 USEC_FORMAT = "usec"
 
-# The tag whose lines name an app's processes, and the priority it logs them
-# at (measured, API 35: `I ActivityManager: Start proc <pid>:<pkg>/<user>`,
-# `Killing ...`, `Process <pkg> (pid N) has died`; recorded in
-# logcat_app_restart_usec). A `*:W` filter drops them, so a reader that needs them
-# under one adds this term.
+# The tag whose records name an app's processes (measured, API 35: `I
+# ActivityManager: Start proc <pid>:<pkg>/<user>`, `Killing ...`, `Process
+# <pkg> (pid N) has died`; recorded in logcat_app_restart_records). They are
+# I, so a `*:W` filter would drop them; a binary read has no filter (``-B``
+# ignores filterspecs, measured), and the readers apply their floor on the
+# host after attribution.
 PROCESS_TAG = "ActivityManager"
-PROCESS_TAG_PRIORITY = "I"
+
+# `logcat -B`: logd's records, unformatted. Each is `struct logger_entry` --
+# u16 payload length, u16 header size, i32 pid, u32 tid, u32 sec, u32 nsec,
+# u32 log id, u32 uid -- then the payload, `<priority byte><tag>\0<message>\0`.
+# Measured on the API 35 emulator (logcat_tag_injection, logcat_crash_tail):
+# header size 28, every record. AOSP logcat refuses a header smaller than
+# that struct, and so does this reader: without the uid there is nothing to
+# check a record's writer against. The upper bounds keep one corrupt length
+# from asking the pipe for 64 KiB that are not a record: logd's records are at
+# most LOGGER_ENTRY_MAX_LEN (5 KiB).
+BINARY_FLAG = "-B"
+_ENTRY_SIZES = struct.Struct("<HH")
+_ENTRY_FIELDS = struct.Struct("<iIIIII")
+MIN_ENTRY_HEADER = 28
+MAX_ENTRY_HEADER = 64
+MAX_ENTRY_PAYLOAD = 5 * 1024
+# android_LogPriority, as logcat prints it (VERBOSE=2 .. FATAL=7, SILENT=8);
+# anything else prints "?".
+_PRIORITY_LETTERS = {2: "V", 3: "D", 4: "I", 5: "W", 6: "E", 7: "F", 8: "S"}
+
+
+class LogFramingError(RuntimeError):
+    """The bytes are not logd's record framing, so no record after them can be trusted.
+
+    A length-framed stream cannot resynchronise: one bad header and every
+    later boundary is a guess, so the read is refused rather than guessed at.
+
+    Attributes:
+        offset: Where in the stream the bad record began.
+        truncated: The stream ended inside a record. A live read that was
+            stopped mid-record (its deadline, an interrupt) ends this way and
+            loses only that record; anything else is a refusal.
+    """
+
+    remedy = (
+        "Retry. If it repeats, this device's `logcat -B` does not write logd's records; "
+        "report the device and its API level."
+    )
+
+    def __init__(self, message: str, *, offset: int, truncated: bool = False) -> None:
+        super().__init__(message)
+        self.offset = offset
+        self.truncated = truncated
+
+
+def _printable(text: str) -> str:
+    """``text`` with every non-printable character escaped (``\\n`` -> ``\\\\n``).
+
+    For the TAG. A tag is the app's to choose and logcat prints it verbatim,
+    newline and all -- the injection logcat_tag_injection records. Escaped, a
+    tag can no longer end its line.
+    """
+    return "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in text)
+
+
+def _line_safe(text: str) -> str:
+    """One line of a message with every character that could end or rewrite a line escaped.
+
+    Control characters (Unicode category Cc) other than TAB -- among them
+    CR, VT, FF, the file/group/record separators, NEL, ESC and DEL -- and the
+    line and paragraph separators U+2028/U+2029. ``str.splitlines``, a
+    text-mode file and most line readers break a line at one of those, so a
+    message holding ``\\r<an E header>`` re-read from a saved log was two
+    lines, the second a forged error (review of PR #35); ESC rewrites a
+    terminal. TAB stays: crash traces indent their frames with it.
+    """
+    return "".join(
+        (
+            ascii(ch)[1:-1]
+            if (ch != "\t" and unicodedata.category(ch) == "Cc") or ch in "\u2028\u2029"
+            else ch
+        )
+        for ch in text
+    )
+
+
+@dataclass(frozen=True)
+class LogRecord:
+    """One record logd stored, as ``logcat -B`` hands it over.
+
+    ``pid`` and ``uid`` are logd's, taken from the writing socket's
+    credentials (SO_PEERCRED): an app cannot choose them. ``tid``, the time
+    (``sec`` / ``nsec``) and ``log_id`` come from the header the writer sent
+    (AOSP logd LogListener), and ``tag`` and ``message`` are the writer's,
+    verbatim.
+    """
+
+    pid: int
+    tid: int
+    uid: int
+    log_id: int
+    sec: int
+    nsec: int
+    priority: str
+    tag: str
+    message: str
+
+    def lines(self, tz: tzinfo | None = None) -> list[str]:
+        """The record as ``logcat -v threadtime -v usec`` prints it, its controls escaped.
+
+        Measured against the device's own text for the same records
+        (logcat_app_restart_records, logcat_crash_tail): the header is
+        ``MM-DD HH:MM:SS.uuuuuu PID TID P TAG: `` with the pid and tid right-
+        aligned in five columns and the tag left-aligned in eight; the message
+        is split at every ``\\n`` and each piece printed under the same
+        header; a final ``\\n`` adds no line, and an empty message is one line.
+
+        Where it departs from logcat, on purpose: a tag's non-printable
+        characters are escaped (:func:`_printable`), and so are a message's
+        line-ending and terminal controls (:func:`_line_safe`; ``\\r`` prints
+        as ``\\\\r``). logcat prints both raw, so its text can be made to hold
+        lines nobody logged; these lines cannot, whoever reads them back.
+
+        Args:
+            tz: The zone to print the time in. Default: this host's local
+                zone -- the same clock :func:`window_start` asks ``-t`` from,
+                so the skill already assumes the device's zone is the host's
+                (an emulator takes the host's).
+        """
+        stamp = datetime.fromtimestamp(self.sec, tz)
+        prefix = (
+            f"{stamp:%m-%d %H:%M:%S}.{self.nsec // 1000:06d} {self.pid:5d} {self.tid:5d} "
+            f"{self.priority} {_printable(self.tag):<8}: "
+        )
+        pieces = self.message.split("\n")
+        if len(pieces) > 1 and pieces[-1] == "":
+            pieces.pop()
+        return [prefix + _line_safe(piece) for piece in pieces]
+
+
+def _decode_record(header: bytes, payload: bytes) -> LogRecord:
+    """A record from its header and payload bytes (sizes already checked).
+
+    The payload is split as AOSP liblog splits it: the tag runs to the first
+    NUL after the priority byte, the message to the next NUL or the end.
+    """
+    pid, tid, sec, nsec, log_id, uid = _ENTRY_FIELDS.unpack_from(header, _ENTRY_SIZES.size)
+    tag, _, rest = payload[1:].partition(b"\0")
+    message = rest.split(b"\0", 1)[0]
+    return LogRecord(
+        pid=pid,
+        tid=tid,
+        uid=uid,
+        log_id=log_id,
+        sec=sec,
+        nsec=nsec,
+        priority=_PRIORITY_LETTERS.get(payload[0] if payload else -1, "?"),
+        tag=tag.decode("utf-8", errors="replace"),
+        message=message.decode("utf-8", errors="replace"),
+    )
+
+
+def _check_sizes(length: int, header_size: int, offset: int) -> None:
+    if not MIN_ENTRY_HEADER <= header_size <= MAX_ENTRY_HEADER or length > MAX_ENTRY_PAYLOAD:
+        raise LogFramingError(
+            f"`logcat -B` output is not logd's record framing at byte {offset}: header "
+            f"size {header_size}, payload {length} (expected a header of "
+            f"{MIN_ENTRY_HEADER}..{MAX_ENTRY_HEADER} bytes and at most "
+            f"{MAX_ENTRY_PAYLOAD} of payload).",
+            offset=offset,
+        )
+
+
+def _read_exactly(stream: BinaryIO, count: int) -> bytes:
+    """``count`` bytes of ``stream``, or fewer only at its end.
+
+    A pipe read returns what has arrived, not what was asked for: an
+    unbuffered pipe (``bufsize=0``) delivered a valid header in two pieces
+    and a single ``read`` took the first for the stream's end (review of PR
+    #35). Read again until the count is met or a read returns nothing.
+    """
+    data = b""
+    while len(data) < count:
+        chunk = stream.read(count - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _read_entry(stream: BinaryIO, offset: int) -> tuple[LogRecord, int] | None:
+    """The next record and its size in bytes; None at a clean end."""
+    sizes = _read_exactly(stream, _ENTRY_SIZES.size)
+    if not sizes:
+        return None
+    if len(sizes) < _ENTRY_SIZES.size:
+        raise LogFramingError(
+            "the stream ended inside a record header", offset=offset, truncated=True
+        )
+    length, header_size = _ENTRY_SIZES.unpack(sizes)
+    _check_sizes(length, header_size, offset)
+    wanted = header_size - _ENTRY_SIZES.size + length
+    rest = _read_exactly(stream, wanted)
+    if len(rest) < wanted:
+        raise LogFramingError("the stream ended inside a record", offset=offset, truncated=True)
+    split = header_size - _ENTRY_SIZES.size
+    return _decode_record(sizes + rest[:split], rest[split:]), header_size + length
+
+
+def read_record(stream: BinaryIO) -> LogRecord | None:
+    """The next record of a binary ``logcat -B`` stream; None at its clean end.
+
+    Blocks like ``readline`` does, until a whole record or the end arrives
+    -- however many pieces the pipe delivers it in -- and reads at most one
+    bounded record. For a live read (``log_monitor``; the ANR readers are
+    meant to use it too). :func:`iter_records` is the same over a whole
+    stream, with stream offsets in its errors.
+
+    Args:
+        stream: A blocking binary file object -- a ``Popen`` stdout opened
+            without ``text=`` (buffered or not), or ``io.BytesIO``.
+
+    Raises:
+        LogFramingError: A header outside the bounds, or the stream ended
+            inside a record (``truncated``). See the module docstring for
+            when a truncation may be tolerated: only when the caller stopped
+            the stream, and disclosed.
+    """
+    entry = _read_entry(stream, 0)
+    return entry[0] if entry is not None else None
+
+
+def iter_records(stream: BinaryIO) -> Iterator[LogRecord]:
+    """Every record of a binary stream, in order, until its clean end.
+
+    Raises:
+        LogFramingError: As :func:`read_record`, with the record's offset.
+    """
+    offset = 0
+    while (entry := _read_entry(stream, offset)) is not None:
+        offset += entry[1]
+        yield entry[0]
+
+
+def parse_records(data: bytes) -> list[LogRecord]:
+    """Every record of a whole ``logcat -d -B`` dump.
+
+    Raises:
+        LogFramingError: The bytes are not whole records -- including a dump
+            that ends inside one, which a complete dump never does.
+    """
+    records: list[LogRecord] = []
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < _ENTRY_SIZES.size:
+            raise LogFramingError(
+                "the dump ended inside a record header", offset=offset, truncated=True
+            )
+        length, header_size = _ENTRY_SIZES.unpack_from(data, offset)
+        _check_sizes(length, header_size, offset)
+        end = offset + header_size + length
+        if end > len(data):
+            raise LogFramingError("the dump ended inside a record", offset=offset, truncated=True)
+        records.append(
+            _decode_record(data[offset : offset + header_size], data[offset + header_size : end])
+        )
+        offset = end
+    return records
+
+
+def records_text(records: Iterable[LogRecord], tz: tzinfo | None = None) -> str:
+    """Records printed as ``-v threadtime -v usec`` text, one ``\\n`` after each line."""
+    return "".join(f"{line}\n" for record in records for line in record.lines(tz))
 
 
 def parse_duration(text: str) -> float:
@@ -223,31 +518,34 @@ def parse_threadtime(line: str) -> tuple[str, str] | None:
     return (match["pid"], match["priority"]) if match else None
 
 
-# --- one app's window: which lines are its processes' -----------------------
+# --- one app's window: which records are its processes' ---------------------
 #
-# A pid is the app's only when (i) the device vouches that its uid is the
-# package's, and (ii) the line falls inside that pid's life as the app's
-# process. The evidence, all recorded in logcat_app_restart_usec (an app crashed,
-# was relaunched, force-stopped and relaunched):
+# A record is the app's only when (i) the device vouches that its writer's pid
+# was the app's process -- its uid the package's -- and (ii) the record falls
+# inside that pid's life as the app's process, and (iii) logd stamped the
+# record with one of the package's uids. The evidence, all recorded in
+# logcat_app_restart_records (an app crashed, was relaunched, force-stopped
+# and relaunched):
 #
 #     ActivityManager: Start proc 21149:<package>/u0a205 for next-top-activity {...}
 #     ActivityManager: Process <package> (pid 21149) has died: fg  TOP
 #     ActivityManager: Killing 21205:<package>/u0a205 (adj 0): stop <package> ...
 #
 # plus `pidof <package>` for the process alive now, its uid checked with `ps`.
-# What does NOT count, and why (security reviews of #27):
+# What does NOT count, and why (security reviews of #27 and v0.8.0):
 #
-# - the package name on its own: most lines naming it are system_server's,
+# - the package name on its own: most records naming it are system_server's,
 #   the launcher's and the IME's;
 # - the tag: any app may log under ActivityManager -- a sentence counts only
-#   when system_server WROTE it (the PID column is system_server's pid, asked
-#   of the device; unknown, nothing counts);
-# - a sentence anywhere but the very start of the message: system_server's
-#   messages carry app-controlled text further on (a component, an intent);
-# - a continuation line: a multi-line message is printed as several lines
-#   with one header, so a later line of it can start with any text the app
-#   put there. Only the first line of a run sharing the full header -- to the
-#   microsecond, see USEC_FORMAT -- may hold a sentence;
+#   when system_server WROTE it (the record's pid, which logd sets, is
+#   system_server's pid, asked of the device; unknown, nothing counts);
+# - a sentence anywhere but the very start of the record's message:
+#   system_server's messages carry app-controlled text further on (a
+#   component, an intent), including whole further lines;
+# - anything a text read would call a line of its own: logcat prints a tag
+#   verbatim, so a tag holding "\n<header>" printed a forged system_server
+#   line (logcat_tag_injection). Records are read whole (`-B`), so a record is
+#   one writer's whatever its tag or message holds;
 # - the process name: an app may name its own process after another package
 #   (`android:process`), and system_server then really logs `Start proc
 #   N:<that package>/<the impostor's uid>`. Start proc and Killing carry the
@@ -256,6 +554,14 @@ def parse_threadtime(line: str) -> tuple[str, str] | None:
 #   confirmed;
 # - a crash's own `AndroidRuntime: Process: <package>, PID: N`: any app can
 #   write it for another package through the public Log API (ruling A).
+#
+# What is NOT shown, and is still reported: a record logd stamped with the
+# package's uid whose pid the window never ties to the package -- a process
+# whose `Start proc` is older than the window and that is gone by its end
+# (a crash read too late). Its lines are left out, counted, and the window is
+# marked incomplete (`unresolved`), rather than dropped as if the app had
+# logged nothing. A record under any other uid is another app's: proven, not
+# unresolved.
 
 # AOSP's UserHandle.formatUid, as system_server prints the uid after a process
 # name: below FIRST_APPLICATION_UID the bare number, else u<user> followed by
@@ -265,11 +571,11 @@ _PER_USER_RANGE = 100_000
 _UID_BASES = {"a": 10_000, "ai": 90_000, "i": 99_000, "s": 0}
 _FORMATTED_UID = re.compile(r"u(?P<user>\d+)(?P<kind>ai|a|i|s)(?P<n>\d+)")
 
-# The three sentences, as the whole opening of the message -- right after
-# "ActivityManager: " -- for ANY process name; whose process it is comes after.
-_START = re.compile(r" Start proc (?P<pid>\d+):(?P<name>[^/\s]+)/(?P<uid>\S+) ")
-_KILLING = re.compile(r" Killing (?P<pid>\d+):(?P<name>[^/\s]+)/(?P<uid>\S+) \(adj -?\d+\): ")
-_DIED = re.compile(r" Process (?P<name>\S+) \(pid (?P<pid>\d+)\) has died\b")
+# The three sentences, as the whole opening of an ActivityManager record's
+# message, for ANY process name; whose process it is comes after.
+_START = re.compile(r"Start proc (?P<pid>\d+):(?P<name>[^/\s]+)/(?P<uid>\S+) ")
+_KILLING = re.compile(r"Killing (?P<pid>\d+):(?P<name>[^/\s]+)/(?P<uid>\S+) \(adj -?\d+\): ")
+_DIED = re.compile(r"Process (?P<name>\S+) \(pid (?P<pid>\d+)\) has died\b")
 
 # What a sentence says about the pid it names.
 _STARTED = "started"  # an app process began (uid checked)
@@ -307,25 +613,23 @@ class _Lazy:
 
 
 class _Reader:
-    """Reads lines in order: which pid wrote each, and what a sentence says."""
+    """Reads records in order: which pid wrote each, and what a sentence says."""
 
     def __init__(self, package: str, system_server_pid, package_uids) -> None:
         self.package = package
         self.system_server = _Lazy(system_server_pid)
         self.package_uids = _Lazy(package_uids)
-        self._previous_head: str | None = None
 
-    def read(self, line: str) -> tuple[str | None, tuple[str, str] | None]:
-        """``(pid that wrote line, (what, pid) said by it)``; None where there is none."""
-        match = _THREADTIME.match(line)
-        if match is None:
-            self._previous_head = None
-            return None, None
-        first = match["head"] != self._previous_head
-        self._previous_head = match["head"]
-        if not first or match["tag"] != PROCESS_TAG:
-            return match["pid"], None
-        return match["pid"], self._sentence(match["pid"], match["message"])
+    def uids(self) -> frozenset[int]:
+        """The package's uids (asked of the device once); empty when unknown."""
+        return _uid_set(self.package_uids())
+
+    def read(self, record: LogRecord) -> tuple[str, tuple[str, str] | None]:
+        """``(pid that wrote record, (what, pid) said by it or None)``."""
+        writer = str(record.pid)
+        if record.tag != PROCESS_TAG:
+            return writer, None
+        return writer, self._sentence(writer, record.message)
 
     def _sentence(self, writer: str, message: str) -> tuple[str, str] | None:
         found, pattern = next(
@@ -340,7 +644,7 @@ class _Reader:
             return _DIED_APP, pid
         # Any of the package's uids: it has one per user it is installed for
         # (recorded: package_list_uid_two_users).
-        uids = _uid_set(self.package_uids())
+        uids = self.uids()
         if not uids or uid_from_formatted(found["uid"]) not in uids:
             return _OTHER, pid
         return (_STARTED if pattern is _START else _KILLED), pid
@@ -385,68 +689,82 @@ def _spans(events: list[tuple[int, str]], end: int, alive: bool) -> list[tuple[i
 
 @dataclass
 class AppWindow:
-    """One app's lines of a logcat window, and which pids they came from."""
+    """One app's records of a logcat window, and what decided them.
 
-    lines: list[str]
+    Attributes:
+        records: The app's records, in input order.
+        pids: Pids with a life in the window.
+        pids_from_log: Those of them the log itself named.
+        unresolved_lines: Lines of records logd stamped with the package's
+            uid that are NOT in ``records``: their pid's life as the app's is
+            not in evidence (see the section comment). Nonzero, the window is
+            incomplete.
+        unresolved_pids: The pids that wrote them.
+    """
+
+    records: list[LogRecord]
     pids: set[str]
     pids_from_log: set[str]
+    unresolved_lines: int = 0
+    unresolved_pids: set[str] | None = None
+
+    def lines(self, tz: tzinfo | None = None) -> list[str]:
+        """The window as threadtime text lines (see :meth:`LogRecord.lines`)."""
+        return [line for record in self.records for line in record.lines(tz)]
+
+    @property
+    def complete(self) -> bool:
+        """Whether no record of the package's uid was left out for lack of evidence."""
+        return not self.unresolved_lines
 
 
 def split_log_lines(text: str) -> list[str]:
-    """logcat output as lines, split on ``\\n`` ONLY.
+    """logcat text as lines, split on ``\\n`` ONLY.
 
     logcat frames each line with ``\\n`` and leaves a ``\\r`` an app wrote
-    inside its message raw (AOSP liblog logprint). ``str.splitlines`` -- and
-    a text-mode pipe -- also break on ``\\r``, which let an app append
-    ``\\r<a forged system_server header> Start proc ...`` to its own line and
-    have it read as a line of its own (security review of #27). A single
-    ``\\r`` ending a line is dropped, as a line terminator; one inside stays.
+    inside its message raw (AOSP liblog logprint), as :meth:`LogRecord.lines`
+    does. ``str.splitlines`` -- and a text-mode pipe -- also break on
+    ``\\r``, which let an app append ``\\r<a forged header>`` to its own line
+    and have it read as a line of its own (security reviews of #27 and
+    v0.8.0). A single ``\\r`` ending a line is dropped, as a line terminator;
+    one inside stays.
     """
     return [line.removesuffix("\r") for line in text.split("\n")]
 
 
-def decode_log_line(raw: bytes) -> str:
-    """One ``\\n``-delimited line of logcat bytes, as text (``\\r`` kept inside).
-
-    Splitting on ``b"\\n"`` before decoding is safe: in UTF-8 that byte is
-    never part of a multi-byte character.
-    """
-    return raw.decode("utf-8", errors="replace").removesuffix("\n").removesuffix("\r")
-
-
 def app_window(
-    text: str,
+    records: Sequence[LogRecord],
     package: str,
     *,
     system_server_pid: str | Callable[[], str | None] | None = None,
     package_uids: int | Iterable[int] | Callable[[], Iterable[int] | None] | None = None,
     running: Iterable[str] = (),
 ) -> AppWindow:
-    """The lines of a whole (historical) window that were ``package``'s processes'.
+    """The records of a whole (historical) window that were ``package``'s processes'.
 
     Args:
-        text: ``logcat -v threadtime [-v usec]`` output.
+        records: ``logcat -B`` records (:func:`parse_records`), in order.
         package: The application id.
         system_server_pid: system_server's pid, or a function returning it
             (None when the device cannot say); asked only if the window holds
             an ActivityManager sentence. Unknown: no sentence counts.
         package_uids: The package's uids -- one per user it is installed for --
-            or a function returning them; asked only if a sentence names the
-            package. A sentence's uid must be one of them. Unknown: no
-            sentence counts.
+            or a function returning them; asked once, when the window holds a
+            record. A sentence's uid, and a kept record's, must be one of them.
+            Unknown: nothing is the app's.
         running: Pids alive now whose uid the caller checked is the package's
             (``pidof`` then ``ps``). Each one's life runs to the window's end.
 
     Returns:
-        The lines in input order, the pids with a life in the window, and
-        those of them the log itself named.
+        The app's records in input order, the pids with a life in the window,
+        those of them the log itself named, and what of the package's uid was
+        left out unresolved.
     """
-    lines = split_log_lines(text)
     reader = _Reader(package, system_server_pid, package_uids)
-    writers: list[str | None] = []
+    writers: list[str] = []
     events: dict[str, list[tuple[int, str]]] = {}
-    for index, line in enumerate(lines):
-        writer, sentence = reader.read(line)
+    for index, record in enumerate(records):
+        writer, sentence = reader.read(record)
         writers.append(writer)
         if sentence is not None:
             events.setdefault(sentence[1], []).append((index, sentence[0]))
@@ -454,21 +772,28 @@ def app_window(
     spans = {
         pid: found
         for pid in set(events) | alive
-        if (found := _spans(events.get(pid, []), len(lines), pid in alive))
+        if (found := _spans(events.get(pid, []), len(records), pid in alive))
     }
-    kept = [
-        line
-        for index, (line, writer) in enumerate(zip(lines, writers, strict=True))
-        if writer in spans and any(start <= index <= end for start, end in spans[writer])
-    ]
+    uids = reader.uids() if records else frozenset()
+    kept: list[LogRecord] = []
+    unresolved_lines = 0
+    unresolved_pids: set[str] = set()
+    for index, (record, writer) in enumerate(zip(records, writers, strict=True)):
+        if record.uid not in uids:
+            continue
+        if writer in spans and any(start <= index <= end for start, end in spans[writer]):
+            kept.append(record)
+        else:
+            unresolved_lines += len(record.lines())
+            unresolved_pids.add(writer)
     from_log = {
         pid for pid in spans if any(w in (_STARTED, _KILLED) for _, w in events.get(pid, []))
     }
-    return AppWindow(kept, set(spans), from_log)
+    return AppWindow(kept, set(spans), from_log, unresolved_lines, unresolved_pids)
 
 
 def parse_package_pids(
-    text: str,
+    records: Sequence[LogRecord],
     package: str,
     *,
     system_server_pid: str | Callable[[], str | None] | None = None,
@@ -481,19 +806,20 @@ def parse_package_pids(
     to count; without them, none does (fail closed).
     """
     return app_window(
-        text, package, system_server_pid=system_server_pid, package_uids=package_uids
+        records, package, system_server_pid=system_server_pid, package_uids=package_uids
     ).pids
 
 
 class AppWindowStream:
-    """:func:`app_window` for a live read: decides each line as it arrives.
+    """:func:`app_window` for a live read: decides each record as it arrives.
 
     A live read cannot see ahead, and a process already running when it began
-    is named only when it is killed. So a line from a pid not yet decided is
-    held -- up to ``pending_cap`` lines, oldest dropped first -- and returned
-    when a uid-checked ``Killing`` makes the pid the app's. Every line is
-    numbered in input order, so a caller can store what it keeps in that order
-    whatever the order of decision.
+    is named only when it is killed. So a record of the package's uid from a
+    pid not yet decided is held -- up to ``pending_cap`` lines, oldest dropped
+    first -- and returned when a uid-checked ``Killing`` makes the pid the
+    app's. A record under any other uid is never the app's and is never held.
+    Every record is numbered in input order, so a caller can store what it
+    keeps in that order whatever the order of decision.
 
     Attributes:
         pids: Pids with a life in the read so far.
@@ -516,68 +842,98 @@ class AppWindowStream:
         self._decided: set[str] = set(running)
         self.pids: set[str] = set(running)
         self.pids_from_log: set[str] = set()
-        self._pending: deque[tuple[int, str, str]] = deque(maxlen=pending_cap)
+        self._cap = pending_cap
+        # (sequence, pid, record, its line count), oldest first.
+        self._pending: deque[tuple[int, str, LogRecord, int]] = deque()
+        self._held_lines = 0
         self._evicted: dict[str, int] = {}
         self.pending_evicted = 0
+        self._unresolved: dict[str, int] = {}
         self._sequence = 0
 
     @property
     def unattributed(self) -> int:
-        """Lines held now, from pids the read has not (yet) shown to be the app's."""
-        return len(self._pending)
+        """Lines held now: the package's uid, from pids not (yet) shown to be the app's."""
+        return self._held_lines
 
-    def feed(self, line: str) -> list[tuple[int, str, bool]]:
-        """Read one line; return ``(sequence, line, replayed)`` for what is now the app's."""
+    @property
+    def unresolved_lines(self) -> int:
+        """Lines of the package's uid left out so far, held ones included.
+
+        A pid the read decided was not the app's, or never decided -- its
+        held lines and the ones the cap dropped. Nonzero: incomplete.
+        """
+        return sum(self._unresolved.values()) + sum(self._evicted.values()) + self._held_lines
+
+    @property
+    def unresolved_pids(self) -> set[str]:
+        """The pids whose lines :attr:`unresolved_lines` counts."""
+        return set(self._unresolved) | set(self._evicted) | {pid for _, pid, _, _ in self._pending}
+
+    def feed(self, record: LogRecord) -> list[tuple[int, LogRecord, bool]]:
+        """Read one record; return ``(sequence, record, replayed)`` for what is now the app's."""
         sequence = self._sequence
         self._sequence += 1
-        writer, sentence = self._reader.read(line)
+        writer, sentence = self._reader.read(record)
         kept = self._apply(sentence) if sentence is not None else []
-        if writer is None:
+        if record.uid not in self._reader.uids():
             return kept
         if writer in self._open:
-            kept.append((sequence, line, False))
+            kept.append((sequence, record, False))
         elif writer not in self._decided:
-            self._hold(sequence, writer, line)
+            self._hold(sequence, writer, record)
+        else:
+            self._unresolved[writer] = self._unresolved.get(writer, 0) + len(record.lines())
         return kept
 
-    def _apply(self, sentence: tuple[str, str]) -> list[tuple[int, str, bool]]:
+    def _apply(self, sentence: tuple[str, str]) -> list[tuple[int, LogRecord, bool]]:
         what, pid = sentence
-        replayed: list[tuple[int, str, bool]] = []
+        replayed: list[tuple[int, LogRecord, bool]] = []
         if what == _STARTED:
             # Anything pid logged before its start was an earlier process's.
-            self._release(pid)
+            self._settle_unresolved(pid)
             self._open.add(pid)
             self.pids.add(pid)
             self.pids_from_log.add(pid)
         elif what == _KILLED and pid not in self._decided:
-            replayed = [(seq, line, True) for seq, line in self._release(pid)]
+            replayed = [(seq, record, True) for seq, record in self._release(pid)]
             self.pending_evicted += self._evicted.pop(pid, 0)
             self.pids.add(pid)
             self.pids_from_log.add(pid)
             self._open.discard(pid)
         else:
-            self._release(pid)
+            self._settle_unresolved(pid)
             self._open.discard(pid)
-        self._evicted.pop(pid, None)
         self._decided.add(pid)
         return replayed
 
-    def _hold(self, sequence: int, pid: str, line: str) -> None:
-        if self._pending.maxlen is not None and len(self._pending) == self._pending.maxlen:
-            dropped = self._pending[0][1]
-            self._evicted[dropped] = self._evicted.get(dropped, 0) + 1
-        self._pending.append((sequence, pid, line))
+    def _settle_unresolved(self, pid: str) -> None:
+        """``pid``'s held and dropped lines stay out of the window, as unresolved."""
+        lines = sum(count for _, count in self._release_counted(pid)) + self._evicted.pop(pid, 0)
+        if lines:
+            self._unresolved[pid] = self._unresolved.get(pid, 0) + lines
 
-    def _release(self, pid: str) -> list[tuple[int, str]]:
-        """Take ``pid``'s held lines out of the hold, in arrival order."""
-        if not any(held == pid for _, held, _ in self._pending):
+    def _hold(self, sequence: int, pid: str, record: LogRecord) -> None:
+        count = len(record.lines())
+        self._pending.append((sequence, pid, record, count))
+        self._held_lines += count
+        while self._cap is not None and self._held_lines > self._cap and self._pending:
+            _, dropped, _, dropped_count = self._pending.popleft()
+            self._held_lines -= dropped_count
+            self._evicted[dropped] = self._evicted.get(dropped, 0) + dropped_count
+
+    def _release_counted(self, pid: str) -> list[tuple[tuple[int, LogRecord], int]]:
+        """Take ``pid``'s held records out of the hold, in arrival order, with line counts."""
+        if not any(held == pid for _, held, _, _ in self._pending):
             return []
-        mine = [(seq, line) for seq, held, line in self._pending if held == pid]
-        self._pending = deque(
-            ((seq, held, line) for seq, held, line in self._pending if held != pid),
-            maxlen=self._pending.maxlen,
-        )
+        mine = [((seq, rec), count) for seq, held, rec, count in self._pending if held == pid]
+        self._pending = deque(entry for entry in self._pending if entry[1] != pid)
+        self._held_lines -= sum(count for _, count in mine)
         return mine
+
+    def _release(self, pid: str) -> list[tuple[int, LogRecord]]:
+        """Take ``pid``'s held records out of the hold, in arrival order."""
+        return [entry for entry, _ in self._release_counted(pid)]
 
 
 def logcat_args(
@@ -592,6 +948,7 @@ def logcat_args(
     tag_priorities: Sequence[tuple[str, str]] = (),
     usec: bool = False,
     tail: int | None = None,
+    binary: bool = False,
 ) -> list[str]:
     """Build the argument tail that follows ``adb [-s S] logcat``.
 
@@ -612,12 +969,12 @@ def logcat_args(
             "sixty lines" here once, hence the timestamp-only signature.
         fmt: ``-v`` format. Defaults to ``threadtime``; pass None to inherit
             the device's format (only safe when nothing parses the output).
-        usec: Add ``-v usec``: microsecond headers, which the app-window
-            readers need to tell a continuation line (see USEC_FORMAT).
+        usec: Add ``-v usec``: microsecond headers, which a text reader needs
+            to tell a continuation line (see USEC_FORMAT).
         tail: For a live read, ``-T <tail>``: start at the END of the buffer
-            (the most recent ``tail`` lines, then follow) instead of replaying
-            it all. Measured: placed before filterspecs, ``-T 1`` prints the
-            newest line and then follows.
+            (the most recent ``tail`` records, then follow) instead of
+            replaying it all. Measured: placed before filterspecs, ``-T 1``
+            prints the newest record -- every line of it -- and then follows.
         pid: Restrict to one process via ``--pid=``. Falsy values are omitted,
             which reads EVERY process: a caller that means one app must not
             reach here with an unresolved pid, or its "app" window is the whole
@@ -626,8 +983,15 @@ def logcat_args(
         min_priority: A single letter for the trailing ``*:<priority>`` term.
         tag_priorities: ``(tag, letter)`` terms placed before ``*:<priority>``,
             so one tag is read below the global floor (logcat applies the most
-            specific term). ``log_monitor --app`` keeps ``ActivityManager:I``
-            under ``*:W`` this way.
+            specific term).
+        binary: ``-B`` in place of every ``-v`` term: logd's records whole
+            (:func:`parse_records`). ``fmt``, ``usec``, ``min_priority`` and
+            ``tag_priorities`` are then left out: measured on API 35, ``-B``
+            ignores filterspecs (``*:E`` still returned I and D records), so
+            sending them would only suggest a filter that is not applied. A
+            binary reader filters on the host. ``-d``, ``-t``, ``-T`` and
+            ``--pid`` are logd's own and still apply; ``-T N`` and ``-t N``
+            count RECORDS (measured: ``-T 1`` returned one 13-line crash).
 
     Returns:
         The argument list, in the fixed order documented at module level.
@@ -644,17 +1008,21 @@ def logcat_args(
         args.append("-d")
     if since is not None:
         args.extend(["-t", since])
-    if fmt:
-        args.extend(["-v", fmt])
-    if usec:
-        args.extend(["-v", USEC_FORMAT])
+    if binary:
+        args.append(BINARY_FLAG)
+    else:
+        if fmt:
+            args.extend(["-v", fmt])
+        if usec:
+            args.extend(["-v", USEC_FORMAT])
     if tail is not None:
         args.extend(["-T", str(tail)])
     if pid:
         args.append(f"--pid={pid}")
-    args.extend(f"{tag}:{letter}" for tag, letter in tag_priorities)
-    if min_priority:
-        args.append(f"*:{min_priority}")
+    if not binary:
+        args.extend(f"{tag}:{letter}" for tag, letter in tag_priorities)
+        if min_priority:
+            args.append(f"*:{min_priority}")
     return args
 
 

@@ -104,20 +104,25 @@ def test_parser_matches_the_threadtime_format_it_was_written_for(recorded):
 
 
 def test_requested_format_and_parsed_format_agree(recorded):
-    """The command's `-v` argument must name the format the parser understands.
+    """What the command asks for must be what the parser understands.
 
     This is the invariant that, held from the start, would have made A1
-    impossible — regardless of which of the two sides was chosen.
+    impossible — regardless of which of the two sides was chosen. The command
+    asks for logd's records (`-B`); each is printed as threadtime
+    (`LogRecord.lines`, held against the device's own text in
+    test_log_records.py), and the parser must read every line of that.
     """
-    monitor = _log_monitor()
-    cmd = monitor.build_logcat_command()
-    requested = cmd[cmd.index("-v") + 1]
+    from common import logcat
 
-    probe = _content_lines(recorded.text(f"logcat_{requested}"))[:50]
+    monitor = _log_monitor()
+    assert logcat.BINARY_FLAG in monitor.build_logcat_command()
+
+    records = logcat.parse_records(recorded.data("logcat_app_restart_records.bin"))[:50]
+    probe = [line for record in records for line in record.lines()]
     parsed = [monitor.parse_logcat_line(line) for line in probe]
-    assert any(p is not None for p in parsed), (
-        f"build_logcat_command requests '-v {requested}', but parse_logcat_line "
-        f"matched none of {len(probe)} real lines in that format"
+    assert probe and all(p is not None for p in parsed), (
+        f"build_logcat_command requests records, but parse_logcat_line did not read "
+        f"{sum(p is None for p in parsed)} of the {len(probe)} lines they print as"
     )
 
 

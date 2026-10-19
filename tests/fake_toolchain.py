@@ -22,16 +22,28 @@ with two differences that the specs need:
 
 Two behaviours are simulated rather than replayed, because ignoring them would
 make a spec pass against the very bug it pins. ``logcat --pid=N`` prints only
-the lines whose PID column is N; a rule opts in with ``filter_pid=True``. And a
+the records whose pid is N; a rule opts in with ``filter_pid=True``. And a
 following ``logcat -T N`` starts at the end of what the device had already
-buffered -- its last N lines -- before what arrives after; a rule that gives
+buffered -- its last N RECORDS -- before what arrives after; a rule that gives
 that history as ``buffered=`` gets it whole without ``-T`` and only its tail
-with it. Both are documented logcat behaviour, applied to a recorded threadtime
-transcript; everything else ``logcat`` can be asked (``-t``, ``*:W``, ``-b``)
-is ignored, which only ever makes the stub answer *more* than a device would.
+with it. logd tails records, not lines: a 13-line crash is one record, and
+``-T 1`` prints all 13 lines (recorded: logcat_crash_tail, the tail of
+logcat_crash_buffer). In a recorded threadtime transcript a record is a run of
+lines sharing one header (``-v usec``: to the microsecond), and the buffer's
+separator line before it is printed too; in recorded ``-B`` bytes
+(``stdout``/``buffered`` given as bytes) a record is logd's own frame.
+Everything else ``logcat`` can be asked (``-t``, ``*:W``, ``-b``) is ignored,
+which only ever makes the stub answer *more* than a device would.
 
 Replayed text is byte-exact: a carriage return inside a recorded line stays
 inside it, as it does on the device, whose logcat ends a line only at ``\\n``.
+Replayed records are byte-exact too: bytes are written as they were recorded.
+
+Two more behaviours are simulated: ``hang=True`` answers and then does not
+exit until it is killed, as a streaming ``adb logcat`` aimed at a device that is
+not attached waits (recorded: adb_waiting_for_device); and ``once=True``
+answers the first call it matches only, so a device can be there for one
+question and gone for the next.
 
 Every invocation of every stub is appended to a log, so a spec can say both
 "the script answered X" and "the script asked the device Y" -- and so a spec
@@ -48,6 +60,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -72,8 +85,11 @@ _STUB = """#!{python}
 # Fake {name}: replays recorded output per subcommand. See tests/fake_toolchain.py.
 import json
 import os
+import re
 import shutil
+import struct
 import sys
+import time
 
 with open({spec!r}, encoding="utf-8") as handle:
     spec = json.load(handle)
@@ -81,9 +97,62 @@ argv = sys.argv[1:]
 with open(spec["log"], "a", encoding="utf-8") as log:
     log.write(json.dumps([spec["name"], *argv]) + "\\n")
 
-for rule in spec["rules"]:
+# A threadtime header: everything before the message. A run of lines sharing
+# one is one record.
+HEADER = re.compile(r"^\\S+ \\S+\\s+\\d+\\s+\\d+ \\S [^:]*:")
+SEPARATOR = b"--------- beginning of"
+
+def split_lines(data):
+    # Split where logcat does -- at "\\n" only -- keeping the ends.
+    parts = data.split(b"\\n")
+    return [part + b"\\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+def text_records(data):
+    # ("sep", [line]) for a buffer separator, ("rec", [lines]) per record.
+    items, previous = [], None
+    for line in split_lines(data):
+        if line.startswith(SEPARATOR):
+            items.append(("sep", [line]))
+            previous = None
+            continue
+        match = HEADER.match(line.decode("utf-8", "replace"))
+        key = match.group(0) if match else None
+        if key is not None and key == previous and items and items[-1][0] == "rec":
+            items[-1][1].append(line)
+        else:
+            items.append(("rec", [line]))
+        previous = key
+    return items
+
+def binary_records(data):
+    # logd's frames: u16 payload length, u16 header size, i32 pid, ...
+    records, offset = [], 0
+    while offset + 8 <= len(data):
+        length, header = struct.unpack_from("<HH", data, offset)
+        end = offset + header + length
+        records.append((str(struct.unpack_from("<i", data, offset + 4)[0]), data[offset:end]))
+        offset = end
+    return records
+
+def tail_text(data, count):
+    items = text_records(data)
+    recs = [i for i, (kind, _) in enumerate(items) if kind == "rec"]
+    if count >= len(recs):
+        return data
+    first = recs[-count] if count else len(items)
+    seps = [i for i in range(first) if items[i][0] == "sep"]
+    chosen = ([items[seps[-1]]] if seps else []) + items[first:]
+    return b"".join(line for _, lines in chosen for line in lines)
+
+for index, rule in enumerate(spec["rules"]):
     if not all(token in argv for token in rule["match"]):
         continue
+    if rule["once"]:
+        # Answers the first matching call only; later calls fall through.
+        used = spec["log"] + ".used-" + spec["name"] + "-" + str(index)
+        if os.path.exists(used):
+            continue
+        open(used, "w").close()
     for destination, source in rule["writes"]:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         with open(source, encoding="utf-8") as src, open(destination, "w", encoding="utf-8") as dst:
@@ -91,39 +160,45 @@ for rule in spec["rules"]:
     if rule["pull_from"]:
         # `adb pull <device path> <host path>`: the host path is the last argument.
         shutil.copyfile(rule["pull_from"], argv[-1])
+
     def read(path):
-        # newline="": a carriage return is replayed, not turned into a newline.
-        with open(path, encoding="utf-8", newline="") as handle:
+        # Bytes: a carriage return is replayed, never turned into a newline.
+        with open(path, "rb") as handle:
             return handle.read()
 
-    def lines(text):
-        # Split where logcat does -- at "\\n" only -- keeping the ends.
-        parts = text.split("\\n")
-        return [part + "\\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
-
-    out = ""
+    binary = rule["binary"]
+    tail = next((argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-T"), None)
+    out = b""
     if rule["buffered"]:
-        # logcat -T N: the last N lines already buffered, then what follows.
-        history = lines(read(rule["buffered"]))
-        tail = next((argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-T"), None)
+        # logcat -T N: the last N RECORDS already buffered, then what follows.
+        history = read(rule["buffered"])
         if tail is not None:
-            history = history[-int(tail):]
-        out = "".join(history)
+            history = (
+                b"".join(raw for _, raw in binary_records(history)[-int(tail):])
+                if binary
+                else tail_text(history, int(tail))
+            )
+        out = history
     if rule["stdout"]:
         out += read(rule["stdout"])
     pid = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("--pid=")), None)
     if rule["filter_pid"] and pid is not None:
-        # logcat --pid=N: only the lines whose threadtime PID column is N.
-        out = "".join(
-            line for line in lines(out)
-            if len(line.split()) > 2 and line.split()[2] == pid
-        )
-    sys.stdout.buffer.write(out.encode("utf-8"))
+        # logcat --pid=N: only the records whose pid is N.
+        if binary:
+            out = b"".join(raw for owner, raw in binary_records(out) if owner == pid)
+        else:
+            out = b"".join(
+                line for line in split_lines(out)
+                if len(line.split()) > 2 and line.split()[2] == pid.encode()
+            )
+    sys.stdout.buffer.write(out)
     sys.stdout.flush()
     if rule["stderr"]:
-        with open(rule["stderr"], encoding="utf-8") as handle:
-            sys.stderr.write(handle.read())
+        sys.stderr.buffer.write(read(rule["stderr"]))
         sys.stderr.flush()
+    if rule["hang"]:
+        # Waits like `adb logcat` for a device that is not there, until killed.
+        time.sleep(3600)
     sys.exit(rule["exit"])
 
 sys.exit(spec["default_exit"])
@@ -136,17 +211,20 @@ class Rule:
 
     ``stdout`` / ``stderr`` are the TEXT to replay. Pass recorded output, never
     a literal -- tests/test_fixture_policy.py enforces that for this keyword.
+    ``stdout`` and ``buffered`` may instead be BYTES: a recorded ``logcat -B``
+    (``recorded.data("<name>.bin")``), replayed byte for byte; both must then
+    be bytes, and ``-T`` / ``--pid`` act on logd's record frames.
     """
 
     match: tuple[str, ...]
-    stdout: str = ""
+    stdout: str | bytes = ""
     stderr: str = ""
     exit: int = 0
     filter_pid: bool = False
     # What the device had already buffered when a following `logcat` began:
-    # replayed whole before ``stdout``, or only its last N lines under `-T N`.
-    # Recorded text, like ``stdout``.
-    buffered: str = ""
+    # replayed whole before ``stdout``, or only its last N records under `-T N`.
+    # Recorded, like ``stdout``.
+    buffered: str | bytes = ""
     # Files the tool writes as a side effect, as (absolute path, text). Gradle
     # writes its JUnit XML during the run; a stub that did not would leave the
     # script reading whatever an earlier run left behind.
@@ -155,6 +233,17 @@ class Rule:
     # path it was given -- the recorded `screencap -p` PNG, for a capture that
     # has to succeed end to end. Copied byte for byte; nothing is generated.
     pull_from: str = ""
+    # Answer, then wait until killed instead of exiting -- a streaming `adb
+    # logcat` aimed at a device that is not attached (adb_waiting_for_device).
+    hang: bool = False
+    # Answer only the first call it matches; later ones go to the next rule --
+    # a device that answers `get-state` once, then is gone.
+    once: bool = False
+
+    @property
+    def binary(self) -> bool:
+        """Whether this rule replays recorded ``logcat -B`` records."""
+        return isinstance(self.stdout, bytes) or isinstance(self.buffered, bytes)
 
 
 class FakeToolchain:
@@ -174,13 +263,18 @@ class FakeToolchain:
 
     # --- installing stubs ---------------------------------------------------
 
-    def _stage(self, text: str) -> str:
-        """Write ``text`` beside the stubs and return its path ("" for none)."""
+    def _stage(self, text: str | bytes) -> str:
+        """Write ``text`` (or recorded bytes) beside the stubs; its path, "" for none."""
         if not text:
             return ""
         self._staged += 1
         path = self.root / f"staged-{self._staged}.txt"
-        path.write_text(text, encoding="utf-8")
+        if isinstance(text, bytes):
+            path.write_bytes(text)
+        else:
+            # newline="": what is staged is what is replayed, "\\r" and all.
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
         return str(path)
 
     def install(
@@ -208,8 +302,11 @@ class FakeToolchain:
                     "exit": rule.exit,
                     "filter_pid": rule.filter_pid,
                     "buffered": self._stage(rule.buffered),
+                    "binary": rule.binary,
                     "writes": [[str(path), self._stage(text)] for path, text in rule.writes],
                     "pull_from": rule.pull_from,
+                    "hang": rule.hang,
+                    "once": rule.once,
                 }
                 for rule in rules
             ],
@@ -242,6 +339,11 @@ class FakeToolchain:
             "ANDROID_EMU_ANR_HOME": str(self.home),
             "TMPDIR": str(self.tmp),
         }
+        # The one thing passed through: the zone. A script prints logd's
+        # records in local time (common.logcat.LogRecord.lines), and a spec
+        # comparing its output with records it printed itself must share it.
+        if "TZ" in os.environ:
+            env["TZ"] = os.environ["TZ"]
         env.update(extra)
         return env
 
@@ -360,6 +462,102 @@ def recorded_missing_file(recorded, directory: str, name: str) -> str:
     text = recorded.text("run_as_cat_missing")
     assert "shared_prefs/aes_missing.xml" in text, "the fixture moved; re-derive"
     return text.replace("shared_prefs/aes_missing.xml", f"{directory.rstrip('/')}/{name}")
+
+
+# --- logd's records: deriving a window a record at a time -----------------------
+#
+# log_monitor and app_state_capture read `logcat -B` (common.logcat): logd's
+# records whole. A spec that needs a window the device did not record -- a
+# start deleted, a pid reused, a sentence forged -- derives it from a recorded
+# one by substitution, at the record's own granularity: whole records deleted,
+# moved or repeated, or one field of one record replaced. A replaced field is
+# re-framed with its length recomputed, the way logd frames a record holding
+# that text; every byte not substituted is recorded. Read with struct here,
+# not with common.logcat, so the reader under test is not also the oracle.
+
+_FRAME_HEADER = struct.Struct("<HHiIIIII")
+_FRAME_PRIORITIES = {2: "V", 3: "D", 4: "I", 5: "W", 6: "E", 7: "F", 8: "S"}
+
+
+@dataclass(frozen=True)
+class Frame:
+    """One recorded logd record, raw: ``struct logger_entry`` then its payload."""
+
+    raw: bytes
+
+    @property
+    def _header_size(self) -> int:
+        return struct.unpack_from("<H", self.raw, 2)[0]
+
+    def _parts(self) -> tuple[bytes, bytes, bytes, bytes]:
+        """``(priority byte, tag, message, what follows the message's NUL)``."""
+        payload = self.raw[self._header_size :]
+        tag, _, rest = payload[1:].partition(b"\0")
+        message, _, trailer = rest.partition(b"\0")
+        return payload[:1], tag, message, trailer
+
+    @property
+    def pid(self) -> str:
+        return str(struct.unpack_from("<i", self.raw, 4)[0])
+
+    @property
+    def uid(self) -> int:
+        return struct.unpack_from("<I", self.raw, 24)[0]
+
+    @property
+    def priority(self) -> str:
+        return _FRAME_PRIORITIES.get(self._parts()[0][0], "?")
+
+    @property
+    def tag(self) -> str:
+        return self._parts()[1].decode("utf-8")
+
+    @property
+    def message(self) -> str:
+        return self._parts()[2].decode("utf-8")
+
+    def replace(
+        self, *, pid: str | None = None, tag: str | None = None, message: str | None = None
+    ) -> Frame:
+        """This record with its writer's pid, its tag or its message substituted."""
+        priority, old_tag, old_message, trailer = self._parts()
+        body = (
+            priority
+            + (old_tag if tag is None else tag.encode("utf-8"))
+            + b"\0"
+            + (old_message if message is None else message.encode("utf-8"))
+            + b"\0"
+            + trailer
+        )
+        header = bytearray(self.raw[: self._header_size])
+        struct.pack_into("<H", header, 0, len(body))
+        if pid is not None:
+            struct.pack_into("<i", header, 4, int(pid))
+        return Frame(bytes(header) + body)
+
+
+def frames(data: bytes) -> list[Frame]:
+    """The records of a recorded ``logcat -B`` dump, in order."""
+    out: list[Frame] = []
+    offset = 0
+    while offset < len(data):
+        length, header, *_ = _FRAME_HEADER.unpack_from(data, offset)
+        out.append(Frame(data[offset : offset + header + length]))
+        offset += header + length
+    return out
+
+
+def framed(records) -> bytes:
+    """Records back into a ``logcat -B`` byte stream."""
+    return b"".join(record.raw for record in records)
+
+
+def recorded_zone(recorded, name: str) -> str:
+    """The zone the device printed ``name``'s text half in (its MANIFEST ``timezone``)."""
+    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == name)
+    if "timezone" not in entry:
+        pytest.fail(f"{name} records no timezone; re-record it")
+    return entry["timezone"]
 
 
 # --- the refusal contract ------------------------------------------------------
