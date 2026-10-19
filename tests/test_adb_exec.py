@@ -33,9 +33,15 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-from fake_toolchain import COLLIDING_FILE_NAMES, recorded_missing_file
+from fake_toolchain import (
+    COLLIDING_FILE_NAMES,
+    FakeToolchain,
+    Rule,
+    assert_refusal,
+    recorded_missing_file,
+)
 
-from common import adb_exec
+from common import adb_exec, logcat
 
 
 @pytest.fixture
@@ -528,7 +534,11 @@ def test_run_argv_types_adbs_own_failures_like_run_adb(fake_run, recorded_anywhe
 def test_run_argv_only_suppresses_a_suspected_device_error_when_probe_reports_device(
     monkeypatch, probe, retains_error
 ):
-    """The probe confirms reachability only with the documented ``device`` state."""
+    """The probe confirms reachability only with the documented ``device`` state.
+
+    Asked for by the run-as readers alone (``confirm_device_errors``): theirs is
+    the stderr a device command writes, which can carry a name an app chose.
+    """
     calls: list[list[str]] = []
     probe_returncode, probe_stdout, probe_stderr, probe_exception = probe
 
@@ -545,12 +555,106 @@ def test_run_argv_only_suppresses_a_suspected_device_error_when_probe_reports_de
 
     if retains_error:
         with pytest.raises(adb_exec.DeviceOfflineError) as excinfo:
-            adb_exec.run_argv(cmd, serial="emulator-5554")
+            adb_exec.run_argv(cmd, serial="emulator-5554", confirm_device_errors=True)
         assert "reconnect" in str(excinfo.value).lower()
     else:
-        result = adb_exec.run_argv(cmd, serial="emulator-5554")
+        result = adb_exec.run_argv(cmd, serial="emulator-5554", confirm_device_errors=True)
         assert result.returncode == 1
         assert result.stderr == b"error: device offline\n"
 
     assert len(calls) == 2
     assert calls[1][-1] == "get-state"
+
+
+# ---------------------------------------------------------------------------
+# Which stderr the get-state confirmation is for (final review, W4-D item 1).
+#
+# #32's confirmation exists because `adb shell` hands a REMOTE command's stderr
+# on as adb's, and a file name can hold a newline and a whole `adb: ...` line.
+# logcat's stderr holds no such name: a device error there is adb's own, and a
+# probe answering `device` a moment later turned a real one into exit 1
+# (anr_watcher --since) where log_monitor reports it as exit 3.
+# ---------------------------------------------------------------------------
+
+
+def _logcat_dump_command() -> list[str]:
+    """The argv the --since/snapshot readers run: logd's records, dumped (common.logcat)."""
+    return logcat.build_logcat_command("emulator-5554", since="01-01 00:00:00.000", binary=True)
+
+
+def _adb_that_lost_the_device_then_found_it(monkeypatch, recorded, recorded_anywhere):
+    """The first call fails with adb's recorded device error; get-state then answers `device`.
+
+    Derived: `adb_shell_device_not_found` is adb's own stderr for a shell-service
+    command whose device is not there, replayed as logcat's -- which adb error
+    ends a dump mid-read is not recorded; the point is that the line is adb's.
+    """
+    calls: list[list[str]] = []
+    lost = recorded_anywhere("adb_shell_device_not_found").encode()
+    reachable = recorded.text("adb_get_state").encode()
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        if "get-state" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, reachable, b"")
+        return subprocess.CompletedProcess(cmd, 1, b"", lost)
+
+    monkeypatch.setattr(adb_exec.subprocess, "run", fake_run)
+    return calls
+
+
+def _without_listing(calls: list[list[str]]) -> list[list[str]]:
+    """The calls besides `adb devices`, which a device error's message asks to name serials."""
+    return [call for call in calls if call != ["adb", "devices"]]
+
+
+def test_a_logcat_device_error_is_the_devices_without_a_probe(
+    monkeypatch, recorded, recorded_anywhere
+):
+    """Nothing on logcat's stderr is a name an app chose: adb's device error raises as is."""
+    calls = _adb_that_lost_the_device_then_found_it(monkeypatch, recorded, recorded_anywhere)
+    cmd = _logcat_dump_command()
+    assert cmd[3] == "logcat", cmd
+
+    with pytest.raises(adb_exec.DeviceNotFoundError):
+        adb_exec.run_argv(cmd, serial="emulator-5554")
+
+    # (`adb devices` is the error's message listing what is attached.)
+    assert _without_listing(calls) == [cmd], "a logcat device error was put to a probe"
+
+
+def test_a_run_as_read_still_confirms_a_device_error_it_was_asked_to(
+    monkeypatch, recorded, recorded_anywhere
+):
+    """The run-as readers opt in, and for them `device` from get-state still decides."""
+    calls = _adb_that_lost_the_device_then_found_it(monkeypatch, recorded, recorded_anywhere)
+    cmd = ["adb", "-s", "emulator-5554", "shell", "-T", "run-as", "pkg", "cat", "f"]
+
+    result = adb_exec.run_argv(cmd, serial="emulator-5554", confirm_device_errors=True)
+
+    assert result.returncode == 1
+    assert [call[-1] for call in _without_listing(calls)] == ["f", "get-state"]
+
+
+def test_anr_since_reports_a_logcat_device_error_as_unavailable(tmp_path, recorded):
+    """End to end, the reviewer's reproduction: exit 3, as log_monitor reports it.
+
+    Before: the probe after the failed dump answered `device`, the error was
+    dropped, and the dump's non-zero status became a generic failure at exit 1.
+    """
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    chain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("logcat",), stderr=recorded.text("adb_shell_device_not_found"), exit=1),
+        ],
+    )
+
+    result = chain.run("anr_watcher.py", "--since", "1m", "--serial", "emulator-5554", "--json")
+
+    assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+    logcat_calls = [call for call in chain.calls("adb") if "logcat" in call]
+    assert len(logcat_calls) == 1, chain.calls("adb")

@@ -1,0 +1,1 @@
+uid=10205(u0_a205) gid=10205(u0_a205) groups=10205(u0_a205),1004(input),1007(log),1011(adb),1015(sdcard_rw),1028(sdcard_r),1078(ext_data_rw),1079(ext_obb_rw),3001(net_bt_admin),3002(net_bt),3003(inet),3006(net_bw_stats),3009(readproc),3011(uhid),3012(readtracefs),50205(all_a205) context=u:r:runas_app:s0:c205,c256,c512,c768

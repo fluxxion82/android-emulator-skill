@@ -514,6 +514,55 @@ cli.run(main, ["--json"])
     assert completed.returncode == 3, completed.stderr
 
 
+@pytest.mark.parametrize(
+    ("raised", "argv", "status"),
+    [
+        ('adb_exec.DeviceOfflineError("device offline")', [], 3),
+        ('KeyError("serial")', [], 1),
+        ('KeyError("serial")', ["--json"], 1),
+        ("KeyboardInterrupt()", [], 130),
+    ],
+    ids=["typed-text", "defect-text", "defect-json", "interrupt"],
+)
+def test_a_real_closed_stderr_pipe_keeps_the_exit_status(raised, argv, status):
+    """The stream that broke is the one neutralised (final review, W4-D item 4).
+
+    A text refusal goes to stderr, a defect's traceback does in either mode,
+    and so does "Interrupted.". Written to a real stderr pipe nobody reads,
+    each failed, the handler pointed STDOUT at the null device, and the
+    interpreter's final flush of stderr's pending bytes failed again and
+    exited 120 -- for the reviewer's case, a device-offline refusal that is 3.
+    """
+    scripts = Path(cli.__file__).resolve().parents[1]
+    program = f"""
+import sys
+sys.path.insert(0, {str(scripts)!r})
+from common import adb_exec, cli
+
+def main(argv):
+    raise {raised}
+
+cli.run(main, {argv!r})
+"""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            stdout=subprocess.PIPE,
+            stderr=write_end,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+
+    assert completed.returncode == status, completed.stdout
+    if "--json" in argv:
+        assert json.loads(completed.stdout)["success"] is False, completed.stdout
+
+
 def test_an_interrupt_with_a_closed_stderr_still_exits_130(monkeypatch):
     import io
 

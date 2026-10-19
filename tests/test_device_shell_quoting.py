@@ -127,8 +127,9 @@ def test_run_as_arguments_are_quoted(monkeypatch):
     captured = {}
 
     class _Result:
-        stdout = ""
-        stderr = ""
+        # Bytes: run_argv hands back what adb wrote, undecoded.
+        stdout = b""
+        stderr = b""
         returncode = 0
 
     def _run(cmd, **_kwargs):
