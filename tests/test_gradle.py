@@ -921,6 +921,10 @@ def test_a_module_project_dir_override_selects_its_reports(
             "/*\nproject(':app').projectDir = file('old-mobile')\n*/",
             id="block-comment",
         ),
+        pytest.param(
+            'println("projectDir is configured by the convention plugin")',
+            id="string-literal",
+        ),
     ],
 )
 def test_commented_project_dir_assignment_keeps_default_directory(
@@ -986,11 +990,12 @@ def test_settings_gradle_takes_precedence_over_kotlin_settings(
 
 
 @pytest.mark.parametrize(
-    ("assignment", "assignment_line"),
+    ("assignment", "assignment_line", "candidate"),
     [
         pytest.param(
             "project(':app').projectDir = new File(rootDir, 'mobile')",
             0,
+            "mobile",
             id="dynamic-rhs",
         ),
         pytest.param(
@@ -998,14 +1003,87 @@ def test_settings_gradle_takes_precedence_over_kotlin_settings(
             "    project(':app').projectDir = file('mobile')\n"
             "}",
             1,
+            "mobile",
             id="conditional-literal",
+        ),
+        pytest.param(
+            "if (true) {\n" "} else {\n" "    project(':app').projectDir = file('mobile')\n" "}",
+            2,
+            "mobile",
+            id="unexecuted-else",
+        ),
+        pytest.param(
+            "project(':app')\n    .projectDir = file('mobile')",
+            1,
+            "app",
+            id="split-lines",
+        ),
+        pytest.param(
+            'project(":app").projectDir = file("$dir/mobile")',
+            0,
+            "$dir/mobile",
+            id="interpolated-dollar-name",
+        ),
+        pytest.param(
+            'project(":app").projectDir = file("${x}")',
+            0,
+            "${x}",
+            id="interpolated-expression",
+        ),
+        pytest.param(
+            "pluginManagement {\n    project(':app').projectDir = file('mobile')\n}",
+            1,
+            "mobile",
+            id="nested-plugin-management",
+        ),
+        pytest.param(
+            "gradle.beforeProject {\n    project(':app').projectDir = file('mobile')\n}",
+            1,
+            "mobile",
+            id="nested-closure",
+        ),
+        pytest.param(
+            "project(':other').projectDir = new File(rootDir, 'other')",
+            0,
+            "app",
+            id="unsupported-other-module",
+        ),
+        pytest.param(
+            "project(':app').projectDir = mobileDirectory",
+            0,
+            "app",
+            id="variable-rhs",
+        ),
+        pytest.param(
+            "project(':app').projectDir = resolveMobileDirectory()",
+            0,
+            "app",
+            id="method-call-rhs",
+        ),
+        pytest.param(
+            "project(':app').projectDir = file('mobile+variant')",
+            0,
+            "mobile+variant",
+            id="plus-in-literal",
+        ),
+        pytest.param(
+            "project(':app').projectDir = file('../mobile')",
+            0,
+            "app",
+            id="parent-component",
+        ),
+        pytest.param(
+            "project(':app').projectDir = file('/var/tmp/mobile')",
+            0,
+            "app",
+            id="absolute-path",
         ),
     ],
 )
 def test_unsupported_project_dir_assignment_is_refused_before_gradle(
-    assignment, assignment_line, tmp_path: Path, monkeypatch, recorded_gradle
+    assignment, assignment_line, candidate, tmp_path: Path, monkeypatch, recorded_gradle
 ):
-    """An explicit mapping the resolver cannot prove is never treated as absent."""
+    """One appended construct cannot redirect or hide cleanup before it is refused."""
     from common import cli
     from gradle import BuildRunner
 
@@ -1013,8 +1091,17 @@ def test_unsupported_project_dir_assignment_is_refused_before_gradle(
     base = recorded_gradle("settings_gradle_compose").rstrip()
     settings = f"{base}\n{assignment}\n"
     (project / "settings.gradle").write_text(settings, encoding="utf-8")
-    (project / "mobile").mkdir()
+    candidate_root = project / candidate
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    stale_reports = {
+        root / "build" / "test-results" / "testDebugUnitTest" / "TEST-stale.xml"
+        for root in (project / "app", candidate_root)
+    }
+    for stale_report in stale_reports:
+        stale_report.parent.mkdir(parents=True, exist_ok=True)
+        stale_report.write_text(recorded_gradle("junit_xml_passing_case"), encoding="utf-8")
     gradle_started = False
+    reports_collected = False
 
     def fake_run(cmd, **_kwargs):
         nonlocal gradle_started
@@ -1023,7 +1110,13 @@ def test_unsupported_project_dir_assignment_is_refused_before_gradle(
 
     import gradle.builder as builder_mod
 
+    def fail_if_collected(_paths):
+        nonlocal reports_collected
+        reports_collected = True
+        return {"total": 0}
+
     monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(builder_mod, "aggregate_test_results", fail_if_collected)
 
     with pytest.raises(cli.Failure) as refused:
         BuildRunner(str(project), module=":app").test()
@@ -1034,6 +1127,44 @@ def test_unsupported_project_dir_assignment_is_refused_before_gradle(
     assert "file('relative/path')" in refused.value.remedy
     assert 'File("relative/path")' in refused.value.remedy
     assert gradle_started is False, "Gradle started before the assignment was refused"
+    assert reports_collected is False, "JUnit reports were collected before refusal"
+    assert all(path.exists() for path in stale_reports), "a stale JUnit report was deleted"
+
+
+def test_duplicate_project_dir_assignment_is_refused_before_cleanup(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Two otherwise supported mappings are ambiguous, even when they agree."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    base = recorded_gradle("settings_gradle_compose").rstrip()
+    first_line = len(base.splitlines()) + 1
+    settings = (
+        f"{base}\n"
+        "project(':app').projectDir = file('mobile')\n"
+        "project(':app').projectDir = file('mobile')\n"
+    )
+    (project / "settings.gradle").write_text(settings, encoding="utf-8")
+    stale_report = _results(project, "mobile") / "TEST-stale.xml"
+    stale_report.parent.mkdir(parents=True)
+    stale_report.write_text(recorded_gradle("junit_xml_passing_case"), encoding="utf-8")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(
+        builder_mod.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    assert f"settings.gradle:{first_line + 1}" in str(refused.value)
+    assert "assigned more than once" in str(refused.value)
+    assert stale_report.exists(), "a stale JUnit report was deleted before refusal"
 
 
 def test_a_missing_resolved_module_directory_refuses_before_gradle(

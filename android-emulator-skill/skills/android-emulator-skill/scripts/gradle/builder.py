@@ -16,7 +16,7 @@ Timeouts are tunable via the ANDROID_EMU_ prefix:
 import contextlib
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from common import cli
 from common.env_config import env_int
@@ -43,12 +43,7 @@ _PROJECT_DIR_ASSIGNMENT = re.compile(
     r"(?P<path_quote>['\"])(?P<path>[^'\"]+)(?P=path_quote)\s*\)\s*;?\s*(?://.*)?$",
     re.VERBOSE,
 )
-_PROJECT_DIR_ASSIGNMENT_TARGET = re.compile(
-    r"project\s*\(\s*(?P<module_quote>['\"])(?P<module>:[^'\"]+)"
-    r"(?P=module_quote)\s*\)\s*\.projectDir\s*=",
-    re.VERBOSE,
-)
-_IF_CONDITION = re.compile(r"\bif\s*\(")
+_PROJECT_DIR_REFERENCE = re.compile(r"\bprojectDir\b")
 
 
 def _strip_gradle_comments(source: str) -> str:
@@ -132,40 +127,6 @@ def _mask_gradle_strings(source: str) -> str:
             index += 1
 
     return "".join(masked)
-
-
-def _conditional_block_ranges(structure: str) -> list[tuple[int, int]]:
-    """Return source ranges enclosed by an ``if (...) { ... }`` block."""
-    conditional_braces: set[int] = set()
-    for match in _IF_CONDITION.finditer(structure):
-        position = match.end() - 1
-        depth = 0
-        while position < len(structure):
-            char = structure[position]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    position += 1
-                    while position < len(structure) and structure[position].isspace():
-                        position += 1
-                    if position < len(structure) and structure[position] == "{":
-                        conditional_braces.add(position)
-                    break
-            position += 1
-
-    stack: list[int] = []
-    ranges: list[tuple[int, int]] = []
-    for position, char in enumerate(structure):
-        if char == "{":
-            stack.append(position)
-        elif char == "}" and stack:
-            opening = stack.pop()
-            if opening in conditional_braces:
-                ranges.append((opening, position))
-    ranges.extend((opening, len(structure)) for opening in stack if opening in conditional_braces)
-    return ranges
 
 
 class BuildResult:
@@ -397,35 +358,60 @@ class BuildRunner:
 
         uncommented = _strip_gradle_comments(source)
         structure = _mask_gradle_strings(uncommented)
-        conditional_ranges = _conditional_block_ranges(structure)
-        configured: Path | None = None
+        configured: dict[str, Path] = {}
+        brace_depth = 0
         offset = 0
         for line_number, line_with_ending in enumerate(
             uncommented.splitlines(keepends=True), start=1
         ):
             line = line_with_ending.rstrip("\r\n")
-            for target in _PROJECT_DIR_ASSIGNMENT_TARGET.finditer(line):
-                absolute_offset = offset + target.start()
-                if structure[absolute_offset : absolute_offset + len("project")] != "project":
-                    continue
-                if target.group("module") != module:
-                    continue
+            structure_line = structure[offset : offset + len(line_with_ending)].rstrip("\r\n")
+            references = list(_PROJECT_DIR_REFERENCE.finditer(structure_line))
+            reference_depths: list[int] = []
+            reference_starts = {reference.start() for reference in references}
+            for position, char in enumerate(structure_line):
+                if position in reference_starts:
+                    reference_depths.append(brace_depth)
+                if char == "{":
+                    brace_depth += 1
+                elif char == "}":
+                    brace_depth = max(0, brace_depth - 1)
 
+            if references:
                 supported = _PROJECT_DIR_ASSIGNMENT.fullmatch(line)
-                conditional = any(
-                    start < absolute_offset < end for start, end in conditional_ranges
+                path_text = supported.group("path") if supported is not None else ""
+                path_parts = re.split(r"[/\\\\]", path_text)
+                literal_is_fixed = (
+                    supported is not None
+                    and len(references) == 1
+                    and reference_depths == [0]
+                    and "$" not in path_text
+                    and "+" not in path_text
+                    and not Path(path_text).is_absolute()
+                    and not PureWindowsPath(path_text).is_absolute()
+                    and ".." not in path_parts
                 )
-                if supported is None or conditional:
+                if not literal_is_fixed:
                     cli.fail(
-                        f"unsupported projectDir assignment for Gradle module {module} "
-                        f"at {settings}:{line_number}",
-                        f"Use an unconditional single-line project('{module}').projectDir = "
-                        "file('relative/path') or "
-                        f'project("{module}").projectDir = File("relative/path").',
+                        f"unsupported projectDir assignment while resolving Gradle module "
+                        f"{module} at {settings}:{line_number}",
+                        f"Use a top-level, unconditional single-line "
+                        f"project('{module}').projectDir = file('relative/path') or "
+                        f'project("{module}").projectDir = File("relative/path"), with a '
+                        "fixed relative path containing no interpolation, concatenation, or '..'.",
                     )
-                configured = self.project_dir / supported.group("path")
+
+                configured_module = supported.group("module")
+                if configured_module in configured:
+                    cli.fail(
+                        f"Gradle module {configured_module} projectDir is assigned more than once "
+                        f"at {settings}:{line_number}",
+                        "Keep exactly one supported top-level projectDir assignment for each "
+                        "Gradle module, then rerun the task.",
+                    )
+                configured[configured_module] = self.project_dir / path_text
             offset += len(line_with_ending)
-        return configured
+        return configured.get(module)
 
     def _report_files(self, root: Path, task: str) -> tuple[list[Path], list[Path]]:
         """Find reports and prove every resolved path stays in its permitted directory."""
