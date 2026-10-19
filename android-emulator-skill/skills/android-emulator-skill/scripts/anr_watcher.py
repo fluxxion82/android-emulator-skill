@@ -96,6 +96,7 @@ from common.anr_sessions import (  # noqa: E402
     LIVE_STATES,
     PENDING,
     RUNNING,
+    WORKER_END_LOCK_TIMEOUT_SECONDS,
     WORKER_TOKEN_FLAG,
     Identity,
     SessionBusyError,
@@ -1158,9 +1159,11 @@ class AnrBuster:
         a failure is published only with the session's end, in one write
         (``SessionStore.finish_worker``), so a running session holds none. A
         worker deciding how its stream ended is waited for, to that
-        decision's bound; one that has already ended is answered for as
+        decision's bound; one that has already crashed is answered for as
         --stop answers -- the summary saved, refused by its failure's class
-        (exit 3 for a device that went). A worker that has not claimed the
+        (exit 3 for a device that went) -- and one that ended otherwise
+        (stopped, cancelled or abandoned by another command meanwhile) is
+        refused, exit 1, without a summary. A worker that has not claimed the
         session in ``REGISTRATION_TIMEOUT_SECONDS`` is given up on: the
         session is cancelled, so a worker that starts late records nothing.
         """
@@ -1213,8 +1216,9 @@ class AnrBuster:
         failure = settled.counters.get("stream_failure")
         if settled.status == RUNNING and isinstance(failure, dict):
             # Never left so by a worker of this version; refused by the
-            # failure's class all the same, as --stop raises it.
-            _refuse_broken_stream(session_id, failure)
+            # failure's class all the same, as --stop raises it -- but nothing
+            # is saved for a session still running.
+            _refuse_broken_stream(session_id, failure, summary_saved=False)
         if settled.status in LIVE_STATES:
             cli.fail(
                 f"The worker for {session_id} was still deciding how its logcat stream ended "
@@ -1308,8 +1312,20 @@ class AnrBuster:
            answered with a summary: a missing marker cannot prove no decision
            remains (fourth review of PR #42). --stop refuses (exit 1) and
            saves nothing -- unless ``abandon``, which marks the session
-           abandoned (the worker can write nothing more to it) and saves the
-           summary of what was read, incomplete.
+           abandoned (no meta write of the worker's is applied after it; its
+           event appends are not locked, and the answers are frozen at what
+           the events file held then) and saves the summary of what was read,
+           incomplete.
+
+        A session an earlier version recorded (no ``lifecycle``) whose
+        worker's pid is recorded is not trusted, whatever its status says,
+        while that pid may be the worker: that version's worker takes no lock
+        and checks no state -- it wrote a device loss into a session this
+        --stop had answered `stopped` at exit 0, and set an abandoned one
+        `running` again (review of PR #44). It is identified as a worker of
+        this version is, signalled, and waited for until it is gone; while it
+        lives, or cannot be told from another process, --stop refuses (exit
+        1), --abandon included, which could fence nothing it ignores.
 
         The summary is marked ``incomplete``, with ``incomplete_reason``,
         whenever the capture may be missing events: the stream broke or ended
@@ -1321,6 +1337,13 @@ class AnrBuster:
         if signalled is not None:
             self._wait_for_end(session_id, signalled)
         with self.store.transaction(session_id) as meta:
+            if _legacy_worker(meta):
+                identity, why = worker_identity(meta)
+                if identity is not Identity.GONE:
+                    _refuse_legacy_worker(meta, identity, why)
+                # Gone: nothing writes the session any more. Read again -- its
+                # last write may have come after this transaction began.
+                meta = self.store.load_meta(session_id)
             if meta.status in LIVE_STATES:
                 identity, why = worker_identity(meta)
                 if not abandon:
@@ -1383,7 +1406,7 @@ class AnrBuster:
             if meta.status == PENDING:
                 self.store.mark_cancelled(meta)
                 return None
-            if meta.status not in LIVE_STATES:
+            if meta.status not in LIVE_STATES and not _legacy_worker(meta):
                 return None
             identity, _why = worker_identity(meta)
             if identity is not Identity.WORKER:
@@ -1398,7 +1421,8 @@ class AnrBuster:
         """Wait for the signalled worker to publish how it ended, or to be gone without doing so.
 
         Up to ``WORKER_EXIT_TIMEOUT_SECONDS``: a lookup under way, the stop
-        drain, a margin. A worker deciding how its stream ended is waited for
+        drain, a margin -- and an earlier version's worker until it is gone,
+        to the same bound. A worker deciding how its stream ended is waited for
         to that decision's own bound (``DECIDING_TIMEOUT_SECONDS`` from when
         it began): answering before it saved a summary at exit 0 while the
         worker went on to find the device gone (second review of PR #42).
@@ -1406,7 +1430,10 @@ class AnrBuster:
         deadline = time.monotonic() + WORKER_EXIT_TIMEOUT_SECONDS
         while True:
             meta = self.store.load_meta(session_id)
-            if meta.status not in LIVE_STATES or not _alive(pid):
+            # An earlier version's worker says nothing of its end: it is
+            # waited for until it is gone, whatever its meta says.
+            ended = meta.status not in LIVE_STATES and not _legacy_worker(meta)
+            if ended or not _alive(pid):
                 return
             limit = deadline
             since = _deciding_since(meta)
@@ -1693,10 +1720,14 @@ class AnrBuster:
         cancelled, is claimed already, or the token is not its own -- and,
         before it exits, publishes how it ended, ``stopped`` or ``crashed``
         with its failure, in one write, on every path: a stop, a device lost,
-        restarts exhausted, a stream that broke, an error nothing foresaw. A
-        SIGTERM meanwhile only asks for a stop. Once a write of its own is
-        refused -- the session abandoned or deleted -- it stops, writing
-        nothing more (exit 2).
+        restarts exhausted, a stream that broke, an error nothing foresaw --
+        unless the session's lock cannot be had within
+        ``WORKER_END_LOCK_TIMEOUT_SECONDS``, or the session was deleted, when
+        it exits unpublished and --stop finds it gone. A SIGTERM meanwhile
+        only asks for a stop. Once a meta write of its own is refused -- the
+        session abandoned or deleted -- it stops, writing nothing more to the
+        meta (exit 2); its event appends, which take no lock, may land until
+        then, and the session's answers ignore them.
         """
         stop_flag = {"value": False}
 
@@ -1937,7 +1968,9 @@ class AnrBuster:
                 with contextlib.suppress(
                     TransitionRefusedError, SessionBusyError, FileNotFoundError
                 ):
-                    self.store.finish_worker(session_id, pid, counters)
+                    self.store.finish_worker(
+                        session_id, pid, counters, timeout=WORKER_END_LOCK_TIMEOUT_SECONDS
+                    )
 
         return 2 if disowned or counters.get("stream_failure") else 0
 
@@ -2139,11 +2172,8 @@ class AnrBuster:
     # === PRIVATE ===
 
     def _dump_raw_events(self, session_id: str) -> str:
-        path = self.store.events_path(session_id)
-        if not path.exists():
-            return ""
-        with open(path) as handle:
-            return handle.read()
+        """events.jsonl as the session's answers read it: an abandoned one's up to its fence."""
+        return self.store.read_raw_events(session_id)
 
     def _load_summary(self, session_id: str) -> SessionSummary | None:
         """The stored summary, its unrecorded drop count read as what it can be.
@@ -2230,6 +2260,37 @@ def _deciding_since(meta: SessionMeta) -> float | None:
     return deciding / 1000 if isinstance(deciding, int | float) else None
 
 
+def _legacy_worker(meta: SessionMeta) -> bool:
+    """Whether a session an earlier version recorded names a worker pid that may still be it.
+
+    That version's worker (no ``lifecycle`` in the meta it wrote) takes no
+    lock and checks no state, and its --stop could save ``stopped`` while it
+    ran on, its pid kept: its status is no promise that nothing more is
+    written (review of PR #44).
+    """
+    return meta.lifecycle is None and bool(meta.pid)
+
+
+def _refuse_legacy_worker(meta: SessionMeta, identity: Identity, why: str) -> NoReturn:
+    """--stop's refusal while an earlier version's worker may still write its session: no summary."""
+    session_id = meta.session_id
+    if identity is Identity.WORKER:
+        state = (
+            f"its worker, pid {meta.pid}, is still running (it was asked to stop, and had not "
+            f"ended {WORKER_EXIT_TIMEOUT_SECONDS:.1f}s later)"
+        )
+    else:
+        state = f"pid {meta.pid} may be its worker: {why}"
+    cli.fail(
+        f"Session {session_id} was recorded by an earlier version, and {state}. That version's "
+        f"worker takes none of this version's locks, so whatever the session says now -- "
+        f"`{meta.status}` -- it may still change, a device loss included: nothing is concluded, "
+        f"no summary is saved, and --abandon cannot fence it.",
+        f"Run --stop {session_id} again once the worker has ended; if it never does, end pid "
+        f"{meta.pid} yourself once you know it is the worker, then --stop {session_id}.",
+    )
+
+
 def _unconcluded(meta: SessionMeta, identity: Identity, why: str) -> str:
     """Why --stop could not conclude a session whose worker has not said how it ended."""
     if identity is Identity.WORKER:
@@ -2303,7 +2364,9 @@ _DEVICE_ERRORS: dict[str, type[DeviceError]] = {
 }
 
 
-def _refuse_broken_stream(session_id: str, failure: dict) -> NoReturn:
+def _refuse_broken_stream(
+    session_id: str, failure: dict, *, summary_saved: bool = True
+) -> NoReturn:
     """--stop's answer for a session whose stream broke (common.logcat's framing rule).
 
     The summary is saved first, so ``--get-details`` reads what was captured
@@ -2323,6 +2386,8 @@ def _refuse_broken_stream(session_id: str, failure: dict) -> NoReturn:
     saved = (
         f"The summary of what was read before the break is saved -- read it with "
         f"--get-details {session_id}."
+        if summary_saved
+        else f"No summary is saved yet: run --stop {session_id} once its worker has ended."
     )
     if isinstance(device, dict) and device.get("error_class") in _DEVICE_ERRORS:
         said = device.get("message") or device["error_class"]

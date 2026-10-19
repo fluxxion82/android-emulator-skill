@@ -37,13 +37,21 @@ The three sessions, one directory each under ``<out>/<label>/``:
 These are written by the skill, not by a device, so they live outside
 ``tests/fixtures/recorded/``; ``--label`` names the version that wrote them.
 
+``--archive COMMIT`` also keeps that version's worker itself, to be run LIVE
+by the tests: ``<out>/<label>/scripts.tar.gz`` is ``git archive
+--format=tar.gz COMMIT`` of its ``anr_watcher.py`` and ``common/`` -- the
+whole import closure of the worker, byte for byte as committed (git writes
+the archive without a timestamp, so the same commit gives the same file). A
+session store outlives an upgrade, and so can a worker still recording into
+it: one that takes none of this version's locks (fourth review of PR #44).
+
 Usage (the label names the commit whose scripts are run)::
 
     git archive fb5de9c android-emulator-skill/skills/android-emulator-skill/scripts \\
         | tar -x -C /tmp/main-fb5de9c
     python tests/derive_legacy_anr_sessions.py \\
         --scripts /tmp/main-fb5de9c/android-emulator-skill/skills/android-emulator-skill/scripts \\
-        --label main-fb5de9c
+        --label main-fb5de9c --archive fb5de9c
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -185,12 +194,44 @@ def derive(scripts: Path, out: Path) -> None:
             _kill_worker(session)
 
 
+SCRIPTS = "android-emulator-skill/skills/android-emulator-skill/scripts"
+
+
+def archive(commit: str, out: Path) -> None:
+    """Keep ``commit``'s worker: its anr_watcher.py and common/, as ``git archive`` gives them."""
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / "scripts.tar.gz"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(TESTS.parent),
+            "archive",
+            "--format=tar.gz",
+            "-o",
+            str(target),
+            commit,
+            f"{SCRIPTS}/anr_watcher.py",
+            f"{SCRIPTS}/common",
+        ],
+        check=True,
+        timeout=60,
+    )
+    print(f"kept {target.relative_to(TESTS.parent)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("--scripts", type=Path, required=True, help="the version's scripts/ dir")
+    parser.add_argument("--scripts", type=Path, help="the version's scripts/ dir: derive sessions")
     parser.add_argument("--label", required=True, help="names the version, e.g. main-fb5de9c")
+    parser.add_argument("--archive", metavar="COMMIT", help="keep COMMIT's worker code too")
     args = parser.parse_args()
-    derive(args.scripts.resolve(), OUT / args.label)
+    if not (args.scripts or args.archive):
+        parser.error("pass --scripts, --archive, or both")
+    if args.archive:
+        archive(args.archive, OUT / args.label)
+    if args.scripts:
+        derive(args.scripts.resolve(), OUT / args.label)
 
 
 if __name__ == "__main__":

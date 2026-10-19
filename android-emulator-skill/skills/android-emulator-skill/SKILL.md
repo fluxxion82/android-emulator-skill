@@ -663,28 +663,45 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `pending` → (the worker claims it) `running` ⇄ `deciding` → `stopped` |
       `crashed`, or `pending` → `cancelled` (a `--stop` or a `--start` that
       gave up on its worker), or `running`/`deciding` → `abandoned` (`--stop
-      --abandon`). Every read-modify-write of a session's files is made under
-      its lock (`flock` on `<session>/lock`, bounded; a lock held past the
-      bound is a refusal, exit 1, "run the same command again"), by one owner
-      per transition, and only from the state it expects — otherwise it is
-      refused, never applied. The worker owns its claim, `deciding`, its
-      counters and its end, which it publishes before it exits on every path
-      (a stop, a device lost, restarts exhausted, a stream that broke, an
-      error nothing foresaw; a SIGTERM meanwhile only asks for a stop):
-      `stopped`, or `crashed` with its failure, in one write. The CLI owns
-      `cancelled`, `abandoned` and `summary.json`. Every write goes to a
-      temporary file of its own and is renamed into place. A worker whose
-      claim is refused — its session cancelled, already claimed, or not its
-      token — exits writing nothing; one whose session is abandoned or
-      deleted stops at its next write (it writes its counters every 5 s of
-      quiet). Four reviews had closed one timing window at a time: a stop
+      --abandon`). Every read-modify-write of a session's `meta.json` and
+      `summary.json` is made under its lock (`flock` on `<session>/lock`; the
+      wait for it is bounded, not the hold, and a wait past the bound is a
+      refusal, exit 1, "run the same command again"), by one owner per
+      transition, and only from the state it expects — otherwise it is
+      refused, never applied — and goes to a temporary file of its own,
+      renamed into place. The worker owns its claim, `deciding`, its
+      counters and its end, which it publishes before it exits (a stop, a
+      device lost, restarts exhausted, a stream that broke, an error nothing
+      foresaw; a SIGTERM meanwhile only asks for a stop): `stopped`, or
+      `crashed` with its failure, in one write — unless it cannot have the
+      lock within 5 minutes or the session was deleted, when `--stop` finds
+      it gone without having said, and `--abandon` is the way out. The CLI
+      owns `cancelled`, `abandoned` and `summary.json`. `events.jsonl` is not
+      locked: the worker appends to it as it reads. A worker whose claim is
+      refused — its session cancelled, already claimed, or not its token —
+      exits writing nothing; one whose session is abandoned or deleted stops
+      at its next meta write (a counter write while its stream is quiet, at
+      most every 5 s and skipped when the lock is busy, or its next
+      transition), and may append events until then, which the session's
+      answers ignore (below). The lock needs a filesystem that implements
+      `flock` — a local one; a home on a network filesystem serialises only as
+      far as its server and mount options honour it — and telling the worker
+      from another process needs `ps`. A worker of an earlier version (a
+      session with no `lifecycle` in its meta) takes none of these locks:
+      while its recorded pid may be it, `--stop` trusts nothing the session
+      says — it signals it and waits until it is gone, and refuses (exit 1,
+      `--abandon` included, which cannot fence it) while it lives or cannot
+      be identified. Four reviews had closed one timing window at a time: a stop
       during the reader's end-of-stream grace skipped the decision (exit 0
       over a device loss); `--stop` answered at exit 0 while the worker was
       still to publish a failure, wrote back a meta it had read after the
       worker had persisted one, and took an unrecorded start time for
       another process; a worker claimed a session `--stop` had already
       answered for; `--start` took a failure published under `running` for
-      a started session
+      a started session; a fifth found a `stopped` meta trusted while that
+      version's worker ran on (exit 0, then the device loss it persisted),
+      and an abandoned session's answer growing with every event appended
+      after the abandonment
     - An unknown session, a session with no summary yet, or a `--cluster` past
       the end exits 1 and says what to run instead (the refusal object under
       `--json`) — it does not print the sentence and exit 0
@@ -817,10 +834,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       then answered at exit 0 while the worker went on to persist a device
       loss. `--stop --abandon` is the way out when the worker never will say
       (gone, stuck, or a pid that cannot be identified): the session is
-      marked `abandoned` — nothing the worker writes after that is applied —
-      and what was read is saved with `"incomplete": true`, the reason
-      beginning "abandoned with --abandon", at exit 0. It never claims
-      completeness, and a later `--stop` gives the same answer. A pending
+      marked `abandoned` — no meta write of the worker's is applied after
+      that — and what was read is saved with `"incomplete": true`, the
+      reason beginning "abandoned with --abandon", at exit 0. The worker may
+      still append raw event lines after the fence (that file is not
+      locked); the abandonment records how much of `events.jsonl` was
+      there, to its last whole line, and every answer of the session —
+      `--stop`, `--get-details`, `--cluster`, `--raw` — reads that much
+      only, so a later `--stop` gives the same answer (it rebuilt the
+      summary from the grown file: event count 1, then 2). It never claims
+      completeness. A pending
       session (no worker has claimed it) is cancelled: `--stop` saves an
       empty summary marked incomplete and refuses (exit 1), and a worker
       that claims it later is refused. Two `--stop`s of a session that has
@@ -1353,12 +1376,16 @@ recorded fixture, and was red before the fix.
   is left, unless adb or `adb get-state` names a device error, then refused
   at `--stop` — adb's own words typed first (a device error is exit 3), in
   `--watch`, `--since` and the session worker alike. A session's lifecycle
-  is serialised under a per-session lock, each transition owned by the
-  worker or the CLI and applied only from the state it expects: the worker
-  publishes how it ended before it exits, `--stop` answers with a summary
-  only once the session has ended (otherwise it refuses, exit 1, and
-  `--stop --abandon` saves what was read, marked incomplete), and `--start`
-  succeeds only on a worker that is recording.
+  is serialised under a per-session lock (meta and summary; events are
+  appended unlocked), each transition owned by the worker or the CLI and
+  applied only from the state it expects: the worker publishes how it ended
+  before it exits (unless it cannot have the lock in 5 minutes),
+  `--stop` answers with a summary only once the session has ended
+  (otherwise it refuses, exit 1, and `--stop --abandon` saves what was
+  read, marked incomplete, its events frozen at the abandonment), and
+  `--start` succeeds only on a worker that is recording. A worker of the
+  previous version, which takes no lock, is waited for until it is gone
+  before its session is answered.
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
   now read through `adb shell -T` and refuse an adb client too old to honour

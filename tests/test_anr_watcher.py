@@ -25,6 +25,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from dataclasses import replace
@@ -5720,6 +5721,64 @@ STRESS_LANES = 3
 STRESS_CYCLES = 8
 # About how long a --stop takes to start and signal the worker (measured: 0.2-0.3 s).
 STOP_LEAD_SECONDS = 0.25
+# How many cycles must have had their device die while a --stop was running, for
+# the run to have exercised the window it is about (review of PR #44).
+STRESS_MIN_OVERLAPS = 3
+_ENDED = ("stopped", "crashed", "cancelled", "abandoned")
+
+
+def _stress_cycle(toolchain, store, device, dies_after: float | None, stop_after: float) -> dict:
+    """One cycle: --start, a wait, --stop (again while the worker is unfinished), --stop once more.
+
+    Records when each --stop ran and when the device died -- the stub's
+    ``dead`` marker, written as it dies -- so the run can show a death fell
+    inside a --stop. The session's worker is killed, with its stream's
+    process, however the cycle ends.
+    """
+    env = {"ANR_STRESS_CYCLE": str(device)}
+    known = {meta.session_id for meta in store.list_sessions()}
+    session_id = None
+    try:
+        started = toolchain.run(
+            "anr_watcher.py", "--start", "--serial", "emulator-5554", "--json", **env
+        )
+        (session_id,) = {meta.session_id for meta in store.list_sessions()} - known
+        if started.returncode == 0:
+            time.sleep(stop_after)
+        stops = []
+        windows = []
+        for _attempt in range(4):
+            began = time.time()
+            stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--json", **env)
+            windows.append((began, time.time()))
+            stops.append((stopped.returncode, json.loads(stopped.stdout)))
+            unfinished = stopped.returncode == 1 and "not finished" in stops[-1][1].get("error", "")
+            if not unfinished:
+                break
+        deadline = time.monotonic() + 20
+        while store.load_meta(session_id).status not in _ENDED:
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        final = store.load_meta(session_id)
+        again = toolchain.run("anr_watcher.py", "--stop", session_id, "--json", **env)
+        dead = device / "dead"
+        died = dead.stat().st_mtime if dead.exists() else None
+        return {
+            "dies_after": dies_after,
+            "stop_after": stop_after,
+            "start": started.returncode,
+            "stops": [status for status, _ in stops],
+            "status": final.status,
+            "device_lost": _device_lost(final),
+            "agree": (again.returncode, json.loads(again.stdout)) == stops[-1],
+            "died_during_stop": died is not None and any(a <= died <= b for a, b in windows),
+        }
+    finally:
+        pid = store.load_meta(session_id).pid if session_id else None
+        if pid:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pid, signal.SIGKILL)
 
 
 def _stress_lane(lane: int, seed: int, root, recorded, recorded_anywhere) -> list[dict]:
@@ -5757,49 +5816,8 @@ def _stress_lane(lane: int, seed: int, root, recorded, recorded_anywhere) -> lis
             if dies_after is None
             else max(0.0, dies_after - STOP_LEAD_SECONDS + rng.uniform(-0.2, 0.2))
         )
-        env = {"ANR_STRESS_CYCLE": str(device)}
-        known = {meta.session_id for meta in store.list_sessions()}
-        started = toolchain.run(
-            "anr_watcher.py", "--start", "--serial", "emulator-5554", "--json", **env
-        )
-        (session_id,) = {meta.session_id for meta in store.list_sessions()} - known
-        if started.returncode == 0:
-            time.sleep(stop_after)
-        stops = []
-        for _attempt in range(4):
-            stopped = toolchain.run("anr_watcher.py", "--stop", session_id, "--json", **env)
-            stops.append((stopped.returncode, json.loads(stopped.stdout)))
-            unfinished = stopped.returncode == 1 and "not finished" in stops[-1][1].get("error", "")
-            if not unfinished:
-                break
-        deadline = time.monotonic() + 20
-        while store.load_meta(session_id).status not in (
-            "stopped",
-            "crashed",
-            "cancelled",
-            "abandoned",
-        ):
-            if time.monotonic() > deadline:
-                break
-            time.sleep(0.05)
-        final = store.load_meta(session_id)
-        again = toolchain.run("anr_watcher.py", "--stop", session_id, "--json", **env)
-        outcomes.append(
-            {
-                "lane": lane,
-                "cycle": cycle,
-                "dies_after": dies_after,
-                "stop_after": stop_after,
-                "start": started.returncode,
-                "stops": [status for status, _ in stops],
-                "status": final.status,
-                "device_lost": _device_lost(final),
-                "agree": (again.returncode, json.loads(again.stdout)) == stops[-1],
-            }
-        )
-        if final.pid:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(final.pid, signal.SIGKILL)
+        outcome = _stress_cycle(toolchain, store, device, dies_after, stop_after)
+        outcomes.append({"lane": lane, "cycle": cycle, **outcome})
     return outcomes
 
 
@@ -5817,7 +5835,11 @@ def test_stop_never_exits_0_for_a_session_whose_device_loss_is_or_will_be_persis
     its meta says whether the device loss was persisted; whenever it was, no
     --stop of that session exited 0 -- before or after the loss reached the
     meta -- and the last two --stops gave one answer. A failure names the
-    seed: rerun with ``ANR_STRESS_SEED=<seed>``.
+    seed: rerun with ``ANR_STRESS_SEED=<seed>``. The run must also show it
+    exercised the window it is about: at least ``STRESS_MIN_OVERLAPS``
+    devices died while a --stop was running (the stub's marker time against
+    each --stop's start and end) -- without it, every loss could have come
+    before any stop and the run still passed (review of PR #44).
     """
     seed = int(os.environ.get("ANR_STRESS_SEED", time.time_ns() % 2**32))
     lanes: list[list[dict]] = [[] for _ in range(STRESS_LANES)]
@@ -5847,3 +5869,250 @@ def test_stop_never_exits_0_for_a_session_whose_device_loss_is_or_will_be_persis
     assert unended == [], f"{rerun}; a worker never published its end: {unended}"
     assert any(o["device_lost"] for o in outcomes), f"{rerun}; no device was lost: {outcomes}"
     assert any(0 in o["stops"] for o in outcomes), f"{rerun}; no --stop answered: {outcomes}"
+    overlapping = [o for o in outcomes if o["died_during_stop"]]
+    assert len(overlapping) >= STRESS_MIN_OVERLAPS, (
+        f"{rerun}; only {len(overlapping)} device(s) died while a --stop ran, so the window "
+        f"this test is about was not exercised: {outcomes}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review of PR #44: a worker of the previous version, live across the upgrade
+# ---------------------------------------------------------------------------
+
+# fb5de9c's own worker code -- anr_watcher.py and common/, `git archive`d by
+# tests/derive_legacy_anr_sessions.py --archive -- run as that version ran it.
+LEGACY_SCRIPTS = "android-emulator-skill/skills/android-emulator-skill/scripts"
+
+# The device the previous version's worker reads, in sh: `get-state` answers
+# `device` until its stream has ended, and then -- after `get_state_delay`
+# seconds -- the recorded not-found text; its logcat replays the recorded
+# records and ends cleanly, saying nothing, after `ends_after` seconds (or
+# never, without that file). Everything it prints is a recorded fixture.
+_LEGACY_ADB = """#!/bin/sh
+d="$ANR_LEGACY_DEVICE"
+case " $* " in
+  *" get-state "*)
+    if [ -e "$d/stream-ended" ]; then
+      sleep "$(cat "$d/get_state_delay")"; cat "$d/not_found" >&2; exit 1
+    fi
+    cat "$d/get_state"; exit 0 ;;
+  *" devices "*) cat "$d/devices"; exit 0 ;;
+  *" logcat "*)
+    cat "$d/records"
+    if [ ! -e "$d/ends_after" ]; then exec sleep 60; fi
+    sleep "$(cat "$d/ends_after")"
+    : > "$d/stream-ended"
+    exit 0 ;;
+esac
+exit 1
+"""
+
+# What fb5de9c's --stop saves when its wait ends with the worker unfinished
+# (its "undecided" path): the summary, marked incomplete, status `stopped`,
+# the pid kept -- run with that version's own SessionStore.
+_LEGACY_STOP = (
+    "import sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from dataclasses import replace\n"
+    "from common.anr_sessions import SessionStore\n"
+    "store = SessionStore()\n"
+    "summary = store.build_summary(sys.argv[2])\n"
+    "store.stop(sys.argv[2], replace(summary, incomplete=True, incomplete_reason=sys.argv[3]))\n"
+)
+
+
+class _LegacyWorker:
+    """fb5de9c's --start and worker, LIVE, against ``_LEGACY_ADB``, in a store of their own."""
+
+    def __init__(self, root, recorded, recorded_anywhere, *, ends_after: float | None) -> None:
+        with tarfile.open(LEGACY_SESSIONS / "scripts.tar.gz") as archive:
+            archive.extractall(root / "fb5de9c", filter="data")
+        self.scripts = root / "fb5de9c" / LEGACY_SCRIPTS
+        self.toolchain = FakeToolchain(root / "toolchain")
+        self.toolchain.assert_isolated()
+        adb = self.toolchain.bin / "adb"
+        adb.write_text(_LEGACY_ADB)
+        adb.chmod(0o755)
+        device = root / "device"
+        device.mkdir()
+        (device / "records").write_bytes(recorded.data(f"{CRASH_DUMP}.bin"))
+        (device / "not_found").write_text(recorded_anywhere("adb_device_not_found"))
+        (device / "get_state").write_text(recorded.text("adb_get_state"))
+        (device / "devices").write_text(recorded.text("adb_devices_single"))
+        (device / "get_state_delay").write_text("4")
+        if ends_after is not None:
+            (device / "ends_after").write_text(f"{ends_after}")
+        self.env = {"ANR_LEGACY_DEVICE": str(device)}
+        self.store = SessionStore(base_dir=self.toolchain.home / "anr-sessions")
+        self.session_id: str | None = None
+
+    def start(self) -> str:
+        started = self.toolchain.run(
+            self.scripts / "anr_watcher.py",
+            "--start",
+            "--serial",
+            "emulator-5554",
+            "--json",
+            **self.env,
+        )
+        assert started.returncode == 0, started.stdout + started.stderr
+        self.session_id = json.loads(started.stdout)["session_id"]
+        return self.session_id
+
+    def legacy_stop_save(self, reason: str) -> None:
+        saved = subprocess.run(
+            [sys.executable, "-c", _LEGACY_STOP, str(self.scripts), self.session_id, reason],
+            env=self.toolchain.env(**self.env),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert saved.returncode == 0, saved.stderr
+
+    def kill(self) -> None:
+        """End the worker and its stream's process, whatever state the test left them in."""
+        if self.session_id is None:
+            return
+        pid = self.store.load_meta(self.session_id).pid
+        if pid:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pid, signal.SIGCONT)
+                os.killpg(pid, signal.SIGKILL)
+
+
+def test_a_previous_versions_live_worker_is_fenced_before_its_stopped_session_is_answered(
+    recorded, recorded_anywhere, tmp_path
+):
+    """Review of PR #44, REQUIRED 1 (P1): a `stopped` meta was trusted while its old worker ran.
+
+    fb5de9c's own worker, LIVE: its stream (the recorded crash dump) ends
+    cleanly, and it asks `adb get-state`, which answers the recorded
+    not-found text 4 s later. While it waits, the session is what that
+    version's --stop leaves when its wait ends with the worker still
+    deciding: SIGTERM sent, the summary saved, status `stopped`, the pid
+    kept (that version's SessionStore.stop, run as it). This version's
+    --stop read `stopped` and answered 0 at once; the old worker, which
+    takes none of this version's locks, then persisted DeviceNotFoundError,
+    and the next --stop said 3. An earlier version's worker is never trusted
+    while its pid may be it: it is identified, signalled and waited for
+    until it is gone, and the session answered from what it left -- exit 3.
+    """
+    legacy = _LegacyWorker(tmp_path, recorded, recorded_anywhere, ends_after=0.3)
+    session_id = legacy.start()
+    try:
+        _wait_until(
+            lambda: "deciding" in legacy.store.load_meta(session_id).counters,
+            "the old worker began deciding how its stream ended",
+        )
+        old = legacy.store.load_meta(session_id)
+        assert old.lifecycle is None and old.pid
+        os.kill(old.pid, signal.SIGTERM)
+        legacy.legacy_stop_save(
+            "the worker had not decided how its stream ended when this was saved"
+        )
+        assert legacy.store.load_meta(session_id).status == "stopped"
+
+        stopped = legacy.toolchain.run(
+            "anr_watcher.py", "--stop", session_id, "--json", **legacy.env
+        )
+        _wait_until(lambda: not anr_watcher._alive(old.pid), "the old worker ended")
+        final = legacy.store.load_meta(session_id)
+        again = legacy.toolchain.run("anr_watcher.py", "--stop", session_id, "--json", **legacy.env)
+    finally:
+        legacy.kill()
+
+    assert _device_lost(final), f"the old worker persisted no device loss: {final.to_json()}"
+    assert stopped.returncode != 0, stopped.stdout
+    refusal = assert_refusal(stopped, json_mode=True, naming=("not attached",), status=3)
+    assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+    assert (again.returncode, again.stdout) == (stopped.returncode, stopped.stdout)
+
+
+def test_abandoning_a_previous_versions_session_never_fences_a_worker_it_cannot(
+    recorded, recorded_anywhere, tmp_path, monkeypatch, capsys
+):
+    """Review of PR #44, REQUIRED 1: --abandon claimed a fence an old worker ignores.
+
+    fb5de9c's own worker, LIVE, its stream open, held stopped (SIGSTOP) as a
+    worker that does not answer. `--stop --abandon` marked the session
+    abandoned at exit 0, and that version's worker -- whose counter write
+    re-reads the meta and sets it `running` -- would write over it. While
+    the old worker may still write, the session is refused (exit 1) and left
+    as it is; once it has ended, the abandonment holds: exit 0, incomplete.
+
+    In process for --stop (the new CLI, its wait shortened); the old worker
+    is a real process.
+    """
+    legacy = _LegacyWorker(tmp_path, recorded, recorded_anywhere, ends_after=None)
+    monkeypatch.setenv("ANDROID_EMU_ANR_HOME", str(legacy.toolchain.home))
+    monkeypatch.setattr(anr_watcher, "WORKER_EXIT_TIMEOUT_SECONDS", 0.5)
+    session_id = legacy.start()
+    try:
+        old = legacy.store.load_meta(session_id)
+        assert old.lifecycle is None and old.pid
+        os.kill(old.pid, signal.SIGSTOP)
+        refused = _cli_json(monkeypatch, capsys, "--stop", session_id, "--abandon")
+        held = legacy.store.load_meta(session_id)
+        saved_when_refused = legacy.store.load_summary(session_id)
+        os.kill(old.pid, signal.SIGCONT)
+        _wait_until(lambda: not anr_watcher._alive(old.pid), "the old worker ended")
+        abandoned = _cli_json(monkeypatch, capsys, "--stop", session_id, "--abandon")
+    finally:
+        legacy.kill()
+
+    status, refusal = refused
+    assert status == 1, refusal
+    assert "earlier version" in refusal["error"] and str(old.pid) in refusal["error"], refusal
+    assert held.status == "running", "the session was abandoned while its old worker could write"
+    assert saved_when_refused is None, "a summary was saved while the old worker could write"
+    status, payload = abandoned
+    assert status == 0, payload
+    assert "abandoned with --abandon" in payload["incomplete_reason"], payload
+
+
+def test_an_abandoned_sessions_answers_ignore_what_its_worker_appends_after(
+    recorded, store, tmp_path, monkeypatch, capsys
+):
+    """Review of PR #44, REQUIRED 2 (P2): abandonment fenced the meta, not the events.
+
+    A worker appends its events without the lock, so one that was abandoned
+    can still append. Every later --stop rebuilt the summary from the file
+    as it then was: the recorded broadcast ANR's session answered event
+    count 1 when abandoned, then 2 after one more line -- here the session's
+    own line, appended again. The abandonment records how much of the file
+    it covers, and every answer of the session -- --stop, --get-details, its
+    --raw dump -- is built from that much, whatever is appended after.
+    """
+    meta = store.create({"package": None})
+    _run_worker_over(
+        store,
+        meta.session_id,
+        [_anr_record(recorded)],
+        tmp_path,
+        process_names=_oracle(recorded, BROADCAST),
+    )
+    # Claimed by a process that has since exited: a worker gone without saying how it ended.
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(timeout=30)
+    store.claim_worker(meta.session_id, pid=gone.pid, token=meta.worker_token)
+    buster = anr_watcher.AnrBuster(store=store)
+
+    abandoned = _cli_json(monkeypatch, capsys, "--stop", meta.session_id, "--abandon")
+    details = _cli_json(monkeypatch, capsys, "--get-details", meta.session_id)
+    raw = buster.get_details(meta.session_id, raw=True)
+    events = store.events_path(meta.session_id)
+    (line,) = [
+        ln for ln in events.read_text(encoding="utf-8").splitlines() if '"fingerprint"' in ln
+    ]
+    with open(events, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    again = _cli_json(monkeypatch, capsys, "--stop", meta.session_id)
+    details_again = _cli_json(monkeypatch, capsys, "--get-details", meta.session_id)
+    raw_again = buster.get_details(meta.session_id, raw=True)
+
+    assert abandoned[0] == 0 and abandoned[1]["event_count"] == 1, abandoned
+    assert again == abandoned, "a later --stop answered from what was appended after"
+    assert details_again == details
+    assert raw_again == raw

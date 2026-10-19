@@ -20,15 +20,30 @@ window at a time did not converge, so it is serialised instead)::
        v                          |
     cancelled                     +-- abandon (--stop --abandon) --> abandoned
 
-Every read-modify-write of a session's files happens under its lock
-(``fcntl.flock`` on ``<dir>/lock``, acquisition bounded), by exactly one
-owner per transition, and only from the state the transition expects --
-anything else is refused (:class:`TransitionRefusedError`), not applied. The
-worker owns its claim, ``deciding``, its counters and its end (``stopped`` /
-``crashed``, which it publishes before it exits, with the counters and any
-failure in the same write); the CLI owns ``cancelled``, ``abandoned`` and
-``summary.json``, and writes no field the worker owns. A write goes to a
-temporary file of its own (``mkstemp``) and is renamed into place.
+Every read-modify-write of a session's meta.json and summary.json happens
+under its lock (``fcntl.flock`` on ``<dir>/lock``; how long a writer waits
+for it is bounded, not how long it is held), by exactly one owner per
+transition, and only from the state the transition expects -- anything else
+is refused (:class:`TransitionRefusedError`), not applied. The worker owns
+its claim, ``deciding``, its counters and its end (``stopped`` / ``crashed``,
+which it publishes before it exits, with the counters and any failure in the
+same write -- unless the lock cannot be had in
+``WORKER_END_LOCK_TIMEOUT_SECONDS`` or the session was deleted); the CLI
+owns ``cancelled``, ``abandoned`` and ``summary.json``, and writes no field
+the worker owns. Those writes go to a temporary file of their own
+(``mkstemp``) and are renamed into place. ``events.jsonl`` is the
+exception: the worker appends to it without the lock, so an abandoned worker
+may still append; the abandonment records how much of it the session's
+answers read (``extras["abandoned_events_bytes"]``), and they read no more.
+
+``flock`` needs a filesystem that implements it: a local one. A home on a
+network filesystem serialises only as far as its server and mount options
+honour ``flock``. Telling the worker from another process needs ``ps``.
+
+A session an earlier version wrote has no ``lifecycle`` key: its worker took
+no lock and checked no state, and its --stop could save ``stopped`` while
+the worker ran on. --stop (anr_watcher) fences such a worker before trusting
+what the session says.
 
 The parent creates the directory and writes initial meta, with a random
 ``worker_token`` it hands the worker on its command line. ``--stop``
@@ -94,13 +109,16 @@ _DURATION_RE = re.compile(r"(\d+)([smhd])$")
 WORKER_TOKEN_FLAG = "--worker-token"
 # One `ps` question about the host's process table.
 PS_TIMEOUT_SECONDS = 5
-# How long the CLI waits for a session's lock. Its longest holder is another
-# --stop asking `ps` twice (2 x PS_TIMEOUT_SECONDS); a worker's writes are
-# milliseconds.
+# How long the CLI waits for a session's lock -- the wait, not the hold: a
+# --stop holds it while it asks `ps` twice (2 x PS_TIMEOUT_SECONDS) and while
+# it builds the summary from the events file, a --get-details while it reads;
+# a worker's writes are milliseconds.
 CLI_LOCK_TIMEOUT_SECONDS = 30
-# How long the worker waits for it: past any --stop's hold, because what it
-# writes then is how the session ended.
+# How long the worker waits for it: past any --stop's hold.
 WORKER_LOCK_TIMEOUT_SECONDS = 60
+# And for its last write, how the session ended: longer still, since without
+# it the session can only be refused, or abandoned (review of PR #44).
+WORKER_END_LOCK_TIMEOUT_SECONDS = 300
 _LOCK_POLL_SECONDS = 0.02
 
 
@@ -467,17 +485,25 @@ class SessionStore:
         """deciding -> running: decided, and the stream is restarted."""
         return self._worker_write(session_id, pid, counters, {DECIDING}, RUNNING)
 
-    def finish_worker(self, session_id: str, pid: int, counters: dict) -> SessionMeta:
+    def finish_worker(
+        self,
+        session_id: str,
+        pid: int,
+        counters: dict,
+        timeout: float = WORKER_LOCK_TIMEOUT_SECONDS,
+    ) -> SessionMeta:
         """running | deciding -> crashed (counters hold a stream failure) | stopped.
 
-        The worker's last write, before it exits, on every path: the end, its
+        The worker's last write, before it exits, on every path that can take
+        the lock (``timeout``: the worker passes
+        ``WORKER_END_LOCK_TIMEOUT_SECONDS``): the end, its
         counters and any failure in one write, so nothing ever reads a failure
         under a status that says the session is still recording (fourth review
         of PR #42: --start answered `{"success": true}` between the two writes
         that published them). Its pid is cleared: the OS may reuse it now.
         """
         end = CRASHED if counters.get("stream_failure") else STOPPED
-        return self._worker_write(session_id, pid, counters, LIVE_STATES, end)
+        return self._worker_write(session_id, pid, counters, LIVE_STATES, end, timeout)
 
     # --- the CLI's transitions (inside a ``transaction``) --------------------
 
@@ -496,7 +522,12 @@ class SessionStore:
     def mark_abandoned(self, meta: SessionMeta, why: str) -> None:
         """running | deciding -> abandoned: --stop --abandon gives up on the worker.
 
-        Whatever the worker would still write is refused from now on.
+        Whatever meta write the worker would still make is refused from now
+        on. Its event appends are not locked, so it may still append; the
+        session's events are fixed at what the file held now, to its last
+        whole line (``abandoned_events_bytes``), and every later answer reads
+        that much only -- every --stop rebuilt the summary from the file as
+        it had grown (review of PR #44).
 
         Raises:
             TransitionRefusedError: The worker is not at work (it has ended, or never began).
@@ -505,6 +536,7 @@ class SessionStore:
             raise TransitionRefusedError(meta.session_id, "abandoned", meta.status)
         meta.status = ABANDONED
         meta.extras["abandoned"] = why
+        meta.extras["abandoned_events_bytes"] = _whole_lines(self._events_path(meta.session_id))
         self._mark_ended(meta)
         self._write_meta(meta)
 
@@ -542,31 +574,42 @@ class SessionStore:
         with open(path) as handle:
             return summary_from_json(json.load(handle))
 
-    def read_events(self, session_id: str) -> list:
-        """Read all events.jsonl lines, returning NormalisedEvent instances.
+    def read_raw_events(self, session_id: str) -> str:
+        """events.jsonl as the session's answers read it: all of it, or an abandoned one's prefix.
 
-        Skips non-event sentinel lines (e.g. ``{"event": "stream_ended"}``).
+        An abandoned session's events end where its abandonment fixed them
+        (``abandoned_events_bytes``): its worker may still append, unlocked.
         """
         path = self._events_path(session_id)
         if not path.exists():
-            return []
+            return ""
+        with open(path, "rb") as handle:
+            data = handle.read(self._events_limit(session_id))
+        return data.decode("utf-8", errors="replace")
+
+    def read_events(self, session_id: str) -> list:
+        """Read events.jsonl lines, returning NormalisedEvent instances.
+
+        Skips non-event sentinel lines (e.g. ``{"event": "stream_ended"}``),
+        and reads an abandoned session's events only as far as its
+        abandonment fixed them (:meth:`read_raw_events`).
+        """
         events = []
-        with open(path) as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                # Skip non-event sentinel lines (e.g. {"event": "stream_ended"}).
-                if "event" in payload and "fingerprint" not in payload:
-                    continue
-                try:
-                    events.append(event_from_jsonl(line))
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        for raw in self.read_raw_events(session_id).splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Skip non-event sentinel lines (e.g. {"event": "stream_ended"}).
+            if "event" in payload and "fingerprint" not in payload:
+                continue
+            try:
+                events.append(event_from_jsonl(line))
+            except (json.JSONDecodeError, KeyError):
+                continue
         return events
 
     def events_path(self, session_id: str) -> Path:
@@ -729,6 +772,15 @@ class SessionStore:
     def _summary_path(self, session_id: str) -> Path:
         return self.session_dir(session_id) / "summary.json"
 
+    def _events_limit(self, session_id: str) -> int:
+        """How many bytes of events.jsonl the session's answers read: -1 for all of it."""
+        try:
+            meta = self.load_meta(session_id)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return -1
+        limit = meta.extras.get("abandoned_events_bytes")
+        return limit if meta.status == ABANDONED and isinstance(limit, int) else -1
+
     @contextlib.contextmanager
     def _lock(self, session_id: str, timeout: float) -> Iterator[None]:
         """Hold ``<session dir>/lock`` exclusively, waiting at most ``timeout`` seconds.
@@ -879,6 +931,18 @@ def _resolve_cutoff_ms(duration_str: str) -> int:
     seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
     cutoff = datetime.now() - timedelta(seconds=seconds)
     return int(cutoff.timestamp() * 1000)
+
+
+def _whole_lines(path: Path) -> int:
+    """The length of ``path`` up to and including its last newline (0 when there is none).
+
+    A line still being appended -- unlocked, by a worker -- is not a whole one yet.
+    """
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return 0
+    return data.rfind(b"\n") + 1
 
 
 def _remove_tree(path: Path) -> None:
