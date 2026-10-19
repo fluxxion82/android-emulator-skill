@@ -83,8 +83,13 @@ def _adb_stub(
     )
 
 
-def _python_stub(version: str, pillow: bool = False, encoder_preamble: str = "") -> str:
-    """python3 stub honoring the queries the script makes.
+def _python_stub(
+    version: str,
+    pillow: bool = False,
+    encoder_preamble: str = "",
+    encoder_preamble_newline: bool = True,
+) -> str:
+    """Python stub honoring the queries the script makes.
 
     ``version`` is "MAJOR.MINOR". ``import PIL`` succeeds only when ``pillow`` is
     True, so callers control whether the Pillow check passes or warns without
@@ -98,6 +103,7 @@ def _python_stub(version: str, pillow: bool = False, encoder_preamble: str = "")
     major, minor = version.split(".")
     pil_exit = "0" if pillow else "1"
     real_python = shlex.quote(sys.executable)
+    preamble_format = "%s\\n" if encoder_preamble_newline else "%s"
     return (
         'arg="$*"\n'
         'case "$arg" in\n'
@@ -105,10 +111,15 @@ def _python_stub(version: str, pillow: bool = False, encoder_preamble: str = "")
         '  *version_info.minor*) echo "' + minor + '" ;;\n'
         '  *"import PIL"*) exit ' + pil_exit + " ;;\n"
         '  *"json.dumps"*) '
-        + (f"printf '%s\\n' {shlex.quote(encoder_preamble)}; " if encoder_preamble else "")
+        + (
+            f"printf {shlex.quote(preamble_format)} {shlex.quote(encoder_preamble)}; "
+            if encoder_preamble
+            else ""
+        )
         + "exec "
         + real_python
         + ' "$@" ;;\n'
+        '  *"json.loads"*) exec ' + real_python + ' "$@" ;;\n'
         "  *) exit 0 ;;\n"
         "esac\n"
     )
@@ -131,6 +142,7 @@ def sandbox(tmp_path: Path):
         avdmanager: bool = True,
         sdkmanager: bool = True,
         python_version: str | None = "3.12",
+        python_command: str = "python3",
         pillow: bool = False,
         java: bool = True,
         devices_body: str = "emulator-5554          device transport_id:1",
@@ -144,6 +156,8 @@ def sandbox(tmp_path: Path):
         tmpdir: Path | None = None,
         before_list_avds: str = "",
         encoder_preamble: str = "",
+        encoder_preamble_newline: bool = True,
+        python3_shadow_log: Path | None = None,
     ) -> subprocess.CompletedProcess:
         if adb:
             _write_stub(
@@ -186,12 +200,25 @@ def sandbox(tmp_path: Path):
         if python_version is not None:
             _write_stub(
                 bin_dir,
-                "python3",
-                _python_stub(python_version, pillow=pillow, encoder_preamble=encoder_preamble),
+                python_command,
+                _python_stub(
+                    python_version,
+                    pillow=pillow,
+                    encoder_preamble=encoder_preamble,
+                    encoder_preamble_newline=encoder_preamble_newline,
+                ),
             )
-        else:
-            # Hide /usr/bin/python3 while retaining only the system utilities the
-            # Bash script needs, so this exercises the actual no-Python fallback.
+        if python_version is None or python_command != "python3":
+            shadow_body = "exit 127\n"
+            if python3_shadow_log is not None:
+                shadow_body = (
+                    f"printf '%s\\n' called >> {shlex.quote(str(python3_shadow_log))}\n"
+                    + shadow_body
+                )
+            _write_stub(bin_dir, "python3", shadow_body)
+            # Keep the system utilities the Bash script needs available. The
+            # python3 shadow above prevents either /usr/bin or /bin from leaking
+            # a host interpreter into the sandbox.
             for tool in ("grep", "mktemp", "perl", "sed", "tr", "wc"):
                 (bin_dir / tool).symlink_to(Path("/usr/bin") / tool)
         if java:
@@ -220,12 +247,26 @@ def sandbox(tmp_path: Path):
             )
 
         env = dict(os.environ)
-        # Prepend our stubs to a minimal system PATH. /usr/bin:/bin provides
-        # bash and coreutils (sed/grep/wc/head/tr) but NOT adb/emulator/python3
-        # (those live in the SDK / pyenv), so the only versions visible are the
-        # stubs we installed above — the shell equivalent of monkeypatching.
-        system_paths = ["/bin"] if python_version is None else ["/usr/bin", "/bin"]
+        # Prepend our stubs to a minimal system PATH. The only tool versions
+        # visible are the stubs installed above — the shell equivalent of
+        # monkeypatching.
+        system_paths = ["/usr/bin", "/bin"]
         env["PATH"] = os.pathsep.join([str(bin_dir), *system_paths])
+        if python_command != "python3":
+            # This scenario exercises selection of the legacy ``python`` name.
+            # Treat the python3 sentinel as unavailable to ``command -v``; if
+            # the script invokes python3 directly anyway, the sentinel records
+            # that isolation failure and exits 127.
+            bash_env = tmp_path / "bash_env"
+            bash_env.write_text(
+                "command() {\n"
+                '  if [ "$#" -eq 2 ] && [ "$1" = -v ] && [ "$2" = python3 ]; then\n'
+                "    return 1\n"
+                "  fi\n"
+                '  builtin command "$@"\n'
+                "}\n"
+            )
+            env["BASH_ENV"] = str(bash_env)
         env["ANDROID_HOME"] = str(tmp_path / "sdk")
         (tmp_path / "sdk").mkdir(exist_ok=True)
         if tmpdir is not None:
@@ -348,6 +389,31 @@ def test_json_without_python3_uses_parseable_fallback(sandbox):
 
     assert result.returncode == 0
     assert isinstance(json.loads(result.stdout), dict)
+
+
+def test_json_guard_uses_detected_python_interpreter(sandbox, tmp_path):
+    """A runnable ``python`` must validate the Bash report when python3 is absent."""
+    timeout_log = tmp_path / "timeout.log"
+    python3_shadow_log = tmp_path / "python3-shadow.log"
+
+    result = sandbox(
+        "--json",
+        python_version="3.12",
+        python_command="python",
+        pillow=True,
+        timeout_log=timeout_log,
+        python3_shadow_log=python3_shadow_log,
+    )
+
+    assert result.returncode == 0, result.stderr[-800:]
+    payload = _one_object(result)
+    assert payload["success"] is True and len(payload["checks"]) == 10, payload
+    calls = _bounded_calls(timeout_log)
+    validators = [
+        call for call in calls if call.startswith("10 python -c ") and "json.loads" in call
+    ]
+    assert len(validators) == 1, calls
+    assert not python3_shadow_log.exists(), "the script tried to invoke the shadowed python3"
 
 
 def test_java_version_uses_first_combined_output_line(sandbox):
@@ -504,6 +570,70 @@ def test_encoder_output_that_is_not_one_object_is_not_the_report(sandbox):
     payload = _one_object(result)
     assert payload["success"] is True and len(payload["checks"]) == 10, payload
     assert "the Bash encoder did" in result.stderr
+
+
+def test_concatenated_python_documents_are_not_accepted_as_one_report(sandbox):
+    """A startup hook can print an object without a newline before the real report."""
+    result = sandbox(
+        "--json",
+        pillow=True,
+        encoder_preamble="{}",
+        encoder_preamble_newline=False,
+    )
+
+    assert result.returncode == 0, result.stderr[-800:]
+    payload, end = json.JSONDecoder().raw_decode(result.stdout)
+    trailing = result.stdout[end:].strip()
+    assert not trailing, f"stdout has a second JSON document: {result.stdout[end:]!r}"
+    assert payload["success"] is True and len(payload["checks"]) == 10, payload
+    assert "the Bash encoder did" in result.stderr
+
+
+def _shell_function(name: str) -> str:
+    """Extract one top-level Bash function so its return status can be exercised."""
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    start = lines.index(f"{name}() {{")
+    end = next(index for index in range(start + 1, len(lines)) if lines[index] == "}")
+    return "\n".join(lines[start : end + 1])
+
+
+def test_python_document_guard_requires_the_report_keys():
+    """A JSON object is not enough: it must have the health report's required fields."""
+    functions = f'{_shell_function("is_json_object")}\n{_shell_function("run_bounded")}'
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'{functions}\nPYTHON_RUNS=true\nis_json_object "$1"',
+            "json-guard",
+            "{}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, "the Python guard accepted an object without report keys"
+
+
+def test_bash_document_guard_rejects_concatenated_objects():
+    """The no-Python path still rejects a second top-level object."""
+    function = _shell_function("is_json_object")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'{function}\nPYTHON_RUNS=false\nis_json_object "$1"',
+            "json-guard",
+            "{}{}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, "the Bash fallback accepted two top-level objects"
 
 
 def test_a_probe_with_no_temporary_file_says_it_did_not_run(sandbox, tmp_path):

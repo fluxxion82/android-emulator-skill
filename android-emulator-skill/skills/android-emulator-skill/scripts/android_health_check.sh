@@ -259,15 +259,72 @@ cleanup_json_records() {
     fi
 }
 
-# One line that opens and closes an object -- what both encoders print. Braces
-# alone let a line printed ahead of the report (a startup diagnostic) through
-# as two documents at exit 0 (review of #33).
+# Validate the complete encoder stdout, not only its outer braces. A startup
+# hook can print `{}` without a newline and turn the captured value into two
+# concatenated objects while it still starts and ends with braces.
 is_json_object() {
+    local char
+    local depth=0
+    local escaped=false
+    local in_string=false
+    local index
+    local saw_complete=false
+
+    if [ "${PYTHON_RUNS:-false}" = true ]; then
+        run_bounded 10 "$PYTHON_BIN" -c '
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+required = {"ok", "success", "checks", "summary"}
+if not isinstance(payload, dict) or not required.issubset(payload):
+    raise SystemExit(1)
+' "$1" >/dev/null 2>&1
+        return
+    fi
+
     case "$1" in
         *$'\n'*) return 1 ;;
-        "{"*"}") return 0 ;;
+        "{"*"}") ;;
         *) return 1 ;;
     esac
+
+    for ((index = 0; index < ${#1}; index++)); do
+        char=${1:index:1}
+        if [ "$in_string" = true ]; then
+            if [ "$escaped" = true ]; then
+                escaped=false
+            elif [ "$char" = "\\" ]; then
+                escaped=true
+            elif [ "$char" = '"' ]; then
+                in_string=false
+            fi
+            continue
+        fi
+        case "$char" in
+            '"') in_string=true ;;
+            '{')
+                if [ "$depth" -eq 0 ] && [ "$saw_complete" = true ]; then
+                    return 1
+                fi
+                depth=$((depth + 1))
+                ;;
+            '}')
+                depth=$((depth - 1))
+                if [ "$depth" -lt 0 ]; then
+                    return 1
+                elif [ "$depth" -eq 0 ]; then
+                    saw_complete=true
+                fi
+                ;;
+            *)
+                if [ "$depth" -eq 0 ]; then
+                    return 1
+                fi
+                ;;
+        esac
+    done
+    [ "$depth" -eq 0 ] && [ "$in_string" = false ] && [ "$saw_complete" = true ]
 }
 
 # Prints the report on stdout, and returns non-zero when it could not: the

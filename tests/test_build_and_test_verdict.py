@@ -30,6 +30,7 @@ def toolchain(tmp_path) -> FakeToolchain:
 def _project(toolchain: FakeToolchain, tmp_path: Path, rule: Rule) -> Path:
     project = tmp_path / "proj"
     project.mkdir(parents=True, exist_ok=True)
+    (project / "app").mkdir(exist_ok=True)
     toolchain.install("gradlew", [rule], directory=project)
     return project
 
@@ -174,6 +175,30 @@ def test_rerun_reaches_gradle_right_after_the_test_task(toolchain, tmp_path, rec
     task = argv.index(":app:testDebugUnitTest")
     assert argv[task + 1] == "--rerun", argv
     assert argv[argv.index("--tests") + 1] == "com.example.PassingTest", argv
+
+
+def test_a_missing_selected_module_is_refused_before_gradle(toolchain, tmp_path, recorded_gradle):
+    """The shared boundary reports the resolved directory at exit 1 without starting Gradle."""
+    project = _silent_green_run(toolchain, tmp_path, recorded_gradle)
+
+    result = toolchain.run(
+        "build_and_test.py",
+        "--project",
+        str(project),
+        "--module",
+        ":missing",
+        "--test",
+        "--json",
+    )
+
+    payload = assert_refusal(
+        result,
+        json_mode=True,
+        naming=(str(project / "missing"), "does not exist"),
+        status=1,
+    )
+    assert payload is not None and "projectDir" in payload["remedy"], payload
+    assert toolchain.calls("gradlew") == [], "Gradle started before module validation"
 
 
 @pytest.mark.parametrize(

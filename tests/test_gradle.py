@@ -708,6 +708,7 @@ def _make_project(tmp_path: Path) -> Path:
     project = tmp_path / "proj"
     project.mkdir()
     (project / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+    (project / "app").mkdir()
     return project
 
 
@@ -829,6 +830,243 @@ def _gradle_that_writes(monkeypatch, returncode: int, log: str, writes=(), lag: 
 
 def _results(project: Path, module: str = "app") -> Path:
     return project / module / "build" / "test-results" / "testDebugUnitTest"
+
+
+def test_a_module_without_project_dir_keeps_the_default_directory(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """The recorded scaffold has no projectDir override, so :app remains app/."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    (project / "settings.gradle").write_text(
+        recorded_gradle("settings_gradle_compose"), encoding="utf-8"
+    )
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project) / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
+
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is True
+    assert result.results_dir == str(_results(project))
+
+
+@pytest.mark.parametrize(
+    ("settings_name", "assignment"),
+    [
+        pytest.param(
+            "settings.gradle",
+            "project(':app').projectDir = file('mobile')",
+            id="groovy-file",
+        ),
+        pytest.param(
+            "settings.gradle.kts",
+            'project(":app").projectDir = File("mobile")',
+            id="kotlin-file-constructor",
+        ),
+    ],
+)
+def test_a_module_project_dir_override_selects_its_reports(
+    settings_name, assignment, tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """The appended assignment forms are documented Gradle DSL, not invented tool output."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    settings = recorded_gradle("settings_gradle_compose")
+    if settings_name.endswith(".kts"):
+        # Mechanical Groovy-to-Kotlin spelling changes from Gradle's documented
+        # settings DSL; the rest stays byte-for-byte from the recorded scaffold.
+        settings = settings.replace(
+            "rootProject.name = 'compose-scaffold'", 'rootProject.name = "compose-scaffold"'
+        ).replace("include ':app'", 'include(":app")')
+    settings = f"{settings.rstrip()}\n{assignment}\n"
+    (project / settings_name).write_text(settings, encoding="utf-8")
+    (project / "mobile").mkdir()
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project, "mobile") / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
+
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is True
+    assert result.results_dir == str(_results(project, "mobile"))
+
+
+@pytest.mark.parametrize(
+    "commented_assignment",
+    [
+        pytest.param(
+            "// project(':app').projectDir = file('old-mobile')",
+            id="line-comment",
+        ),
+        pytest.param(
+            "/*\nproject(':app').projectDir = file('old-mobile')\n*/",
+            id="block-comment",
+        ),
+    ],
+)
+def test_commented_project_dir_assignment_keeps_default_directory(
+    commented_assignment, tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Comment text cannot redirect cleanup or report collection away from app/."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    settings = f'{recorded_gradle("settings_gradle_compose").rstrip()}\n{commented_assignment}\n'
+    (project / "settings.gradle").write_text(settings, encoding="utf-8")
+    (project / "old-mobile").mkdir()
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project) / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
+
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is True
+    assert result.results_dir == str(_results(project))
+
+
+def test_settings_gradle_takes_precedence_over_kotlin_settings(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """Gradle executes settings.gradle when both settings script variants exist."""
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    groovy = (
+        f'{recorded_gradle("settings_gradle_compose").rstrip()}\n'
+        "project(':app').projectDir = file('groovy-mobile')\n"
+    )
+    kotlin = 'include(":app")\nproject(":app").projectDir = file("kotlin-mobile")\n'
+    (project / "settings.gradle").write_text(groovy, encoding="utf-8")
+    (project / "settings.gradle.kts").write_text(kotlin, encoding="utf-8")
+    (project / "groovy-mobile").mkdir()
+    (project / "kotlin-mobile").mkdir()
+    _gradle_that_writes(
+        monkeypatch,
+        0,
+        recorded_gradle("gradle_build_successful"),
+        [
+            (
+                _results(project, "groovy-mobile") / "TEST-com.example.PassingTest.xml",
+                recorded_gradle("junit_xml_passing_case"),
+            )
+        ],
+    )
+
+    result = BuildRunner(str(project), module=":app").test()
+
+    assert result.success is True
+    assert result.results_dir == str(_results(project, "groovy-mobile"))
+
+
+@pytest.mark.parametrize(
+    ("assignment", "assignment_line"),
+    [
+        pytest.param(
+            "project(':app').projectDir = new File(rootDir, 'mobile')",
+            0,
+            id="dynamic-rhs",
+        ),
+        pytest.param(
+            "if (providers.gradleProperty('mobile').isPresent()) {\n"
+            "    project(':app').projectDir = file('mobile')\n"
+            "}",
+            1,
+            id="conditional-literal",
+        ),
+    ],
+)
+def test_unsupported_project_dir_assignment_is_refused_before_gradle(
+    assignment, assignment_line, tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """An explicit mapping the resolver cannot prove is never treated as absent."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    base = recorded_gradle("settings_gradle_compose").rstrip()
+    settings = f"{base}\n{assignment}\n"
+    (project / "settings.gradle").write_text(settings, encoding="utf-8")
+    (project / "mobile").mkdir()
+    gradle_started = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal gradle_started
+        gradle_started = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    line_number = len(base.splitlines()) + 1 + assignment_line
+    assert f"settings.gradle:{line_number}" in str(refused.value)
+    assert ":app" in str(refused.value)
+    assert "file('relative/path')" in refused.value.remedy
+    assert 'File("relative/path")' in refused.value.remedy
+    assert gradle_started is False, "Gradle started before the assignment was refused"
+
+
+def test_a_missing_resolved_module_directory_refuses_before_gradle(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """A bad projectDir is a settings error, not a successful run with no reports."""
+    from common import cli
+    from gradle import BuildRunner
+
+    project = _make_project(tmp_path)
+    settings = (
+        f'{recorded_gradle("settings_gradle_compose").rstrip()}\n'
+        "project(':app').projectDir = file('missing-mobile')\n"
+    )
+    (project / "settings.gradle").write_text(settings, encoding="utf-8")
+    gradle_started = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal gradle_started
+        gradle_started = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import gradle.builder as builder_mod
+
+    monkeypatch.setattr(builder_mod.subprocess, "run", fake_run)
+
+    with pytest.raises(cli.Failure) as refused:
+        BuildRunner(str(project), module=":app").test()
+
+    expected = project / "missing-mobile"
+    assert str(expected) in str(refused.value)
+    assert "projectDir" in refused.value.remedy
+    assert gradle_started is False, "Gradle started before the module directory was validated"
 
 
 def test_x7_failing_tests_fail_the_run_when_gradle_exits_zero(
@@ -1081,7 +1319,7 @@ def test_a_module_run_reads_only_that_modules_reports(tmp_path: Path, monkeypatc
 
     project = _make_project(tmp_path)
     for module in ("app", "lib"):
-        (project / module).mkdir()
+        (project / module).mkdir(exist_ok=True)
     _gradle_that_writes(
         monkeypatch,
         0,
@@ -1252,7 +1490,7 @@ def test_report_cleanup_refuses_a_build_symlink_outside_the_project(
     from gradle import BuildRunner
 
     project = _make_project(tmp_path)
-    (project / "app").mkdir()
+    (project / "app").mkdir(exist_ok=True)
     outside_build = tmp_path / "outside" / "build"
     sentinel = _report(
         outside_build / "test-results" / TASK,
@@ -1292,7 +1530,7 @@ def test_report_cleanup_refuses_an_in_project_build_redirect(
 
     project = _make_project(tmp_path)
     module = project / "app"
-    module.mkdir()
+    module.mkdir(exist_ok=True)
     sentinel = _report(
         module / "child" / "build" / "test-results" / TASK,
         "sentinel",

@@ -197,6 +197,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 10. **build_and_test.py** - Gradle build/test automation with progressive disclosure (backed by the `gradle/` subpackage)
     - One-line summary + a result ID by default; drill in on demand
     - Parses JUnit XML for pass/fail counts + failed test names; extracts Gradle/Kotlin/Java errors & warnings
+    - Resolves a selected module's report directory from an unconditional, single-line
+      `project(...).projectDir = file(...)` or `File(...)` in the settings file Gradle selects
+      (`settings.gradle` takes precedence); comments are ignored, unsupported assignments and a
+      missing or outside-project directory are refused before Gradle starts, and no assignment
+      keeps the conventional module path
     - `--test` reads only the reports *this* run wrote: it deletes the test task's old `TEST-*.xml` reports
       first, after proving their resolved paths stay inside the selected module and exact task directory,
       and reruns the task (`--rerun`, Gradle 7.6+; an older wrapper is refused by name). It passes only
@@ -498,6 +503,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       be emitted at all (no temporary directory, or a check record that could
       not be written or read back), it exits 1 with one `{"success": false,
       "error": ..., "remedy": ...}` line — never an empty stdout
+    - When Python runs, encoder stdout is parsed as one complete report with the expected keys;
+      without Python, the Bash guard enforces one brace-balanced top-level object. Concatenated
+      startup-hook output is discarded before the Bash fallback is used
     - Options: `--json`, `--help`
 
 24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
