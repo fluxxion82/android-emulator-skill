@@ -9,14 +9,15 @@ architecture but speaks Gradle (tasks, ``-p``/module, variants) instead of
 xcodebuild.
 
 Timeouts are tunable via the ANDROID_EMU_ prefix:
-- ANDROID_EMU_BUILD_TIMEOUT (default 1800s)
+- ANDROID_EMU_BUILD_TIMEOUT (default 1800s; also bounds a --module test run's projectDir query)
 - ANDROID_EMU_TEST_TIMEOUT  (default 2700s)
 """
 
 import contextlib
 import re
+import shlex
 import subprocess
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from common import cli
 from common.env_config import env_int
@@ -24,6 +25,7 @@ from common.env_config import env_int
 from .config import Config
 from .results import (
     aggregate_test_results,
+    extract_failure_reasons,
     find_test_result_directories,
     find_test_result_files,
     parse_build_output,
@@ -37,96 +39,24 @@ RERUN_UNSUPPORTED = "Unknown command-line option '--rerun'"
 BUILD_TIMEOUT = env_int("ANDROID_EMU_BUILD_TIMEOUT", 1800)
 TEST_TIMEOUT = env_int("ANDROID_EMU_TEST_TIMEOUT", 2700)
 
-_PROJECT_DIR_ASSIGNMENT = re.compile(
-    r"^\s*project\s*\(\s*(?P<module_quote>['\"])(?P<module>:[^'\"]+)"
-    r"(?P=module_quote)\s*\)\s*\.projectDir\s*=\s*(?:file|File)\s*\(\s*"
-    r"(?P<path_quote>['\"])(?P<path>[^'\"]+)(?P=path_quote)\s*\)\s*;?\s*(?://.*)?$",
-    re.VERBOSE,
-)
-_PROJECT_DIR_REFERENCE = re.compile(r"\bprojectDir\b")
+# What ``<module>:properties --property projectDir`` prints for the module's
+# directory (recorded: gradle-8.13 and gradle-7.5.1 gradle_properties_project_dir):
+# a dashed ``Project ':app'`` banner even under -q, then exactly this one line
+# holding the absolute path. A filter that matches no property still exits 0
+# and prints ``<name>: null`` instead (gradle_properties_no_such_property).
+_PROJECT_DIR_LINE = re.compile(r"^projectDir: (?P<path>.+?)\r?$", re.MULTILINE)
 
 
-def _strip_gradle_comments(source: str) -> str:
-    """Replace Gradle line/block comments with spaces while preserving strings and lines."""
-    stripped = list(source)
-    index = 0
-    quote = ""
-
-    while index < len(source):
-        if quote:
-            if source.startswith(quote, index):
-                index += len(quote)
-                quote = ""
-            elif len(quote) == 1 and source[index] == "\\":
-                index += min(2, len(source) - index)
-            else:
-                index += 1
-            continue
-
-        if source.startswith("//", index):
-            end = source.find("\n", index)
-            end = len(source) if end == -1 else end
-            for position in range(index, end):
-                stripped[position] = " "
-            index = end
-        elif source.startswith("/*", index):
-            end = source.find("*/", index + 2)
-            end = len(source) if end == -1 else end + 2
-            for position in range(index, end):
-                if source[position] not in "\r\n":
-                    stripped[position] = " "
-            index = end
-        elif source.startswith(("'''", '"""'), index):
-            quote = source[index : index + 3]
-            index += 3
-        elif source[index] in "'\"":
-            quote = source[index]
-            index += 1
-        else:
-            index += 1
-
-    return "".join(stripped)
-
-
-def _mask_gradle_strings(source: str) -> str:
-    """Mask quoted strings so structural braces and keywords can be scanned safely."""
-    masked = list(source)
-    index = 0
-    quote = ""
-
-    while index < len(source):
-        if quote:
-            if source.startswith(quote, index):
-                for position in range(index, index + len(quote)):
-                    masked[position] = " "
-                index += len(quote)
-                quote = ""
-            elif len(quote) == 1 and source[index] == "\\":
-                masked[index] = " "
-                index += 1
-                if index < len(source):
-                    if source[index] not in "\r\n":
-                        masked[index] = " "
-                    index += 1
-            else:
-                if source[index] not in "\r\n":
-                    masked[index] = " "
-                index += 1
-            continue
-
-        if source.startswith(("'''", '"""'), index):
-            quote = source[index : index + 3]
-            for position in range(index, index + 3):
-                masked[position] = " "
-            index += 3
-        elif source[index] in "'\"":
-            quote = source[index]
-            masked[index] = " "
-            index += 1
-        else:
-            index += 1
-
-    return "".join(masked)
+def _gradle_query(command: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+    """Run one read-only Gradle question; its own seam so a test can answer it."""
+    return subprocess.run(
+        command,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
 
 
 class BuildResult:
@@ -307,111 +237,104 @@ class BuildRunner:
         extra = ["--rerun", *(["--tests", suite] if suite else [])]
         return self._run([task, *extra], clean=clean, timeout=TEST_TIMEOUT, test_task=task)
 
-    def _results_root(self) -> Path:
-        """The directory a test run's reports are searched under: the module's, if it has one."""
-        if self.module:
-            parts = self.module.lstrip(":").split(":")
-            if not parts or any(
-                not part or part in {".", ".."} or "/" in part or "\\" in part for part in parts
-            ):
-                cli.fail(
-                    f"invalid Gradle module path: {self.module}",
-                    "Pass a colon-separated Gradle project path such as :app or :feature:login.",
-                )
-            module = f":{':'.join(parts)}"
-            candidate = self._configured_module_dir(module) or self.project_dir.joinpath(*parts)
-            resolved = candidate.resolve()
-            if not resolved.is_relative_to(self.project_dir.resolve()):
-                cli.fail(
-                    f"Gradle module path resolves outside the project: {candidate}",
-                    "Pass --module a project contained under the selected --project root.",
-                )
-            if not resolved.is_dir():
-                cli.fail(
-                    f"Gradle module {module} directory does not exist: {candidate}",
-                    f"Set project('{module}').projectDir = file('relative/path') in "
-                    "settings.gradle(.kts), or pass --module for an existing Gradle project.",
-                )
-            return candidate
-        return self.project_dir
-
-    def _configured_module_dir(self, module: str) -> Path | None:
-        """Read a module's explicit ``projectDir`` from the root settings script."""
-        settings = next(
-            (
-                self.project_dir / name
-                for name in ("settings.gradle", "settings.gradle.kts")
-                if (self.project_dir / name).exists()
-            ),
-            None,
-        )
-        if settings is None:
+    def _module_path(self) -> str | None:
+        """The selected module as a normalised ``:a:b`` Gradle path, or None."""
+        if not self.module:
             return None
-
-        try:
-            source = settings.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+        parts = self.module.lstrip(":").split(":")
+        if not parts or any(
+            not part or part in {".", ".."} or "/" in part or "\\" in part for part in parts
+        ):
             cli.fail(
-                f"could not read Gradle settings file {settings}: {error}",
-                "Make the settings file readable UTF-8, then rerun the Gradle task.",
+                f"invalid Gradle module path: {self.module}",
+                "Pass a colon-separated Gradle project path such as :app or :feature:login.",
+            )
+        return f":{':'.join(parts)}"
+
+    def _results_root(self) -> Path:
+        """The directory a test run's reports are searched under: the module's, if it has one.
+
+        A module's directory is Gradle's own answer, never a reading of the
+        settings script. Two static scanners (PR #37, #41) lost to Groovy and
+        Kotlin syntax every review round -- slashy strings, unbraced ``if``
+        bodies, ``project(":$name")``, ``setProjectDir``, ``includeFlat``,
+        settings plugins -- and a wrong answer here points report cleanup at
+        another directory. Only Gradle evaluates the settings script, so it is
+        asked; it costs one configuration of the build per ``--module`` test run.
+        """
+        module = self._module_path()
+        if module is None:
+            return self.project_dir
+        candidate = self._gradle_project_dir(module)
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(self.project_dir.resolve()):
+            cli.fail(
+                f"Gradle module {module} resolves outside the project: {candidate}",
+                "Pass --module a project whose projectDir is under the selected --project "
+                "root; build_and_test only cleans and reads reports inside it.",
+            )
+        if not resolved.is_dir():
+            cli.fail(
+                f"Gradle module {module} directory does not exist: {candidate}",
+                f"Point project('{module}').projectDir at an existing directory in "
+                "settings.gradle(.kts), or pass --module for an existing Gradle project.",
+            )
+        return candidate
+
+    def _gradle_project_dir(self, module: str) -> Path:
+        """Ask the project's Gradle for ``module``'s projectDir; refuse anything but one answer."""
+        command = [
+            str(self.gradlew),
+            "--console=plain",
+            "-q",
+            "-p",
+            str(self.project_dir),
+            f"{module}:properties",
+            "--property",
+            "projectDir",
+        ]
+        shown = shlex.join(command)
+        try:
+            completed = _gradle_query(command, self.project_dir, BUILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            cli.fail(
+                f"Gradle did not report the directory of module {module} within "
+                f"{BUILD_TIMEOUT}s: {shown}",
+                "Raise ANDROID_EMU_BUILD_TIMEOUT (a first configuration may download plugins), "
+                "or run the command yourself to see where Gradle stops.",
+            )
+        except OSError as error:
+            cli.fail(
+                f"could not start the Gradle wrapper to resolve module {module}: {error}",
+                f"Make {self.gradlew} a runnable Gradle wrapper (./gradlew --version), then rerun.",
             )
 
-        uncommented = _strip_gradle_comments(source)
-        structure = _mask_gradle_strings(uncommented)
-        configured: dict[str, Path] = {}
-        brace_depth = 0
-        offset = 0
-        for line_number, line_with_ending in enumerate(
-            uncommented.splitlines(keepends=True), start=1
-        ):
-            line = line_with_ending.rstrip("\r\n")
-            structure_line = structure[offset : offset + len(line_with_ending)].rstrip("\r\n")
-            references = list(_PROJECT_DIR_REFERENCE.finditer(structure_line))
-            reference_depths: list[int] = []
-            reference_starts = {reference.start() for reference in references}
-            for position, char in enumerate(structure_line):
-                if position in reference_starts:
-                    reference_depths.append(brace_depth)
-                if char == "{":
-                    brace_depth += 1
-                elif char == "}":
-                    brace_depth = max(0, brace_depth - 1)
+        stdout = completed.stdout or ""
+        output = f"{stdout}\n{completed.stderr or ''}".strip()
+        if completed.returncode != 0:
+            reasons = extract_failure_reasons(output)
+            said = "; ".join(reasons) if reasons else (output[-500:] or "no output")
+            cli.fail(
+                f"Gradle could not resolve module {module} (exit {completed.returncode}): "
+                f"{said}",
+                f"Pass --module a project Gradle knows (./gradlew projects lists them), or fix "
+                f"the error Gradle reports for: {shown}",
+                details={"command": shown, "gradle_output": output[-2000:]},
+            )
 
-            if references:
-                supported = _PROJECT_DIR_ASSIGNMENT.fullmatch(line)
-                path_text = supported.group("path") if supported is not None else ""
-                path_parts = re.split(r"[/\\\\]", path_text)
-                literal_is_fixed = (
-                    supported is not None
-                    and len(references) == 1
-                    and reference_depths == [0]
-                    and "$" not in path_text
-                    and "+" not in path_text
-                    and not Path(path_text).is_absolute()
-                    and not PureWindowsPath(path_text).is_absolute()
-                    and ".." not in path_parts
-                )
-                if not literal_is_fixed:
-                    cli.fail(
-                        f"unsupported projectDir assignment while resolving Gradle module "
-                        f"{module} at {settings}:{line_number}",
-                        f"Use a top-level, unconditional single-line "
-                        f"project('{module}').projectDir = file('relative/path') or "
-                        f'project("{module}").projectDir = File("relative/path"), with a '
-                        "fixed relative path containing no interpolation, concatenation, or '..'.",
-                    )
-
-                configured_module = supported.group("module")
-                if configured_module in configured:
-                    cli.fail(
-                        f"Gradle module {configured_module} projectDir is assigned more than once "
-                        f"at {settings}:{line_number}",
-                        "Keep exactly one supported top-level projectDir assignment for each "
-                        "Gradle module, then rerun the task.",
-                    )
-                configured[configured_module] = self.project_dir / path_text
-            offset += len(line_with_ending)
-        return configured.get(module)
+        answers = [match.group("path") for match in _PROJECT_DIR_LINE.finditer(stdout)]
+        if len(answers) != 1:
+            cli.fail(
+                f"Gradle printed {len(answers)} projectDir lines for module {module}, "
+                f"expected exactly one: {shown}",
+                "Run the command yourself; an init script or plugin that prints its own "
+                "projectDir line makes the module's directory ambiguous, so no report is "
+                "cleaned or read.",
+                details={"command": shown, "gradle_output": output[-2000:]},
+            )
+        # Gradle prints an absolute path; a relative one would be read against the
+        # project rather than this process's cwd, then held to the same containment.
+        return self.project_dir / answers[0]
 
     def _report_files(self, root: Path, task: str) -> tuple[list[Path], list[Path]]:
         """Find reports and prove every resolved path stays in its permitted directory."""
@@ -531,7 +454,9 @@ class BuildRunner:
 
         cmd = self._build_command(tasks, clean)
         name = test_task.rsplit(":", 1)[-1] if test_task is not None else None
-        root = self._results_root()
+        self._module_path()
+        # Only a test run reads reports, so only it pays for asking Gradle where they are.
+        root = self._results_root() if name is not None else self.project_dir
         if name is not None:
             self._clear_reports(root, name)
         start = time.time()

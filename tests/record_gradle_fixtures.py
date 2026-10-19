@@ -44,8 +44,10 @@ import argparse
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -89,6 +91,11 @@ class GradleFixture:
         gradle_below: Only a Gradle older than this version produces the
             output this fixture is about (``"7.6"`` for an option 7.6 added).
             Skipped by a recording made with a newer Gradle.
+        settings_append: Text appended to ``settings.gradle`` before the run.
+            When set (or ``make_dirs`` is), the run happens in a throwaway COPY
+            of the scaffold -- the checked-in scaffold is never edited -- and
+            the copy's path is scrubbed to ``/scaffold`` like the scaffold's.
+        make_dirs: Directories, relative to the copy, created before the run.
     """
 
     name: str
@@ -101,7 +108,15 @@ class GradleFixture:
     requires_in_log: str | None = None
     ext: str = "txt"
     gradle_below: str | None = None
+    settings_append: str | None = None
+    make_dirs: tuple[str, ...] = ()
 
+
+# build_and_test asks Gradle where a --module lives instead of reading the
+# settings script (a scanner lost to Groovy/Kotlin syntax four rounds running).
+# These record the one question it asks, as the builder asks it (``-q``), in
+# every shape the answer comes in.
+_PROJECT_DIR_QUERY = ["-q", ":app:properties", "--property", "projectDir"]
 
 FIXTURES: list[GradleFixture] = [
     GradleFixture(
@@ -323,6 +338,115 @@ FIXTURES: list[GradleFixture] = [
         ),
         catches=("N6",),
     ),
+    GradleFixture(
+        name="gradle_properties_project_dir",
+        args=_PROJECT_DIR_QUERY,
+        requires_in_log="projectDir: ",
+        description=(
+            "The module-directory question build_and_test asks for --module, against "
+            "a settings script with no projectDir override. Even under -q Gradle "
+            "prints a dashed `Project ':app'` banner first, then exactly one "
+            "`projectDir: <absolute path>` line -- the conventional app/ directory."
+        ),
+        catches=("W5-G",),
+    ),
+    GradleFixture(
+        name="gradle_properties_project_dir_remapped",
+        args=_PROJECT_DIR_QUERY,
+        requires_in_log="projectDir: ",
+        settings_append="project(':app').projectDir = file('mobile')\n",
+        make_dirs=("mobile",),
+        description=(
+            "The same question on a copy of the scaffold whose settings.gradle ends "
+            "with `project(':app').projectDir = file('mobile')` and has a mobile/ "
+            "directory. Gradle answers mobile/: the directory the test task writes "
+            "its reports under, and so the one cleanup and collection must use."
+        ),
+        catches=("W5-G",),
+    ),
+    # The four settings constructs the PR #41 review used to defeat the static
+    # scanner, each appended to a copy of the scaffold. Gradle's answer is the
+    # ground truth a scanner kept getting wrong.
+    GradleFixture(
+        name="gradle_properties_slashy_dead_branch",
+        args=_PROJECT_DIR_QUERY,
+        requires_in_log="projectDir: ",
+        settings_append=(
+            "if (false) {\n"
+            "    def ignored = /}/\n"
+            "    project(':app').projectDir = file('mobile')\n"
+            "}\n"
+        ),
+        make_dirs=("mobile",),
+        description=(
+            "A remap inside `if (false) { ... }` behind a slashy string `/}/` that "
+            "desynchronised the scanner's brace depth. Never executed: Gradle "
+            "answers app/."
+        ),
+        catches=("W5-G",),
+    ),
+    GradleFixture(
+        name="gradle_properties_unbraced_dead_branch",
+        args=_PROJECT_DIR_QUERY,
+        requires_in_log="projectDir: ",
+        settings_append="if (false)\n    project(':app').projectDir = file('mobile')\n",
+        make_dirs=("mobile",),
+        description=(
+            "A remap as the unbraced body of `if (false)`: at brace depth zero, "
+            "yet never executed. Gradle answers app/."
+        ),
+        catches=("W5-G",),
+    ),
+    GradleFixture(
+        name="gradle_properties_interpolated_module",
+        args=_PROJECT_DIR_QUERY,
+        requires_in_log="projectDir: ",
+        settings_append='def name = \'app\'\nproject(":$name").projectDir = file("mobile")\n',
+        make_dirs=("mobile",),
+        description=(
+            'A remap whose module path is a GString, `project(":$name")` with '
+            "name = 'app'. The scanner stored ':$name' and kept app/; Gradle "
+            "answers mobile/."
+        ),
+        catches=("W5-G",),
+    ),
+    GradleFixture(
+        name="gradle_properties_set_project_dir",
+        args=_PROJECT_DIR_QUERY,
+        requires_in_log="projectDir: ",
+        settings_append="project(':app').setProjectDir(file('mobile'))\n",
+        make_dirs=("mobile",),
+        description=(
+            "A remap through the setter, `setProjectDir(...)`, which has no "
+            "`projectDir` token for a scanner to find. Gradle answers mobile/."
+        ),
+        catches=("W5-G",),
+    ),
+    GradleFixture(
+        name="gradle_properties_unknown_project",
+        args=["-q", ":nope:properties", "--property", "projectDir"],
+        requires_in_log="not found in root project",
+        description=(
+            "The question asked about a module the build does not have: exit 1 and "
+            "a '* What went wrong:' block, no projectDir line. The wording differs "
+            'by version -- 8.13 says "Cannot locate tasks that match '
+            "':nope:properties' as project 'nope' not found in root project ...\", "
+            "7.5.1 says \"Project 'nope' not found in root project ...\"."
+        ),
+        catches=("W5-G",),
+    ),
+    GradleFixture(
+        name="gradle_properties_no_such_property",
+        args=["-q", ":app:properties", "--property", "noSuchPropertyAnywhere"],
+        requires_in_log="noSuchPropertyAnywhere: null",
+        description=(
+            "A property filter that matches nothing still exits 0, prints the "
+            "banner and `noSuchPropertyAnywhere: null` -- an honest successful "
+            "answer with no projectDir line in it, which the builder must refuse "
+            "rather than fall back to a guessed directory."
+        ),
+        catches=("W5-G",),
+    ),
 ]
 
 
@@ -347,7 +471,23 @@ def _artifact_path(fixture: GradleFixture) -> pathlib.Path | None:
     return None if fixture.artifact is None else fixture.scaffold / fixture.artifact
 
 
-def _run(gradle: str, fixture: GradleFixture) -> str:
+def _prepare_copy(fixture: GradleFixture, workdir: Path) -> Path:
+    """Copy the scaffold into ``workdir`` and apply the fixture's settings edit."""
+    copy = workdir / fixture.scaffold.name
+    shutil.copytree(
+        fixture.scaffold, copy, ignore=shutil.ignore_patterns(".gradle", "build", ".kotlin")
+    )
+    if fixture.settings_append is not None:
+        settings = copy / "settings.gradle"
+        settings.write_text(
+            settings.read_text(encoding="utf-8") + fixture.settings_append, encoding="utf-8"
+        )
+    for directory in fixture.make_dirs:
+        (copy / directory).mkdir(parents=True, exist_ok=True)
+    return copy
+
+
+def _run(gradle: str, fixture: GradleFixture, cwd: Path | None = None) -> str:
     """Run one fixture's Gradle invocation and return combined output.
 
     Failure output is the point of most of these fixtures, so a non-zero exit is
@@ -359,7 +499,7 @@ def _run(gradle: str, fixture: GradleFixture) -> str:
         flags.append("--rerun-tasks")
     result = subprocess.run(
         [gradle, *flags, *fixture.args],
-        cwd=fixture.scaffold,
+        cwd=cwd or fixture.scaffold,
         capture_output=True,
         text=True,
         timeout=GRADLE_TIMEOUT,
@@ -368,7 +508,7 @@ def _run(gradle: str, fixture: GradleFixture) -> str:
     return result.stdout + result.stderr
 
 
-def _scrub(text: str) -> str:
+def _scrub(text: str, extra_roots: tuple[Path, ...] = ()) -> str:
     """Remove machine-specific and run-specific detail.
 
     Durations and absolute paths change every run and would make every
@@ -390,8 +530,12 @@ def _scrub(text: str) -> str:
     text = re.sub(r'hostname="[^"]*"', 'hostname="build-host"', text)
     text = re.sub(r'timestamp="[^"]*"', 'timestamp="2020-01-01T00:00:00Z"', text)
     text = re.sub(r'time="[\d.]+"', 'time="0.0"', text)
-    for scaffold in ALL_SCAFFOLDS:
-        text = text.replace(str(scaffold), "/scaffold")
+    # A throwaway copy is scrubbed under both spellings: Gradle prints the
+    # canonical path, which on macOS is /private/var/... for a /var/... tempdir.
+    # Longest first, so /var/... cannot rewrite the middle of /private/var/...
+    roots = {str(root) for root in extra_roots} | {str(root.resolve()) for root in extra_roots}
+    for root in (*sorted(roots, key=len, reverse=True), *map(str, ALL_SCAFFOLDS)):
+        text = text.replace(root, "/scaffold")
     return text
 
 
@@ -440,7 +584,14 @@ def record(gradle: str, only: set[str] | None = None) -> int:
         if produced is not None and produced.exists():
             produced.unlink()
         started_at = time.time()
-        log = _run(gradle, fixture)
+        copies: tuple[Path, ...] = ()
+        if fixture.settings_append is not None or fixture.make_dirs:
+            with tempfile.TemporaryDirectory(prefix="gradle-fixture-") as workdir:
+                copy = _prepare_copy(fixture, Path(workdir))
+                copies = (copy,)
+                log = _scrub(_run(gradle, fixture, cwd=copy), copies)
+        else:
+            log = _run(gradle, fixture)
 
         if fixture.requires_in_log is not None and fixture.requires_in_log not in log:
             print(
@@ -452,7 +603,7 @@ def record(gradle: str, only: set[str] | None = None) -> int:
             return 1
 
         if produced is None:
-            text = _scrub(log)
+            text = _scrub(log, copies)
         else:
             # The build had to run to produce it, but what gets recorded is the
             # file the build WROTE, not what it printed.
@@ -485,6 +636,25 @@ def record(gradle: str, only: set[str] | None = None) -> int:
                     + " ".join(fixture.args)
                 ),
                 "scaffold": f"tests/fixtures/scaffold/{fixture.scaffold.name}",
+                **(
+                    {
+                        "setup": (
+                            "run in a temporary copy of the scaffold"
+                            + (
+                                f"; appended to settings.gradle: {fixture.settings_append!r}"
+                                if fixture.settings_append is not None
+                                else ""
+                            )
+                            + (
+                                f"; created: {', '.join(fixture.make_dirs)}"
+                                if fixture.make_dirs
+                                else ""
+                            )
+                        )
+                    }
+                    if copies
+                    else {}
+                ),
                 "produced_artifact": fixture.artifact,
                 "description": fixture.description,
                 "catches": list(fixture.catches),

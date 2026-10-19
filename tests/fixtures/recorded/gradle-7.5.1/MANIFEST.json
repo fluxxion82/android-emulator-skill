@@ -1,6 +1,6 @@
 {
   "profile": "gradle-7.5.1",
-  "recorded_at": "2026-10-16T23:00:02Z",
+  "recorded_at": "2026-10-19T06:49:42Z",
   "gradle_version": "7.5.1",
   "scaffolds": [
     "tests/fixtures/scaffold/flavored",
@@ -20,6 +20,55 @@
         "N6"
       ],
       "bytes": 493
+    },
+    {
+      "name": "gradle_properties_project_dir",
+      "file": "gradle_properties_project_dir.txt",
+      "command": "gradle --console=plain -q :app:properties --property projectDir",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "produced_artifact": null,
+      "description": "The module-directory question build_and_test asks for --module, against a settings script with no projectDir override. Even under -q Gradle prints a dashed `Project ':app'` banner first, then exactly one `projectDir: <absolute path>` line -- the conventional app/ directory.",
+      "catches": [
+        "W5-G"
+      ],
+      "bytes": 165
+    },
+    {
+      "name": "gradle_properties_project_dir_remapped",
+      "file": "gradle_properties_project_dir_remapped.txt",
+      "command": "gradle --console=plain -q :app:properties --property projectDir",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "setup": "run in a temporary copy of the scaffold; appended to settings.gradle: \"project(':app').projectDir = file('mobile')\\n\"; created: mobile",
+      "produced_artifact": null,
+      "description": "The same question on a copy of the scaffold whose settings.gradle ends with `project(':app').projectDir = file('mobile')` and has a mobile/ directory. Gradle answers mobile/: the directory the test task writes its reports under, and so the one cleanup and collection must use.",
+      "catches": [
+        "W5-G"
+      ],
+      "bytes": 168
+    },
+    {
+      "name": "gradle_properties_unknown_project",
+      "file": "gradle_properties_unknown_project.txt",
+      "command": "gradle --console=plain -q :nope:properties --property projectDir",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "produced_artifact": null,
+      "description": "The question asked about a module the build does not have: exit 1 and a '* What went wrong:' block, no projectDir line. The wording differs by version -- 8.13 says \"Cannot locate tasks that match ':nope:properties' as project 'nope' not found in root project ...\", 7.5.1 says \"Project 'nope' not found in root project ...\".",
+      "catches": [
+        "W5-G"
+      ],
+      "bytes": 351
+    },
+    {
+      "name": "gradle_properties_no_such_property",
+      "file": "gradle_properties_no_such_property.txt",
+      "command": "gradle --console=plain -q :app:properties --property noSuchPropertyAnywhere",
+      "scaffold": "tests/fixtures/scaffold/flavored",
+      "produced_artifact": null,
+      "description": "A property filter that matches nothing still exits 0, prints the banner and `noSuchPropertyAnywhere: null` -- an honest successful answer with no projectDir line in it, which the builder must refuse rather than fall back to a guessed directory.",
+      "catches": [
+        "W5-G"
+      ],
+      "bytes": 168
     }
   ]
 }
