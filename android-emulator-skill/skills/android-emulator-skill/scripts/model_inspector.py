@@ -53,24 +53,8 @@ DB_MAX_BYTES = env_int("ANDROID_EMU_MODEL_DB_MAX_BYTES", 50_000_000, min_value=4
 # Timeout (seconds) for a single run-as adb invocation in LIVE mode.
 RUN_AS_TIMEOUT = env_int("ANDROID_EMU_MODEL_TIMEOUT", 30, min_value=5)
 
-# Markers adb/run-as emit when run-as is refused. Matched case-insensitively as
-# substrings; the platform wording has drifted across API levels.
-_RUN_AS_DENIED_MARKERS = (
-    "is not debuggable",
-    "not debuggable",
-    "is unknown",
-    "unknown package",
-    "run-as: package not found",
-    "package not found",
-    # Measured: the device prints "run-as: package not an application: <pkg>".
-    # This read "is not an application", with an "is" Android never emits, so a
-    # real denial fell through and the failure was reported as
-    # "app.db is not a valid SQLite database" -- blaming the database for a
-    # permissions problem. Recorded as run_as_not_an_application.
-    "not an application",
-    "user is not debuggable",
-    "permission denied",
-)
+# What a run-as refusal looks like is decided once, in common.run_as
+# (run_as_refused), for this script and container.py alike.
 
 SCOPING_NOTE = (
     "Room is backed by SQLite. This inspector covers Room (annotations + "
@@ -647,7 +631,9 @@ class LiveInspector:
             except RunAsDeniedError as exc:
                 return False, _denied_result(package, exc)
             except _RunAsError as exc:
-                return False, {"error": str(exc)}
+                # run-as ran; the device refused the directory itself.
+                remedy = run_as.path_failure_remedy(package, db_dir)
+                return False, {"error": str(exc), "path": db_dir, "remedy": remedy}
             names = [
                 line.strip()
                 for line in output.splitlines()
@@ -694,8 +680,8 @@ class LiveInspector:
         )
         result = adb_exec.run_argv(cmd, serial=self.serial, timeout=RUN_AS_TIMEOUT, text=True)
 
-        combined = f"{result.stdout}\n{result.stderr}"
-        _raise_if_denied(package, combined, result.returncode)
+        # stderr only: stdout holds names the app chose (see _raise_if_denied).
+        _raise_if_denied(package, result.stderr, result.returncode)
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
             raise _RunAsError(f"Command failed ({' '.join(argv)}): {detail}")
@@ -806,14 +792,16 @@ class _RunAsError(RuntimeError):
     """Generic run-as / adb command failure (not a denial)."""
 
 
-def _raise_if_denied(package: str, text: str, returncode: int) -> None:
-    """Raise RunAsDeniedError if output looks like a run-as denial."""
-    if returncode == 0:
-        return
-    lowered = text.lower()
-    for marker in _RUN_AS_DENIED_MARKERS:
-        if marker in lowered:
-            raise RunAsDeniedError(f"run-as denied for '{package}': {text.strip() or marker}")
+def _raise_if_denied(package: str, stderr: str, returncode: int) -> None:
+    """Raise RunAsDeniedError if run-as itself refused the package.
+
+    Decided by ``run_as.run_as_refused``: a ``run-as:`` line on stderr at a
+    non-zero exit. This matched the markers anywhere in stdout and stderr, so
+    ``ls: <dir>: Permission denied`` (recorded: run_as_ls_1_databases_unreadable)
+    came back as a run-as denial with "install a debug build" (review of #33).
+    """
+    if run_as.run_as_refused(stderr, returncode):
+        raise RunAsDeniedError(f"run-as denied for '{package}': {stderr.strip()}")
 
 
 def _denied_result(package: str, exc: RunAsDeniedError) -> dict:
@@ -1155,7 +1143,7 @@ OFFLINE_REMEDY = (
 )
 
 # What to do about a LIVE run whose result names no remedy of its own (a run-as
-# refusal carries its hint).
+# refusal carries its hint, a path the device refused its own remedy).
 LIVE_REMEDY = (
     "Fix what the error names, then retry; `model_inspector.py --package <pkg>` "
     "without --db lists the databases the app has."
@@ -1173,7 +1161,7 @@ def _refuse(result: dict, remedy: str) -> None:
     Raises:
         cli.Failure: always.
     """
-    details = {key: value for key, value in result.items() if key != "error"}
+    details = {key: value for key, value in result.items() if key not in ("error", "remedy")}
     cli.fail(str(result.get("error") or "no results found"), remedy, details=details)
 
 
@@ -1224,7 +1212,7 @@ def _run_live(args: argparse.Namespace) -> None:
     if not success:
         # A run-as refusal's hint is its remedy; the text form printed it as a
         # third line (`Hint:`), the JSON form not at all.
-        _refuse(result, result.get("hint") or LIVE_REMEDY)
+        _refuse(result, result.get("remedy") or result.get("hint") or LIVE_REMEDY)
 
     if args.json:
         print(json.dumps({"success": True, **result}, indent=2))

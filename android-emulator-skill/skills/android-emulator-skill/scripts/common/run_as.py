@@ -92,6 +92,67 @@ def require_adb_for_reads(version: tuple[int, int, int]) -> None:
         )
 
 
+# Markers run-as prints when it refuses a package. Matched case-insensitively as
+# substrings, and only on a stderr line that starts `run-as:` (see
+# run_as_refused); the platform wording has drifted across API levels.
+RUN_AS_DENIED_MARKERS = (
+    "is not debuggable",
+    "not debuggable",
+    "is unknown",
+    "unknown package",
+    "run-as: package not found",
+    "package not found",
+    # Measured, not guessed: the device prints "run-as: package not an
+    # application: <pkg>". Both scripts' lists read "is not an application",
+    # with an "is" the platform never emits, so a system or release package fell
+    # through to a generic failure (container) or to "app.db is not a valid
+    # SQLite database" (model_inspector). Recorded as run_as_not_an_application.
+    "not an application",
+    "user is not debuggable",
+    "permission denied",
+)
+
+
+def run_as_refused(stderr: str, returncode: int) -> bool:
+    """True when run-as itself refused the package, so nothing ran.
+
+    Only a line run-as printed counts: on stderr, starting ``run-as:``, at a
+    non-zero exit -- where the device puts its refusals (recorded without
+    ``2>&1``: run_as_not_an_application_stderr, run_as_unknown_package_stderr;
+    stdout empty, exit 1). Both scripts matched the markers anywhere in stdout
+    and stderr, so ``ls: <dir>: Permission denied`` -- the filesystem refusing
+    one directory of an app run-as had already entered (recorded:
+    run_as_ls_shared_prefs_unreadable, run_as_ls_1_databases_unreadable) -- was
+    reported as a run-as denial with "install a debug build" (review of #33),
+    and stdout, which holds names the app chose, was searched as well.
+
+    Args:
+        stderr: The command's stderr, decoded.
+        returncode: Its exit status; a refusal is non-zero.
+    """
+    if returncode == 0:
+        return False
+    for line in stderr.splitlines():
+        lowered = line.strip().lower()
+        if lowered.startswith("run-as:") and any(m in lowered for m in RUN_AS_DENIED_MARKERS):
+            return True
+    return False
+
+
+def path_failure_remedy(package: str, path: str) -> str:
+    """The remedy for a device command that failed on ``path`` once run-as had let it run.
+
+    Not a run-as denial (see :func:`run_as_refused`): the app is installed and
+    debuggable, and the device refused the path itself -- it is missing, or its
+    mode does not let the app read it.
+    """
+    return (
+        f"run-as works for this app; the device refused {path} itself. Check that it "
+        f"exists and that the app may read it: `adb shell run-as {package} ls -ld {path}` "
+        "(a directory needs its owner's r bit to be listed, a file its r bit to be read)."
+    )
+
+
 def read_command(serial: str | None, package: str, argv: list[str]) -> list[str]:
     """The argv of ``adb shell -T run-as <package> <argv...>``, quoted for the device shell.
 

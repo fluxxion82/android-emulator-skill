@@ -376,18 +376,29 @@ def test_live_dump_schema_via_device_sqlite3(monkeypatch, recorded):
     assert "/data/data/com.example.app/databases/app.db" in cmd
 
 
-def test_live_list_databases_skips_sidecars(monkeypatch):
-    listing = "app.db\napp.db-wal\napp.db-shm\nother.db\n"
+def test_live_list_databases_skips_sidecars(monkeypatch, recorded):
+    """The fixture app's `ls -1 databases/`, recorded: the journal is not a database.
+
+    This listing was hand-written as `app.db`, `-wal`, `-shm` and `other.db`;
+    the device's is fixture.db beside a zero-byte fixture.db-journal, one name
+    per line with no `.`/`..` (run_as_ls_1_databases).
+    """
+    listing = recorded.text("run_as_ls_1_databases")
+    assert listing.split() == ["fixture.db", "fixture.db-journal"], "the recording changed"
+    captured: list[list[str]] = []
 
     def fake_run(cmd, *args, **kwargs):
+        captured.append(cmd)
         return _completed(cmd, stdout=listing)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    ok, result = LiveInspector().execute("com.example.app")
+    ok, result = LiveInspector().execute("com.example.composefixture")
     assert ok is True
-    assert set(result["databases"]) == {"app.db", "other.db"}
-    assert result["total_databases"] == 2
+    assert result["databases"] == ["fixture.db"]
+    assert result["total_databases"] == 1
+    # The recording is of this command: the same `ls -1` of the same directory.
+    assert captured[0][-3:] == ["ls", "-1", "/data/data/com.example.composefixture/databases"]
 
 
 def test_live_falls_back_to_host_sqlite3(monkeypatch, tmp_path):
@@ -429,9 +440,13 @@ def test_live_run_as_denied_release_build(monkeypatch, recorded):
     denial = recorded.text("run_as_not_an_application")
 
     def fake_run(cmd, *args, **kwargs):
-        # bytes, not str: this path runs adb without text mode and decodes the
-        # stream itself, so a str double would exercise code the real call never
-        # reaches.
+        # Each call in the mode it asked for. The database read runs adb without
+        # text mode and decodes the stream itself, so it gets bytes; the
+        # on-device sqlite3 attempt before it asks for text, and gets str. (This
+        # answered both with bytes, and the denial was found only because the
+        # old classifier formatted b'...' into a string and searched that.)
+        if kwargs.get("text"):
+            return _completed(cmd, returncode=1, stderr=denial)
         return _completed(cmd, returncode=1, stderr=denial.encode("utf-8"))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -631,3 +646,90 @@ def test_an_adb_client_too_old_for_t_is_refused_before_the_database_is_read(tmp_
     assert "platform-tools" in payload["remedy"]
     reads = [call for call in chain.calls("adb") if "run-as" in call]
     assert not reads, f"the app's data was read before the client was checked: {reads}"
+
+
+# ---------------------------------------------------------------------------
+# What a run-as denial is (review of #33), decided in common.run_as for this
+# script and container.py alike. This matched the markers anywhere in stdout
+# and stderr, so `ls: <dir>: Permission denied` -- the filesystem refusing the
+# databases directory of an app run-as had entered -- came back as a run-as
+# denial with "install a debug build". Only a line run-as printed counts: on
+# stderr, starting `run-as: `, at a non-zero exit.
+# ---------------------------------------------------------------------------
+
+DATABASES_DIR = "/data/data/com.example.composefixture/databases"
+
+
+def _device_answering_the_listing(tmp_path, recorded, recording: str) -> FakeToolchain:
+    """adb whose `ls -1` answers as ``recording`` did: stdout empty, the reason on stderr."""
+    entry = {f["name"]: f for f in recorded.manifest["fixtures"]}[recording]
+    assert (entry["stream"], entry["stdout_bytes"]) == ("stderr", 0), entry
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    chain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("ls", "-1"), stderr=recorded.text(recording), exit=entry["exit_status"]),
+        ],
+        default_exit=127,
+    )
+    return chain
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_an_unreadable_databases_dir_is_a_filesystem_failure_not_a_run_as_denial(
+    tmp_path, recorded, json_mode
+):
+    """run_as_ls_1_databases_unreadable is this script's own `ls -1`, recorded with `chmod u-r`."""
+    chain = _device_answering_the_listing(tmp_path, recorded, "run_as_ls_1_databases_unreadable")
+    argv = ["--package", "com.example.composefixture", "--serial", "emulator-5554"]
+
+    result = chain.run("model_inspector.py", *argv, *(["--json"] if json_mode else []))
+
+    remedy = f"adb shell run-as com.example.composefixture ls -ld {DATABASES_DIR}"
+    payload = assert_refusal(result, json_mode=json_mode, naming=("permission denied",), status=1)
+    output = result.stdout + result.stderr
+    assert "Install a debug build" not in output and "run-as denied" not in output, output
+    assert remedy in output, output
+    if payload is not None:
+        assert "run_as_denied" not in payload and "hint" not in payload, payload
+        assert remedy in payload["remedy"]
+    (listing,) = [call for call in chain.calls("adb") if "ls" in call]
+    assert listing[-3:] == ["ls", "-1", DATABASES_DIR], "the recording is not of this command"
+
+
+@pytest.mark.parametrize(
+    ("recording", "package"),
+    [
+        ("run_as_not_an_application_stderr", "com.android.settings"),
+        ("run_as_unknown_package_stderr", "com.example.app1"),
+    ],
+)
+def test_a_refusal_run_as_printed_is_still_a_run_as_denial(tmp_path, recorded, recording, package):
+    """The two recorded refusals keep the debug-build remedy.
+
+    Recorded for `run-as <pkg> ls`; run-as refuses before it runs any command,
+    so the same refusal answers this script's `ls -1`.
+    """
+    chain = _device_answering_the_listing(tmp_path, recorded, recording)
+
+    result = chain.run(
+        "model_inspector.py", "--package", package, "--serial", "emulator-5554", "--json"
+    )
+
+    payload = assert_refusal(result, json_mode=True, naming=("run-as denied",), status=1)
+    assert payload["run_as_denied"] is True, payload
+    assert "Install a debug build" in payload["remedy"]
+    assert recorded.text(recording).strip() in payload["error"]
+
+
+def test_only_a_line_run_as_printed_is_a_denial(recorded):
+    """The classifier itself, on recorded stderr."""
+    with pytest.raises(model_inspector.RunAsDeniedError):
+        model_inspector._raise_if_denied(
+            "com.android.settings", recorded.text("run_as_not_an_application_stderr"), 1
+        )
+    model_inspector._raise_if_denied(
+        "com.example.composefixture", recorded.text("run_as_ls_1_databases_unreadable"), 1
+    )

@@ -438,6 +438,15 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 #### Discovery & Device State (14 scripts) ⭐ NEW
 
 23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
+    - Every probe is bounded (10 s), the Python version and Pillow probes
+      included. A `python3` on PATH that cannot run is a warning saying so,
+      not "Python 0.0 found"
+    - `--json` prints one object on stdout (progress goes to stderr). When
+      `python3` cannot encode it, a Bash encoder does; when the report cannot
+      be emitted at all (no temporary directory, or a check record that could
+      not be written or read back), it exits 1 with one `{"success": false,
+      "error": ..., "remedy": ...}` line — never an empty stdout
+    - Options: `--json`, `--help`
 
 24. **device_list.py** - List connected devices (`adb devices -l`) and defined AVDs (`emulator -list-avds`) with progressive disclosure.
     - An empty inventory at exit 0 means the tools ran and found nothing. A
@@ -500,11 +509,26 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       written) a name that would land outside the snapshot. A name holding a
       real newline can still add a plain-named entry to a listing (`ls -1b` /
       `find -print0` would end that; not done)
+    - `--export` lists `shared_prefs/` and `databases/` only when the data dir
+      holds them. One it does not hold is named in `absent` — the app has none,
+      a complete export at exit 0, and `databases.json` says `"absent": true` —
+      but only when that listing refused no entry: a refused entry may be the
+      directory, so the export is refused first (`presence_unknown`, exit 1,
+      nothing written).
+      One it holds whose own listing fails (unreadable, or gone since) is in
+      `unlisted` / `unlisted_dirs` with the device's reason; nothing is written
+      for it, and the export exits 1 naming what was written and where (a
+      failed listing used to read as an empty directory, at exit 0)
     - A failed or incomplete inspection is the shared refusal (`{"success":
       false, "error": ..., "remedy": ...}` under `--json`, carrying what was
       read; a run-as denial's hint is its remedy). No adb, a hang, or a device
       that is not there is adb's own error (exit 3 for the device), not "the
       command failed" at exit 1
+    - A run-as denial (debug-build remedy) is only a refusal run-as itself
+      printed: `run-as: …` on stderr at a non-zero exit. A path the device
+      refuses once run-as has run — `ls: <dir>: Permission denied`, a missing
+      file — is that path's failure, with an `adb shell run-as <pkg> ls -ld
+      <path>` check as its remedy
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
@@ -516,6 +540,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Failures in every mode are the shared refusal (`{"success": false,
       "error": ..., "remedy": ...}` under `--json`; a run-as denial's hint is
       its remedy)
+    - A run-as denial is decided as container.py decides it, in
+      common/run_as.py: only `run-as: …` on stderr at a non-zero exit. An
+      unreadable `databases/` (`ls: <dir>: Permission denied`) is the
+      directory's failure, with an `ls -ld` check as its remedy, not "install
+      a debug build"
     - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.

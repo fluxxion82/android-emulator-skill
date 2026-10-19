@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-17T08:54:16Z",
+  "recorded_at": "2026-10-19T01:03:36Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -738,6 +738,30 @@
       "bytes": 7
     },
     {
+      "name": "pm_path_absent",
+      "file": "pm_path_absent.txt",
+      "command": "adb shell pm path com.nonexistent.app",
+      "description": "`pm path` of a package that is not installed: nothing on either stream, and exit 1 -- the status is the whole answer, which is why the lane can send stdout to /dev/null.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 1,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "pm_path_installed",
+      "file": "pm_path_installed.txt",
+      "command": "adb shell pm path com.example.composefixture",
+      "description": "`pm path` of an installed package, the emulator lane's check that the fixture app is there before it runs: exit 0, `package:<apk path>` on stdout, stderr empty. The lane reads only the status.",
+      "catches": [],
+      "bytes": 106,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 106,
+      "stderr_bytes": 0
+    },
+    {
       "name": "ps_lifetime",
       "file": "ps_lifetime.txt",
       "command": "adb shell ps -o PID,NAME,ELAPSED -p $(pidof com.android.systemui)",
@@ -833,6 +857,28 @@
       "stderr_bytes": 0
     },
     {
+      "name": "run_as_ls_1_databases",
+      "file": "run_as_ls_1_databases.txt",
+      "command": "adb shell run-as com.example.composefixture ls -1 /data/data/com.example.composefixture/databases",
+      "description": "`ls -1` of databases/, as model_inspector's live mode lists it: one name per line, no `.`/`..`, and the zero-byte fixture.db-journal beside fixture.db -- not the -wal/-shm pair a hand-written listing had in its place.",
+      "catches": [],
+      "bytes": 30,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "run_as_ls_1_databases_unreadable",
+      "file": "run_as_ls_1_databases_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture ls -1 /data/data/com.example.composefixture/databases",
+      "description": "model_inspector's `ls -1` of databases/ with the owner's read bit taken off it (`chmod u-r`, `u+r` after; run_as_ls_databases_unreadable is the `ls -la` container.py runs): exit 1, stdout EMPTY, `ls: <path>: Permission denied` on stderr -- which matched the run-as denial marker 'permission denied' and was answered with the debug-build hint.",
+      "catches": [],
+      "bytes": 71,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 71
+    },
+    {
       "name": "run_as_ls_data_dir",
       "file": "run_as_ls_data_dir.txt",
       "command": "adb shell run-as com.example.composefixture ls -la",
@@ -841,12 +887,68 @@
       "bytes": 337
     },
     {
+      "name": "run_as_ls_data_dir_seeded",
+      "file": "run_as_ls_data_dir_seeded.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture",
+      "description": "The fixture app's data dir listed as container.py lists it (by its absolute path), after the app has run: shared_prefs/ and databases/ are in it. run_as_ls_data_dir was recorded before the app first ran and holds neither -- the listing of an app with no prefs and no databases, which --export reports as absent, not as a failure.",
+      "catches": [],
+      "bytes": 480,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
       "name": "run_as_ls_databases",
       "file": "run_as_ls_databases.txt",
       "command": "adb shell run-as com.example.composefixture ls -la databases",
       "description": "The databases directory. Carries the -journal file alongside the database, which anything listing databases has to not offer as a database.",
       "catches": [],
       "bytes": 252
+    },
+    {
+      "name": "run_as_ls_databases_unreadable",
+      "file": "run_as_ls_databases_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/databases",
+      "description": "run_as_ls_shared_prefs_unreadable for databases/ (`chmod u-r`, then `u+r`). Taking only the read bit leaves the directory searchable, so an open database is undisturbed. --export wrote this failure into databases.json and still reported success.",
+      "catches": [],
+      "bytes": 71,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 71
+    },
+    {
+      "name": "run_as_ls_shared_prefs",
+      "file": "run_as_ls_shared_prefs.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
+      "description": "`ls -la` of the fixture app's shared_prefs/, as --shared-prefs and --export list it: one prefs file, fixture_settings.xml (the file shared_prefs_settings_xml holds).",
+      "catches": [],
+      "bytes": 188,
+      "exit_status": 0,
+      "stream": "stdout"
+    },
+    {
+      "name": "run_as_ls_shared_prefs_absent",
+      "file": "run_as_ls_shared_prefs_absent.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
+      "description": "The same listing while shared_prefs/ is moved aside (renamed shared_prefs.aes_moved inside the data dir, and back after): exit 1, stdout EMPTY, `ls: <path>: No such file or directory` on stderr. --export took any failed sub-listing for an empty directory and reported success; a directory the data-dir listing names and this listing cannot find is a listing that failed.",
+      "catches": [],
+      "bytes": 82,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 82
+    },
+    {
+      "name": "run_as_ls_shared_prefs_unreadable",
+      "file": "run_as_ls_shared_prefs_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/shared_prefs",
+      "description": "The same listing with the owner's read bit taken off shared_prefs/ (`chmod u-r`, and `u+r` after; the app's uid is the owner, so the group's r does not apply): exit 1, stdout EMPTY, `ls: <path>: Permission denied` on stderr. The reviewer's reproduction of export reporting success with unread 0 over exactly this. Note the text matches container.py's run-as denial marker 'permission denied'.",
+      "catches": [],
+      "bytes": 74,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 74
     },
     {
       "name": "run_as_ls_symlink_space",
@@ -867,12 +969,36 @@
       "bytes": 57
     },
     {
+      "name": "run_as_not_an_application_stderr",
+      "file": "run_as_not_an_application_stderr.txt",
+      "command": "adb shell run-as com.android.settings ls",
+      "description": "run_as_not_an_application without its `2>&1`, so the manifest says where run-as puts a refusal: on STDERR, stdout empty, exit 1, one line starting `run-as: `. container.py now takes only such a line for a run-as denial. It used to scan every stream for markers, and `ls: <dir>: Permission denied` (run_as_ls_shared_prefs_unreadable) matched 'permission denied' and was given the debug-build hint.",
+      "catches": [],
+      "bytes": 57,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 57
+    },
+    {
       "name": "run_as_unknown_package",
       "file": "run_as_unknown_package.txt",
       "command": "adb shell run-as com.nonexistent.app ls 2>&1",
       "description": "run-as refused for a package that is not installed: 'run-as: unknown package: <pkg>'. This one the marker list does match, which is why the actionable hint appears here and not for run_as_not_an_application -- the contrast is the point.",
       "catches": [],
       "bytes": 42
+    },
+    {
+      "name": "run_as_unknown_package_stderr",
+      "file": "run_as_unknown_package_stderr.txt",
+      "command": "adb shell run-as com.nonexistent.app ls",
+      "description": "run_as_unknown_package without its `2>&1`: on STDERR, stdout empty, exit 1, `run-as: unknown package: <pkg>` (the package name aliased like any non-AOSP name).",
+      "catches": [],
+      "bytes": 42,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 45
     },
     {
       "name": "sdkmanager_java_list",
