@@ -163,6 +163,25 @@ def fake_popen(monkeypatch):
     return _install
 
 
+def _stopped_when_drained(proc: FakeProc, monitor: log_monitor.LogMonitor) -> None:
+    """The caller's stop (Ctrl-C) arrives once the stream's records are read.
+
+    A live read ends only when it is stopped -- one that ends by itself is a
+    refusal (wave 4) -- so a spec about what a capture counts stops it. The
+    interrupt terminates logcat, which ends the read before the loop sees the
+    flag: still a stop.
+    """
+    read = proc.read
+
+    def read_then_stop(size: int = -1) -> bytes:
+        chunk = read(size)
+        if not chunk:
+            monitor.interrupted = True
+        return chunk
+
+    proc.read = read_then_stop
+
+
 # ---------------------------------------------------------------------------
 # A1 — the requested format must be one the parser understands.
 # ---------------------------------------------------------------------------
@@ -183,9 +202,10 @@ def test_command_requests_records_and_the_parser_reads_how_they_print(recorded):
 
 def test_severity_counts_reflect_real_output(fake_popen, recorded):
     """The whole point of the tool: real logs must produce real counts."""
-    fake_popen(_real_records(recorded))
+    proc = fake_popen(_real_records(recorded))
 
     monitor = log_monitor.LogMonitor()
+    _stopped_when_drained(proc, monitor)
     monitor.stream_logs()
     counted = monitor.error_count + monitor.warning_count + monitor.info_count
     assert counted > 0, "streamed real device output and classified nothing"
@@ -228,7 +248,9 @@ def test_never_waits_on_a_streaming_process_without_a_timeout(fake_popen, record
     """`.wait()` with no timeout on a live logcat is the A2 hang itself."""
     proc = fake_popen(_real_records(recorded, limit=3))
 
-    log_monitor.LogMonitor().stream_logs()
+    monitor = log_monitor.LogMonitor()
+    _stopped_when_drained(proc, monitor)
+    monitor.stream_logs()
 
     assert not proc.waited_without_timeout, (
         "called wait() with no timeout on a streaming process; if the stream "
@@ -249,8 +271,9 @@ def test_adb_errors_are_not_counted_as_device_log_lines(fake_popen, recorded):
     captured log line. Draining stderr separately keeps the two apart.
     """
     records = _real_records(recorded, limit=3)
-    fake_popen(records, stderr_text=recorded.text("adb_shell_device_not_found"))
+    proc = fake_popen(records, stderr_text=recorded.text("adb_shell_device_not_found"))
     monitor = log_monitor.LogMonitor()
+    _stopped_when_drained(proc, monitor)
     monitor.stream_logs()
 
     assert monitor.total_lines == _shown(records), (
@@ -327,9 +350,33 @@ def test_a_read_we_stopped_inside_a_record_loses_it_and_says_so(fake_popen, reco
 
 
 def test_successful_logcat_is_reported_as_success(fake_popen, recorded):
-    """Guard against over-correcting into always-False."""
-    fake_popen(_real_records(recorded, limit=3), returncode=0)
-    assert log_monitor.LogMonitor().stream_logs() is True
+    """Guard against over-correcting into always-False: a read the caller stopped."""
+    proc = fake_popen(_real_records(recorded, limit=3), returncode=0)
+    monitor = log_monitor.LogMonitor()
+    _stopped_when_drained(proc, monitor)
+    assert monitor.stream_logs() is True
+
+
+def test_a_live_read_that_ends_by_itself_is_refused_with_what_it_read(
+    fake_popen, attached, recorded
+):
+    """Nobody stopped it and adb exited 0, the device still there: a refusal, not the capture.
+
+    It returned True with a note on stderr. A live read ends only when it is
+    stopped, so an end of its own cannot show the observation asked for was
+    made (wave 4's rule): the device is asked again, and -- still there --
+    the read is refused, with what it read under ``partial``.
+    """
+    records = _real_records(recorded, limit=3)
+    fake_popen(records, returncode=0)
+    monitor = log_monitor.LogMonitor()
+    with pytest.raises(cli.Failure) as raised:
+        monitor.stream_logs()
+
+    assert "ended the live read by itself (exit status 0)" in str(raised.value)
+    assert f"It had read {_shown(records)} line(s)" in str(raised.value)
+    assert raised.value.details["partial"]["statistics"]["total_lines"] == _shown(records)
+    assert [cmd[-1] for cmd in attached] == ["get-state", "get-state"]
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +418,8 @@ def test_unknown_serial_fails_before_streaming(monkeypatch, recorded):
 
 def test_known_serial_proceeds(fake_popen, recorded):
     """Guard against the check rejecting a device that is present."""
-    fake_popen(_real_records(recorded, limit=3))
+    proc = fake_popen(_real_records(recorded, limit=3))
 
     monitor = log_monitor.LogMonitor(device_serial="emulator-5554")
+    _stopped_when_drained(proc, monitor)
     assert monitor.stream_logs() is True

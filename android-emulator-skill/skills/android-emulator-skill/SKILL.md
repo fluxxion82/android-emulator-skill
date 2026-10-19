@@ -267,6 +267,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       (A streaming `adb logcat` aimed at a device that is not attached waits
       instead of failing, so `--duration` used to report it as zero lines.)
       Unavailable is exit 3, as everywhere else
+    - A live read (`--follow`, `--duration`) ends only when it is stopped: by
+      its `--duration`, or an interrupt, and either is the capture. One that
+      ends by itself -- whatever adb's exit status, cut or not -- cannot show
+      it observed what was asked: exit 3 when the device went, otherwise a
+      refusal (exit 1) that keeps what it read, its line count in the error
+      and its JSON summary under `partial` (`--json`). It used to be the
+      capture, with a note on stderr
     - A `--last` dump has a deadline of its own: twice `ANDROID_EMU_ADB_TIMEOUT`
       (60 s by default). A dump that has not ended by then -- a device lost after
       the first question (`logcat -d` waits for it too), a stream that stalls
@@ -1110,8 +1117,8 @@ recorded fixture, and was red before the fix.
   which no tag can forge. Jank is keyed by process, and a pid is named only
   from system_server's own `Start proc` record for it, seen in the same stream.
   `--diff` says "inconclusive" when it could not compare sessions, and never
-  emits `Infinity`. The live readers no longer lose lines or swallow adb's
-  exit status.
+  emits `Infinity`. The live readers no longer swallow adb's exit status:
+  losses are disclosed, and a stream that ends unexpectedly is a refusal.
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
   now read through `adb shell -T` and refuse an adb client too old to honour

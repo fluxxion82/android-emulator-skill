@@ -349,6 +349,12 @@ def test_a_bad_duration_never_reaches_the_device(monkeypatch):
 PACKAGE = "com.example.composefixture"
 RECORDS = "logcat_app_restart_records"
 
+# A live read of a device that `follows` (fake_toolchain): it replays what it is
+# given and then waits, as a device's does, so the read ends when --duration
+# stops it. A live read that ends by itself is a refusal (wave 4's rule), so
+# the stub's end is no longer the reader's.
+LIVE = ("--duration", "2s")
+
 # The threadtime layout, read for its PRIORITY and PID columns only -- what
 # log_monitor prints a record as (common.logcat.LogRecord.lines).
 _THREADTIME = re.compile(r"^\d{2}-\d{2}\s+\S+\s+(?P<pid>\d+)\s+\d+\s+(?P<priority>[VDIWEF])\s")
@@ -374,6 +380,7 @@ def _device(
     system_server: str | None = None,
     uids: bool = True,
     buffered: bytes = b"",
+    follows: bool = True,
 ) -> None:
     """A device that is attached, answers ``pidof`` as told, and replays ``window``.
 
@@ -389,6 +396,10 @@ def _device(
     ``pidof`` answer like any other. With ``uids``, the package's uid and the
     ``pidof`` pid's uid are the recorded package uid (fake_toolchain.uid_rules);
     without, those questions get no answer.
+
+    A live read ``follows``: the device replays ``window`` and then waits until
+    the read is stopped, as a device's does. ``follows=False`` is a live read
+    that adb ends by itself, which is a refusal.
     """
     rules = [
         Rule(("devices",), stdout=recorded.text("adb_devices_single")),
@@ -401,7 +412,9 @@ def _device(
         rules += uid_rules(recorded, PACKAGE, answered if answered.isdigit() else None)
     if pidof is not None:
         rules.append(pidof)
-    rules.append(Rule(("logcat",), stdout=window, buffered=buffered, filter_pid=True))
+    rules.append(
+        Rule(("logcat",), stdout=window, buffered=buffered, filter_pid=True, follows=follows)
+    )
     toolchain.install("adb", rules)
 
 
@@ -793,13 +806,12 @@ def test_d4_a_process_already_running_when_the_window_opened_is_kept_whole(toolc
 def _historical_and_live(toolchain, *app_args: str) -> tuple[dict, dict]:
     """The same device read with ``--last`` and with a live ``--duration``.
 
-    The stub's logcat prints its recording and exits, so the live read ends at
-    the end of the recording -- the same records a historical read sees. (A
-    live read that ends by itself asks ``get-state`` again; the device still
-    answers ``device``, so what it read is the capture.)
+    The device's live read replays its recording and then waits, as a
+    device's does (``follows``), until --duration stops it: the same records a
+    historical read sees. (A live read that ended by itself would be a refusal.)
     """
     runs = []
-    for window in (("--last", "5m"), ("--duration", "30s")):
+    for window in (("--last", "5m"), LIVE):
         result = toolchain.run(
             "log_monitor.py", *app_args, *window, "--json", ANDROID_EMU_LOG_TAIL="1000"
         )
@@ -913,8 +925,7 @@ def test_d4_the_live_hold_is_bounded(toolchain, recorded):
         PACKAGE,
         "--severity",
         "verbose",
-        "--duration",
-        "30s",
+        *LIVE,
         "--json",
         ANDROID_EMU_LOG_TAIL="1000",
         ANDROID_EMU_LOG_PENDING_CAP="5",
@@ -1011,7 +1022,7 @@ def _split_after_start(window: list[Frame], pid: str) -> tuple[bytes, bytes]:
 
 
 @pytest.mark.parametrize("ending", [STOPPED, ALIVE], ids=["stopped", "running"])
-@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "30s")], ids=["last", "live"])
+@pytest.mark.parametrize("read", [("--last", "5m"), LIVE], ids=["last", "live"])
 def test_d4_a_reused_pid_is_the_apps_only_inside_its_life(read, ending, toolchain, recorded):
     """One pid, first another process's, then the app's: only the app's life counts.
 
@@ -1083,7 +1094,7 @@ def test_d4_a_live_read_stores_lines_in_input_order(toolchain, tmp_path, recorde
         system_server=_system_server(recorded),
     )
     saved = {}
-    for name, read in (("last", ("--last", "5m")), ("live", ("--duration", "30s"))):
+    for name, read in (("last", ("--last", "5m")), ("live", LIVE)):
         out = tmp_path / name
         result = toolchain.run(
             "log_monitor.py", "--app", PACKAGE, *read, "--output", str(out), "--json"
@@ -1109,7 +1120,9 @@ def test_d4_follow_marks_a_held_line_when_it_prints_it(toolchain, recorded):
         pidof=Rule(("shell", "pidof"), stdout=pids[ALIVE]),
         system_server=_system_server(recorded),
     )
-    result = toolchain.run("log_monitor.py", "--app", PACKAGE, "--follow")
+    # --follow runs until Ctrl-C: the device follows, so the interrupt ends it --
+    # late enough that the script has started and read what the device replays.
+    result = toolchain.run("log_monitor.py", "--app", PACKAGE, "--follow", interrupt_after=4)
     assert result.returncode == 0, result.stderr
     marked = [line for line in result.stdout.splitlines() if line.startswith("[held back] ")]
     unmarked = [line for line in result.stdout.splitlines() if not line.startswith("[held back] ")]
@@ -1123,8 +1136,7 @@ def test_d4_a_live_capture_follows_the_app_through_its_restarts(toolchain, recor
 
     Each start is announced before the new process's first record
     (recorded), so a live read learns every pid in time. ``pidof`` answers as
-    recorded for an app that is not running; the stub's logcat then exits,
-    ending the read.
+    recorded for an app that is not running; the read ends at its --duration.
     """
     pids = _restart_pids(recorded)
     window = recorded.data(f"{RECORDS}.bin")
@@ -1140,8 +1152,7 @@ def test_d4_a_live_capture_follows_the_app_through_its_restarts(toolchain, recor
         "log_monitor.py",
         "--app",
         PACKAGE,
-        "--duration",
-        "30s",
+        *LIVE,
         "--json",
         ANDROID_EMU_LOG_TAIL="1000",
     )
@@ -1158,7 +1169,9 @@ def test_d4_follow_prints_only_the_apps_lines(toolchain, recorded):
         pidof=_not_running(recorded),
         system_server=_system_server(recorded),
     )
-    result = toolchain.run("log_monitor.py", "--app", PACKAGE, "--follow")
+    # --follow runs until Ctrl-C: the device follows, so the interrupt ends it --
+    # late enough that the script has started and read what the device replays.
+    result = toolchain.run("log_monitor.py", "--app", PACKAGE, "--follow", interrupt_after=4)
     assert result.returncode == 0, result.stderr
     printed = set(_column(result.stdout.splitlines(), "pid"))
     assert printed and printed <= pids, printed
@@ -1279,7 +1292,7 @@ def test_d4_the_floor_still_reads_the_records_that_name_the_apps_processes(toolc
 # --- A3: a window that leaves the app's lines out says so -----------------------
 
 
-@pytest.mark.parametrize("read", [("--last", "5m"), ("--duration", "30s")], ids=["last", "live"])
+@pytest.mark.parametrize("read", [("--last", "5m"), LIVE], ids=["last", "live"])
 def test_a3_a_crash_whose_start_predates_the_window_is_reported(read, toolchain, recorded):
     """The crash is left out -- and the result says so, with how much.
 
@@ -1423,15 +1436,47 @@ def test_a4_a_live_read_that_ends_by_itself_asks_whether_the_device_went(
     ]
 
 
-def test_a4_a_live_read_that_ends_while_the_device_is_still_there_is_the_capture(
-    toolchain, recorded
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a4_a_live_read_that_ends_by_itself_with_the_device_there_is_refused(
+    json_mode, toolchain, recorded
 ):
-    """The control: asked again, the device answers -- what was read stands, and is said."""
-    _device(toolchain, recorded, recorded.data(f"{RECORDS}.bin"))
-    result = toolchain.run("log_monitor.py", "--duration", "30s", "--json")
+    """A live read ends only when it is stopped, so an end of its own proves nothing.
+
+    The stub's logcat prints the recorded records and exits 0 before the
+    --duration (``follows=False``); asked again, the device answers. That was
+    the capture -- exit 0, a note on stderr -- but a stream that ends
+    unexpectedly cannot show the observation asked for was made (wave 4's
+    rule, which anr_watcher --watch follows): a refusal, exit 1. What it read
+    is kept: the JSON summary under ``partial``, its count in the error.
+    """
+    window = recorded.data(f"{RECORDS}.bin")
+    _device(toolchain, recorded, window, follows=False)
+    argv = ["--duration", "30s"] + (["--json"] if json_mode else [])
+    result = toolchain.run("log_monitor.py", *argv)
+
+    read = len(_lines(window))
+    refusal = assert_refusal(
+        result, json_mode=json_mode, naming=("ended the live read by itself",), status=1
+    )
+    assert [call[-1] for call in toolchain.calls("adb") if "get-state" in call] == [
+        "get-state",
+        "get-state",
+    ], "the device was not asked again when the read ended"
+    if json_mode:
+        assert refusal["partial"]["statistics"]["total_lines"] == read
+        assert refusal["partial"]["sample_logs"] == _lines(window)[-50:]
+    else:
+        assert f"It had read {read} line(s)" in result.stderr
+
+
+def test_a4_a_live_read_stopped_by_its_duration_is_the_capture(toolchain, recorded):
+    """The control: the same records, the read stopped by --duration -- exit 0, all counted."""
+    window = recorded.data(f"{RECORDS}.bin")
+    _device(toolchain, recorded, window)
+    result = toolchain.run("log_monitor.py", *LIVE, "--json")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["statistics"]["total_lines"] > 0
-    assert "ended by itself" in result.stderr
+    assert json.loads(result.stdout)["statistics"]["total_lines"] == len(_lines(window))
+    assert "ended" not in result.stderr
 
 
 # --- a stream cut inside a record is not a complete capture (review of PR #35) ---
@@ -1463,7 +1508,7 @@ def test_a_live_read_cut_by_itself_with_the_device_gone_is_exit_three(toolchain,
 
 def test_a_live_read_cut_by_itself_with_the_device_there_is_refused(toolchain, recorded):
     window = recorded.data("logcat_crash_buffer_records.bin")
-    _device(toolchain, recorded, window[:-1])
+    _device(toolchain, recorded, window[:-1], follows=False)
     result = toolchain.run("log_monitor.py", "--app", PACKAGE, "--duration", "30s")
     assert_refusal(result, json_mode=False, naming=("inside a record",), status=1)
 
