@@ -290,8 +290,8 @@ def test_a_forged_name_is_the_files_failure_in_both_inspectors(tmp_path, recorde
 
 # Listing a directory, per inspector -- the command the refusal answers.
 LISTINGS = {
-    "container": (("container.py", "--shared-prefs"), ("ls", "-la")),
-    "model_inspector": (("model_inspector.py",), ("ls", "-la")),
+    "container": (("container.py", "--shared-prefs"), ("find", "-printf")),
+    "model_inspector": (("model_inspector.py",), ("find", "-printf")),
 }
 
 

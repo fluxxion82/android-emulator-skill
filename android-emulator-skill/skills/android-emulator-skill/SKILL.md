@@ -63,8 +63,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    SDK-root PATH and raises `PermissionError`), **run_as.py** (reads a
    debuggable app's files with `adb shell -T run-as`, never `exec-out`, which
    answers a missing file with its error text as the bytes; checks the adb
-   client honours `-T` first; decides what a run-as refusal is, and parses an
-   `ls -la` listing, for both inspectors), **env_config.py**, **anr_pipeline.py**,
+   client honours `-T` first; decides what a run-as refusal is, and lists a
+   directory as toybox find's NUL-terminated records, for both inspectors),
+   **env_config.py**, **anr_pipeline.py**,
    **anr_sessions.py**, **log_lifecycle.py** (system_server's process
    sentences — `Start proc` / `Killing` / `has died` — authenticated one way for
    `log_monitor --app` and the ANR session worker alike).
@@ -554,13 +555,19 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 29. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
     - List/read files, dump `shared_prefs` XML, list databases and dump SQLite schema (Room == SQLite), export a snapshot
-    - File names come from the app, so they are untrusted. A listing is read as
-      bytes, so a CR stays in its name rather than becoming a line break. Every
-      line of it is an entry, refused, or one of three skips — a blank line,
-      `total N`, and the directory's own `.`/`..`. Refused: a line that is not
-      UTF-8, an unknown mode (`??????????`) or any other line that is not
-      toybox's layout, a name that is not a plain file name (`/`, `\`, NUL, CR,
-      LF), and a symlink target holding a CR or NUL. A refused entry is counted
+    - File names come from the app, so they are untrusted. A directory is
+      listed with `find -H <dir> -maxdepth 1 -printf` (toybox; measured on
+      0.8.11, Android 15): six NUL-terminated fields per entry — mode, owner,
+      group, size, symlink target, name — read as bytes. NUL is the one byte a
+      name cannot hold, so a name holding a newline, a CR or a whole forged
+      line is one name: it can no longer add or hide an entry, as it could
+      through `ls -la`. The directory's own record comes first, so a path that
+      is a file is refused as not a directory, and an answer that is not whole
+      records (empty, cut short, or another tool's) is refused whole — never
+      read as an empty directory, never retried with `ls`. Refused per entry: a
+      name that is not UTF-8 or not a plain file name (`/`, `\`, NUL, CR, LF,
+      `.`/`..`), a field find does not print, and a symlink target that is
+      empty, not UTF-8, or holds a LF, CR or NUL. A refused entry is counted
       in `rejected` and named, escaped, in `rejected_entries` (`--verbose`
       prints them), and the answer exits 1 with what could be read still shown
       — all refused is never "No shared_prefs found"
@@ -573,9 +580,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       of a missing file exits 1 (over `exec-out` it answered with the error text
       as the content). `--export` counts a listed file it could not read in
       `unread` / `unread_entries` and exits 1, and refuses (exit 1, nothing
-      written) a name that would land outside the snapshot. A name holding a
-      real newline can still add a plain-named entry to a listing (`ls -1b` /
-      `find -print0` would end that; not done)
+      written) a name that would land outside the snapshot
     - `--export` lists `shared_prefs/` and `databases/` only when the data dir
       holds them. One it does not hold is named in `absent` — the app has none,
       a complete export at exit 0, and `databases.json` says `"absent": true` —
@@ -597,11 +602,15 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       debuggable: <pkg>`, `package not an application`, `unknown package`; all
       recorded), and one bounded `run-as <pkg> id` (which names no file) does
       not run as the app. A device error during that probe is the device's
-      (exit 3). A path the device refuses once run-as has run — `ls: <dir>:
+      (exit 3). A path the device refuses once run-as has run — `find: <dir>:
       Permission denied`, a missing file, a file whose name holds a newline
       and a `run-as: …` line of its own — is that path's failure, with an
-      `adb shell run-as <pkg> ls -ld <path>` check as its remedy. An older
-      release's refusal wording is not recorded, and reads as that failure
+      `adb shell run-as <pkg> ls -ld <path>` check as its remedy. A listing
+      find refuses without naming a path (`find: bad arg …`, `find: bad
+      -printf …`, as this toybox answers an option or escape it lacks) is
+      find's failure, not the directory's: its remedy says the device's find
+      cannot list this way. An older toybox is not measured. An older
+      release's refusal wording is not recorded, and reads as the failure
     - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
@@ -618,18 +627,17 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       the device prints for THIS package (`run-as: package not debuggable:
       <pkg>`, `package not an application`, `unknown package`; all recorded),
       and one bounded `run-as <pkg> id` must not run as the app. An unreadable
-      `databases/` (`ls: <dir>: Permission denied`), or a database whose name
+      `databases/` (`find: <dir>: Permission denied`), or a database whose name
       holds a newline or CR and a `run-as: …` line, is that path's failure,
       with an `ls -ld` check as its remedy, not "install a debug build"
-    - LIVE lists `databases/` with `ls -la` read as bytes and parsed as
-      container.py parses a listing (common/run_as.py), where it was `ls -1`
-      in text mode: a CR in a name became a line break, and `x\ry.db` was
-      listed as two databases, `x` and `y.db`, at exit 0. A name that is not
-      a plain file name or not UTF-8 is refused and named in
+    - LIVE lists `databases/` as container.py lists a directory
+      (common/run_as.py: toybox find, NUL-terminated fields, read as bytes).
+      It was `ls -1` in text mode, where `x\ry.db` was two databases, `x` and
+      `y.db`, at exit 0; then `ls -la` split on newlines, where `fixture.db` +
+      LF + a whole `ls -la` line listed `ghost.db`, a database the app does
+      not have, at exit 0. Either name is now one name, refused and named in
       `rejected_entries`, and the listing exits 1 with what it read
-      (`databases (0, 1 refused)`, never "No databases found"). As in
-      container.py, a name holding a real newline can still add a whole
-      plain-named entry after it (`ls -b` would end that; not done)
+      (`databases (0, 1 refused)`, never "No databases found")
     - Options: `--source DIR`, `--schema PATH`, `--show-versions`, `--raw NAME`, `--package`, `--db NAME`, `--serial`, `--json`, `--verbose`
 
 31. **anr_watcher.py** ⭐ NEW - Record & summarise Android ANRs/jank from logcat (Choreographer skipped-frames + ActivityManager ANRs) with session-based progressive disclosure.
@@ -1201,9 +1209,10 @@ recorded fixture, and was red before the fix.
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
   now read through `adb shell -T` and refuse an adb client too old to honour
-  it. Device file names are treated as untrusted input: unsafe, undecodable or
-  CR-carrying names are refused and reported, and exports stay inside their
-  directory.
+  it. Device file names are treated as untrusted input: directories are
+  listed as NUL-terminated records (toybox find), so a name holding a newline
+  cannot forge or hide an entry; unsafe, undecodable or CR/LF-carrying names
+  are refused and reported, and exports stay inside their directory.
 - **The required emulator lane can no longer pass without testing.** It fails
   on any skip, exits 3 with diagnostics when the device is lost, retries only
   that case once, and counts the retry in the step summary.

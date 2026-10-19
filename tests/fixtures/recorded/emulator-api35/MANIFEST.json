@@ -1,6 +1,6 @@
 {
   "profile": "emulator-api35",
-  "recorded_at": "2026-10-19T04:43:52Z",
+  "recorded_at": "2026-10-19T06:31:37Z",
   "recorded_on": "macOS-26.6.2-arm64-arm-64bit",
   "device": {
     "model": "sdk_gphone16k_arm64",
@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 1,
+  "redacted_package_count": 0,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths.",
   "fixtures": [
     {
@@ -1106,6 +1106,183 @@
       "stderr_bytes": 0
     },
     {
+      "name": "run_as_find_data_dir",
+      "file": "run_as_find_data_dir.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The fixture app's data dir as container.py --ls and --export list it, after the app has run: shared_prefs/ and databases/ are in it, and cache/ and code_cache/ have a group (u0_aNNN_cache) that is not their owner.",
+      "catches": [],
+      "bytes": 257,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 257,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_data_dir_bare",
+      "file": "run_as_find_data_dir_bare.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The data-dir listing with shared_prefs/ AND databases/ moved aside (renamed <dir>.aes_moved, the app force-stopped first, and both moved back after): a real listing that names neither directory -- what --export reads for an app with no prefs and no databases, and reports as absent, not as a failure.",
+      "catches": [],
+      "bytes": 277,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 277,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_databases",
+      "file": "run_as_find_databases.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/databases -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The fixture app's databases/ as container.py --databases and model_inspector's live mode list it: toybox find, six NUL-terminated fields per record (mode, owner, group, size, symlink target, name), the directory's own record first with an EMPTY name, then fixture.db and the zero-byte fixture.db-journal in directory order. Exit 0, stderr empty.",
+      "catches": [],
+      "bytes": 128,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 128,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_databases_unreadable",
+      "file": "run_as_find_databases_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/databases -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "run_as_find_shared_prefs_unreadable for databases/ (`chmod u-r`, `u+r` after; the directory stays searchable, so an open database is undisturbed): exit 1, the directory's own record on stdout, `find: <path>: Permission denied` on stderr (run_as_find_databases_unreadable_stderr, same run).",
+      "catches": [],
+      "bytes": 34,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 34,
+      "stderr_bytes": 73
+    },
+    {
+      "name": "run_as_find_databases_unreadable_stderr",
+      "file": "run_as_find_databases_unreadable_stderr.txt",
+      "command": "recorded in run_as_find_databases_unreadable's run: its stderr",
+      "description": "The stderr of run_as_find_databases_unreadable's one run, byte for byte.",
+      "catches": [],
+      "bytes": 73,
+      "first_half": "run_as_find_databases_unreadable",
+      "exit_status": 1,
+      "stream": "stderr"
+    },
+    {
+      "name": "run_as_find_names",
+      "file": "run_as_find_names.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/files/aes_names -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The listing of a scratch directory in the fixture app's files/ (made for the purpose, removed after) holding the names a listing must keep whole: `x.db` + LF + a complete `ls -la` line for ghost.db, `c\\d.db`, `e f.db`, `link -> e f.db`, `lflink` whose target holds a LF, `sub/` and `dirlink -> sub`. Each is ONE record here, its name the last of six NUL-terminated fields; the forged line is inside x.db's name, and no record names ghost.db. Compare run_as_ls_names, the same directory through `ls -la`.",
+      "catches": [],
+      "bytes": 376,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 376,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_names_dirlink",
+      "file": "run_as_find_names_dirlink.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/files/aes_names/dirlink -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The listing aimed at run_as_find_names's `dirlink`, a symlink to its `sub/` (which holds `inner`): find's -H follows the named path, so the first record is the directory's own -- mode d, its %l still the link's target `sub` -- and `inner` follows, as `ls sub` would list. Without -H find printed the link's record alone (mode l), which would read as not a directory.",
+      "catches": [],
+      "bytes": 73,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 73,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_not_a_directory",
+      "file": "run_as_find_not_a_directory.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/shared_prefs/fixture_settings.xml -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The listing aimed at a FILE (the fixture app's prefs file): exit 0, stderr empty, and one record -- the file's own, mode `-rw-...`, empty name. Without that record's mode to check, a listing of a file reads as an empty directory.",
+      "catches": [],
+      "bytes": 33,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 33,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_shared_prefs",
+      "file": "run_as_find_shared_prefs.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/shared_prefs -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "shared_prefs/ as --shared-prefs and --export list it: the directory's own record and fixture_settings.xml (the file shared_prefs_settings_xml holds).",
+      "catches": [],
+      "bytes": 87,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 87,
+      "stderr_bytes": 0
+    },
+    {
+      "name": "run_as_find_shared_prefs_absent",
+      "file": "run_as_find_shared_prefs_absent.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/shared_prefs -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The shared_prefs/ listing while the directory is moved aside (renamed shared_prefs.aes_moved, and back after): exit 1, stdout EMPTY, and on stderr `find: '<path>': No such file or directory` -- the path in single quotes, which ls never printed. The first line names the path the listing named.",
+      "catches": [],
+      "bytes": 86,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 86
+    },
+    {
+      "name": "run_as_find_shared_prefs_unreadable",
+      "file": "run_as_find_shared_prefs_unreadable.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/shared_prefs -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The shared_prefs/ listing with the owner's read bit taken off it (`chmod u-r`, `u+r` after): exit 1, and find prints on BOTH streams -- the directory's own record on stdout (it could stat it), then `find: <path>: Permission denied`, unquoted, on stderr (run_as_find_shared_prefs_unreadable_stderr, same run).",
+      "catches": [],
+      "bytes": 34,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 34,
+      "stderr_bytes": 76
+    },
+    {
+      "name": "run_as_find_shared_prefs_unreadable_stderr",
+      "file": "run_as_find_shared_prefs_unreadable_stderr.txt",
+      "command": "recorded in run_as_find_shared_prefs_unreadable's run: its stderr",
+      "description": "The stderr of run_as_find_shared_prefs_unreadable's one run, byte for byte.",
+      "catches": [],
+      "bytes": 76,
+      "first_half": "run_as_find_shared_prefs_unreadable",
+      "exit_status": 1,
+      "stream": "stderr"
+    },
+    {
+      "name": "run_as_find_unknown_escape",
+      "file": "run_as_find_unknown_escape.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/databases -maxdepth 1 -printf '%M\\0%u\\0%g\\0%s\\0%l\\0%Q\\0'",
+      "description": "The listing with its last escape, %P, replaced by %Q, which this find does not have -- the stand-in for a find lacking one of the six. find checks an escape only when it reaches it: exit 1, the directory's own record printed up to the bad escape (five fields) on stdout, then `find: bad -printf %Q` on stderr (run_as_find_unknown_escape_stderr, same run).",
+      "catches": [],
+      "bytes": 33,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 33,
+      "stderr_bytes": 21
+    },
+    {
+      "name": "run_as_find_unknown_escape_stderr",
+      "file": "run_as_find_unknown_escape_stderr.txt",
+      "command": "recorded in run_as_find_unknown_escape's run: its stderr",
+      "description": "The stderr of run_as_find_unknown_escape's one run, byte for byte.",
+      "catches": [],
+      "bytes": 21,
+      "first_half": "run_as_find_unknown_escape",
+      "exit_status": 1,
+      "stream": "stderr"
+    },
+    {
+      "name": "run_as_find_unknown_primary",
+      "file": "run_as_find_unknown_primary.txt",
+      "command": "adb shell run-as com.example.composefixture find -H /data/data/com.example.composefixture/databases -maxdepth 1 -printfx '%M\\0%u\\0%g\\0%s\\0%l\\0%P\\0'",
+      "description": "The listing with `-printf` replaced by `-printfx`, a primary this find does not know -- the nearest measurable stand-in for a toybox without -printf: exit 1, stdout EMPTY, `find: bad arg '<format>'` on stderr. It names no path; an older toybox's own wording is not measured.",
+      "catches": [],
+      "bytes": 41,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 41
+    },
+    {
       "name": "run_as_id",
       "file": "run_as_id.txt",
       "command": "adb shell -T run-as com.example.composefixture id",
@@ -1212,6 +1389,18 @@
       "stream": "stderr",
       "stdout_bytes": 0,
       "stderr_bytes": 71
+    },
+    {
+      "name": "run_as_ls_names",
+      "file": "run_as_ls_names.txt",
+      "command": "adb shell run-as com.example.composefixture ls -la /data/data/com.example.composefixture/files/aes_names",
+      "description": "run_as_find_names's directory through `ls -la`, what both inspectors listed with until it was replaced: x.db's name prints as two lines, and the second is a complete, well-formed entry for ghost.db, a file that does not exist -- the forgery the final review of v0.8.0 reproduced (REQUIRED 4). lflink's target prints as two lines too.",
+      "catches": [],
+      "bytes": 613,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 613,
+      "stderr_bytes": 0
     },
     {
       "name": "run_as_ls_shared_prefs",
