@@ -14,6 +14,7 @@ Timeouts are tunable via the ANDROID_EMU_ prefix:
 """
 
 import contextlib
+import re
 import subprocess
 from pathlib import Path
 
@@ -35,6 +36,136 @@ RERUN_UNSUPPORTED = "Unknown command-line option '--rerun'"
 
 BUILD_TIMEOUT = env_int("ANDROID_EMU_BUILD_TIMEOUT", 1800)
 TEST_TIMEOUT = env_int("ANDROID_EMU_TEST_TIMEOUT", 2700)
+
+_PROJECT_DIR_ASSIGNMENT = re.compile(
+    r"^\s*project\s*\(\s*(?P<module_quote>['\"])(?P<module>:[^'\"]+)"
+    r"(?P=module_quote)\s*\)\s*\.projectDir\s*=\s*(?:file|File)\s*\(\s*"
+    r"(?P<path_quote>['\"])(?P<path>[^'\"]+)(?P=path_quote)\s*\)\s*;?\s*(?://.*)?$",
+    re.VERBOSE,
+)
+_PROJECT_DIR_ASSIGNMENT_TARGET = re.compile(
+    r"project\s*\(\s*(?P<module_quote>['\"])(?P<module>:[^'\"]+)"
+    r"(?P=module_quote)\s*\)\s*\.projectDir\s*=",
+    re.VERBOSE,
+)
+_IF_CONDITION = re.compile(r"\bif\s*\(")
+
+
+def _strip_gradle_comments(source: str) -> str:
+    """Replace Gradle line/block comments with spaces while preserving strings and lines."""
+    stripped = list(source)
+    index = 0
+    quote = ""
+
+    while index < len(source):
+        if quote:
+            if source.startswith(quote, index):
+                index += len(quote)
+                quote = ""
+            elif len(quote) == 1 and source[index] == "\\":
+                index += min(2, len(source) - index)
+            else:
+                index += 1
+            continue
+
+        if source.startswith("//", index):
+            end = source.find("\n", index)
+            end = len(source) if end == -1 else end
+            for position in range(index, end):
+                stripped[position] = " "
+            index = end
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            end = len(source) if end == -1 else end + 2
+            for position in range(index, end):
+                if source[position] not in "\r\n":
+                    stripped[position] = " "
+            index = end
+        elif source.startswith(("'''", '"""'), index):
+            quote = source[index : index + 3]
+            index += 3
+        elif source[index] in "'\"":
+            quote = source[index]
+            index += 1
+        else:
+            index += 1
+
+    return "".join(stripped)
+
+
+def _mask_gradle_strings(source: str) -> str:
+    """Mask quoted strings so structural braces and keywords can be scanned safely."""
+    masked = list(source)
+    index = 0
+    quote = ""
+
+    while index < len(source):
+        if quote:
+            if source.startswith(quote, index):
+                for position in range(index, index + len(quote)):
+                    masked[position] = " "
+                index += len(quote)
+                quote = ""
+            elif len(quote) == 1 and source[index] == "\\":
+                masked[index] = " "
+                index += 1
+                if index < len(source):
+                    if source[index] not in "\r\n":
+                        masked[index] = " "
+                    index += 1
+            else:
+                if source[index] not in "\r\n":
+                    masked[index] = " "
+                index += 1
+            continue
+
+        if source.startswith(("'''", '"""'), index):
+            quote = source[index : index + 3]
+            for position in range(index, index + 3):
+                masked[position] = " "
+            index += 3
+        elif source[index] in "'\"":
+            quote = source[index]
+            masked[index] = " "
+            index += 1
+        else:
+            index += 1
+
+    return "".join(masked)
+
+
+def _conditional_block_ranges(structure: str) -> list[tuple[int, int]]:
+    """Return source ranges enclosed by an ``if (...) { ... }`` block."""
+    conditional_braces: set[int] = set()
+    for match in _IF_CONDITION.finditer(structure):
+        position = match.end() - 1
+        depth = 0
+        while position < len(structure):
+            char = structure[position]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    position += 1
+                    while position < len(structure) and structure[position].isspace():
+                        position += 1
+                    if position < len(structure) and structure[position] == "{":
+                        conditional_braces.add(position)
+                    break
+            position += 1
+
+    stack: list[int] = []
+    ranges: list[tuple[int, int]] = []
+    for position, char in enumerate(structure):
+        if char == "{":
+            stack.append(position)
+        elif char == "}" and stack:
+            opening = stack.pop()
+            if opening in conditional_braces:
+                ranges.append((opening, position))
+    ranges.extend((opening, len(structure)) for opening in stack if opening in conditional_braces)
+    return ranges
 
 
 class BuildResult:
@@ -226,14 +357,75 @@ class BuildRunner:
                     f"invalid Gradle module path: {self.module}",
                     "Pass a colon-separated Gradle project path such as :app or :feature:login.",
                 )
-            candidate = self.project_dir.joinpath(*parts)
-            if not candidate.resolve().is_relative_to(self.project_dir.resolve()):
+            module = f":{':'.join(parts)}"
+            candidate = self._configured_module_dir(module) or self.project_dir.joinpath(*parts)
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(self.project_dir.resolve()):
                 cli.fail(
                     f"Gradle module path resolves outside the project: {candidate}",
                     "Pass --module a project contained under the selected --project root.",
                 )
+            if not resolved.is_dir():
+                cli.fail(
+                    f"Gradle module {module} directory does not exist: {candidate}",
+                    f"Set project('{module}').projectDir = file('relative/path') in "
+                    "settings.gradle(.kts), or pass --module for an existing Gradle project.",
+                )
             return candidate
         return self.project_dir
+
+    def _configured_module_dir(self, module: str) -> Path | None:
+        """Read a module's explicit ``projectDir`` from the root settings script."""
+        settings = next(
+            (
+                self.project_dir / name
+                for name in ("settings.gradle", "settings.gradle.kts")
+                if (self.project_dir / name).exists()
+            ),
+            None,
+        )
+        if settings is None:
+            return None
+
+        try:
+            source = settings.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            cli.fail(
+                f"could not read Gradle settings file {settings}: {error}",
+                "Make the settings file readable UTF-8, then rerun the Gradle task.",
+            )
+
+        uncommented = _strip_gradle_comments(source)
+        structure = _mask_gradle_strings(uncommented)
+        conditional_ranges = _conditional_block_ranges(structure)
+        configured: Path | None = None
+        offset = 0
+        for line_number, line_with_ending in enumerate(
+            uncommented.splitlines(keepends=True), start=1
+        ):
+            line = line_with_ending.rstrip("\r\n")
+            for target in _PROJECT_DIR_ASSIGNMENT_TARGET.finditer(line):
+                absolute_offset = offset + target.start()
+                if structure[absolute_offset : absolute_offset + len("project")] != "project":
+                    continue
+                if target.group("module") != module:
+                    continue
+
+                supported = _PROJECT_DIR_ASSIGNMENT.fullmatch(line)
+                conditional = any(
+                    start < absolute_offset < end for start, end in conditional_ranges
+                )
+                if supported is None or conditional:
+                    cli.fail(
+                        f"unsupported projectDir assignment for Gradle module {module} "
+                        f"at {settings}:{line_number}",
+                        f"Use an unconditional single-line project('{module}').projectDir = "
+                        "file('relative/path') or "
+                        f'project("{module}").projectDir = File("relative/path").',
+                    )
+                configured = self.project_dir / supported.group("path")
+            offset += len(line_with_ending)
+        return configured
 
     def _report_files(self, root: Path, task: str) -> tuple[list[Path], list[Path]]:
         """Find reports and prove every resolved path stays in its permitted directory."""

@@ -10,6 +10,18 @@
   "note": "Durations and absolute paths are normalised so a re-record diffs only on real format changes. The JUnit XML additionally has its hostname, timestamp and per-test time normalised: Gradle writes the recording machine's hostname into every testsuite element.",
   "fixtures": [
     {
+      "name": "settings_gradle_compose",
+      "file": "settings_gradle_compose.txt",
+      "command": "cp tests/fixtures/scaffold/compose/settings.gradle tests/fixtures/recorded/gradle-8.13/settings_gradle_compose.txt",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "produced_artifact": "settings.gradle",
+      "description": "Verbatim settings.gradle from the checked-in Compose scaffold, recorded as parser input for Gradle projectDir resolution tests.",
+      "catches": [
+        "W4-G-1"
+      ],
+      "bytes": 578
+    },
+    {
       "name": "gradle_task_not_found",
       "file": "gradle_task_not_found.txt",
       "command": "gradle --console=plain :app:assembleNoSuchVariantAtAll",
