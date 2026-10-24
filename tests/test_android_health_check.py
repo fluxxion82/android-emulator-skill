@@ -1,7 +1,8 @@
 """Unit tests for android_health_check.sh.
 
 The script is POSIX bash, so the "pure logic" under test is its decision making:
-the Python-version gate (>= 3.12), the hard-requirement exit-code contract (adb
+the Python-version gate (>= 3.12), the JDK floor (>= 17, read from recorded
+``java -version`` banners), the hard-requirement exit-code contract (adb
 missing => non-zero), the device-listing parse from ``adb devices -l``, and the
 PASS/WARN/FAIL summary classification.
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -126,11 +128,13 @@ def _python_stub(
 
 
 @pytest.fixture
-def sandbox(tmp_path: Path):
+def sandbox(tmp_path: Path, recorded):
     """Return a builder that runs the script with a controlled fake PATH.
 
     The builder accepts keyword flags for which stubs to install and returns the
     completed ``subprocess`` result (stdout captured, no real tools invoked).
+    ``java_banner`` is what the java stub prints for ``-version``; left as
+    None it is the recorded JDK 17 banner, ``java_version_17``.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -151,6 +155,7 @@ def sandbox(tmp_path: Path):
         failed_diagnostic: str | None = None,
         raw_invalid_device_diagnostic: bool = False,
         java_version_stdout: bool = False,
+        java_banner: str | None = None,
         timeout_log: Path | None = None,
         text: bool = True,
         tmpdir: Path | None = None,
@@ -222,14 +227,18 @@ def sandbox(tmp_path: Path):
             for tool in ("grep", "mktemp", "perl", "sed", "tr", "wc"):
                 (bin_dir / tool).symlink_to(Path("/usr/bin") / tool)
         if java:
+            # The banner is a recorded `java -version`, whole, on the stream
+            # java writes it to; the script picks the first line itself.
+            banner_file = tmp_path / "java_banner.txt"
+            banner_file.write_text(
+                recorded.text("java_version_17") if java_banner is None else java_banner,
+                encoding="utf-8",
+            )
+            banner_stream = "" if java_version_stdout else " >&2"
             java_body = (
                 f'echo "{failed_command} diagnostic" >&2\nexit 1\n'
                 if failed_command == "java -version"
-                else (
-                    'echo "openjdk version \\"17.0.15\\""\nexit 0\n'
-                    if java_version_stdout
-                    else 'echo "openjdk version \\"17.0.15\\"" 1>&2\nexit 0\n'
-                )
+                else f"cat {shlex.quote(str(banner_file))}{banner_stream}\nexit 0\n"
             )
             _write_stub(
                 bin_dir,
@@ -252,16 +261,23 @@ def sandbox(tmp_path: Path):
         # monkeypatching.
         system_paths = ["/usr/bin", "/bin"]
         env["PATH"] = os.pathsep.join([str(bin_dir), *system_paths])
-        if python_command != "python3":
-            # This scenario exercises selection of the legacy ``python`` name.
-            # Treat the python3 sentinel as unavailable to ``command -v``; if
-            # the script invokes python3 directly anyway, the sentinel records
-            # that isolation failure and exits 127.
+        # Names ``command -v`` must not find. python3: the legacy ``python``
+        # scenario treats the python3 sentinel as unavailable; if the script
+        # invokes python3 directly anyway, the sentinel records that isolation
+        # failure and exits 127. java: macOS ships a /usr/bin/java launcher
+        # that runs whatever JDK is installed, so leaving the stub out does
+        # not make java missing.
+        hidden = [
+            name
+            for name, absent in (("python3", python_command != "python3"), ("java", not java))
+            if absent
+        ]
+        if hidden:
             bash_env = tmp_path / "bash_env"
             bash_env.write_text(
                 "command() {\n"
-                '  if [ "$#" -eq 2 ] && [ "$1" = -v ] && [ "$2" = python3 ]; then\n'
-                "    return 1\n"
+                '  if [ "$#" -eq 2 ] && [ "$1" = -v ]; then\n'
+                '    case "$2" in ' + " | ".join(hidden) + ") return 1 ;; esac\n"
                 "  fi\n"
                 '  builtin command "$@"\n'
                 "}\n"
@@ -313,6 +329,25 @@ def test_all_present_passes_zero(sandbox):
     assert "Warnings: 0" in result.stdout
 
 
+# Every check a healthy host's report carries, by name, in order: the section
+# titles the script prints (sections 4 and 8 each record two checks). Shared
+# with test_agent_task_e2e.py, so the live walk checks the report itself and
+# not a count of entries. ANDROID_HOME naming a directory that does not exist
+# adds one more "Checking Android SDK environment..." warning.
+CHECK_NAMES = (
+    "Checking Android SDK environment...",
+    "Checking adb (Android Debug Bridge)...",
+    "Checking emulator...",
+    "Checking avdmanager and sdkmanager...",
+    "Checking avdmanager and sdkmanager...",
+    "Checking java...",
+    "Checking Python 3.12+...",
+    "Checking Python Pillow (PIL)...",
+    "Checking devices and AVDs...",
+    "Checking devices and AVDs...",
+)
+
+
 def test_json_success_is_one_object_with_every_check(sandbox):
     result = sandbox("--json", python_version="3.12", pillow=True)
 
@@ -322,7 +357,10 @@ def test_json_success_is_one_object_with_every_check(sandbox):
     assert payload["ok"] is True
     assert payload["success"] is True
     assert len(payload["checks"]) == 10
+    assert tuple(check["name"] for check in payload["checks"]) == CHECK_NAMES
     assert payload["summary"] == {"passed": 10, "warnings": 0, "failed": 0}
+    assert set(payload) == {"ok", "success", "checks", "summary", "java_major"}
+    assert payload["java_major"] == 17
     assert "Environment Health Check" in result.stderr
 
 
@@ -388,7 +426,9 @@ def test_json_without_python3_uses_parseable_fallback(sandbox):
     result = sandbox("--json", python_version=None, pillow=False)
 
     assert result.returncode == 0
-    assert isinstance(json.loads(result.stdout), dict)
+    payload = json.loads(result.stdout)
+    assert set(payload) == {"ok", "success", "checks", "summary", "java_major"}
+    assert payload["java_major"] == 17
 
 
 def test_json_guard_uses_detected_python_interpreter(sandbox, tmp_path):
@@ -416,10 +456,232 @@ def test_json_guard_uses_detected_python_interpreter(sandbox, tmp_path):
     assert not python3_shadow_log.exists(), "the script tried to invoke the shadowed python3"
 
 
-def test_java_version_uses_first_combined_output_line(sandbox):
+def test_java_version_uses_first_combined_output_line(sandbox, recorded):
+    banner, runtime, *_ = recorded.lines("java_version_17")
+
     result = sandbox(java_version_stdout=True)
 
-    assert 'java installed (openjdk version "17.0.15")' in result.stdout
+    (java_line,) = [line for line in result.stdout.splitlines() if banner in line]
+    assert runtime not in result.stdout, "more than the banner's first line was read"
+    assert java_line.startswith("✓ java 17 installed"), java_line
+
+
+# ---------------------------------------------------------------------------
+# The Java floor. AGP 8.13.2 (tests/fixtures/scaffold/compose/build.gradle)
+# runs Gradle only on a JDK 17 or newer, and the check passed any `java
+# -version` that exited 0 -- a JDK 11 read as a ready host, and the first build
+# then failed for a reason the health check had been asked about.
+#
+# The banners are recorded, one per JDK on the recording host
+# (`python tests/record_fixtures.py --only java_version`), whole: the stub
+# prints all three lines and the script must pick the first itself.
+# ---------------------------------------------------------------------------
+
+JAVA_FLOOR = 17
+JAVA_CHECK = "Checking java..."
+
+# Every recorded banner, with the major its file is named for. The recorder
+# names the file from its own reading of the banner; the script's parser is a
+# second, independent reading, so the two must agree.
+RECORDED_JAVA_BANNERS = [
+    pytest.param("java_version_11", 11, id="jdk11"),
+    pytest.param("java_version_17", 17, id="jdk17"),
+    pytest.param("java_version_20", 20, id="jdk20"),
+    pytest.param("java_version_21", 21, id="jdk21"),
+]
+
+# The pre-Java-9 numbering, for _legacy_banner.
+LEGACY_VERSION = "1.8.0_392"
+
+
+def _legacy_banner(banner: str) -> str:
+    """A JDK 8 banner, DERIVED from a recorded one.
+
+    No JDK 8 is installed on the recording host, so there is nothing to record.
+    The input is the recorded JDK 17 banner (``java_version_17``) with only
+    the quoted version replaced by ``1.8.0_392``: before Java 9 the version
+    string was ``1.<major>.0_<update>``, so its first number is not its major.
+    A parser that reads the first number reads 1, and 1 is below any floor for
+    the wrong reason. Everything else on the line, and both lines after it,
+    are as recorded.
+    """
+    derived, replaced = re.subn(r'version "[^"]+"', f'version "{LEGACY_VERSION}"', banner, count=1)
+    assert replaced == 1, "the recorded banner has no quoted version to replace"
+    return derived
+
+
+# The JVM's startup notice when JAVA_TOOL_OPTIONS is set, for _tool_options_banner.
+TOOL_OPTIONS_NOTICE = "Picked up JAVA_TOOL_OPTIONS: -Xmx512m"
+
+# The same notice when the options themselves say `version "21"`: the JVM
+# echoes them verbatim, quotes and all, so the notice carries a quoted version
+# of its own -- a higher one than the JDK's.
+VERSION_IN_NOTICE = 'Picked up JAVA_TOOL_OPTIONS: -Dapp.label=version "21"'
+
+# How a banner line starts: the implementation's name, then ` version "`.
+# Oracle prints `java version`, every OpenJDK build `openjdk version`.
+BANNER_LINE = re.compile(r'(java|openjdk) version "')
+
+
+def _tool_options_banner(banner: str, notice: str = TOOL_OPTIONS_NOTICE) -> str:
+    """A banner under JAVA_TOOL_OPTIONS, DERIVED from a recorded one.
+
+    The recorded banner with one line put in front of it: the notice the JVM
+    prints before anything else when JAVA_TOOL_OPTIONS is set, which is common
+    in CI. Its wording was read off the recording host's JDK 11
+    (``JAVA_TOOL_OPTIONS=-Xmx512m java -version``), whose next three lines
+    were the recorded ``java_version_11`` unchanged. With the notice first, a
+    check that reads only the first line reads no version at all, and a JDK
+    below the floor passed as "unreadable".
+
+    ``notice`` may be VERSION_IN_NOTICE: the JVM echoes the options as given,
+    so options that contain ``version "21"`` put a quoted version in the
+    notice. A check that takes the first line *containing* ``version "`` reads
+    21 from it and passes a JDK 11.
+    """
+    return f"{notice}\n{banner}"
+
+
+def _version_line(banner: str) -> str:
+    """The banner line, the one that STARTS `java version "` or `openjdk version "`."""
+    return next(line for line in banner.splitlines() if BANNER_LINE.match(line))
+
+
+def _versionless_banner(banner: str) -> str:
+    """A banner with no version in it, DERIVED from a recorded one.
+
+    The recorded JDK 17 banner with its quoted version deleted, and nothing
+    else changed: output in which no line carries a version the parser can
+    read. (A notice ahead of a real banner is not this case; see
+    _tool_options_banner.)
+    """
+    derived, removed = re.subn(r' version "[^"]+"', "", banner, count=1)
+    assert removed == 1, "the recorded banner has no quoted version to remove"
+    return derived
+
+
+def _java_major(first_line: str) -> subprocess.CompletedProcess:
+    """The script's own banner parser, run on one line."""
+    function = _shell_function("java_major_from_banner")
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'{function}\njava_major_from_banner "$1" && printf "%s" "$JAVA_MAJOR"',
+            "java-major",
+            first_line,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+
+def _java_check(payload: dict) -> dict:
+    (check,) = [check for check in payload["checks"] if check["name"] == JAVA_CHECK]
+    return check
+
+
+@pytest.mark.parametrize(("fixture", "major"), RECORDED_JAVA_BANNERS)
+def test_the_java_major_is_read_from_every_recorded_banner(recorded, fixture, major):
+    first_line = recorded.lines(fixture)[0]
+
+    parsed = _java_major(first_line)
+
+    assert parsed.returncode == 0, f"no major read from {first_line!r}: {parsed.stderr}"
+    assert parsed.stdout == str(major), first_line
+
+
+def test_the_pre_java_9_scheme_reads_its_second_number_as_the_major(recorded):
+    first_line = _legacy_banner(recorded.lines("java_version_17")[0])
+
+    parsed = _java_major(first_line)
+
+    assert parsed.returncode == 0, f"no major read from {first_line!r}: {parsed.stderr}"
+    assert parsed.stdout == "8", first_line
+
+
+@pytest.mark.parametrize("python_version", ["3.12", None], ids=["python3", "bash-encoder"])
+@pytest.mark.parametrize(
+    ("banner_of", "major"),
+    [
+        pytest.param(lambda recorded: recorded.text("java_version_11"), 11, id="jdk11"),
+        pytest.param(
+            lambda recorded: _legacy_banner(recorded.text("java_version_17")), 8, id="jdk8"
+        ),
+        pytest.param(
+            lambda recorded: _tool_options_banner(recorded.text("java_version_11")),
+            11,
+            id="jdk11-under-JAVA_TOOL_OPTIONS",
+        ),
+        pytest.param(
+            lambda recorded: _tool_options_banner(
+                recorded.text("java_version_11"), VERSION_IN_NOTICE
+            ),
+            11,
+            id="jdk11-under-a-notice-saying-version-21",
+        ),
+    ],
+)
+def test_a_jdk_below_the_floor_fails_the_check(sandbox, recorded, banner_of, major, python_version):
+    """Below 17 is a failed check naming what was found and the floor; exit 1.
+
+    Both encoders, because each builds the document separately and the parsed
+    major has to reach the JSON through either.
+    """
+    banner = banner_of(recorded)
+
+    result = sandbox("--json", pillow=True, java_banner=banner, python_version=python_version)
+
+    assert result.returncode == 1, result.stderr[-800:]
+    payload = _one_object(result)
+    check = _java_check(payload)
+    assert check["status"] == "failed", check
+    assert _version_line(banner) in check["message"], check
+    assert f"java {major} found" in check["message"], check
+    assert f"JDK {JAVA_FLOOR}+ required" in check["message"], check
+    assert payload["java_major"] == major, payload
+    assert payload["success"] is False and payload["error"] == check["message"], payload
+    assert set(payload) == {"ok", "success", "checks", "summary", "java_major", "error", "remedy"}
+    assert len(payload["checks"]) == 10
+    assert payload["summary"]["failed"] == 1, payload["summary"]
+
+
+@pytest.mark.parametrize(("fixture", "major"), RECORDED_JAVA_BANNERS[1:])
+def test_a_jdk_at_or_above_the_floor_passes(sandbox, recorded, fixture, major):
+    result = sandbox("--json", pillow=True, java_banner=recorded.text(fixture))
+
+    assert result.returncode == 0, result.stderr[-800:]
+    payload = _one_object(result)
+    check = _java_check(payload)
+    assert check["status"] == "passed", check
+    assert check["message"].startswith(f"java {major} installed"), check
+    assert payload["java_major"] == major, payload
+
+
+def test_a_banner_with_no_readable_version_warns_and_names_it(sandbox, recorded):
+    """Unreadable is not below the floor: a warning that shows the line, exit 0."""
+    banner = _versionless_banner(recorded.text("java_version_17"))
+
+    result = sandbox("--json", pillow=True, java_banner=banner)
+
+    assert result.returncode == 0, result.stderr[-800:]
+    payload = _one_object(result)
+    check = _java_check(payload)
+    assert check["status"] == "warning", check
+    assert banner.splitlines()[0] in check["message"], check
+    assert f"JDK {JAVA_FLOOR}+" in check["message"], check
+    assert payload["java_major"] is None, payload
+
+
+def test_no_java_on_path_reports_no_major(sandbox):
+    result = sandbox("--json", pillow=True, java=False)
+
+    assert result.returncode == 0, result.stderr[-800:]
+    payload = _one_object(result)
+    assert _java_check(payload)["status"] == "warning"
+    assert payload["java_major"] is None, payload
 
 
 def _bounded_calls(timeout_log: Path) -> list[str]:

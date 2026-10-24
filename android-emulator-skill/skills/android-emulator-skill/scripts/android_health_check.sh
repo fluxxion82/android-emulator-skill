@@ -14,10 +14,15 @@
 #
 # Exit codes:
 #   0 - All hard requirements satisfied (warnings allowed)
-#   1 - A hard requirement is missing (adb not on PATH), or --json could not
-#       emit its report (one {"success": false, "error", "remedy"} line instead)
+#   1 - A hard requirement is missing (adb not on PATH, a JDK below 17, a tool
+#       that cannot run), or --json could not emit its report (one
+#       {"success": false, "error", "remedy"} line instead)
 
 set -u
+
+# AGP 8 (tests/fixtures/scaffold/compose/build.gradle uses 8.13.2) runs Gradle
+# only on a JDK this new or newer.
+JAVA_FLOOR=17
 
 # ---------------------------------------------------------------------------
 # Output styling (disabled automatically when stdout is not a TTY)
@@ -66,14 +71,17 @@ Options:
 This script checks for:
   - ANDROID_HOME / ANDROID_SDK_ROOT environment variable
   - adb, emulator, avdmanager, sdkmanager, and java on PATH (with versions)
+  - A JDK ${JAVA_FLOOR}+ (AGP 8 runs Gradle on nothing older); --json reports
+    the major it read as "java_major" (null when java is missing or unreadable)
   - Python 3.12+ (for the skill's Python scripts) and Pillow importability
   - Connected devices/emulators (adb devices -l)
   - Defined AVDs (emulator -list-avds)
 
 Exit codes:
   0 - All hard requirements satisfied (warnings allowed)
-  1 - A hard requirement is missing (adb not on PATH), or --json could not
-      emit its report (one {"success": false, "error", "remedy"} line instead)
+  1 - A hard requirement is missing (adb not on PATH, a JDK below ${JAVA_FLOOR}, a
+      tool that cannot run), or --json could not emit its report (one
+      {"success": false, "error", "remedy"} line instead)
 EOF
     exit 0
 fi
@@ -93,6 +101,9 @@ JSON_RECORD_DIR=""
 # without that check would claim a completeness it does not have, so --json
 # then ends in a refusal instead (see emit_json).
 JSON_RECORD_ERROR=""
+# The JDK's major version as the java check read it; empty when java is
+# missing, could not run, or printed a banner with no readable version.
+JAVA_MAJOR=""
 
 record_check() {
     local record_prefix
@@ -149,6 +160,36 @@ section() {
     CURRENT_SECTION="$1"
     CURRENT_TITLE="$2"
     printf "%b[%s]%b %s\n" "$BLUE" "$1" "$NC" "$2"
+}
+
+# The major version in the banner line of `java -version`, into JAVA_MAJOR.
+# Fails, leaving JAVA_MAJOR alone, unless the line STARTS `java version "`
+# (Oracle) or `openjdk version "` (every OpenJDK build) and its quoted version
+# starts with a number: anything else, a "Picked up ..." notice that happens
+# to echo `version "21"` included, is not a banner. The forms recorded in
+# tests/fixtures/recorded:
+#   openjdk version "17.0.20.1" 2026-08-18 LTS   -> 17
+#   openjdk version "21.0.12" 2026-07-21         -> 21
+# and before Java 9 the version was "1.<major>.0_<update>", so "1.8.0_392" is
+# 8: its leading 1 is not the major.
+java_major_from_banner() {
+    local version
+    local major
+    case "$1" in
+        'java version "'* | 'openjdk version "'*) ;;
+        *) return 1 ;;
+    esac
+    version=${1#*version \"}
+    version=${version%%\"*}
+    major=${version%%[!0-9]*}
+    if [ "$major" = 1 ] && [ "${version#1.}" != "$version" ]; then
+        version=${version#1.}
+        major=${version%%[!0-9]*}
+    fi
+    case "$major" in
+        "" | *[!0-9]*) return 1 ;;
+    esac
+    JAVA_MAJOR=$((10#$major))
 }
 
 fallback_json_escape() {
@@ -225,8 +266,10 @@ emit_json_fallback() {
             "$(fallback_json_escape "$message_value")"
         separator=","
     done
-    printf '],"summary":{"passed":%s,"warnings":%s,"failed":%s}' \
-        "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED"
+    # JAVA_MAJOR is digits or empty (java_major_from_banner), so it needs no
+    # escaping.
+    printf '],"summary":{"passed":%s,"warnings":%s,"failed":%s},"java_major":%s' \
+        "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED" "${JAVA_MAJOR:-null}"
     if [ "$ok" = false ]; then
         printf ',"error":"%s","remedy":"%s"' \
             "$(fallback_json_escape "$FIRST_FAILURE")" \
@@ -367,7 +410,8 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-count, passed, warnings, failed = map(int, sys.argv[2:])
+count, passed, warnings, failed = map(int, sys.argv[2:6])
+java_major = int(sys.argv[6]) if sys.argv[6] else None
 
 
 def read_field(index, field):
@@ -391,12 +435,14 @@ payload = {
     "success": ok,
     "checks": checks,
     "summary": {"passed": passed, "warnings": warnings, "failed": failed},
+    "java_major": java_major,
 }
 if not ok:
     payload["error"] = next(check["message"] for check in checks if check["status"] == "failed")
     payload["remedy"] = "Fix the failed checks above, then run the health check again."
 print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-' "$JSON_RECORD_DIR" "$CHECKS_RECORDED" "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED"
+' "$JSON_RECORD_DIR" "$CHECKS_RECORDED" "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED" \
+        "$JAVA_MAJOR"
 }
 
 run_bounded() {
@@ -456,6 +502,8 @@ run_captured() {
 }
 
 CAPTURED_COMBINED=""
+# All of it, for a reader that must look past a first line (see the java check).
+CAPTURED_COMBINED_ALL=""
 
 run_combined_captured() {
     local combined_file
@@ -468,6 +516,7 @@ run_combined_captured() {
     fi
 
     CAPTURED_COMBINED=""
+    CAPTURED_COMBINED_ALL=$(<"$combined_file")
     IFS= read -r CAPTURED_COMBINED <"$combined_file" || true
     if [ "$CAPTURED_STATUS" -ne 0 ] && [ -z "$CAPTURED_COMBINED" ]; then
         CAPTURED_COMBINED="exited $CAPTURED_STATUS with no error output"
@@ -592,10 +641,35 @@ echo ""
 # ---------------------------------------------------------------------------
 section "5/8" "Checking java..."
 if command -v java >/dev/null 2>&1; then
-    # Java normally uses stderr, but preserve the original first-combined-line behavior.
+    # Java writes its banner to stderr, so both streams are read together.
     if run_combined_captured java -version; then
+        # The banner is the line that STARTS with the implementation's name
+        # and ` version "`, not the first line: startup notices come before
+        # it. With JAVA_TOOL_OPTIONS set (common in CI) the JVM prints "Picked
+        # up JAVA_TOOL_OPTIONS: ..." first -- reading that let a JDK 11 through
+        # as unreadable -- and it echoes the options verbatim, so a notice can
+        # itself contain `version "21"`. Hence anchored, never "contains".
         JAVA_VERSION=$CAPTURED_COMBINED
-        check_passed "java installed ($JAVA_VERSION)"
+        while IFS= read -r JAVA_LINE; do
+            case "$JAVA_LINE" in
+                'java version "'* | 'openjdk version "'*)
+                    JAVA_VERSION=$JAVA_LINE
+                    break
+                    ;;
+            esac
+        done <<<"$CAPTURED_COMBINED_ALL"
+        if ! java_major_from_banner "$JAVA_VERSION"; then
+            # No line with a readable version at all. Unreadable is not below
+            # the floor: say what was printed, and that the floor could not be
+            # checked, without failing a JDK that may well be new enough.
+            check_warning "java -version printed no version this check can read ($JAVA_VERSION); could not confirm JDK $JAVA_FLOOR+"
+            hint "Run: java -version   (JDK $JAVA_FLOOR+ is required)"
+        elif [ "$JAVA_MAJOR" -lt "$JAVA_FLOOR" ]; then
+            check_failed "java $JAVA_MAJOR found ($JAVA_VERSION); JDK $JAVA_FLOOR+ required (AGP 8 runs Gradle on nothing older)"
+            hint "Install a JDK $JAVA_FLOOR+ (e.g. Temurin), put its bin/ first on PATH, and point JAVA_HOME at it"
+        else
+            check_passed "java $JAVA_MAJOR installed ($JAVA_VERSION; JDK $JAVA_FLOOR+ required)"
+        fi
     else
         check_failed "java -version failed: $CAPTURED_COMBINED"
     fi
@@ -603,7 +677,7 @@ if command -v java >/dev/null 2>&1; then
 else
     check_warning "java not found on PATH"
     hint "Android SDK tools (sdkmanager/avdmanager) and Gradle require a JDK"
-    hint "Install a JDK 17+ (e.g. Temurin) and ensure java is on PATH"
+    hint "Install a JDK $JAVA_FLOOR+ (e.g. Temurin) and ensure java is on PATH"
 fi
 echo ""
 
