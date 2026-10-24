@@ -1172,7 +1172,19 @@ class AnrBuster:
         # into a 1 MB cap that pruned sessions (the N14 shape).
         aggregate_cap_mb = env_int("ANDROID_EMU_ANR_TOTAL_CAP_MB", 100, min_value=0)
         if aggregate_cap_mb > 0:
-            self.store.prune_to_aggregate_cap(aggregate_cap_mb * 1024 * 1024)
+            capped = self.store.prune_to_aggregate_cap(aggregate_cap_mb * 1024 * 1024)
+            over = capped.over_cap
+            if over is not None:
+                # Best effort, never a refusal: a --start that cannot free space
+                # is worse than an overrun (D11). On stderr: stdout is the id.
+                print(
+                    f"warning: ANR sessions hold {over['bytes_over']} bytes over "
+                    f"ANDROID_EMU_ANR_TOTAL_CAP_MB ({aggregate_cap_mb} MB): the "
+                    f"{over['protected']} session(s) left have not ended, or another command "
+                    f"holds them, so none could be pruned. --stop them (--stop --abandon one "
+                    f"whose worker is gone) to let the cap reclaim them.",
+                    file=sys.stderr,
+                )
         resolved_serial = self._resolve_serial(serial)
         # Before the session exists: a worker started without a device waits
         # in `adb logcat` forever, and the id it was given names nothing (B4).

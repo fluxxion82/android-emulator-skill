@@ -7,8 +7,9 @@ prefix, and session-id prefix are retargeted for Android.
 
 Each session is a directory under
 ``~/.android-emulator-skill/anr-sessions/<id>/`` containing ``meta.json``
-(config + pid + status), ``events.jsonl`` (append-only normalised events),
-``summary.json`` (post-stop) and ``lock``.
+(config + pid + status), ``events.jsonl`` (append-only normalised events) and
+``summary.json`` (post-stop). Its lock is ``anr-sessions/locks/<id>.lock``,
+outside the directory a prune deletes (D11, below).
 
 The lifecycle (fourth review of PR #42: four rounds of closing one timing
 window at a time did not converge, so it is serialised instead)::
@@ -21,8 +22,8 @@ window at a time did not converge, so it is serialised instead)::
     cancelled                     +-- abandon (--stop --abandon) --> abandoned
 
 Every read-modify-write of a session's meta.json and summary.json happens
-under its lock (``fcntl.flock`` on ``<dir>/lock``; how long a writer waits
-for it is bounded, not how long it is held), by exactly one owner per
+under its lock (``fcntl.flock`` on ``locks/<id>.lock``; how long a writer
+waits for it is bounded, not how long it is held), by exactly one owner per
 transition, and only from the state the transition expects -- anything else
 is refused (:class:`TransitionRefusedError`), not applied. The worker owns
 its claim, ``deciding``, its counters and its end (``stopped`` / ``crashed``,
@@ -44,6 +45,27 @@ A session an earlier version wrote has no ``lifecycle`` key: its worker took
 no lock and checked no state, and its --stop could save ``stopped`` while
 the worker ran on. --stop (anr_watcher) fences such a worker before trusting
 what the session says.
+
+Creating and pruning are serialised too (D11). A session's lock used to live
+in its own directory, so creation could take it only after making the
+directory, and a prune that took that meta-less directory for an abandoned one
+deleted the session being created -- and with it the lock file another
+process held, so the next opener locked another inode. Now:
+
+- Every opener takes the base guard (``locks/.base``) first, opens and locks
+  the session's lock file under it, and lets the guard go: base -> session,
+  always. A waiter keeps no descriptor between attempts.
+- ``create`` holds the session's lock from before it makes the directory until
+  its meta (written first) and events file exist: a directory with no meta
+  whose lock is free has no creator left.
+- A sweep (TTL, the aggregate cap, ``clear``) holds the base guard throughout,
+  takes each session's lock without waiting -- one that is held is skipped --
+  reads it again under the lock, and removes only a session that has ended
+  (``TERMINAL_STATES``; an earlier version's only once its worker is shown
+  gone), or a directory with no meta (an interrupted creation). Never by age
+  alone: a pending session whose worker never came stays until --stop cancels
+  it. A lock file is unlinked only by a sweep holding both the base guard and
+  that lock, with its directory gone -- never one someone holds.
 
 The parent creates the directory and writes initial meta, with a random
 ``worker_token`` it hands the worker on its command line. ``--stop``
@@ -68,7 +90,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -121,6 +143,11 @@ WORKER_LOCK_TIMEOUT_SECONDS = 60
 WORKER_END_LOCK_TIMEOUT_SECONDS = 300
 _LOCK_POLL_SECONDS = 0.02
 
+# Under the storage root, beside the sessions and never one of them: the
+# session locks (``<id>.lock``) and the base guard every opener takes first.
+LOCKS_DIRNAME = "locks"
+_BASE_GUARD_NAME = ".base"
+
 
 def _default_sessions_dir() -> Path:
     """Resolve the storage root, honouring the ``ANDROID_EMU_ANR_HOME`` override.
@@ -160,6 +187,18 @@ class SessionBusyError(RuntimeError):
         )
 
 
+class StoreBusyError(SessionBusyError):
+    """The store's base guard was held past the bound (a sweep under way); nothing was removed."""
+
+    def __init__(self, seconds: float) -> None:
+        RuntimeError.__init__(
+            self,
+            f"The ANR session store is being swept by another process: its guard was held "
+            f"for {seconds:g}s.",
+        )
+        self.remedy = "Run the same command again; the other command's sweep finishes in seconds."
+
+
 class TransitionRefusedError(RuntimeError):
     """The session is not in a state the transition starts from, so it was not applied.
 
@@ -174,6 +213,30 @@ class TransitionRefusedError(RuntimeError):
 
 
 # === TYPES ===
+
+
+@dataclass(frozen=True)
+class CapPrune:
+    """What one aggregate-cap prune did, and what it could not (best effort, D11).
+
+    Attributes:
+        deleted: Sessions removed.
+        total_bytes: What the sessions hold afterwards.
+        max_bytes: The cap.
+        protected: Sessions it had to keep: not ended, or held by another command.
+    """
+
+    deleted: int = 0
+    total_bytes: int = 0
+    max_bytes: int = 0
+    protected: int = 0
+
+    @property
+    def over_cap(self) -> dict | None:
+        """``{"bytes_over", "protected"}`` when the sessions it may not remove exceed the cap."""
+        if self.max_bytes <= 0 or self.total_bytes <= self.max_bytes:
+            return None
+        return {"bytes_over": self.total_bytes - self.max_bytes, "protected": self.protected}
 
 
 @dataclass
@@ -358,6 +421,10 @@ class SessionStore:
     def __init__(self, base_dir: Path | str | None = None):
         self.base_dir = Path(base_dir).expanduser() if base_dir else _default_sessions_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # Outside every session's directory: deleting a session never unlinks
+        # a lock someone holds (D11).
+        self.locks_dir = self.base_dir / LOCKS_DIRNAME
+        self.locks_dir.mkdir(exist_ok=True)
         # (thread, session id) for each lock this store holds: a write checks
         # its writer holds the session's lock (``_require_lock``).
         self._held: set[tuple[int, str]] = set()
@@ -365,12 +432,16 @@ class SessionStore:
     # === PUBLIC API ===
 
     def create(self, args: dict) -> SessionMeta:
-        """Generate id + dir + initial meta.json. Caller detaches the worker next."""
+        """Generate id + dir + initial meta.json. Caller detaches the worker next.
+
+        All of it under the session's lock, taken before the directory exists
+        (D11): a sweep finds a directory with no meta only while its creator
+        holds the lock -- and skips it -- or once the creator has died, when
+        it removes it. Meta is written first, so the directory is a session
+        from the first moment anything without the lock can see it.
+        """
         session_id = _generate_session_id()
-        session_dir = self.base_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=False)
-        # Empty events file so the worker can `open(..., 'a')` cleanly.
-        (session_dir / "events.jsonl").touch()
+        session_dir = self.session_dir(session_id)
         now = datetime.now()
         meta = SessionMeta(
             session_id=session_id,
@@ -385,7 +456,10 @@ class SessionStore:
             lifecycle=LIFECYCLE_VERSION,
         )
         with self._lock(session_id, CLI_LOCK_TIMEOUT_SECONDS):
+            session_dir.mkdir(parents=True, exist_ok=False)
             self._write_meta(meta)
+            # Empty events file so the worker can `open(..., 'a')` cleanly.
+            (session_dir / "events.jsonl").touch()
         return meta
 
     @contextlib.contextmanager
@@ -633,7 +707,11 @@ class SessionStore:
         Raises:
             ValueError: If the id is not a plain session id.
         """
-        if not session_id or not _SAFE_SESSION_ID_RE.fullmatch(session_id):
+        if (
+            not session_id
+            or not _SAFE_SESSION_ID_RE.fullmatch(session_id)
+            or session_id == LOCKS_DIRNAME
+        ):
             raise ValueError(
                 f"Invalid session id {session_id!r}. Expected a plain id like "
                 f"'anr-20260617-143000-a1b2' (letters, digits, dash, underscore)."
@@ -652,76 +730,73 @@ class SessionStore:
                     total += path.stat().st_size
         return total
 
-    def prune_to_aggregate_cap(self, max_bytes: int) -> int:
-        """Drop oldest sessions until total bytes ≤ max_bytes. Returns deletions.
+    def prune_to_aggregate_cap(self, max_bytes: int) -> CapPrune:
+        """Drop the oldest ended sessions until total bytes <= max_bytes: best effort.
 
         Pairs with ``prune_expired``: TTL handles age, this handles disk usage
-        when activity outpaces TTL. Both are called automatically on every
-        ``create`` so the user never has to clean up manually.
+        when activity outpaces TTL. Both are called on every --start, so the
+        user never has to clean up manually. Only what a sweep may remove goes
+        (``_evict``); when the sessions it may not -- pending, running,
+        deciding, or held by another command -- exceed the cap on their own,
+        it stops there and says so (``CapPrune.over_cap``). It never refuses
+        anything: a --start that cannot free space is worse than an overrun.
         """
         if max_bytes <= 0:
-            return 0
-        # Oldest first — deletion order.
-        entries: list[tuple[int, str, int]] = []  # (started_at_ms, session_id, bytes)
-        total = 0
-        for entry in self.base_dir.iterdir():
-            if not entry.is_dir():
-                continue
-            try:
-                meta = self.load_meta(entry.name)
-            except (FileNotFoundError, json.JSONDecodeError):
-                continue
-            size = self.session_total_bytes(entry.name)
-            total += size
-            entries.append((meta.started_at_ms, entry.name, size))
-        if total <= max_bytes:
-            return 0
-        entries.sort(key=lambda e: e[0])  # oldest first
-        deleted = 0
-        for _, session_id, size in entries:
-            if total <= max_bytes:
-                break
-            _remove_tree(self.session_dir(session_id))
-            total -= size
-            deleted += 1
-        return deleted
+            return CapPrune(max_bytes=max_bytes)
+        with self._base_guard():
+            # (started_at_ms, session_id, bytes); a directory with no meta
+            # sorts oldest: an interrupted creation, if its lock is free.
+            entries: list[tuple[int, str, int]] = []
+            total = 0
+            for session_id in self._session_ids():
+                size = self.session_total_bytes(session_id)
+                total += size
+                try:
+                    started = self.load_meta(session_id).started_at_ms
+                except (FileNotFoundError, json.JSONDecodeError):
+                    started = 0
+                entries.append((started, session_id, size))
+            deleted = 0
+            protected = 0
+            entries.sort(key=lambda e: e[0])  # oldest first
+            for _, session_id, size in entries:
+                if total <= max_bytes:
+                    break
+                if self._evict(session_id, lambda _meta: True):
+                    total -= size
+                    deleted += 1
+                else:
+                    protected += 1
+            self._sweep_orphaned_locks()
+        return CapPrune(
+            deleted=deleted, total_bytes=total, max_bytes=max_bytes, protected=protected
+        )
 
     def list_sessions(self) -> list[SessionMeta]:
         """All session metas, newest first."""
         metas: list[SessionMeta] = []
-        for entry in self.base_dir.iterdir():
-            if not entry.is_dir():
-                continue
+        for session_id in self._session_ids():
             try:
-                metas.append(self.load_meta(entry.name))
+                metas.append(self.load_meta(session_id))
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
         metas.sort(key=lambda m: m.started_at_ms, reverse=True)
         return metas
 
     def clear(self, older_than: str | None = None) -> int:
-        """Delete session dirs. ``older_than`` is a duration string like ``24h``."""
+        """Delete ended sessions. ``older_than`` is a duration string like ``24h``.
+
+        Only what a sweep may remove (``_evict``): a pending session is
+        --stop's to cancel, and a running one's worker may still write it.
+        """
         cutoff_ms = _resolve_cutoff_ms(older_than) if older_than else None
-        deleted = 0
-        for entry in self.base_dir.iterdir():
-            if not entry.is_dir():
-                continue
-            try:
-                meta = self.load_meta(entry.name)
-            except (FileNotFoundError, json.JSONDecodeError):
-                _remove_tree(entry)
-                deleted += 1
-                continue
-            if cutoff_ms is None or meta.started_at_ms <= cutoff_ms:
-                _remove_tree(entry)
-                deleted += 1
-        return deleted
+        return self._sweep(cutoff_ms)
 
     def prune_expired(self, ttl_hours: int | None = None) -> int:
-        """Remove sessions older than ttl. Called on every ``create``."""
+        """Remove ended sessions older than ttl. Called on every --start."""
         ttl = ttl_hours if ttl_hours is not None else _default_ttl_hours()
         cutoff = int((datetime.now() - timedelta(hours=ttl)).timestamp() * 1000)
-        return self._clear_older_than_ms(cutoff)
+        return self._sweep(cutoff)
 
     # === SUMMARY HELPERS ===
 
@@ -781,32 +856,77 @@ class SessionStore:
         limit = meta.extras.get("abandoned_events_bytes")
         return limit if meta.status == ABANDONED and isinstance(limit, int) else -1
 
+    def _lock_path(self, session_id: str) -> Path:
+        """A session's lock file: ``locks/<id>.lock``, outside the directory a sweep deletes.
+
+        The one place it is named (D11): creation, every transaction and every
+        sweep reach the lock through here.
+
+        Raises:
+            ValueError: ``session_id`` is not a plain session id.
+        """
+        self.session_dir(session_id)
+        return self.locks_dir / f"{session_id}.lock"
+
+    @property
+    def _base_guard_path(self) -> Path:
+        return self.locks_dir / _BASE_GUARD_NAME
+
     @contextlib.contextmanager
     def _lock(self, session_id: str, timeout: float) -> Iterator[None]:
-        """Hold ``<session dir>/lock`` exclusively, waiting at most ``timeout`` seconds.
+        """Hold the session's lock exclusively, waiting at most ``timeout`` seconds.
 
         ``flock`` belongs to the open file, so two holders conflict whether
         they are two processes or two threads of one; it is released when the
         file is closed -- here, or by the kernel when a holder dies.
+
+        Base -> session (D11): each attempt takes the base guard, opens the
+        lock file and tries it under the guard, and lets the guard go. A sweep
+        unlinks a lock file only holding the guard, so the file an attempt
+        opens is the one its path names until the attempt holds it; and a
+        waiter keeps no descriptor between attempts, which a sweep could
+        otherwise leave naming an unlinked file no later opener reaches.
         """
-        path = self.session_dir(session_id) / "lock"
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        path = self._lock_path(session_id)
         key = (threading.get_ident(), session_id)
+        deadline = time.monotonic() + timeout
+        while (fd := self._attempt(path)) is None:
+            if time.monotonic() >= deadline:
+                raise SessionBusyError(session_id, timeout)
+            time.sleep(_LOCK_POLL_SECONDS)
         try:
-            deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise SessionBusyError(session_id, timeout) from None
-                    time.sleep(_LOCK_POLL_SECONDS)
             self._held.add(key)
             try:
                 yield
             finally:
                 self._held.discard(key)
+        finally:
+            os.close(fd)
+
+    def _attempt(self, path: Path) -> int | None:
+        """One try at a session's lock, under the base guard: its descriptor, or None (busy)."""
+        guard = _try_flock(self._base_guard_path)
+        if guard is None:
+            return None
+        try:
+            return _try_flock(path)
+        finally:
+            os.close(guard)
+
+    @contextlib.contextmanager
+    def _base_guard(self, timeout: float = CLI_LOCK_TIMEOUT_SECONDS) -> Iterator[None]:
+        """Hold the base guard for a sweep: while it is held, no session lock is newly taken.
+
+        Raises:
+            StoreBusyError: It was held past ``timeout`` seconds.
+        """
+        deadline = time.monotonic() + timeout
+        while (fd := _try_flock(self._base_guard_path)) is None:
+            if time.monotonic() >= deadline:
+                raise StoreBusyError(timeout)
+            time.sleep(_LOCK_POLL_SECONDS)
+        try:
+            yield
         finally:
             os.close(fd)
 
@@ -889,27 +1009,97 @@ class SessionStore:
                 Path(tmp).unlink()
             raise
 
-    def _clear_older_than_ms(self, cutoff_ms: int) -> int:
+    def _session_ids(self) -> list[str]:
+        """The sessions under the root: directories named as ``create`` names them.
+
+        Not ``locks/``, and not whatever else is kept here: every walker took
+        every directory for a session -- a prune removed it for having no meta,
+        and a listing raised on a name no session id can be (D11).
+        """
+        return [
+            entry.name
+            for entry in self.base_dir.iterdir()
+            if _GENERATED_SESSION_ID_RE.fullmatch(entry.name)
+            and entry.is_dir()
+            and not entry.is_symlink()
+        ]
+
+    def _sweep(self, cutoff_ms: int | None) -> int:
+        """Remove what may go (``_evict``) and started at or before ``cutoff_ms`` (None: any)."""
         deleted = 0
-        for entry in self.base_dir.iterdir():
-            if not entry.is_dir():
+        with self._base_guard():
+            for session_id in self._session_ids():
+                if self._evict(
+                    session_id, lambda meta: cutoff_ms is None or meta.started_at_ms <= cutoff_ms
+                ):
+                    deleted += 1
+            self._sweep_orphaned_locks()
+        return deleted
+
+    def _evict(self, session_id: str, wanted: Callable[[SessionMeta], bool]) -> bool:
+        """Remove one session if, under its lock, it may go and is ``wanted``. Hold the base guard.
+
+        The lock is tried without waiting: one that is held is a writer at
+        work, or a creator between its directory and its meta, and the
+        session is skipped. Under it the meta is read again. A session goes
+        when nothing can write it again (``_ended_for_good``); a directory with
+        no meta goes too -- its lock was free, so its creator died before
+        writing it. Its lock file is unlinked last, while this sweep holds
+        both it and the base guard: no one else has it open.
+        """
+        fd = _try_flock(self._lock_path(session_id))
+        if fd is None:
+            return False
+        try:
+            session_dir = self.session_dir(session_id)
+            if not session_dir.is_dir():
+                return False
+            try:
+                meta = self.load_meta(session_id)
+            except (FileNotFoundError, json.JSONDecodeError):
+                meta = None
+            if meta is not None and not (_ended_for_good(meta) and wanted(meta)):
+                return False
+            _remove_tree(session_dir)
+            with contextlib.suppress(FileNotFoundError):
+                self._lock_path(session_id).unlink()
+            return True
+        finally:
+            os.close(fd)
+
+    def _sweep_orphaned_locks(self) -> int:
+        """Unlink the lock files whose session directory is gone. Hold the base guard.
+
+        Each only while holding it too, its directory still absent then:
+        never a lock someone holds -- a creator holds its own before its
+        directory exists -- and never one whose session exists.
+        """
+        unlinked = 0
+        for path in self.locks_dir.glob("*.lock"):
+            session_id = path.name.removesuffix(".lock")
+            if not _SAFE_SESSION_ID_RE.fullmatch(session_id) or session_id == LOCKS_DIRNAME:
+                continue
+            if self.session_dir(session_id).exists():
+                continue
+            fd = _try_flock(path)
+            if fd is None:
                 continue
             try:
-                meta = self.load_meta(entry.name)
-            except (FileNotFoundError, json.JSONDecodeError):
-                _remove_tree(entry)
-                deleted += 1
-                continue
-            if meta.started_at_ms <= cutoff_ms:
-                _remove_tree(entry)
-                deleted += 1
-        return deleted
+                if not self.session_dir(session_id).exists():
+                    with contextlib.suppress(FileNotFoundError):
+                        path.unlink()
+                    unlinked += 1
+            finally:
+                os.close(fd)
+        return unlinked
 
 
 # Session ids are generated as "anr-<YYYYmmdd>-<HHMMSS>-<4 hex>". Anything
 # outside this alphabet cannot be one, and a separator or ".." would let an
 # id address paths outside the storage root.
 _SAFE_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+# What ``_generate_session_id`` makes: the only directories a walker takes for sessions.
+_GENERATED_SESSION_ID_RE = re.compile(r"anr-\d{8}-\d{6}-[0-9a-f]{4}")
 
 
 # === MODULE-LEVEL HELPERS ===
@@ -931,6 +1121,47 @@ def _resolve_cutoff_ms(duration_str: str) -> int:
     seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
     cutoff = datetime.now() - timedelta(seconds=seconds)
     return int(cutoff.timestamp() * 1000)
+
+
+def _ended_for_good(meta: SessionMeta) -> bool:
+    """Whether nothing can write ``meta``'s session again, so a sweep may remove it.
+
+    A session that has ended (``TERMINAL_STATES``), of this lifecycle: its
+    worker published its end, or the CLI cancelled or abandoned it. Never
+    one pending (a worker may yet claim it; --stop cancels it), running or
+    deciding. An earlier version's (no ``lifecycle``) ended status is no
+    promise -- its --stop could save ``stopped`` while its worker ran on, its
+    pid kept -- so such a session goes only once that pid is shown not to be
+    its worker: never while UNRESOLVED.
+    """
+    if meta.status not in TERMINAL_STATES:
+        return False
+    if meta.lifecycle is None and meta.pid:
+        return worker_identity(meta)[0] is Identity.GONE
+    return True
+
+
+def _try_flock(path: Path) -> int | None:
+    """Open ``path`` (made if absent) and lock it without waiting: its descriptor, or None (held).
+
+    ``locks/`` itself is made again when it is gone: an earlier version's
+    prune takes it for a session with no meta and deletes it (whatever it held
+    then excludes no one -- the reason an upgrade is made quiescently).
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except FileNotFoundError:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _whole_lines(path: Path) -> int:
