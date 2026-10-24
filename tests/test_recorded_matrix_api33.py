@@ -65,43 +65,58 @@ def test_manifest_matches_files_on_disk():
 
 # --- ANR records -------------------------------------------------------------
 #
-# Not recorded on API 33. Both pinned defects are in the RECORDER, not a
-# parser, and each test fails on the missing file until the recording exists.
+# API 33 logs no `Broadcasting: Intent` record (V9-A) and its `input` has no
+# --async (V9-I), so these windows start at the recorder's own mark and the key
+# event's adb call is bounded. What remains is API 35's shape, record for record.
 
-_ANR_MARKER_ABSENT = (
-    "V9-A: the ANR recorders start their window at ActivityManager's `Broadcasting: Intent "
-    "{ act=...PROVOKE_ANR` record, which API 33 does not log (the ANR itself happens: "
-    "'ANR in com.example.composefixture' is in the buffer), so they refuse with 'no "
-    "provoking broadcast in the buffer'"
-)
-_INPUT_ASYNC_ABSENT = (
-    "V9-I: logcat_anr_input_records refuses on API 33 with 'timed out after 30s' in a setup "
-    "step. The likely one is `input keyevent --async`: API 33's `input` usage lists no "
-    "--async (it still exits 0 on an idle device), so the key is presumably injected "
-    "synchronously into the blocked window"
-)
+ANR_FILES = {
+    "logcat_anr_broadcast_records": "logcat_anr_broadcast_records.bin",
+    "logcat_anr_input_records": "logcat_anr_input_records.bin",
+    "logcat_anr_foreign_process_records": "logcat_anr_foreign_process_records.bin",
+}
 
 
-@pytest.mark.parametrize(
-    "file",
-    [
-        pytest.param(
-            "logcat_anr_broadcast_records.bin",
-            marks=pytest.mark.xfail(strict=True, reason=_ANR_MARKER_ABSENT),
-        ),
-        pytest.param(
-            "logcat_anr_input_records.bin",
-            marks=pytest.mark.xfail(strict=True, reason=_INPUT_ASYNC_ABSENT),
-        ),
-        pytest.param(
-            "logcat_anr_foreign_process_records.bin",
-            marks=pytest.mark.xfail(strict=True, reason=_ANR_MARKER_ABSENT),
-        ),
-    ],
-)
-def test_anr_records_parse_to_an_anr_report(file):
-    records = parse_records(API33.data(file))
-    assert [r for r in records if "ANR in" in r.message]
+@pytest.mark.parametrize("name", sorted(ANR_FILES))
+def test_an_anr_report_is_a_system_server_record(name):
+    """`ANR in` from system_server: its pid (pidof in the same run) and uid 1000."""
+    system_server = int(_entry(name)["system_server_pid"])
+    reports = [r for r in parse_records(API33.data(ANR_FILES[name])) if "ANR in" in r.message]
+    assert reports
+    assert all(r.pid == system_server and r.uid == 1000 for r in reports)
+    assert any(r.tag == "ActivityManager" and "\nPID: " in r.message for r in reports)
+
+
+@pytest.mark.parametrize("name", sorted(ANR_FILES))
+def test_api_33_has_all_of_api_35_s_anr_shape_but_the_broadcast_record(name):
+    entry = _entry(name)
+    assert entry["expected_absent"] == []
+    assert "aes-recorder" in entry["window_anchor"]
+
+
+def test_the_input_anr_is_reported_by_window_manager_and_activity_manager():
+    records = parse_records(API33.data(ANR_FILES["logcat_anr_input_records"]))
+    assert any(r.tag == "WindowManager" and r.message.startswith("ANR in Window{") for r in records)
+    assert any(
+        r.tag == "ActivityManager"
+        and r.message.startswith(f"ANR in {PACKAGE} (")
+        and "\nReason: Input dispatching timed out" in r.message
+        for r in records
+    )
+
+
+def test_the_input_anr_key_event_was_bounded_not_async():
+    key = _entry("logcat_anr_input_records")["key_event"]
+    assert key["input_lists_async"] is False
+    assert "--async" not in key["argv"]
+
+
+def test_the_foreign_process_anr_carries_its_start_proc_record():
+    entry = _entry("logcat_anr_foreign_process_records")
+    system_server, pid = int(entry["system_server_pid"]), entry["stalled_pid"]
+    records = parse_records(API33.data(ANR_FILES["logcat_anr_foreign_process_records"]))
+    starts = [r for r in records if r.message.startswith(f"Start proc {pid}:com.example.victim/")]
+    assert starts and all(r.pid == system_server and r.uid == 1000 for r in starts)
+    assert any(r.message.startswith(f"ANR in com.example.victim\nPID: {pid}\n") for r in records)
 
 
 # --- StrictMode --------------------------------------------------------------
@@ -228,13 +243,39 @@ def test_the_two_user_dump_has_a_block_per_user():
     assert re.search(rf"^    User {user}: ", text, flags=re.MULTILINE)
 
 
-def test_the_two_user_dump_parses_to_the_app_s_permissions():
+CAMERA = "android.permission.CAMERA"
+
+
+def _user_blocks(text: str) -> dict[str, str]:
+    """``{user id: that user's block}`` from the package's ``    User N: `` blocks."""
+    parts = re.split(r"^    User (\d+): ", text, flags=re.MULTILINE)
+    return {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
+
+
+def test_camera_is_denied_for_user_0_and_granted_for_the_other_user():
+    """`pm grant --user <id>` changed that user's runtime state and no other's."""
+    user = _entry("dumpsys_package_two_users")["secondary_user"]
+    blocks = _user_blocks(API33.text("dumpsys_package_two_users"))
+    assert re.search(rf"^        {CAMERA}: granted=false\b", blocks["0"], flags=re.MULTILINE)
+    assert re.search(rf"^        {CAMERA}: granted=true\b", blocks[user], flags=re.MULTILINE)
+
+
+def test_the_two_user_dump_parses_to_user_0_s_permissions():
+    """The parser keeps the first runtime section -- user 0's -- so CAMERA reads denied.
+
+    The grant for the other user is invisible to it: what privacy_manager, which
+    has no --user, would confirm against.
+    """
     parsed = parse_package_permissions(API33.text("dumpsys_package_two_users"))
     assert parsed["found"]
     assert parsed["install"], "the app's install-time permission was not read"
     assert all(entry["granted"] for entry in parsed["install"])
-    # The app requests no runtime permission, for either user.
-    assert parsed["runtime"] == []
+    assert [(e["permission"], e["granted"]) for e in parsed["runtime"]] == [(CAMERA, False)]
+
+
+def test_a_per_user_grant_prints_nothing_and_exits_zero():
+    assert API33.text("pm_grant_user").strip() == "exit=0"
+    assert _entry("pm_grant_user")["permission"] == CAMERA
 
 
 def test_the_shared_uid_dump_reads_user_0_of_two():
@@ -263,20 +304,6 @@ def test_the_shared_uid_dump_without_a_second_user_reads_runtime_permissions():
     parsed = parse_package_permissions(API33.text("dumpsys_package_shared_uid"))
     assert parsed["found"]
     assert parsed["runtime"]
-
-
-def test_a_grant_for_another_user_of_an_unrequested_permission_throws():
-    """API 33, user N: SecurityException and exit 255 -- not the silence of user 0 on API 35.
-
-    emulator-api35's pm_grant_not_requested (user 0, the same permission) is
-    no output and exit 0; here the same request for a secondary user fails
-    loudly. Which of the two differences -- API level or user -- decides it is
-    not separable from these two recordings.
-    """
-    text = API33.text("pm_grant_user")
-    assert "SecurityException" in text
-    assert "has not requested permission" in text
-    assert text.rstrip().endswith("exit=255")
 
 
 # --- adb devices -------------------------------------------------------------

@@ -1,6 +1,6 @@
-"""The recorder's MANIFEST bookkeeping, and its serial redaction. No device needed.
+"""The recorder's MANIFEST bookkeeping, serial redaction and ANR window. No device needed.
 
-Three things are held here:
+Four things are held here:
 
 - Every device profile's MANIFEST says, for each fixture, the description and
   command the recorder says today. Four entries had drifted (the recorder's
@@ -12,6 +12,9 @@ Three things are held here:
   re-record claimed every fixture was captured that day.
 - A serial that is not ``emulator-NNNN`` never reaches a committed
   ``adb devices`` fixture.
+- The ANR recorders' window starts at ActivityManager's `Broadcasting:` record
+  where there is one (API 35), and at the recorder's own mark where there is
+  not (API 33, V9-A); the input ANR's key event cannot hang the run (V9-I).
 """
 
 from __future__ import annotations
@@ -211,3 +214,64 @@ def test_a_single_device_listing_must_be_one_device():
     assert rf._exactly_one_device(single) == single
     with pytest.raises(rf.CaptureError, match="lists 2 devices"):
         rf._exactly_one_device(api35.text("adb_devices_multiple"))
+
+
+# --- ANR window and key event ---------------------------------------------------
+
+BROADCAST_MARK = "Broadcasting: Intent { act=com.example.composefixture.PROVOKE_ANR"
+
+
+def test_the_window_starts_at_the_broadcast_record_where_one_is_logged():
+    """API 35's recording begins with that record, so the window is all of it."""
+    data = RecordedFixtures(RECORDED_ROOT / "emulator-api35").data(
+        "logcat_anr_broadcast_records.bin"
+    )
+    records = rf._split_records(data)
+    extra: dict = {}
+    assert rf._anr_window(records, BROADCAST_MARK, extra) == records
+    assert "Broadcasting" in extra["window_anchor"]
+
+
+def test_without_a_broadcast_record_or_a_mark_the_window_is_refused():
+    """API 33's recording holds neither: its mark was filtered out after it was used."""
+    data = RecordedFixtures(RECORDED_ROOT / "emulator-api33").data(
+        "logcat_anr_broadcast_records.bin"
+    )
+    with pytest.raises(rf.CaptureError, match="no window mark"):
+        rf._anr_window(rf._split_records(data), BROADCAST_MARK, {})
+
+
+def test_every_anr_provocation_logs_the_window_mark_first():
+    for name in ("logcat_anr_broadcast_records", "logcat_anr_input_records"):
+        fixture = next(f for f in rf.FIXTURES if f.name == name)
+        provoke = next(i for i, step in enumerate(fixture.setup) if "broadcast" in step)
+        assert fixture.setup[provoke - 1] == rf._LOG_WINDOW_MARK, name
+
+
+class _Hanging:
+    """A child process that never exits until killed, like `input` into a stalled window."""
+
+    killed = False
+
+    def __init__(self, argv, **_kwargs):
+        self.argv = argv
+
+    def wait(self, timeout=None):
+        if not _Hanging.killed:
+            raise rf.subprocess.TimeoutExpired(self.argv, timeout)
+        return -9
+
+    def kill(self):
+        _Hanging.killed = True
+
+
+def test_a_key_event_that_blocks_is_killed_not_waited_for(monkeypatch):
+    # `input`'s usage is not recorded; an empty answer stands for one that lists no --async.
+    monkeypatch.setattr(rf, "_run", lambda *_a, **_k: rf.Capture("", "", 0))
+    monkeypatch.setattr(rf.subprocess, "Popen", _Hanging)
+    _Hanging.killed = False
+    extra: dict = {}
+    rf._send_key_bounded("emulator-5556", extra)
+    assert _Hanging.killed
+    assert extra["key_event"]["killed"] is True
+    assert "--async" not in extra["key_event"]["argv"]

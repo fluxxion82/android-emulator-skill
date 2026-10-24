@@ -2047,35 +2047,136 @@ def _tag_and_message(raw: bytes) -> tuple[str, str]:
     )
 
 
-def _anr_records(*, requires: tuple[str, ...]) -> Callable[[str | None, dict], bytes]:
+# A record the recorder writes itself, immediately before it provokes an ANR,
+# so a window can start somewhere every API level logs. ActivityManager's
+# `Broadcasting: Intent { act=... }` record, the original anchor, is not logged
+# on API 33 (measured: the ANR happens, the record does not).
+_WINDOW_TAG = "aes-recorder"
+_WINDOW_MARK = "anr-window"
+_LOG_WINDOW_MARK = ["shell", "log", "-t", _WINDOW_TAG, _WINDOW_MARK]
+
+
+def _record_time(raw: bytes) -> tuple[int, int]:
+    """``(sec, nsec)`` from one raw record's header."""
+    return struct.unpack_from("<II", raw, 12)
+
+
+def _anr_window(
+    records: list[tuple[int, bytes]], broadcast: str, extra: dict
+) -> list[tuple[int, bytes]]:
+    """The records from the provoking broadcast on.
+
+    The LAST ActivityManager record starting ``broadcast`` when there is one
+    (API 35: what the emulator-api35 fixtures were cut at). Otherwise every
+    record at or after the time of the last window mark the recorder logged
+    (:data:`_LOG_WINDOW_MARK`) just before provoking. ``extra["window_anchor"]``
+    says which.
+
+    Raises:
+        CaptureError: The buffer holds neither.
+    """
+    starts = [
+        index
+        for index, (_pid, raw) in enumerate(records)
+        if _tag_and_message(raw)[0] == "ActivityManager"
+        and _tag_and_message(raw)[1].startswith(broadcast)
+    ]
+    if starts:
+        extra["window_anchor"] = "ActivityManager `Broadcasting: Intent` record"
+        return records[starts[-1] :]
+    marks = [raw for _pid, raw in records if _tag_and_message(raw) == (_WINDOW_TAG, _WINDOW_MARK)]
+    if not marks:
+        raise CaptureError(
+            "no provoking broadcast and no window mark in the buffer: the ANR was not provoked"
+        )
+    since = _record_time(marks[-1])
+    extra["window_anchor"] = f"the recorder's `{_WINDOW_TAG}: {_WINDOW_MARK}` record"
+    return [(pid, raw) for pid, raw in records if _record_time(raw) >= since]
+
+
+# How long the input ANR's key event may block before its adb call is killed.
+# Where `input` has no --async (API 33) the injection waits on the stalled
+# window -- exactly what timed the step out at 30 s.
+_KEY_EVENT_BOUND_S = 5
+
+
+def _send_key_bounded(serial: str | None, extra: dict) -> None:
+    """``input keyevent KEYCODE_SHIFT_LEFT`` to the blocked window, never blocking the run.
+
+    With ``--async`` where the device's ``input`` usage lists it (API 35);
+    without it elsewhere, its adb call killed after :data:`_KEY_EVENT_BOUND_S`
+    seconds. ``extra["key_event"]`` records the argv and whether it was killed.
+    """
+    usage = _run(["shell", "input"], serial, timeout=15)
+    asynchronous = "--async" in usage.stdout + usage.stderr
+    argv = [
+        "shell",
+        "input",
+        "keyevent",
+        *(["--async"] if asynchronous else []),
+        "KEYCODE_SHIFT_LEFT",
+    ]
+    target = ["-s", serial] if serial else []
+    child = subprocess.Popen(
+        ["adb", *target, *argv],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        child.wait(timeout=_KEY_EVENT_BOUND_S)
+        killed = False
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=DEFAULT_TIMEOUT)
+        killed = True
+    extra["key_event"] = {
+        "argv": ["adb", *argv],
+        "input_lists_async": asynchronous,
+        "bound_s": _KEY_EVENT_BOUND_S,
+        "killed": killed,
+    }
+
+
+def _key_then_wait(serial: str | None, extra: dict) -> None:
+    """The input ANR's provocation after its setup: a bounded key event, then 15 s."""
+    _send_key_bounded(serial, extra)
+    time.sleep(15)
+
+
+def _anr_records(
+    *,
+    requires: tuple[str, ...],
+    expects: tuple[str, ...] = (),
+    before: Callable[[str | None, dict], None] | None = None,
+) -> Callable[[str | None, dict], bytes]:
     """One provoked ANR as logd's records -- what the ANR readers read since PR #34.
 
     The ``-B`` counterpart of the ``*_stream`` fixtures: ActivityManager's and
-    WindowManager's records naming the fixture package, from the LAST
-    provoking ``Broadcasting:`` record on (the buffer is not cleared, as
-    there). ``requires`` is text the kept records' messages must hold --
-    among it ``"\\nPID: "``, which is only there if ActivityManager's report is
-    ONE record of many lines. Every kept record must have been written by the
-    pid ``pidof system_server`` names in the same run (``system_server_pid``).
+    WindowManager's records naming the fixture package, from the provoking
+    broadcast on (:func:`_anr_window`; the buffer is not cleared, as there).
+    ``requires`` is text the kept records' messages must hold on every API
+    level; ``expects`` is the rest of the shape measured on API 35 -- among it
+    ``"\\nPID: "``, which is only there if ActivityManager's report is ONE
+    record of many lines. A missing expectation does not refuse the capture: it
+    is listed under the manifest's ``expected_absent``, so a level that differs
+    is recorded as it is and says how. Every kept record must have been written
+    by the pid ``pidof system_server`` names in the same run
+    (``system_server_pid``). ``before`` runs first, given the serial and the
+    manifest extras (the input ANR's key event).
     """
     marker = f"Broadcasting: Intent {{ act={COMPOSE_PACKAGE}.PROVOKE_ANR"
 
     def capture(serial: str | None, extra: dict) -> bytes:
+        if before is not None:
+            before(serial, extra)
         system_server = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
         if not system_server.isdigit():
             raise CaptureError(f"pidof system_server named no single pid: {system_server!r}")
         records = _split_records(_run_bytes(["logcat", "-d", "-B"], serial, timeout=60))
-        starts = [
-            index
-            for index, (_pid, raw) in enumerate(records)
-            if _tag_and_message(raw)[0] == "ActivityManager"
-            and _tag_and_message(raw)[1].startswith(marker)
-        ]
-        if not starts:
-            raise CaptureError("no provoking broadcast in the buffer: the ANR was not provoked")
         kept = [
             (pid, raw)
-            for pid, raw in records[starts[-1] :]
+            for pid, raw in _anr_window(records, marker, extra)
             if _tag_and_message(raw)[0] in ("ActivityManager", "WindowManager")
             and COMPOSE_PACKAGE in _tag_and_message(raw)[1]
         ]
@@ -2087,6 +2188,7 @@ def _anr_records(*, requires: tuple[str, ...]) -> Callable[[str | None, dict], b
         if writers != {system_server}:
             raise CaptureError(f"system_server is {system_server}; the records came from {writers}")
         extra["system_server_pid"] = system_server
+        extra["expected_absent"] = [needle for needle in expects if needle not in messages]
         extra.update(_device_zone(serial))
         return b"".join(_aliased_record(raw) for _pid, raw in kept)
 
@@ -2127,6 +2229,7 @@ def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
     # --async: `am broadcast` otherwise waits for the broadcast to finish --
     # here, for the ANR that kills the process -- so nothing could be asked of
     # the process while it lived (measured: every question came too late).
+    _run(_LOG_WINDOW_MARK, serial, timeout=15)
     _run(
         [
             "shell",
@@ -2186,17 +2289,9 @@ def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
         raise CaptureError(f"pidof system_server named no single pid: {system_server!r}")
     records = _split_records(_run_bytes(["logcat", "-d", "-B"], serial, timeout=60))
     marker = f"Broadcasting: Intent {{ act={_FOREIGN_ACTION}"
-    starts = [
-        index
-        for index, (_pid, raw) in enumerate(records)
-        if _tag_and_message(raw)[0] == "ActivityManager"
-        and _tag_and_message(raw)[1].startswith(marker)
-    ]
-    if not starts:
-        raise CaptureError("no provoking broadcast in the buffer")
     kept = [
         (writer, raw)
-        for writer, raw in records[starts[-1] :]
+        for writer, raw in _anr_window(records, marker, extra)
         if _tag_and_message(raw)[0] in ("ActivityManager", "WindowManager")
         and (
             _FOREIGN_PROCESS in _tag_and_message(raw)[1]
@@ -2204,13 +2299,12 @@ def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
         )
     ]
     messages = "\n".join(_tag_and_message(raw)[1] for _writer, raw in kept)
-    for needle in (
-        f"Start proc {pid}:{_FOREIGN_PROCESS}/",
-        f"ANR in {_FOREIGN_PROCESS}\nPID: {pid}\n",
-        f"Killing {pid}:{_FOREIGN_PROCESS}/",
-    ):
+    for needle in (f"Start proc {pid}:{_FOREIGN_PROCESS}/", f"ANR in {_FOREIGN_PROCESS}"):
         if needle not in messages:
             raise CaptureError(f"the provoked ANR's records do not hold {needle!r}")
+    # The rest of the shape measured on API 35; listed, not refused, when absent.
+    expects = (f"ANR in {_FOREIGN_PROCESS}\nPID: {pid}\n", f"Killing {pid}:{_FOREIGN_PROCESS}/")
+    extra["expected_absent"] = [needle for needle in expects if needle not in messages]
     writers = {str(writer) for writer, _raw in kept}
     if writers != {system_server}:
         raise CaptureError(f"system_server is {system_server}; the records came from {writers}")
@@ -2219,7 +2313,9 @@ def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
         for _writer, raw in kept
         if _tag_and_message(raw)[1].startswith(f"Killing {pid}:")
     ]
-    if not killed or int(asked_at) >= killed[-1]:
+    # ps showing the pid under the app's uid is itself proof it was alive; the
+    # Killing record, where there is one, must also come after it was asked.
+    if killed and int(asked_at) >= killed[-1]:
         raise CaptureError(f"ps was asked at {asked_at}, not before pid {pid} was killed {killed}")
     extra["system_server_pid"] = system_server
     extra["stalled_pid"] = pid
@@ -2523,12 +2619,10 @@ def _exactly_one_device(text: str) -> str:
 # leftover is recognisable in `pm list users`.
 _TMP_USER_NAME = "v9-fixture-tmp"
 
-# What `pm grant --user` is asked for in the two-user window. The fixture app
-# requests NO runtime permission (its merged manifest requests only the
-# install-time DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION), so no grant can
-# change its per-user state; POST_NOTIFICATIONS is the one pm_grant_not_requested
-# measured for user 0, asked here for the secondary user.
-_TWO_USER_GRANT = "android.permission.POST_NOTIFICATIONS"
+# What `pm grant --user` grants in the two-user window: the one runtime
+# permission the fixture app requests (added to its manifest for this), so the
+# secondary user's block can read granted=true while user 0's reads false.
+_TWO_USER_GRANT = "android.permission.CAMERA"
 _SHARED_UID_PACKAGE = "com.android.localtransport"
 
 # The text halves of a multi-fixture run, written by the fixtures listed after
@@ -2612,6 +2706,19 @@ def _two_users_window(_scratch: Path, serial: str | None, extra: dict) -> Captur
                 raise CaptureError(f"{name} names no {needle!r} block with two users installed")
     if "exit=" not in grant.text:
         raise CaptureError(f"pm grant --user printed no exit status: {grant.text.strip()!r}")
+    blocks = re.split(r"^    User (\d+): ", dump.text, flags=re.MULTILINE)
+    states = {
+        blocks[i]: re.search(
+            rf"^\s+{re.escape(_TWO_USER_GRANT)}: granted=(\w+)", blocks[i + 1], re.M
+        )
+        for i in range(1, len(blocks) - 1, 2)
+    }
+    seen = {u: m.group(1) if m else None for u, m in states.items()}
+    if seen.get("0") != "false" or seen.get(user) != "true":
+        raise CaptureError(
+            f"expected {_TWO_USER_GRANT} denied for user 0 and granted for user {user}; the "
+            f"dump's user blocks say {seen} (pm grant: {grant.text.strip()!r})"
+        )
     provenance = {"secondary_user": user}
     extra.update(provenance)
     _TEXT_TWINS["pm_grant_user"] = (grant, {**provenance, "permission": _TWO_USER_GRANT})
@@ -3154,7 +3261,9 @@ FIXTURES: list[Fixture] = [
         command=(
             "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks "
             "40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and "
-            "WindowManager records naming the package, from the provoking broadcast on"
+            "WindowManager records naming the package, from the provoking broadcast on; where "
+            "ActivityManager logs no `Broadcasting: Intent` record (API 33), from an "
+            "`aes-recorder: anr-window` record logged just before provoking"
         ),
         description=(
             "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin "
@@ -3164,24 +3273,26 @@ FIXTURES: list[Fixture] = [
             "WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping "
             "duplicate ANR' verdict, one record each. Every record's pid is system_server's "
             "(manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report "
-            "is held to."
+            "is held to. That shape is API 35's; a level that differs lists what it lacks under "
+            "the manifest's `expected_absent`, and `window_anchor` says where the window began."
         ),
         setup=[
             ["shell", "am", "force-stop", COMPOSE_PACKAGE],
             ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
             ["shell", "sleep", "2"],
+            _LOG_WINDOW_MARK,
             _PROVOKE_ANR,
             ["shell", "sleep", "20"],
         ],
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
         capture_bytes=_anr_records(
-            requires=(
-                f"ANR in {COMPOSE_PACKAGE}",
+            requires=(f"ANR in {COMPOSE_PACKAGE}",),
+            expects=(
                 "\nPID: ",
                 "\nReason: Broadcast of Intent",
                 "ANR in Window{",
                 "Skipping duplicate ANR",
-            )
+            ),
         ),
     ),
     Fixture(
@@ -3192,20 +3303,24 @@ FIXTURES: list[Fixture] = [
         args=["logcat", "-d", "-B"],
         command=(
             "adb shell am broadcast --async (background, 60 s timeout), then input keyevent "
-            "--async KEYCODE_SHIFT_LEFT to the blocked window; 15 s later adb logcat -d -B, "
-            "host-filtered as logcat_anr_broadcast_records"
+            "--async KEYCODE_SHIFT_LEFT to the blocked window (where `input` lists no --async, "
+            "API 33: plain `input keyevent`, its adb call killed after 5 s); 15 s later adb "
+            "logcat -d -B, host-filtered as logcat_anr_broadcast_records"
         ),
         description=(
             "An input-dispatch ANR as logd's records, the twin in kind of "
             "logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input "
             "dispatching timed out' record first, then ActivityManager's report -- ONE record, "
             "'ANR in <package> (<component>)' with its PID and Reason lines. Every record's "
-            "pid is system_server's (manifest `system_server_pid`)."
+            "pid is system_server's (manifest `system_server_pid`). That shape is API 35's; a "
+            "level that differs lists what it lacks under `expected_absent`, and `key_event` "
+            "says how the key was sent."
         ),
         setup=[
             ["shell", "am", "force-stop", COMPOSE_PACKAGE],
             ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
             ["shell", "sleep", "2"],
+            _LOG_WINDOW_MARK,
             [
                 "shell",
                 "am",
@@ -3217,16 +3332,16 @@ FIXTURES: list[Fixture] = [
                 f"{COMPOSE_PACKAGE}.PROVOKE_ANR",
             ],
             ["shell", "sleep", "2"],
-            ["shell", "input", "keyevent", "--async", "KEYCODE_SHIFT_LEFT"],
-            ["shell", "sleep", "15"],
         ],
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
         capture_bytes=_anr_records(
-            requires=(
+            requires=(f"ANR in {COMPOSE_PACKAGE}",),
+            expects=(
                 "ANR in Window{",
                 f"ANR in {COMPOSE_PACKAGE} (",
                 "\nReason: Input dispatching timed out",
-            )
+            ),
+            before=_key_then_wait,
         ),
     ),
     Fixture(
@@ -3243,7 +3358,9 @@ FIXTURES: list[Fixture] = [
             "`Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' "
             "cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, "
             "host-filtered to ActivityManager and WindowManager records naming the process or "
-            "the provoking action"
+            "the provoking action, from the provoking broadcast on; where ActivityManager logs "
+            "no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` "
+            "record logged just before the broadcast"
         ),
         description=(
             "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, "
@@ -3254,7 +3371,9 @@ FIXTURES: list[Fixture] = [
             "carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p "
             "<pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture "
             "app's uid) and `claimed_package_uid_listing` (com.example.victim is not "
-            "installed), `system_server_pid`."
+            "installed), `system_server_pid`. The `Start proc` and `ANR in` records are "
+            "required on every level; what a level lacks of the rest of API 35's shape is "
+            "listed under `expected_absent`."
         ),
         setup=[
             ["shell", "am", "force-stop", COMPOSE_PACKAGE],
@@ -3397,17 +3516,21 @@ FIXTURES: list[Fixture] = [
         args=[],
         command=(
             "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> "
-            f"{COMPOSE_PACKAGE}; pm grant --user <id> ... (pm_grant_user); dumpsys package "
-            f"{COMPOSE_PACKAGE}; dumpsys package {_SHARED_UID_PACKAGE} "
-            "(dumpsys_package_shared_uid_two_users); pm remove-user <id>"
+            f"{COMPOSE_PACKAGE}; pm grant --user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT} "
+            f"(pm_grant_user); dumpsys package {COMPOSE_PACKAGE}; dumpsys package "
+            f"{_SHARED_UID_PACKAGE} (dumpsys_package_shared_uid_two_users); pm remove-user <id>"
         ),
         description=(
-            "`dumpsys package <fixture app>` with the app installed for two users: ground truth "
-            "for where per-user state sits in the dump -- a `User 0:` and a `User <id>:` "
-            "block under the package (the id is the manifest's `secondary_user`), each with "
-            "its own install state and runtime-permission section. The fixture app requests no "
-            "runtime permission, so both users' runtime-permission state is the same (empty); "
-            "what differs is the user blocks themselves. The throwaway user is removed in the "
+            "`dumpsys package <fixture app>` with the app installed for two users and CAMERA "
+            "granted for the second only: ground truth for where per-user runtime-permission "
+            "state sits in the dump -- a `User 0:` and a `User <id>:` block under the package "
+            "(the id is the manifest's `secondary_user`), each with its own install state and "
+            "its own `runtime permissions:` section, where CAMERA reads granted=false for user "
+            "0 and granted=true for user <id> (the recorder refuses a capture that does not). "
+            "CAMERA is the one runtime permission the fixture app requests, added to its "
+            "manifest for this fixture; emulator-api35's pm_grant_not_requested and "
+            "dumpsys_package_after_silent_grant predate it and are unaffected (they use "
+            "POST_NOTIFICATIONS, still not requested). The throwaway user is removed in the "
             "same run and its removal read back from `pm list users`."
         ),
         capture_with=_two_users_window,
@@ -3423,12 +3546,12 @@ FIXTURES: list[Fixture] = [
             "echo exit=$?' (in dumpsys_package_two_users' run, while user <id> exists)"
         ),
         description=(
-            "`pm grant --user <secondary user>` for a permission the fixture app does not "
-            "request: what a per-user grant prints and its exit status (stdout and stderr "
-            "together, then the echoed `exit=`), ground truth for privacy_manager's "
-            "--user handling. The app requests no runtime permission at all, so no grant on it "
-            "can succeed; this records how the request fails or no-ops for a non-zero user. "
-            "Recorded with dumpsys_package_two_users; manifest `secondary_user`, `permission`."
+            "`pm grant --user <secondary user>` of CAMERA, a runtime permission the fixture app "
+            "requests: what a per-user grant that WORKS prints and its exit status (stdout and "
+            "stderr together, then the echoed `exit=`), ground truth for privacy_manager's "
+            "--user handling. That it took effect for that user only is in "
+            "dumpsys_package_two_users, recorded in the same run; manifest `secondary_user`, "
+            "`permission`."
         ),
         capture_with=_text_twin("pm_grant_user", "dumpsys_package_two_users"),
         post=_requires("exit="),
@@ -3446,8 +3569,9 @@ FIXTURES: list[Fixture] = [
             "truth for the shared-uid layout per user. Runtime permissions of a shared-uid "
             "package are printed under the top-level `Shared users:` block "
             "(dumpsys_package_shared_uid), and here that block carries one `User <n>:` "
-            "section per user. Recorded with dumpsys_package_two_users; manifest "
-            "`secondary_user`."
+            "section per user, each with its own runtime-permission list. Recorded with "
+            "dumpsys_package_two_users (whose CAMERA grant does not touch this package); "
+            "manifest `secondary_user`."
         ),
         capture_with=_text_twin(
             "dumpsys_package_shared_uid_two_users", "dumpsys_package_two_users"

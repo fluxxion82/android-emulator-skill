@@ -118,25 +118,101 @@
       "name": "dumpsys_package_shared_uid_two_users",
       "file": "dumpsys_package_shared_uid_two_users.txt",
       "command": "adb shell dumpsys package com.android.localtransport (in dumpsys_package_two_users' run, while the secondary user exists)",
-      "description": "`dumpsys package com.android.localtransport` with a second user on the device: ground truth for the shared-uid layout per user. Runtime permissions of a shared-uid package are printed under the top-level `Shared users:` block (dumpsys_package_shared_uid), and here that block carries one `User <n>:` section per user. Recorded with dumpsys_package_two_users; manifest `secondary_user`.",
+      "description": "`dumpsys package com.android.localtransport` with a second user on the device: ground truth for the shared-uid layout per user. Runtime permissions of a shared-uid package are printed under the top-level `Shared users:` block (dumpsys_package_shared_uid), and here that block carries one `User <n>:` section per user, each with its own runtime-permission list. Recorded with dumpsys_package_two_users (whose CAMERA grant does not touch this package); manifest `secondary_user`.",
       "catches": [],
-      "bytes": 43011,
+      "bytes": 41877,
       "exit_status": 0,
       "stream": "stdout",
-      "secondary_user": "11",
-      "recorded_at": "2026-10-24T18:13:33Z"
+      "secondary_user": "10",
+      "recorded_at": "2026-10-24T18:44:32Z"
     },
     {
       "name": "dumpsys_package_two_users",
       "file": "dumpsys_package_two_users.txt",
-      "command": "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> com.example.composefixture; pm grant --user <id> ... (pm_grant_user); dumpsys package com.example.composefixture; dumpsys package com.android.localtransport (dumpsys_package_shared_uid_two_users); pm remove-user <id>",
-      "description": "`dumpsys package <fixture app>` with the app installed for two users: ground truth for where per-user state sits in the dump -- a `User 0:` and a `User <id>:` block under the package (the id is the manifest's `secondary_user`), each with its own install state and runtime-permission section. The fixture app requests no runtime permission, so both users' runtime-permission state is the same (empty); what differs is the user blocks themselves. The throwaway user is removed in the same run and its removal read back from `pm list users`.",
+      "command": "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> com.example.composefixture; pm grant --user <id> com.example.composefixture android.permission.CAMERA (pm_grant_user); dumpsys package com.example.composefixture; dumpsys package com.android.localtransport (dumpsys_package_shared_uid_two_users); pm remove-user <id>",
+      "description": "`dumpsys package <fixture app>` with the app installed for two users and CAMERA granted for the second only: ground truth for where per-user runtime-permission state sits in the dump -- a `User 0:` and a `User <id>:` block under the package (the id is the manifest's `secondary_user`), each with its own install state and its own `runtime permissions:` section, where CAMERA reads granted=false for user 0 and granted=true for user <id> (the recorder refuses a capture that does not). CAMERA is the one runtime permission the fixture app requests, added to its manifest for this fixture; emulator-api35's pm_grant_not_requested and dumpsys_package_after_silent_grant predate it and are unaffected (they use POST_NOTIFICATIONS, still not requested). The throwaway user is removed in the same run and its removal read back from `pm list users`.",
       "catches": [],
-      "bytes": 6517,
+      "bytes": 6970,
       "exit_status": 0,
       "stream": "stdout",
-      "secondary_user": "11",
-      "recorded_at": "2026-10-24T18:13:33Z"
+      "secondary_user": "10",
+      "recorded_at": "2026-10-24T18:44:32Z"
+    },
+    {
+      "name": "logcat_anr_broadcast_records",
+      "file": "logcat_anr_broadcast_records.bin",
+      "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before provoking",
+      "description": "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin in kind of logcat_anr_broadcast_stream. ActivityManager's report is ONE record: its message is 'ANR in <package>' then '\\nPID: <app pid>', '\\nReason: Broadcast of Intent {...}' and the rest of the report, all one writer's. ~5 s later WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping duplicate ANR' verdict, one record each. Every record's pid is system_server's (manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report is held to. That shape is API 35's; a level that differs lists what it lacks under the manifest's `expected_absent`, and `window_anchor` says where the window began.",
+      "catches": [
+        "D5",
+        "A1"
+      ],
+      "bytes": 4491,
+      "window_anchor": "the recorder's `aes-recorder: anr-window` record",
+      "system_server_pid": "565",
+      "expected_absent": [],
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:44:13Z"
+    },
+    {
+      "name": "logcat_anr_foreign_process_records",
+      "file": "logcat_anr_foreign_process_records.bin",
+      "command": "adb logcat -c; am start -W the fixture app; adb shell am broadcast --async -f 0x10000000 -n com.example.composefixture/.ForeignProcessAnrReceiver (android:process=com.example.victim, AnrReceiver's 40 s block); once system_server logs its `Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the process or the provoking action, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before the broadcast",
+      "description": "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, in a process it named com.example.victim (android:process), under its own uid. ActivityManager prints the PROCESS name -- 'ANR in com.example.victim', its '\\nPID: <pid>' that process's -- and system_server's `Start proc <pid>:com.example.victim/u0a205` and `Killing <pid>:com.example.victim/u0a205 ... bg anr` carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p <pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture app's uid) and `claimed_package_uid_listing` (com.example.victim is not installed), `system_server_pid`. The `Start proc` and `ANR in` records are required on every level; what a level lacks of the rest of API 35's shape is listed under `expected_absent`.",
+      "catches": [
+        "W4-N"
+      ],
+      "bytes": 4432,
+      "window_anchor": "the recorder's `aes-recorder: anr-window` record",
+      "expected_absent": [],
+      "system_server_pid": "565",
+      "stalled_pid": "5725",
+      "ps_alive": {
+        "command": "adb shell ps -o PID,UID -p 5725",
+        "exit_status": 0,
+        "output": "  PID   UID\n 5725 10174\n",
+        "device_epoch": 1792867440
+      },
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10174\n"
+      },
+      "claimed_package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.victim",
+        "exit_status": 0,
+        "output": ""
+      },
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:44:13Z"
+    },
+    {
+      "name": "logcat_anr_input_records",
+      "file": "logcat_anr_input_records.bin",
+      "command": "adb shell am broadcast --async (background, 60 s timeout), then input keyevent --async KEYCODE_SHIFT_LEFT to the blocked window (where `input` lists no --async, API 33: plain `input keyevent`, its adb call killed after 5 s); 15 s later adb logcat -d -B, host-filtered as logcat_anr_broadcast_records",
+      "description": "An input-dispatch ANR as logd's records, the twin in kind of logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input dispatching timed out' record first, then ActivityManager's report -- ONE record, 'ANR in <package> (<component>)' with its PID and Reason lines. Every record's pid is system_server's (manifest `system_server_pid`). That shape is API 35's; a level that differs lists what it lacks under `expected_absent`, and `key_event` says how the key was sent.",
+      "catches": [
+        "D5",
+        "A1"
+      ],
+      "bytes": 4622,
+      "key_event": {
+        "argv": [
+          "adb",
+          "shell",
+          "input",
+          "keyevent",
+          "KEYCODE_SHIFT_LEFT"
+        ],
+        "input_lists_async": false,
+        "bound_s": 5,
+        "killed": true
+      },
+      "window_anchor": "the recorder's `aes-recorder: anr-window` record",
+      "system_server_pid": "565",
+      "expected_absent": [],
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:44:13Z"
     },
     {
       "name": "logcat_choreographer_jank",
@@ -228,15 +304,15 @@
     {
       "name": "pm_grant_user",
       "file": "pm_grant_user.txt",
-      "command": "adb shell 'pm grant --user <id> com.example.composefixture android.permission.POST_NOTIFICATIONS 2>&1; echo exit=$?' (in dumpsys_package_two_users' run, while user <id> exists)",
-      "description": "`pm grant --user <secondary user>` for a permission the fixture app does not request: what a per-user grant prints and its exit status (stdout and stderr together, then the echoed `exit=`), ground truth for privacy_manager's --user handling. The app requests no runtime permission at all, so no grant on it can succeed; this records how the request fails or no-ops for a non-zero user. Recorded with dumpsys_package_two_users; manifest `secondary_user`, `permission`.",
+      "command": "adb shell 'pm grant --user <id> com.example.composefixture android.permission.CAMERA 2>&1; echo exit=$?' (in dumpsys_package_two_users' run, while user <id> exists)",
+      "description": "`pm grant --user <secondary user>` of CAMERA, a runtime permission the fixture app requests: what a per-user grant that WORKS prints and its exit status (stdout and stderr together, then the echoed `exit=`), ground truth for privacy_manager's --user handling. That it took effect for that user only is in dumpsys_package_two_users, recorded in the same run; manifest `secondary_user`, `permission`.",
       "catches": [],
-      "bytes": 1555,
+      "bytes": 7,
       "exit_status": 0,
       "stream": "stdout",
-      "secondary_user": "11",
-      "permission": "android.permission.POST_NOTIFICATIONS",
-      "recorded_at": "2026-10-24T18:13:33Z"
+      "secondary_user": "10",
+      "permission": "android.permission.CAMERA",
+      "recorded_at": "2026-10-24T18:44:32Z"
     },
     {
       "name": "ps_all_pid_uid",
