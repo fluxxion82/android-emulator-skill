@@ -1,6 +1,6 @@
 {
   "profile": "gradle-8.13",
-  "recorded_at": "2026-10-24T18:14:26Z",
+  "recorded_at": "2026-10-19T06:54:28Z",
   "gradle_version": "8.13",
   "scaffolds": [
     "tests/fixtures/scaffold/flavored",
@@ -264,6 +264,7 @@
     {
       "name": "connected_android_test_success",
       "file": "connected_android_test_success.txt",
+      "recorded_at": "2026-10-24T18:14:00Z",
       "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
       "scaffold": "tests/fixtures/scaffold/compose",
       "setup": "run in a temporary copy of the scaffold",
@@ -281,6 +282,7 @@
     {
       "name": "junit_xml_instrumented_passing",
       "file": "junit_xml_instrumented_passing.xml",
+      "recorded_at": "2026-10-24T18:14:00Z",
       "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
       "scaffold": "tests/fixtures/scaffold/compose",
       "setup": "run in a temporary copy of the scaffold",
@@ -297,6 +299,7 @@
     {
       "name": "instrumented_results_tree",
       "file": "instrumented_results_tree.txt",
+      "recorded_at": "2026-10-24T18:14:00Z",
       "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
       "scaffold": "tests/fixtures/scaffold/compose",
       "setup": "run in a temporary copy of the scaffold",
@@ -313,6 +316,7 @@
     {
       "name": "connected_android_test_failure",
       "file": "connected_android_test_failure.txt",
+      "recorded_at": "2026-10-24T18:14:26Z",
       "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.FailingInstrumentedTest",
       "scaffold": "tests/fixtures/scaffold/compose",
       "setup": "run in a temporary copy of the scaffold",
@@ -330,6 +334,7 @@
     {
       "name": "junit_xml_instrumented_failing",
       "file": "junit_xml_instrumented_failing.xml",
+      "recorded_at": "2026-10-24T18:14:26Z",
       "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.FailingInstrumentedTest",
       "scaffold": "tests/fixtures/scaffold/compose",
       "setup": "run in a temporary copy of the scaffold",
@@ -346,6 +351,7 @@
     {
       "name": "connected_android_test_no_device",
       "file": "connected_android_test_no_device.txt",
+      "recorded_at": "2026-10-24T18:13:26Z",
       "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
       "scaffold": "tests/fixtures/scaffold/compose",
       "setup": "run in a temporary copy of the scaffold",

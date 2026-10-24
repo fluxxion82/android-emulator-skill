@@ -954,6 +954,8 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
         path = out_dir / f"{fixture.name}.{fixture.ext}"
         path.write_text(text, encoding="utf-8")
         common = {
+            # Per entry: a partial run must not re-date what it did not record.
+            "recorded_at": _utc_stamp(),
             "command": (
                 "gradle --console=plain "
                 + ("--rerun-tasks " if fixture.rerun else "")
@@ -1048,20 +1050,50 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
             )
             print(f"  ok    {side_path.name} ({len(body.encode('utf-8'))} bytes)")
 
-    if only is not None and (out_dir / "MANIFEST.json").exists():
-        # Merge: what was not re-recorded keeps its entry, in FIXTURES order.
-        previous = json.loads((out_dir / "MANIFEST.json").read_text(encoding="utf-8"))
+    manifest_path = out_dir / "MANIFEST.json"
+    previous = None
+    if only is not None and manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _merged_manifest(previous, entries, version=version, now=_utc_stamp())
+    manifest_path.write_text(_manifest_text(manifest), encoding="utf-8")
+    print(f"\n{len(manifest['fixtures'])} fixture(s) -> {out_dir}")
+    return 0
+
+
+def _utc_stamp() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _manifest_text(manifest: dict) -> str:
+    return json.dumps(manifest, indent=2) + "\n"
+
+
+def _merged_manifest(previous: dict | None, entries: list[dict], *, version: str, now: str) -> dict:
+    """The manifest to write after recording ``entries``.
+
+    ``previous`` is the existing manifest on a partial (``--only``) run, None on
+    a full one. A partial run replaces only the entries it recorded -- each of
+    which carries its own ``recorded_at`` -- and keeps every other entry as it
+    was, in FIXTURES order, together with the profile-level ``recorded_at``:
+    re-dating the whole profile would claim every untouched fixture was
+    recorded today. ``gradle_version`` is the profile's key, so it cannot
+    differ; ``scaffolds`` and ``note`` are this recorder's constants and only
+    change when the recorder does.
+    """
+    if previous is None:
+        recorded_at, fixtures = now, entries
+    else:
+        recorded_at = previous.get("recorded_at", now)
         recorded = {entry["name"]: entry for entry in previous.get("fixtures", [])}
         recorded.update({entry["name"]: entry for entry in entries})
         order = _ordered_names()
-        entries = sorted(
+        fixtures = sorted(
             recorded.values(),
             key=lambda e: order.index(e["name"]) if e["name"] in order else len(order),
         )
-
-    manifest = {
+    return {
         "profile": f"gradle-{version}",
-        "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recorded_at": recorded_at,
         "gradle_version": version,
         "scaffolds": [f"tests/fixtures/scaffold/{s.name}" for s in ALL_SCAFFOLDS],
         "note": (
@@ -1070,11 +1102,8 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
             "hostname, timestamp and per-test time normalised: Gradle writes "
             "the recording machine's hostname into every testsuite element."
         ),
-        "fixtures": entries,
+        "fixtures": fixtures,
     }
-    (out_dir / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"\n{len(entries)} fixture(s) -> {out_dir}")
-    return 0
 
 
 def main() -> None:
