@@ -469,8 +469,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 21. **status_bar.py** ⭐ NEW - Status bar control
     - Set battery level and charging state
-    - Set WiFi/mobile signal strength
-    - Set time display (for consistent screenshots)
+    - Set WiFi/mobile signal strength, or hide either icon: `--wifi hide`,
+      `--mobile hide` (bare `--wifi` / `--mobile` shows it)
+    - Set time display (for consistent screenshots): `--time` takes `H:MM` or
+      `HH:MM` (`9:41` reaches SystemUI as `0941`); anything else is refused
     - Demo mode support
     - Options: `--preset`, `--battery`, `--charging`, `--wifi`, `--mobile`, `--time`, `--reset`, `--serial`, `--json`
     - All of these drive SystemUI **demo mode**, which changes what the status
@@ -1439,9 +1441,6 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
 
 **Known gaps, for the next release:**
 
-- `status_bar --time` must be given zero-padded — `09:41`, not `9:41`. The value
-  reaches SystemUI's demo mode as `hhmm`; an unpadded one is ignored while the
-  script still reports success.
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
 - `anr_watcher --watch` / `--since` with `--package` drop every jank and

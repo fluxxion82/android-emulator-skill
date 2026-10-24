@@ -18,8 +18,11 @@ Usage Examples:
     # Set full signal
     python scripts/status_bar.py --signal full
 
-    # Set time to 9:41 AM
+    # Set time to 9:41 (H:MM or HH:MM; sent to SystemUI as 0941)
     python scripts/status_bar.py --time "9:41"
+
+    # Hide the WiFi icon (bare --wifi shows it)
+    python scripts/status_bar.py --wifi hide
 
     # Apply a coherent demo-mode preset (clean status bar for screenshots)
     python scripts/status_bar.py --preset clean
@@ -30,6 +33,7 @@ Usage Examples:
 
 import argparse
 import json
+import re
 import sys
 
 from common import adb_exec, cli
@@ -41,6 +45,43 @@ from common.env_config import env_int
 # without code edits (e.g. raising the "low battery" threshold for testing).
 PRESET_LOW_BATTERY_LEVEL = env_int("ANDROID_EMU_PRESET_LOW_BATTERY_LEVEL", 15, min_value=0)
 PRESET_TESTING_BATTERY_LEVEL = env_int("ANDROID_EMU_PRESET_TESTING_BATTERY_LEVEL", 50, min_value=0)
+
+# H:MM or HH:MM. ASCII digits only: `\d` would also take other scripts' digits.
+_TIME_PATTERN = re.compile(r"([0-9]{1,2}):([0-9]{2})")
+
+TIME_REMEDY = "Pass the time as H:MM or HH:MM on a 24-hour clock, e.g. --time 9:41 or --time 13:05."
+
+
+def demo_clock_hhmm(time_str: str) -> str:
+    """Turn ``H:MM`` / ``HH:MM`` into the four-digit ``hhmm`` SystemUI's demo clock takes.
+
+    SystemUI ignores an ``hhmm`` that is not four digits -- no error, exit 0,
+    ``Broadcast completed: result=0`` -- so ``"9:41"`` with its colon stripped
+    (``941``) left the real time on screen while every check passed. Recorded:
+    ``tests/fixtures/recorded/emulator-api35/demo_mode_clock_941.png`` shows the
+    device's own clock, ``demo_mode_clock_0941.png`` shows 9:41.
+
+    Colon-less input (``941``, ``0941``) is refused rather than guessed at: the
+    colon is what says where the hour ends.
+
+    Args:
+        time_str: The time as given, e.g. ``"9:41"`` or ``"09:41"``.
+
+    Returns:
+        The zero-padded ``hhmm``, e.g. ``"0941"``.
+
+    Raises:
+        ValueError: ``time_str`` is not H:MM / HH:MM in 00:00-23:59.
+    """
+    match = _TIME_PATTERN.fullmatch(time_str)
+    if match is not None:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if hour <= 23 and minute <= 59:
+            return f"{hour:02d}{minute:02d}"
+    raise ValueError(
+        f"--time {time_str!r} is not a time SystemUI's demo clock can show "
+        "(expected H:MM or HH:MM, 00:00-23:59)"
+    )
 
 
 class StatusBarController:
@@ -279,13 +320,17 @@ class StatusBarController:
         Set time display (for screenshots).
 
         Args:
-            time_str: Time string (e.g., "9:41")
+            time_str: Time as H:MM or HH:MM (e.g., "9:41"), sent as a
+                four-digit hhmm (see :func:`demo_clock_hhmm`)
 
         Returns:
-            (success, message) tuple
+            (success, message) tuple; a malformed time is refused before any
+            adb call
         """
-        # Note: This requires custom implementation as Android doesn't have
-        # a built-in command for this. Using demo mode on supported devices.
+        try:
+            hhmm = demo_clock_hhmm(time_str)
+        except ValueError as e:
+            return False, str(e)
 
         try:
             # Enable + enter demo mode
@@ -298,7 +343,7 @@ class StatusBarController:
                 "clock",
                 "-e",
                 "hhmm",
-                quote_for_device_shell(time_str.replace(":", "")),
+                quote_for_device_shell(hhmm),
             )
 
             return True, f"Time set to {time_str} (demo mode)"
@@ -327,7 +372,8 @@ class StatusBarController:
         directly for ad-hoc multi-field overrides.
 
         Args:
-            time: Time string in H:MM form (e.g., "9:41")
+            time: Time as H:MM or HH:MM (e.g., "9:41"); a malformed one is
+                refused before any adb call
             battery: Battery level (0-100)
             charging: Show the battery as charging/plugged in
             wifi: Show (True) or hide (False) the WiFi icon; None leaves it alone
@@ -343,20 +389,27 @@ class StatusBarController:
         if battery is not None and not 0 <= battery <= 100:
             return False, "Battery level must be between 0 and 100"
 
+        hhmm = None
+        if time is not None:
+            try:
+                hhmm = demo_clock_hhmm(time)
+            except ValueError as e:
+                return False, str(e)
+
         try:
             # Enter demo mode once for the whole atomic group.
             self._enter_demo_mode()
 
             applied = []
 
-            if time:
+            if hhmm is not None:
                 self._demo_broadcast(
                     "-e",
                     "command",
                     "clock",
                     "-e",
                     "hhmm",
-                    quote_for_device_shell(time.replace(":", "")),
+                    quote_for_device_shell(hhmm),
                 )
                 applied.append(f"time={time}")
 
@@ -501,7 +554,10 @@ Examples:
   # Set full WiFi signal
   python scripts/status_bar.py --wifi --wifi-level 4
 
-  # Set time for screenshots
+  # Hide the WiFi and mobile icons
+  python scripts/status_bar.py --wifi hide --mobile hide
+
+  # Set time for screenshots (H:MM or HH:MM; 9:41 is sent as 0941)
   python scripts/status_bar.py --time "9:41"
 
   # Apply a coherent demo-mode preset
@@ -521,12 +577,29 @@ Examples:
     )
     parser.add_argument("--battery", type=int, help="Battery level (0-100)")
     parser.add_argument("--charging", action="store_true", help="Show charging indicator")
-    parser.add_argument("--wifi", action="store_true", help="Enable WiFi indicator")
+    parser.add_argument(
+        "--wifi",
+        nargs="?",
+        const="show",
+        choices=["show", "hide"],
+        help="Show the WiFi indicator (bare --wifi or --wifi show), or hide it (--wifi hide)",
+    )
     parser.add_argument("--wifi-level", type=int, default=4, help="WiFi signal level (0-4)")
-    parser.add_argument("--mobile", action="store_true", help="Enable mobile data")
+    parser.add_argument(
+        "--mobile",
+        nargs="?",
+        const="show",
+        choices=["show", "hide"],
+        help="Show the mobile-data indicator (bare --mobile or --mobile show), "
+        "or hide it (--mobile hide)",
+    )
     parser.add_argument("--mobile-level", type=int, default=4, help="Mobile signal level (0-4)")
     parser.add_argument("--mobile-type", default="lte", help="Mobile data type (lte, 3g, 4g, 5g)")
-    parser.add_argument("--time", help="Set time display (e.g., 9:41)")
+    parser.add_argument(
+        "--time",
+        help="Set time display as H:MM or HH:MM, 00:00-23:59 (e.g., 9:41); "
+        "anything else is refused",
+    )
     parser.add_argument("--reset", action="store_true", help="Reset to actual values")
     parser.add_argument(
         "--serial", dest="device_serial", help="Device serial (uses default if not specified)"
@@ -535,6 +608,14 @@ Examples:
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args(argv)
+
+    # Refuse a malformed --time before anything reaches the device, so a
+    # refused command changes nothing (not even the --battery beside it).
+    if args.time is not None:
+        try:
+            demo_clock_hhmm(args.time)
+        except ValueError as e:
+            cli.fail(str(e), TIME_REMEDY)
 
     controller = StatusBarController(serial=args.device_serial)
     results = []
@@ -566,17 +647,19 @@ Examples:
         results.append({"operation": "battery", "success": success, "message": message})
 
     # WiFi operation
-    if args.wifi:
-        success, message = controller.set_wifi(True, args.wifi_level)
+    if args.wifi is not None:
+        success, message = controller.set_wifi(args.wifi == "show", args.wifi_level)
         results.append({"operation": "wifi", "success": success, "message": message})
 
     # Mobile data operation
-    if args.mobile:
-        success, message = controller.set_mobile_data(True, args.mobile_level, args.mobile_type)
+    if args.mobile is not None:
+        success, message = controller.set_mobile_data(
+            args.mobile == "show", args.mobile_level, args.mobile_type
+        )
         results.append({"operation": "mobile", "success": success, "message": message})
 
     # Time operation
-    if args.time:
+    if args.time is not None:
         success, message = controller.set_time(args.time)
         results.append({"operation": "time", "success": success, "message": message})
 
