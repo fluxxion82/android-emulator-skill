@@ -1,0 +1,144 @@
+Activity Resolver Table:
+  Non-Data Actions:
+      android.intent.action.MAIN:
+        c83f079 com.example.composefixture/.DefaultActivity filter e0871be
+          Action: "android.intent.action.MAIN"
+          Category: "android.intent.category.LAUNCHER"
+
+Receiver Resolver Table:
+  Non-Data Actions:
+      androidx.profileinstaller.action.SAVE_PROFILE:
+        829213b com.example.composefixture/androidx.profileinstaller.ProfileInstallReceiver filter a4efa96
+          Action: "androidx.profileinstaller.action.SAVE_PROFILE"
+      com.example.composefixture.PROVOKE_FOREIGN_PROCESS_ANR:
+        4a1b35 com.example.composefixture/.ForeignProcessAnrReceiver filter 3d5ebca
+          Action: "com.example.composefixture.PROVOKE_FOREIGN_PROCESS_ANR"
+      com.example.composefixture.PROVOKE_ANR:
+        334821f com.example.composefixture/.AnrReceiver filter ffb096c
+          Action: "com.example.composefixture.PROVOKE_ANR"
+      androidx.profileinstaller.action.INSTALL_PROFILE:
+        829213b com.example.composefixture/androidx.profileinstaller.ProfileInstallReceiver filter 455058
+          Action: "androidx.profileinstaller.action.INSTALL_PROFILE"
+      androidx.profileinstaller.action.SKIP_FILE:
+        829213b com.example.composefixture/androidx.profileinstaller.ProfileInstallReceiver filter 80e35b1
+          Action: "androidx.profileinstaller.action.SKIP_FILE"
+      androidx.profileinstaller.action.BENCHMARK_OPERATION:
+        829213b com.example.composefixture/androidx.profileinstaller.ProfileInstallReceiver filter 9fe9617
+          Action: "androidx.profileinstaller.action.BENCHMARK_OPERATION"
+
+Domain verification status:
+
+Permissions:
+  Permission [com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION] (b76e388):
+    sourcePackage=com.example.composefixture
+    uid=10174 gids=[] type=0 prot=signature
+    perm=PermissionInfo{e228121 com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION}
+
+Registered ContentProviders:
+  com.example.composefixture/androidx.startup.InitializationProvider:
+    Provider{88f3946 com.example.composefixture/androidx.startup.InitializationProvider}
+
+ContentProvider Authorities:
+  [com.example.composefixture.androidx-startup]:
+    Provider{88f3946 com.example.composefixture/androidx.startup.InitializationProvider}
+      applicationInfo=ApplicationInfo{a92e707 com.example.composefixture}
+
+Key Set Manager:
+  [com.example.composefixture]
+      Signing KeySets: 53
+
+Packages:
+  Package [com.example.composefixture] (95ab034):
+    userId=10174
+    pkg=Package{9850e5d com.example.composefixture}
+    codePath=/data/app/~~1MHH_Ig0nZ9Osm6lOuD7TQ==/com.example.composefixture-w7a83D395drkO5DggMUckQ==
+    resourcePath=/data/app/~~1MHH_Ig0nZ9Osm6lOuD7TQ==/com.example.composefixture-w7a83D395drkO5DggMUckQ==
+    legacyNativeLibraryDir=/data/app/~~1MHH_Ig0nZ9Osm6lOuD7TQ==/com.example.composefixture-w7a83D395drkO5DggMUckQ==/lib
+    extractNativeLibs=false
+    primaryCpuAbi=arm64-v8a
+    secondaryCpuAbi=null
+    cpuAbiOverride=null
+    versionCode=1 minSdk=24 targetSdk=36
+    minExtensionVersions=[]
+    versionName=1.0
+    usesNonSdkApi=false
+    splits=[base]
+    apkSigningVersion=2
+    flags=[ DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]
+    privateFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE_VIA_SDK_VERSION ALLOW_AUDIO_PLAYBACK_CAPTURE PRIVATE_FLAG_ALLOW_NATIVE_HEAP_POINTER_TAGGING ]
+    forceQueryable=false
+    dataDir=/data/user/0/com.example.composefixture
+    supportsScreens=[small, medium, large, xlarge, resizeable, anyDensity]
+    usesOptionalLibraries:
+      androidx.window.extensions
+      androidx.window.sidecar
+    usesLibraryFiles:
+      /system_ext/framework/androidx.window.extensions.jar
+      /system_ext/framework/androidx.window.sidecar.jar
+    timeStamp=2026-10-24 11:09:23
+    lastUpdateTime=2026-10-24 11:09:23
+    packageSource=0
+    signatures=PackageSignatures{376bec6 version:2, signatures:[aa083f1f], past signatures:[]}
+    installPermissionsFixed=true
+    pkgFlags=[ DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]
+    declared permissions:
+      com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION: prot=signature, INSTALLED
+    requested permissions:
+      com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+    install permissions:
+      com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION: granted=true
+    User 0: ceDataInode=140481 installed=true hidden=false suspended=false distractionFlags=0 stopped=true notLaunched=true enabled=0 instant=false virtual=false
+      installReason=0
+      firstInstallTime=2026-10-24 11:09:23
+      uninstallReason=0
+      overlay paths:
+        /product/overlay/EmulationPixel7/EmulationPixel7Overlay.apk
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+      legacy overlay paths:
+        /product/overlay/EmulationPixel7/EmulationPixel7Overlay.apk
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+      runtime permissions:
+    User 11: ceDataInode=0 installed=true hidden=false suspended=false distractionFlags=0 stopped=false notLaunched=false enabled=0 instant=false virtual=false
+      installReason=0
+      firstInstallTime=2026-10-24 11:13:18
+      uninstallReason=0
+      overlay paths:
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+      legacy overlay paths:
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+      runtime permissions:
+
+Queries:
+  system apps queryable: false
+  queries via forceQueryable:
+  queries via package name:
+  queries via component:
+    com.google.android.settings.intelligence:
+      com.example.composefixture
+  queryable via interaction:
+    User 0:
+    User 11:
+  queryable via uses-library:
+
+Dexopt state:
+  [com.example.composefixture]
+    path: /data/app/~~1MHH_Ig0nZ9Osm6lOuD7TQ==/com.example.composefixture-w7a83D395drkO5DggMUckQ==/base.apk
+      arm64: [status=run-from-apk] [reason=unknown]
+  BgDexopt state:
+    enabled:true
+    mDexOptThread:null
+    mDexOptCancellingThread:null
+    mFinishedPostBootUpdate:false
+    mLastExecutionStatus:0
+    mLastExecutionStartTimeMs:0
+    mLastExecutionDurationIncludingSleepMs:0
+    mLastExecutionStartUptimeMs:0
+    mLastExecutionDurationMs:0
+    now:377325
+    mLastCancelledPackages:
+    mFailedPackageNamesPrimary:
+    mFailedPackageNamesSecondary:
+
+Compiler stats:
+  [com.example.composefixture]
+    (No recorded stats)

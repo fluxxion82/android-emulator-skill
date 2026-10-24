@@ -1,0 +1,202 @@
+--------- beginning of system
+10-24 11:13:12.748   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:12.748   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+10-24 11:13:12.748   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:12.748   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:12.748   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:12.763   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.763   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:12.763   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:12.763   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.763   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:12.764   581   581 I ExplicitHealthCheckController: Not binding to service, service already connecting
+10-24 11:13:12.769   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:12.769   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:12.769   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.769   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:12.772   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.772   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.772   581  3282 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:12.775   581  3282 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:12.775   581  3282 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:12.776   581  3282 I ExplicitHealthCheckController: Explicit health check service is unbound
+--------- beginning of main
+10-24 11:13:12.779  5199  7808 I bwir    : updateFromConfigurations using legacy put method [CONTEXT service_id=204 ]
+10-24 11:13:12.788  1381  1381 D NavigationModeController: getCurrentUserContext: contextUser=0 currentUser=0
+10-24 11:13:12.800   581  1372 I RescueParty: Starting to observe: [android], updated namespace: alarm_manager
+10-24 11:13:12.800   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:12.800   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+10-24 11:13:12.801   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:12.801   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:12.801   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:12.811   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.811   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:12.813   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:12.814   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:12.815   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:12.815   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.815   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:12.817   581  1372 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.817   581  1372 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.817   581  1372 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:12.817   581  1372 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:12.818   581  1372 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:12.822   581  1372 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:12.843   581  3282 I RescueParty: Starting to observe: [android, com.google.android.permissioncontroller, com.android.settings], updated namespace: app_hibernation
+10-24 11:13:12.843   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:12.843   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.google.android.permissioncontroller, com.android.settings]
+10-24 11:13:12.843   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:12.843   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:12.843   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:12.869   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.869   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:12.876   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:12.884   581   581 D AppHibernationService: App hibernation changed to enabled=true
+10-24 11:13:12.886   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:12.886   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:12.886   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.886   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:12.889   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.889   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.889   581  3282 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:12.891   581  3282 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:12.891   581  3282 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:12.893   581  3282 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:12.930   581  1372 I RescueParty: Starting to observe: [android, com.android.systemui], updated namespace: window_manager
+10-24 11:13:12.930   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:12.930   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.android.systemui]
+10-24 11:13:12.930   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:12.930   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:12.930   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:12.936   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.936   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:12.940   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:12.943   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:12.944   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:12.944   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:12.944   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:12.946   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.946   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:12.946   581  3282 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:12.946   581  3282 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:12.946   581  3282 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:12.947   581  3282 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:13.003   581  1372 I RescueParty: Starting to observe: [android, com.google.android.bluetooth], updated namespace: bluetooth
+10-24 11:13:13.004   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.004   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.google.android.bluetooth]
+10-24 11:13:13.004   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.004   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:13.004   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.006   581   581 D BluetoothDeviceConfigChangeTracker: shouldRestartWhenPropertiesUpdated: scan_timeout_millis='300000',location_denylist_name='',location_denylist_advertising_data='⊈0016AAFE40/00FFFFFFF0,⊆0016AAFE/00FFFFFF,⊆00FF4C0002/00FFFFFFFF',location_denylist_mac=''
+10-24 11:13:13.006   581   581 D BluetoothDeviceConfigListener: All properties unchanged, skipping restart
+10-24 11:13:13.010   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.010   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:13.012   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:13.012   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:13.013   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:13.013   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.013   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:13.016   581  1372 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.017   581  1372 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.017   581  1372 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:13.018   581  1372 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:13.018   581  1372 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:13.019   581  1372 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:13.025   581  1372 I RescueParty: Starting to observe: [android, com.android.systemui], updated namespace: latency_tracker
+10-24 11:13:13.025   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.025   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.android.systemui]
+10-24 11:13:13.025   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.025   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:13.025   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.031   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.031   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:13.032   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:13.037   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:13.037   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:13.037   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.037   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:13.038   581  3282 I RescueParty: Starting to observe: [android], updated namespace: battery_saver
+10-24 11:13:13.040   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.040   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+10-24 11:13:13.040   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.040   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:13.040   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.053   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.054   581   581 E DeviceConfig: Parsing int failed for location_mode
+10-24 11:13:13.061   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.061   581  3282 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:13.062   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.062   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:13.063   581  1372 I RescueParty: Starting to observe: [android], updated namespace: constrain_display_apis
+10-24 11:13:13.063   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.063   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+10-24 11:13:13.063   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.063   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:13.063   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.064   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.065   581  1372 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:13.065   581  1372 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:13.067   581  1372 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:13.086   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.086   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:13.089   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.089   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:13.089   581  3282 I ExplicitHealthCheckController: Service not ready to get health check requested packages. Binding...
+10-24 11:13:13.089   581  3282 I ExplicitHealthCheckController: Not binding to service, service already connecting
+10-24 11:13:13.094   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:13.094   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:13.094   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.094   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:13.102   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.102   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.102   581  3282 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:13.106   581  3282 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:13.107   581  3282 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:13.111  2596  2968 W A       : (REDACTED) [%s] response code: %d
+10-24 11:13:13.119   581  3282 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:13.140   581  1589 I RescueParty: Starting to observe: [android], updated namespace: nnapi_native
+10-24 11:13:13.141   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.144   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+10-24 11:13:13.144   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.144   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.147   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.148   581  1589 I RescueParty: Starting to observe: [android, com.google.android.networkstack], updated namespace: tethering
+10-24 11:13:13.148   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.148   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android, com.google.android.networkstack]
+10-24 11:13:13.149   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.149   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.149   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:13.156   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:13.157   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.157   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:13.157   581   581 I ExplicitHealthCheckController: Not binding to service, service already connecting
+10-24 11:13:13.157   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:13.157   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:13.157   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.157   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:13.160   581  1372 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.160   581  1372 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.161   581  1372 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:13.163   581  1589 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:13.163   581  1589 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:13.167   581  1589 I ExplicitHealthCheckController: Explicit health check service is unbound
+10-24 11:13:13.186   581  1589 I RescueParty: Starting to observe: [android], updated namespace: location
+10-24 11:13:13.186   581   647 I PackageWatchdog: Syncing state, reason: observing new packages
+10-24 11:13:13.186   581   647 D PackageWatchdog: rescue-party-observer added the following packages to monitor [android]
+10-24 11:13:13.186   581   647 I PackageWatchdog: Syncing state, reason: updated observers
+10-24 11:13:13.186   581   647 I PackageWatchdog: Not pruning observers, elapsed time: 0ms
+10-24 11:13:13.186   581   647 I PackageWatchdog: Saving observer state to file
+10-24 11:13:13.191   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.191   581   581 I ExplicitHealthCheckController: Service not ready to get health check supported packages. Binding...
+10-24 11:13:13.192   581   601 I system_server: Background concurrent copying GC freed 556827(24MB) AllocSpace objects, 11(248KB) LOS objects, 50% free, 21MB/43MB, paused 65us,33us total 159.227ms
+10-24 11:13:13.192   581   581 I ExplicitHealthCheckController: Explicit health check service is bound
+10-24 11:13:13.195   581   581 I ExplicitHealthCheckController: Explicit health check service is connected ComponentInfo{com.google.android.ext.services/android.ext.services.watchdog.ExplicitHealthCheckServiceImpl}
+10-24 11:13:13.195   581   581 I ExplicitHealthCheckController: Service initialized, syncing requests
+10-24 11:13:13.195   581   581 I PackageWatchdog: Syncing health check requests for packages: {}
+10-24 11:13:13.195   581   581 D ExplicitHealthCheckController: Getting health check supported packages
+10-24 11:13:13.195   581  3282 I ExplicitHealthCheckController: Explicit health check supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.195   581  3282 D PackageWatchdog: Received supported packages [PackageConfig{com.google.android.networkstack, 86400000}]
+10-24 11:13:13.195   581  3282 D ExplicitHealthCheckController: Getting health check requested packages
+10-24 11:13:13.196   581  3282 I ExplicitHealthCheckController: Explicit health check requested packages []
+10-24 11:13:13.196   581  3282 I ExplicitHealthCheckController: No more health check requests, unbinding...
+10-24 11:13:13.196   581  3282 I ExplicitHealthCheckController: Explicit health check service is unbound

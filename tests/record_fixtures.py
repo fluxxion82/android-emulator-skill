@@ -15,7 +15,7 @@ Fixtures are written with no header or annotation, so a parser under test sees
 what it would see from the real tool. Provenance lives alongside in
 ``MANIFEST.json``.
 
-Four documented departures from verbatim, all visible in the code below:
+Five documented departures from verbatim, all visible in the code below:
 
 1. CRLF is normalised to LF (``_strip_cr``). In practice the text-mode decode
    in ``_run`` / ``_run_host`` already does it, and does more: Python's
@@ -40,6 +40,9 @@ Four documented departures from verbatim, all visible in the code below:
    of the pids ``pidof`` reported for it, plus the reader's ``beginning of``
    separators. A full window carries every other app's free text, which is not
    ours to publish. Each kept line is verbatim; what is absent is whole lines.
+5. In the ``adb devices`` fixtures, every serial that is not ``emulator-NNNN``
+   -- a phone attached to the recording host -- is replaced by
+   ``SERIALREDACTED`` (``_redact_serials``). Its row and state are kept.
 
 Three fixtures are written through ``capture_bytes`` and so skip (1) and (2)
 entirely; each carries its own check instead.
@@ -106,6 +109,12 @@ DEFAULT_TIMEOUT = 30
 
 # Captured out-of-band: needs `adb exec-out`, not the plain call the rest use.
 HIERARCHY_FIXTURE = "uiautomator_current_screen"
+HIERARCHY_COMMAND = "adb shell uiautomator dump /dev/tty"
+HIERARCHY_DESCRIPTION = (
+    "A real uiautomator hierarchy. Note bounds are in physical "
+    "PIXELS, which is what makes accessibility_audit's comparison "
+    "against a 48 'dp' constant wrong."
+)
 
 
 @dataclass(frozen=True)
@@ -2456,12 +2465,272 @@ def _logcat_tail_zero(_scratch: Path, serial: str | None, extra: dict) -> Captur
     return capture
 
 
+# --- v0.9.0 Inc 0: ground truth for uid ownership, users and adb states -------
+
+# A serial adb gives an emulator. Every other serial -- a USB handset's, an
+# `adb connect` host:port, an mDNS name -- belongs to somebody's hardware and is
+# not ours to publish.
+_EMULATOR_SERIAL_RE = re.compile(r"emulator-\d+")
+SERIAL_REDACTED = "SERIALREDACTED"
+
+
+def _redact_serials(text: str) -> str:
+    """``adb devices`` text with every non-emulator serial replaced by SERIALREDACTED.
+
+    The row is kept, and its state column with it: a phone listed beside the
+    emulator is part of what the output looks like, and its STATE is what a
+    parser reads. Only the first column changes; the header and adb's
+    ``* daemon ...`` lines are left alone.
+    """
+    out = []
+    for line in text.splitlines(keepends=True):
+        fields = line.split()
+        if (
+            fields
+            and not line.startswith(("List of devices", "*"))
+            and not _EMULATOR_SERIAL_RE.fullmatch(fields[0])
+        ):
+            line = line.replace(fields[0], SERIAL_REDACTED, 1)
+        out.append(line)
+    return "".join(out)
+
+
+def _device_rows(text: str) -> list[list[str]]:
+    """The device rows of ``adb devices`` text, split into fields."""
+    return [
+        line.split()
+        for line in text.splitlines()
+        if line.split() and not line.startswith(("List of devices", "*"))
+    ]
+
+
+def _exactly_one_device(text: str) -> str:
+    """Refuse an ``adb devices`` capture that is not one device row.
+
+    adb_devices_single exists to show the one-device shape. Recorded with a
+    second emulator or a phone attached it would be a multi-device listing
+    under a name that says otherwise.
+    """
+    rows = _device_rows(text)
+    if len(rows) != 1:
+        raise CaptureError(
+            f"adb lists {len(rows)} devices; adb_devices_single needs exactly one attached"
+        )
+    return text
+
+
+# A user created for one capture and removed before it is accepted. Named so a
+# leftover is recognisable in `pm list users`.
+_TMP_USER_NAME = "v9-fixture-tmp"
+
+# What `pm grant --user` is asked for in the two-user window. The fixture app
+# requests NO runtime permission (its merged manifest requests only the
+# install-time DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION), so no grant can
+# change its per-user state; POST_NOTIFICATIONS is the one pm_grant_not_requested
+# measured for user 0, asked here for the secondary user.
+_TWO_USER_GRANT = "android.permission.POST_NOTIFICATIONS"
+_SHARED_UID_PACKAGE = "com.android.localtransport"
+
+# The text halves of a multi-fixture run, written by the fixtures listed after
+# it (`_text_twin`). Captures, so they still go through the text pipeline.
+_TEXT_TWINS: dict[str, tuple[Capture, dict]] = {}
+
+
+def _text_twin(name: str, first_half: str) -> Callable[[Path, str | None, dict], Capture]:
+    """A ``capture_with`` returning what ``first_half``'s run captured for ``name``."""
+
+    def capture(_scratch: Path, _serial: str | None, extra: dict) -> Capture:
+        if name not in _TEXT_TWINS:
+            raise CaptureError(
+                f"{name} is captured in the same run as {first_half}; record them together: "
+                f"--only {first_half} {name}"
+            )
+        result, provenance = _TEXT_TWINS.pop(name)
+        extra.update(provenance)
+        return result
+
+    return capture
+
+
+def _users_listed(serial: str | None) -> str:
+    return _run(["shell", "pm", "list", "users"], serial, timeout=15).text
+
+
+def _secondary_user_gone(serial: str | None) -> None:
+    """``teardown_verify``: no user this recorder created is still on the device."""
+    listing = _users_listed(serial)
+    if f":{_TMP_USER_NAME}:" in listing:
+        raise CaptureError(
+            f"user {_TMP_USER_NAME!r} is still on the device; remove it by hand: "
+            f"adb -s <serial> shell pm remove-user <id>  ({listing.strip()!r})"
+        )
+
+
+def _two_users_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """The fixture app installed for two users: a per-user grant and both dumps.
+
+    A throwaway user is created and the app installed for it (as
+    package_list_uid_two_users does). Inside the user's lifetime: ``pm grant
+    --user <id>`` (pm_grant_user, its stdout and stderr together and its exit
+    status echoed), then ``dumpsys package`` for the fixture app (this
+    fixture) and for com.android.localtransport, a shared-uid package
+    (dumpsys_package_shared_uid_two_users). The user is removed in a
+    ``finally`` and the removal read back from ``pm list users``.
+    """
+    created = _run(["shell", "pm", "create-user", _TMP_USER_NAME], serial, timeout=60)
+    match = re.search(r"created user id (\d+)", created.text)
+    if created.returncode != 0 or match is None:
+        raise CaptureError(f"pm create-user failed: {created.text.strip()!r}")
+    user = match.group(1)
+    try:
+        installed = _run(
+            ["shell", "pm", "install-existing", "--user", user, COMPOSE_PACKAGE], serial, timeout=60
+        )
+        if installed.returncode != 0:
+            raise CaptureError(f"install-existing failed: {installed.text.strip()!r}")
+        grant = _run(
+            [
+                "shell",
+                f"pm grant --user {user} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} 2>&1; echo exit=$?",
+            ],
+            serial,
+            timeout=30,
+        )
+        dump = _run(["shell", "dumpsys", "package", COMPOSE_PACKAGE], serial, timeout=60)
+        shared = _run(["shell", "dumpsys", "package", _SHARED_UID_PACKAGE], serial, timeout=60)
+    finally:
+        removed = _run(["shell", "pm", "remove-user", user], serial, timeout=60)
+    for _ in range(15):
+        if f"UserInfo{{{user}:" not in _users_listed(serial):
+            break
+        time.sleep(1)
+    else:
+        raise CaptureError(f"user {user} still listed after pm remove-user: {removed.text!r}")
+    for name, result in (("dumpsys package", dump), ("dumpsys package (shared uid)", shared)):
+        for needle in ("User 0:", f"User {user}:"):
+            if needle not in result.text:
+                raise CaptureError(f"{name} names no {needle!r} block with two users installed")
+    if "exit=" not in grant.text:
+        raise CaptureError(f"pm grant --user printed no exit status: {grant.text.strip()!r}")
+    provenance = {"secondary_user": user}
+    extra.update(provenance)
+    _TEXT_TWINS["pm_grant_user"] = (grant, {**provenance, "permission": _TWO_USER_GRANT})
+    _TEXT_TWINS["dumpsys_package_shared_uid_two_users"] = (shared, dict(provenance))
+    return dump
+
+
+def _strictmode_records(serial: str | None, extra: dict) -> bytes:
+    """StrictModeActivity's violation as logd's records, with the app's uid beside it.
+
+    Run after the setup that provokes it (the same as
+    logcat_strictmode_violation's). Kept: the records from the app's pid
+    (``pidof`` in the same run) or naming the package. The manifest carries the
+    package's uid listing, so the uid logd stamped on the StrictMode records
+    can be held against the app's.
+    """
+    pid = _run(["shell", "pidof", COMPOSE_PACKAGE], serial, timeout=15).text.strip()
+    if not pid.isdigit():
+        raise CaptureError(f"{COMPOSE_PACKAGE} is not running after StrictModeActivity: {pid!r}")
+    listing = _run(
+        ["shell", "cmd", "package", "list", "packages", "-U", COMPOSE_PACKAGE], serial, timeout=15
+    )
+    if f"package:{COMPOSE_PACKAGE} uid:" not in listing.text:
+        raise CaptureError(f"no uid listing for {COMPOSE_PACKAGE}: {listing.text.strip()!r}")
+    data = _keep_records(
+        _run_bytes(["logcat", "-d", "-B"], serial, timeout=60), [pid], [COMPOSE_PACKAGE]
+    )
+    tags = [_tag_and_message(raw)[0] for _pid, raw in _split_records(data)]
+    if "StrictMode" not in tags:
+        raise CaptureError(f"no StrictMode record among the app's {len(tags)} record(s)")
+    extra["pids"] = [pid]
+    extra["package_uid_listing"] = {
+        "command": f"adb shell cmd package list packages -U {COMPOSE_PACKAGE}",
+        "exit_status": listing.returncode,
+        "output": _strip_cr(listing.text),
+    }
+    extra.update(_device_zone(serial))
+    return data
+
+
+def _system_server_pid(serial: str | None) -> dict:
+    """``metadata``: system_server's pid, read with ``pidof`` right after the capture."""
+    answer = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
+    if not answer.isdigit():
+        raise CaptureError(f"pidof system_server named no single pid: {answer!r}")
+    return {"system_server_pid": answer}
+
+
+# How long a rebooting emulator is watched for an `offline` row, and how long
+# it then gets to come back. A cold boot of an API 33 image is ~1 min.
+_OFFLINE_WITHIN_S = 60
+_REBOOT_BACK_WITHIN_S = 240
+
+
+def _booted(serial: str) -> bool:
+    try:
+        answer = _run(["shell", "getprop", "sys.boot_completed"], serial, timeout=10)
+    except CaptureError:
+        return False
+    return answer.returncode == 0 and answer.text.strip() == "1"
+
+
+def _rebooted_back(serial: str | None) -> None:
+    """``teardown_verify``: the rebooted emulator finished booting again."""
+    if serial is None or not _booted(serial):
+        raise CaptureError(f"{serial} has not finished booting (sys.boot_completed != 1)")
+
+
+def _offline_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    """``adb devices -l`` (host-wide, no serial) while the target reads ``offline``.
+
+    The target is rebooted and the HOST's device list polled until the target's
+    row says ``offline``; that listing is the capture. The emulator is then
+    waited for (``wait-for-device``, then ``sys.boot_completed``) before the
+    capture is returned, so a run never ends with the device down.
+    """
+    if not serial or not _EMULATOR_SERIAL_RE.fullmatch(serial):
+        raise CaptureError(f"adb_devices_offline reboots its target; {serial!r} is no emulator")
+    rebooted = _run(["reboot"], serial, timeout=60)
+    if rebooted.returncode != 0:
+        raise CaptureError(f"adb reboot exited {rebooted.returncode}: {rebooted.text.strip()!r}")
+    seen: list[str] = []
+    capture: Capture | None = None
+    try:
+        deadline = time.monotonic() + _OFFLINE_WITHIN_S
+        while time.monotonic() < deadline:
+            listing = _run(["devices", "-l"], None, timeout=15)
+            row = next((r for r in _device_rows(listing.stdout) if r[0] == serial), None)
+            state = row[1] if row and len(row) > 1 else "absent"
+            if not seen or seen[-1] != state:
+                seen.append(state)
+            if state == "offline":
+                capture = listing
+                break
+            time.sleep(0.1)
+    finally:
+        _run(["wait-for-device"], serial, timeout=_REBOOT_BACK_WITHIN_S)
+        deadline = time.monotonic() + _REBOOT_BACK_WITHIN_S
+        while not _booted(serial):
+            if time.monotonic() > deadline:
+                raise CaptureError(f"{serial} did not finish booting within the wait")
+            time.sleep(2)
+    if capture is None:
+        raise CaptureError(
+            f"{serial} never read `offline` within {_OFFLINE_WITHIN_S}s of `adb reboot`; "
+            f"states seen in order: {seen}"
+        )
+    extra["target_serial"] = serial
+    extra["states_seen"] = seen
+    return capture
+
+
 FIXTURES: list[Fixture] = [
     # --- device discovery -------------------------------------------------
     Fixture(
         name="adb_devices_single",
         args=["devices", "-l"],
         description="`adb devices -l` with exactly one device attached.",
+        post=_chain(_redact_serials, _exactly_one_device),
     ),
     Fixture(
         name="adb_devices_multiple",
@@ -2473,6 +2742,32 @@ FIXTURES: list[Fixture] = [
             "a second emulator instance: emulator -avd NAME -read-only."
         ),
         catches=("R5",),
+        post=_redact_serials,
+    ),
+    Fixture(
+        name="adb_devices_offline",
+        emulator_only=True,
+        args=["devices", "-l"],
+        command=(
+            "adb -s <emulator> reboot; poll adb devices -l (host-wide, no serial) every 0.1 s "
+            "until the emulator's row reads offline; adb -s <emulator> wait-for-device; poll "
+            "getprop sys.boot_completed until 1"
+        ),
+        description=(
+            "`adb devices -l` while a device is in the `offline` state: ground truth for what "
+            "device_list's parse_adb_devices and serial resolution see for a device that is "
+            "attached but not usable. Produced by rebooting the recording emulator and "
+            "keeping the first host listing whose row for it reads `offline`; the emulator is "
+            "waited for until sys.boot_completed is 1 before the capture is accepted. Every "
+            "serial that is not `emulator-NNNN` (a phone attached to the same host) is "
+            "replaced by SERIALREDACTED; its row and state are kept. Manifest: "
+            "`target_serial`, and `states_seen`, the target's states in the order they were "
+            "polled. `unauthorized` is NOT recorded: it needs a new adb host key and an "
+            "authorization prompt on a real phone."
+        ),
+        capture_with=_offline_window,
+        teardown_verify=_rebooted_back,
+        post=_redact_serials,
     ),
     Fixture(
         name="adb_device_not_found",
@@ -2678,9 +2973,10 @@ FIXTURES: list[Fixture] = [
             "com.android.settings",
         ],
         description=(
-            "Correct launcher-activity resolution. app_launcher instead greps "
-            "`pm dump` for the first line containing 'Activity' and the package, "
-            "which readily returns an ActivityRecord or a provider."
+            "Correct launcher-activity resolution. app_launcher now uses this; it "
+            "previously grepped `pm dump` for the first line containing both 'Activity' "
+            "and the package name, which readily matched an ActivityRecord or a provider "
+            "(S10, fixed during the adb_exec migration)."
         ),
         catches=("S10",),
     ),
@@ -3084,6 +3380,81 @@ FIXTURES: list[Fixture] = [
         capture_with=_package_uids_two_users,
     ),
     Fixture(
+        name="package_list_uid_all",
+        args=["shell", "cmd", "package", "list", "packages", "-U"],
+        description=(
+            "`cmd package list packages -U` with NO package filter: the whole table, one "
+            "'package:<name> uid:<uid>' row per package. Ground truth for mapping a uid back "
+            "to its packages -- several rows naming one uid is a sharedUserId (android.uid."
+            "system's packages all read uid:1000) -- which a reader of the filtered form "
+            "(package_list_uid) never sees. Non-AOSP names are aliased."
+        ),
+        post=_requires(f"package:{COMPOSE_PACKAGE} uid:", "package:android uid:1000"),
+    ),
+    Fixture(
+        name="dumpsys_package_two_users",
+        emulator_only=True,
+        args=[],
+        command=(
+            "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> "
+            f"{COMPOSE_PACKAGE}; pm grant --user <id> ... (pm_grant_user); dumpsys package "
+            f"{COMPOSE_PACKAGE}; dumpsys package {_SHARED_UID_PACKAGE} "
+            "(dumpsys_package_shared_uid_two_users); pm remove-user <id>"
+        ),
+        description=(
+            "`dumpsys package <fixture app>` with the app installed for two users: ground truth "
+            "for where per-user state sits in the dump -- a `User 0:` and a `User <id>:` "
+            "block under the package (the id is the manifest's `secondary_user`), each with "
+            "its own install state and runtime-permission section. The fixture app requests no "
+            "runtime permission, so both users' runtime-permission state is the same (empty); "
+            "what differs is the user blocks themselves. The throwaway user is removed in the "
+            "same run and its removal read back from `pm list users`."
+        ),
+        capture_with=_two_users_window,
+        teardown_verify=_secondary_user_gone,
+        post=_requires("User 0:"),
+    ),
+    Fixture(
+        name="pm_grant_user",
+        emulator_only=True,
+        args=[],
+        command=(
+            f"adb shell 'pm grant --user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT} 2>&1; "
+            "echo exit=$?' (in dumpsys_package_two_users' run, while user <id> exists)"
+        ),
+        description=(
+            "`pm grant --user <secondary user>` for a permission the fixture app does not "
+            "request: what a per-user grant prints and its exit status (stdout and stderr "
+            "together, then the echoed `exit=`), ground truth for privacy_manager's "
+            "--user handling. The app requests no runtime permission at all, so no grant on it "
+            "can succeed; this records how the request fails or no-ops for a non-zero user. "
+            "Recorded with dumpsys_package_two_users; manifest `secondary_user`, `permission`."
+        ),
+        capture_with=_text_twin("pm_grant_user", "dumpsys_package_two_users"),
+        post=_requires("exit="),
+    ),
+    Fixture(
+        name="dumpsys_package_shared_uid_two_users",
+        emulator_only=True,
+        args=[],
+        command=(
+            f"adb shell dumpsys package {_SHARED_UID_PACKAGE} (in dumpsys_package_two_users' "
+            "run, while the secondary user exists)"
+        ),
+        description=(
+            f"`dumpsys package {_SHARED_UID_PACKAGE}` with a second user on the device: ground "
+            "truth for the shared-uid layout per user. Runtime permissions of a shared-uid "
+            "package are printed under the top-level `Shared users:` block "
+            "(dumpsys_package_shared_uid), and here that block carries one `User <n>:` "
+            "section per user. Recorded with dumpsys_package_two_users; manifest "
+            "`secondary_user`."
+        ),
+        capture_with=_text_twin(
+            "dumpsys_package_shared_uid_two_users", "dumpsys_package_two_users"
+        ),
+        post=_requires("Shared users:"),
+    ),
+    Fixture(
         name="ps_pid_uid",
         emulator_only=True,
         args=[],
@@ -3098,6 +3469,19 @@ FIXTURES: list[Fixture] = [
         ),
         capture_with=_ps_two_owners,
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+    ),
+    Fixture(
+        name="ps_all_pid_uid",
+        args=["shell", "ps", "-A", "-o", "PID,UID"],
+        description=(
+            "`ps -A -o PID,UID`: every process, as the two numeric columns parse_ps_uids "
+            "reads (a `PID UID` header, then one row per process). Ground truth for a "
+            "whole-table pid -> uid read rather than ps_pid_uid's `-p` subset. Manifest "
+            "`system_server_pid` (`pidof system_server` right after) names the row that must "
+            "read uid 1000."
+        ),
+        metadata=_system_server_pid,
+        post=_requires("PID", "UID"),
     ),
     Fixture(
         name="emu_sms_send",
@@ -3509,6 +3893,33 @@ FIXTURES: list[Fixture] = [
         ],
         teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
         post=_requires("StrictMode policy violation"),
+    ),
+    Fixture(
+        name="logcat_strictmode_records",
+        emulator_only=True,
+        ext="bin",
+        args=["logcat", "-d", "-B"],
+        command=(
+            "adb shell am force-stop; adb logcat -c; adb shell am start -W -n "
+            f"{COMPOSE_PACKAGE}/.StrictModeActivity; sleep 3; adb logcat -d -B, host-filtered "
+            "to the records from the app's pid (pidof) or naming the package"
+        ),
+        description=(
+            "logcat_strictmode_violation's provocation as logd's records (`-B`): ground truth "
+            "for whether a StrictMode record carries the APP's uid, which is what lets a "
+            "records reader attribute a violation to a package by uid instead of by text. "
+            "Each record's pid and uid are logd's, from the writer's socket credentials. "
+            "Manifest: `pids` (pidof in the same run), `package_uid_listing` (the app's uid "
+            "to hold the records' uid against), `timezone`."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            ["logcat", "-c"],
+            ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.StrictModeActivity"],
+            ["shell", "sleep", "3"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_bytes=_strictmode_records,
     ),
     # --- host-side adb failures: the retry prompts an agent reads ---------
     Fixture(
@@ -5334,6 +5745,54 @@ def _physical_target_refusal(serial: str | None, selected: list[Fixture]) -> str
     )
 
 
+def recorder_text(name: str) -> tuple[str, str]:
+    """``(command, description)`` the recorder writes to the manifest for ``name``.
+
+    Raises:
+        KeyError: The recorder has no fixture by that name.
+    """
+    if name == HIERARCHY_FIXTURE:
+        return HIERARCHY_COMMAND, HIERARCHY_DESCRIPTION
+    for fixture in FIXTURES:
+        if fixture.name == name:
+            return _command_of(fixture), fixture.description
+    raise KeyError(name)
+
+
+# Profile-level provenance a partial (--only) run leaves as it was. Each entry
+# the run records carries its own `recorded_at`, and its own copy of any of the
+# others that differ from the profile's.
+_PROFILE_PROVENANCE = ("recorded_at", "recorded_on", "device")
+
+
+def _merge_manifest(manifest: dict, previous: dict | None, *, partial: bool) -> dict:
+    """The manifest to write: this run's, merged into ``previous`` when ``partial``.
+
+    Every entry this run recorded is stamped with this run's ``recorded_at``.
+    A full run replaces the manifest. A partial run keeps every previous entry
+    it did not re-record and the profile's own ``recorded_at``,
+    ``recorded_on`` and ``device`` -- a one-fixture re-record must not
+    re-date fixtures it never touched -- and an entry it recorded carries its
+    own ``recorded_on`` / ``device`` when they differ from the profile's
+    (a build-fingerprint bump, say, which the drift refusal does not stop).
+    """
+    for entry in manifest["fixtures"]:
+        entry["recorded_at"] = manifest["recorded_at"]
+    if previous is None or not partial:
+        return manifest
+    recorded_now = {entry["name"] for entry in manifest["fixtures"]}
+    kept = [e for e in previous.get("fixtures", []) if e["name"] not in recorded_now]
+    merged = {**manifest, "fixtures": sorted(kept + manifest["fixtures"], key=lambda e: e["name"])}
+    for key in _PROFILE_PROVENANCE:
+        if key not in previous:
+            continue
+        merged[key] = previous[key]
+        if key != "recorded_at" and manifest[key] != previous[key]:
+            for entry in manifest["fixtures"]:
+                entry[key] = manifest[key]
+    return merged
+
+
 def record(serial: str | None, only: set[str] | None, profile: str) -> int:
     """Record fixtures, write MANIFEST.json, and report what was written."""
     selected = [f for f in FIXTURES if only is None or f.name in only]
@@ -5529,12 +5988,8 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         else:
             _record_one(
                 HIERARCHY_FIXTURE,
-                "adb shell uiautomator dump /dev/tty",
-                (
-                    "A real uiautomator hierarchy. Note bounds are in physical "
-                    "PIXELS, which is what makes accessibility_audit's comparison "
-                    "against a 48 'dp' constant wrong."
-                ),
+                HIERARCHY_COMMAND,
+                HIERARCHY_DESCRIPTION,
                 ["S7"],
                 hierarchy,
                 ext="xml",
@@ -5556,17 +6011,13 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
         "fixtures": entries,
     }
     manifest_path = recorded_dir / "MANIFEST.json"
-    # Merge with any previous run so a partial re-record keeps earlier provenance.
-    if manifest_path.exists() and only is not None:
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        recorded_now = {entry["name"] for entry in entries}
-        entries = [
-            e for e in previous.get("fixtures", []) if e["name"] not in recorded_now
-        ] + entries
-        manifest["fixtures"] = sorted(entries, key=lambda e: e["name"])
+    previous = (
+        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    )
+    manifest = _merge_manifest(manifest, previous, partial=only is not None)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
-    print(f"\n{len(entries)} fixture(s) -> {recorded_dir}")
+    print(f"\n{len(entries)} fixture(s) recorded -> {recorded_dir}")
     print(f"Device: {device.get('model')} API {device.get('api_level')} ({device.get('abi')})")
     if restore_failures:
         print(
