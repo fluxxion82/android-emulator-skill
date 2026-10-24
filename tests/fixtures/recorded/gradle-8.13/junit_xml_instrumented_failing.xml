@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuite name="com.example.composefixture.FailingInstrumentedTest" tests="2" failures="1" errors="0" skipped="0" time="0.0" timestamp="2020-01-01T00:00:00Z" hostname="build-host">
+  <properties>
+    <property name="device" value="Pixel_9(AVD) - 15" />
+    <property name="flavor" value="" />
+    <property name="project" value=":app" />
+  </properties>
+  <testcase name="failsOnPurpose" classname="com.example.composefixture.FailingInstrumentedTest" time="0.0">
+    <failure>java.lang.AssertionError: recorded failure
+at org.junit.Assert.fail(Assert.java:89)
+at com.example.composefixture.FailingInstrumentedTest.failsOnPurpose(FailingInstrumentedTest.kt:21)
+</failure>
+  </testcase>
+  <testcase name="passesAlongsideTheFailure" classname="com.example.composefixture.FailingInstrumentedTest" time="0.0" />
+</testsuite>

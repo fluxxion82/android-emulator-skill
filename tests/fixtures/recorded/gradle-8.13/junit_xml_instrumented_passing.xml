@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuite name="com.example.composefixture.PassingInstrumentedTest" tests="1" failures="0" errors="0" skipped="0" time="0.0" timestamp="2020-01-01T00:00:00Z" hostname="build-host">
+  <properties>
+    <property name="device" value="Pixel_9(AVD) - 15" />
+    <property name="flavor" value="" />
+    <property name="project" value=":app" />
+  </properties>
+  <testcase name="targetContextIsTheFixtureApp" classname="com.example.composefixture.PassingInstrumentedTest" time="0.0" />
+</testsuite>

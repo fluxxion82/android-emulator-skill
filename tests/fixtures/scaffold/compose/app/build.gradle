@@ -1,12 +1,19 @@
 // Build + install (ANDROID_HOME is not exported on the recording machine, so
-// pass it explicitly; there is no Gradle wrapper here on purpose -- `gradle` on
-// PATH is used, exactly like the flavored/ scaffold next door):
+// pass it explicitly). There is a Gradle wrapper here (./gradlew, Gradle 8.13);
+// the recorders use `gradle` on PATH instead -- also 8.13 -- exactly like the
+// flavored/ scaffold next door. Either works:
 //
 //   ANDROID_HOME=~/Library/Android/sdk \
 //   JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 //   gradle -p tests/fixtures/scaffold/compose :app:assembleDebug
 //   adb -s emulator-5554 install -r \
 //     tests/fixtures/scaffold/compose/app/build/outputs/apk/debug/app-debug.apk
+//
+// src/androidTest holds one passing class and one mixed pass/fail class, which
+// tests/record_gradle_fixtures.py runs through connectedDebugAndroidTest to
+// record AGP's console output and JUnit XML. Always pin the device with
+// ANDROID_SERIAL: with several devices attached a connected task runs on every
+// one of them. AGP also uninstalls the APKs it installed when the run ends.
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
@@ -23,6 +30,8 @@ android {
         targetSdk 36
         versionCode 1
         versionName '1.0'
+
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     buildFeatures {
@@ -53,4 +62,9 @@ dependencies {
     implementation 'androidx.compose.ui:ui:1.11.4'
     implementation 'androidx.compose.foundation:foundation:1.11.4'
     implementation 'androidx.compose.material3:material3:1.4.0'
+
+    // Instrumented tests only. Versions are the ones already in the recording
+    // machine's Gradle cache, like everything else in this file.
+    androidTestImplementation 'androidx.test.ext:junit:1.3.0'
+    androidTestImplementation 'androidx.test:runner:1.7.0'
 }

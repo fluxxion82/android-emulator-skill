@@ -1,0 +1,20 @@
+app/build/outputs/androidTest-results/
+app/build/outputs/androidTest-results/connected/
+app/build/outputs/androidTest-results/connected/debug/
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/aapt.1.ok.txt
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/aapt.2.ok.txt
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/cpuinfo
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/device-info.pb
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/logcat-com.example.composefixture.PassingInstrumentedTest-targetContextIsTheFixtureApp.txt
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/meminfo
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/profiling/
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/profiling/emulator-5554_profile.pb
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/test-result.pb
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/test-result.textproto
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/testlog/
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/testlog/test-results.log
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/utp.0.log
+app/build/outputs/androidTest-results/connected/debug/Pixel_9(AVD) - 15/utp.0.log.lck
+app/build/outputs/androidTest-results/connected/debug/TEST-Pixel_9(AVD) - 15-_app-.xml
+app/build/outputs/androidTest-results/connected/debug/test-result.pb
