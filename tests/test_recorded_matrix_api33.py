@@ -93,6 +93,73 @@ def test_api_33_has_all_of_api_35_s_anr_shape_but_the_broadcast_record(name):
     assert "aes-recorder" in entry["window_anchor"]
 
 
+def _events(file: str) -> list[tuple]:
+    """``(record, event)`` for every record anr_watcher's classifier makes an event of."""
+    pairs = []
+    for record in parse_records(API33.data(file)):
+        event = anr_pipeline.event_from_record(record)
+        if event is not None:
+            pairs.append((record, event))
+    return pairs
+
+
+def _activity_manager_anr(name: str) -> dict:
+    """The one `anr` event ActivityManager's report classifies as, held to its writer."""
+    system_server = int(_entry(name)["system_server_pid"])
+    reports = [
+        event
+        for record, event in _events(ANR_FILES[name])
+        if record.tag == "ActivityManager" and event["kind"] == "anr"
+    ]
+    assert len(reports) == 1, f"{name}: {len(reports)} ActivityManager ANR events"
+    assert reports[0]["pid"] == system_server
+    return reports[0]
+
+
+@pytest.mark.parametrize(
+    ("name", "package", "reason"),
+    [
+        (
+            "logcat_anr_broadcast_records",
+            PACKAGE,
+            f"Broadcast of Intent {{ act={PACKAGE}.PROVOKE_ANR ",
+        ),
+        ("logcat_anr_input_records", PACKAGE, "Input dispatching timed out ("),
+        (
+            "logcat_anr_foreign_process_records",
+            "com.example.victim",
+            f"Broadcast of Intent {{ act={PACKAGE}.PROVOKE_FOREIGN_PROCESS_ANR ",
+        ),
+    ],
+)
+def test_the_anr_report_classifies_with_package_pid_and_reason(name, package, reason):
+    """What anr_watcher's classifier (event_from_record) reads off the report record."""
+    event = _activity_manager_anr(name)
+    assert event["anr_package"] == package
+    assert event["reason"].startswith(reason)
+    assert event["app_pid"] not in (None, event["pid"])
+
+
+def test_the_foreign_process_anr_names_the_stalled_pid():
+    event = _activity_manager_anr("logcat_anr_foreign_process_records")
+    assert event["app_pid"] == int(_entry("logcat_anr_foreign_process_records")["stalled_pid"])
+
+
+def test_the_input_anr_s_activity_manager_report_names_the_component():
+    event = _activity_manager_anr("logcat_anr_input_records")
+    assert event["component"] == f"{PACKAGE}/.DefaultActivity"
+
+
+@pytest.mark.parametrize("name", ["logcat_anr_input_records", "logcat_anr_broadcast_records"])
+def test_window_manager_s_report_classifies_as_a_window_anr(name):
+    """An `anr` of a window: its title kept as `window`, no package read from it."""
+    windows = [event for record, event in _events(ANR_FILES[name]) if record.tag == "WindowManager"]
+    assert len(windows) == 1
+    assert windows[0]["kind"] == "anr"
+    assert windows[0]["window"] == f"{PACKAGE}/{PACKAGE}.DefaultActivity"
+    assert "anr_package" not in windows[0]
+
+
 def test_the_input_anr_is_reported_by_window_manager_and_activity_manager():
     records = parse_records(API33.data(ANR_FILES["logcat_anr_input_records"]))
     assert any(r.tag == "WindowManager" and r.message.startswith("ANR in Window{") for r in records)
@@ -134,6 +201,18 @@ def _strictmode_records():
 
 def test_strictmode_records_parse():
     assert any("StrictMode policy violation" in r.message for r in _strictmode_records())
+
+
+def test_each_strictmode_record_classifies_as_one_strictmode_event():
+    """event_from_record: one `strictmode` event per violation, the app's pid, its own cost."""
+    entry = _entry("logcat_strictmode_records")
+    events = [event for _record, event in _events("logcat_strictmode_records.bin")]
+    assert len(events) == len(_strictmode_records())
+    for event in events:
+        assert event["kind"] == "strictmode"
+        assert str(event["pid"]) in entry["pids"]
+        stated = re.search(r"~duration=(\d+) ms", event["message"])
+        assert stated and event["duration_ms"] == float(stated.group(1))
 
 
 def test_a_strictmode_record_carries_the_app_s_uid_and_pid():
@@ -278,26 +357,48 @@ def test_a_per_user_grant_prints_nothing_and_exits_zero():
     assert _entry("pm_grant_user")["permission"] == CAMERA
 
 
-def test_the_shared_uid_dump_reads_user_0_of_two():
-    """Runtime state of a shared-uid package, one block per user under `Shared users:`.
+READ_PHONE_NUMBERS = "android.permission.READ_PHONE_NUMBERS"
 
-    The parser keeps the FIRST runtime section, documented as user 0's. The
-    two users' entries differ in their flags here (user 0's carry
-    USER_SENSITIVE_WHEN_GRANTED, the new user's do not), which is what shows
-    the parser read user 0's block and not the other.
-    """
+
+def _shared_users_blocks() -> dict[str, str]:
+    """The `User N:` blocks of the `SharedUser [android.uid.shared]` section."""
     text = API33.text("dumpsys_package_shared_uid_two_users")
-    user = _entry("dumpsys_package_shared_uid_two_users")["secondary_user"]
-    shared = text[text.index("\nShared users:") :]
-    first, second = shared.split(f"\n    User {user}: ", 1)
-    parsed = parse_package_permissions(text)
+    shared = text.partition("\nShared users:")[2]
+    assert "SharedUser [android.uid.shared]" in shared
+    return _user_blocks(shared)
 
+
+def test_a_shared_uid_grant_differs_between_users():
+    """`pm grant --user <id>` on a shared uid: denied for user 0, granted for the other user.
+
+    Under `Shared users:`, not under the package -- the shared-uid layout. Only
+    the granted permission differs; the SYSTEM_FIXED ones read the same.
+    """
+    entry = _entry("dumpsys_package_shared_uid_two_users")
+    user = entry["secondary_user"]
+    assert entry["permission"] == READ_PHONE_NUMBERS
+    assert entry["grant"]["output"].strip() == "exit=0"
+    blocks = _shared_users_blocks()
+    assert set(blocks) == {"0", user}
+    states = {
+        u: dict(re.findall(r"^        (\S+): granted=(\w+)", block, flags=re.MULTILINE))
+        for u, block in blocks.items()
+    }
+    assert states["0"][READ_PHONE_NUMBERS] == "false"
+    assert states[user][READ_PHONE_NUMBERS] == "true"
+    differing = {p for p in states["0"] if states["0"][p] != states[user].get(p)}
+    assert differing == {READ_PHONE_NUMBERS}
+
+
+def test_the_shared_uid_dump_parses_to_user_0_s_runtime_state():
+    """The parser keeps the first runtime section, user 0's: the grant for the other is unseen."""
+    parsed = parse_package_permissions(API33.text("dumpsys_package_shared_uid_two_users"))
+    user0 = dict(
+        re.findall(r"^        (\S+): granted=(\w+)", _shared_users_blocks()["0"], re.MULTILINE)
+    )
     assert parsed["runtime"], "no runtime permissions read for a shared-uid package"
-    user0_names = re.findall(r"^        (\S+): granted=", first, flags=re.MULTILINE)
-    assert [e["permission"] for e in parsed["runtime"]] == user0_names
-    sensitive = [e for e in parsed["runtime"] if "USER_SENSITIVE_WHEN_GRANTED" in e["flags"]]
-    assert sensitive, "user 0's flags were not the ones read"
-    assert "USER_SENSITIVE_WHEN_GRANTED" not in second.split("\n\n", 1)[0]
+    assert {e["permission"]: str(e["granted"]).lower() for e in parsed["runtime"]} == user0
+    assert user0[READ_PHONE_NUMBERS] == "false"
 
 
 def test_the_shared_uid_dump_without_a_second_user_reads_runtime_permissions():
@@ -327,3 +428,15 @@ def test_the_manifest_is_json_with_one_entry_per_name():
     data = json.loads((RECORDED_ROOT / PROFILE / "MANIFEST.json").read_text(encoding="utf-8"))
     names = [entry["name"] for entry in data["fixtures"]]
     assert len(names) == len(set(names))
+
+
+# --- host adb ------------------------------------------------------------------
+
+
+def test_the_recorded_adb_client_is_one_the_skill_reads_files_with():
+    """The banner parses, and to a client run_as accepts (`adb shell -T` is refused, not run)."""
+    from common.run_as import MIN_ADB_FOR_READS, parse_adb_version
+
+    version = parse_adb_version(API33.text("adb_version"))
+    assert version is not None, "the recorded banner does not parse"
+    assert version >= MIN_ADB_FOR_READS

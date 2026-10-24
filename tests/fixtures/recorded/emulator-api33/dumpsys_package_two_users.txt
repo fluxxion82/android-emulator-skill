@@ -29,7 +29,7 @@ Receiver Resolver Table:
 Domain verification status:
 
 Permissions:
-  Permission [com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION] (3d13d9f):
+  Permission [com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION] (50bdcb6):
     sourcePackage=com.example.composefixture
     uid=10174 gids=[] type=0 prot=signature
     perm=PermissionInfo{35cdaf7 com.example.composefixture.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION}
@@ -41,14 +41,14 @@ Registered ContentProviders:
 ContentProvider Authorities:
   [com.example.composefixture.androidx-startup]:
     Provider{b4aad64 com.example.composefixture/androidx.startup.InitializationProvider}
-      applicationInfo=ApplicationInfo{8d7deec com.example.composefixture}
+      applicationInfo=ApplicationInfo{e109db7 com.example.composefixture}
 
 Key Set Manager:
   [com.example.composefixture]
       Signing KeySets: 53
 
 Packages:
-  Package [com.example.composefixture] (5e02b5):
+  Package [com.example.composefixture] (fab1924):
     userId=10174
     pkg=Package{3fa2f93 com.example.composefixture}
     codePath=/data/app/~~jiDg6SVGNgX1nDescsgyFQ==/com.example.composefixture-3aLKi9f7fRgJzN6LPKSJWQ==
@@ -100,9 +100,9 @@ Packages:
         /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
       runtime permissions:
         android.permission.CAMERA: granted=false, flags=[ USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
-    User 10: ceDataInode=0 installed=true hidden=false suspended=false distractionFlags=0 stopped=false notLaunched=false enabled=0 instant=false virtual=false
+    User 11: ceDataInode=0 installed=true hidden=false suspended=false distractionFlags=0 stopped=false notLaunched=false enabled=0 instant=false virtual=false
       installReason=0
-      firstInstallTime=2026-10-24 11:44:32
+      firstInstallTime=2026-10-24 12:17:46
       uninstallReason=0
       runtime permissions:
         android.permission.CAMERA: granted=true
@@ -116,13 +116,13 @@ Queries:
       com.example.composefixture
   queryable via interaction:
     User 0:
-      [com.android.dynsystem,com.android.keychain,com.android.location.fused,com.android.localtransport,com.android.emulator.multidisplay,com.android.server.telecom,com.android.wallpaperbackup,com.android.inputdevices,android,com.android.providers.settings,com.android.settings]:
+      [com.android.wallpaperbackup,com.android.localtransport,com.android.location.fused,com.android.providers.settings,com.android.keychain,android,com.android.emulator.multidisplay,com.android.dynsystem,com.android.inputdevices,com.android.settings,com.android.server.telecom]:
         com.example.composefixture
       [com.google.android.gsf,com.google.android.gms]:
         com.example.composefixture
       com.google.android.inputmethod.latin:
         com.example.composefixture
-    User 10:
+    User 11:
   queryable via uses-library:
 
 Dexopt state:
@@ -139,7 +139,7 @@ Dexopt state:
     mLastExecutionDurationIncludingSleepMs:0
     mLastExecutionStartUptimeMs:0
     mLastExecutionDurationMs:0
-    now:1640535
+    now:3634851
     mLastCancelledPackages:
     mFailedPackageNamesPrimary:
     mFailedPackageNamesSecondary:
