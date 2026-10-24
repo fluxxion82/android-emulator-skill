@@ -153,6 +153,18 @@ def _sdk(script: str, argv: tuple[str, ...], tool: str, reason: str) -> Mode:
 
 # The sweep table. `defect` is filled from an unmarked run, not from a guess.
 MODES: tuple[Mode, ...] = (
+    # --- Quick Start step 0: the environment check --------------------------
+    # Not a device refusal: adb failing or missing is a failed check, and the
+    # report is the refusal -- one object, success false, the first failed
+    # check as the error -- at exit 1 in both passes. adb is its first probe.
+    Mode(
+        "android_health_check.sh",
+        ("--json",),
+        "adb",
+        "Quick Start step 0",
+        naming=("adb",),
+        broken_status=FAILURE,
+    ),
     # --- C6: app_launcher, Quick Start step 1 -------------------------------
     _adb("app_launcher.py", ("--list",), "package listing"),
     _adb("app_launcher.py", ("--list", "--json"), "package listing"),
@@ -349,18 +361,20 @@ def _invoke(mode: Mode, chain: Toolchain, workdir: Path) -> Outcome:
     """Run one mode in one toolchain.
 
     The interpreter is this test's own (``sys.executable``, an absolute path),
-    never ``python3`` looked up on the reduced PATH. A timeout is captured
-    rather than raised, so the three tests sharing this outcome each get to
-    say their own thing about it.
+    never ``python3`` looked up on the reduced PATH; a ``.sh`` script runs
+    under bash, as SKILL.md writes it. A timeout is captured rather than
+    raised, so the three tests sharing this outcome each get to say their own
+    thing about it.
     """
     tool_log = workdir / "tools.log"
     tool_log.touch()
     argv = [arg.replace(WORKDIR, str(workdir)) for arg in mode.argv]
+    interpreter = "/bin/bash" if mode.script.endswith(".sh") else sys.executable
 
     timed_out = False
     try:
         completed = subprocess.run(
-            [sys.executable, str(SCRIPTS / mode.script), *argv],
+            [interpreter, str(SCRIPTS / mode.script), *argv],
             env=_env(chain, workdir, tool_log),
             cwd=workdir,
             stdin=subprocess.DEVNULL,
