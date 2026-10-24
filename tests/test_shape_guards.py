@@ -638,12 +638,10 @@ KNOWN_QUOTED: tuple[Expectation, ...] = (
         QUOTED,
         "quote_for_device_shell(str(level)), quote_for_device_shell(datatype)",
     ),
-    Expectation(
-        "status_bar.py", "set_time", QUOTED, "quote_for_device_shell(time_str.replace(':', ''))"
-    ),
-    Expectation(
-        "status_bar.py", "override", QUOTED, "quote_for_device_shell(time.replace(':', ''))"
-    ),
+    # L2: the time travels as the padded hhmm demo_clock_hhmm returns, not as
+    # the input with its colon stripped ("9:41" -> "941", which SystemUI drops).
+    Expectation("status_bar.py", "set_time", QUOTED, "quote_for_device_shell(hhmm)"),
+    Expectation("status_bar.py", "override", QUOTED, "quote_for_device_shell(hhmm)"),
     Expectation("status_bar.py", "override", QUOTED, "quote_for_device_shell(str(battery))"),
     Expectation("status_bar.py", "override", QUOTED, "quote_for_device_shell(str(wifi_level))"),
     Expectation(

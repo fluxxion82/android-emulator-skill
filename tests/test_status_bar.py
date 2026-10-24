@@ -20,6 +20,7 @@ pinning a broken path as intended behaviour.
 from __future__ import annotations
 
 import ast
+import json
 import subprocess
 from pathlib import Path
 
@@ -137,7 +138,10 @@ def test_override_clock_and_battery_commands(captured_cmds):
 
     clock = [c for c in captured_cmds if "clock" in c]
     assert len(clock) == 1
-    assert clock[0][-3:] == ["-e", "hhmm", "941"]
+    # SystemUI's demo clock takes a four-digit hhmm and silently ignores a
+    # shorter one (recorded: demo_mode_clock_941.png shows the device's own
+    # time, demo_mode_clock_0941.png shows 9:41). This line used to pin "941".
+    assert clock[0][-3:] == ["-e", "hhmm", "0941"]
 
     battery = [c for c in captured_cmds if "battery" in c]
     assert len(battery) == 1
@@ -430,3 +434,168 @@ def test_a_failed_enter_is_not_remembered_as_entered(monkeypatch):
     ok, _msg = controller.set_battery(50)
     assert ok is True
     assert _enter_count(calls) == 1, "the retry never re-entered demo mode"
+
+
+# ---------------------------------------------------------------------------
+# L2 -- --time reaches SystemUI as a four-digit hhmm, or is refused.
+# ---------------------------------------------------------------------------
+
+
+def _hhmm_sent(cmds) -> list[str]:
+    """The hhmm value of every demo clock broadcast, in order."""
+    return [c[c.index("hhmm") + 1] for c in cmds if "hhmm" in c]
+
+
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [("9:41", "0941"), ("09:41", "0941"), ("12:05", "1205"), ("0:00", "0000"), ("23:59", "2359")],
+)
+def test_set_time_sends_a_four_digit_hhmm(captured_cmds, given, sent):
+    ok, _msg = StatusBarController().set_time(given)
+    assert ok is True
+    assert _hhmm_sent(captured_cmds) == [sent]
+
+
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [("9:41", "0941"), ("09:41", "0941"), ("12:05", "1205")],
+)
+def test_override_sends_a_four_digit_hhmm(captured_cmds, given, sent):
+    ok, _msg = StatusBarController().override(time=given)
+    assert ok is True
+    assert _hhmm_sent(captured_cmds) == [sent]
+
+
+@pytest.mark.parametrize(
+    ("preset", "sent"),
+    [("clean", "0941"), ("testing", "1111"), ("low-battery", "0941"), ("airplane", "0941")],
+)
+def test_presets_send_a_four_digit_hhmm(captured_cmds, preset, sent):
+    ok, _msg = StatusBarController().apply_preset(preset)
+    assert ok is True
+    assert _hhmm_sent(captured_cmds) == [sent]
+
+
+BAD_TIMES = [
+    "941",
+    "9:4",
+    "25:00",
+    "9:60",
+    "abc",
+    "",
+    "0941",
+    "9:41pm",
+    " 9:41",
+    "-1:00",
+    "9:41:00",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_TIMES)
+def test_set_time_refuses_a_malformed_time_before_touching_the_device(captured_cmds, bad):
+    ok, msg = StatusBarController().set_time(bad)
+    assert ok is False
+    assert "H:MM" in msg
+    assert captured_cmds == [], "a refused time must not enter demo mode"
+
+
+@pytest.mark.parametrize("bad", ["941", "9:4", "25:00", "9:60", "abc", ""])
+def test_override_refuses_a_malformed_time_before_touching_the_device(captured_cmds, bad):
+    ok, msg = StatusBarController().override(time=bad, battery=50)
+    assert ok is False
+    assert "H:MM" in msg
+    assert captured_cmds == []
+
+
+@pytest.mark.parametrize("bad", ["941", "9:4", "25:00", "9:60", "abc"])
+def test_cli_refuses_a_malformed_time_as_a_typed_failure_json(captured_cmds, capsys, bad):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.run(status_bar.main, ["--time", bad, "--battery", "50", "--json"])
+
+    assert excinfo.value.code == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["success"] is False
+    assert repr(bad) in payload["error"]
+    assert "H:MM" in payload["remedy"]
+    # Refused up front: not even the battery half of the command ran.
+    assert captured_cmds == []
+
+
+def test_cli_refuses_a_malformed_time_as_a_typed_failure_text(captured_cmds, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.run(status_bar.main, ["--time", "941"])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert lines[0].startswith("Error: ") and "'941'" in lines[0]
+    assert lines[1].startswith("Remedy: ") and "H:MM" in lines[1]
+    assert captured_cmds == []
+
+
+def test_cli_time_reaches_the_device_padded(captured_cmds, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.run(status_bar.main, ["--time", "9:41", "--json"])
+
+    assert excinfo.value.code == 0
+    assert _hhmm_sent(captured_cmds) == ["0941"]
+    assert json.loads(capsys.readouterr().out)["results"][0]["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# L13 -- --wifi / --mobile can hide the icon, and bare --wifi still shows it.
+# ---------------------------------------------------------------------------
+
+
+def _radio_cmds(cmds, radio: str) -> list[list[str]]:
+    return [c for c in _network_cmds(cmds) if radio in c]
+
+
+def _run_cli(argv) -> int:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.run(status_bar.main, argv)
+    return excinfo.value.code
+
+
+@pytest.mark.parametrize("radio", ["wifi", "mobile"])
+@pytest.mark.parametrize(
+    ("argv_tail", "state"),
+    [([], "show"), (["show"], "show"), (["hide"], "hide")],
+)
+def test_cli_radio_flag_shows_or_hides(captured_cmds, capsys, radio, argv_tail, state):
+    code = _run_cli([f"--{radio}", *argv_tail, "--json"])
+
+    assert code == 0
+    sent = _radio_cmds(captured_cmds, radio)
+    assert len(sent) == 1
+    assert sent[0][sent[0].index(radio) + 1] == state
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["operation"] == radio
+    assert result["success"] is True
+    assert ("hidden" in result["message"]) is (state == "hide")
+
+
+def test_cli_bare_wifi_before_another_option_still_shows(captured_cmds):
+    """`--wifi --wifi-level 2` must not swallow the next option as wifi's value."""
+    assert _run_cli(["--wifi", "--wifi-level", "2"]) == 0
+    sent = _radio_cmds(captured_cmds, "wifi")
+    assert len(sent) == 1
+    assert sent[0][sent[0].index("wifi") + 1] == "show"
+    assert sent[0][sent[0].index("level") + 1] == "2"
+
+
+def test_cli_wifi_and_mobile_hide_together(captured_cmds):
+    assert _run_cli(["--wifi", "hide", "--mobile", "hide"]) == 0
+    for radio in ("wifi", "mobile"):
+        sent = _radio_cmds(captured_cmds, radio)
+        assert len(sent) == 1
+        assert sent[0][sent[0].index(radio) + 1] == "hide"
+
+
+@pytest.mark.parametrize("radio", ["wifi", "mobile"])
+def test_cli_radio_flag_rejects_other_values(captured_cmds, capsys, radio):
+    assert _run_cli([f"--{radio}", "off"]) == 2
+    assert "invalid choice" in capsys.readouterr().err
+    assert captured_cmds == []
