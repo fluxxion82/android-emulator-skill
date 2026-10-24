@@ -2,6 +2,8 @@
 // Not part of the pytest suite: it is built by hand on a machine with the
 // Android SDK, installed on an emulator, and the resulting hierarchy dump is
 // what the suite consumes. See app/build.gradle for the exact build command.
+// tests/record_gradle_fixtures.py also runs its androidTest sources on an
+// emulator to record the connected_android_test_* fixtures.
 pluginManagement {
     repositories {
         google()

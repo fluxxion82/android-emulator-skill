@@ -1,0 +1,359 @@
+{
+  "profile": "emulator-api33",
+  "recorded_at": "2026-10-24T18:13:33Z",
+  "recorded_on": "macOS-27.0.1-arm64-arm-64bit",
+  "device": {
+    "model": "sdk_gphone64_arm64",
+    "api_level": "33",
+    "android_release": "13",
+    "abi": "arm64-v8a",
+    "build_fingerprint": "google/sdk_gphone64_arm64/emu64a:13/TE1A.240213.009/12342917:userdebug/dev-keys"
+  },
+  "redacted_package_count": 1,
+  "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths. The count is of the distinct aliases this profile's fixtures hold; a partial re-record numbers its own from app1, so it is a lower bound on packages redacted.",
+  "fixtures": [
+    {
+      "name": "adb_device_not_found",
+      "file": "adb_device_not_found.txt",
+      "command": "adb -s no-such-serial-xyz get-state",
+      "description": "What adb prints for an unknown serial, using a non-blocking command. Note the prefix is 'error:', not 'adb:'. `adb -s <unknown> shell` does NOT print this -- it blocks waiting for the device to appear, which is why log_monitor validates the serial up front instead of inferring from exit status.",
+      "catches": [
+        "R5"
+      ],
+      "bytes": 45,
+      "exit_status": 1,
+      "stream": "stderr",
+      "recorded_at": "2026-10-24T18:30:17Z"
+    },
+    {
+      "name": "adb_devices_offline",
+      "file": "adb_devices_offline.txt",
+      "command": "adb -s <emulator> reboot; poll adb devices -l (host-wide, no serial) every 0.1 s until the emulator's row reads offline; adb -s <emulator> wait-for-device; poll getprop sys.boot_completed until 1",
+      "description": "`adb devices -l` while a device is in the `offline` state: ground truth for what device_list's parse_adb_devices and serial resolution see for a device that is attached but not usable. Produced by rebooting the recording emulator and keeping the first host listing whose row for it reads `offline`; the emulator is waited for until sys.boot_completed is 1 before the capture is accepted. Every serial that is not `emulator-NNNN` (a phone attached to the same host) is replaced by SERIALREDACTED; its row and state are kept. Manifest: `target_serial`, and `states_seen`, the target's states in the order they were polled. `unauthorized` is NOT recorded: it needs a new adb host key and an authorization prompt on a real phone.",
+      "catches": [],
+      "bytes": 254,
+      "exit_status": 0,
+      "stream": "stdout",
+      "target_serial": "emulator-5556",
+      "states_seen": [
+        "offline"
+      ],
+      "recorded_at": "2026-10-24T18:17:35Z"
+    },
+    {
+      "name": "adb_shell_device_not_found",
+      "file": "adb_shell_device_not_found.txt",
+      "command": "adb -s no-such-serial-xyz shell getprop ro.build.version.sdk",
+      "description": "`adb -s <unknown> shell` -- the call shape the skill's scripts actually make. The prefix here is 'adb:', where the same failure from `get-state` (adb_device_not_found) says 'error:'. adb mixes the two, which is why adb_exec._classify matches the message body rather than the prefix; recorded so that stays a measured fact rather than a comment.",
+      "catches": [],
+      "bytes": 43,
+      "exit_status": 1,
+      "stream": "stderr",
+      "recorded_at": "2026-10-24T18:30:17Z"
+    },
+    {
+      "name": "adb_version",
+      "file": "adb_version.txt",
+      "command": "adb version",
+      "description": "The HOST adb client's `adb version` banner; its first line is 'Android Debug Bridge version X.Y.Z'. container.py reads app files with `adb shell -T`, which a client older than 1.0.36 (platform-tools 24) does not refuse: it forwards `-T` to the device shell as command text and exits 0 after printing the shell's error, which a read deciding by exit status takes for the file. So the client is checked against this line before the first read. The install path is scrubbed of the recording account's home directory.",
+      "catches": [],
+      "bytes": 159,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "cmd_notification_help",
+      "file": "cmd_notification_help.txt",
+      "command": "adb shell cmd notification",
+      "description": "Authoritative `cmd notification` subcommand list. There is no 'list channels' subcommand \u2014 `cmd notification list channels <pkg>` silently ignores the extra args and runs bare `list`, exiting 0, which is why push_notification always reports 'no channels found'.",
+      "catches": [
+        "S14"
+      ],
+      "bytes": 990,
+      "exit_status": 255,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "cmd_statusbar_help",
+      "file": "cmd_statusbar_help.txt",
+      "command": "adb shell cmd statusbar",
+      "description": "Authoritative `cmd statusbar` subcommand list. Contains no battery-level / battery-charging / wifi-enabled / wifi-level / mobile-enabled / mobile-level / mobile-datatype \u2014 the seven subcommands status_bar.py invents. Those are SystemUI demo-mode broadcast extras, not statusbar subcommands.",
+      "catches": [
+        "S12"
+      ],
+      "bytes": 1874,
+      "exit_status": 1,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "dumpsys_input_method_shown",
+      "file": "dumpsys_input_method_shown.txt",
+      "command": "adb shell dumpsys input_method",
+      "description": "IME visibility flags, filtered out of `dumpsys input_method` to the lines matching mInputShown|mIsInputViewShown|mImeWindowVis. Measured on API 33 and API 35: `mInputShown` and `mIsInputViewShown` both exist; **`mImeWindowVis` does not appear on either**, so code keying on it reads nothing. Note the second key shares its line with `mStatusIcon`, so a parser splitting the line on whitespace gets two fields, not one. The full dump is 7000+ lines and names the user's IME, keyboard app and open windows, so it is filtered BEFORE anything is written -- package redaction does not catch free text.",
+      "catches": [
+        "C8"
+      ],
+      "bytes": 130,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:30:17Z"
+    },
+    {
+      "name": "dumpsys_package_shared_uid",
+      "file": "dumpsys_package_shared_uid.txt",
+      "command": "adb shell dumpsys package com.android.localtransport",
+      "description": "The other place `install permissions:` shows up twice, and the one that costs data rather than adds it. A package in a shared uid has its runtime permission state tracked against the UID, so the dump prints it under the top-level 'Shared users:' header and NOT under 'Packages:' -- this package's Packages block has no 'runtime permissions:' line at all, while the SharedUser [android.uid.system] block below it has twenty-three. A parser that reads only 'Packages:' (the obvious fix for the stale copy under 'Hidden system packages:') answers that a system app holds no runtime permissions whatsoever. com.android.settings has the same shape at five times the size.",
+      "catches": [
+        "S15"
+      ],
+      "bytes": 40142,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "dumpsys_package_shared_uid_two_users",
+      "file": "dumpsys_package_shared_uid_two_users.txt",
+      "command": "adb shell 'pm grant --user <id> com.android.providers.contacts android.permission.READ_PHONE_NUMBERS'; adb shell dumpsys package com.android.providers.contacts (in dumpsys_package_two_users' run, while the secondary user exists)",
+      "description": "`dumpsys package com.android.providers.contacts` (shared uid android.uid.shared) with a second user on the device and READ_PHONE_NUMBERS granted for that user only: ground truth for per-user runtime state in the shared-uid layout. A shared-uid package's runtime permissions are printed under the top-level `Shared users:` block (dumpsys_package_shared_uid), and here its `SharedUser [android.uid.shared]` block carries one `User <n>:` section per user, the permission granted=false under `User 0:` and granted=true under `User <id>:` (the recorder refuses a capture that does not). android.uid.system (com.android.localtransport, dumpsys_package_shared_uid) cannot show this: its grants are SYSTEM_FIXED and read the same for every user. Recorded with dumpsys_package_two_users; manifest `secondary_user`, `permission`, `grant` (the pm grant's command and output).",
+      "catches": [],
+      "bytes": 13639,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "11",
+      "permission": "android.permission.READ_PHONE_NUMBERS",
+      "grant": {
+        "command": "adb shell 'pm grant --user 11 com.android.providers.contacts android.permission.READ_PHONE_NUMBERS 2>&1; echo exit=$?'",
+        "output": "exit=0\n"
+      },
+      "recorded_at": "2026-10-24T19:17:47Z"
+    },
+    {
+      "name": "dumpsys_package_two_users",
+      "file": "dumpsys_package_two_users.txt",
+      "command": "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> com.example.composefixture; pm grant --user <id> com.example.composefixture android.permission.CAMERA (pm_grant_user); pm grant --user <id> com.android.providers.contacts android.permission.READ_PHONE_NUMBERS; dumpsys package com.example.composefixture; dumpsys package com.android.providers.contacts (dumpsys_package_shared_uid_two_users); pm remove-user <id>",
+      "description": "`dumpsys package <fixture app>` with the app installed for two users and CAMERA granted for the second only: ground truth for where per-user runtime-permission state sits in the dump -- a `User 0:` and a `User <id>:` block under the package (the id is the manifest's `secondary_user`), each with its own install state and its own `runtime permissions:` section, where CAMERA reads granted=false for user 0 and granted=true for user <id> (the recorder refuses a capture that does not). CAMERA is the one runtime permission the fixture app requests, added to its manifest for this fixture; emulator-api35's pm_grant_not_requested and dumpsys_package_after_silent_grant predate it and are unaffected (they use POST_NOTIFICATIONS, still not requested). The throwaway user is removed in the same run and its removal read back from `pm list users`.",
+      "catches": [],
+      "bytes": 6971,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "11",
+      "recorded_at": "2026-10-24T19:17:47Z"
+    },
+    {
+      "name": "logcat_anr_broadcast_records",
+      "file": "logcat_anr_broadcast_records.bin",
+      "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before provoking",
+      "description": "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin in kind of logcat_anr_broadcast_stream. ActivityManager's report is ONE record: its message is 'ANR in <package>' then '\\nPID: <app pid>', '\\nReason: Broadcast of Intent {...}' and the rest of the report, all one writer's. ~5 s later WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping duplicate ANR' verdict, one record each. Every record's pid is system_server's (manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report is held to. That shape is API 35's; a level that differs lists what it lacks under the manifest's `expected_absent`, and `window_anchor` says where the window began.",
+      "catches": [
+        "D5",
+        "A1"
+      ],
+      "bytes": 4491,
+      "window_anchor": "the recorder's `aes-recorder: anr-window` record",
+      "system_server_pid": "565",
+      "expected_absent": [],
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:44:13Z"
+    },
+    {
+      "name": "logcat_anr_foreign_process_records",
+      "file": "logcat_anr_foreign_process_records.bin",
+      "command": "adb logcat -c; am start -W the fixture app; adb shell am broadcast --async -f 0x10000000 -n com.example.composefixture/.ForeignProcessAnrReceiver (android:process=com.example.victim, AnrReceiver's 40 s block); once system_server logs its `Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the process or the provoking action, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before the broadcast",
+      "description": "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, in a process it named com.example.victim (android:process), under its own uid. ActivityManager prints the PROCESS name -- 'ANR in com.example.victim', its '\\nPID: <pid>' that process's -- and system_server's `Start proc <pid>:com.example.victim/u0a205` and `Killing <pid>:com.example.victim/u0a205 ... bg anr` carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p <pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture app's uid) and `claimed_package_uid_listing` (com.example.victim is not installed), `system_server_pid`. The `Start proc` and `ANR in` records are required on every level; what a level lacks of the rest of API 35's shape is listed under `expected_absent`.",
+      "catches": [
+        "W4-N"
+      ],
+      "bytes": 4432,
+      "window_anchor": "the recorder's `aes-recorder: anr-window` record",
+      "expected_absent": [],
+      "system_server_pid": "565",
+      "stalled_pid": "5725",
+      "ps_alive": {
+        "command": "adb shell ps -o PID,UID -p 5725",
+        "exit_status": 0,
+        "output": "  PID   UID\n 5725 10174\n",
+        "device_epoch": 1792867440
+      },
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10174\n"
+      },
+      "claimed_package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.victim",
+        "exit_status": 0,
+        "output": ""
+      },
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:44:13Z"
+    },
+    {
+      "name": "logcat_anr_input_records",
+      "file": "logcat_anr_input_records.bin",
+      "command": "adb shell am broadcast --async (background, 60 s timeout), then input keyevent --async KEYCODE_SHIFT_LEFT to the blocked window (where `input` lists no --async, API 33: plain `input keyevent`, its adb call killed after 5 s); 15 s later adb logcat -d -B, host-filtered as logcat_anr_broadcast_records",
+      "description": "An input-dispatch ANR as logd's records, the twin in kind of logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input dispatching timed out' record first, then ActivityManager's report -- ONE record, 'ANR in <package> (<component>)' with its PID and Reason lines. Every record's pid is system_server's (manifest `system_server_pid`). That shape is API 35's; a level that differs lists what it lacks under `expected_absent`, and `key_event` says how the key was sent.",
+      "catches": [
+        "D5",
+        "A1"
+      ],
+      "bytes": 4622,
+      "key_event": {
+        "argv": [
+          "adb",
+          "shell",
+          "input",
+          "keyevent",
+          "KEYCODE_SHIFT_LEFT"
+        ],
+        "input_lists_async": false,
+        "bound_s": 5,
+        "killed": true
+      },
+      "window_anchor": "the recorder's `aes-recorder: anr-window` record",
+      "system_server_pid": "565",
+      "expected_absent": [],
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:44:13Z"
+    },
+    {
+      "name": "logcat_choreographer_jank",
+      "file": "logcat_choreographer_jank.txt",
+      "command": "adb shell logcat -d -v threadtime | grep Choreographer",
+      "description": "Real Choreographer jank: 'I Choreographer: Skipped N frames!  The application may be doing too much work on its main thread.' TWO spaces after the exclamation mark, and the tag carries the janking app's own pid in the logcat columns -- unlike the ActivityManager ANR lines, whose pid is system_server's. Recorded because every skipped-frame test in this repo built its input from an f-string, which proves only that the parser matches the f-string. Provoked by a cold start and then AnrReceiver's 40s block, and what lands differs by level. emulator-api35 recorded the block's own line, 'Skipped 2401 frames', and 2401 * 16.7ms is 40.1 seconds -- the first independent check this repo has that the FRAME_MS heuristic tracks wall-clock, on a stall whose real length is known. emulator-api33 recorded no line for the block, only the cold start's (tens of frames), plus a Looper 'Slow dispatch' line the grep keeps because it names Choreographer. A cold start janks only when the host happens to be busy, so how MANY lines land here is not fixed; the severity-boundary tests vary the frame count off this line rather than typing new ones.",
+      "catches": [],
+      "bytes": 319,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:16:36Z"
+    },
+    {
+      "name": "logcat_strictmode_records",
+      "file": "logcat_strictmode_records.bin",
+      "command": "adb shell am force-stop; adb logcat -c; adb shell am start -W -n com.example.composefixture/.StrictModeActivity; sleep 3; adb logcat -d -B, host-filtered to the records from the app's pid (pidof) or naming the package",
+      "description": "logcat_strictmode_violation's provocation as logd's records (`-B`): ground truth for whether a StrictMode record carries the APP's uid, which is what lets a records reader attribute a violation to a package by uid instead of by text. Each record's pid and uid are logd's, from the writer's socket credentials. Manifest: `pids` (pidof in the same run), `package_uid_listing` (the app's uid to hold the records' uid against), `timezone`.",
+      "catches": [],
+      "bytes": 23196,
+      "pids": [
+        "8417"
+      ],
+      "package_uid_listing": {
+        "command": "adb shell cmd package list packages -U com.example.composefixture",
+        "exit_status": 0,
+        "output": "package:com.example.composefixture uid:10174\n"
+      },
+      "timezone": "America/Los_Angeles",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "logcat_strictmode_violation",
+      "file": "logcat_strictmode_violation.txt",
+      "command": "adb shell logcat -d -v threadtime | grep -E '[VDIWEF] StrictMode: '",
+      "description": "What StrictMode actually logs, against what anr_pipeline was written for. The real header is 'D StrictMode: StrictMode policy violation; ~duration=27 ms: android.os.strictmode.DiskReadViolation'; the invented sample was 'D StrictMode: Slow operation detected on main thread', which StrictMode prints in no form at all (it borrows the wording of ActivityManager's own 'Slow operation:' bookkeeping, a different subsystem entirely). Two consequences visible in this file. The violation states its OWN duration, which _classify_anr discards in favour of a hard-coded WARN_FRAMES * FRAME_MS. And every frame of the stack trace that follows is logged under the same StrictMode tag, so a tag-only match turns one violation into one event per stack frame -- about thirty. Provoked by StrictModeActivity, which enables the policy and then reads and writes a file on the main thread.",
+      "catches": [],
+      "bytes": 30788,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "logcat_threadtime",
+      "file": "logcat_threadtime.txt",
+      "command": "adb logcat -d -v threadtime -t 200",
+      "description": "`logcat -v threadtime` output: 'MM-DD HH:MM:SS.mmm PID TID P Tag: msg'. This is the layout log_monitor's regex actually expects, and what anr_watcher correctly requests.",
+      "catches": [
+        "A1"
+      ],
+      "bytes": 23321,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "package_list_uid",
+      "file": "package_list_uid.txt",
+      "command": "adb shell cmd package list packages -U com.example.composefixture",
+      "description": "`cmd package list packages -U <package>`: one line, 'package:<package> uid:<uid>', exit 0. The filter is a SUBSTRING match (measured: asking for 'com.example.compose' lists com.example.composefixture too), and a package that is not installed prints nothing and still exits 0 -- so a reader must pick the line whose name is exactly the package, and treat none as unknown.",
+      "catches": [],
+      "bytes": 45,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "package_list_uid_all",
+      "file": "package_list_uid_all.txt",
+      "command": "adb shell cmd package list packages -U",
+      "description": "`cmd package list packages -U` with NO package filter: the whole table, one 'package:<name> uid:<uid>' row per package. Ground truth for mapping a uid back to its packages -- several rows naming one uid is a sharedUserId (android.uid.system's packages all read uid:1000) -- which a reader of the filtered form (package_list_uid) never sees. Non-AOSP names are aliased.",
+      "catches": [],
+      "bytes": 10927,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "package_list_uid_two_users",
+      "file": "package_list_uid_two_users.txt",
+      "command": "adb shell pm create-user; pm install-existing --user <id> <package>; cmd package list packages -U <package>; pm remove-user <id>",
+      "description": "`cmd package list packages -U <package>` with the package installed for two users: ONE row, the uids comma-separated ('uid:10205,1110205' for user 11), not a row per user (measured, Android 15). A reader keeping the first number rejects the second user's processes. The throwaway user is removed before the capture is accepted, and the listing is read back until it names one uid again.",
+      "catches": [],
+      "bytes": 53,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "10",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "pm_grant_user",
+      "file": "pm_grant_user.txt",
+      "command": "adb shell 'pm grant --user <id> com.example.composefixture android.permission.CAMERA 2>&1; echo exit=$?' (in dumpsys_package_two_users' run, while user <id> exists)",
+      "description": "`pm grant --user <secondary user>` of CAMERA, a runtime permission the fixture app requests: what a per-user grant that WORKS prints and its exit status (stdout and stderr together, then the echoed `exit=`), ground truth for privacy_manager's --user handling. That it took effect for that user only is in dumpsys_package_two_users, recorded in the same run; manifest `secondary_user`, `permission`.",
+      "catches": [],
+      "bytes": 7,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "11",
+      "permission": "android.permission.CAMERA",
+      "recorded_at": "2026-10-24T19:17:47Z"
+    },
+    {
+      "name": "ps_all_pid_uid",
+      "file": "ps_all_pid_uid.txt",
+      "command": "adb shell ps -A -o PID,UID",
+      "description": "`ps -A -o PID,UID`: every process, as the two numeric columns parse_ps_uids reads (a `PID UID` header, then one row per process). Ground truth for a whole-table pid -> uid read rather than ps_pid_uid's `-p` subset. Manifest `system_server_pid` (`pidof system_server` right after) names the row that must read uid 1000.",
+      "catches": [],
+      "bytes": 3948,
+      "exit_status": 0,
+      "stream": "stdout",
+      "system_server_pid": "581",
+      "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "ps_pid_uid",
+      "file": "ps_pid_uid.txt",
+      "command": "adb shell ps -o PID,UID -p <fixture app pid>,<system_server pid>",
+      "description": "`ps -o PID,UID -p <pid>,<pid>`: a header, then one row per pid that exists, sorted by pid, with the NUMERIC uid (10205 for the fixture app, 1000 for system_server). Measured: `-p a -p b` answers the same; a pid that does not exist is left out, and with none existing only the header prints and the exit status is 1. The pids are under 'pids' in this entry.",
+      "catches": [],
+      "bytes": 36,
+      "exit_status": 0,
+      "stream": "stdout",
+      "pids": {
+        "app": "8253",
+        "system_server": "581"
+      },
+      "argv": [
+        "adb",
+        "shell",
+        "ps",
+        "-o",
+        "PID,UID",
+        "-p",
+        "<app>,<system_server>"
+      ],
+      "recorded_at": "2026-10-24T18:13:33Z"
+    }
+  ]
+}

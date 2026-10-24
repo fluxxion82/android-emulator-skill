@@ -36,12 +36,28 @@ Usage
 version's existing manifest instead of replacing it. A fixture with
 ``gradle_below`` set is about an OLDER Gradle's answer; a full recording skips
 it unless the Gradle being run is older than that version.
+
+Connected (instrumented) fixtures
+---------------------------------
+The ``connected_android_test_*`` fixtures run ``connectedDebugAndroidTest`` in
+a fresh copy of ``tests/fixtures/scaffold/compose`` (AGP, so ANDROID_HOME must
+be set) and need a running emulator, named with ``--serial``::
+
+    ANDROID_HOME=~/Library/Android/sdk python tests/record_gradle_fixtures.py \
+        --serial emulator-5554 --only connected_android_test_success
+
+The serial reaches Gradle as ``ANDROID_SERIAL`` in the child's environment,
+set here rather than inherited from the shell, and anything that is not an
+``emulator-NNNN`` is refused: with several devices attached a connected task
+without ANDROID_SERIAL runs on EVERY one of them -- a plugged-in phone
+included -- and uninstalls the APKs from each when it finishes.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -57,10 +73,64 @@ SCAFFOLDS = Path(__file__).resolve().parent / "fixtures" / "scaffold"
 FLAVORED = SCAFFOLDS / "flavored"
 COMPILE = SCAFFOLDS / "compile"
 WHERE_BLOCK = SCAFFOLDS / "where-block"
-ALL_SCAFFOLDS = (FLAVORED, COMPILE, WHERE_BLOCK)
+COMPOSE = SCAFFOLDS / "compose"
+ALL_SCAFFOLDS = (FLAVORED, COMPILE, WHERE_BLOCK, COMPOSE)
 RECORDED_ROOT = Path(__file__).resolve().parent / "fixtures" / "recorded"
 
 GRADLE_TIMEOUT = 300
+# A connected run in a fresh copy compiles the Compose app and its test APK,
+# installs both and runs instrumentation: minutes, not seconds.
+CONNECTED_TIMEOUT = 1800
+
+# ``GradleFixture.android_serial`` value meaning "the emulator named by
+# --serial". Any other value is passed to Gradle verbatim.
+SERIAL_FROM_ARGS = "<--serial>"
+
+_INSTRUMENTED_CLASS_ARG = "-Pandroid.testInstrumentationRunnerArguments.class="
+_INSTRUMENTED_PACKAGE = "com.example.composefixture"
+
+# What a fixture's ``args`` may contain, enumerated rather than screened.
+# Gradle expands camelCase abbreviations (``cDAT`` is connectedDebugAndroidTest)
+# and resolves miscased names, so no pattern over task names can say which ones
+# reach a device; a closed list can. _args_refusal() refuses, quoting it, any
+# element not listed here, before Gradle runs at all. A new fixture adds its
+# task here, fully spelled and module-qualified exactly as it appears in args.
+#
+# Some entries are deliberately not real tasks -- a missing variant, an
+# ambiguous abbreviation, a miscased name -- because Gradle's answer to them is
+# the recording. They run against the flavored scaffold, which applies no
+# Android plugin and so has no task that can reach a device.
+KNOWN_TASKS = frozenset(
+    {
+        ":app:assembleNoSuchVariantAtAll",
+        ":app:assembleProstaging",
+        ":app:assembleProstagingdebug",
+        ":app:assembleProStagingDebug",
+        ":kotlin-error:compileKotlin",
+        ":kotlin-warning:compileKotlin",
+        ":java-error:compileJava",
+        ":java-warning:compileJava",
+        ":junit-error:test",
+        "help",
+        ":app:testProStagingDebugUnitTest",
+        ":app:properties",
+        ":nope:properties",
+        ":app:connectedDebugAndroidTest",
+    }
+)
+# The known tasks that install on or run against a device: a fixture running
+# one MUST pin ANDROID_SERIAL.
+DEVICE_TASKS = frozenset({":app:connectedDebugAndroidTest"})
+# Flags taking no value, and flags whose NEXT element is their value. The
+# recorder's own --console=plain and --rerun-tasks are added by _run(), not
+# taken from args.
+KNOWN_FLAGS = frozenset({"-q", "--rerun"})
+KNOWN_VALUE_FLAGS = frozenset({"--property"})
+# -P project properties, by the text up to and including '='. A property cannot
+# select a task, but "-P..." would also admit AGP's injected options, some of
+# which change what a device run does, so these are enumerated too.
+KNOWN_PROPERTY_PREFIXES = (_INSTRUMENTED_CLASS_ARG,)
+assert DEVICE_TASKS <= KNOWN_TASKS
 
 
 @dataclass(frozen=True)
@@ -96,6 +166,26 @@ class GradleFixture:
             of the scaffold -- the checked-in scaffold is never edited -- and
             the copy's path is scrubbed to ``/scaffold`` like the scaffold's.
         make_dirs: Directories, relative to the copy, created before the run.
+        fresh_copy: Run in a throwaway copy even with no settings edit, so
+            nothing a previous build left in the scaffold (a results file, an
+            up-to-date task) can stand in for this run's output.
+        android_serial: ``ANDROID_SERIAL`` for the run, set in the child's
+            environment. ``SERIAL_FROM_ARGS`` takes the recorder's ``--serial``
+            (refused unless an ``emulator-NNNN``); any other value is used
+            verbatim. Mandatory for a task that reaches a device.
+        timeout: Seconds before the run is killed.
+        expect_success: When not None, the exit status the run must have for
+            the capture to count -- a "passing" run that failed because the
+            emulator went away is not a recording of a passing run.
+        results_glob: Glob, relative to the copy, for the JUnit XML the run
+            wrote. Deliberately a search, not a path: where AGP writes it is
+            part of what is being recorded. Exactly one match is required; it
+            is recorded as ``results_fixture`` and its relative path goes into
+            the manifest as ``results_path``.
+        results_fixture: Name the ``results_glob`` match is recorded under.
+        tree_root: Directory, relative to the copy, whose listing is recorded
+            as ``tree_fixture`` so the output layout is ground truth too.
+        tree_fixture: Name the ``tree_root`` listing is recorded under.
     """
 
     name: str
@@ -110,6 +200,14 @@ class GradleFixture:
     gradle_below: str | None = None
     settings_append: str | None = None
     make_dirs: tuple[str, ...] = ()
+    fresh_copy: bool = False
+    android_serial: str | None = None
+    timeout: int = GRADLE_TIMEOUT
+    expect_success: bool | None = None
+    results_glob: str | None = None
+    results_fixture: str | None = None
+    tree_root: str | None = None
+    tree_fixture: str | None = None
 
 
 # build_and_test asks Gradle where a --module lives instead of reading the
@@ -447,6 +545,66 @@ FIXTURES: list[GradleFixture] = [
         ),
         catches=("W5-G",),
     ),
+    GradleFixture(
+        name="connected_android_test_success",
+        args=[
+            ":app:connectedDebugAndroidTest",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.PassingInstrumentedTest",
+        ],
+        scaffold=COMPOSE,
+        fresh_copy=True,
+        android_serial=SERIAL_FROM_ARGS,
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=True,
+        requires_in_log="> Task :app:connectedDebugAndroidTest",
+        results_glob="app/build/**/TEST-*.xml",
+        results_fixture="junit_xml_instrumented_passing",
+        tree_root="app/build/outputs/androidTest-results",
+        tree_fixture="instrumented_results_tree",
+        description=(
+            "connectedDebugAndroidTest on one emulator, filtered by the AGP "
+            "runner argument to the one-test passing class. The console output "
+            "of a green instrumented run, from a cold build of the scaffold."
+        ),
+    ),
+    GradleFixture(
+        name="connected_android_test_failure",
+        args=[
+            ":app:connectedDebugAndroidTest",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.FailingInstrumentedTest",
+        ],
+        scaffold=COMPOSE,
+        fresh_copy=True,
+        android_serial=SERIAL_FROM_ARGS,
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=False,
+        requires_in_log="> Task :app:connectedDebugAndroidTest",
+        results_glob="app/build/**/TEST-*.xml",
+        results_fixture="junit_xml_instrumented_failing",
+        description=(
+            "connectedDebugAndroidTest filtered to the mixed class: one test "
+            'passes, one calls fail("recorded failure"). The console output '
+            "of a red instrumented run."
+        ),
+    ),
+    GradleFixture(
+        name="connected_android_test_no_device",
+        args=[
+            ":app:connectedDebugAndroidTest",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.PassingInstrumentedTest",
+        ],
+        scaffold=COMPOSE,
+        fresh_copy=True,
+        android_serial="no-such-serial-xyz",
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=False,
+        requires_in_log="> Task :app:connectedDebugAndroidTest",
+        description=(
+            "The same task with ANDROID_SERIAL naming a device that does not "
+            "exist: what an agent sees when the emulator it asked for is gone. "
+            "Needs no emulator."
+        ),
+    ),
 ]
 
 
@@ -487,8 +645,82 @@ def _prepare_copy(fixture: GradleFixture, workdir: Path) -> Path:
     return copy
 
 
-def _run(gradle: str, fixture: GradleFixture, cwd: Path | None = None) -> str:
-    """Run one fixture's Gradle invocation and return combined output.
+def _args_refusal(fixture: GradleFixture) -> str | None:
+    """Why this fixture's ``args`` must not reach Gradle, or None when they may.
+
+    Every element must be a known flag, the value following a known value flag,
+    a known ``-P`` property, or a task in ``KNOWN_TASKS``; a task in
+    ``DEVICE_TASKS`` additionally needs ``android_serial``. Anything else is
+    refused with its text quoted -- an abbreviation of a known task included,
+    which Gradle would otherwise expand and run.
+    """
+    awaiting_value_of: str | None = None
+    for arg in fixture.args:
+        if awaiting_value_of is not None:
+            awaiting_value_of = None
+        elif arg in KNOWN_VALUE_FLAGS:
+            awaiting_value_of = arg
+        elif arg in KNOWN_FLAGS or arg.startswith(KNOWN_PROPERTY_PREFIXES):
+            continue
+        elif arg not in KNOWN_TASKS:
+            return (
+                f"{fixture.name}: {arg!r} is not a known task, flag or property "
+                f"(a new task goes into KNOWN_TASKS, fully spelled)"
+            )
+        elif arg in DEVICE_TASKS and fixture.android_serial is None:
+            return (
+                f"{fixture.name}: {arg!r} reaches a device and no android_serial "
+                f"is pinned, so it would run on every attached device"
+            )
+    if awaiting_value_of is not None:
+        return f"{fixture.name}: {awaiting_value_of!r} is missing its value"
+    return None
+
+
+def _args_refusals(fixtures: list[GradleFixture]) -> list[str]:
+    """``_args_refusal`` for every fixture that has one."""
+    return [why for why in map(_args_refusal, fixtures) if why is not None]
+
+
+def _serial_refusal(serial: str | None, selected: list[GradleFixture]) -> str | None:
+    """Why this run must not start, or None when it may.
+
+    Mirrors ``record_fixtures._physical_target_refusal`` but is stricter in
+    one respect: an ``ANDROID_SERIAL`` already in the shell does not count.
+    The serial is required on the command line, so what a run targets is in
+    the command that started it rather than in whatever terminal it came from.
+    """
+    needing = sorted(f.name for f in selected if f.android_serial == SERIAL_FROM_ARGS)
+    if not needing:
+        return None
+    if serial and serial.startswith("emulator-"):
+        return None
+    shown = repr(serial) if serial else "not given"
+    return (
+        f"Refusing to record: --serial is {shown}, not an emulator, and "
+        f"{len(needing)} selected fixture(s) install APKs on the device and run "
+        f"instrumentation there ({', '.join(needing)}). Pass --serial "
+        f"emulator-NNNN, or select only fixtures that need no device with --only."
+    )
+
+
+def _environment(fixture: GradleFixture, serial: str | None) -> dict[str, str] | None:
+    """The child's environment: inherited, plus ANDROID_SERIAL when pinned."""
+    if fixture.android_serial is None:
+        return None
+    value = serial if fixture.android_serial == SERIAL_FROM_ARGS else fixture.android_serial
+    if not value:
+        raise RuntimeError(f"{fixture.name}: no serial to pin (refusal check skipped?)")
+    return {**os.environ, "ANDROID_SERIAL": value}
+
+
+def _run(
+    gradle: str,
+    fixture: GradleFixture,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[str, int]:
+    """Run one fixture's Gradle invocation; return combined output and exit code.
 
     Failure output is the point of most of these fixtures, so a non-zero exit is
     expected and not an error. ``--console=plain`` matches what the skill itself
@@ -500,12 +732,47 @@ def _run(gradle: str, fixture: GradleFixture, cwd: Path | None = None) -> str:
     result = subprocess.run(
         [gradle, *flags, *fixture.args],
         cwd=cwd or fixture.scaffold,
+        env=env,
         capture_output=True,
         text=True,
-        timeout=GRADLE_TIMEOUT,
+        timeout=fixture.timeout,
         check=False,
     )
-    return result.stdout + result.stderr
+    return result.stdout + result.stderr, result.returncode
+
+
+def _tree_listing(copy: Path, root: Path) -> str:
+    """Every path under ``root``, relative to ``copy``; directories end in '/'."""
+    lines = [f"{root.relative_to(copy).as_posix()}/"]
+    for path in sorted(root.rglob("*")):
+        suffix = "/" if path.is_dir() else ""
+        lines.append(f"{path.relative_to(copy).as_posix()}{suffix}")
+    return "\n".join(lines) + "\n"
+
+
+def _collect_outputs(fixture: GradleFixture, copy: Path) -> dict[str, tuple[str, str]]:
+    """Files the run wrote that are recorded alongside its log.
+
+    Returns ``{"results": (relative path, text), "tree": (root, listing)}``,
+    either key absent when the fixture does not ask for it. Raises ValueError
+    when what was asked for is not there, or is not exactly one file.
+    """
+    outputs: dict[str, tuple[str, str]] = {}
+    if fixture.results_glob is not None:
+        found = sorted(path for path in copy.glob(fixture.results_glob) if path.is_file())
+        if len(found) != 1:
+            listed = [path.relative_to(copy).as_posix() for path in found]
+            raise ValueError(f"{fixture.results_glob} matched {len(found)} file(s): {listed}")
+        outputs["results"] = (
+            found[0].relative_to(copy).as_posix(),
+            found[0].read_text(encoding="utf-8"),
+        )
+    if fixture.tree_root is not None:
+        root = copy / fixture.tree_root
+        if not root.is_dir():
+            raise ValueError(f"{fixture.tree_root} was not created")
+        outputs["tree"] = (fixture.tree_root, _tree_listing(copy, root))
+    return outputs
 
 
 def _scrub(text: str, extra_roots: tuple[Path, ...] = ()) -> str:
@@ -524,7 +791,12 @@ def _scrub(text: str, extra_roots: tuple[Path, ...] = ()) -> str:
     redaction that guards the adb corpus never sees it. ``timestamp`` and the
     per-test ``time`` are wall-clock values that would otherwise change on
     every re-record.
+
+    A connected run is the first to take over a minute (``in 2m 5s``) and the
+    first to print paths outside the scaffold (the Android SDK's), so any
+    remaining home-directory prefix is reduced to ``~`` last of all.
     """
+    text = re.sub(r"in \d+m \d+s\b", "in 0s", text)
     text = re.sub(r"in \d+m?s\b", "in 0s", text)
     text = re.sub(r"\d+ actionable task", "1 actionable task", text)
     text = re.sub(r'hostname="[^"]*"', 'hostname="build-host"', text)
@@ -536,20 +808,55 @@ def _scrub(text: str, extra_roots: tuple[Path, ...] = ()) -> str:
     roots = {str(root) for root in extra_roots} | {str(root.resolve()) for root in extra_roots}
     for root in (*sorted(roots, key=len, reverse=True), *map(str, ALL_SCAFFOLDS)):
         text = text.replace(root, "/scaffold")
-    return text
+    return text.replace(str(Path.home()), "~")
 
 
-def record(gradle: str, only: set[str] | None = None) -> int:
+def _sidecar_parents() -> dict[str, str]:
+    """Recorded names that are written by another fixture's run, to that fixture."""
+    parents = {}
+    for fixture in FIXTURES:
+        for sidecar in (fixture.results_fixture, fixture.tree_fixture):
+            if sidecar is not None:
+                parents[sidecar] = fixture.name
+    return parents
+
+
+def _ordered_names() -> list[str]:
+    """Manifest order: FIXTURES order, each run's sidecars right after it."""
+    order = []
+    for fixture in FIXTURES:
+        order.append(fixture.name)
+        order.extend(s for s in (fixture.results_fixture, fixture.tree_fixture) if s is not None)
+    return order
+
+
+def _fail(name: str, why: str, log: str) -> int:
+    print(f"  FAIL  {name}: {why}. The build printed:\n{log[-2000:]}", file=sys.stderr)
+    return 1
+
+
+def record(gradle: str, only: set[str] | None = None, serial: str | None = None) -> int:
     """Record the Gradle fixtures (all, or ``only`` those) and write the manifest."""
     for scaffold in ALL_SCAFFOLDS:
         if not scaffold.exists():
             print(f"scaffold missing: {scaffold}", file=sys.stderr)
             return 1
 
-    known = {fixture.name for fixture in FIXTURES}
+    parents = _sidecar_parents()
+    known = {fixture.name for fixture in FIXTURES} | set(parents)
     if only is not None and only - known:
         print(f"unknown fixture(s): {sorted(only - known)}", file=sys.stderr)
         return 1
+    if only is not None:
+        # A sidecar is written by its parent's run, so asking for one runs that.
+        only = {parents.get(name, name) for name in only}
+
+    # Every fixture, not only the selected ones: a bad entry is a bug in this
+    # file whichever fixture is asked for. Nothing has been run yet.
+    refusals = _args_refusals(FIXTURES)
+    if refusals:
+        print("Refusing to record:\n  " + "\n  ".join(refusals), file=sys.stderr)
+        return 2
 
     version = _gradle_version(gradle)
     out_dir = RECORDED_ROOT / f"gradle-{version}"
@@ -573,6 +880,16 @@ def record(gradle: str, only: set[str] | None = None) -> int:
             continue
         selected.append(fixture)
 
+    refusal = _serial_refusal(serial, selected)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
+    if any(f.scaffold == COMPOSE for f in selected) and not (
+        os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    ):
+        print("The compose scaffold builds with AGP: set ANDROID_HOME.", file=sys.stderr)
+        return 1
+
     entries = []
     for fixture in selected:
         produced = _artifact_path(fixture)
@@ -583,24 +900,39 @@ def record(gradle: str, only: set[str] | None = None) -> int:
         # thing this tool exists to prevent.
         if produced is not None and produced.exists():
             produced.unlink()
+        env = _environment(fixture, serial)
         started_at = time.time()
         copies: tuple[Path, ...] = ()
-        if fixture.settings_append is not None or fixture.make_dirs:
+        outputs: dict[str, tuple[str, str]] = {}
+        collect_error: str | None = None
+        if fixture.settings_append is not None or fixture.make_dirs or fixture.fresh_copy:
             with tempfile.TemporaryDirectory(prefix="gradle-fixture-") as workdir:
                 copy = _prepare_copy(fixture, Path(workdir))
                 copies = (copy,)
-                log = _scrub(_run(gradle, fixture, cwd=copy), copies)
+                raw, exit_code = _run(gradle, fixture, cwd=copy, env=env)
+                wall_seconds = round(time.time() - started_at, 1)
+                log = _scrub(raw, copies)
+                # Read before the copy is deleted; judged after the log is.
+                try:
+                    outputs = _collect_outputs(fixture, copy)
+                except ValueError as exc:
+                    collect_error = str(exc)
         else:
-            log = _run(gradle, fixture)
+            log, exit_code = _run(gradle, fixture, env=env)
+            wall_seconds = round(time.time() - started_at, 1)
 
         if fixture.requires_in_log is not None and fixture.requires_in_log not in log:
-            print(
-                f"  FAIL  {fixture.name}: the build output does not contain "
-                f"{fixture.requires_in_log!r}, so the producing task did not "
-                f"run. The build printed:\n{log[-2000:]}",
-                file=sys.stderr,
+            return _fail(
+                fixture.name,
+                f"the build output does not contain {fixture.requires_in_log!r}, "
+                f"so the producing task did not run",
+                log,
             )
-            return 1
+        if fixture.expect_success is not None and (exit_code == 0) != fixture.expect_success:
+            wanted = "succeed" if fixture.expect_success else "fail"
+            return _fail(fixture.name, f"expected the run to {wanted}, exit {exit_code}", log)
+        if collect_error is not None:
+            return _fail(fixture.name, collect_error, log)
 
         if produced is None:
             text = _scrub(log, copies)
@@ -608,12 +940,7 @@ def record(gradle: str, only: set[str] | None = None) -> int:
             # The build had to run to produce it, but what gets recorded is the
             # file the build WROTE, not what it printed.
             if not produced.exists():
-                print(
-                    f"  FAIL  {fixture.name}: {fixture.artifact} was not "
-                    f"produced. The build printed:\n{log[-2000:]}",
-                    file=sys.stderr,
-                )
-                return 1
+                return _fail(fixture.name, f"{fixture.artifact} was not produced", log)
             # Belt and braces after the pre-delete: the file must also be newer
             # than the invocation that was supposed to create it.
             if produced.stat().st_mtime < started_at:
@@ -626,57 +953,147 @@ def record(gradle: str, only: set[str] | None = None) -> int:
             text = _scrub(produced.read_text(encoding="utf-8"))
         path = out_dir / f"{fixture.name}.{fixture.ext}"
         path.write_text(text, encoding="utf-8")
+        common = {
+            # Per entry: a partial run must not re-date what it did not record.
+            "recorded_at": _utc_stamp(),
+            "command": (
+                "gradle --console=plain "
+                + ("--rerun-tasks " if fixture.rerun else "")
+                + " ".join(fixture.args)
+            ),
+            "scaffold": f"tests/fixtures/scaffold/{fixture.scaffold.name}",
+            **(
+                {
+                    "setup": (
+                        "run in a temporary copy of the scaffold"
+                        + (
+                            f"; appended to settings.gradle: {fixture.settings_append!r}"
+                            if fixture.settings_append is not None
+                            else ""
+                        )
+                        + (
+                            f"; created: {', '.join(fixture.make_dirs)}"
+                            if fixture.make_dirs
+                            else ""
+                        )
+                    )
+                }
+                if copies
+                else {}
+            ),
+            # The lane budget for a device run is set from this, so only those
+            # carry it; elsewhere it would only make every re-record a diff.
+            **(
+                {
+                    "environment": {"ANDROID_SERIAL": env["ANDROID_SERIAL"]},
+                    "wall_seconds": wall_seconds,
+                }
+                if env is not None
+                else {}
+            ),
+        }
         entries.append(
             {
                 "name": fixture.name,
                 "file": path.name,
-                "command": (
-                    "gradle --console=plain "
-                    + ("--rerun-tasks " if fixture.rerun else "")
-                    + " ".join(fixture.args)
-                ),
-                "scaffold": f"tests/fixtures/scaffold/{fixture.scaffold.name}",
-                **(
-                    {
-                        "setup": (
-                            "run in a temporary copy of the scaffold"
-                            + (
-                                f"; appended to settings.gradle: {fixture.settings_append!r}"
-                                if fixture.settings_append is not None
-                                else ""
-                            )
-                            + (
-                                f"; created: {', '.join(fixture.make_dirs)}"
-                                if fixture.make_dirs
-                                else ""
-                            )
-                        )
-                    }
-                    if copies
-                    else {}
-                ),
+                **common,
+                "exit_code": exit_code,
                 "produced_artifact": fixture.artifact,
+                **({"results_path": outputs["results"][0]} if "results" in outputs else {}),
                 "description": fixture.description,
                 "catches": list(fixture.catches),
                 "bytes": len(text.encode("utf-8")),
             }
         )
-        print(f"  ok    {path.name} ({len(text.encode('utf-8'))} bytes)")
+        print(f"  ok    {path.name} ({len(text.encode('utf-8'))} bytes, exit {exit_code})")
 
-    if only is not None and (out_dir / "MANIFEST.json").exists():
-        # Merge: what was not re-recorded keeps its entry, in FIXTURES order.
-        previous = json.loads((out_dir / "MANIFEST.json").read_text(encoding="utf-8"))
+        sidecars = []
+        if "results" in outputs:
+            results_path, xml = outputs["results"]
+            sidecars.append(
+                (
+                    fixture.results_fixture,
+                    "xml",
+                    _scrub(xml, copies),
+                    {"results_path": results_path},
+                    f"The JUnit XML {fixture.name} wrote. Found by searching "
+                    f"{fixture.results_glob!r} after the run, not by assuming a "
+                    f"path: results_path is where AGP put it.",
+                )
+            )
+        if "tree" in outputs:
+            tree_root, listing = outputs["tree"]
+            sidecars.append(
+                (
+                    fixture.tree_fixture,
+                    "txt",
+                    listing,
+                    {"tree_root": tree_root},
+                    f"Every path under {tree_root}/ after {fixture.name}, so the "
+                    f"layout AGP writes is ground truth rather than an assumption.",
+                )
+            )
+        for name, ext, body, extra, description in sidecars:
+            side_path = out_dir / f"{name}.{ext}"
+            side_path.write_text(body, encoding="utf-8")
+            entries.append(
+                {
+                    "name": name,
+                    "file": side_path.name,
+                    **common,
+                    "produced_by": fixture.name,
+                    **extra,
+                    "description": description,
+                    "catches": [],
+                    "bytes": len(body.encode("utf-8")),
+                }
+            )
+            print(f"  ok    {side_path.name} ({len(body.encode('utf-8'))} bytes)")
+
+    manifest_path = out_dir / "MANIFEST.json"
+    previous = None
+    if only is not None and manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _merged_manifest(previous, entries, version=version, now=_utc_stamp())
+    manifest_path.write_text(_manifest_text(manifest), encoding="utf-8")
+    print(f"\n{len(manifest['fixtures'])} fixture(s) -> {out_dir}")
+    return 0
+
+
+def _utc_stamp() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _manifest_text(manifest: dict) -> str:
+    return json.dumps(manifest, indent=2) + "\n"
+
+
+def _merged_manifest(previous: dict | None, entries: list[dict], *, version: str, now: str) -> dict:
+    """The manifest to write after recording ``entries``.
+
+    ``previous`` is the existing manifest on a partial (``--only``) run, None on
+    a full one. A partial run replaces only the entries it recorded -- each of
+    which carries its own ``recorded_at`` -- and keeps every other entry as it
+    was, in FIXTURES order, together with the profile-level ``recorded_at``:
+    re-dating the whole profile would claim every untouched fixture was
+    recorded today. ``gradle_version`` is the profile's key, so it cannot
+    differ; ``scaffolds`` and ``note`` are this recorder's constants and only
+    change when the recorder does.
+    """
+    if previous is None:
+        recorded_at, fixtures = now, entries
+    else:
+        recorded_at = previous.get("recorded_at", now)
         recorded = {entry["name"]: entry for entry in previous.get("fixtures", [])}
         recorded.update({entry["name"]: entry for entry in entries})
-        order = [fixture.name for fixture in FIXTURES]
-        entries = sorted(
+        order = _ordered_names()
+        fixtures = sorted(
             recorded.values(),
             key=lambda e: order.index(e["name"]) if e["name"] in order else len(order),
         )
-
-    manifest = {
+    return {
         "profile": f"gradle-{version}",
-        "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recorded_at": recorded_at,
         "gradle_version": version,
         "scaffolds": [f"tests/fixtures/scaffold/{s.name}" for s in ALL_SCAFFOLDS],
         "note": (
@@ -685,11 +1102,8 @@ def record(gradle: str, only: set[str] | None = None) -> int:
             "hostname, timestamp and per-test time normalised: Gradle writes "
             "the recording machine's hostname into every testsuite element."
         ),
-        "fixtures": entries,
+        "fixtures": fixtures,
     }
-    (out_dir / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"\n{len(entries)} fixture(s) -> {out_dir}")
-    return 0
 
 
 def main() -> None:
@@ -706,16 +1120,27 @@ def main() -> None:
         metavar="NAME",
         help="Record only this fixture (repeatable); merges into the existing manifest",
     )
+    parser.add_argument(
+        "--serial",
+        help=(
+            "Emulator for the connected fixtures (emulator-NNNN; anything else is "
+            "refused). Passed to Gradle as ANDROID_SERIAL."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list:
         width = max(len(f.name) for f in FIXTURES)
         for fixture in FIXTURES:
             catches = f"  [catches {', '.join(fixture.catches)}]" if fixture.catches else ""
-            print(f"{fixture.name:<{width}}  gradle {' '.join(fixture.args)}{catches}")
+            device = "  [needs --serial]" if fixture.android_serial == SERIAL_FROM_ARGS else ""
+            print(f"{fixture.name:<{width}}  gradle {' '.join(fixture.args)}{catches}{device}")
+            for sidecar in (fixture.results_fixture, fixture.tree_fixture):
+                if sidecar is not None:
+                    print(f"  {sidecar}  (written by {fixture.name})")
         return
 
-    sys.exit(record(args.gradle, set(args.only) if args.only else None))
+    sys.exit(record(args.gradle, set(args.only) if args.only else None, args.serial))
 
 
 if __name__ == "__main__":

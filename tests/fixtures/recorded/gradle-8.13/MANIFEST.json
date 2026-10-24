@@ -5,7 +5,8 @@
   "scaffolds": [
     "tests/fixtures/scaffold/flavored",
     "tests/fixtures/scaffold/compile",
-    "tests/fixtures/scaffold/where-block"
+    "tests/fixtures/scaffold/where-block",
+    "tests/fixtures/scaffold/compose"
   ],
   "note": "Durations and absolute paths are normalised so a re-record diffs only on real format changes. The JUnit XML additionally has its hostname, timestamp and per-test time normalised: Gradle writes the recording machine's hostname into every testsuite element.",
   "fixtures": [
@@ -259,6 +260,110 @@
         "W5-G"
       ],
       "bytes": 168
+    },
+    {
+      "name": "connected_android_test_success",
+      "file": "connected_android_test_success.txt",
+      "recorded_at": "2026-10-24T18:14:00Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5554"
+      },
+      "wall_seconds": 24.0,
+      "exit_code": 0,
+      "produced_artifact": null,
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/TEST-Pixel_9(AVD) - 15-_app-.xml",
+      "description": "connectedDebugAndroidTest on one emulator, filtered by the AGP runner argument to the one-test passing class. The console output of a green instrumented run, from a cold build of the scaffold.",
+      "catches": [],
+      "bytes": 4479
+    },
+    {
+      "name": "junit_xml_instrumented_passing",
+      "file": "junit_xml_instrumented_passing.xml",
+      "recorded_at": "2026-10-24T18:14:00Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5554"
+      },
+      "wall_seconds": 24.0,
+      "produced_by": "connected_android_test_success",
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/TEST-Pixel_9(AVD) - 15-_app-.xml",
+      "description": "The JUnit XML connected_android_test_success wrote. Found by searching 'app/build/**/TEST-*.xml' after the run, not by assuming a path: results_path is where AGP put it.",
+      "catches": [],
+      "bytes": 532
+    },
+    {
+      "name": "instrumented_results_tree",
+      "file": "instrumented_results_tree.txt",
+      "recorded_at": "2026-10-24T18:14:00Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5554"
+      },
+      "wall_seconds": 24.0,
+      "produced_by": "connected_android_test_success",
+      "tree_root": "app/build/outputs/androidTest-results",
+      "description": "Every path under app/build/outputs/androidTest-results/ after connected_android_test_success, so the layout AGP writes is ground truth rather than an assumption.",
+      "catches": [],
+      "bytes": 1671
+    },
+    {
+      "name": "connected_android_test_failure",
+      "file": "connected_android_test_failure.txt",
+      "recorded_at": "2026-10-24T18:14:26Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.FailingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5554"
+      },
+      "wall_seconds": 15.8,
+      "exit_code": 1,
+      "produced_artifact": null,
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/TEST-Pixel_9(AVD) - 15-_app-.xml",
+      "description": "connectedDebugAndroidTest filtered to the mixed class: one test passes, one calls fail(\"recorded failure\"). The console output of a red instrumented run.",
+      "catches": [],
+      "bytes": 5222
+    },
+    {
+      "name": "junit_xml_instrumented_failing",
+      "file": "junit_xml_instrumented_failing.xml",
+      "recorded_at": "2026-10-24T18:14:26Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.FailingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5554"
+      },
+      "wall_seconds": 15.8,
+      "produced_by": "connected_android_test_failure",
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/TEST-Pixel_9(AVD) - 15-_app-.xml",
+      "description": "The JUnit XML connected_android_test_failure wrote. Found by searching 'app/build/**/TEST-*.xml' after the run, not by assuming a path: results_path is where AGP put it.",
+      "catches": [],
+      "bytes": 860
+    },
+    {
+      "name": "connected_android_test_no_device",
+      "file": "connected_android_test_no_device.txt",
+      "recorded_at": "2026-10-24T18:13:26Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "no-such-serial-xyz"
+      },
+      "wall_seconds": 20.0,
+      "exit_code": 1,
+      "produced_artifact": null,
+      "description": "The same task with ANDROID_SERIAL naming a device that does not exist: what an agent sees when the emulator it asked for is gone. Needs no emulator.",
+      "catches": [],
+      "bytes": 4845
     }
   ]
 }

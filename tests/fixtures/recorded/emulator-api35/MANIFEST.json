@@ -9,7 +9,7 @@
     "abi": "arm64-v8a",
     "build_fingerprint": "google/sdk_gphone16k_arm64/emu64a16k:15/AE3A.240806.041/12890756:user/dev-keys"
   },
-  "redacted_package_count": 9,
+  "redacted_package_count": 11,
   "redaction_note": "Non-AOSP package names were replaced with stable com.example.appN aliases so a developer's own apps are not published. Line shape is unchanged, so parsers exercise identical code paths. The count is of the distinct aliases this profile's fixtures hold; a partial re-record numbers its own from app1, so it is a lower bound on packages redacted.",
   "fixtures": [
     {
@@ -587,8 +587,8 @@
     {
       "name": "logcat_anr_broadcast_records",
       "file": "logcat_anr_broadcast_records.bin",
-      "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on",
-      "description": "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin in kind of logcat_anr_broadcast_stream. ActivityManager's report is ONE record: its message is 'ANR in <package>' then '\\nPID: <app pid>', '\\nReason: Broadcast of Intent {...}' and the rest of the report, all one writer's. ~5 s later WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping duplicate ANR' verdict, one record each. Every record's pid is system_server's (manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report is held to.",
+      "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before provoking",
+      "description": "One broadcast ANR as logd's records -- what anr_watcher reads (`-B`), the twin in kind of logcat_anr_broadcast_stream. ActivityManager's report is ONE record: its message is 'ANR in <package>' then '\\nPID: <app pid>', '\\nReason: Broadcast of Intent {...}' and the rest of the report, all one writer's. ~5 s later WindowManager's 'ANR in Window{...}' report and ActivityManager's 'Skipping duplicate ANR' verdict, one record each. Every record's pid is system_server's (manifest `system_server_pid`, `pidof` in the same run): the writer an ANR report is held to. That shape is API 35's; a level that differs lists what it lacks under the manifest's `expected_absent`, and `window_anchor` says where the window began.",
       "catches": [
         "D5",
         "A1"
@@ -612,8 +612,8 @@
     {
       "name": "logcat_anr_foreign_process_records",
       "file": "logcat_anr_foreign_process_records.bin",
-      "command": "adb logcat -c; am start -W the fixture app; adb shell am broadcast --async -f 0x10000000 -n com.example.composefixture/.ForeignProcessAnrReceiver (android:process=com.example.victim, AnrReceiver's 40 s block); once system_server logs its `Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the process or the provoking action",
-      "description": "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, in a process it named com.example.victim (android:process), under its own uid. ActivityManager prints the PROCESS name -- 'ANR in com.example.victim', its '\\nPID: <pid>' that process's -- and system_server's `Start proc <pid>:com.example.victim/u0a205` and `Killing <pid>:com.example.victim/u0a205 ... bg anr` carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p <pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture app's uid) and `claimed_package_uid_listing` (com.example.victim is not installed), `system_server_pid`.",
+      "command": "adb logcat -c; am start -W the fixture app; adb shell am broadcast --async -f 0x10000000 -n com.example.composefixture/.ForeignProcessAnrReceiver (android:process=com.example.victim, AnrReceiver's 40 s block); once system_server logs its `Start proc <pid>:com.example.victim`, ps -o PID,UID -p <pid> and both packages' cmd package list packages -U; after `ANR in com.example.victim`, adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the process or the provoking action, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before the broadcast",
+      "description": "An ANR ActivityManager files under ANOTHER package: the fixture app's own stall, in a process it named com.example.victim (android:process), under its own uid. ActivityManager prints the PROCESS name -- 'ANR in com.example.victim', its '\\nPID: <pid>' that process's -- and system_server's `Start proc <pid>:com.example.victim/u0a205` and `Killing <pid>:com.example.victim/u0a205 ... bg anr` carry the impostor's uid. Manifest: `stalled_pid`, `ps_alive` (ps -o PID,UID -p <pid> while it lived, ps_pid_uid's syntax), `package_uid_listing` (the fixture app's uid) and `claimed_package_uid_listing` (com.example.victim is not installed), `system_server_pid`. The `Start proc` and `ANR in` records are required on every level; what a level lacks of the rest of API 35's shape is listed under `expected_absent`.",
       "catches": [
         "W4-N"
       ],
@@ -649,8 +649,8 @@
     {
       "name": "logcat_anr_input_records",
       "file": "logcat_anr_input_records.bin",
-      "command": "adb shell am broadcast --async (background, 60 s timeout), then input keyevent --async KEYCODE_SHIFT_LEFT to the blocked window; 15 s later adb logcat -d -B, host-filtered as logcat_anr_broadcast_records",
-      "description": "An input-dispatch ANR as logd's records, the twin in kind of logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input dispatching timed out' record first, then ActivityManager's report -- ONE record, 'ANR in <package> (<component>)' with its PID and Reason lines. Every record's pid is system_server's (manifest `system_server_pid`).",
+      "command": "adb shell am broadcast --async (background, 60 s timeout), then input keyevent --async KEYCODE_SHIFT_LEFT to the blocked window (where `input` lists no --async, API 33: plain `input keyevent`, its adb call killed after 5 s); 15 s later adb logcat -d -B, host-filtered as logcat_anr_broadcast_records",
+      "description": "An input-dispatch ANR as logd's records, the twin in kind of logcat_anr_input_stream: WindowManager's 'ANR in Window{...}. Reason:Input dispatching timed out' record first, then ActivityManager's report -- ONE record, 'ANR in <package> (<component>)' with its PID and Reason lines. Every record's pid is system_server's (manifest `system_server_pid`). That shape is API 35's; a level that differs lists what it lacks under `expected_absent`, and `key_event` says how the key was sent.",
       "catches": [
         "D5",
         "A1"
@@ -764,7 +764,7 @@
       "name": "logcat_choreographer_jank",
       "file": "logcat_choreographer_jank.txt",
       "command": "adb shell logcat -d -v threadtime | grep Choreographer",
-      "description": "Real Choreographer jank: 'I Choreographer: Skipped N frames!  The application may be doing too much work on its main thread.' TWO spaces after the exclamation mark, and the tag carries the janking app's own pid in the logcat columns -- unlike the ActivityManager ANR lines, whose pid is system_server's. Recorded because every skipped-frame test in this repo built its input from an f-string, which proves only that the parser matches the f-string. Provoked by a cold start of the fixture app, which reliably drops ~30 frames on this profile; a fixed frame COUNT is not something a recording can pin, so the severity-boundary tests derive their counts from this line rather than typing a new one.",
+      "description": "Real Choreographer jank: 'I Choreographer: Skipped N frames!  The application may be doing too much work on its main thread.' TWO spaces after the exclamation mark, and the tag carries the janking app's own pid in the logcat columns -- unlike the ActivityManager ANR lines, whose pid is system_server's. Recorded because every skipped-frame test in this repo built its input from an f-string, which proves only that the parser matches the f-string. Provoked by a cold start and then AnrReceiver's 40s block, and what lands differs by level. emulator-api35 recorded the block's own line, 'Skipped 2401 frames', and 2401 * 16.7ms is 40.1 seconds -- the first independent check this repo has that the FRAME_MS heuristic tracks wall-clock, on a stall whose real length is known. emulator-api33 recorded no line for the block, only the cold start's (tens of frames), plus a Looper 'Slow dispatch' line the grep keeps because it names Choreographer. A cold start janks only when the host happens to be busy, so how MANY lines land here is not fixed; the severity-boundary tests vary the frame count off this line rather than typing new ones.",
       "catches": [],
       "bytes": 133
     },
@@ -984,6 +984,18 @@
       "stream": "stdout"
     },
     {
+      "name": "package_list_uid_all",
+      "file": "package_list_uid_all.txt",
+      "command": "adb shell cmd package list packages -U",
+      "description": "`cmd package list packages -U` with NO package filter: the whole table, one 'package:<name> uid:<uid>' row per package. Ground truth for mapping a uid back to its packages -- several rows naming one uid is a sharedUserId (android.uid.system's packages all read uid:1000) -- which a reader of the filtered form (package_list_uid) never sees. Non-AOSP names are aliased.",
+      "catches": [],
+      "bytes": 13278,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-24T18:18:02Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
       "name": "package_list_uid_two_users",
       "file": "package_list_uid_two_users.txt",
       "command": "adb shell pm create-user; pm install-existing --user <id> <package>; cmd package list packages -U <package>; pm remove-user <id>",
@@ -1047,6 +1059,19 @@
       "stream": "stdout",
       "stdout_bytes": 106,
       "stderr_bytes": 0
+    },
+    {
+      "name": "ps_all_pid_uid",
+      "file": "ps_all_pid_uid.txt",
+      "command": "adb shell ps -A -o PID,UID",
+      "description": "`ps -A -o PID,UID`: every process, as the two numeric columns parse_ps_uids reads (a `PID UID` header, then one row per process). Ground truth for a whole-table pid -> uid read rather than ps_pid_uid's `-p` subset. Manifest `system_server_pid` (`pidof system_server` right after) names the row that must read uid 1000.",
+      "catches": [],
+      "bytes": 3624,
+      "exit_status": 0,
+      "stream": "stdout",
+      "system_server_pid": "613",
+      "recorded_at": "2026-10-24T18:18:02Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
     },
     {
       "name": "ps_pid_uid",
@@ -1541,7 +1566,7 @@
       "name": "sdkmanager_list",
       "file": "sdkmanager_list.txt",
       "command": "{sdkmanager} --list",
-      "description": "`sdkmanager --list` -- what `--list-images` reads, and inert for the same reason its sibling was: it looked for `system-images;` lines split on `|`, and sdkmanager prints neither. The rows are the same slash-separated paths in whitespace-padded columns as `--list_installed`, in TWO sections -- `Installed packages:` then `Available packages:` -- which is the only thing here that says whether an image is already on the machine or has to be downloaded. It is also the only recording that contains API tokens which are not bare integers (`android-34-ext12`, `android-36.1`, `android-37.2-beta1`, `android-CANARY`): they are 76 of the 325 image rows, so a parser requiring `android-<int>` silently drops a quarter of the listing.",
+      "description": "`sdkmanager --list` from cmdline-tools 23's Android-CLI wrapper (the Java tool's is sdkmanager_java_list) -- what `--list-images` reads, and inert for the same reason its sibling was: it looked for `system-images;` lines split on `|`, and this wrapper prints neither. The rows are the same slash-separated paths in whitespace-padded columns as `--list_installed`, in TWO sections -- `Installed packages:` then `Available packages:` -- which is the only thing here that says whether an image is already on the machine or has to be downloaded. It is also the only recording that contains API tokens which are not bare integers (`android-34-ext12`, `android-36.1`, `android-37.2-beta1`, `android-CANARY`): they are 76 of the 325 image rows, so a parser requiring `android-<int>` silently drops a quarter of the listing.",
       "catches": [
         "AVD-LIST-IMAGES"
       ],
@@ -1551,7 +1576,7 @@
       "name": "sdkmanager_list_installed",
       "file": "sdkmanager_list_installed.txt",
       "command": "{sdkmanager} --list_installed",
-      "description": "`sdkmanager --list_installed`, and the reason AVD creation could never work. emulator_create looked for lines starting `system-images;` and split them on `|`. sdkmanager prints `  system-images/android-34/google_apis/arm64-v8a` -- SLASHES, and whitespace-padded columns with no pipe anywhere. So the installed list was always empty, every image reported as 'not installed', and `--api` inference had nothing to infer from. Note also that the *install* id uses semicolons, so the slashes have to be converted back to build the `sdkmanager` argument the error message tells the user to run.",
+      "description": "`sdkmanager --list_installed` from cmdline-tools 23, whose `bin/sdkmanager` is a wrapper that hands the command to the Android CLI -- one of TWO formats (the Java tool's is sdkmanager_java_list_installed). emulator_create looked for lines starting `system-images;` and split them on `|`. This wrapper prints `  system-images/android-34/google_apis/arm64-v8a` -- SLASHES, and whitespace-padded columns with no pipe. So the installed list was always empty, every image reported as 'not installed', and `--api` inference had nothing to infer from. Note also that the *install* id uses semicolons, so the slashes have to be converted back to build the `sdkmanager` argument the error message tells the user to run.",
       "catches": [],
       "bytes": 3868
     },

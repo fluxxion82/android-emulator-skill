@@ -47,7 +47,7 @@ def test_manifest_matches_files_on_disk(recorded):
     )
 
 
-@pytest.mark.parametrize("profile", ["emulator-api35", "pixel4xl-api33"])
+@pytest.mark.parametrize("profile", ["emulator-api35", "emulator-api33", "pixel4xl-api33"])
 def test_the_redaction_count_is_the_corpus_s_not_the_last_run_s(profile):
     """MANIFEST's redacted_package_count is the distinct aliases the profile holds.
 
@@ -948,3 +948,35 @@ def test_touch_target_bug_severity_scales_with_density(any_profile):
         f"{any_profile.name}: a {smallest_dp_wrongly_accepted:.0f}dp target "
         f"passes a check documented as requiring 48dp"
     )
+
+
+# ---------------------------------------------------------------------------
+# Whole-table uid sources (v0.9.0 Inc 0): pid -> uid and uid -> packages.
+# emulator-api33 holds the same pair: tests/test_recorded_matrix_api33.py.
+# ---------------------------------------------------------------------------
+
+
+def test_the_whole_process_table_maps_system_server_to_uid_1000(recorded):
+    from common.device_utils import parse_ps_uids
+
+    entry = next(e for e in recorded.manifest["fixtures"] if e["name"] == "ps_all_pid_uid")
+    uids = parse_ps_uids(recorded.text("ps_all_pid_uid"))
+    assert len(uids) > 50, "a whole process table parsed to almost nothing"
+    assert uids[entry["system_server_pid"]] == 1000
+
+
+def test_the_whole_package_table_names_the_fixture_app_and_a_shared_uid(recorded):
+    from common.device_utils import parse_package_uids
+
+    table = recorded.text("package_list_uid_all")
+    package = "com.example.composefixture"
+    # Not compared with package_list_uid's: that was recorded before the app
+    # was last reinstalled, and a reinstall assigns a new uid.
+    whole = parse_package_uids(table, package)
+    assert whole and all(uid >= 10_000 for uid in whole)
+    on_system = [
+        name
+        for name in re.findall(r"^package:(\S+) uid:", table, flags=re.MULTILINE)
+        if parse_package_uids(table, name) == frozenset({1000})
+    ]
+    assert {"android", "com.android.localtransport"} <= set(on_system)

@@ -1,0 +1,260 @@
+Activity Resolver Table:
+  Non-Data Actions:
+      com.android.providers.contacts.DUMP_DATABASE:
+        134e627 com.android.providers.contacts/.debug.ContactsDumpActivity filter ad010d4
+          Action: "com.android.providers.contacts.DUMP_DATABASE"
+          Category: "android.intent.category.DEFAULT"
+
+Receiver Resolver Table:
+  Non-Data Actions:
+      android.intent.action.LOCALE_CHANGED:
+        fffbdc3 com.android.providers.contacts/.LocaleChangeReceiver filter 3876640
+          Action: "android.intent.action.LOCALE_CHANGED"
+      android.intent.action.PRE_BOOT_COMPLETED:
+        7aff27d com.android.providers.contacts/.ContactsUpgradeReceiver filter b7a8572
+          Action: "android.intent.action.PRE_BOOT_COMPLETED"
+
+Domain verification status:
+
+Permissions:
+  Permission [android.permission.SEND_CALL_LOG_CHANGE] (f7874bd):
+    sourcePackage=com.android.providers.contacts
+    uid=10074 gids=[] type=0 prot=signature|privileged
+    perm=PermissionInfo{b4b3215 android.permission.SEND_CALL_LOG_CHANGE}
+
+Permissions:
+  Permission [android.contacts.permission.MANAGE_SIM_ACCOUNTS] (1097ab2):
+    sourcePackage=com.android.providers.contacts
+    uid=10074 gids=[] type=0 prot=signature
+    perm=PermissionInfo{a45afb5 android.contacts.permission.MANAGE_SIM_ACCOUNTS}
+
+Registered ContentProviders:
+  com.android.providers.contacts/.debug.DumpFileProvider:
+    Provider{6b243ae com.android.providers.contacts/.debug.DumpFileProvider}
+  com.android.providers.contacts/.ContactsProvider2:
+    Provider{8f72e0 com.android.providers.contacts/.ContactsProvider2}
+  com.android.providers.contacts/.CallComposerLocationProvider:
+    Provider{48d310e com.android.providers.contacts/.CallComposerLocationProvider}
+  com.android.providers.contacts/.ShadowCallLogProvider:
+    Provider{f0875cc com.android.providers.contacts/.ShadowCallLogProvider}
+  com.android.providers.contacts/.CallLogProvider:
+    Provider{b707ea8 com.android.providers.contacts/.CallLogProvider}
+  com.android.providers.contacts/.VoicemailContentProvider:
+    Provider{e222586 com.android.providers.contacts/.VoicemailContentProvider}
+
+ContentProvider Authorities:
+  [com.android.voicemail]:
+    Provider{e222586 com.android.providers.contacts/.VoicemailContentProvider}
+      applicationInfo=ApplicationInfo{c17aa03 com.android.providers.contacts}
+  [com.android.contacts]:
+    Provider{8f72e0 com.android.providers.contacts/.ContactsProvider2}
+      applicationInfo=ApplicationInfo{d327d80 com.android.providers.contacts}
+  [contacts]:
+    Provider{8f72e0 com.android.providers.contacts/.ContactsProvider2}
+      applicationInfo=ApplicationInfo{1bc9fb9 com.android.providers.contacts}
+  [call_log]:
+    Provider{b707ea8 com.android.providers.contacts/.CallLogProvider}
+      applicationInfo=ApplicationInfo{8108ffe com.android.providers.contacts}
+  [call_log_shadow]:
+    Provider{f0875cc com.android.providers.contacts/.ShadowCallLogProvider}
+      applicationInfo=ApplicationInfo{760e35f com.android.providers.contacts}
+  [call_composer_locations]:
+    Provider{48d310e com.android.providers.contacts/.CallComposerLocationProvider}
+      applicationInfo=ApplicationInfo{401f1ac com.android.providers.contacts}
+  [com.android.contacts.dumpfile]:
+    Provider{6b243ae com.android.providers.contacts/.debug.DumpFileProvider}
+      applicationInfo=ApplicationInfo{37e7e75 com.android.providers.contacts}
+
+Key Set Manager:
+  [com.android.providers.contacts]
+      Signing KeySets: 4
+
+Packages:
+  Package [com.android.providers.contacts] (4776fa):
+    userId=10074
+    sharedUser=SharedUserSetting{ae1ae0a android.uid.shared/10074}
+    pkg=Package{b1df803 com.android.providers.contacts}
+    codePath=/system/priv-app/ContactsProvider
+    resourcePath=/system/priv-app/ContactsProvider
+    legacyNativeLibraryDir=/system/priv-app/ContactsProvider/lib
+    extractNativeLibs=true
+    primaryCpuAbi=null
+    secondaryCpuAbi=null
+    cpuAbiOverride=null
+    versionCode=33 minSdk=33 targetSdk=33
+    minExtensionVersions=[]
+    versionName=13
+    usesNonSdkApi=true
+    splits=[base]
+    apkSigningVersion=3
+    flags=[ SYSTEM HAS_CODE ALLOW_CLEAR_USER_DATA ]
+    privateFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE_VIA_SDK_VERSION ALLOW_AUDIO_PLAYBACK_CAPTURE PARTIALLY_DIRECT_BOOT_AWARE PRIVILEGED PRIVATE_FLAG_ALLOW_NATIVE_HEAP_POINTER_TAGGING ]
+    forceQueryable=true
+    dataDir=/data/user/0/com.android.providers.contacts
+    supportsScreens=[small, medium, large, xlarge, resizeable, anyDensity]
+    timeStamp=2024-09-09 15:58:09
+    lastUpdateTime=2024-09-09 15:58:09
+    packageSource=0
+    signatures=PackageSignatures{2a5b380 version:3, signatures:[301c6974], past signatures:[]}
+    installPermissionsFixed=false
+    pkgFlags=[ SYSTEM HAS_CODE ALLOW_CLEAR_USER_DATA ]
+    declared permissions:
+      android.permission.SEND_CALL_LOG_CHANGE: prot=signature|privileged, INSTALLED
+      android.contacts.permission.MANAGE_SIM_ACCOUNTS: prot=signature, INSTALLED
+    requested permissions:
+      android.permission.BIND_DIRECTORY_SEARCH
+      android.permission.CHANGE_DEVICE_IDLE_TEMP_WHITELIST
+      android.permission.GET_ACCOUNTS
+      android.permission.GET_ACCOUNTS_PRIVILEGED
+      android.permission.INTERACT_ACROSS_USERS
+      android.permission.MANAGE_USERS
+      android.permission.PROCESS_PHONE_ACCOUNT_REGISTRATION
+      android.permission.READ_CONTACTS
+      android.permission.READ_PHONE_STATE
+      android.permission.READ_PRIVILEGED_PHONE_STATE
+      android.permission.READ_SYNC_SETTINGS
+      android.permission.SEND_CALL_LOG_CHANGE
+      android.permission.UPDATE_APP_OPS_STATS
+      android.permission.WRITE_CONTACTS
+      android.permission.USE_RESERVED_DISK
+      android.permission.READ_DEVICE_CONFIG
+      android.permission.HIDE_NON_SYSTEM_OVERLAY_WINDOWS
+      android.permission.READ_PHONE_NUMBERS
+      android.permission.READ_COMPAT_CHANGE_CONFIG
+      android.permission.LOG_COMPAT_CHANGE
+    install permissions:
+      android.permission.USE_RESERVED_DISK: granted=true
+      android.permission.PROCESS_PHONE_ACCOUNT_REGISTRATION: granted=true
+      com.android.voicemail.permission.READ_VOICEMAIL: granted=true
+      android.permission.GET_ACCOUNTS_PRIVILEGED: granted=true
+      android.permission.LOG_COMPAT_CHANGE: granted=true
+      android.permission.READ_PRIVILEGED_PHONE_STATE: granted=true
+      android.permission.MANAGE_USERS: granted=true
+      android.permission.INTERACT_ACROSS_USERS: granted=true
+      android.permission.BIND_DIRECTORY_SEARCH: granted=true
+      android.permission.READ_SYNC_SETTINGS: granted=true
+      android.permission.READ_COMPAT_CHANGE_CONFIG: granted=true
+      android.permission.HIDE_NON_SYSTEM_OVERLAY_WINDOWS: granted=true
+      android.permission.SEND_CALL_LOG_CHANGE: granted=true
+      android.permission.CHANGE_DEVICE_IDLE_TEMP_WHITELIST: granted=true
+      android.permission.QUERY_ALL_PACKAGES: granted=true
+      android.permission.READ_DEVICE_CONFIG: granted=true
+      android.permission.UPDATE_APP_OPS_STATS: granted=true
+    User 0: ceDataInode=131186 installed=true hidden=false suspended=false distractionFlags=0 stopped=false notLaunched=false enabled=0 instant=false virtual=false
+      installReason=0
+      firstInstallTime=2024-09-09 15:58:09
+      uninstallReason=0
+      overlay paths:
+        /product/overlay/EmulationPixel7/EmulationPixel7Overlay.apk
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+        /product/overlay/ContactsProvider__auto_generated_rro_product.apk
+      legacy overlay paths:
+        /product/overlay/EmulationPixel7/EmulationPixel7Overlay.apk
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+        /product/overlay/ContactsProvider__auto_generated_rro_product.apk
+    User 11: ceDataInode=0 installed=true hidden=false suspended=false distractionFlags=0 stopped=false notLaunched=false enabled=0 instant=false virtual=false
+      installReason=0
+      firstInstallTime=1969-12-31 16:00:00
+      uninstallReason=0
+      overlay paths:
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+        /product/overlay/ContactsProvider__auto_generated_rro_product.apk
+      legacy overlay paths:
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+        /product/overlay/ContactsProvider__auto_generated_rro_product.apk
+
+Queries:
+  system apps queryable: false
+  queries via forceQueryable:
+  forceQueryable:
+    [com.android.providers.contacts,com.android.providers.userdictionary,com.android.calllogbackup,com.android.providers.blockednumber]
+  queries via package name:
+  queries via component:
+  queryable via interaction:
+    User 0:
+      [com.android.emulator.multidisplay,android,com.android.providers.settings,com.android.localtransport,com.android.keychain,com.android.settings,com.android.wallpaperbackup,com.android.dynsystem,com.android.server.telecom,com.android.inputdevices,com.android.location.fused]:
+        [com.android.providers.contacts,com.android.providers.userdictionary,com.android.calllogbackup,com.android.providers.blockednumber]
+      [com.android.providers.contacts,com.android.providers.userdictionary,com.android.calllogbackup,com.android.providers.blockednumber]:
+        [com.android.emulator.multidisplay,android,com.android.providers.settings,com.android.localtransport,com.android.keychain,com.android.settings,com.android.wallpaperbackup,com.android.dynsystem,com.android.server.telecom,com.android.inputdevices,com.android.location.fused]
+        [com.google.android.bluetooth,com.android.bluetooth]
+        com.google.android.as
+        [com.google.android.gsf,com.google.android.gms]
+        com.google.android.apps.messaging
+        com.google.android.dialer
+        com.google.android.contacts
+        com.google.android.inputmethod.latin
+      [com.google.android.gsf,com.google.android.gms]:
+        [com.android.providers.contacts,com.android.providers.userdictionary,com.android.calllogbackup,com.android.providers.blockednumber]
+      com.google.android.contacts:
+        [com.android.providers.contacts,com.android.providers.userdictionary,com.android.calllogbackup,com.android.providers.blockednumber]
+      com.google.android.gm:
+        [com.android.providers.contacts,com.android.providers.userdictionary,com.android.calllogbackup,com.android.providers.blockednumber]
+    User 11:
+  queryable via uses-library:
+
+Shared users:
+  SharedUser [android.uid.shared] (ae1ae0a):
+    userId=10074
+    Packages
+      PackageSetting{4776fa com.android.providers.contacts/10074}
+      PackageSetting{e42b69 com.android.providers.userdictionary/10074}
+      PackageSetting{54a94b5 com.android.calllogbackup/10074}
+      PackageSetting{73729f0 com.android.providers.blockednumber/10074}
+    install permissions:
+      android.permission.USE_RESERVED_DISK: granted=true
+      android.permission.PROCESS_PHONE_ACCOUNT_REGISTRATION: granted=true
+      com.android.voicemail.permission.READ_VOICEMAIL: granted=true
+      android.permission.GET_ACCOUNTS_PRIVILEGED: granted=true
+      android.permission.LOG_COMPAT_CHANGE: granted=true
+      android.permission.READ_PRIVILEGED_PHONE_STATE: granted=true
+      android.permission.MANAGE_USERS: granted=true
+      android.permission.INTERACT_ACROSS_USERS: granted=true
+      android.permission.BIND_DIRECTORY_SEARCH: granted=true
+      android.permission.READ_SYNC_SETTINGS: granted=true
+      android.permission.READ_COMPAT_CHANGE_CONFIG: granted=true
+      android.permission.HIDE_NON_SYSTEM_OVERLAY_WINDOWS: granted=true
+      android.permission.SEND_CALL_LOG_CHANGE: granted=true
+      android.permission.CHANGE_DEVICE_IDLE_TEMP_WHITELIST: granted=true
+      android.permission.QUERY_ALL_PACKAGES: granted=true
+      android.permission.READ_DEVICE_CONFIG: granted=true
+      android.permission.UPDATE_APP_OPS_STATS: granted=true
+    User 0: 
+      gids=[1065]
+      runtime permissions:
+        android.permission.READ_PHONE_NUMBERS: granted=false, flags=[ USER_SENSITIVE_WHEN_GRANTED]
+        android.permission.READ_PHONE_STATE: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+        android.permission.WRITE_CONTACTS: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+        android.permission.GET_ACCOUNTS: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+        android.permission.READ_CONTACTS: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+    User 11: 
+      gids=[1065]
+      runtime permissions:
+        android.permission.READ_PHONE_NUMBERS: granted=true
+        android.permission.READ_PHONE_STATE: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+        android.permission.WRITE_CONTACTS: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+        android.permission.GET_ACCOUNTS: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+        android.permission.READ_CONTACTS: granted=true, flags=[ SYSTEM_FIXED|GRANTED_BY_DEFAULT]
+
+Dexopt state:
+  [com.android.providers.contacts]
+    path: /system/priv-app/ContactsProvider/ContactsProvider.apk
+      arm64: [status=verify] [reason=prebuilt]
+      used by other apps: [com.android.providers.blockednumber]
+  BgDexopt state:
+    enabled:true
+    mDexOptThread:null
+    mDexOptCancellingThread:null
+    mFinishedPostBootUpdate:false
+    mLastExecutionStatus:0
+    mLastExecutionStartTimeMs:0
+    mLastExecutionDurationIncludingSleepMs:0
+    mLastExecutionStartUptimeMs:0
+    mLastExecutionDurationMs:0
+    now:3634883
+    mLastCancelledPackages:
+    mFailedPackageNamesPrimary:
+    mFailedPackageNamesSecondary:
+
+Compiler stats:
+  [com.android.providers.contacts]
+    (No recorded stats)
