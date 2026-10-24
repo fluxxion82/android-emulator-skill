@@ -41,6 +41,9 @@ HOST_ONLY = frozenset(
         "sdkmanager_java_list",
         # Host adb aimed at a serial that is not attached: it reaches no device.
         "adb_waiting_for_device",
+        # Host adb with no target, run only while two or more devices are
+        # attached and with ANDROID_SERIAL removed: adb refuses it unaddressed.
+        "adb_more_than_one_device",
     }
 )
 
@@ -133,6 +136,118 @@ def test_android_serial_naming_an_emulator_gets_past_the_guard(adb_calls, monkey
     monkeypatch.setenv("ANDROID_SERIAL", EMULATOR)
     with pytest.raises(_AdbReachedError):
         rf.record(None, {"run_as_ls_symlink_space"}, "guard")
+    # The env var is resolved into the argv, not left for adb to read.
+    assert adb_calls[0][:3] == ["adb", "-s", EMULATOR]
+
+
+def test_no_serial_at_all_is_refused_even_for_a_read_only_fixture(adb_calls, capsys):
+    """Every run reads getprop first; with no serial adb would pick the device."""
+    assert rf.record(None, {READ_ONLY}, "guard") == 2
+    assert adb_calls == []
+    assert "no target serial" in capsys.readouterr().err
+
+
+def test_a_device_argv_cannot_be_built_without_a_serial():
+    for missing in (None, ""):
+        with pytest.raises(ValueError):
+            rf._adb_argv(missing, ["shell", "true"])
+    with pytest.raises(ValueError):
+        rf._run_host(["adb", "shell", "true"])
+    with pytest.raises(ValueError):
+        rf._run_host_adb(["shell", "true"])
+
+
+class _FakeClock:
+    """``time`` for the recorder: sleeping advances the clock, so polls end at once."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _FakeChild:
+    """A Popen child that never exits on its own, like `input` into a stalled window."""
+
+    def __init__(self, argv, calls, **kwargs):
+        calls.append((list(argv), kwargs.get("env")))
+        self.argv = argv
+        self.text = kwargs.get("text", False)
+        self.stopped = False
+        self.returncode = 0
+
+    def _stop(self) -> None:
+        self.stopped = True
+
+    kill = terminate = _stop
+
+    def wait(self, timeout=None):
+        if not self.stopped:
+            raise rf.subprocess.TimeoutExpired(self.argv, timeout)
+        return 0
+
+    def communicate(self, timeout=None):
+        self.wait(timeout)
+        return ("", "") if self.text else (b"", b"")
+
+
+# A run names no device but the resolved one, except these, each by design:
+# host-scope adb (no device at all), and adb_waiting_for_device, whose
+# ANDROID_SERIAL pins a serial that is not attached.
+NOT_ATTACHED = "no-such-serial-xyz"
+
+
+def test_every_adb_call_of_a_full_run_names_the_resolved_serial(monkeypatch, tmp_path):
+    """R1: the whole recorder, every device fixture, the serial from $ANDROID_SERIAL alone.
+
+    Each subprocess answers exit 0 with empty output (getprop says 33, so the run
+    starts); most captures then fail, after issuing the commands that lead up
+    to them -- which is what is checked. The steps that write (reboot,
+    create-user, the key event, the window mark) are required to appear, so a
+    run that died early cannot pass by issuing nothing.
+    """
+    calls: list[tuple[list[str], dict | None]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs.get("env")))
+        out = "33\n" if "getprop" in argv else ""
+        if not kwargs.get("text"):
+            return rf.subprocess.CompletedProcess(argv, 0, out.encode(), b"")
+        return rf.subprocess.CompletedProcess(argv, 0, out, "")
+
+    monkeypatch.setattr(rf.subprocess, "run", fake_run)
+    monkeypatch.setattr(rf.subprocess, "Popen", lambda argv, **kw: _FakeChild(argv, calls, **kw))
+    monkeypatch.setattr(rf, "time", _FakeClock())
+    monkeypatch.setattr(rf, "RECORDED_ROOT", tmp_path)
+    monkeypatch.setenv("ANDROID_SERIAL", EMULATOR)
+
+    # Every fixture but the SDK-tool ones, which run no adb and read real files
+    # off the host; the two host adb ones stay in, to hold their exemptions.
+    sdk_tools = HOST_ONLY - {"adb_waiting_for_device", "adb_more_than_one_device"}
+    rf.record(None, rf._known_names() - sdk_tools, "full")
+
+    adb = [(argv, env) for argv, env in calls if argv and argv[0] == "adb"]
+    unnamed = [
+        argv
+        for argv, env in adb
+        if argv[1:3] != ["-s", EMULATOR]
+        and argv[1] not in rf._HOST_ADB_SUBCOMMANDS
+        and not (env and env.get("ANDROID_SERIAL") == NOT_ATTACHED)
+    ]
+    assert not unnamed, f"adb argv without -s {EMULATOR}: {unnamed}"
+
+    issued = [" ".join(argv) for argv, _env in adb]
+    for step in (
+        f"adb -s {EMULATOR} reboot",
+        f"adb -s {EMULATOR} shell pm create-user",
+        f"adb -s {EMULATOR} shell input keyevent",
+        f"adb -s {EMULATOR} shell log -t aes-recorder",
+    ):
+        assert any(line.startswith(step) for line in issued), f"never issued: {step}"
 
 
 def test_a_read_only_fixture_is_not_refused(adb_calls):

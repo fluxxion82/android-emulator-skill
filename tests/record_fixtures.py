@@ -64,14 +64,15 @@ Device safety: a fixture marked ``emulator_only`` changes the device it runs on
 (installs state, launches, taps, grants, writes files). ``record`` refuses the
 whole run before any adb call unless the target serial -- ``--serial``, or
 $ANDROID_SERIAL when it is omitted -- starts with ``emulator-``, the same rule
-tests/conftest.py's ``emulator_only_device`` applies to live tests.
+tests/conftest.py's ``emulator_only_device`` applies to live tests. That serial
+is resolved once and every adb call names it with ``-s`` (``_adb_argv``); with
+neither ``--serial`` nor $ANDROID_SERIAL the run is refused, so adb never picks.
 
 Usage
 -----
     python tests/record_fixtures.py --list
-    python tests/record_fixtures.py                 # record everything
-    python tests/record_fixtures.py --only logcat_threadtime wm_size_override
-    python tests/record_fixtures.py --serial emulator-5554
+    python tests/record_fixtures.py --serial emulator-5554       # record everything
+    python tests/record_fixtures.py --serial emulator-5554 --only logcat_threadtime
 
 Requires a booted device or emulator. Re-run after an Android version bump and
 commit the diff: a fixture that changes shape is exactly the signal you want.
@@ -236,13 +237,13 @@ class Fixture:
     teardown: list[list[str]] = field(default_factory=list)
     timeout: int = DEFAULT_TIMEOUT
     post: Callable[[str], str] | None = None
-    prepare: Callable[[Path, str | None], None] | None = None
+    prepare: Callable[[Path, str], None] | None = None
     host_argv: list[str] | None = None
-    capture_bytes: Callable[[str | None, dict], bytes] | None = None
+    capture_bytes: Callable[[str, dict], bytes] | None = None
     record_both_streams: bool = False
-    teardown_verify: Callable[[str | None], None] | None = None
-    metadata: Callable[[str | None], dict] | None = None
-    capture_with: Callable[[Path, str | None, dict], Capture] | None = None
+    teardown_verify: Callable[[str], None] | None = None
+    metadata: Callable[[str], dict] | None = None
+    capture_with: Callable[[Path, str, dict], Capture] | None = None
     command: str | None = None
     emulator_only: bool = False
 
@@ -257,7 +258,48 @@ class CaptureError(RuntimeError):
     """
 
 
-def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> Capture:
+def _adb_argv(serial: str, args: list[str]) -> list[str]:
+    """``adb -s <serial> <args>``: the ONLY way this file addresses a device.
+
+    The serial is required, never defaulted. An argv without ``-s`` lets adb
+    pick for itself -- $ANDROID_SERIAL, or the only device attached -- and a
+    device-writing step must never be aimed by anything but the serial
+    :func:`record` resolved and checked. Host-scope adb (``version``,
+    ``devices``) goes through :func:`_run_host_adb` instead.
+
+    Raises:
+        ValueError: ``serial`` is empty or not a string -- a programming error,
+            deliberately not a CaptureError a run would note and carry on past.
+    """
+    if not isinstance(serial, str) or not serial:
+        raise ValueError(f"an adb device command needs a serial; got {serial!r} for {args}")
+    return ["adb", "-s", serial, *args]
+
+
+# The adb subcommands that address no device: the host's own client and
+# server. Anything else goes through _adb_argv.
+_HOST_ADB_SUBCOMMANDS = frozenset({"version", "devices"})
+
+
+def _run_host_adb(args: list[str], timeout: int = DEFAULT_TIMEOUT) -> Capture:
+    """A host-scope adb command (``devices``, ``version``), with no ``-s``.
+
+    Raises:
+        ValueError: ``args`` is not one of :data:`_HOST_ADB_SUBCOMMANDS`.
+        CaptureError: on timeout.
+    """
+    if not args or args[0] not in _HOST_ADB_SUBCOMMANDS:
+        raise ValueError(f"not a host-scope adb command: {args}")
+    try:
+        result = subprocess.run(
+            ["adb", *args], capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CaptureError(f"timed out after {timeout}s") from exc
+    return Capture(result.stdout, result.stderr, result.returncode)
+
+
+def _run(args: list[str], serial: str, timeout: int = DEFAULT_TIMEOUT) -> Capture:
     """Run one adb command and return both streams plus its exit status.
 
     Raises:
@@ -267,10 +309,7 @@ def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) ->
     wrong" is itself worth recording (see am_broadcast_missing_receiver, whose
     entire point is that a doomed broadcast still exits 0).
     """
-    cmd = ["adb"]
-    if serial:
-        cmd += ["-s", serial]
-    cmd += args
+    cmd = _adb_argv(serial, args)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -284,16 +323,13 @@ def _run(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) ->
     return capture
 
 
-def _run_bytes(args: list[str], serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> bytes:
+def _run_bytes(args: list[str], serial: str, timeout: int = DEFAULT_TIMEOUT) -> bytes:
     """Run one adb command and return its stdout as raw bytes.
 
     ``_run`` decodes with ``text=True``, which mangles a PNG beyond repair.
     Used only by the screencap fixtures.
     """
-    cmd = ["adb"]
-    if serial:
-        cmd += ["-s", serial]
-    cmd += args
+    cmd = _adb_argv(serial, args)
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -384,7 +420,7 @@ def _java_sdkmanager() -> list[str]:
 def _capture_java_sdkmanager(*args: str, timeout: int) -> Callable[..., Capture]:
     """A ``capture_with`` that runs the Java sdkmanager with ``args``."""
 
-    def capture(_scratch: Path, _serial: str | None, extra: dict) -> Capture:
+    def capture(_scratch: Path, _serial: str, extra: dict) -> Capture:
         argv = _java_sdkmanager()
         tools = Path(argv[1].split("=", 1)[1])
         properties = (tools / "source.properties").read_text(encoding="utf-8")
@@ -442,7 +478,7 @@ def _scrub_home_paths(text: str) -> str:
     return text.replace(str(Path.home()), "/Users/<user>")
 
 
-def _pull_app_database(scratch: Path, serial: str | None) -> None:
+def _pull_app_database(scratch: Path, serial: str) -> None:
     """Copy the fixture app's database to the host, byte for byte.
 
     `adb exec-out` rather than a device-side redirect: `run-as ... cat > /sdcard/x`
@@ -450,10 +486,9 @@ def _pull_app_database(scratch: Path, serial: str | None) -> None:
     measured result is a 0-byte file. exec-out streams the bytes straight to the
     host with no pty and no intermediate file.
     """
-    cmd = ["adb"]
-    if serial:
-        cmd += ["-s", serial]
-    cmd += ["exec-out", "run-as", "com.example.composefixture", "cat", "databases/fixture.db"]
+    cmd = _adb_argv(
+        serial, ["exec-out", "run-as", "com.example.composefixture", "cat", "databases/fixture.db"]
+    )
 
     result = subprocess.run(cmd, capture_output=True, timeout=DEFAULT_TIMEOUT, check=False)
     if result.returncode != 0 or not result.stdout:
@@ -485,7 +520,13 @@ def _run_host(
     child inherits the recorder's stdin, and a prompt would wait on a terminal.
     ``env`` is for the same lifecycle: it points ANDROID_AVD_HOME at a private
     directory so avdmanager cannot reach the user's own AVDs.
+
+    Raises:
+        ValueError: ``argv`` is an adb command that could address a device.
+            Those go through :func:`_adb_argv`, which always names the serial.
     """
+    if Path(argv[0]).name == "adb" and (len(argv) < 2 or argv[1] not in _HOST_ADB_SUBCOMMANDS):
+        raise ValueError(f"a device adb command must name its serial: {argv}")
     try:
         result = subprocess.run(
             argv,
@@ -707,7 +748,7 @@ STATUS_BAR_STRIP_PX = 120
 MAX_PNG_BYTES = 50 * 1024
 
 
-def _status_bar_strip(serial: str | None, extra: dict) -> bytes:
+def _status_bar_strip(serial: str, extra: dict) -> bytes:
     """Screencap the device and return the top strip as a PNG.
 
     Cropped rather than recorded whole for two reasons: a full 1080x2424
@@ -741,7 +782,7 @@ def _status_bar_strip(serial: str | None, extra: dict) -> bytes:
     return payload
 
 
-def _display_restored(*, size: bool = False, density: bool = False) -> Callable[[str | None], None]:
+def _display_restored(*, size: bool = False, density: bool = False) -> Callable[[str], None]:
     """Read the display state back and refuse to believe an unverified reset.
 
     `wm size reset` prints nothing whether it worked or not, so the recorder
@@ -753,7 +794,7 @@ def _display_restored(*, size: bool = False, density: bool = False) -> Callable[
     back and require the Override line to be gone.
     """
 
-    def verify(serial: str | None) -> None:
+    def verify(serial: str) -> None:
         for enabled, subcommand in ((size, "size"), (density, "density")):
             if not enabled:
                 continue
@@ -775,7 +816,7 @@ def _display_restored(*, size: bool = False, density: bool = False) -> Callable[
 DEMO_CLOCK_RENDERED = "9:41"
 
 
-def _device_clock(serial: str | None) -> str:
+def _device_clock(serial: str) -> str:
     """The device's own wall-clock time, in the form SystemUI renders.
 
     `%I:%M` is the 12-hour form the status bar uses (measured: the bar reads
@@ -803,7 +844,7 @@ def _device_clock(serial: str | None) -> str:
     return before
 
 
-def _status_bar_strip_showing(demo_clock_applied: bool) -> Callable[[str | None, dict], bytes]:
+def _status_bar_strip_showing(demo_clock_applied: bool) -> Callable[[str, dict], bytes]:
     """Screencap the status bar and record, measured, what its clock reads.
 
     Neither `dumpsys` nor `uiautomator` exposes the rendered status-bar clock
@@ -823,7 +864,7 @@ def _status_bar_strip_showing(demo_clock_applied: bool) -> Callable[[str | None,
     at the one minute of the day that would make the pair meaningless.
     """
 
-    def capture(serial: str | None, extra: dict) -> bytes:
+    def capture(serial: str, extra: dict) -> bytes:
         device_clock = _device_clock(serial)
         if device_clock == DEMO_CLOCK_RENDERED:
             raise CaptureError(
@@ -1003,7 +1044,7 @@ def _chain(*steps: Callable[[str], str]) -> Callable[[str], str]:
     return run
 
 
-def _device_path_absent(listing: list[str]) -> Callable[[str | None], None]:
+def _device_path_absent(listing: list[str]) -> Callable[[str], None]:
     """Read a teardown's deletion back instead of trusting ``rm``'s silence.
 
     ``rm -f`` exits 0 whether or not there was anything to remove, so its
@@ -1011,7 +1052,7 @@ def _device_path_absent(listing: list[str]) -> Callable[[str | None], None]:
     for permission would also exit non-zero, and would prove nothing.
     """
 
-    def verify(serial: str | None) -> None:
+    def verify(serial: str) -> None:
         result = _run(listing, serial, timeout=15)
         if result.returncode == 0 or "No such file" not in result.text:
             raise CaptureError(
@@ -1027,7 +1068,7 @@ def _device_path_absent(listing: list[str]) -> Callable[[str | None], None]:
 _MOVED_ASIDE = ".aes_moved"
 
 
-def _app_dir_restored(directory: str, holds: str) -> Callable[[str | None], None]:
+def _app_dir_restored(directory: str, holds: str) -> Callable[[str], None]:
     """Read back that the fixture app's ``directory`` is listable again and whole.
 
     For the fixtures that move a directory aside, or take its owner's read bit
@@ -1038,7 +1079,7 @@ def _app_dir_restored(directory: str, holds: str) -> Callable[[str | None], None
     app recreated the directory meanwhile (the teardown's ``-T`` refuses that).
     """
 
-    def verify(serial: str | None) -> None:
+    def verify(serial: str) -> None:
         argv = ["shell", "run-as", COMPOSE_PACKAGE, "ls", "-la", directory]
         listing = _run(argv, serial, timeout=15)
         if (
@@ -1056,10 +1097,10 @@ def _app_dir_restored(directory: str, holds: str) -> Callable[[str | None], None
     return verify
 
 
-def _all_of(*verifies: Callable[[str | None], None]) -> Callable[[str | None], None]:
+def _all_of(*verifies: Callable[[str], None]) -> Callable[[str], None]:
     """One ``teardown_verify`` running each of ``verifies``, for a setup that moved two things."""
 
-    def verify(serial: str | None) -> None:
+    def verify(serial: str) -> None:
         for each in verifies:
             each(serial)
 
@@ -1084,7 +1125,7 @@ def _listing(directory: str) -> list[str]:
     return ["shell", "run-as", COMPOSE_PACKAGE, *argv]
 
 
-def _both_streams(args: list[str], name: str) -> Callable[[Path, str | None, dict], Capture]:
+def _both_streams(args: list[str], name: str) -> Callable[[Path, str, dict], Capture]:
     """Capture ``adb <args>`` once; stdout is fixture ``name``, stderr its twin ``name``_stderr.
 
     A find that fails after printing prints on BOTH streams -- an unreadable
@@ -1094,7 +1135,7 @@ def _both_streams(args: list[str], name: str) -> Callable[[Path, str | None, dic
     follows this one.
     """
 
-    def capture(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    def capture(_scratch: Path, serial: str, extra: dict) -> Capture:
         result = _run(args, serial)
         if not (result.stdout and result.stderr) or result.returncode == 0:
             raise CaptureError(
@@ -1302,7 +1343,7 @@ def _check_hang_trace(payload: bytes) -> None:
         )
 
 
-def _wait_for_complete_file(serial: str | None, path: str, *, within_s: int = 20) -> int:
+def _wait_for_complete_file(serial: str, path: str, *, within_s: int = 20) -> int:
     """Wait until the app has finished writing ``path``; return its size.
 
     `am profile stop` returns before the app has written the trace -- the stop
@@ -1321,7 +1362,7 @@ def _wait_for_complete_file(serial: str | None, path: str, *, within_s: int = 20
     raise CaptureError(f"{path} did not reach a stable non-zero size within {within_s}s")
 
 
-def _profile_hang_trace(serial: str | None, extra: dict) -> bytes:
+def _profile_hang_trace(serial: str, extra: dict) -> bytes:
     """Sample the fixture app while AnrReceiver blocks its main thread for 40 s."""
     start = _run(_profile_start(TRACE_DEVICE_PATH), serial)
     if start.returncode != 0:
@@ -1365,9 +1406,7 @@ def _profile_hang_trace(serial: str | None, extra: dict) -> bytes:
     return payload
 
 
-def _profile_refusal(
-    destination: str, listing: list[str]
-) -> Callable[[Path, str | None, dict], Capture]:
+def _profile_refusal(destination: str, listing: list[str]) -> Callable[[Path, str, dict], Capture]:
     """`am profile start` to a destination it refuses, and what the refusal leaves.
 
     The listing is taken here, not in teardown, because teardown deletes what it
@@ -1375,7 +1414,7 @@ def _profile_refusal(
     file behind, so "the trace file exists" is no evidence profiling started.
     """
 
-    def capture(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+    def capture(_scratch: Path, serial: str, extra: dict) -> Capture:
         refusal = _run(_profile_start(destination), serial)
         if refusal.returncode == 0:
             raise CaptureError(
@@ -1457,7 +1496,7 @@ def _avd_home_entries(home: Path) -> set[str]:
         return set()
 
 
-def _throwaway_avd_removed(_serial: str | None) -> None:
+def _throwaway_avd_removed(_serial: str) -> None:
     """Teardown check for the four avdmanager fixtures: nothing in the user's home."""
     home = _avd_home()
     if _avd_present(home, THROWAWAY_AVD):
@@ -1505,10 +1544,10 @@ class _ThrowawayAvd:
         self._config_ini = ""
         self._error: CaptureError | None = None
 
-    def capture(self, name: str) -> Callable[[Path, str | None, dict], Capture]:
+    def capture(self, name: str) -> Callable[[Path, str, dict], Capture]:
         """A ``capture_with`` for one of the three avdmanager commands."""
 
-        def get(_scratch: Path, _serial: str | None, extra: dict) -> Capture:
+        def get(_scratch: Path, _serial: str, extra: dict) -> Capture:
             captures = self._run_once()
             extra["argv"] = _AVD_ARGV[name]
             extra["avd_home"] = f"{PRIVATE_AVD_HOME}: a directory made for the run, then removed"
@@ -1516,7 +1555,7 @@ class _ThrowawayAvd:
 
         return get
 
-    def config_ini(self, _serial: str | None, extra: dict) -> bytes:
+    def config_ini(self, _serial: str, extra: dict) -> bytes:
         """A ``capture_bytes`` for the config.ini, read between create and delete.
 
         Bytes rather than text so the package aliaser never sees it: its keys
@@ -1699,9 +1738,7 @@ _LAUNCH_COMPOSE = ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.Defa
 _RESTART_ENDINGS: tuple[tuple[str, ...] | None, ...] = (("am", "crash"), ("am", "force-stop"), None)
 
 
-def _app_restart_window(
-    _scratch: Path, serial: str | None, extra: dict, *, usec: bool = True
-) -> Capture:
+def _app_restart_window(_scratch: Path, serial: str, extra: dict, *, usec: bool = True) -> Capture:
     """Three processes of the fixture app in one logcat window, and their pids.
 
     ``usec`` asks for microsecond headers (logcat_app_restart_usec, what
@@ -1821,12 +1858,12 @@ def _app_restart_window(
     return Capture("".join(kept), window.stderr, window.returncode)
 
 
-def _app_restart_window_ms(scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _app_restart_window_ms(scratch: Path, serial: str, extra: dict) -> Capture:
     """:func:`_app_restart_window` with logcat's default millisecond headers."""
     return _app_restart_window(scratch, serial, extra, usec=False)
 
 
-def _package_uids_two_users(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _package_uids_two_users(_scratch: Path, serial: str, extra: dict) -> Capture:
     """`cmd package list packages -U` with the fixture app installed for two users.
 
     A throwaway secondary user is created, the app installed for it, the
@@ -1861,7 +1898,7 @@ def _package_uids_two_users(_scratch: Path, serial: str | None, extra: dict) -> 
     return capture
 
 
-def _ps_two_owners(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _ps_two_owners(_scratch: Path, serial: str, extra: dict) -> Capture:
     """`ps -o PID,UID` for the fixture app's process and system_server's, in one call.
 
     Two rows with two different uids: the evidence a `pidof` answer is checked
@@ -1986,7 +2023,7 @@ def _keep_records(data: bytes, pids: list[str], needles: list[str]) -> bytes:
     return b"".join(kept)
 
 
-def _device_zone(serial: str | None) -> dict:
+def _device_zone(serial: str) -> dict:
     """The device's time zone, which its threadtime text is printed in.
 
     A test printing a binary half's records to compare with its text half has
@@ -2002,10 +2039,10 @@ def _stash_twin(name: str, data: bytes, provenance: dict) -> None:
     _TWINS[name] = (data, provenance)
 
 
-def _twin(name: str, first_half: str) -> Callable[[str | None, dict], bytes]:
+def _twin(name: str, first_half: str) -> Callable[[str, dict], bytes]:
     """A ``capture_bytes`` writing what ``first_half``'s run captured for ``name``."""
 
-    def capture(_serial: str | None, extra: dict) -> bytes:
+    def capture(_serial: str, extra: dict) -> bytes:
         if name not in _TWINS:
             raise CaptureError(
                 f"{name} is captured in the same run as {first_half}; record them together: "
@@ -2018,7 +2055,7 @@ def _twin(name: str, first_half: str) -> Callable[[str | None, dict], bytes]:
     return capture
 
 
-def _logcat_text(args: list[str], serial: str | None) -> str:
+def _logcat_text(args: list[str], serial: str) -> str:
     """A logcat dump as text, decoded without newline translation.
 
     ``_run``'s text mode would turn a raw carriage return inside a message
@@ -2100,7 +2137,7 @@ def _anr_window(
 _KEY_EVENT_BOUND_S = 5
 
 
-def _send_key_bounded(serial: str | None, extra: dict) -> None:
+def _send_key_bounded(serial: str, extra: dict) -> None:
     """``input keyevent KEYCODE_SHIFT_LEFT`` to the blocked window, never blocking the run.
 
     With ``--async`` where the device's ``input`` usage lists it (API 35);
@@ -2116,9 +2153,8 @@ def _send_key_bounded(serial: str | None, extra: dict) -> None:
         *(["--async"] if asynchronous else []),
         "KEYCODE_SHIFT_LEFT",
     ]
-    target = ["-s", serial] if serial else []
     child = subprocess.Popen(
-        ["adb", *target, *argv],
+        _adb_argv(serial, argv),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
@@ -2138,7 +2174,7 @@ def _send_key_bounded(serial: str | None, extra: dict) -> None:
     }
 
 
-def _key_then_wait(serial: str | None, extra: dict) -> None:
+def _key_then_wait(serial: str, extra: dict) -> None:
     """The input ANR's provocation after its setup: a bounded key event, then 15 s."""
     _send_key_bounded(serial, extra)
     time.sleep(15)
@@ -2148,8 +2184,8 @@ def _anr_records(
     *,
     requires: tuple[str, ...],
     expects: tuple[str, ...] = (),
-    before: Callable[[str | None, dict], None] | None = None,
-) -> Callable[[str | None, dict], bytes]:
+    before: Callable[[str, dict], None] | None = None,
+) -> Callable[[str, dict], bytes]:
     """One provoked ANR as logd's records -- what the ANR readers read since PR #34.
 
     The ``-B`` counterpart of the ``*_stream`` fixtures: ActivityManager's and
@@ -2167,7 +2203,7 @@ def _anr_records(
     """
     marker = f"Broadcasting: Intent {{ act={COMPOSE_PACKAGE}.PROVOKE_ANR"
 
-    def capture(serial: str | None, extra: dict) -> bytes:
+    def capture(serial: str, extra: dict) -> bytes:
         if before is not None:
             before(serial, extra)
         system_server = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
@@ -2211,7 +2247,7 @@ def _poll(check: Callable[[], str | None], seconds: int) -> str | None:
     return None
 
 
-def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
+def _foreign_process_anr(serial: str, extra: dict) -> bytes:
     """An ANR ActivityManager names after ANOTHER package: the app's own, in a process so named.
 
     The fixture app declares ForeignProcessAnrReceiver with
@@ -2343,7 +2379,7 @@ def _foreign_process_anr(serial: str | None, extra: dict) -> bytes:
 _INJECTION_MARKER = "w3l-tag-injection"
 
 
-def _tag_injection(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _tag_injection(_scratch: Path, serial: str, extra: dict) -> Capture:
     """An app-controlled TAG that forges system_server's line, and the records beneath it.
 
     The fixture app is launched (its own `Start proc`; its pid from `pidof`),
@@ -2426,7 +2462,7 @@ def _tag_injection(_scratch: Path, serial: str | None, extra: dict) -> Capture:
     return Capture(_alias_pair_text("".join(kept)), "", 0)
 
 
-def _crash_tail(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _crash_tail(_scratch: Path, serial: str, extra: dict) -> Capture:
     """`logcat -T 1` against a buffer whose last record is a many-line crash.
 
     The crash buffer is cleared and the fixture app crashed twice (`am
@@ -2479,7 +2515,38 @@ def _crash_tail(_scratch: Path, serial: str | None, extra: dict) -> Capture:
     return Capture(tail, "", 0)
 
 
-def _waiting_for_device(_scratch: Path, _serial: str | None, _extra: dict) -> Capture:
+# The one device-shaped adb argv in this file without -s: adb_more_than_one_device
+# records adb refusing it.
+_NO_TARGET_ARGV = ["adb", "shell", "getprop", "ro.build.version.sdk"]
+
+
+def _more_than_one_device(_scratch: Path, _serial: str, _extra: dict) -> Capture:
+    """``adb shell`` with no ``-s`` and no $ANDROID_SERIAL, while two devices are attached.
+
+    It can reach no device: the host's list is read first and fewer than two
+    rows refuse before it runs, and ANDROID_SERIAL is removed from its
+    environment (with it set, adb would simply use it). adb then has nothing to
+    choose by and refuses -- which is the output recorded.
+    """
+    rows = _device_rows(_run_host_adb(["devices"], timeout=15).stdout)
+    if len(rows) < 2:
+        raise CaptureError(f"adb lists {len(rows)} device(s); this needs two or more attached")
+    env = {key: value for key, value in os.environ.items() if key != "ANDROID_SERIAL"}
+    try:
+        result = subprocess.run(
+            _NO_TARGET_ARGV,
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_TIMEOUT,
+            check=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CaptureError(f"timed out after {DEFAULT_TIMEOUT}s") from exc
+    return Capture(result.stdout, result.stderr, result.returncode)
+
+
+def _waiting_for_device(_scratch: Path, _serial: str, _extra: dict) -> Capture:
     """What a streaming `adb logcat` says while its device is not there: it waits.
 
     Host adb, aimed at a serial that is not attached through ANDROID_SERIAL --
@@ -2514,7 +2581,7 @@ def _waiting_for_device(_scratch: Path, _serial: str | None, _extra: dict) -> Ca
 _TAIL_ZERO_SECONDS = 3
 
 
-def _logcat_tail_zero(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _logcat_tail_zero(_scratch: Path, serial: str, extra: dict) -> Capture:
     """`logcat -T 0`: can a live read start with NO replayed entry? (It cannot.)
 
     Asked with the session worker's own format terms, millisecond and
@@ -2523,14 +2590,13 @@ def _logcat_tail_zero(_scratch: Path, serial: str | None, extra: dict) -> Captur
     one's timestamp, beside the device's clock read just before the call, to
     show that the entry it starts on was already in the buffer.
     """
-    target = ["-s", serial] if serial else []
     stamp = _run(["shell", "date '+%m-%d %H:%M:%S'"], serial, timeout=15).text.strip()
     measured: dict[str, dict] = {}
     capture = None
     for name, terms in (("threadtime", []), ("threadtime_usec", ["-v", "usec"])):
-        argv = ["adb", *target, "logcat", "-v", "threadtime", *terms, "-T", "0"]
+        args = ["logcat", "-v", "threadtime", *terms, "-T", "0"]
         child = subprocess.Popen(
-            argv,
+            _adb_argv(serial, args),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
@@ -2549,7 +2615,7 @@ def _logcat_tail_zero(_scratch: Path, serial: str | None, extra: dict) -> Captur
             )
         first = entries[0][:14]
         measured[name] = {
-            "argv": ["adb", "-s", "<serial>", *argv[len(target) + 1 :]],
+            "argv": ["adb", "-s", "<serial>", *args],
             "stderr": stderr,
             "first_entry_timestamp": first,
             "first_entry_predates_the_call": first <= stamp,
@@ -2623,17 +2689,23 @@ _TMP_USER_NAME = "v9-fixture-tmp"
 # permission the fixture app requests (added to its manifest for this), so the
 # secondary user's block can read granted=true while user 0's reads false.
 _TWO_USER_GRANT = "android.permission.CAMERA"
-_SHARED_UID_PACKAGE = "com.android.localtransport"
+# A package in a shared uid whose runtime grants are NOT system-fixed, so a
+# per-user grant can differ: android.uid.shared, where READ_PHONE_NUMBERS is
+# denied without SYSTEM_FIXED (measured, API 33). android.uid.system's grants
+# (com.android.localtransport) are all SYSTEM_FIXED and read the same for
+# every user.
+_SHARED_UID_PACKAGE = "com.android.providers.contacts"
+_SHARED_UID_GRANT = "android.permission.READ_PHONE_NUMBERS"
 
 # The text halves of a multi-fixture run, written by the fixtures listed after
 # it (`_text_twin`). Captures, so they still go through the text pipeline.
 _TEXT_TWINS: dict[str, tuple[Capture, dict]] = {}
 
 
-def _text_twin(name: str, first_half: str) -> Callable[[Path, str | None, dict], Capture]:
+def _text_twin(name: str, first_half: str) -> Callable[[Path, str, dict], Capture]:
     """A ``capture_with`` returning what ``first_half``'s run captured for ``name``."""
 
-    def capture(_scratch: Path, _serial: str | None, extra: dict) -> Capture:
+    def capture(_scratch: Path, _serial: str, extra: dict) -> Capture:
         if name not in _TEXT_TWINS:
             raise CaptureError(
                 f"{name} is captured in the same run as {first_half}; record them together: "
@@ -2646,11 +2718,11 @@ def _text_twin(name: str, first_half: str) -> Callable[[Path, str | None, dict],
     return capture
 
 
-def _users_listed(serial: str | None) -> str:
+def _users_listed(serial: str) -> str:
     return _run(["shell", "pm", "list", "users"], serial, timeout=15).text
 
 
-def _secondary_user_gone(serial: str | None) -> None:
+def _secondary_user_gone(serial: str) -> None:
     """``teardown_verify``: no user this recorder created is still on the device."""
     listing = _users_listed(serial)
     if f":{_TMP_USER_NAME}:" in listing:
@@ -2660,16 +2732,18 @@ def _secondary_user_gone(serial: str | None) -> None:
         )
 
 
-def _two_users_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _two_users_window(_scratch: Path, serial: str, extra: dict) -> Capture:
     """The fixture app installed for two users: a per-user grant and both dumps.
 
     A throwaway user is created and the app installed for it (as
     package_list_uid_two_users does). Inside the user's lifetime: ``pm grant
     --user <id>`` (pm_grant_user, its stdout and stderr together and its exit
-    status echoed), then ``dumpsys package`` for the fixture app (this
-    fixture) and for com.android.localtransport, a shared-uid package
-    (dumpsys_package_shared_uid_two_users). The user is removed in a
-    ``finally`` and the removal read back from ``pm list users``.
+    status echoed), the same for a shared-uid package
+    (:data:`_SHARED_UID_PACKAGE`), then ``dumpsys package`` for the fixture app
+    (this fixture) and for that package (dumpsys_package_shared_uid_two_users).
+    Each dump must show its permission denied for user 0 and granted for the
+    new user. The user is removed in a ``finally`` and the removal read back
+    from ``pm list users``.
     """
     created = _run(["shell", "pm", "create-user", _TMP_USER_NAME], serial, timeout=60)
     match = re.search(r"created user id (\d+)", created.text)
@@ -2690,6 +2764,15 @@ def _two_users_window(_scratch: Path, serial: str | None, extra: dict) -> Captur
             serial,
             timeout=30,
         )
+        shared_grant = _run(
+            [
+                "shell",
+                f"pm grant --user {user} {_SHARED_UID_PACKAGE} {_SHARED_UID_GRANT} 2>&1; "
+                f"echo exit=$?",
+            ],
+            serial,
+            timeout=30,
+        )
         dump = _run(["shell", "dumpsys", "package", COMPOSE_PACKAGE], serial, timeout=60)
         shared = _run(["shell", "dumpsys", "package", _SHARED_UID_PACKAGE], serial, timeout=60)
     finally:
@@ -2706,27 +2789,48 @@ def _two_users_window(_scratch: Path, serial: str | None, extra: dict) -> Captur
                 raise CaptureError(f"{name} names no {needle!r} block with two users installed")
     if "exit=" not in grant.text:
         raise CaptureError(f"pm grant --user printed no exit status: {grant.text.strip()!r}")
-    blocks = re.split(r"^    User (\d+): ", dump.text, flags=re.MULTILINE)
-    states = {
-        blocks[i]: re.search(
-            rf"^\s+{re.escape(_TWO_USER_GRANT)}: granted=(\w+)", blocks[i + 1], re.M
-        )
-        for i in range(1, len(blocks) - 1, 2)
-    }
-    seen = {u: m.group(1) if m else None for u, m in states.items()}
-    if seen.get("0") != "false" or seen.get(user) != "true":
-        raise CaptureError(
-            f"expected {_TWO_USER_GRANT} denied for user 0 and granted for user {user}; the "
-            f"dump's user blocks say {seen} (pm grant: {grant.text.strip()!r})"
-        )
+    shared_users = shared.text.partition("\nShared users:")[2]
+    for text, permission, result in (
+        (dump.text, _TWO_USER_GRANT, grant),
+        (shared_users, _SHARED_UID_GRANT, shared_grant),
+    ):
+        seen = _granted_by_user(text, permission)
+        if seen.get("0") != "false" or seen.get(user) != "true":
+            raise CaptureError(
+                f"expected {permission} denied for user 0 and granted for user {user}; the "
+                f"dump's user blocks say {seen} (pm grant: {result.text.strip()!r})"
+            )
     provenance = {"secondary_user": user}
     extra.update(provenance)
     _TEXT_TWINS["pm_grant_user"] = (grant, {**provenance, "permission": _TWO_USER_GRANT})
-    _TEXT_TWINS["dumpsys_package_shared_uid_two_users"] = (shared, dict(provenance))
+    _TEXT_TWINS["dumpsys_package_shared_uid_two_users"] = (
+        shared,
+        {
+            **provenance,
+            "permission": _SHARED_UID_GRANT,
+            "grant": {
+                "command": (
+                    f"adb shell 'pm grant --user {user} {_SHARED_UID_PACKAGE} "
+                    f"{_SHARED_UID_GRANT} 2>&1; echo exit=$?'"
+                ),
+                "output": _strip_cr(shared_grant.text),
+            },
+        },
+    )
     return dump
 
 
-def _strictmode_records(serial: str | None, extra: dict) -> bytes:
+def _granted_by_user(text: str, permission: str) -> dict[str, str | None]:
+    """``{user id: "true"/"false"/None}`` for ``permission`` in each ``    User N: `` block."""
+    parts = re.split(r"^    User (\d+): ", text, flags=re.MULTILINE)
+    seen: dict[str, str | None] = {}
+    for at in range(1, len(parts) - 1, 2):
+        state = re.search(rf"^\s+{re.escape(permission)}: granted=(\w+)", parts[at + 1], re.M)
+        seen[parts[at]] = state.group(1) if state else None
+    return seen
+
+
+def _strictmode_records(serial: str, extra: dict) -> bytes:
     """StrictModeActivity's violation as logd's records, with the app's uid beside it.
 
     Run after the setup that provokes it (the same as
@@ -2759,7 +2863,7 @@ def _strictmode_records(serial: str | None, extra: dict) -> bytes:
     return data
 
 
-def _system_server_pid(serial: str | None) -> dict:
+def _system_server_pid(serial: str) -> dict:
     """``metadata``: system_server's pid, read with ``pidof`` right after the capture."""
     answer = _run(["shell", "pidof", "system_server"], serial, timeout=15).text.strip()
     if not answer.isdigit():
@@ -2781,13 +2885,13 @@ def _booted(serial: str) -> bool:
     return answer.returncode == 0 and answer.text.strip() == "1"
 
 
-def _rebooted_back(serial: str | None) -> None:
+def _rebooted_back(serial: str) -> None:
     """``teardown_verify``: the rebooted emulator finished booting again."""
-    if serial is None or not _booted(serial):
+    if not _booted(serial):
         raise CaptureError(f"{serial} has not finished booting (sys.boot_completed != 1)")
 
 
-def _offline_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
+def _offline_window(_scratch: Path, serial: str, extra: dict) -> Capture:
     """``adb devices -l`` (host-wide, no serial) while the target reads ``offline``.
 
     The target is rebooted and the HOST's device list polled until the target's
@@ -2805,7 +2909,7 @@ def _offline_window(_scratch: Path, serial: str | None, extra: dict) -> Capture:
     try:
         deadline = time.monotonic() + _OFFLINE_WITHIN_S
         while time.monotonic() < deadline:
-            listing = _run(["devices", "-l"], None, timeout=15)
+            listing = _run_host_adb(["devices", "-l"], timeout=15)
             row = next((r for r in _device_rows(listing.stdout) if r[0] == serial), None)
             state = row[1] if row and len(row) > 1 else "absent"
             if not seen or seen[-1] != state:
@@ -3517,8 +3621,9 @@ FIXTURES: list[Fixture] = [
         command=(
             "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> "
             f"{COMPOSE_PACKAGE}; pm grant --user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT} "
-            f"(pm_grant_user); dumpsys package {COMPOSE_PACKAGE}; dumpsys package "
-            f"{_SHARED_UID_PACKAGE} (dumpsys_package_shared_uid_two_users); pm remove-user <id>"
+            f"(pm_grant_user); pm grant --user <id> {_SHARED_UID_PACKAGE} {_SHARED_UID_GRANT}; "
+            f"dumpsys package {COMPOSE_PACKAGE}; dumpsys package {_SHARED_UID_PACKAGE} "
+            "(dumpsys_package_shared_uid_two_users); pm remove-user <id>"
         ),
         description=(
             "`dumpsys package <fixture app>` with the app installed for two users and CAMERA "
@@ -3561,22 +3666,28 @@ FIXTURES: list[Fixture] = [
         emulator_only=True,
         args=[],
         command=(
+            f"adb shell 'pm grant --user <id> {_SHARED_UID_PACKAGE} {_SHARED_UID_GRANT}'; "
             f"adb shell dumpsys package {_SHARED_UID_PACKAGE} (in dumpsys_package_two_users' "
             "run, while the secondary user exists)"
         ),
         description=(
-            f"`dumpsys package {_SHARED_UID_PACKAGE}` with a second user on the device: ground "
-            "truth for the shared-uid layout per user. Runtime permissions of a shared-uid "
-            "package are printed under the top-level `Shared users:` block "
-            "(dumpsys_package_shared_uid), and here that block carries one `User <n>:` "
-            "section per user, each with its own runtime-permission list. Recorded with "
-            "dumpsys_package_two_users (whose CAMERA grant does not touch this package); "
-            "manifest `secondary_user`."
+            f"`dumpsys package {_SHARED_UID_PACKAGE}` (shared uid android.uid.shared) with a "
+            f"second user on the device and {_SHARED_UID_GRANT.rsplit('.', 1)[1]} granted for "
+            "that user only: ground truth for per-user runtime state in the shared-uid "
+            "layout. A shared-uid package's runtime permissions are printed under the "
+            "top-level `Shared users:` block (dumpsys_package_shared_uid), and here its "
+            "`SharedUser [android.uid.shared]` block carries one `User <n>:` section per user, "
+            "the permission granted=false under `User 0:` and granted=true under `User <id>:` "
+            "(the recorder refuses a capture that does not). android.uid.system "
+            "(com.android.localtransport, dumpsys_package_shared_uid) cannot show this: its "
+            "grants are SYSTEM_FIXED and read the same for every user. Recorded with "
+            "dumpsys_package_two_users; manifest `secondary_user`, `permission`, `grant` "
+            "(the pm grant's command and output)."
         ),
         capture_with=_text_twin(
             "dumpsys_package_shared_uid_two_users", "dumpsys_package_two_users"
         ),
-        post=_requires("Shared users:"),
+        post=_requires("Shared users:", "SharedUser [android.uid.shared]"),
     ),
     Fixture(
         name="ps_pid_uid",
@@ -3949,14 +4060,18 @@ FIXTURES: list[Fixture] = [
             "the logcat columns -- unlike the ActivityManager ANR lines, whose "
             "pid is system_server's. Recorded because every skipped-frame test "
             "in this repo built its input from an f-string, which proves only "
-            "that the parser matches the f-string. Provoked by AnrReceiver's "
-            "40s block: the recorded line says 'Skipped 2401 frames', and "
-            "2401 * 16.7ms is 40.1 seconds -- the first independent check this "
-            "repo has that the FRAME_MS heuristic tracks wall-clock, on a stall "
-            "whose real length is known. A cold start alone also janks, but "
-            "only when the host happens to be busy, so how MANY lines land here "
-            "is not fixed; the severity-boundary tests vary the frame count off "
-            "this line rather than typing new ones."
+            "that the parser matches the f-string. Provoked by a cold start and "
+            "then AnrReceiver's 40s block, and what lands differs by level. "
+            "emulator-api35 recorded the block's own line, 'Skipped 2401 "
+            "frames', and 2401 * 16.7ms is 40.1 seconds -- the first independent "
+            "check this repo has that the FRAME_MS heuristic tracks wall-clock, "
+            "on a stall whose real length is known. emulator-api33 recorded no "
+            "line for the block, only the cold start's (tens of frames), plus a "
+            "Looper 'Slow dispatch' line the grep keeps because it names "
+            "Choreographer. A cold start janks only when the host happens to be "
+            "busy, so how MANY lines land here is not fixed; the "
+            "severity-boundary tests vary the frame count off this line rather "
+            "than typing new ones."
         ),
         setup=[
             ["shell", "am", "force-stop", COMPOSE_PACKAGE],
@@ -4061,7 +4176,8 @@ FIXTURES: list[Fixture] = [
     Fixture(
         name="adb_more_than_one_device",
         args=[],
-        host_argv=["adb", "shell", "getprop", "ro.build.version.sdk"],
+        command=" ".join(_NO_TARGET_ARGV),
+        capture_with=_more_than_one_device,
         description=(
             "What adb says when two devices are attached and no -s was given: "
             "'adb: more than one device/emulator', exit 1, on stderr, and the "
@@ -5806,7 +5922,7 @@ def _known_names() -> set[str]:
     return {f.name for f in FIXTURES} | {HIERARCHY_FIXTURE}
 
 
-def _capture_hierarchy(serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> str:
+def _capture_hierarchy(serial: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Dump the current UI hierarchy to stdout.
 
     Uses ``adb exec-out``, not ``adb shell``. Over ``shell`` the device
@@ -5828,7 +5944,7 @@ def _capture_hierarchy(serial: str | None, timeout: int = DEFAULT_TIMEOUT) -> st
     return raw[start : end + len("</hierarchy>")] + "\n"
 
 
-def _device_metadata(serial: str | None) -> dict[str, str]:
+def _device_metadata(serial: str) -> dict[str, str]:
     """Collect the device identity that gives a fixture its provenance."""
     props = {
         "model": "ro.product.model",
@@ -5843,18 +5959,28 @@ def _device_metadata(serial: str | None) -> dict[str, str]:
     return meta
 
 
-def _physical_target_refusal(serial: str | None, selected: list[Fixture]) -> str | None:
+def resolve_serial(serial: str | None) -> str | None:
+    """The one serial a run addresses: ``--serial``, else $ANDROID_SERIAL, else None.
+
+    Resolved once, at the start of :func:`record`, and passed to every adb call
+    from there on -- each of which puts it after ``-s`` (:func:`_adb_argv`).
+    adb's own fallbacks (the env var it reads itself, the only device
+    attached) are never left to choose a target.
+    """
+    return serial or os.environ.get("ANDROID_SERIAL") or None
+
+
+def _physical_target_refusal(target: str | None, selected: list[Fixture]) -> str | None:
     """Why this run must not start, or None when it may.
 
     Any selected ``emulator_only`` fixture needs a target that is provably an
-    emulator. With no ``--serial`` adb falls back to $ANDROID_SERIAL, or to the
-    only device attached -- which may be a phone -- so "no serial" is not proof
-    and is refused like a phone's serial is.
+    emulator. ``target`` is :func:`resolve_serial`'s answer; None -- no
+    ``--serial`` and no $ANDROID_SERIAL -- is not proof and is refused like a
+    phone's serial is.
     """
     mutating = sorted(f.name for f in selected if f.emulator_only)
     if not mutating:
         return None
-    target = serial or os.environ.get("ANDROID_SERIAL")
     if target and target.startswith("emulator-"):
         return None
     shown = repr(target) if target else "unspecified (adb would pick for itself)"
@@ -5931,10 +6057,21 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
 
     # Before any adb call and before anything is written: the getprop just
     # below already talks to the target.
-    refusal = _physical_target_refusal(serial, selected)
+    target = resolve_serial(serial)
+    refusal = _physical_target_refusal(target, selected)
     if refusal:
         print(refusal, file=sys.stderr)
         return 2
+    if target is None:
+        # Every run reads the device's identity (getprop) first, so every run
+        # needs a device -- and an unnamed one is whatever adb picks.
+        print(
+            "Refusing to record: no target serial. Pass --serial <serial> or set "
+            "ANDROID_SERIAL; adb is never left to pick a device for itself.",
+            file=sys.stderr,
+        )
+        return 2
+    serial = target
 
     recorded_dir = RECORDED_ROOT / profile
     recorded_dir.mkdir(parents=True, exist_ok=True)
@@ -6173,7 +6310,11 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--serial", "-s", help="Device serial (auto-detects if omitted)")
+    parser.add_argument(
+        "--serial",
+        "-s",
+        help="Device serial; $ANDROID_SERIAL if omitted. With neither, the run is refused.",
+    )
     parser.add_argument("--only", nargs="+", metavar="NAME", help="Record only these fixtures")
     parser.add_argument("--list", action="store_true", help="List fixtures and exit")
     parser.add_argument(

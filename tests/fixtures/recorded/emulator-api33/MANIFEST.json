@@ -117,26 +117,31 @@
     {
       "name": "dumpsys_package_shared_uid_two_users",
       "file": "dumpsys_package_shared_uid_two_users.txt",
-      "command": "adb shell dumpsys package com.android.localtransport (in dumpsys_package_two_users' run, while the secondary user exists)",
-      "description": "`dumpsys package com.android.localtransport` with a second user on the device: ground truth for the shared-uid layout per user. Runtime permissions of a shared-uid package are printed under the top-level `Shared users:` block (dumpsys_package_shared_uid), and here that block carries one `User <n>:` section per user, each with its own runtime-permission list. Recorded with dumpsys_package_two_users (whose CAMERA grant does not touch this package); manifest `secondary_user`.",
+      "command": "adb shell 'pm grant --user <id> com.android.providers.contacts android.permission.READ_PHONE_NUMBERS'; adb shell dumpsys package com.android.providers.contacts (in dumpsys_package_two_users' run, while the secondary user exists)",
+      "description": "`dumpsys package com.android.providers.contacts` (shared uid android.uid.shared) with a second user on the device and READ_PHONE_NUMBERS granted for that user only: ground truth for per-user runtime state in the shared-uid layout. A shared-uid package's runtime permissions are printed under the top-level `Shared users:` block (dumpsys_package_shared_uid), and here its `SharedUser [android.uid.shared]` block carries one `User <n>:` section per user, the permission granted=false under `User 0:` and granted=true under `User <id>:` (the recorder refuses a capture that does not). android.uid.system (com.android.localtransport, dumpsys_package_shared_uid) cannot show this: its grants are SYSTEM_FIXED and read the same for every user. Recorded with dumpsys_package_two_users; manifest `secondary_user`, `permission`, `grant` (the pm grant's command and output).",
       "catches": [],
-      "bytes": 41877,
+      "bytes": 13639,
       "exit_status": 0,
       "stream": "stdout",
-      "secondary_user": "10",
-      "recorded_at": "2026-10-24T18:44:32Z"
+      "secondary_user": "11",
+      "permission": "android.permission.READ_PHONE_NUMBERS",
+      "grant": {
+        "command": "adb shell 'pm grant --user 11 com.android.providers.contacts android.permission.READ_PHONE_NUMBERS 2>&1; echo exit=$?'",
+        "output": "exit=0\n"
+      },
+      "recorded_at": "2026-10-24T19:17:47Z"
     },
     {
       "name": "dumpsys_package_two_users",
       "file": "dumpsys_package_two_users.txt",
-      "command": "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> com.example.composefixture; pm grant --user <id> com.example.composefixture android.permission.CAMERA (pm_grant_user); dumpsys package com.example.composefixture; dumpsys package com.android.localtransport (dumpsys_package_shared_uid_two_users); pm remove-user <id>",
+      "command": "adb shell pm create-user v9-fixture-tmp; pm install-existing --user <id> com.example.composefixture; pm grant --user <id> com.example.composefixture android.permission.CAMERA (pm_grant_user); pm grant --user <id> com.android.providers.contacts android.permission.READ_PHONE_NUMBERS; dumpsys package com.example.composefixture; dumpsys package com.android.providers.contacts (dumpsys_package_shared_uid_two_users); pm remove-user <id>",
       "description": "`dumpsys package <fixture app>` with the app installed for two users and CAMERA granted for the second only: ground truth for where per-user runtime-permission state sits in the dump -- a `User 0:` and a `User <id>:` block under the package (the id is the manifest's `secondary_user`), each with its own install state and its own `runtime permissions:` section, where CAMERA reads granted=false for user 0 and granted=true for user <id> (the recorder refuses a capture that does not). CAMERA is the one runtime permission the fixture app requests, added to its manifest for this fixture; emulator-api35's pm_grant_not_requested and dumpsys_package_after_silent_grant predate it and are unaffected (they use POST_NOTIFICATIONS, still not requested). The throwaway user is removed in the same run and its removal read back from `pm list users`.",
       "catches": [],
-      "bytes": 6970,
+      "bytes": 6971,
       "exit_status": 0,
       "stream": "stdout",
-      "secondary_user": "10",
-      "recorded_at": "2026-10-24T18:44:32Z"
+      "secondary_user": "11",
+      "recorded_at": "2026-10-24T19:17:47Z"
     },
     {
       "name": "logcat_anr_broadcast_records",
@@ -218,7 +223,7 @@
       "name": "logcat_choreographer_jank",
       "file": "logcat_choreographer_jank.txt",
       "command": "adb shell logcat -d -v threadtime | grep Choreographer",
-      "description": "Real Choreographer jank: 'I Choreographer: Skipped N frames!  The application may be doing too much work on its main thread.' TWO spaces after the exclamation mark, and the tag carries the janking app's own pid in the logcat columns -- unlike the ActivityManager ANR lines, whose pid is system_server's. Recorded because every skipped-frame test in this repo built its input from an f-string, which proves only that the parser matches the f-string. Provoked by AnrReceiver's 40s block: the recorded line says 'Skipped 2401 frames', and 2401 * 16.7ms is 40.1 seconds -- the first independent check this repo has that the FRAME_MS heuristic tracks wall-clock, on a stall whose real length is known. A cold start alone also janks, but only when the host happens to be busy, so how MANY lines land here is not fixed; the severity-boundary tests vary the frame count off this line rather than typing new ones.",
+      "description": "Real Choreographer jank: 'I Choreographer: Skipped N frames!  The application may be doing too much work on its main thread.' TWO spaces after the exclamation mark, and the tag carries the janking app's own pid in the logcat columns -- unlike the ActivityManager ANR lines, whose pid is system_server's. Recorded because every skipped-frame test in this repo built its input from an f-string, which proves only that the parser matches the f-string. Provoked by a cold start and then AnrReceiver's 40s block, and what lands differs by level. emulator-api35 recorded the block's own line, 'Skipped 2401 frames', and 2401 * 16.7ms is 40.1 seconds -- the first independent check this repo has that the FRAME_MS heuristic tracks wall-clock, on a stall whose real length is known. emulator-api33 recorded no line for the block, only the cold start's (tens of frames), plus a Looper 'Slow dispatch' line the grep keeps because it names Choreographer. A cold start janks only when the host happens to be busy, so how MANY lines land here is not fixed; the severity-boundary tests vary the frame count off this line rather than typing new ones.",
       "catches": [],
       "bytes": 319,
       "exit_status": 0,
@@ -310,9 +315,9 @@
       "bytes": 7,
       "exit_status": 0,
       "stream": "stdout",
-      "secondary_user": "10",
+      "secondary_user": "11",
       "permission": "android.permission.CAMERA",
-      "recorded_at": "2026-10-24T18:44:32Z"
+      "recorded_at": "2026-10-24T19:17:47Z"
     },
     {
       "name": "ps_all_pid_uid",
