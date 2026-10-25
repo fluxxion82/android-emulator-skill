@@ -10,31 +10,28 @@ These exercise the three pieces of pure logic without any emulator/adb:
 The device-touching path (set_coordinate / replay_gpx) is also covered by
 monkeypatching the module's subprocess.run so no real device is needed.
 
-A documented exception to the recorded-fixture rule
----------------------------------------------------
-The GPX documents below are written here rather than read from
-``tests/fixtures/recorded/``, and ``test_location.py::parse_gpx`` stays in
-``KNOWN_VIOLATIONS`` in ``tests/test_fixture_policy.py`` because of it.
+The GPX comes from a recording
+------------------------------
+GPX is not tool output this skill runs a command to get: it is a document the
+*user* hands to ``location.py --gpx``, written by a GPS device, a mapping
+service or a GPX library. Nothing in adb, the Android SDK, the emulator or
+Android Studio writes one, so the recording comes from a real GPX writer:
+``gpxpy`` (``tests/record_gpx_fixtures.py``, run through uvx; the command, the
+gpxpy version and the route are in ``tests/fixtures/recorded/gpxpy-1.6.2/
+MANIFEST.json``). The route is chosen -- three points around the emulator's
+default location -- and the document is gpxpy's ``to_xml()`` output verbatim,
+in GPX 1.1 and GPX 1.0. They reach the tests through the ``recorded_gpx``
+fixture.
 
-The rule exists for **tool output** -- text some command prints, which can be
-captured by running that command and looking at it. GPX is not that. It is a
-document the *user* hands to ``location.py --gpx``, produced by a GPS device or
-a mapping service; nothing in this skill, in adb, or in the Android SDK emits
-GPX, so there is no tool for a recorder to run. (Checked: the SDK ships no .gpx
-of any kind, and no GPX-producing tool is a dependency of this repo.) A real
-track is also a record of somebody's movements, which must not be committed to
-a public repository.
+What the recordings carry that the old hand-written documents did not: the
+GPX 1.1 and GPX 1.0 namespaces, ``xsi:schemaLocation``, a ``creator``, a track
+``<name>``, and ``<ele>`` / ``<time>`` children inside a point.
 
-The line the ratchet actually flags is ``lat="north"`` -- a deliberately
-malformed document, which by definition no producer emits.
-
-What is genuinely untested here, and worth saying plainly: no real-world GPX
-file has ever been through this parser. A track exported by a watch or a
-mapping service carries ``<metadata>``, ``<ele>`` and ``<time>`` children,
-``xsi:schemaLocation``, ``<extensions>``, and GPX 1.0's different namespace.
-``parse_gpx`` walks ``root.iter()`` and matches on the local tag name, so it
-should tolerate all of that -- but "should" is exactly the word this repo
-distrusts, and nobody has checked.
+Every other document here is DERIVED from a recording, by the documented string
+edits in ``_without_namespace``, ``_with_point_tag``, ``_without_points`` and
+``_crlf`` and the substitutions in the error tests, never written from memory.
+What remains untested, said plainly: ``<metadata>``, ``<extensions>`` and a
+watch's or a mapping service's own export have still never been through it.
 """
 
 from __future__ import annotations
@@ -70,77 +67,119 @@ class _FakeCompleted:
 
 # === GPX parsing ===
 
-_GPX_BASIC = """<?xml version="1.0"?>
-<gpx version="1.1">
-  <trk><trkseg>
-    <trkpt lat="51.5074" lon="-0.1278"/>
-    <trkpt lat="48.8566" lon="2.3522"/>
-    <trkpt lat="40.7128" lon="-74.0060"/>
-  </trkseg></trk>
-</gpx>
-"""
+GPX_11 = "gpxpy_route_gpx11.gpx"
+GPX_10 = "gpxpy_route_gpx10.gpx"
 
-_GPX_NAMESPACED = """<?xml version="1.0"?>
-<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
-  <trk><trkseg>
-    <trkpt lat="35.6762" lon="139.6503"/>
-    <trkpt lat="-33.8688" lon="151.2093"/>
-  </trkseg></trk>
-</gpx>
-"""
+# The recorded route, as gpxpy wrote its lat/lon attributes (MANIFEST "route").
+ROUTE = [(37.422, -122.0841), (37.4226, -122.085), (37.4232, -122.0838)]
+
+# The first point's attributes, exactly as the recording spells them.
+FIRST_LAT = 'lat="37.422"'
+FIRST_LON = ' lon="-122.0841"'
 
 
-def test_parse_gpx_basic_order_and_values():
-    pts = parse_gpx(_GPX_BASIC)
-    assert pts == [
-        (51.5074, -0.1278),
-        (48.8566, 2.3522),
-        (40.7128, -74.0060),
-    ]
+def _without_namespace(gpx: str, version: str = "1/1") -> str:
+    """The recording with its default namespace declaration removed.
+
+    Derivation: delete ``xmlns="http://www.topografix.com/GPX/<version>" `` from
+    the root, nothing else touched (``xmlns:xsi`` stays). Not every writer
+    declares one -- Xcode's GPX template does not -- so the parser must read
+    the bare ``trkpt`` as well as ``{...GPX/1/1}trkpt``.
+    """
+    declaration = f'xmlns="http://www.topografix.com/GPX/{version}" '
+    assert gpx.count(declaration) == 1, "the recording changed"
+    return gpx.replace(declaration, "")
 
 
-def test_parse_gpx_preserves_document_order():
-    pts = parse_gpx(_GPX_BASIC)
-    # First point must be London, last must be New York (insertion order).
-    assert pts[0] == (51.5074, -0.1278)
-    assert pts[-1] == (40.7128, -74.0060)
+def _with_point_tag(gpx: str, tag: str) -> str:
+    """The recording with its ``trkpt`` elements renamed to ``tag``.
+
+    Derivation: ``<trkpt `` and ``</trkpt>`` renamed, attributes and children
+    untouched. ``rtept`` and ``wpt`` are the GPX schema's other two point
+    elements (all three are ``wptType``); the parser matches the local tag name
+    wherever it sits, which is what this pins, not a route's nesting.
+    """
+    return gpx.replace("<trkpt ", f"<{tag} ").replace("</trkpt>", f"</{tag}>")
 
 
-def test_parse_gpx_handles_default_namespace():
-    pts = parse_gpx(_GPX_NAMESPACED)
-    assert pts == [(35.6762, 139.6503), (-33.8688, 151.2093)]
+def _without_points(gpx: str) -> str:
+    """The recording with every ``<trkpt>`` element cut out of its ``<trkseg>``.
+
+    Derivation: delete from the first ``<trkpt `` to the end of the last
+    ``</trkpt>``; the track, its name and its empty segment stay.
+    """
+    start = gpx.index("<trkpt ")
+    end = gpx.rindex("</trkpt>") + len("</trkpt>")
+    return gpx[:start] + gpx[end:]
 
 
-def test_parse_gpx_accepts_rtept_and_wpt():
-    xml = """<gpx>
-      <wpt lat="1.0" lon="2.0"/>
-      <rte><rtept lat="3.0" lon="4.0"/></rte>
-    </gpx>"""
-    assert parse_gpx(xml) == [(1.0, 2.0), (3.0, 4.0)]
+def _crlf(gpx: str) -> str:
+    """The recording with CRLF line endings.
+
+    Derivation: every ``\\n`` becomes ``\\r\\n``, nothing else. A Windows
+    writer, or a checkout with ``core.autocrlf``, hands the parser exactly
+    this; gpxpy itself writes LF.
+    """
+    assert "\r" not in gpx, "the recording changed"
+    return gpx.replace("\n", "\r\n")
 
 
-def test_parse_gpx_empty_returns_empty_list():
-    assert parse_gpx("<gpx></gpx>") == []
+@pytest.mark.parametrize("name", [GPX_11, GPX_10], ids=["gpx11", "gpx10"])
+def test_parse_gpx_reads_the_recorded_route_in_document_order(recorded_gpx, name):
+    """Namespaced, schemaLocation, creator, <name>, <ele>/<time> children: the real thing."""
+    assert parse_gpx(recorded_gpx(name)) == ROUTE
 
 
-def test_parse_gpx_missing_attr_raises():
+def test_parse_gpx_preserves_document_order(recorded_gpx):
+    pts = parse_gpx(recorded_gpx(GPX_11))
+    assert pts[0] == (37.422, -122.0841)
+    assert pts[-1] == (37.4232, -122.0838)
+
+
+@pytest.mark.parametrize(
+    ("name", "version"), [(GPX_11, "1/1"), (GPX_10, "1/0")], ids=["gpx11", "gpx10"]
+)
+def test_parse_gpx_reads_a_document_with_no_default_namespace(recorded_gpx, name, version):
+    assert parse_gpx(_without_namespace(recorded_gpx(name), version)) == ROUTE
+
+
+def test_parse_gpx_survives_crlf_line_endings(recorded_gpx):
+    assert parse_gpx(_crlf(recorded_gpx(GPX_11))) == ROUTE
+
+
+@pytest.mark.parametrize("tag", ["trkpt", "rtept", "wpt"])
+def test_parse_gpx_accepts_every_point_element(recorded_gpx, tag):
+    assert parse_gpx(_with_point_tag(recorded_gpx(GPX_11), tag)) == ROUTE
+
+
+def test_parse_gpx_empty_returns_empty_list(recorded_gpx):
+    assert parse_gpx(_without_points(recorded_gpx(GPX_11))) == []
+
+
+def test_parse_gpx_missing_attr_raises(recorded_gpx):
+    gpx = recorded_gpx(GPX_11)
+    assert gpx.count(FIRST_LON) == 1, "the recording changed"
     with pytest.raises(ValueError, match="missing lat/lon"):
-        parse_gpx('<gpx><trkpt lat="1.0"/></gpx>')
+        parse_gpx(gpx.replace(FIRST_LON, ""))
 
 
-def test_parse_gpx_non_numeric_raises():
+def test_parse_gpx_non_numeric_raises(recorded_gpx):
+    gpx = recorded_gpx(GPX_11).replace(FIRST_LAT, 'lat="north"')
     with pytest.raises(ValueError, match="non-numeric"):
-        parse_gpx('<gpx><trkpt lat="north" lon="2.0"/></gpx>')
+        parse_gpx(gpx)
 
 
-def test_parse_gpx_out_of_range_raises():
+def test_parse_gpx_out_of_range_raises(recorded_gpx):
+    gpx = recorded_gpx(GPX_11).replace(FIRST_LAT, 'lat="999"')
     with pytest.raises(ValueError, match="latitude"):
-        parse_gpx('<gpx><trkpt lat="999" lon="0"/></gpx>')
+        parse_gpx(gpx)
 
 
-def test_parse_gpx_malformed_xml_raises():
+def test_parse_gpx_malformed_xml_raises(recorded_gpx):
+    """The recording cut off inside its first point's attribute, as a truncated download is."""
+    gpx = recorded_gpx(GPX_11)
     with pytest.raises(ValueError, match="Malformed GPX"):
-        parse_gpx("<gpx><trkpt lat=")
+        parse_gpx(gpx[: gpx.index(FIRST_LAT) + len('lat="')])
 
 
 # === City preset lookup ===
@@ -301,23 +340,23 @@ def test_set_city_unknown_makes_no_call(captured_cmds):
     assert captured_cmds == []
 
 
-def test_replay_gpx_issues_one_call_per_point(monkeypatch, captured_cmds):
+def test_replay_gpx_issues_one_call_per_point(monkeypatch, captured_cmds, recorded_gpx):
     monkeypatch.setattr(location.time, "sleep", lambda _s: None)
-    pts = parse_gpx(_GPX_BASIC)
+    pts = parse_gpx(recorded_gpx(GPX_11))
     ok, msg = LocationManager(serial="emulator-5554").replay_gpx(pts, interval_seconds=0.0)
     assert ok is True
     assert "3 points" in msg
     geo_calls = [c for c in captured_cmds if c[3:6] == ["emu", "geo", "fix"]]
     assert len(geo_calls) == 3
-    # First call is the first waypoint, lon-first.
-    assert float(geo_calls[0][6]) == -0.1278
-    assert float(geo_calls[0][7]) == 51.5074
+    # First call is the first point of the recorded route, lon-first.
+    assert float(geo_calls[0][6]) == -122.0841
+    assert float(geo_calls[0][7]) == 37.422
 
 
-def test_replay_gpx_sleeps_between_points_only(monkeypatch, captured_cmds):
+def test_replay_gpx_sleeps_between_points_only(monkeypatch, captured_cmds, recorded_gpx):
     sleeps: list[float] = []
     monkeypatch.setattr(location.time, "sleep", lambda s: sleeps.append(s))
-    pts = parse_gpx(_GPX_BASIC)  # 3 points
+    pts = parse_gpx(recorded_gpx(GPX_11))  # 3 points
     LocationManager(serial="emulator-5554").replay_gpx(pts, interval_seconds=0.5)
     # n-1 sleeps for n points.
     assert sleeps == [0.5, 0.5]

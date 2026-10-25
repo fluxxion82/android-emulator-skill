@@ -515,6 +515,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       carrying what it found), exit 1; a device adb cannot reach is exit 3
     - `--grant-permission` / `--revoke-permission` toggle `POST_NOTIFICATIONS`
       (API 33+) on `--package`, for exercising the runtime-permission path.
+      The change is read back from user 0's `User 0:` section of `dumpsys
+      package`, by the same rule as `privacy_manager`: no section, or one
+      reading `installed=false` (where a grant still shows `granted=true`),
+      is a refusal with the `pm install-existing --user 0 <pkg>` remedy.
     - Options: `--post`, `--list`, `--grant-permission`, `--revoke-permission`,
       `--tag`, `--text`, `--no-verify`, `--expect-package`, `--package`,
       `--serial`, `--json`, `--verbose`
@@ -528,7 +532,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing or the JDK is below 17. Quick Start step 0.
     - The JDK floor is 17 (AGP 8 runs Gradle on nothing older). The major is
-      read from the first line of `java -version`, including the pre-Java-9
+      read from the first line of `java -version` (both streams) that STARTS
+      `java version "` or `openjdk version "` -- not from its first line,
+      since startup notices such as `Picked up JAVA_TOOL_OPTIONS: ...` can come
+      before the banner -- including the pre-Java-9
       `"1.8.0_392"` form (major 8); `--json` carries it as `java_major`, or
       `null` when java is missing or its banner has no readable version
       (that case is a warning, not a failure).
@@ -1568,7 +1575,8 @@ recorded fixture, and was red before the fix.
   package's uid (ActivityManager names the process, which an app may name
   after another package). Jank is keyed by process, and a pid is named only
   from system_server's own `Start proc` record for it, seen in the same
-  stream; `--package` matches that identity whole. A session's capture
+  stream; `--package` matches that identity whole (since v0.9.0, jank and
+  StrictMode are the package's by each record's uid instead). A session's capture
   losses — a record cut by the stop, a stream restart's gap — mark it
   incomplete, and the one record `-T 1` replays when it starts is shown,
   never counted. `--diff` calls nothing resolved, new or stable on the
@@ -1657,18 +1665,25 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     `accessibility_audit` exits 1 when a critical issue is present.
   - A streaming mode (`log_monitor --follow`, `anr_watcher --watch`) cannot
     take back the records it already printed: there the refusal object is the
-    **last line** of stdout, and parses on its own. Every other mode keeps
-    stdout to the one object under `--json` (`emulator_delete`'s confirmation
-    prompt goes to stderr).
-  - Six places catch a device error on purpose, so it does not reach the
-    boundary: boot-completion polling (`emulator_boot`), the snapshot
+    **last line** of stdout, and parses on its own. `anr_watcher --since
+    --json` is JSON Lines as well, like `--watch --json`: one object per
+    event, no enclosing document, so read it line by line (a single-document
+    parse fails at the second event). Every other mode keeps stdout to the one
+    object under `--json` (`emulator_delete`'s confirmation prompt goes to
+    stderr).
+  - Some places catch a device error on purpose, so it does not reach the
+    boundary. This list is not exhaustive; among them: boot-completion
+    polling (`emulator_boot`), the snapshot
     save/delete verify poll (`snapshot`, which keeps asking until its deadline
     and then reports the device as unavailable), the optional
     foreground-activity lookup (`device_utils.get_current_activity`), the
     emulator-console survey (`emu_console`), and the partial-capture policy of
     `test_recorder` steps and `app_state_capture` (what arrived is kept and
     handed over -- by `app_state_capture` in a refusal that is still exit 3
-    when the device was unavailable).
+    when the device was unavailable), and `anr_watcher`'s attribution lookups
+    (system_server's pid, the package's uids, a live pid's uid and the whole
+    uid table, each an unknown answer on failure, disclosed as unattributed or
+    unknown attribution rather than ending a read or a session).
   - Checked, not just promised: `tests/test_exit_code_sweep.py` runs every
     Quick Start command and the modes its table lists twice — with the Android
     tools present and failing, and with none on PATH at all — and

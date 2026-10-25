@@ -658,6 +658,67 @@ def test_a_read_back_with_no_user_0_section_is_a_refusal_not_a_defect(
         assert "Remedy:" in captured.err
 
 
+def _user_0_not_installed_dump() -> str:
+    """emulator-api33's dumpsys_package_user_not_installed, relabelled to user 0.
+
+    The recording is a `pm grant --user 15` of CAMERA for a user the app is not
+    installed for: it exited 0, and the dump shows `User 15: ... installed=false`
+    still carrying `android.permission.CAMERA: granted=true`.
+
+    Derivation, changing labels only: swap every `User 0:` and `User 15:` label
+    (so the `Packages:` block's user 0 section is the installed=false one with
+    granted=true, and user 15's is the installed=true one), then rename
+    `android.permission.CAMERA` to `android.permission.POST_NOTIFICATIONS`. No
+    line is added or removed; `pm grant` without --user targets user 0, which is
+    the user this script reads back.
+    """
+    text = RecordedFixtures(RECORDED_ROOT / "emulator-api33").text(
+        "dumpsys_package_user_not_installed"
+    )
+    derived = (
+        text.replace("User 0:", "\0SWAP\0")
+        .replace("User 15:", "User 0:")
+        .replace("\0SWAP\0", "User 15:")
+        .replace("android.permission.CAMERA", "android.permission.POST_NOTIFICATIONS")
+    )
+    assert derived.count("\n") == text.count("\n")
+    assert "    User 0: ceDataInode=0 installed=false" in derived
+    assert "android.permission.POST_NOTIFICATIONS: granted=true" in derived
+    return derived
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_grant_read_back_for_a_user_the_app_is_not_installed_for_is_refused(
+    fake_adb, monkeypatch, capsys, json_mode
+):
+    """`granted=true` under `User 0: ... installed=false` is not a held grant.
+
+    `pm grant` for a user the app is not installed for exits 0 and records the
+    grant (dumpsys_package_user_not_installed), but the app does not exist for
+    that user, so nothing it posts can use it. privacy_manager refused this
+    shape; the shared read-back this script uses reported `verified: true`.
+    """
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    fake_adb.when("dumpsys", "package", stdout=_user_0_not_installed_dump())
+    argv = ["--grant-permission", "--package", "com.example.composefixture"]
+
+    code = _run_main(monkeypatch, argv + (["--json"] if json_mode else []))
+    captured = capsys.readouterr()
+
+    assert code == 1, f"an uninstalled user's grant was reported as done: {captured.out}"
+    assert "Traceback" not in captured.out + captured.err
+    assert '"verified": true' not in captured.out
+    remedy = "pm install-existing --user 0 com.example.composefixture"
+    if json_mode:
+        payload = json.loads(captured.out)
+        assert payload.get("verified") is not True
+        assert "installed=false" in payload["error"]
+        assert remedy in payload["remedy"]
+    else:
+        assert "installed=false" in captured.err
+        assert remedy in captured.err
+
+
 # ---------------------------------------------------------------------------
 # Subprocess hygiene: no host shell, bounded, explicit.
 # ---------------------------------------------------------------------------

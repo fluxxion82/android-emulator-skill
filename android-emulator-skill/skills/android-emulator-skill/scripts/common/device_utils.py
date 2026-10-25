@@ -778,8 +778,92 @@ def parse_package_permissions(dump: str, user: int = 0) -> dict:
     }
 
 
-class UserSectionMissingError(LookupError):
+class UserStateUnreadableError(LookupError):
+    """The dump describes the package but cannot answer for ``user``.
+
+    Raised by :func:`permission_state` and returned by :func:`user_state_error`,
+    which is the one rule every read-back goes through. Never answered from
+    another user's section instead.
+    """
+
+    def __init__(self, user: int, message: str) -> None:
+        super().__init__(message)
+        self.user = user
+
+    def describe(self, package: str) -> str:
+        """Why the dump cannot answer for :attr:`user`, naming ``package``."""
+        raise NotImplementedError
+
+    def install_command(self, package: str) -> str:
+        """The command that makes ``package`` exist for :attr:`user`."""
+        return f"adb shell pm install-existing --user {self.user} {package}"
+
+    def remedy(self, package: str) -> str:
+        """What to run before retrying."""
+        raise NotImplementedError
+
+
+class UserSectionMissingError(UserStateUnreadableError):
     """The dump describes the package but has no ``User N:`` section for the user."""
+
+    def __init__(self, user: int) -> None:
+        super().__init__(user, f"the dump has no `User {user}:` section")
+
+    def describe(self, package: str) -> str:
+        return (
+            f"the dump of {package} has no `User {self.user}:` section, so its state for "
+            f"user {self.user} could not be read"
+        )
+
+    def remedy(self, package: str) -> str:
+        return (
+            f"Check `adb shell pm list users` and `adb shell dumpsys package {package}`; "
+            f"install the app for user {self.user} with `{self.install_command(package)}`, "
+            f"then retry."
+        )
+
+
+class UserNotInstalledError(UserStateUnreadableError):
+    """The user's ``User N:`` section reads ``installed=false``.
+
+    Its permission lines are still there and can read ``granted=true``: ``pm grant
+    --user N`` for a user the app is not installed for exits 0 and records the
+    grant (recorded as ``dumpsys_package_user_not_installed``). No app exists for
+    that user to hold it, so that state is never reported as held.
+    """
+
+    def __init__(self, user: int) -> None:
+        super().__init__(user, f"`User {user}:` reads installed=false")
+
+    def describe(self, package: str) -> str:
+        return (
+            f"{package} is not installed for user {self.user} (`User {self.user}:` reads "
+            f"installed=false)"
+        )
+
+    def remedy(self, package: str) -> str:
+        return (
+            f"Install the app for user {self.user} with `{self.install_command(package)}`, "
+            f"then retry."
+        )
+
+
+def user_state_error(parsed: dict) -> UserStateUnreadableError | None:
+    """Why a :func:`parse_package_permissions` result cannot answer for its user.
+
+    The single rule behind every permission read-back: a package with no
+    ``User N:`` section for the user, or one whose section reads
+    ``installed=false``, has no state for that user worth reporting. ``None``
+    when the dump can answer, including when it does not describe the package
+    at all (``found`` is False), which each caller words for itself.
+    """
+    if not parsed["found"]:
+        return None
+    if not parsed["user_found"]:
+        return UserSectionMissingError(parsed["user"])
+    if parsed["user_installed"] is False:
+        return UserNotInstalledError(parsed["user"])
+    return None
 
 
 def permission_state(dump: str, permission: str, user: int = 0) -> bool | None:
@@ -802,10 +886,13 @@ def permission_state(dump: str, permission: str, user: int = 0) -> bool | None:
         UserSectionMissingError: the package is in the dump but ``user`` has
             no section in it. Answering ``None`` there would read as "not
             requested", which a revoke counts as done.
+        UserNotInstalledError: ``user``'s section reads ``installed=false``.
+            Its ``granted=true`` is a grant no installed app holds.
     """
     parsed = parse_package_permissions(dump, user=user)
-    if parsed["found"] and not parsed["user_found"]:
-        raise UserSectionMissingError(f"the dump has no `User {user}:` section")
+    error = user_state_error(parsed)
+    if error is not None:
+        raise error
     for entry in parsed["install"] + parsed["runtime"]:
         if entry["permission"] == permission:
             return bool(entry["granted"])
