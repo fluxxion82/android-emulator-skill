@@ -475,7 +475,17 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - List app permissions
     - Support for 20+ permission types
     - Batch operations
-    - Options: `--grant`, `--revoke`, `--list`, `--package`, `--serial`, `--list-permissions`, `--json`
+    - `--user <id>` acts on one Android user (a secondary user or a work
+      profile): the id goes into `pm grant/revoke --user`, and the read-back
+      and `--list` read that user's `User <id>:` section of `dumpsys package`
+      (under the package, or under `Shared users:` for a shared-uid app).
+      Without it both name user 0. The id must be one `pm list users` names (a
+      grant for a missing user exits 0 silently, so it is checked first);
+      `--user all` / `current` are refused. A user the app is not installed
+      for fails with the `pm install-existing --user <id>` remedy, and a
+      read-back with no section for the user fails rather than reading
+      another user's state.
+    - Options: `--grant`, `--revoke`, `--reset`, `--list`, `--package`, `--user`, `--serial`, `--list-permissions`, `--json`
 
 21. **status_bar.py** ⭐ NEW - Status bar control
     - Set battery level and charging state
@@ -1537,8 +1547,6 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
   `Start proc` is the only evidence it takes); an app already running when
   `--start` is called is keyed by pid, listed under `unnamed_pids`, and its
   jank is dropped under `--package`. Start the session before the app.
-- `privacy_manager` acts on the default user only. It passes no `--user`, so a
-  work profile or a secondary user is out of reach.
 - **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is
   promised, and what is not yet:
   - A *typed* failure — a missing `adb` or SDK tool, an adb call that failed, a

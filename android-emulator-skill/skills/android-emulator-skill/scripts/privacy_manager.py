@@ -25,6 +25,18 @@ Usage Examples:
     python scripts/privacy_manager.py --revoke camera --package com.myapp \
         --scenario onboarding --step 2
 
+    # Act on (and read back) a secondary user's permissions
+    python scripts/privacy_manager.py --grant camera --package com.myapp --user 11
+
+Note on --user:
+    Runtime permissions are per user. ``--user <id>`` goes into the ``pm``
+    command AND selects that user's ``User <id>:`` section of ``dumpsys
+    package`` for the read-back and ``--list``; without it both name user 0,
+    the system user (``pm grant``'s own default). The id must be one ``pm list
+    users`` names -- a grant for a user the device does not have exits 0 and
+    prints nothing -- and ``all`` / ``current`` are refused: one read-back
+    cannot verify several users.
+
 Note on --reset:
     Unlike iOS (xcrun simctl privacy reset), Android has no command that returns
     a runtime permission to the original "ask on next use" prompt state. The
@@ -36,13 +48,14 @@ Note on --reset:
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 
 from common import adb_exec, cli
 from common.device_utils import (
     parse_package_permissions,
-    permission_state,
+    parse_user_ids,
     quote_for_device_shell,
 )
 from common.env_config import env_int
@@ -61,6 +74,21 @@ ADB_TIMEOUT_SECONDS = env_int("ANDROID_EMU_PRIVACY_ADB_TIMEOUT", 30, min_value=1
 #   and no --serial, a missing adb, a timeout: these raise. A batch stops at the
 #   first one -- continuing against a device that is not there only repeats the
 #   error -- and common.cli reports it: exit 3 for an unavailable device, else 1.
+
+# "java.lang.SecurityException: Package X has not requested permission Y" --
+# the line of `pm`'s stack trace that says why (recorded: pm_grant_not_changeable
+# on API 35, pm_grant_user_not_requested on API 33).
+_PLATFORM_EXCEPTION_RE = re.compile(r"^\s*(?:[\w$]+\.)*(\w*Exception): (.+)$", re.MULTILINE)
+
+# An Android user id is a Java int: at most 2147483647, ten digits.
+_MAX_USER_ID = 2**31 - 1
+_MAX_USER_DIGITS = len(str(_MAX_USER_ID))
+
+
+def platform_refusal(output: str) -> str | None:
+    """``"SecurityException: <why>"`` from ``pm``'s output, without the stack trace."""
+    match = _PLATFORM_EXCEPTION_RE.search(output)
+    return f"{match.group(1)}: {match.group(2).strip()}" if match else None
 
 
 class PrivacyManager:
@@ -91,14 +119,29 @@ class PrivacyManager:
         "notification": "android.permission.POST_NOTIFICATIONS",
     }
 
-    def __init__(self, serial: str | None = None):
+    def __init__(self, serial: str | None = None, user: int = 0):
         """
         Initialize privacy manager.
 
         Args:
             serial: Optional device serial (auto-detects if None)
+            user: The Android user whose permissions are changed and read
+                back. 0, the system user, is ``pm grant``'s own default.
         """
         self.serial = serial
+        self.user = user
+
+    @property
+    def _for_user(self) -> str:
+        """`` for user N`` in a message, empty for the default user."""
+        return f" for user {self.user}" if self.user else ""
+
+    def device_user_ids(self) -> frozenset[int]:
+        """The user ids ``pm list users`` names on the device."""
+        listing = adb_exec.run_adb(
+            "shell", self.serial, "pm", "list", "users", timeout=ADB_TIMEOUT_SECONDS, check=True
+        )
+        return parse_user_ids(listing.stdout)
 
     def get_permission_name(self, permission: str) -> str | None:
         """
@@ -141,6 +184,8 @@ class PrivacyManager:
                 self.serial,
                 "pm",
                 "grant",
+                "--user",
+                quote_for_device_shell(str(self.user)),
                 quote_for_device_shell(package),
                 quote_for_device_shell(full_permission),
                 timeout=ADB_TIMEOUT_SECONDS,
@@ -151,12 +196,19 @@ class PrivacyManager:
             # Check common errors
             if "unknown package" in error_msg.lower():
                 return False, f"Package not found: {package}"
+            refusal = platform_refusal(e.stderr or e.stdout)
+            if refusal is not None:
+                return False, f"Failed to grant permission{self._for_user}: {refusal}"
             return False, f"Failed to grant permission: {error_msg}"
 
         confirmed, detail = self.confirm_permission(package, full_permission, expect_granted=True)
         if not confirmed:
-            return False, f"Grant of {permission} to {package} did not take effect: {detail}"
-        return True, f"Granted {permission} to {package} (verified)"
+            return (
+                False,
+                f"Grant of {permission} to {package}{self._for_user} did not take effect: "
+                f"{detail}",
+            )
+        return True, f"Granted {permission} to {package}{self._for_user} (verified)"
 
     def revoke_permission(self, package: str, permission: str) -> tuple:
         """
@@ -182,6 +234,8 @@ class PrivacyManager:
                 self.serial,
                 "pm",
                 "revoke",
+                "--user",
+                quote_for_device_shell(str(self.user)),
                 quote_for_device_shell(package),
                 quote_for_device_shell(full_permission),
                 timeout=ADB_TIMEOUT_SECONDS,
@@ -189,12 +243,19 @@ class PrivacyManager:
             )
         except adb_exec.AdbCommandError as e:
             error_msg = e.stderr if e.stderr else str(e)
+            refusal = platform_refusal(e.stderr or e.stdout)
+            if refusal is not None:
+                return False, f"Failed to revoke permission{self._for_user}: {refusal}"
             return False, f"Failed to revoke permission: {error_msg}"
 
         confirmed, detail = self.confirm_permission(package, full_permission, expect_granted=False)
         if not confirmed:
-            return False, f"Revoke of {permission} from {package} did not take effect: {detail}"
-        return True, f"Revoked {permission} from {package} (verified){detail}"
+            return (
+                False,
+                f"Revoke of {permission} from {package}{self._for_user} did not take effect: "
+                f"{detail}",
+            )
+        return True, f"Revoked {permission} from {package}{self._for_user} (verified){detail}"
 
     def confirm_permission(
         self, package: str, full_permission: str, expect_granted: bool
@@ -234,7 +295,18 @@ class PrivacyManager:
         except adb_exec.AdbCommandError as e:
             return False, f"could not read {package} back to check: {e.stderr or e}"
 
-        state = permission_state(dump, full_permission)
+        parsed = parse_package_permissions(dump, user=self.user)
+        problem = self.user_state_problem(package, parsed)
+        if problem is not None:
+            return False, problem
+        state = next(
+            (
+                bool(entry["granted"])
+                for entry in parsed["install"] + parsed["runtime"]
+                if entry["permission"] == full_permission
+            ),
+            None,
+        )
         if expect_granted:
             if state is True:
                 return True, ""
@@ -250,6 +322,29 @@ class PrivacyManager:
         if state is None:
             return True, " (package does not request it)"
         return True, ""
+
+    def user_state_problem(self, package: str, parsed: dict) -> str | None:
+        """Why ``parsed`` cannot answer for :attr:`user`, or None when it can.
+
+        Never falls back to another user's section: a read-back that cannot
+        find the one asked for is a failure, because the only alternative is
+        reporting a state nobody checked.
+        """
+        user = self.user
+        if not parsed["found"]:
+            return f"{package} is not installed on this device"
+        if not parsed["user_found"]:
+            return (
+                f"the dump of {package} has no `User {user}:` section, so its state for "
+                f"user {user} could not be read"
+            )
+        if parsed["user_installed"] is False:
+            return (
+                f"{package} is not installed for user {user} (`User {user}:` reads "
+                f"installed=false); install it with `adb shell pm install-existing --user "
+                f"{user} {package}`"
+            )
+        return None
 
     def reset_permission(self, package: str, permission: str) -> tuple:
         """
@@ -309,11 +404,19 @@ class PrivacyManager:
             error_msg = e.stderr if e.stderr else str(e)
             return False, f"Failed to list permissions: {error_msg}", None
 
-        permissions_data = {"package": package, **parse_package_permissions(result.stdout)}
+        permissions_data = {
+            "package": package,
+            **parse_package_permissions(result.stdout, user=self.user),
+        }
         if not permissions_data["found"]:
             # `dumpsys package <unknown>` prints "Unable to find package: X"
             # and exits 0, so an empty result must not read as "no permissions".
             return False, f"Package not installed on this device: {package}", permissions_data
+        problem = self.user_state_problem(package, permissions_data)
+        if problem is not None:
+            return False, problem, permissions_data
+        # Always true by now; the user's id stays, as what the list is for.
+        del permissions_data["user_found"], permissions_data["user_installed"]
         return True, "Permissions retrieved", permissions_data
 
 
@@ -361,13 +464,24 @@ def print_permissions(package: str, data: dict, verbose: bool) -> None:
     runtime = data["runtime"]
     install = data["install"]
     held = sum(1 for entry in install if entry["granted"])
-    print(f"{package}: {len(runtime)} runtime, {len(install)} install-time ({held} granted)")
+    user = f" (user {data['user']})" if data.get("user") else ""
+    print(f"{package}{user}: {len(runtime)} runtime, {len(install)} install-time ({held} granted)")
+
+    stated = {entry["permission"] for entry in install + runtime}
+    unstated = [name for name in data["requested"] if name not in stated]
 
     if runtime:
         print("Runtime:")
         for entry in runtime:
             symbol = "✓" if entry["granted"] else "✗"
             print(f"  {symbol} {entry['permission']}")
+    elif unstated:
+        # Not "nothing can be granted": a requested permission the dump gives
+        # no state for may still be a runtime one.
+        print(
+            f"Runtime: none listed ({len(unstated)} requested with no state reported; "
+            f"--verbose lists them)"
+        )
     else:
         print("Runtime: none (nothing here can be granted or revoked at runtime)")
 
@@ -378,12 +492,73 @@ def print_permissions(package: str, data: dict, verbose: bool) -> None:
     for entry in install:
         print(f"  {'✓' if entry['granted'] else '✗'} {entry['permission']}")
 
-    stated = {entry["permission"] for entry in install + runtime}
-    unstated = [name for name in data["requested"] if name not in stated]
     if unstated:
         print(f"Requested, no state reported ({len(unstated)}):")
         for name in unstated:
             print(f"  ? {name}")
+
+
+def parse_user_arg(value: str | None) -> int:
+    """``--user``'s value as one user id; refused through common.cli otherwise.
+
+    ``pm`` itself accepts ``all`` and ``current``, but a grant for several
+    users cannot be verified by reading one user's section back (and on API 33
+    ``pm grant --user all`` throws ``IllegalArgumentException``), and
+    ``current`` is a different user depending on when it is asked.
+    """
+    if value is None:
+        return 0
+    if value.strip().lower() in {"all", "current", "cur"}:
+        cli.fail(
+            f"--user {value} is not supported: a grant is verified by reading one user's "
+            f"state back, so --user takes one numeric user id",
+            "Pass --user <id> (from `adb shell pm list users`), once per user to change.",
+        )
+    # ASCII digits only, nothing around them. `str.isdigit()` accepts "²",
+    # which int() then rejects with a traceback, and int() itself reads "٣"
+    # as 3 and "1_0" as 10. Leading zeros are kept: "005" is user 5.
+    if re.fullmatch(r"[0-9]+", value) is None:
+        cli.fail(
+            f"--user {value!r} is not a user id",
+            "Pass --user <id>, a non-negative number from `adb shell pm list users`.",
+        )
+    # Bounded BEFORE int(): past 4300 digits int() raises (Python's integer
+    # string-length limit), and an Android user id is a 32-bit int anyway.
+    if len(value) > _MAX_USER_DIGITS or int(value) > _MAX_USER_ID:
+        shown = value if len(value) <= 20 else f"{value[:12]}... ({len(value)} digits)"
+        cli.fail(
+            f"--user {shown} is not a user id: Android user ids are at most {_MAX_USER_ID}",
+            "Pass --user <id>, a number from `adb shell pm list users`.",
+        )
+    return int(value)
+
+
+def require_user_on_device(manager: PrivacyManager) -> None:
+    """Refuse a ``--user`` the device does not have, before anything is changed.
+
+    Checked against ``pm list users`` because ``pm grant --user <missing id>``
+    prints nothing and exits 0 (recorded: pm_grant_user_missing); without this
+    the only sign would be the read-back's missing section, after the fact.
+    """
+    try:
+        users = manager.device_user_ids()
+    except adb_exec.AdbCommandError as e:
+        cli.fail(
+            f"could not list the device's users to check user {manager.user}: {e}",
+            "Check the device answers `adb shell pm list users`, then retry.",
+        )
+    if not users:
+        cli.fail(
+            f"`pm list users` named no users, so user {manager.user} could not be checked",
+            "Run `adb shell pm list users` and check its output, then retry.",
+        )
+    if manager.user not in users:
+        listed = ", ".join(str(u) for u in sorted(users))
+        cli.fail(
+            f"user {manager.user} does not exist on this device (`pm list users` names {listed})",
+            f"Pass one of --user {listed}, or create the user first "
+            f"(`adb shell pm create-user <name>`).",
+        )
 
 
 def main(argv: list[str] | None = None):
@@ -414,6 +589,9 @@ Examples:
 
   # List available permission names
   python scripts/privacy_manager.py --list-permissions
+
+  # Grant, verify and list for a secondary user (default: user 0)
+  python scripts/privacy_manager.py --grant camera --package com.myapp --user 11
         """,
     )
 
@@ -444,12 +622,20 @@ Examples:
         "--step", type=int, help="Step number within the test scenario to record in output"
     )
 
+    parser.add_argument(
+        "--user",
+        help=(
+            "Android user id to grant/revoke for and read back (default 0, the system "
+            "user). Must be listed by `pm list users`; 'all' and 'current' are refused."
+        ),
+    )
+
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args(argv)
 
-    manager = PrivacyManager(serial=args.device_serial)
+    manager = PrivacyManager(serial=args.device_serial, user=parse_user_arg(args.user))
 
     # List available permissions
     if args.list_permissions:
@@ -468,6 +654,9 @@ Examples:
             "--package is required for --grant, --revoke, --reset and --list",
             "Pass --package <application id>, e.g. --package com.example.app.",
         )
+
+    if manager.user != 0:
+        require_user_on_device(manager)
 
     # List app permissions
     if args.list:

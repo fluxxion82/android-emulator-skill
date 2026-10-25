@@ -2919,6 +2919,140 @@ def _granted_by_user(text: str, permission: str) -> dict[str, str | None]:
     return seen
 
 
+# What the user-refusal window grants for the installed secondary user: a
+# runtime permission the fixture app does NOT request. On API 35 user 0 that is
+# a silent no-op (pm_grant_not_requested); on API 33 it throws.
+_UNREQUESTED_GRANT = "android.permission.POST_NOTIFICATIONS"
+
+
+def _user_refusals_window(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """What a per-user grant does when the user, the install or the request is missing.
+
+    A throwaway user is created. While it exists, in this order: ``pm list
+    users`` (pm_list_users_two_users); ``pm grant --user <id>`` for an id the
+    listing does not name (pm_grant_user_missing); a grant of CAMERA for the
+    new user BEFORE the app is installed for it, then ``dumpsys package``
+    (dumpsys_package_user_not_installed); ``pm install-existing --user <id>``;
+    a grant of :data:`_UNREQUESTED_GRANT`, which the app does not request, for
+    that user (this fixture, both streams and the exit status kept apart); and
+    a grant then revoke of CAMERA for that user, then ``dumpsys package``
+    (dumpsys_package_user_revoked). The user is removed in a ``finally`` and
+    the removal read back.
+    """
+    created = _run(["shell", "pm", "create-user", _TMP_USER_NAME], serial, timeout=60)
+    match = re.search(r"created user id (\d+)", created.text)
+    if created.returncode != 0 or match is None:
+        raise CaptureError(f"pm create-user failed: {created.text.strip()!r}")
+    user = match.group(1)
+    try:
+        listing = _run(["shell", "pm", "list", "users"], serial, timeout=15)
+        listed = set(re.findall(r"UserInfo\{(\d+):", listing.text))
+        if listed != {"0", user}:
+            raise CaptureError(f"expected users 0 and {user} listed: {listing.text.strip()!r}")
+        missing = str(max(int(u) for u in listed) + 100)
+        missing_grant = _run(
+            [
+                "shell",
+                f"pm grant --user {missing} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} 2>&1; "
+                f"echo exit=$?",
+            ],
+            serial,
+            timeout=30,
+        )
+        uninstalled_grant = _run(
+            [
+                "shell",
+                f"pm grant --user {user} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} 2>&1; echo exit=$?",
+            ],
+            serial,
+            timeout=30,
+        )
+        uninstalled_dump = _run(["shell", "dumpsys", "package", COMPOSE_PACKAGE], serial, 60)
+        installed = _run(
+            ["shell", "pm", "install-existing", "--user", user, COMPOSE_PACKAGE], serial, timeout=60
+        )
+        if installed.returncode != 0:
+            raise CaptureError(f"install-existing failed: {installed.text.strip()!r}")
+        refused = _run(
+            ["shell", "pm", "grant", "--user", user, COMPOSE_PACKAGE, _UNREQUESTED_GRANT],
+            serial,
+            timeout=30,
+        )
+        cycle = _run(
+            [
+                "shell",
+                f"pm grant --user {user} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} 2>&1; "
+                f"echo exit=$?; pm revoke --user {user} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} "
+                f"2>&1; echo exit=$?",
+            ],
+            serial,
+            timeout=30,
+        )
+        revoked_dump = _run(["shell", "dumpsys", "package", COMPOSE_PACKAGE], serial, 60)
+    finally:
+        removed = _run(["shell", "pm", "remove-user", user], serial, timeout=60)
+    for _ in range(15):
+        if f"UserInfo{{{user}:" not in _users_listed(serial):
+            break
+        time.sleep(1)
+    else:
+        raise CaptureError(f"user {user} still listed after pm remove-user: {removed.text!r}")
+
+    if "exit=" not in missing_grant.text:
+        raise CaptureError(f"pm grant --user {missing} printed no exit status")
+    if not re.search(rf"^    User {user}: .*\binstalled=false\b", uninstalled_dump.text, re.M):
+        raise CaptureError(f"the dump before install-existing names no installed=false user {user}")
+    if "SecurityException" not in refused.stderr:
+        raise CaptureError(
+            f"expected a SecurityException granting an unrequested permission for user {user}; "
+            f"got exit {refused.returncode}: {refused.text.strip()!r}"
+        )
+    if cycle.text.count("exit=0") != 2:
+        raise CaptureError(f"the grant/revoke cycle did not exit 0 twice: {cycle.text!r}")
+    if _granted_by_user(revoked_dump.text, _TWO_USER_GRANT).get(user) is not None:
+        raise CaptureError(
+            f"expected no {_TWO_USER_GRANT} entry left under user {user} after the revoke; "
+            f"the dump's user blocks say {_granted_by_user(revoked_dump.text, _TWO_USER_GRANT)}"
+        )
+    provenance = {"secondary_user": user}
+    extra.update({**provenance, "permission": _UNREQUESTED_GRANT})
+    _TEXT_TWINS["pm_list_users_two_users"] = (listing, provenance)
+    _TEXT_TWINS["pm_grant_user_missing"] = (
+        missing_grant,
+        {**provenance, "missing_user": missing, "permission": _TWO_USER_GRANT},
+    )
+    _TEXT_TWINS["dumpsys_package_user_not_installed"] = (
+        uninstalled_dump,
+        {
+            **provenance,
+            "permission": _TWO_USER_GRANT,
+            "grant": {
+                "command": (
+                    f"adb shell 'pm grant --user {user} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} "
+                    f"2>&1; echo exit=$?'"
+                ),
+                "output": _strip_cr(uninstalled_grant.text),
+            },
+        },
+    )
+    _TEXT_TWINS["dumpsys_package_user_revoked"] = (
+        revoked_dump,
+        {
+            **provenance,
+            "permission": _TWO_USER_GRANT,
+            "grant_revoke": {
+                "command": (
+                    f"adb shell 'pm grant --user {user} {COMPOSE_PACKAGE} {_TWO_USER_GRANT} "
+                    f"2>&1; echo exit=$?; pm revoke --user {user} {COMPOSE_PACKAGE} "
+                    f"{_TWO_USER_GRANT} 2>&1; echo exit=$?'"
+                ),
+                "output": _strip_cr(cycle.text),
+            },
+        },
+    )
+    return refused
+
+
 def _strictmode_records(serial: str, extra: dict) -> bytes:
     """StrictModeActivity's violation as logd's records, with the app's uid beside it.
 
@@ -3777,6 +3911,119 @@ FIXTURES: list[Fixture] = [
             "dumpsys_package_shared_uid_two_users", "dumpsys_package_two_users"
         ),
         post=_requires("Shared users:", "SharedUser [android.uid.shared]"),
+    ),
+    Fixture(
+        name="pm_list_users",
+        args=["shell", "pm", "list", "users"],
+        description=(
+            "`pm list users` on a device with only its system user: a `Users:` line, then one "
+            "tab-indented `UserInfo{<id>:<name>:<flags>}` row per user, `running` after a "
+            "started one. Ground truth for privacy_manager's check that a --user id exists "
+            "before it grants (pm_grant_user_missing: a grant for a missing user exits 0)."
+        ),
+        post=_requires("UserInfo{0:"),
+    ),
+    Fixture(
+        name="pm_grant_user_not_requested",
+        emulator_only=True,
+        args=[],
+        command=(
+            f"adb shell pm create-user {_TMP_USER_NAME}; pm list users "
+            "(pm_list_users_two_users); pm grant --user <missing id> ... "
+            "(pm_grant_user_missing); pm grant --user <id> "
+            f"{COMPOSE_PACKAGE} {_TWO_USER_GRANT}; dumpsys package {COMPOSE_PACKAGE} "
+            f"(dumpsys_package_user_not_installed); pm install-existing --user <id> "
+            f"{COMPOSE_PACKAGE}; pm grant --user <id> {COMPOSE_PACKAGE} {_UNREQUESTED_GRANT}; "
+            f"pm grant then pm revoke --user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT}; "
+            f"dumpsys package {COMPOSE_PACKAGE} (dumpsys_package_user_revoked); "
+            "pm remove-user <id>"
+        ),
+        description=(
+            "`pm grant --user <secondary user>` of a runtime permission the fixture app does "
+            f"NOT request ({_UNREQUESTED_GRANT.rsplit('.', 1)[1]}), the app installed for that "
+            "user: `java.lang.SecurityException: Package ... has not requested permission ...` "
+            "and a stack trace on stderr, exit 255 (API 33). On API 35 the same grant for user "
+            "0 is a silent exit 0 (emulator-api35 pm_grant_not_requested), so a reader must "
+            "handle both. The throwaway user is removed in the same run and its removal read "
+            "back; manifest `secondary_user`, `permission`."
+        ),
+        capture_with=_user_refusals_window,
+        teardown_verify=_secondary_user_gone,
+        post=_requires("SecurityException"),
+    ),
+    Fixture(
+        name="pm_list_users_two_users",
+        emulator_only=True,
+        args=[],
+        command="adb shell pm list users (in pm_grant_user_not_requested's run)",
+        description=(
+            "`pm list users` while a throwaway secondary user exists: `UserInfo{0:...}` and "
+            "`UserInfo{<id>:...}` rows (the id is the manifest's `secondary_user`). Ground "
+            "truth for parsing more than one user out of the listing."
+        ),
+        capture_with=_text_twin("pm_list_users_two_users", "pm_grant_user_not_requested"),
+        post=_requires("UserInfo{0:"),
+    ),
+    Fixture(
+        name="pm_grant_user_missing",
+        emulator_only=True,
+        args=[],
+        command=(
+            f"adb shell 'pm grant --user <id not in pm list users> {COMPOSE_PACKAGE} "
+            f"{_TWO_USER_GRANT} 2>&1; echo exit=$?' (in pm_grant_user_not_requested's run)"
+        ),
+        description=(
+            "`pm grant --user <id>` for a user the device does not have (manifest "
+            "`missing_user`): nothing printed and exit 0 (measured, API 33). Neither the "
+            "output nor the status says the user is missing, so privacy_manager checks the id "
+            "against `pm list users` before granting."
+        ),
+        capture_with=_text_twin("pm_grant_user_missing", "pm_grant_user_not_requested"),
+        post=_requires("exit="),
+    ),
+    Fixture(
+        name="dumpsys_package_user_not_installed",
+        emulator_only=True,
+        args=[],
+        command=(
+            f"adb shell 'pm grant --user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT}'; adb shell "
+            f"dumpsys package {COMPOSE_PACKAGE} (in pm_grant_user_not_requested's run, the user "
+            "created but the app not yet installed for it)"
+        ),
+        description=(
+            "`dumpsys package <fixture app>` with a secondary user the app is NOT installed "
+            "for, after `pm grant --user <id>` of CAMERA for that user (it exits 0; manifest "
+            "`grant`): the dump still prints a `User <id>:` block, its first line saying "
+            "`installed=false`, and a `runtime permissions:` section under it in which CAMERA "
+            "reads granted=true (measured, API 33). A read-back that only looks for the "
+            "permission would confirm a grant for an app that user does not have."
+        ),
+        capture_with=_text_twin(
+            "dumpsys_package_user_not_installed", "pm_grant_user_not_requested"
+        ),
+        post=_requires("installed=false"),
+    ),
+    Fixture(
+        name="dumpsys_package_user_revoked",
+        emulator_only=True,
+        args=[],
+        command=(
+            f"adb shell 'pm grant --user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT}; pm revoke "
+            f"--user <id> {COMPOSE_PACKAGE} {_TWO_USER_GRANT}'; adb shell dumpsys package "
+            f"{COMPOSE_PACKAGE} (in pm_grant_user_not_requested's run, the app installed for "
+            "the user)"
+        ),
+        description=(
+            "`dumpsys package <fixture app>` after CAMERA was granted and then revoked for a "
+            "secondary user (both exit 0; manifest `grant_revoke`): that user's `runtime "
+            "permissions:` header is printed with NO entries -- a revoked permission with no "
+            "flags is not listed at all, while `requested permissions:` still names CAMERA "
+            "and user 0's section still lists it with its USER_SENSITIVE flags (measured, "
+            "API 33). A reader taking a missing entry for 'not requested' misreports a "
+            "plain revoke."
+        ),
+        capture_with=_text_twin("dumpsys_package_user_revoked", "pm_grant_user_not_requested"),
+        post=_requires("runtime permissions:"),
     ),
     Fixture(
         name="ps_pid_uid",

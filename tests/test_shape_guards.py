@@ -618,13 +618,15 @@ KNOWN_QUOTED: tuple[Expectation, ...] = (
         "privacy_manager.py",
         "grant_permission",
         QUOTED,
-        "quote_for_device_shell(package), quote_for_device_shell(full_permission)",
+        "quote_for_device_shell(str(self.user)), quote_for_device_shell(package), "
+        "quote_for_device_shell(full_permission)",
     ),
     Expectation(
         "privacy_manager.py",
         "revoke_permission",
         QUOTED,
-        "quote_for_device_shell(package), quote_for_device_shell(full_permission)",
+        "quote_for_device_shell(str(self.user)), quote_for_device_shell(package), "
+        "quote_for_device_shell(full_permission)",
     ),
     Expectation(
         "privacy_manager.py", "confirm_permission", QUOTED, "quote_for_device_shell(package)"

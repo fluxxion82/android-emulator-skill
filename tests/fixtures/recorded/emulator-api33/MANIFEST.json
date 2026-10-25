@@ -144,6 +144,40 @@
       "recorded_at": "2026-10-24T19:17:47Z"
     },
     {
+      "name": "dumpsys_package_user_not_installed",
+      "file": "dumpsys_package_user_not_installed.txt",
+      "command": "adb shell 'pm grant --user <id> com.example.composefixture android.permission.CAMERA'; adb shell dumpsys package com.example.composefixture (in pm_grant_user_not_requested's run, the user created but the app not yet installed for it)",
+      "description": "`dumpsys package <fixture app>` with a secondary user the app is NOT installed for, after `pm grant --user <id>` of CAMERA for that user (it exits 0; manifest `grant`): the dump still prints a `User <id>:` block, its first line saying `installed=false`, and a `runtime permissions:` section under it in which CAMERA reads granted=true (measured, API 33). A read-back that only looks for the permission would confirm a grant for an app that user does not have.",
+      "catches": [],
+      "bytes": 6974,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "15",
+      "permission": "android.permission.CAMERA",
+      "grant": {
+        "command": "adb shell 'pm grant --user 15 com.example.composefixture android.permission.CAMERA 2>&1; echo exit=$?'",
+        "output": "exit=0\n"
+      },
+      "recorded_at": "2026-10-25T01:29:49Z"
+    },
+    {
+      "name": "dumpsys_package_user_revoked",
+      "file": "dumpsys_package_user_revoked.txt",
+      "command": "adb shell 'pm grant --user <id> com.example.composefixture android.permission.CAMERA; pm revoke --user <id> com.example.composefixture android.permission.CAMERA'; adb shell dumpsys package com.example.composefixture (in pm_grant_user_not_requested's run, the app installed for the user)",
+      "description": "`dumpsys package <fixture app>` after CAMERA was granted and then revoked for a secondary user (both exit 0; manifest `grant_revoke`): that user's `runtime permissions:` header is printed with NO entries -- a revoked permission with no flags is not listed at all, while `requested permissions:` still names CAMERA and user 0's section still lists it with its USER_SENSITIVE flags (measured, API 33). A reader taking a missing entry for 'not requested' misreports a plain revoke.",
+      "catches": [],
+      "bytes": 7149,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "15",
+      "permission": "android.permission.CAMERA",
+      "grant_revoke": {
+        "command": "adb shell 'pm grant --user 15 com.example.composefixture android.permission.CAMERA 2>&1; echo exit=$?; pm revoke --user 15 com.example.composefixture android.permission.CAMERA 2>&1; echo exit=$?'",
+        "output": "exit=0\nexit=0\n"
+      },
+      "recorded_at": "2026-10-25T01:29:49Z"
+    },
+    {
       "name": "logcat_anr_broadcast_records",
       "file": "logcat_anr_broadcast_records.bin",
       "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before provoking",
@@ -318,6 +352,56 @@
       "secondary_user": "11",
       "permission": "android.permission.CAMERA",
       "recorded_at": "2026-10-24T19:17:47Z"
+    },
+    {
+      "name": "pm_grant_user_missing",
+      "file": "pm_grant_user_missing.txt",
+      "command": "adb shell 'pm grant --user <id not in pm list users> com.example.composefixture android.permission.CAMERA 2>&1; echo exit=$?' (in pm_grant_user_not_requested's run)",
+      "description": "`pm grant --user <id>` for a user the device does not have (manifest `missing_user`): nothing printed and exit 0 (measured, API 33). Neither the output nor the status says the user is missing, so privacy_manager checks the id against `pm list users` before granting.",
+      "catches": [],
+      "bytes": 7,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "15",
+      "missing_user": "115",
+      "permission": "android.permission.CAMERA",
+      "recorded_at": "2026-10-25T01:29:49Z"
+    },
+    {
+      "name": "pm_grant_user_not_requested",
+      "file": "pm_grant_user_not_requested.txt",
+      "command": "adb shell pm create-user v9-fixture-tmp; pm list users (pm_list_users_two_users); pm grant --user <missing id> ... (pm_grant_user_missing); pm grant --user <id> com.example.composefixture android.permission.CAMERA; dumpsys package com.example.composefixture (dumpsys_package_user_not_installed); pm install-existing --user <id> com.example.composefixture; pm grant --user <id> com.example.composefixture android.permission.POST_NOTIFICATIONS; pm grant then pm revoke --user <id> com.example.composefixture android.permission.CAMERA; dumpsys package com.example.composefixture (dumpsys_package_user_revoked); pm remove-user <id>",
+      "description": "`pm grant --user <secondary user>` of a runtime permission the fixture app does NOT request (POST_NOTIFICATIONS), the app installed for that user: `java.lang.SecurityException: Package ... has not requested permission ...` and a stack trace on stderr, exit 255 (API 33). On API 35 the same grant for user 0 is a silent exit 0 (emulator-api35 pm_grant_not_requested), so a reader must handle both. The throwaway user is removed in the same run and its removal read back; manifest `secondary_user`, `permission`.",
+      "catches": [],
+      "bytes": 1546,
+      "exit_status": 255,
+      "stream": "stderr",
+      "secondary_user": "15",
+      "permission": "android.permission.POST_NOTIFICATIONS",
+      "recorded_at": "2026-10-25T01:29:49Z"
+    },
+    {
+      "name": "pm_list_users",
+      "file": "pm_list_users.txt",
+      "command": "adb shell pm list users",
+      "description": "`pm list users` on a device with only its system user: a `Users:` line, then one tab-indented `UserInfo{<id>:<name>:<flags>}` row per user, `running` after a started one. Ground truth for privacy_manager's check that a --user id exists before it grants (pm_grant_user_missing: a grant for a missing user exits 0).",
+      "catches": [],
+      "bytes": 38,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-25T01:14:16Z"
+    },
+    {
+      "name": "pm_list_users_two_users",
+      "file": "pm_list_users_two_users.txt",
+      "command": "adb shell pm list users (in pm_grant_user_not_requested's run)",
+      "description": "`pm list users` while a throwaway secondary user exists: `UserInfo{0:...}` and `UserInfo{<id>:...}` rows (the id is the manifest's `secondary_user`). Ground truth for parsing more than one user out of the listing.",
+      "catches": [],
+      "bytes": 71,
+      "exit_status": 0,
+      "stream": "stdout",
+      "secondary_user": "15",
+      "recorded_at": "2026-10-25T01:29:49Z"
     },
     {
       "name": "ps_all_pid_uid",

@@ -33,6 +33,7 @@ from types import SimpleNamespace
 
 import push_notification
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
 
 from common import cli
 
@@ -615,6 +616,46 @@ def test_permission_cli_exit_codes(fake_adb, monkeypatch, recorded):
 
 def test_permission_actions_require_a_package(monkeypatch, fake_adb):
     assert _run_main(monkeypatch, ["--grant-permission"]) == 2
+
+
+def _two_users_dump_without_user_0() -> str:
+    """emulator-api33's dumpsys_package_two_users with the PACKAGE's `User 0:` section cut.
+
+    Derivation: delete from the line starting `    User 0: ceDataInode` (under
+    `Packages:`) up to, not including, the next `    User 11: ` line. The `Packages:`
+    block, user 11's section and `Queries:` (whose own `    User 0:` line stays) are
+    untouched. The read-back then finds the package but no section for user 0.
+    """
+    text = RecordedFixtures(RECORDED_ROOT / "emulator-api33").text("dumpsys_package_two_users")
+    start = text.index("\n    User 0: ceDataInode")
+    end = text.index("\n    User 11: ", start)
+    derived = text[:start] + text[end:]
+    assert "Packages:" in derived and "\n    User 11: " in derived
+    assert "\nQueries:" in derived and "\n    User 0:" in derived.partition("\nQueries:")[2]
+    return derived
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_read_back_with_no_user_0_section_is_a_refusal_not_a_defect(
+    fake_adb, monkeypatch, capsys, json_mode
+):
+    fake_adb.when("pm", "grant", returncode=0, stdout="")
+    fake_adb.when("dumpsys", "package", stdout=_two_users_dump_without_user_0())
+    argv = ["--grant-permission", "--package", "com.example.composefixture"]
+
+    code = _run_main(monkeypatch, argv + (["--json"] if json_mode else []))
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.out + captured.err
+    assert "defect" not in (captured.out + captured.err).lower()
+    if json_mode:
+        payload = json.loads(captured.out)
+        assert "User 0:" in payload["error"]
+        assert "pm list users" in payload["remedy"] or "install-existing" in payload["remedy"]
+    else:
+        assert "User 0:" in captured.err
+        assert "Remedy:" in captured.err
 
 
 # ---------------------------------------------------------------------------
