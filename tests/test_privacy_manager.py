@@ -32,6 +32,7 @@ from types import SimpleNamespace
 
 import privacy_manager
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
 from fake_toolchain import assert_refusal
 from privacy_manager import PrivacyManager, build_test_trail, print_permissions
 
@@ -547,3 +548,303 @@ def test_build_test_trail_both():
     assert trail["scenario"] == "login"
     assert trail["step"] == 2
     assert "timestamp" in trail
+
+
+# ---------------------------------------------------------------------------
+# --user: the mutation and the read-back name the same user.
+#
+# Ground truth is emulator-api33's two-user window: CAMERA granted for the
+# secondary user only (dumpsys_package_two_users), READ_PHONE_NUMBERS likewise
+# for a shared-uid package (dumpsys_package_shared_uid_two_users), and the
+# refusals in pm_grant_user_not_requested's run.
+# ---------------------------------------------------------------------------
+
+API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
+SHARED_UID_PACKAGE = "com.android.providers.contacts"
+
+
+def _api33_user(name: str) -> int:
+    for entry in API33.manifest["fixtures"]:
+        if entry["name"] == name:
+            return int(entry["secondary_user"])
+    pytest.fail(f"emulator-api33/MANIFEST.json has no entry for {name}")
+
+
+def test_the_grant_argv_names_the_user(fake_adb):
+    user = _api33_user("dumpsys_package_two_users")
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_two_users"))
+
+    PrivacyManager(serial="emulator-5554", user=user).grant_permission(COMPOSE_FIXTURE, "camera")
+
+    (grant,) = fake_adb.commands_matching("pm", "grant")
+    assert grant[grant.index("grant") + 1 :] == [
+        "--user",
+        str(user),
+        COMPOSE_FIXTURE,
+        "android.permission.CAMERA",
+    ]
+
+
+def test_the_revoke_argv_names_user_0_explicitly_by_default(fake_adb, deskclock_dump):
+    fake_adb.when("dumpsys", "package", stdout=deskclock_dump)
+
+    PrivacyManager(serial="emulator-5554").revoke_permission(DESKCLOCK, "calendar")
+
+    (revoke,) = fake_adb.commands_matching("pm", "revoke")
+    assert revoke[revoke.index("revoke") + 1 : revoke.index("revoke") + 3] == ["--user", "0"]
+
+
+def test_a_secondary_user_grant_is_verified_against_that_user(fake_adb):
+    """CAMERA is granted for the secondary user and denied for user 0 in one dump.
+
+    Verifying against the first section (user 0's) would call this grant a failure;
+    verifying user 0's grant against it must still say "still denied".
+    """
+    user = _api33_user("dumpsys_package_two_users")
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_two_users"))
+
+    ok, message = PrivacyManager(serial="emulator-5554", user=user).grant_permission(
+        COMPOSE_FIXTURE, "camera"
+    )
+    assert ok is True, message
+    assert f"user {user}" in message
+
+    ok, message = PrivacyManager(serial="emulator-5554").grant_permission(COMPOSE_FIXTURE, "camera")
+    assert ok is False
+    assert "still denied" in message
+
+
+def test_a_shared_uid_revoke_is_verified_against_that_user(fake_adb):
+    """READ_PHONE_NUMBERS: denied for user 0, granted for the secondary user, under
+    `Shared users:`. A revoke for the secondary user that left it granted is a failure."""
+    user = _api33_user("dumpsys_package_shared_uid_two_users")
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_shared_uid_two_users"))
+
+    ok, message = PrivacyManager(serial="emulator-5554", user=user).revoke_permission(
+        SHARED_UID_PACKAGE, "android.permission.READ_PHONE_NUMBERS"
+    )
+    assert ok is False
+    assert "still granted" in message
+
+    ok, message = PrivacyManager(serial="emulator-5554").revoke_permission(
+        SHARED_UID_PACKAGE, "android.permission.READ_PHONE_NUMBERS"
+    )
+    assert ok is True, message
+
+
+def test_a_read_back_with_no_section_for_the_user_fails_loudly(fake_adb):
+    """A single-user dump asked about user 11: no `User 11:` section. Not "the app
+    does not request it" (which a revoke would count as done) and not user 0's state."""
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_shared_uid"))
+
+    for action in ("grant_permission", "revoke_permission"):
+        ok, message = getattr(PrivacyManager(serial="emulator-5554", user=11), action)(
+            "com.android.localtransport", "camera"
+        )
+        assert ok is False, (action, message)
+        assert "User 11:" in message, message
+
+
+def test_a_grant_for_a_user_without_the_app_is_not_verified(fake_adb):
+    """`pm grant --user <id>` exits 0 for a user the app is not installed for, and the
+    dump then reads CAMERA granted=true under `User <id>: ... installed=false`."""
+    user = _api33_user("dumpsys_package_user_not_installed")
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_user_not_installed"))
+
+    ok, message = PrivacyManager(serial="emulator-5554", user=user).grant_permission(
+        COMPOSE_FIXTURE, "camera"
+    )
+
+    assert ok is False
+    assert f"not installed for user {user}" in message
+    assert "pm install-existing --user" in message
+
+
+def test_a_revoked_permission_with_no_entry_left_is_denied_not_unrequested(fake_adb):
+    """After a grant and revoke for a secondary user, CAMERA has no entry under that user's
+    `runtime permissions:` at all (dumpsys_package_user_revoked) while the manifest still
+    requests it. That is "denied", not "the app does not request it"."""
+    user = _api33_user("dumpsys_package_user_revoked")
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_user_revoked"))
+    manager = PrivacyManager(serial="emulator-5554", user=user)
+
+    ok, message = manager.revoke_permission(COMPOSE_FIXTURE, "camera")
+    assert ok is True, message
+    assert "does not request" not in message
+
+    ok, message = manager.grant_permission(COMPOSE_FIXTURE, "camera")
+    assert ok is False
+    assert "still denied" in message
+
+
+def test_a_secondary_user_security_exception_is_reported_as_a_refusal(fake_adb):
+    """API 33: granting an unrequested permission for a user throws (exit 255)."""
+    user = _api33_user("pm_grant_user_not_requested")
+    fake_adb.when("pm", "grant", returncode=255, stderr=API33.text("pm_grant_user_not_requested"))
+
+    ok, message = PrivacyManager(serial="emulator-5554", user=user).grant_permission(
+        COMPOSE_FIXTURE, "notification"
+    )
+
+    assert ok is False
+    assert "SecurityException: Package com.example.composefixture has not requested" in message
+    assert f"user {user}" in message
+    assert "\tat " not in message and "PermissionManager" not in message, "stack trace leaked"
+    assert not fake_adb.commands_matching("dumpsys"), "a refused grant should not be read back"
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize(
+    "value",
+    ["all", "current", "-1", "eleven", "²", "٣", "1_0", " 5", "1" * 4301, "2147483648"],
+    ids=[
+        "all",
+        "current",
+        "negative",
+        "word",
+        "superscript-2",
+        "arabic-indic-3",
+        "underscore",
+        "space",
+        "past-int-str-limit",
+        "past-int32",
+    ],
+)
+def test_a_user_that_is_not_one_id_is_refused(fake_adb, monkeypatch, capsys, json_mode, value):
+    """Only ASCII digits: `str.isdigit()` accepts a superscript two, which `int()` then
+    rejects with a traceback, and `int()` itself reads an Arabic-Indic three and `1_0`."""
+    argv = ["--grant", "camera", "--package", COMPOSE_FIXTURE, "--user", value]
+
+    code, out, err = _cli(monkeypatch, capsys, *argv, *(["--json"] if json_mode else []))
+
+    assert_refusal(
+        subprocess.CompletedProcess(argv, code, out, err),
+        json_mode=json_mode,
+        naming=("--user",),
+        status=1,
+    )
+    assert "Traceback" not in out + err
+    assert "defect" not in (out + err).lower()
+    assert fake_adb.calls == [], "refused before touching the device"
+
+
+def test_leading_zeros_name_the_same_user():
+    assert privacy_manager.parse_user_arg("005") == 5
+    assert privacy_manager.parse_user_arg("2147483647") == 2147483647
+    assert privacy_manager.parse_user_arg(None) == 0
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_user_the_device_does_not_have_is_refused(fake_adb, monkeypatch, capsys, json_mode):
+    """`pm grant --user <missing>` exits 0 silently (pm_grant_user_missing), so the id is
+    checked against `pm list users` first."""
+    fake_adb.when("pm", "list", "users", stdout=API33.text("pm_list_users"))
+    argv = ["--grant", "camera", "--package", COMPOSE_FIXTURE, "--user", "11"]
+
+    code, out, err = _cli(monkeypatch, capsys, *argv, *(["--json"] if json_mode else []))
+
+    assert_refusal(
+        subprocess.CompletedProcess(argv, code, out, err),
+        json_mode=json_mode,
+        naming=("user 11",),
+        status=1,
+    )
+    assert not fake_adb.commands_matching("pm", "grant")
+
+
+def test_cli_grant_for_a_listed_user_reaches_that_user(fake_adb, monkeypatch, capsys):
+    """End to end on one recorded run: the listing names the user, so the grant goes
+    out with --user <id>; that run's dump says the app is not installed for it, so the
+    read-back refuses -- in the batch's existing output shape."""
+    user = _api33_user("dumpsys_package_user_not_installed")
+    assert user == _api33_user("pm_list_users_two_users"), "recorded in one run"
+    fake_adb.when("pm", "list", "users", stdout=API33.text("pm_list_users_two_users"))
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_user_not_installed"))
+
+    code, out, _ = _cli(
+        monkeypatch,
+        capsys,
+        "--grant",
+        "camera",
+        "--package",
+        COMPOSE_FIXTURE,
+        "--user",
+        str(user),
+        "--json",
+    )
+
+    assert code == 1, out
+    report = json.loads(out)
+    assert set(report) == {"action", "results"}, "the output shape is unchanged"
+    assert report["results"][0]["success"] is False
+    assert f"not installed for user {user}" in report["results"][0]["message"]
+    (grant,) = fake_adb.commands_matching("pm", "grant")
+    assert _contains(grant, ("--user", str(user)))
+
+
+def test_cli_list_reads_the_requested_user(fake_adb, monkeypatch, capsys):
+    """--user 0 names user 0's section; no listing is needed for the system user."""
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_two_users"))
+
+    code, out, _ = _cli(
+        monkeypatch, capsys, "--list", "--package", COMPOSE_FIXTURE, "--user", "0", "--json"
+    )
+
+    assert code == 0, out
+    data = json.loads(out)
+    assert data["user"] == 0
+    assert [(e["permission"], e["granted"]) for e in data["runtime"]] == [
+        ("android.permission.CAMERA", False)
+    ]
+    assert not fake_adb.commands_matching("pm", "list", "users")
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_cli_list_for_a_user_without_the_app_is_refused(fake_adb, monkeypatch, capsys, json_mode):
+    user = _api33_user("dumpsys_package_user_not_installed")
+    fake_adb.when("pm", "list", "users", stdout=API33.text("pm_list_users_two_users"))
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_user_not_installed"))
+    argv = ["--list", "--package", COMPOSE_FIXTURE, "--user", str(user)]
+
+    code, out, err = _cli(monkeypatch, capsys, *argv, *(["--json"] if json_mode else []))
+
+    assert_refusal(
+        subprocess.CompletedProcess(argv, code, out, err),
+        json_mode=json_mode,
+        naming=(f"not installed for user {user}",),
+        status=1,
+    )
+
+
+def _list_revoked_user(fake_adb, monkeypatch, capsys, *extra: str) -> tuple[int, str, str]:
+    user = _api33_user("dumpsys_package_user_revoked")
+    assert user == _api33_user("pm_list_users_two_users"), "recorded in one run"
+    fake_adb.when("pm", "list", "users", stdout=API33.text("pm_list_users_two_users"))
+    fake_adb.when("dumpsys", "package", stdout=API33.text("dumpsys_package_user_revoked"))
+    return _cli(
+        monkeypatch, capsys, "--list", "--package", COMPOSE_FIXTURE, "--user", str(user), *extra
+    )
+
+
+def test_list_shows_a_revoked_permission_with_no_entry_as_denied(fake_adb, monkeypatch, capsys):
+    """dumpsys_package_user_revoked: the user's `runtime permissions:` header has no
+    entries after a revoke, yet the app requests CAMERA (and user 0 lists it as runtime).
+    That is denied -- not "nothing here can be granted or revoked"."""
+    code, out, _ = _list_revoked_user(fake_adb, monkeypatch, capsys)
+
+    assert code == 0, out
+    assert "✗ android.permission.CAMERA" in out
+    assert "nothing here can be granted" not in out
+
+
+def test_list_json_counts_a_revoked_permission_with_no_entry_as_denied(
+    fake_adb, monkeypatch, capsys
+):
+    code, out, _ = _list_revoked_user(fake_adb, monkeypatch, capsys, "--json")
+
+    assert code == 0, out
+    data = json.loads(out)
+    assert "android.permission.CAMERA" in data["denied"]
+    assert [(e["permission"], e["granted"]) for e in data["runtime"]] == [
+        ("android.permission.CAMERA", False)
+    ]

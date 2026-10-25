@@ -25,7 +25,14 @@ from conftest import RECORDED_ROOT, RecordedFixtures
 from device_list import parse_adb_devices
 
 from common import anr_pipeline
-from common.device_utils import parse_package_permissions, parse_package_uids, parse_ps_uids
+from common.device_utils import (
+    UserSectionMissingError,
+    parse_package_permissions,
+    parse_package_uids,
+    parse_ps_uids,
+    parse_user_ids,
+    permission_state,
+)
 from common.logcat import parse_records
 
 PROFILE = "emulator-api33"
@@ -340,10 +347,10 @@ def test_camera_is_denied_for_user_0_and_granted_for_the_other_user():
 
 
 def test_the_two_user_dump_parses_to_user_0_s_permissions():
-    """The parser keeps the first runtime section -- user 0's -- so CAMERA reads denied.
+    """By default the parser reads `User 0:`'s runtime section, so CAMERA reads denied.
 
-    The grant for the other user is invisible to it: what privacy_manager, which
-    has no --user, would confirm against.
+    The grant for the other user is invisible to it unless that user is asked
+    for (test_the_secondary_user_s_runtime_state_is_read_from_its_own_section).
     """
     parsed = parse_package_permissions(API33.text("dumpsys_package_two_users"))
     assert parsed["found"]
@@ -391,7 +398,7 @@ def test_a_shared_uid_grant_differs_between_users():
 
 
 def test_the_shared_uid_dump_parses_to_user_0_s_runtime_state():
-    """The parser keeps the first runtime section, user 0's: the grant for the other is unseen."""
+    """By default the parser reads `User 0:`: the grant for the other user is unseen."""
     parsed = parse_package_permissions(API33.text("dumpsys_package_shared_uid_two_users"))
     user0 = dict(
         re.findall(r"^        (\S+): granted=(\w+)", _shared_users_blocks()["0"], re.MULTILINE)
@@ -405,6 +412,148 @@ def test_the_shared_uid_dump_without_a_second_user_reads_runtime_permissions():
     parsed = parse_package_permissions(API33.text("dumpsys_package_shared_uid"))
     assert parsed["found"]
     assert parsed["runtime"]
+
+
+# --- per-user selection (privacy_manager --user) -----------------------------
+
+
+def _secondary(name: str) -> int:
+    return int(_entry(name)["secondary_user"])
+
+
+def test_the_secondary_user_s_runtime_state_is_read_from_its_own_section():
+    """`--user <id>` reads that user's `User <id>:` block, where CAMERA is granted."""
+    user = _secondary("dumpsys_package_two_users")
+    parsed = parse_package_permissions(API33.text("dumpsys_package_two_users"), user=user)
+    assert parsed["user"] == user
+    assert parsed["user_found"] is True
+    assert parsed["user_installed"] is True
+    assert [(e["permission"], e["granted"]) for e in parsed["runtime"]] == [(CAMERA, True)]
+
+
+def test_the_secondary_user_s_shared_uid_state_is_read_under_shared_users():
+    """The shared-uid layout: the runtime section is the SharedUser block's `User <id>:`."""
+    user = _secondary("dumpsys_package_shared_uid_two_users")
+    parsed = parse_package_permissions(
+        API33.text("dumpsys_package_shared_uid_two_users"), user=user
+    )
+    wanted = dict(
+        re.findall(r"^        (\S+): granted=(\w+)", _shared_users_blocks()[str(user)], re.M)
+    )
+    assert parsed["user_found"] is True
+    assert {e["permission"]: str(e["granted"]).lower() for e in parsed["runtime"]} == wanted
+    assert wanted[READ_PHONE_NUMBERS] == "true"
+
+
+def test_user_0_is_selected_by_its_label():
+    """The default is `User 0:` by name, not "the first section".
+
+    No recording shows a secondary user printed before user 0: in both two-user
+    dumps the order is fixed, `User 0:` first. So this pins the label (the
+    `user` key and the explicit call agreeing with the default) and the order
+    the dump uses; the secondary-user tests above are what a first-section
+    reader fails.
+    """
+    for name in ("dumpsys_package_two_users", "dumpsys_package_shared_uid_two_users"):
+        text = API33.text(name)
+        user = _secondary(name)
+        assert text.index("    User 0: ") < text.index(f"    User {user}: "), name
+        default = parse_package_permissions(text)
+        assert default["user"] == 0
+        assert default["user_found"] is True
+        assert default == parse_package_permissions(text, user=0)
+
+
+def test_a_user_with_no_section_reads_nothing_rather_than_user_0_s_state():
+    """A single-user dump asked for user 11: not found, and no runtime state borrowed."""
+    parsed = parse_package_permissions(API33.text("dumpsys_package_shared_uid"), user=11)
+    assert parsed["found"] is True
+    assert parsed["user_found"] is False
+    assert parsed["runtime"] == []
+    with pytest.raises(UserSectionMissingError):
+        permission_state(API33.text("dumpsys_package_shared_uid"), CAMERA, user=11)
+    assert permission_state(API33.text("dumpsys_package_shared_uid"), CAMERA) is True
+
+
+def test_a_user_the_package_is_not_installed_for_reads_installed_false():
+    """`User <id>: ... installed=false` -- yet CAMERA reads granted=true under it."""
+    user = _secondary("dumpsys_package_user_not_installed")
+    parsed = parse_package_permissions(API33.text("dumpsys_package_user_not_installed"), user=user)
+    assert parsed["user_found"] is True
+    assert parsed["user_installed"] is False
+    assert [(e["permission"], e["granted"]) for e in parsed["runtime"]] == [(CAMERA, True)]
+    assert parse_package_permissions(API33.text("dumpsys_package_user_not_installed"))[
+        "user_installed"
+    ]
+
+
+def test_a_revoked_permission_with_no_entry_left_parses_as_denied():
+    """After grant+revoke for the secondary user its runtime section is empty; CAMERA is
+    requested and listed as runtime under user 0, so for that user it is denied."""
+    user = _secondary("dumpsys_package_user_revoked")
+    text = API33.text("dumpsys_package_user_revoked")
+    assert _user_blocks(text)[str(user)].count(CAMERA) == 0, "the recording changed"
+    parsed = parse_package_permissions(text, user=user)
+    assert [(e["permission"], e["granted"]) for e in parsed["runtime"]] == [(CAMERA, False)]
+    assert CAMERA in parsed["denied"]
+    assert permission_state(text, CAMERA, user=user) is False
+
+
+def test_requested_permissions_no_user_lists_as_runtime_are_not_made_runtime():
+    """deskclock (API 35) requests eight permissions the dump gives no state for at all;
+    nothing marks them runtime, so they must not be reported as denied runtime ones."""
+    text = RecordedFixtures(RECORDED_ROOT / "emulator-api35").text("dumpsys_package_permissions")
+    parsed = parse_package_permissions(text)
+    stated = {e["permission"] for e in parsed["install"] + parsed["runtime"]}
+    unstated = [name for name in parsed["requested"] if name not in stated]
+    assert "android.permission.QUERY_USERS" in unstated
+    assert "android.permission.QUERY_USERS" not in parsed["denied"]
+
+
+def _with_shared_user_renamed() -> str:
+    """dumpsys_package_shared_uid_two_users, its `SharedUser [android.uid.shared]` header
+    renamed to `SharedUser [android.uid.unrelated]` -- nothing else touched -- so the block
+    no longer belongs to the package, whose `sharedUser=` still names android.uid.shared."""
+    text = API33.text("dumpsys_package_shared_uid_two_users")
+    old, new = "  SharedUser [android.uid.shared] (", "  SharedUser [android.uid.unrelated] ("
+    assert text.count(old) == 1
+    assert "sharedUser=SharedUserSetting{" in text and " android.uid.shared/" in text
+    return text.replace(old, new)
+
+
+def test_a_shared_user_block_the_package_is_not_in_supplies_no_state():
+    derived = _with_shared_user_renamed()
+    for user in (0, _secondary("dumpsys_package_shared_uid_two_users")):
+        parsed = parse_package_permissions(derived, user=user)
+        assert parsed["found"] and parsed["user_found"]
+        assert parsed["runtime"] == [], f"user {user} read an unrelated shared user's state"
+        assert permission_state(derived, READ_PHONE_NUMBERS, user=user) is None
+
+
+def test_the_package_s_own_shared_user_block_still_supplies_state():
+    parsed = parse_package_permissions(API33.text("dumpsys_package_shared_uid_two_users"))
+    assert READ_PHONE_NUMBERS in {e["permission"] for e in parsed["runtime"]}
+    assert parse_package_permissions(API33.text("dumpsys_package_shared_uid"))["runtime"]
+
+
+def test_pm_list_users_parses_to_user_ids():
+    assert parse_user_ids(API33.text("pm_list_users")) == frozenset({0})
+    user = _secondary("pm_list_users_two_users")
+    assert parse_user_ids(API33.text("pm_list_users_two_users")) == frozenset({0, user})
+
+
+def test_a_grant_for_a_user_the_device_does_not_have_exits_zero_silently():
+    """Why the user is checked against `pm list users` before the grant."""
+    entry = _entry("pm_grant_user_missing")
+    assert API33.text("pm_grant_user_missing").strip() == "exit=0"
+    assert int(entry["missing_user"]) not in parse_user_ids(API33.text("pm_list_users_two_users"))
+
+
+def test_an_unrequested_grant_for_a_secondary_user_throws():
+    entry = _entry("pm_grant_user_not_requested")
+    assert entry["exit_status"] == 255
+    assert entry["stream"] == "stderr"
+    assert "java.lang.SecurityException: Package" in API33.text("pm_grant_user_not_requested")
 
 
 # --- adb devices -------------------------------------------------------------

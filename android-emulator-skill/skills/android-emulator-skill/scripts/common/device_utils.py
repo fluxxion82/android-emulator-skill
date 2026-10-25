@@ -58,12 +58,19 @@ opposite directions -- which is why "find the header" is not enough on its own:
   reports a system app as holding no runtime permissions whatsoever.
 
 So the parser reads the whole dump and keeps the FIRST occurrence of each
-section. That one rule covers both: the live copy is printed before the
-``Hidden system packages:`` repeat, and user 0 -- the user ``pm grant``
-targets without ``--user`` -- is printed before any secondary user. A
-top-level allow-list of blocks was tried first and dropped: it was redundant
-with this rule, and no recorded dump could tell the two apart, which makes it
-a guard nothing could check.
+section: the live copy is printed before the ``Hidden system packages:``
+repeat. Runtime sections are the exception, because they are per user: one
+``runtime permissions:`` per ``User N:`` section, in both layouts (under the
+package, and under the ``SharedUser`` in ``Shared users:``). Those are chosen
+by their ``User N:`` label -- user 0, what ``pm grant`` targets without
+``--user``, unless the caller names another -- and a runtime section under
+any other user is never read in its place. Position used to pick user 0, and
+that is what let a ``--user 11`` grant be "verified" against user 0. The
+``User N:`` labels are only read under ``Packages:``, ``Hidden system
+packages:`` and ``Shared users:``: ``Queries:`` prints ``User 0:`` lines at
+the same indent with a different meaning. And a ``SharedUser [<name>]`` block
+is read only when ``<name>`` is the package's own ``sharedUser=`` value; any
+other shared user's block is skipped whole.
 """
 
 import re
@@ -556,12 +563,36 @@ _STATE_RE = re.compile(
 # because `dumpsys package <unknown>` exits 0 like everything else here.
 _PACKAGES_HEADER = "Packages:"
 
+# The top-level blocks whose "User N:" sections are per-user package state.
+# `Queries:` prints "    User 0:" at the same indent and means something else
+# (who may see the package), so a user section is only one under these.
+_USER_STATE_BLOCKS = frozenset({_PACKAGES_HEADER, "Hidden system packages:", "Shared users:"})
 
-def parse_package_permissions(dump: str) -> dict:
+# "    User 11: ceDataInode=0 installed=true ..." under a package, or
+# "    User 11: " (nothing after it) under a SharedUser.
+_USER_SECTION_RE = re.compile(r"^(\s+)User (\d+):(?:\s(.*))?$")
+_INSTALLED_RE = re.compile(r"\binstalled=(true|false)\b")
+
+# The package's shared uid, "    sharedUser=SharedUserSetting{ae1ae0a android.uid.shared/10074}",
+# and a block header under "Shared users:", "  SharedUser [android.uid.shared] (ae1ae0a):".
+# A SharedUser block is read only when its name is the package's own.
+_SHARED_USER_FIELD_RE = re.compile(r"^\s+sharedUser=SharedUserSetting\{\S+ ([^/}\s]+)/")
+_SHARED_USER_BLOCK_RE = re.compile(r"^\s+SharedUser \[([^\]]+)\]")
+
+
+def parse_package_permissions(dump: str, user: int = 0) -> dict:
     """Parse ``adb shell dumpsys package <pkg>`` into permission state.
+
+    Runtime permissions are per user: each sits in a ``User N:`` section,
+    under the package in ``Packages:`` or, for a package in a shared uid, under
+    its ``SharedUser [...]`` in ``Shared users:`` (both layouts are the same on
+    API 33 and API 35). Only ``user``'s section is read, found by its label,
+    never by position -- and when it is absent nothing is read in its place.
 
     Args:
         dump: Verbatim stdout of ``dumpsys package <pkg>``.
+        user: The user whose runtime state to read. 0, the system user, is
+            what ``pm grant`` targets without ``--user``.
 
     Returns:
         A dict with:
@@ -576,9 +607,26 @@ def parse_package_permissions(dump: str) -> dict:
         * ``install`` -- ``[{"permission", "granted"}]`` for install-time
           permissions.
         * ``runtime`` -- ``[{"permission", "granted", "flags"}]`` for runtime
-          permissions, for user 0.
+          permissions, for ``user`` only. A requested permission another
+          user's section lists as runtime, but ``user``'s section does not
+          list at all, is added as ``{"granted": False, "flags": [],
+          "unlisted": True}``: a revoked permission left with no flags is not
+          printed (recorded: ``dumpsys_package_user_revoked``). A requested
+          permission no section lists stays out -- nothing says it is a
+          runtime one (deskclock requests eight such).
         * ``granted`` -- names actually held, install and runtime together.
         * ``denied`` -- names the dump reports with ``granted=false``.
+        * ``user`` -- the user asked about.
+        * ``user_found`` -- whether the dump has a ``User <user>:`` section
+          for the package at all. False means ``runtime`` is empty because
+          nothing was read, not because the app requests nothing: a caller
+          verifying a grant must refuse rather than read on.
+        * ``user_installed`` -- the ``installed=`` flag of the package's
+          ``User <user>:`` line, or None when there is none. The dump prints
+          a section for every user on the device, installed or not, and a
+          ``pm grant --user`` for a user without the app exits 0 and then
+          reads granted=true there (recorded:
+          ``dumpsys_package_user_not_installed``).
 
         A dump with no ``Packages:`` block yields the same keys, all empty,
         and ``found`` False.
@@ -592,6 +640,18 @@ def parse_package_permissions(dump: str) -> dict:
     section: str | None = None
     section_indent = 0
     found = False
+    block = ""
+    # The "User N:" section the current line is inside, if any.
+    in_user: int | None = None
+    user_indent = 0
+    user_found = False
+    user_installed: bool | None = None
+    # Runtime permission names seen under any OTHER user's section.
+    elsewhere_runtime: set[str] = set()
+    shared_user: str | None = None
+    # Lines more indented than this belong to a SharedUser block that is not
+    # the package's, and are skipped whole.
+    skip_indent: int | None = None
 
     for line in dump.splitlines():
         if not line.strip():
@@ -599,22 +659,62 @@ def parse_package_permissions(dump: str) -> dict:
 
         indent = len(line) - len(line.lstrip())
         if indent == 0:
-            found = found or line.strip() == _PACKAGES_HEADER
+            block = line.strip()
+            found = found or block == _PACKAGES_HEADER
             section = None
+            in_user = None
+            skip_indent = None
             continue
 
+        if skip_indent is not None:
+            if indent > skip_indent:
+                continue
+            skip_indent = None
         if section is not None and indent <= section_indent:
             section = None
+        if in_user is not None and indent <= user_indent:
+            in_user = None
+
+        if block == _PACKAGES_HEADER and shared_user is None:
+            field = _SHARED_USER_FIELD_RE.match(line)
+            if field is not None:
+                shared_user = field.group(1)
+                continue
+        if block == "Shared users:":
+            owner = _SHARED_USER_BLOCK_RE.match(line)
+            if owner is not None:
+                section = None
+                in_user = None
+                if owner.group(1) != shared_user:
+                    skip_indent = indent
+                continue
+
+        user_line = _USER_SECTION_RE.match(line) if block in _USER_STATE_BLOCKS else None
+        if user_line is not None:
+            in_user = int(user_line.group(2))
+            user_indent = len(user_line.group(1))
+            section = None
+            if in_user == user:
+                user_found = True
+                installed = _INSTALLED_RE.search(user_line.group(3) or "")
+                if block == _PACKAGES_HEADER and installed and user_installed is None:
+                    user_installed = installed.group(1) == "true"
+            continue
 
         header = _SECTION_RE.match(line)
         if header is not None:
             name = header.group(2)
-            # First occurrence wins, and it is the only thing keeping the
-            # repeats out. See the module docstring: a multi-user device
-            # prints one "runtime permissions:" per "User N:" and user 0 --
-            # what `pm grant` without --user targets -- comes first, and an
+            if name == "runtime" and in_user != user:
+                # Another user's section, or one outside any user: never read
+                # in place of the one asked for. Another user's names are kept
+                # only as evidence of which permissions are runtime ones.
+                section = "elsewhere" if in_user is not None else None
+                section_indent = len(header.group(1))
+                continue
+            # First occurrence wins, and it is what keeps the repeats out: an
             # updated system app repeats every section under "Hidden system
-            # packages:" AFTER the live copy.
+            # packages:" AFTER the live copy. Runtime sections are chosen by
+            # their "User N:" label above, so position no longer picks a user.
             section = None if name in seen_sections else name
             seen_sections.add(name)
             section_indent = len(header.group(1))
@@ -634,6 +734,10 @@ def parse_package_permissions(dump: str) -> dict:
             continue
 
         state = _STATE_RE.match(entry)
+        if section == "elsewhere":
+            if state is not None:
+                elsewhere_runtime.add(state.group("name"))
+            continue
         if state is None:
             # Never guess. An unparsed line is a format change, and inventing a
             # value for it is how this script came to report an empty list as
@@ -650,6 +754,14 @@ def parse_package_permissions(dump: str) -> dict:
             record["flags"] = [f for f in flags.split("|") if f]
             runtime.append(record)
 
+    if user_found:
+        listed = {e["permission"] for e in install + runtime}
+        for name in requested:
+            if name in elsewhere_runtime and name not in listed:
+                runtime.append(
+                    {"permission": name, "granted": False, "flags": [], "unlisted": True}
+                )
+
     held = [e["permission"] for e in install + runtime if e["granted"]]
     denied = [e["permission"] for e in install + runtime if not e["granted"]]
     return {
@@ -660,15 +772,23 @@ def parse_package_permissions(dump: str) -> dict:
         "runtime": runtime,
         "granted": held,
         "denied": denied,
+        "user": user,
+        "user_found": user_found,
+        "user_installed": user_installed,
     }
 
 
-def permission_state(dump: str, permission: str) -> bool | None:
-    """Whether ``permission`` is held, according to the dump itself.
+class UserSectionMissingError(LookupError):
+    """The dump describes the package but has no ``User N:`` section for the user."""
+
+
+def permission_state(dump: str, permission: str, user: int = 0) -> bool | None:
+    """Whether ``permission`` is held for ``user``, according to the dump itself.
 
     Args:
         dump: Verbatim stdout of ``dumpsys package <pkg>``.
         permission: Full permission name, e.g. ``android.permission.CAMERA``.
+        user: Whose runtime state to read; 0 by default, as ``pm grant``.
 
     Returns:
         ``True`` or ``False`` as the dump reports it, or ``None`` when the
@@ -677,12 +797,33 @@ def permission_state(dump: str, permission: str) -> bool | None:
         not ``False``: "the app does not ask for this" and "the user said no"
         are different answers, and only the first means the caller's command
         could never have worked.
+
+    Raises:
+        UserSectionMissingError: the package is in the dump but ``user`` has
+            no section in it. Answering ``None`` there would read as "not
+            requested", which a revoke counts as done.
     """
-    parsed = parse_package_permissions(dump)
+    parsed = parse_package_permissions(dump, user=user)
+    if parsed["found"] and not parsed["user_found"]:
+        raise UserSectionMissingError(f"the dump has no `User {user}:` section")
     for entry in parsed["install"] + parsed["runtime"]:
         if entry["permission"] == permission:
             return bool(entry["granted"])
     return None
+
+
+_USER_INFO_RE = re.compile(r"^\s*UserInfo\{(\d+):", re.MULTILINE)
+
+
+def parse_user_ids(output: str) -> frozenset[int]:
+    """The user ids in ``adb shell pm list users``.
+
+    Recorded (``pm_list_users``, ``pm_list_users_two_users``): a ``Users:``
+    line, then one ``UserInfo{<id>:<name>:<flags>}`` row per user, ``running``
+    after a started one. Empty when no row parses, which a caller must treat
+    as "could not tell", not as "no such user".
+    """
+    return frozenset(int(match) for match in _USER_INFO_RE.findall(output))
 
 
 def list_installed_packages(serial: str | None = None) -> list:

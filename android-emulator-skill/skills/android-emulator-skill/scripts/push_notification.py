@@ -72,6 +72,7 @@ from dataclasses import asdict, dataclass
 
 from common import adb_exec, cli
 from common.device_utils import (
+    UserSectionMissingError,
     build_adb_command,
     permission_state,
     quote_for_device_shell,
@@ -403,7 +404,22 @@ class NotificationTester:
             )
             return False, result
 
-        state = permission_state(dump, POST_NOTIFICATIONS)
+        try:
+            state = permission_state(dump, POST_NOTIFICATIONS)
+        except UserSectionMissingError:
+            # The package is in the dump but user 0 -- whom `pm grant` without
+            # --user targets -- has no section in it, so there is no state to
+            # read back. Never answered from another user's section.
+            result["error"] = (
+                f"pm {verb} exited 0, but the dump of {package} has no `User 0:` section, "
+                f"so its state for user 0 could not be read back"
+            )
+            result["remedy"] = (
+                "Check `adb shell pm list users` and `adb shell dumpsys package "
+                f"{package}`; install the app for user 0 with `adb shell pm "
+                f"install-existing --user 0 {package}`, then retry."
+            )
+            return False, result
         result["state"] = state
         if state is granted or (not granted and state is None):
             result["verified"] = True
@@ -539,8 +555,9 @@ def _refuse(result: dict) -> None:
     """
     action = str(result.get("action") or "notification")
     error = str(result.get("error") or "unknown error")
-    details = {key: value for key, value in result.items() if key != "error"}
-    cli.fail(f"{action} failed: {error}", PUSH_REMEDY, details=details)
+    remedy = str(result.get("remedy") or PUSH_REMEDY)
+    details = {key: value for key, value in result.items() if key not in {"error", "remedy"}}
+    cli.fail(f"{action} failed: {error}", remedy, details=details)
 
 
 def _build_parser() -> argparse.ArgumentParser:
