@@ -563,6 +563,32 @@
       "bytes": 8
     },
     {
+      "name": "getprop_sdk",
+      "file": "getprop_sdk.txt",
+      "command": "adb shell getprop ro.build.version.sdk",
+      "description": "The device's API level, as log_monitor reads it once before a live read: Android 13 (API 33) is the one release whose logcat holds `-B` records back (logcat_stream_quiet_records), so there the read is made by dumps instead of a stream.",
+      "catches": [],
+      "bytes": 3,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-25T08:40:48Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
+      "name": "getprop_unset",
+      "file": "getprop_unset.txt",
+      "command": "adb shell getprop ro.aes_recorder.not_a_property",
+      "description": "What getprop answers for a property the device does not have: an empty line, exit 0 -- no error at all. So a device that does not say its API level (one still booting, or a getprop that fails) answers ro.build.version.sdk this way, and log_monitor refuses the live read rather than guessing the level: a guessed stream on API 33 is the zero-line success it exists to prevent.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 0,
+      "stream": "empty",
+      "stdout_bytes": 1,
+      "stderr_bytes": 0,
+      "recorded_at": "2026-10-25T09:34:35Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
       "name": "input_text_nonascii",
       "file": "input_text_nonascii.txt",
       "command": "adb shell input text h\u00e9llo",
@@ -905,6 +931,110 @@
       "text_twin": "logcat_crash_tail"
     },
     {
+      "name": "logcat_stream_quiet_open_records",
+      "file": "logcat_stream_quiet_open_records.bin",
+      "command": "recorded in logcat_stream_quiet_records' run: adb -s <serial> logcat -d -B -T 1",
+      "description": "The newest record the device held just before the stream opened: the window runs after it (the twin's `-t` is one nanosecond before its epoch).",
+      "catches": [],
+      "bytes": 81,
+      "first_half": "logcat_stream_quiet_records",
+      "run": "3ec93f30",
+      "recorded_at": "2026-10-25T08:41:04Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
+      "name": "logcat_stream_quiet_records",
+      "file": "logcat_stream_quiet_records.bin",
+      "command": "adb -s <serial> logcat -B -T 1, stopped by the recorder after 5 s",
+      "description": "What a live `logcat -B -T 1` delivers in 5 s on a device left alone, before its reader stops it; the recorder writes nothing to the device. On API 33 (Android 13) it delivers nothing: logcat writes `-B` records through stdio and flushes only after a TEXT record (AOSP system/logging logcat.cpp, android13-release), so records wait in its 4 KiB buffer and are lost when the stream is terminated. On API 35 each record arrives as it is logged. Manifest: every chunk the stream delivered, timed (`stream`), and how many of the window's records it had delivered by the stop (`window`).",
+      "catches": [],
+      "bytes": 1592,
+      "stream": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-B",
+          "-T",
+          "1"
+        ],
+        "stopped_after_s": 5.006,
+        "exit_status_after_terminate": -15,
+        "bytes_delivered": 2824,
+        "chunks_at_s_and_bytes": [
+          [
+            0.026,
+            81
+          ],
+          [
+            0.177,
+            679
+          ],
+          [
+            0.177,
+            84
+          ],
+          [
+            0.179,
+            1465
+          ],
+          [
+            0.18,
+            268
+          ],
+          [
+            0.686,
+            172
+          ],
+          [
+            6.229,
+            75
+          ]
+        ],
+        "complete_records_delivered": 27,
+        "cut_record_bytes": 0
+      },
+      "window": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-d",
+          "-B",
+          "-t",
+          "<open's epoch - 1 ns>"
+        ],
+        "open_epoch": "1792917650.240284503",
+        "close_epoch": "1792917656.637772131",
+        "open_record_at": 0,
+        "records_after_open": 26,
+        "records_through_close": 26,
+        "of_them_delivered_by_the_stream": 26
+      },
+      "kept": {
+        "rule": "records whose uid is below 10000, private package names aliased",
+        "stream_records": 19,
+        "cut_record_kept": false,
+        "window_records": 19
+      },
+      "recorded_at": "2026-10-25T08:41:04Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
+      "name": "logcat_stream_quiet_window_records",
+      "file": "logcat_stream_quiet_window_records.bin",
+      "command": "recorded in logcat_stream_quiet_records' run: adb -s <serial> logcat -d -B -t <open's epoch - 1 ns>",
+      "description": "The stream's window read back in dump mode once the stream was gone: the open record itself (manifest `window.open_record_at`), then every record after it that was still in the buffer.",
+      "catches": [],
+      "bytes": 1592,
+      "first_half": "logcat_stream_quiet_records",
+      "run": "3ec93f30",
+      "recorded_at": "2026-10-25T08:41:04Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
       "name": "logcat_strictmode_violation",
       "file": "logcat_strictmode_violation.txt",
       "command": "adb shell logcat -d -v threadtime | grep -E '[VDIWEF] StrictMode: '",
@@ -963,6 +1093,43 @@
       },
       "text_twin": "logcat_tag_injection",
       "timezone": "America/Los_Angeles"
+    },
+    {
+      "name": "logcat_tail_records",
+      "file": "logcat_tail_records.bin",
+      "command": "adb -s <serial> logcat -d -B -T N, for N in 1, 5, 50, 500",
+      "description": "Count-based tails of logd's order as records: `-T N` answers the newest N whole frames while the buffer holds N (manifest `measured`: bytes, frames, and the bytes of any cut record, per N). log_monitor's dump-made read on API 33 finds its cursor in such a tail, doubling N until the tail reaches it or comes back short: no timestamp positions the read. The file keeps the publishable records of the -T 50 answer.",
+      "catches": [],
+      "bytes": 2363,
+      "measured": {
+        "1": {
+          "bytes": 81,
+          "frames": 1,
+          "cut_bytes": 0
+        },
+        "5": {
+          "bytes": 684,
+          "frames": 5,
+          "cut_bytes": 0
+        },
+        "50": {
+          "bytes": 8620,
+          "frames": 50,
+          "cut_bytes": 0
+        },
+        "500": {
+          "bytes": 80945,
+          "frames": 500,
+          "cut_bytes": 0
+        }
+      },
+      "kept": {
+        "rule": "records whose uid is below 10000, private package names aliased",
+        "of": "the -T 50 answer",
+        "records": 16
+      },
+      "recorded_at": "2026-10-25T23:28:37Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
     },
     {
       "name": "logcat_tail_zero",

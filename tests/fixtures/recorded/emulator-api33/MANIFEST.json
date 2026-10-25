@@ -178,6 +178,30 @@
       "recorded_at": "2026-10-25T01:29:49Z"
     },
     {
+      "name": "getprop_sdk",
+      "file": "getprop_sdk.txt",
+      "command": "adb shell getprop ro.build.version.sdk",
+      "description": "The device's API level, as log_monitor reads it once before a live read: Android 13 (API 33) is the one release whose logcat holds `-B` records back (logcat_stream_quiet_records), so there the read is made by dumps instead of a stream.",
+      "catches": [],
+      "bytes": 3,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "getprop_unset",
+      "file": "getprop_unset.txt",
+      "command": "adb shell getprop ro.aes_recorder.not_a_property",
+      "description": "What getprop answers for a property the device does not have: an empty line, exit 0 -- no error at all. So a device that does not say its API level (one still booting, or a getprop that fails) answers ro.build.version.sdk this way, and log_monitor refuses the live read rather than guessing the level: a guessed stream on API 33 is the zero-line success it exists to prevent.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 0,
+      "stream": "empty",
+      "stdout_bytes": 1,
+      "stderr_bytes": 0,
+      "recorded_at": "2026-10-25T09:34:34Z"
+    },
+    {
       "name": "logcat_anr_broadcast_records",
       "file": "logcat_anr_broadcast_records.bin",
       "command": "adb shell am broadcast -f 0x10000000 (the fixture app's AnrReceiver, which blocks 40 s); 20 s later adb logcat -d -B, host-filtered to ActivityManager and WindowManager records naming the package, from the provoking broadcast on; where ActivityManager logs no `Broadcasting: Intent` record (API 33), from an `aes-recorder: anr-window` record logged just before provoking",
@@ -265,6 +289,259 @@
       "recorded_at": "2026-10-24T18:16:36Z"
     },
     {
+      "name": "logcat_stream_block_open_records",
+      "file": "logcat_stream_block_open_records.bin",
+      "command": "recorded in logcat_stream_block_records' run: adb -s <serial> logcat -d -B -T 1",
+      "description": "The newest record the device held just before the stream opened: the window runs after it (the twin's `-t` is one nanosecond before its epoch).",
+      "catches": [],
+      "bytes": 65,
+      "first_half": "logcat_stream_block_records",
+      "run": "799c4c31",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_block_records",
+      "file": "logcat_stream_block_records.bin",
+      "command": "adb -s <serial> logcat -B -T 1, stopped by the recorder after 5 s, 6 marks logged into it",
+      "description": "As logcat_stream_marks_records, each mark padded with 900 bytes so six of them pass 4096: on API 33 the stream delivers whole 4 KiB blocks only -- the last cut inside a record -- and the marks after the last block reach the reader only in the window read back in dump mode. The cut mark's visible bytes are kept when they are the recorder's (`kept.cut_record_kept`).",
+      "catches": [],
+      "bytes": 3990,
+      "stream": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-B",
+          "-T",
+          "1"
+        ],
+        "stopped_after_s": 5.004,
+        "exit_status_after_terminate": -15,
+        "bytes_delivered": 4096,
+        "chunks_at_s_and_bytes": [
+          [
+            0.624,
+            4096
+          ]
+        ],
+        "complete_records_delivered": 6,
+        "cut_record_bytes": 856
+      },
+      "window": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-d",
+          "-B",
+          "-t",
+          "<open's epoch - 1 ns>"
+        ],
+        "open_epoch": "1792917629.018203990",
+        "close_epoch": "1792917634.094873825",
+        "open_record_at": 0,
+        "records_after_open": 14,
+        "records_through_close": 13,
+        "of_them_delivered_by_the_stream": 6
+      },
+      "marks": {
+        "written": 6,
+        "padding_bytes": 900,
+        "in_window": 6,
+        "delivered_by_the_stream": 3
+      },
+      "since_is_strict": {
+        "at_its_epoch": {
+          "since": "1792917629.602775823",
+          "includes_the_record": false
+        },
+        "one_ns_earlier": {
+          "since": "1792917629.602775822",
+          "includes_the_record": true
+        }
+      },
+      "kept": {
+        "rule": "records whose uid is below 10000, private package names aliased",
+        "stream_records": 5,
+        "cut_record_kept": true,
+        "window_records": 11
+      },
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_block_window_records",
+      "file": "logcat_stream_block_window_records.bin",
+      "command": "recorded in logcat_stream_block_records' run: adb -s <serial> logcat -d -B -t <open's epoch - 1 ns>",
+      "description": "The stream's window read back in dump mode once the stream was gone: the open record itself (manifest `window.open_record_at`), then every record after it that was still in the buffer.",
+      "catches": [],
+      "bytes": 6281,
+      "first_half": "logcat_stream_block_records",
+      "run": "799c4c31",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_marks_open_records",
+      "file": "logcat_stream_marks_open_records.bin",
+      "command": "recorded in logcat_stream_marks_records' run: adb -s <serial> logcat -d -B -T 1",
+      "description": "The newest record the device held just before the stream opened: the window runs after it (the twin's `-t` is one nanosecond before its epoch).",
+      "catches": [],
+      "bytes": 65,
+      "first_half": "logcat_stream_marks_records",
+      "run": "722780c9",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_marks_records",
+      "file": "logcat_stream_marks_records.bin",
+      "command": "adb -s <serial> logcat -B -T 1, stopped by the recorder after 5 s, 5 marks logged into it",
+      "description": "As logcat_stream_quiet_records, with 5 marks (`aes-recorder: stream-mark-<run>-<n>`) logged half a second in. On API 33 the stream delivers none of them, and its window read back in dump mode holds all five. Also measured (`since_is_strict`): `-t <epoch>` leaves out a record stamped exactly then and includes it from one nanosecond earlier.",
+      "catches": [],
+      "bytes": 0,
+      "stream": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-B",
+          "-T",
+          "1"
+        ],
+        "stopped_after_s": 5.006,
+        "exit_status_after_terminate": -15,
+        "bytes_delivered": 0,
+        "chunks_at_s_and_bytes": [],
+        "complete_records_delivered": 0,
+        "cut_record_bytes": 0
+      },
+      "window": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-d",
+          "-B",
+          "-t",
+          "<open's epoch - 1 ns>"
+        ],
+        "open_epoch": "1792917623.734071779",
+        "close_epoch": "1792917628.814899865",
+        "open_record_at": 0,
+        "records_after_open": 15,
+        "records_through_close": 14,
+        "of_them_delivered_by_the_stream": 0
+      },
+      "marks": {
+        "written": 5,
+        "padding_bytes": 0,
+        "in_window": 5,
+        "delivered_by_the_stream": 0
+      },
+      "since_is_strict": {
+        "at_its_epoch": {
+          "since": "1792917624.319466279",
+          "includes_the_record": false
+        },
+        "one_ns_earlier": {
+          "since": "1792917624.319466278",
+          "includes_the_record": true
+        }
+      },
+      "kept": {
+        "rule": "records whose uid is below 10000, private package names aliased",
+        "stream_records": 0,
+        "cut_record_kept": false,
+        "window_records": 11
+      },
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_marks_window_records",
+      "file": "logcat_stream_marks_window_records.bin",
+      "command": "recorded in logcat_stream_marks_records' run: adb -s <serial> logcat -d -B -t <open's epoch - 1 ns>",
+      "description": "The stream's window read back in dump mode once the stream was gone: the open record itself (manifest `window.open_record_at`), then every record after it that was still in the buffer.",
+      "catches": [],
+      "bytes": 885,
+      "first_half": "logcat_stream_marks_records",
+      "run": "722780c9",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_quiet_open_records",
+      "file": "logcat_stream_quiet_open_records.bin",
+      "command": "recorded in logcat_stream_quiet_records' run: adb -s <serial> logcat -d -B -T 1",
+      "description": "The newest record the device held just before the stream opened: the window runs after it (the twin's `-t` is one nanosecond before its epoch).",
+      "catches": [],
+      "bytes": 106,
+      "first_half": "logcat_stream_quiet_records",
+      "run": "46fc62eb",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_quiet_records",
+      "file": "logcat_stream_quiet_records.bin",
+      "command": "adb -s <serial> logcat -B -T 1, stopped by the recorder after 5 s",
+      "description": "What a live `logcat -B -T 1` delivers in 5 s on a device left alone, before its reader stops it; the recorder writes nothing to the device. On API 33 (Android 13) it delivers nothing: logcat writes `-B` records through stdio and flushes only after a TEXT record (AOSP system/logging logcat.cpp, android13-release), so records wait in its 4 KiB buffer and are lost when the stream is terminated. On API 35 each record arrives as it is logged. Manifest: every chunk the stream delivered, timed (`stream`), and how many of the window's records it had delivered by the stop (`window`).",
+      "catches": [],
+      "bytes": 0,
+      "stream": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-B",
+          "-T",
+          "1"
+        ],
+        "stopped_after_s": 5.006,
+        "exit_status_after_terminate": -15,
+        "bytes_delivered": 0,
+        "chunks_at_s_and_bytes": [],
+        "complete_records_delivered": 0,
+        "cut_record_bytes": 0
+      },
+      "window": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-d",
+          "-B",
+          "-t",
+          "<open's epoch - 1 ns>"
+        ],
+        "open_epoch": "1792917618.099266792",
+        "close_epoch": "1792917623.302115792",
+        "open_record_at": 0,
+        "records_after_open": 9,
+        "records_through_close": 8,
+        "of_them_delivered_by_the_stream": 0
+      },
+      "kept": {
+        "rule": "records whose uid is below 10000, private package names aliased",
+        "stream_records": 0,
+        "cut_record_kept": false,
+        "window_records": 6
+      },
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_quiet_window_records",
+      "file": "logcat_stream_quiet_window_records.bin",
+      "command": "recorded in logcat_stream_quiet_records' run: adb -s <serial> logcat -d -B -t <open's epoch - 1 ns>",
+      "description": "The stream's window read back in dump mode once the stream was gone: the open record itself (manifest `window.open_record_at`), then every record after it that was still in the buffer.",
+      "catches": [],
+      "bytes": 653,
+      "first_half": "logcat_stream_quiet_records",
+      "run": "46fc62eb",
+      "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
       "name": "logcat_strictmode_records",
       "file": "logcat_strictmode_records.bin",
       "command": "adb shell am force-stop; adb logcat -c; adb shell am start -W -n com.example.composefixture/.StrictModeActivity; sleep 3; adb logcat -d -B, host-filtered to the records from the app's pid (pidof) or naming the package",
@@ -292,6 +569,42 @@
       "exit_status": 0,
       "stream": "stdout",
       "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "logcat_tail_records",
+      "file": "logcat_tail_records.bin",
+      "command": "adb -s <serial> logcat -d -B -T N, for N in 1, 5, 50, 500",
+      "description": "Count-based tails of logd's order as records: `-T N` answers the newest N whole frames while the buffer holds N (manifest `measured`: bytes, frames, and the bytes of any cut record, per N). log_monitor's dump-made read on API 33 finds its cursor in such a tail, doubling N until the tail reaches it or comes back short: no timestamp positions the read. The file keeps the publishable records of the -T 50 answer.",
+      "catches": [],
+      "bytes": 877,
+      "measured": {
+        "1": {
+          "bytes": 741,
+          "frames": 1,
+          "cut_bytes": 0
+        },
+        "5": {
+          "bytes": 1177,
+          "frames": 5,
+          "cut_bytes": 0
+        },
+        "50": {
+          "bytes": 6326,
+          "frames": 50,
+          "cut_bytes": 0
+        },
+        "500": {
+          "bytes": 52505,
+          "frames": 500,
+          "cut_bytes": 0
+        }
+      },
+      "kept": {
+        "rule": "records whose uid is below 10000, private package names aliased",
+        "of": "the -T 50 answer",
+        "records": 10
+      },
+      "recorded_at": "2026-10-25T23:28:30Z"
     },
     {
       "name": "logcat_threadtime",
