@@ -234,6 +234,96 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       the line-ending and terminal controls of its message escaped (`\r` as
       `\\r`, ESC as `\\x1b`; TAB is kept) -- so what it prints or saves reads
       back as the same lines in any reader
+    - On API 33 (Android 13) a live read is made of dumps, not a stream:
+      that release's logcat writes `-B` records through a 4 KiB stdio buffer
+      and flushes only after a text record, so a stream stopped by its reader
+      loses what it held back (recorded on the API 33 emulator: a quiet 5 s
+      stream delivered no byte; `--duration 3s` was `total_lines: 0`, a
+      success). There a capture is a series of dumps, nominally one poll
+      apart (a read that takes longer than a poll is followed at once by a
+      catch-up one): the read opens on the newest record a system process
+      wrote (`logcat -d -B -T 1`, the tail doubled until it holds one: the
+      anchor; what followed it was logged before the read opened and is not
+      the window). When the buffer holds no system record to anchor on --
+      empty or only apps', mostly after `--clear` -- log_monitor writes one
+      marker line to the device's log, `adb shell log -t aes-log-monitor
+      anchor-<128-bit hex>` (as shell: a frame no app can write, made unique
+      by the nonce), finds it by that nonce (the tail doubled from 1; not in
+      the whole buffer: refused) and reads what follows it; it says so on
+      stderr, in the text summary (`Anchor written:`) and as `anchor_written:
+      true` in the JSON (`false` when it wrote none; the key exists on API 33
+      only). No read continues from apps' records alone: copies of one
+      datagram can reproduce them byte for byte. Then every
+      `ANDROID_EMU_LOG_POLL_SECONDS` (1), whatever
+      the mode, takes what logd delivered after the records it has read, and
+      once more at the end of a `--duration` or at Ctrl-C -- printing as it
+      goes under `--follow`. The read is positioned by logd's order from the
+      newest system-written record it has reached, whose identity an app
+      cannot forge; timestamps are not used to position it. A system record
+      is one whose uid -- logd's, from the writing socket's credentials, not
+      the writer's say -- is below 10000 in its user (`uid % 100000`): root,
+      system_server, the daemons, and shell (2000), which `adb shell log`
+      writes as. An app can send one datagram twice, time and payload
+      included, and logd keeps two byte-identical frames; so an app's record
+      never places the read. Each read dumps the newest N records (`logcat
+      -d -B -T N`, N at least 64 and enough for twice the last read's new
+      records), finds that system record by its frame byte for byte, checks
+      the records it had read after it are next, frame for frame, and keeps
+      everything after them; when the N do not reach it, N doubles and the
+      dump is asked again. The newest system record in the dump is the next
+      read's place; with none among the new records, the place stays and
+      the new records join what it checks. Without a new system record, the
+      remembered suffix and the required dump grow until turnover or the
+      byte cap refuses continuation. An app resending its own records
+      -- the anchor's neighbours, or all of them -- adds records the read
+      takes; it cannot move the read. A record's time is its writer's (a
+      native app can stamp one anywhere, and the device's clock can step), so
+      no stamp and no clock step moves the read or hides a record from it,
+      and the device's clock is never asked. That system record found twice
+      or more in a dump: where to resume is a guess, refused -- loud, never
+      silent, and only possible if a system writer duplicated a frame, which
+      system writers do not do. Trusted writers must not replay complete
+      frames; duplicate detection covers copies present in the searched dump.
+      Absent from a dump that came back with fewer
+      than N records -- the whole buffer -- or a record read after it missing
+      or different: logd's buffer turned over past it, refused. A doubled
+      tail that would pass
+      `ANDROID_EMU_LOG_DUMP_CAP_BYTES` (twice the last dump's bytes over the
+      cap) is refused before it is asked. Every dump ends the same way, in
+      one order: stopped if still running (killed, then reaped within 2 s;
+      on an interruption, the child is stopped before the interruption
+      propagates, or stderr says it could not be); the last 64 KiB of its
+      stderr read; a device error in adb's own words there -- whatever its
+      exit status -- is exit 3; then `adb get-state`, which proves adb still
+      sees the device (gone or not in state `device`: exit 3; the question
+      itself failing: exit 1); only then the verdict -- could not be
+      stopped, waiting for it failed, its stderr could not be read (adb's
+      own words then go unchecked, and the refusal says so), output past the
+      cap, past its deadline, a non-zero exit, its output could not be read:
+      refused (exit 1). Every refusal carries what was read under `partial`.
+      The records found prove logd still held them when that dump began;
+      they do not prove the window is complete: a capture is what logd
+      delivered, and logd may drop records it prunes while any reader is
+      behind (true of every logd reader, streams included). Zero lines means
+      no record logd delivered after the anchor passed the filters (`--app`,
+      `--severity`). The bounds, each separate: each dump of the opening
+      search gets at most 15 s and never more than the `--duration`, the
+      marker write (when there is one) at most 15 s; each poll's dump's own
+      deadline is 5 s plus the seconds since the last read (about one poll),
+      at most 60 s, the same for every doubling within one read; its output
+      is checked against `ANDROID_EMU_LOG_DUMP_CAP_BYTES` (32 MiB) every 50
+      ms -- a detection threshold, not a maximum: the file can overshoot it
+      by what adb writes in that time and before the kill lands, and is then
+      never read; a dump still running at its end gets 2 s more to be
+      reaped; and before any verdict, `adb get-state` bounded by
+      `ANDROID_EMU_LOG_STATE_TIMEOUT` (15 s) -- plus, when adb's stderr names
+      a missing device, the bounded `adb devices` its message lists the
+      attached devices from. The per-dump check proves adb still sees the
+      device, not that logcat works on it; a logcat that stops answering is
+      refused by the dump's own verdict. Every other level streams, as
+      before. The level is asked once (`getprop ro.build.version.sdk`),
+      before `--clear` or any other logcat call; a device that does not
+      answer a number is refused (exit 1), not guessed to stream
     - A stream that ends inside a record is never a complete capture: on a
       `--last` dump, or a live read that ended by itself, the device is asked
       again (gone: exit 3) and otherwise the capture is refused (exit 1). Only
@@ -1642,6 +1732,53 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
   said (`package_uid_changed`), but one the read never sees — lost in a
   restarted stream's gap — is not; start a new read after changing the
   install.
+- On Android 13 (API 33) the ANR live readers -- `anr_watcher --watch` and
+  the session worker -- lose every record logcat had not yet written when
+  they stop it: that release's logcat writes `-B` records through a 4 KiB
+  stdio buffer and flushes only after a text record (AOSP logcat.cpp,
+  android13-release; Android 12 writes each record, 14 and later flush it),
+  and the readers stop it by terminating it. So a `--watch` ended by
+  `--duration` or Ctrl-C, and a session at `--stop`, drop everything logged
+  since the stream's last full 4 KiB block -- on a quiet device, all of it.
+  Measured on the API 33 emulator: a jank record logged 2 s into a 4.5 s
+  session was missing from its `--stop` summary, which said `event_count:
+  0`, `incomplete: false`; with 5 KB logged after it, the jank arrived and
+  the summary said one record was cut (`cut_records: 1`) while the rest of
+  the unwritten tail went unsaid; `--watch --duration 6` showed the same.
+  While the stream is open, an event can also sit unseen in that buffer
+  until 4 KiB more arrive. `log_monitor` reads by dumps on that level, so
+  that buffering does not affect it.
+- `log_monitor`'s capture is what logd delivered, never a certificate that
+  the window is complete. logd may drop records it prunes while a reader is
+  behind -- Android 13's buffer prunes while it flushes to a slow reader
+  and does not disconnect it -- on every level and for every reader, stream
+  or dump; nothing on our side can tell a pruned record from one never
+  logged. On API 33 the dump-made read (above) adds its own limits: the
+  records it continues from show only that logd still held them when the
+  next dump began, and only in their own buffers (main, system, crash and
+  kernel each turn over on their own, so another one turning over within a
+  poll interval loses records unseen -- on a busy device enlarge its rings
+  with `adb logcat -G`); a buffer that turns over past a record the read
+  already took after its system record is refused although nothing unread
+  may be lost; without a new system record, the remembered suffix and the
+  required dump grow until turnover or the byte cap refuses continuation;
+  and a buffer with no system record at the open gets a marker line written
+  into it (above), so `--clear` on API 33 leaves one `aes-log-monitor` line
+  in the device's log. Android 13's `SerializedLogBuffer::Log` numbers a
+  record before it takes `logd_lock`, so a record from logd's own kernel
+  (LogKlog) or audit (LogAudit) thread can be stored behind records a read
+  already took -- the window is the time between numbering and storing:
+  inside the remembered suffix that is a loud lost refusal; just before the
+  cursor that one record is not captured. Listener writers -- every app and
+  system process -- keep their order among themselves, but under the same
+  race one of their records can also land before a kernel or audit cursor
+  and be missed; the default buffer selection is kept, as the stream path
+  reads it. The read is placed by a
+  system-written record, so an app resending a record
+  -- byte-identical, with or without pruning -- can no longer make it
+  resume from the copy: the earlier limit for a resend is gone. It follows
+  logd's order, not timestamps, so a writer whose clock is far behind (or
+  ahead), or a device clock that steps, no longer opens a gap either.
 - Without `--package`, an ANR session names only a process started while it
   runs (system_server's `Start proc` is the only evidence it takes); an app
   already running when `--start` is called is keyed by pid, listed under

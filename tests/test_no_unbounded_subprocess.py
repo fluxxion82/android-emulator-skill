@@ -26,11 +26,15 @@ and only if it is started and its callback stops the read.
 from __future__ import annotations
 
 import ast
+import contextlib
+import os
+import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
 from fake_toolchain import FakeToolchain, Rule
 
 SCRIPTS = (
@@ -491,6 +495,9 @@ def _why_it_did_not_end(
         "adb",
         [
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            # A live read asks the API level once; the recorded API 35 answer
+            # streams, which is the read these modes' timers bound.
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
         ],
     )
@@ -715,3 +722,84 @@ def test_the_matcher_is_bound_to_the_subprocess_module(tmp_path, source, expecte
     path = tmp_path / "probe.py"
     path.write_text(source, encoding="utf-8")
     assert _unbounded_calls(path) == expected
+
+
+# --- API 33: the dump-made live read ---------------------------------------------------
+#
+# On API 33 log_monitor's live read is not a stream: it is a series of dumps
+# (log_monitor._read_by_dumps), each bounded on the reading thread -- no Timer
+# for the name check above to find, and the runs above all answer API 35, so
+# none of them reaches it. Its own run: a device that says 33, answers the
+# newest record as recorded, and never finishes the window's dump. With
+# --duration 1s that dump's deadline is DUMP_FLOOR (5 s) plus the 1 s it
+# covers; the run must end there, refused, well inside twice that.
+
+API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
+API33_DURATION = TimedMode(
+    bound="DUMP_FLOOR",
+    argv=("--duration", "1s", "--json"),
+    seconds=7,
+    status=1,
+    says="did not finish within",
+)
+# The control: `_dump` waiting on its child with no bound. Python source, not
+# tool output; it must be in log_monitor.py exactly once.
+_UNBOUNDED_DUMP_WAIT = (
+    "returncode = process.wait(timeout=min(DUMP_WAIT_SECONDS, left))",
+    "returncode = process.wait()",
+)
+
+
+def _why_the_api_33_read_did_not_end(
+    toolchain: FakeToolchain, recorded, script: Path, **env: str
+) -> str | None:
+    """Run ``script`` as API 33's --duration over a window dump that never ends; why not on time."""
+    mode = API33_DURATION
+    toolchain.install(
+        "adb",
+        [
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=API33.text("getprop_sdk")),
+            Rule(
+                ("logcat", "-d", "-T", "1"),
+                stdout=API33.data("logcat_stream_marks_open_records.bin"),
+            ),
+            Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
+        ],
+    )
+    limit = 2 * mode.seconds
+    try:
+        try:
+            result = toolchain.run(script, *mode.argv, timeout=limit, **env)
+        except subprocess.TimeoutExpired:
+            return f"still running {limit}s into its {mode.seconds}s bound"
+    finally:
+        # The dump runs in a session of its own, which the run's limit does not
+        # reach: a stub left sleeping by a hung run is ended here.
+        for pid, _argv in toolchain.stub_pids("adb"):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+    shown = f"stdout {result.stdout[-300:]!r}, stderr {result.stderr[-300:]!r}"
+    if result.returncode != mode.status:
+        return f"exit {result.returncode}, not {mode.status}; {shown}"
+    if mode.says not in result.stdout:
+        return f"stdout does not say {mode.says!r}; {shown}"
+    return None
+
+
+def test_the_api_33_live_read_ends_at_its_bound(toolchain, recorded):
+    reason = _why_the_api_33_read_did_not_end(toolchain, recorded, SCRIPTS / "log_monitor.py")
+    assert reason is None, f"log_monitor's API 33 --duration did not end at its bound: {reason}"
+
+
+def test_the_api_33_run_sees_an_unbounded_dump_wait(toolchain, recorded, tmp_path):
+    """The control: with ``_dump`` waiting on its child unbounded, the run must not end."""
+    old, new = _UNBOUNDED_DUMP_WAIT
+    source = (SCRIPTS / "log_monitor.py").read_text(encoding="utf-8")
+    assert source.count(old) == 1, "the dump's bounded wait is not in log_monitor.py once"
+    copy = tmp_path / "log_monitor.py"
+    copy.write_text(source.replace(old, new), encoding="utf-8")
+
+    reason = _why_the_api_33_read_did_not_end(toolchain, recorded, copy, PYTHONPATH=str(SCRIPTS))
+
+    assert reason is not None, "an unbounded dump wait ended at its bound: the run cannot see it"

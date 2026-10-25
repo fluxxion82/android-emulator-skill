@@ -404,6 +404,9 @@ def _device(
     rules = [
         Rule(("devices",), stdout=recorded.text("adb_devices_single")),
         Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+        # The API level a live read asks once: the recorded API 35 emulator's,
+        # a level that streams (API 33 reads by dumps: test_log_monitor_dump_read).
+        Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
     ]
     if system_server is not None:
         rules.append(Rule(("shell", "pidof", "system_server"), stdout=system_server))
@@ -1407,6 +1410,7 @@ def _gone_after_one_read(toolchain, recorded, logcat: Rule) -> None:
                 stderr=recorded.text("adb_device_not_found"),
                 exit=_recorded_exit(recorded, "adb_device_not_found"),
             ),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             logcat,
         ],
     )
@@ -1605,6 +1609,7 @@ def test_a5_adbs_error_after_a_banner_is_still_a_device_error(toolchain, recorde
         "adb",
         [
             Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=True),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stderr=stderr, exit=1),
         ],
     )
