@@ -1033,6 +1033,24 @@ def parse_package_uids(output: str, package: str) -> frozenset[int] | None:
     return None
 
 
+def parse_uid_table(output: str) -> dict[str, frozenset[int]]:
+    """``{package: its uids}`` for every row of ``cmd package list packages -U``.
+
+    The whole table, unfiltered (package_list_uid_all, recorded on API 33 and
+    35): one ``package:<name> uid:<uids>`` row per package, the uids
+    comma-separated when it is installed for several users
+    (package_list_uid_two_users). Several packages may share a uid
+    (sharedUserId): the recorded tables put ``android`` and ten others on
+    1000, and a handful of providers on one app uid.
+    """
+    table: dict[str, frozenset[int]] = {}
+    for line in output.splitlines():
+        match = re.match(r"package:(\S+) uid:(\d+(?:,\d+)*)", line.strip())
+        if match:
+            table[match.group(1)] = frozenset(int(uid) for uid in match.group(2).split(","))
+    return table
+
+
 def get_package_uids(
     serial: str | None, package: str, *, timeout: int | None = None
 ) -> frozenset[int] | None:

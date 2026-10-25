@@ -579,9 +579,18 @@ class Frame:
         return self._parts()[2].decode("utf-8")
 
     def replace(
-        self, *, pid: str | None = None, tag: str | None = None, message: str | None = None
+        self,
+        *,
+        pid: str | None = None,
+        tag: str | None = None,
+        message: str | None = None,
+        uid: int | None = None,
     ) -> Frame:
-        """This record with its writer's pid, its tag or its message substituted."""
+        """This record with its writer's pid or uid, its tag or its message substituted.
+
+        ``uid`` is logd's, from the writing socket's credentials, so a record
+        "from another uid" can only be derived this way: no app can write it.
+        """
         priority, old_tag, old_message, trailer = self._parts()
         body = (
             priority
@@ -595,6 +604,8 @@ class Frame:
         struct.pack_into("<H", header, 0, len(body))
         if pid is not None:
             struct.pack_into("<i", header, 4, int(pid))
+        if uid is not None:
+            struct.pack_into("<I", header, 24, uid)
         return Frame(bytes(header) + body)
 
 

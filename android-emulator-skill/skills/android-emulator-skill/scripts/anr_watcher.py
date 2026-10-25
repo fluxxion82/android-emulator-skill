@@ -74,11 +74,19 @@ from common.adb_exec import (  # noqa: E402
 )
 from common.anr_pipeline import (  # noqa: E402
     PID_NAMED_KINDS,
+    UID_ATTRIBUTED,
+    UID_ISOLATED,
+    UID_PACKAGE,
+    UID_PACKAGE_UIDS_UNKNOWN,
+    UID_SDK_SANDBOX,
+    UID_UNFILTERED,
+    UID_UNKNOWN,
     VERIFICATION_UNKNOWN,
     AnrRecordAssembler,
     SessionSummary,
     attribution_markers,
     build_normalised_event,
+    classify_uid,
     cluster_to_json,
     compress_to_budget,
     diff_sessions,
@@ -110,6 +118,7 @@ from common.device_utils import (  # noqa: E402
     get_package_uids,
     get_system_server_pid,
     parse_ps_uids,
+    parse_uid_table,
     quote_for_device_shell,
     resolve_device_identifier,
 )
@@ -215,9 +224,11 @@ def matches_package(event: dict, package: str) -> bool:
     final output rather than the logcat filter. Matched whole, against only
     the identity the reader established: the package system_server's
     ActivityManager named (``anr_package``), the package of the component it
-    named, and the name the session worker verified for a jank record's pid
-    (``app``) -- a jank record names no package, so without it ``--package``
-    dropped every jank event.
+    named, and ``app`` for a jank or StrictMode record: the package, when the
+    record's uid is one of its uids (``_attribute_by_uid``, both readers), or
+    the name a session verified for the pid from a `Start proc` -- a jank
+    record names no package, so without it ``--package`` dropped every jank
+    event.
 
     It used to match by substring, against the message and the tag too, and
     by the package's last segment alone: the recorded Choreographer text "The
@@ -424,10 +435,12 @@ class _ProcessNames:
 
     So only a process STARTED while the session ran is ever named: one
     already running when it began -- an app warm in the background -- is
-    keyed by pid, identity "pid", and dropped under ``--package``. The pids
-    left unnamed are listed in the summary (``unnamed_pids``), and what
-    ``--package`` dropped of them is counted (``unnamed_dropped``): it may be
-    the package's, so ``--diff`` concludes nothing from its absence.
+    keyed by pid, identity "pid", and its pid listed in the summary
+    (``unnamed_pids``). A name is a label. Whose a jank or StrictMode record
+    is under ``--package`` is its uid's -- logd's, the writing process's
+    own -- against the package's uids (:meth:`package_uids`,
+    ``_attribute_by_uid``); the whole uid table (:meth:`shared_uid`) says
+    which other packages share them.
     """
 
     def __init__(
@@ -435,8 +448,9 @@ class _ProcessNames:
         system_server_pid: Callable[[], str | None] = lambda: None,
         package_uids: Callable[[str], Iterable[int] | None] = lambda _package: None,
         pid_uid: Callable[[int], int | None] = lambda _pid: None,
+        uid_table: Callable[[], dict[str, frozenset[int]] | None] = lambda: None,
     ) -> None:
-        """Build a resolver over the device's answers to three questions.
+        """Build a resolver over the device's answers to four questions.
 
         Args:
             system_server_pid: Asks the device for system_server's pid; None
@@ -448,8 +462,15 @@ class _ProcessNames:
                 (``ps -o PID,UID -p``); None when it cannot say, or the pid
                 is gone. Asked at most once per pid for a stream, and only
                 for an ANR report's pid that this stream gave no owner.
+            uid_table: Asks the device for every package's uids (``cmd
+                package list packages -U``, unfiltered); None when it cannot
+                say. Asked at most once for the session, and only when a
+                record is first attributed to a package by its uid.
         """
         self._ask_system_server = system_server_pid
+        self._ask_uid_table = uid_table
+        self._uid_table: dict[str, frozenset[int]] | None = None
+        self._uid_table_asked = False
         self._answers: dict[str, Iterable[int] | None] = {}
 
         def known_uids(package: str) -> Iterable[int] | None:
@@ -513,15 +534,61 @@ class _ProcessNames:
             self._pid_uids[pid] = self._ask_pid_uid(pid)
         return self._pid_uids[pid]
 
-    def observe(self, record: logcat.LogRecord) -> None:
-        """Learn -- or forget -- a pid's owner from system_server's sentence about it."""
+    def package_uids(self, package: str) -> frozenset[int] | None:
+        """The package's uids, one per user it is installed for, as the device gave them (once)."""
+        uids = self._package_uids(package)
+        return None if uids is None else log_lifecycle.uid_set(uids)
+
+    def shared_uid(self, package: str) -> list[str] | None:
+        """The other packages the device's whole uid table gives one of ``package``'s uids.
+
+        sharedUserId: their processes run under the same uid, so a record of
+        it may be theirs. Empty when none does; None when the table, or the
+        package's uids, could not be had.
+        """
+        if not self._uid_table_asked:
+            self._uid_table_asked = True
+            self._uid_table = self._ask_uid_table()
+        uids = self.package_uids(package)
+        if self._uid_table is None or uids is None:
+            return None
+        return sorted(
+            name for name, theirs in self._uid_table.items() if name != package and theirs & uids
+        )
+
+    def observe(self, record: logcat.LogRecord) -> log_lifecycle.Sentence | None:
+        """Learn -- or forget -- a pid's owner from system_server's sentence about it.
+
+        Returns:
+            The sentence system_server wrote, if the record is one.
+        """
         _writer, sentence = self._reader.read(record)
         if sentence is None:
-            return
+            return None
         if sentence.what == log_lifecycle.STARTED:
             self._owners[int(sentence.pid)] = sentence
         else:
             self._owners.pop(int(sentence.pid), None)
+        return sentence
+
+    def changed_uid(self, package: str, sentence: log_lifecycle.Sentence | None) -> int | None:
+        """The uid ``sentence`` starts a process named ``package`` under, when this read's answer lacks it.
+
+        The package's uids are asked once per read and kept: a reinstall, or
+        an install for another user, gives it a uid the answer does not hold,
+        and its records then classify as another uid's. system_server's
+        ``Start proc <pid>:<package>/<uid>`` under such a uid says so -- or
+        that another app named its process after the package, which the
+        sentence cannot rule out. Only once the package's uids were asked:
+        before that, asking gets the current answer.
+        """
+        if sentence is None or sentence.what != log_lifecycle.STARTED or sentence.uid is None:
+            return None
+        if sentence.name != package or self._answers.get(package) is None:
+            return None
+        return (
+            None if sentence.uid in log_lifecycle.uid_set(self._answers[package]) else sentence.uid
+        )
 
     def name_of(self, pid: int) -> str | None:
         """The name of the process holding ``pid``, as this stream has shown it."""
@@ -586,6 +653,69 @@ def _device_lookups(serial: str | None, may_ask: Callable[[], bool]) -> tuple[
         return parse_ps_uids(result.stdout).get(str(pid))
 
     return system_server_pid, package_uids, pid_uid
+
+
+def _uid_table_lookup(
+    serial: str | None, may_ask: Callable[[], bool]
+) -> Callable[[], dict[str, frozenset[int]] | None]:
+    """The device's whole uid table (``cmd package list packages -U``), as ``_device_lookups`` asks.
+
+    Bounded by ``LOOKUP_TIMEOUT_SECONDS``, asked only while ``may_ask()``
+    holds, and failing closed: None when adb fails, the command fails, or it
+    lists no package -- a device always has some, so an empty table is no
+    answer. Unfiltered, unlike the per-package question, which filters by
+    substring and so cannot show another package on the same uid.
+    """
+
+    def uid_table() -> dict[str, frozenset[int]] | None:
+        if not may_ask():
+            return None
+        try:
+            result = run_adb(
+                "shell",
+                serial,
+                "cmd",
+                "package",
+                "list",
+                "packages",
+                "-U",
+                timeout=LOOKUP_TIMEOUT_SECONDS,
+            )
+        except AdbError:
+            return None
+        table = parse_uid_table(result.stdout) if result.ok else {}
+        return table or None
+
+    return uid_table
+
+
+def _attribute_by_uid(event: dict, package: str, names: _ProcessNames) -> str:
+    """Whose a jank or StrictMode event is under ``--package``, by its record's uid.
+
+    The record's uid is logd's -- the writing process's own -- and Choreographer
+    and StrictMode write from inside the app, so the event is the package's
+    exactly when its uid is one of the package's uids (each user's whole).
+    Then ``app`` becomes the package, and ``shared_uid`` lists the other
+    packages the whole uid table gives that uid (sharedUserId; None: the
+    table could not be read), so a shared uid is never attributed silently.
+    Otherwise ``app`` is cleared: shown to be another uid's, or an isolated
+    process's, a `Start proc` name for its pid -- a pid reused since -- does
+    not make it the package's.
+
+    Returns:
+        ``classify_uid``'s verdict: ``UID_PACKAGE``, ``UID_ISOLATED``,
+        ``UID_OTHER`` or ``UID_UNKNOWN`` (the package's uids unknown: the
+        caller falls back to the name, and counts what it drops).
+    """
+    verdict = classify_uid(event.get("uid"), names.package_uids(package))
+    if verdict == UID_PACKAGE:
+        event["app"] = package
+        shared = names.shared_uid(package)
+        if shared != []:
+            event["shared_uid"] = shared
+    elif verdict != UID_UNKNOWN:
+        event["app"] = None
+    return verdict
 
 
 class _CaptureBoundary:
@@ -658,9 +788,27 @@ class AnrWatcher:
         self.events: list[dict] = []
         # ANRs --package dropped for naming no package, to be said (wave 4).
         self.unattributed_anrs = 0
-        # Jank/StrictMode --package dropped: this reader names no process, so
-        # each may be the package's -- said, never a silent "no jank".
+        # Jank/StrictMode --package dropped because nothing showed whose they
+        # were -- the device did not give the package's uids -- so each may
+        # be the package's: said, never a silent "no jank".
         self.unnamed_dropped = 0
+        # Jank/StrictMode of isolated processes in the package's users, and
+        # their uids: never counted (no package's listing names such a uid),
+        # and said.
+        self.isolated_unattributed = 0
+        self.isolated_uids: list[int] = []
+        # The same for the package's own SDK sandbox (its uid + 10000), whose
+        # records its SDKs write: never counted, and said.
+        self.sdk_sandbox_unattributed = 0
+        self.sdk_sandbox_uids: list[int] = []
+        # Uids a process named the package started under that the package's
+        # uids, asked once at the start, lack: said on stderr as seen.
+        self.package_uid_changed: list[int] = []
+        # How many jank/StrictMode records --package counted by a uid the
+        # whole uid table gives other packages too (sharedUserId), and which
+        # (None: the table could not be read): said.
+        self.shared_counted = 0
+        self.shared_uid: list[str] | None = []
         # What the stream's first record showed: `-T 1`'s replay, which may
         # predate the watch -- printed, marked, and out of every total.
         self.ambiguous: list[dict] = []
@@ -672,10 +820,16 @@ class AnrWatcher:
         # first report arrives, and files one under its package only when
         # its process is shown to be that package's: by system_server's
         # `Start proc` for the pid earlier in what is read, or else by the
-        # uid `ps` gives the pid now (_ProcessNames.owns).
+        # uid `ps` gives the pid now (_ProcessNames.owns). Under --package a
+        # jank or StrictMode record is the package's by its own uid, held
+        # against the package's uids, with the whole uid table asked once for
+        # who else shares them (_attribute_by_uid).
         # Asked only until the watch is stopped, as the session worker asks:
         # after Ctrl-C a lookup under way finishes, and no other starts.
-        self._names = _ProcessNames(*_device_lookups(serial, may_ask=lambda: not self.interrupted))
+        self._names = _ProcessNames(
+            *_device_lookups(serial, may_ask=lambda: not self.interrupted),
+            uid_table=_uid_table_lookup(serial, may_ask=lambda: not self.interrupted),
+        )
         self._assembler = AnrRecordAssembler(
             self._names.system_server_pid, subject_owner=self._names.owns
         )
@@ -802,7 +956,7 @@ class AnrWatcher:
                     self._close(package, json_mode)
                     self._disclose_unverified()
                     self._disclose_unattributed()
-                    self._disclose_unnamed_dropped()
+                    self._disclose_jank_attribution()
 
                 # A deadline and Ctrl-C end the stream themselves, so how adb
                 # exited then says nothing -- and a record cut by them is lost,
@@ -939,7 +1093,7 @@ class AnrWatcher:
         self._close(package, json_mode)
         self._disclose_unverified()
         self._disclose_unattributed()
-        self._disclose_unnamed_dropped()
+        self._disclose_jank_attribution()
         return True
 
     def get_summary(self) -> str:
@@ -947,15 +1101,30 @@ class AnrWatcher:
         total = len(self.events)
         if total == 0:
             dropped = (
-                f" --package dropped {self.unattributed_anrs} ANR(s) naming no verified "
-                f"package."
-                if self.unattributed_anrs
-                else ""
-            ) + (
-                f" --package dropped {self.unnamed_dropped} jank/StrictMode record(s) of a "
-                f"process this read does not name."
-                if self.unnamed_dropped
-                else ""
+                (
+                    f" --package dropped {self.unattributed_anrs} ANR(s) naming no verified "
+                    f"package."
+                    if self.unattributed_anrs
+                    else ""
+                )
+                + (
+                    f" --package dropped {self.unnamed_dropped} jank/StrictMode record(s) whose "
+                    f"uid it could not hold against the package's (its uids unknown)."
+                    if self.unnamed_dropped
+                    else ""
+                )
+                + (
+                    f" --package did not count {self.isolated_unattributed} jank/StrictMode "
+                    f"record(s) from isolated processes."
+                    if self.isolated_unattributed
+                    else ""
+                )
+                + (
+                    f" --package did not count {self.sdk_sandbox_unattributed} jank/StrictMode "
+                    f"record(s) from the package's SDK sandbox."
+                    if self.sdk_sandbox_unattributed
+                    else ""
+                )
             )
             if self._assembler.unverified:
                 return f"No verified ANR/jank events. {self._unverified_sentence()}{dropped}"
@@ -977,10 +1146,22 @@ class AnrWatcher:
                 else ""
             ),
             f"{unverified} unverified" if unverified else "",
+            f"{self.shared_counted} by a shared uid" if self.shared_counted else "",
         ]
         including = "; ".join(q for q in qualifiers if q)
         including = f", including {including}" if including else ""
-        return f"ANR/jank events: {total}{including} | Tags: {top_str}"
+        isolated = (
+            f" Not counted: {self.isolated_unattributed} jank/StrictMode record(s) from "
+            f"isolated processes."
+            if self.isolated_unattributed
+            else ""
+        ) + (
+            f" Not counted: {self.sdk_sandbox_unattributed} jank/StrictMode record(s) from "
+            f"the package's SDK sandbox."
+            if self.sdk_sandbox_unattributed
+            else ""
+        )
+        return f"ANR/jank events: {total}{including} | Tags: {top_str}{isolated}"
 
     def get_json_output(self) -> dict:
         """Return full results as a JSON-serialisable dict."""
@@ -990,6 +1171,16 @@ class AnrWatcher:
             "summary": {
                 "total": len(self.events),
                 "tags": list({e.get("process") for e in self.events}),
+                "isolated_unattributed": {
+                    "records": self.isolated_unattributed,
+                    "uids": self.isolated_uids,
+                },
+                "sdk_sandbox_unattributed": {
+                    "records": self.sdk_sandbox_unattributed,
+                    "uids": self.sdk_sandbox_uids,
+                },
+                "package_uid_changed": self.package_uid_changed,
+                "shared_uid": self.shared_uid,
             },
         }
 
@@ -1020,15 +1211,53 @@ class AnrWatcher:
                 file=sys.stderr,
             )
 
-    def _disclose_unnamed_dropped(self) -> None:
-        """Say so when --package dropped jank/StrictMode it could not attribute: never unsaid."""
+    def _disclose_jank_attribution(self) -> None:
+        """Say what --package could not attribute of jank/StrictMode, or attributed with a doubt."""
         if self.unnamed_dropped:
             plural = "s" if self.unnamed_dropped != 1 else ""
             print(
                 f"warning: --package dropped {self.unnamed_dropped} jank/StrictMode record{plural}: "
-                f"--watch and --since do not name the process behind one, so "
-                f"{'they' if plural else 'it'} may be the package's. A session (--start/--stop) "
-                f"names a process it sees start.",
+                f"the device did not give the package's uids, so no record's uid could show "
+                f"whose {'they are' if plural else 'it is'} -- {'they' if plural else 'it'} may be "
+                f"the package's.",
+                file=sys.stderr,
+            )
+        if self.isolated_unattributed:
+            count = self.isolated_unattributed
+            plural = "s" if count != 1 else ""
+            uids = ", ".join(str(uid) for uid in self.isolated_uids)
+            print(
+                f"warning: --package did not count {count} jank/StrictMode record{plural} from "
+                f"isolated processes (uid {uids}): an isolated process runs under a uid no "
+                f"package's listing names, so {'they' if plural else 'it'} may be the package's "
+                f"or another app's.",
+                file=sys.stderr,
+            )
+        if self.sdk_sandbox_unattributed:
+            count = self.sdk_sandbox_unattributed
+            plural = "s" if count != 1 else ""
+            uids = ", ".join(str(uid) for uid in self.sdk_sandbox_uids)
+            print(
+                f"warning: --package did not count {count} jank/StrictMode record{plural} from "
+                f"the package's SDK sandbox (uid {uids}): the sandbox runs the app's SDKs under a "
+                f"uid of its own (the app's + 10000), so {'they are' if plural else 'it is'} the "
+                f"SDKs' records, not the app's own.",
+                file=sys.stderr,
+            )
+        if self.shared_counted:
+            count = self.shared_counted
+            plural = "s" if count != 1 else ""
+            pronoun = "they" if plural else "it"
+            whose = (
+                f"whether another package shares it is unknown (the device's uid table could not "
+                f"be read): {pronoun} may be another package's"
+                if self.shared_uid is None
+                else f"the device gives it to {', '.join(self.shared_uid)} too (sharedUserId): "
+                f"{pronoun} may be theirs"
+            )
+            print(
+                f"warning: --package counted {count} jank/StrictMode record{plural} by the "
+                f"package's uid, and {whose}.",
                 file=sys.stderr,
             )
 
@@ -1041,7 +1270,19 @@ class AnrWatcher:
         ambiguous: bool = False,
     ) -> None:
         # system_server's word on who a pid is, before any report about it.
-        self._names.observe(record)
+        sentence = self._names.observe(record)
+        changed = self._names.changed_uid(package, sentence) if package else None
+        if changed is not None and changed not in self.package_uid_changed:
+            self.package_uid_changed.append(changed)
+            # Said as it is seen: what follows under that uid goes uncounted.
+            print(
+                f"warning: system_server started a process named {package} under uid {changed}, "
+                f"which the package's uids as this read asked them at its start do not include: "
+                f"reinstalled or installed for another user since (or another app named its "
+                f"process after it), so its jank/StrictMode under that uid goes uncounted -- "
+                f"start a new read.",
+                file=sys.stderr,
+            )
         for event in self._assembler.feed(record, ambiguous=ambiguous):
             self._emit(event, package, json_mode)
 
@@ -1056,11 +1297,28 @@ class AnrWatcher:
             self._emit(event, package, json_mode)
 
     def _emit(self, event: dict, package: str | None, json_mode: bool) -> None:
+        verdict = None
+        if package and event["kind"] in PID_NAMED_KINDS:
+            # Written by the app's own process: its uid says whose it is.
+            verdict = _attribute_by_uid(event, package, self._names)
+            if verdict == UID_PACKAGE and event.get("shared_uid", []) != []:
+                self.shared_counted += 1
+                self.shared_uid = event["shared_uid"]
         if package and not matches_package(event, package):
             if _unattributed(event):
                 self.unattributed_anrs += 1
-            elif event["kind"] in PID_NAMED_KINDS:
+            elif verdict == UID_ISOLATED:
+                self.isolated_unattributed += 1
+                if event["uid"] not in self.isolated_uids:
+                    self.isolated_uids = sorted([*self.isolated_uids, event["uid"]])
+            elif verdict == UID_SDK_SANDBOX:
+                self.sdk_sandbox_unattributed += 1
+                if event["uid"] not in self.sdk_sandbox_uids:
+                    self.sdk_sandbox_uids = sorted([*self.sdk_sandbox_uids, event["uid"]])
+            elif verdict == UID_UNKNOWN:
                 self.unnamed_dropped += 1
+            # UID_OTHER: shown to be another uid's -- not the package's, as
+            # another package's ANR is not.
             return
         # Printed, marked; never in a total (_CaptureBoundary).
         (self.ambiguous if event.get("ambiguous_tail") else self.events).append(event)
@@ -1090,6 +1348,14 @@ class AnrWatcher:
             possible_duplicate_of=event.get("possible_duplicate_of"),
         )
         marks = f" {marks}" if marks else ""
+        # Counted for the package by a uid others may run under too.
+        if "shared_uid" in event:
+            shared = event["shared_uid"]
+            marks += (
+                " [shared uid unknown: the device's uid table could not be read]"
+                if shared is None
+                else f" [uid shared with {', '.join(shared)}]"
+            )
         return (
             f"{event['kind'].upper()} {event['timestamp']} | {event['process']} "
             f"(PID {event['pid']}) [{dur}{frame_str}] | {event['message'][:120]}{reason_str}"
@@ -1494,6 +1760,19 @@ class AnrBuster:
             # ever dropped so. A meta that does not say is unknown too.
             unnamed_dropped = 0 if _unfiltered(meta.args) else None
             dropped_pids = []
+        # How --package's jank/StrictMode was attributed, as the worker kept
+        # it. Not kept -- an earlier version's worker, which attributed none by
+        # uid (and wrote events with no uid), or none wrote any -- is unknown
+        # under --package, and nothing to attribute without it.
+        attributed = line_counters.get("uid_attribution")
+        if not isinstance(attributed, str):
+            attributed = UID_UNFILTERED if _unfiltered(meta.args) else None
+        shared = line_counters.get("shared_uid", [])
+        isolated = line_counters.get("isolated_unattributed")
+        isolated = isolated if isinstance(isolated, dict) else {}
+        sandbox = line_counters.get("sdk_sandbox_unattributed")
+        sandbox = sandbox if isinstance(sandbox, dict) else {}
+        changed = line_counters.get("package_uid_changed")
         summary = replace(
             summary,
             verification=VERIFICATION_UNKNOWN if unverified else None,
@@ -1506,6 +1785,15 @@ class AnrBuster:
             unattributed_anrs=int(line_counters.get("unattributed_anrs", 0)),
             unnamed_dropped=unnamed_dropped,
             unnamed_dropped_pids=dropped_pids,
+            uid_attribution=attributed,
+            shared_uid=list(shared) if isinstance(shared, list) else None,
+            isolated_unattributed=int(isolated.get("records", 0)),
+            isolated_unattributed_uids=sorted(int(uid) for uid in isolated.get("uids", [])),
+            sdk_sandbox_unattributed=int(sandbox.get("records", 0)),
+            sdk_sandbox_unattributed_uids=sorted(int(uid) for uid in sandbox.get("uids", [])),
+            package_uid_changed=(
+                sorted(int(uid) for uid in changed) if isinstance(changed, list) else []
+            ),
         )
         # Every way this capture can be missing events, so --diff concludes
         # nothing from what is absent (Codex review of PR #34: a broken or
@@ -1883,7 +2171,8 @@ class AnrBuster:
             # boundary remembers what was consumed, which a restart's replay is
             # held against.
             process_names = _ProcessNames(
-                *_device_lookups(serial, may_ask=lambda: not stop_flag["value"])
+                *_device_lookups(serial, may_ask=lambda: not stop_flag["value"]),
+                uid_table=_uid_table_lookup(serial, may_ask=lambda: not stop_flag["value"]),
             )
             boundary = _CaptureBoundary()
             cmd = AnrWatcher(serial=serial).build_logcat_command()
@@ -2099,9 +2388,15 @@ class AnrBuster:
 
         Under ``package``, an ANR of a window -- WindowManager's report alone,
         which names no package -- is dropped and counted
-        (``unattributed_anrs``), never dropped unsaid; so is a jank or
-        StrictMode record whose process the stream never named, at or above
-        the frame threshold (``unnamed_dropped``, with its pid).
+        (``unattributed_anrs``), never dropped unsaid. A jank or StrictMode
+        record is the package's when its uid is one of the package's
+        (``_attribute_by_uid``; ``shared_uid`` when other packages share it);
+        one of an isolated process's uid is not counted but listed
+        (``isolated_unattributed``); one another uid wrote is not the
+        package's; and one nothing can place -- the package's uids unknown,
+        and no `Start proc` naming its process -- is dropped and counted
+        (``unnamed_dropped``, with its pid). Each at or above the frame
+        threshold.
 
         A ``LogFramingError`` ends the read (common.logcat's rule): cut by our
         own stop, the lost record is counted (``cut_records``); otherwise the
@@ -2112,6 +2407,11 @@ class AnrBuster:
         # Declared, not only grown: --stop reads a missing count as one this
         # worker did not keep (an earlier version's), not as zero.
         counters.setdefault("unnamed_dropped", {"records": 0, "pids": []})
+        counters.setdefault("uid_attribution", UID_ATTRIBUTED if package else UID_UNFILTERED)
+        counters.setdefault("shared_uid", [])
+        counters.setdefault("isolated_unattributed", {"records": 0, "uids": []})
+        counters.setdefault("sdk_sandbox_unattributed", {"records": 0, "uids": []})
+        counters.setdefault("package_uid_changed", [])
         stream = _FdRecords(proc.stdout)
         names = process_names or _ProcessNames()
         # A new stream: any pid may have changed hands while there was none,
@@ -2124,24 +2424,39 @@ class AnrBuster:
 
         def record(raw_events: list[dict], *, just_read: bool = False) -> None:
             for raw_event in raw_events:
-                # Both are logged from inside the app, so the record's pid is
-                # the app's own -- and neither says which app that is. Named
-                # only as the record is read, by what the stream said before it.
+                verdict = None
+                # Both are logged from inside the app, so the record's pid and
+                # uid are the app process's own -- and neither text says which
+                # app that is. The pid is named only as the record is read, by
+                # what the stream said before it: a label. Under --package the
+                # uid says whose it is.
                 if raw_event["kind"] in PID_NAMED_KINDS:
                     raw_event["app"] = names.name_of(raw_event["pid"]) if just_read else None
+                    if package:
+                        verdict = _attribute_by_uid(raw_event, package, names)
+                        _note_uid_attribution(counters, raw_event, verdict, package, names)
                 frames = raw_event.get("frames")
                 # Only Choreographer jank is frame-thresholded; ANRs (frames=None) pass.
                 below = frames is not None and frames < min_frames
                 if package and not matches_package(raw_event, package):
                     if _unattributed(raw_event):
                         counters["unattributed_anrs"] = counters.get("unattributed_anrs", 0) + 1
-                    elif (
-                        raw_event["kind"] in PID_NAMED_KINDS and not raw_event["app"] and not below
-                    ):
-                        # No `Start proc` named its process, so it may be the
-                        # package's: dropped, and counted, so --diff concludes
-                        # nothing from its absence (closure review of v0.8.0).
-                        # One below the threshold would have been dropped anyway.
+                    elif verdict == UID_ISOLATED and not below:
+                        # An isolated process's uid is no package's: it may be
+                        # the package's or another app's. Never counted, and
+                        # listed, so --diff concludes nothing from its absence.
+                        _count_uncounted(counters, "isolated_unattributed", raw_event["uid"])
+                    elif verdict == UID_SDK_SANDBOX and not below:
+                        # The package's SDK sandbox: its SDKs' records, not the
+                        # app's. Never counted, and listed, likewise.
+                        _count_uncounted(counters, "sdk_sandbox_unattributed", raw_event["uid"])
+                    elif verdict == UID_UNKNOWN and not raw_event["app"] and not below:
+                        # Nothing showed whose it is -- the package's uids
+                        # unknown, and no `Start proc` named its process -- so
+                        # it may be the package's: dropped, and counted, so
+                        # --diff concludes nothing from its absence (closure
+                        # review of v0.8.0). One below the threshold would
+                        # have been dropped anyway.
                         _count_unnamed_drop(counters, raw_event["pid"])
                     continue
                 if raw_event.get("ambiguous_tail"):
@@ -2168,7 +2483,12 @@ class AnrBuster:
                 if verdict == _CaptureBoundary.REPLAYED:
                     continue
                 counters["total"] += 1
-                names.observe(log_record)
+                sentence = names.observe(log_record)
+                changed = names.changed_uid(package, sentence) if package else None
+                if changed is not None and changed not in counters["package_uid_changed"]:
+                    # The package's uids were asked when the session began;
+                    # what follows under this uid goes uncounted, and is said.
+                    counters["package_uid_changed"] = [*counters["package_uid_changed"], changed]
                 ambiguous = verdict == _CaptureBoundary.AMBIGUOUS
                 record(assembler.feed(log_record, ambiguous=ambiguous), just_read=True)
 
@@ -2260,21 +2580,31 @@ class AnrBuster:
         return self.store.read_raw_events(session_id)
 
     def _load_summary(self, session_id: str) -> SessionSummary | None:
-        """The stored summary, its unrecorded drop count read as what it can be.
+        """The stored summary, what it did not record read as what it can be.
 
         A summary saved before drops were counted says nothing of them
-        (``unnamed_dropped`` None: unknown). A session that did not filter by
-        package dropped none, so for it that is 0; under --package it stays
-        unknown, and --diff concludes nothing about jank from it.
+        (``unnamed_dropped`` None: unknown), and one saved before uid
+        attribution nothing of that (``uid_attribution`` None). A session that
+        did not filter by package dropped none and had nothing to attribute,
+        so for it those are 0 and ``UID_UNFILTERED``; under --package they stay
+        unknown, and --diff says so.
         """
         summary = self.store.load_summary(session_id)
-        if summary is None or summary.unnamed_dropped is not None:
+        if summary is None or (
+            summary.unnamed_dropped is not None and summary.uid_attribution is not None
+        ):
             return summary
         try:
             unfiltered = _unfiltered(self.store.load_meta(session_id).args)
         except (FileNotFoundError, ValueError):
             unfiltered = False
-        return replace(summary, unnamed_dropped=0) if unfiltered else summary
+        if not unfiltered:
+            return summary
+        return replace(
+            summary,
+            unnamed_dropped=0 if summary.unnamed_dropped is None else summary.unnamed_dropped,
+            uid_attribution=summary.uid_attribution or UID_UNFILTERED,
+        )
 
     def _resolve_serial(self, serial: str | None) -> str | None:
         # Not re-wrapped: a bare RuntimeError lost DeviceNotFoundError, so an
@@ -2297,6 +2627,37 @@ def _count_unnamed_drop(counters: dict, pid: int) -> None:
         dropped["pids"] = sorted([*dropped["pids"], pid])
 
 
+def _count_uncounted(counters: dict, key: str, uid: int) -> None:
+    """Count one jank/StrictMode record --package did not count under ``key``, and its uid.
+
+    ``key``: ``isolated_unattributed`` (an isolated or app-zygote process's
+    uid) or ``sdk_sandbox_unattributed`` (the package's SDK sandbox's).
+    """
+    uncounted = counters.setdefault(key, {"records": 0, "uids": []})
+    uncounted["records"] += 1
+    if uid not in uncounted["uids"]:
+        uncounted["uids"] = sorted([*uncounted["uids"], uid])
+
+
+def _note_uid_attribution(
+    counters: dict, event: dict, verdict: str, package: str, names: _ProcessNames
+) -> None:
+    """Keep, for the summary, what attributing ``event`` by its uid showed about the session.
+
+    A record counted by a uid other packages share (``shared_uid``, None:
+    the uid table could not be read), and a session that could attribute
+    nothing by uid because the device did not give the package's uids.
+    """
+    if verdict == UID_PACKAGE and event.get("shared_uid", []) != []:
+        counters["shared_uid"] = event["shared_uid"]
+    elif (
+        verdict == UID_UNKNOWN
+        and event.get("uid") is not None
+        and names.package_uids(package) is None
+    ):
+        counters["uid_attribution"] = UID_PACKAGE_UIDS_UNKNOWN
+
+
 def _tail_evidence(event: dict) -> dict:
     """What a summary shows of an event the record a session started on made."""
     shown = (
@@ -2304,6 +2665,7 @@ def _tail_evidence(event: dict) -> dict:
         "timestamp",
         "process",
         "pid",
+        "uid",
         "message",
         "reason",
         "frames",
