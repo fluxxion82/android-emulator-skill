@@ -76,10 +76,45 @@ FRAME_MS = 16.7
 # (android:process). ``--diff`` compares none of them.
 _NO_IDENTITY = frozenset({"pid", "window", "process"})
 
-# The kinds of event logged from inside the app, whose record's pid is the
-# app's own and names no package: only a session that saw the process start
-# can say whose they are (``SessionSummary.unnamed_dropped``).
+# The kinds of event logged from inside the app: the record's pid and uid --
+# logd's, from the writing socket -- are the app process's own, and its text
+# names no package. Under --package such a record is the package's when its
+# uid is one of the package's uids (``classify_uid``); a pid is only a label,
+# named when a session saw its `Start proc`.
 PID_NAMED_KINDS = frozenset({"jank", "strictmode"})
+
+# AOSP android.os.Process / UserHandle: a full uid is ``user * PER_USER_RANGE
+# + app id``. App ids 90000..98999 are processes an app zygote spawns
+# (FIRST/LAST_APP_ZYGOTE_ISOLATED_UID) and 99000..99999 isolated processes
+# (FIRST/LAST_ISOLATED_UID, android:isolatedProcess): each runs under a uid of
+# its own that no package's listing names, so its records can be shown to be
+# no package's -- nor the package's.
+PER_USER_RANGE = 100_000
+FIRST_APP_ZYGOTE_ISOLATED_APP_ID = 90_000
+LAST_ISOLATED_APP_ID = 99_999
+# AOSP Process.toSdkSandboxUid: an app's SDK sandbox (the process the
+# Privacy Sandbox runs its SDKs in) has the app's uid plus 10000, in the same
+# user -- app ids 20000..29999 (FIRST/LAST_SDK_SANDBOX_UID). No listing names
+# it, and the app's SDKs, not the app, write its records.
+FIRST_SDK_SANDBOX_APP_ID = 20_000
+LAST_SDK_SANDBOX_APP_ID = 29_999
+SDK_SANDBOX_OFFSET = 10_000
+
+# What ``classify_uid`` says of a record's uid against a package's uids.
+UID_PACKAGE = "package"
+UID_SDK_SANDBOX = "sdk_sandbox"
+UID_ISOLATED = "isolated"
+UID_OTHER = "other"
+UID_UNKNOWN = "unknown"
+
+# How a summary's --package jank/StrictMode was attributed
+# (``SessionSummary.uid_attribution``): by each record's uid; not at all,
+# because the device did not give the package's uids; or not applicable, no
+# --package. None: not recorded -- by an earlier version, whose
+# --package kept only what a `Start proc` it saw had named.
+UID_ATTRIBUTED = "uid"
+UID_PACKAGE_UIDS_UNKNOWN = "package_uids_unknown"
+UID_UNFILTERED = "unfiltered"
 
 # Skipped-frame severity boundaries (frame counts). Android Choreographer only
 # warns once N skipped frames cross a threshold; we scale severity from there.
@@ -254,6 +289,11 @@ class NormalisedEvent:
     # package's -- "verified", "unverified" or "contradicted" (the assembler's
     # ``attribution``), kept so --get-details says it too.
     attribution: str | None = None
+    # The uid of the record's writer, logd's (from the socket's credentials):
+    # for jank and StrictMode the app process's own, which is how --package
+    # attributes them. None when unknown -- an event an earlier version
+    # wrote, which carried none.
+    uid: int | None = None
 
 
 @dataclass
@@ -318,9 +358,11 @@ class SessionSummary:
     # or of a process no uid confirmed -- so it can neither keep them nor say
     # they were someone else's (wave 4).
     unattributed_anrs: int = 0
-    # Jank and StrictMode records ``--package`` dropped because no `Start
-    # proc` in the session named their process (one already running when it
-    # began), and their pids. They may be the package's, so this session shows
+    # Jank and StrictMode records ``--package`` dropped because nothing showed
+    # whose they were -- the device did not give the package's uids, so
+    # neither a record's uid nor a `Start proc` could -- and their pids (an
+    # earlier version's: no `Start proc` named the process, one already
+    # running when it began). They may be the package's, so this session shows
     # neither the absence of such a cluster nor its maximum (closure review of
     # v0.8.0: the dropped jank read as "improvement: 1 resolved"). None when the
     # summary does not say -- a --package session saved by a version that did
@@ -331,6 +373,35 @@ class SessionSummary:
     # ANRs of a window that a broadcast ANR's report nearby may already
     # account for: counted, and said (``NormalisedEvent.possible_duplicate``).
     possible_duplicates: int = 0
+    # How --package's jank/StrictMode was attributed: ``UID_ATTRIBUTED`` (by
+    # each record's uid), ``UID_PACKAGE_UIDS_UNKNOWN``, ``UID_UNFILTERED``, or
+    # None: not recorded, saved by an earlier version -- which --diff says,
+    # when the other side was attributed by uid.
+    uid_attribution: str | None = UID_UNFILTERED
+    # Jank/StrictMode events with no uid -- written by an earlier version's
+    # worker -- so none of them was attributed by its uid: said.
+    events_without_uid: int = 0
+    # The other packages the device's whole uid table gives one of the
+    # package's uids (sharedUserId): its jank/StrictMode counted by uid may
+    # be theirs. None when the table could not be read.
+    shared_uid: list[str] | None = field(default_factory=list)
+    # Jank/StrictMode records of isolated or app-zygote uids in the package's
+    # users, and those uids: not counted -- such a uid is no package's, so
+    # whose the record is cannot be shown -- and said.
+    isolated_unattributed: int = 0
+    isolated_unattributed_uids: list[int] = field(default_factory=list)
+    # The same for the package's own SDK sandbox (its uid + 10000): its SDKs'
+    # records, not the app's, so never counted -- and said, as they may be
+    # the package's doing (Codex review of PR 3: dropped silently, a missing
+    # jank read as "1 resolved").
+    sdk_sandbox_unattributed: int = 0
+    sdk_sandbox_unattributed_uids: list[int] = field(default_factory=list)
+    # Uids system_server started a process named exactly the package under
+    # that the package's uids, asked once when the read began, do not hold:
+    # reinstalled or installed for another user since (or another app named
+    # a process after it). Records of that uid went uncounted: said, and
+    # --diff concludes nothing about jank from it.
+    package_uid_changed: list[int] = field(default_factory=list)
 
 
 # What a summary says when its ANR reports could not be authenticated.
@@ -516,9 +587,11 @@ def event_from_record(record: LogRecord, tz: tzinfo | None = None) -> dict | Non
     its ``PID:`` and ``Reason:`` lines (recorded: logcat_anr_broadcast_records)
     are read off it here, not assembled from later lines.
 
-    Who wrote the record is ``record.pid`` -- logd's, from the socket's
-    credentials -- never text. Whether an ANR report counts is
-    :class:`AnrRecordAssembler`'s to decide.
+    Who wrote the record is ``record.pid`` and ``record.uid`` -- logd's, from
+    the socket's credentials -- never text; the event carries both. Whether
+    an ANR report counts is :class:`AnrRecordAssembler`'s to decide, and
+    whether a jank or StrictMode record is a package's, its uid's
+    (:func:`classify_uid`).
 
     Args:
         record: One record.
@@ -535,6 +608,9 @@ def event_from_record(record: LogRecord, tz: tzinfo | None = None) -> dict | Non
         # "MM-DD HH:MM:SS.uuuuuu": the head of the printed header.
         "timestamp": prefix[:21],
         "pid": record.pid,
+        # logd's, as the pid is: the writer's uid, which no app can choose --
+        # for jank and StrictMode the app's own (--package attributes by it).
+        "uid": record.uid,
         "process": tag,
         "message": pieces[0].strip(),
         "kind": classified["kind"],
@@ -965,6 +1041,7 @@ def build_normalised_event(
         identity = site = "process"
     fingerprint = compute_fingerprint(symbol, prefix, kind, site=site)
     app_pid = raw_event.get("app_pid")
+    uid = raw_event.get("uid")
     return NormalisedEvent(
         delta_ms=delta_ms,
         process=raw_event.get("process", "unknown"),
@@ -985,7 +1062,50 @@ def build_normalised_event(
         process_name=process_name if identity == "process" else None,
         possible_duplicate=bool(raw_event.get("possible_duplicate")),
         attribution=raw_event.get("attribution"),
+        uid=int(uid) if uid is not None else None,
     )
+
+
+def classify_uid(uid: int | None, package_uids: Iterable[int] | None) -> str:
+    """Whose a jank or StrictMode record is, by its writer's uid, against a package's uids.
+
+    Every uid is compared whole, its user included: the package's uid in a
+    user it is installed for is one of ``package_uids`` (the listing gives
+    one per user), and the same app id in another user is not the package's.
+
+    Returns:
+        ``UID_PACKAGE``: the uid is one of the package's (a sharedUserId
+        sibling's too -- the caller says so). ``UID_SDK_SANDBOX``: the
+        package's own SDK sandbox (one of its uids + 10000), whose records
+        its SDKs write. ``UID_ISOLATED``: an isolated or app-zygote uid in
+        one of the package's users, which no listing names, so the record
+        may be the package's or any app's there. ``UID_OTHER``: shown not to
+        be the package's (another app's SDK sandbox included: that mapping
+        is fixed). ``UID_UNKNOWN``: the record's uid or the package's uids
+        are unknown.
+    """
+    if uid is None or package_uids is None:
+        return UID_UNKNOWN
+    uids = frozenset(package_uids)
+    if not uids:
+        return UID_UNKNOWN
+    if uid in uids:
+        return UID_PACKAGE
+    app_id = uid % PER_USER_RANGE
+    if (
+        FIRST_SDK_SANDBOX_APP_ID <= app_id <= LAST_SDK_SANDBOX_APP_ID
+        and uid - SDK_SANDBOX_OFFSET in uids
+    ):
+        return UID_SDK_SANDBOX
+    users = {owned // PER_USER_RANGE for owned in uids}
+    if is_isolated_uid(uid) and uid // PER_USER_RANGE in users:
+        return UID_ISOLATED
+    return UID_OTHER
+
+
+def is_isolated_uid(uid: int) -> bool:
+    """Whether ``uid`` is an isolated or app-zygote process's, in whichever user (by its app id)."""
+    return FIRST_APP_ZYGOTE_ISOLATED_APP_ID <= uid % PER_USER_RANGE <= LAST_ISOLATED_APP_ID
 
 
 def compute_fingerprint(
@@ -1170,8 +1290,8 @@ def _unnamed_note(summary: SessionSummary) -> str:
     plural = "s" if len(pids) != 1 else ""
     return (
         f"Unnamed: {len(pids)} pid{plural} ({_pids_shown(pids)}) -- only a process whose verified "
-        f"Start proc this session saw is named; the rest are keyed by pid, and "
-        f"--package drops them."
+        f"Start proc this session saw is named; the rest are keyed by pid, and under "
+        f"--package their jank/StrictMode is the package's only by the record's uid."
     )
 
 
@@ -1246,9 +1366,95 @@ def _dropped_note(summary: SessionSummary) -> str:
     plural = "s" if count != 1 else ""
     return (
         f"Dropped: --package dropped {count} jank/StrictMode record{plural} of "
-        f"pid{'s' if len(pids) != 1 else ''} {_pids_shown(pids)}, whose process no Start "
-        f"proc in this session named; {'they' if plural else 'it'} may be the package's, so "
+        f"pid{'s' if len(pids) != 1 else ''} {_pids_shown(pids)}, which nothing showed to be "
+        f"the package's or another's (no uid of the package's to hold the record's against, "
+        f"and no Start proc in this session named the process); "
+        f"{'they' if plural else 'it'} may be the package's, so "
         f"--diff takes no jank/StrictMode cluster as absent here, nor a maximum here as whole."
+    )
+
+
+def _uid_note(summary: SessionSummary) -> str:
+    """How --package's jank/StrictMode was attributed, when not by each record's uid (or empty)."""
+    notes = []
+    if summary.uid_attribution == UID_PACKAGE_UIDS_UNKNOWN:
+        notes.append(
+            "No uid attribution: the device did not give the package's uids, so no "
+            "jank/StrictMode record could be shown to be the package's by its uid."
+        )
+    elif summary.uid_attribution is None:
+        notes.append(
+            "No uid attribution: not recorded -- by an earlier version, whose --package "
+            "kept jank/StrictMode only when a Start proc it saw named the process."
+        )
+    if summary.events_without_uid:
+        count = summary.events_without_uid
+        plural = "s" if count != 1 else ""
+        notes.append(
+            f"No uid: {count} jank/StrictMode event{plural} carry no uid (written by an "
+            f"earlier version's worker), so none was attributed by its uid."
+        )
+    return " ".join(notes)
+
+
+def _shared_note(summary: SessionSummary) -> str:
+    """The other packages on the package's uid, when jank/StrictMode was counted by it (or empty)."""
+    if summary.uid_attribution != UID_ATTRIBUTED:
+        return ""
+    if summary.shared_uid is None:
+        return (
+            "Shared uid: unknown -- the device's uid table could not be read, so jank/StrictMode "
+            "counted for the package by its uid may be another package's on the same uid."
+        )
+    if not summary.shared_uid:
+        return ""
+    return (
+        f"Shared uid: the package's uid is also {', '.join(summary.shared_uid)}'s "
+        f"(sharedUserId), so jank/StrictMode counted for it by uid may be theirs."
+    )
+
+
+def _isolated_note(summary: SessionSummary) -> str:
+    """The isolated processes' jank/StrictMode --package did not count (empty when none)."""
+    count = summary.isolated_unattributed
+    if not count:
+        return ""
+    uids = summary.isolated_unattributed_uids
+    plural = "s" if count != 1 else ""
+    return (
+        f"Isolated: {count} jank/StrictMode record{plural} from isolated processes "
+        f"(uid{'s' if len(uids) != 1 else ''} {_pids_shown(uids)}) not counted -- an isolated "
+        f"process runs under a uid no package's listing names, so "
+        f"{'they' if plural else 'it'} may be the package's or another app's."
+    )
+
+
+def _sdk_sandbox_note(summary: SessionSummary) -> str:
+    """The package's SDK sandbox's jank/StrictMode --package did not count (empty when none)."""
+    count = summary.sdk_sandbox_unattributed
+    if not count:
+        return ""
+    uids = summary.sdk_sandbox_unattributed_uids
+    plural = "s" if count != 1 else ""
+    return (
+        f"SDK sandbox: {count} jank/StrictMode record{plural} from the package's SDK sandbox "
+        f"(uid{'s' if len(uids) != 1 else ''} {_pids_shown(uids)}) not counted -- the sandbox "
+        f"runs the app's SDKs under a uid of its own (the app's + 10000), so "
+        f"{'they are' if plural else 'it is'} the SDKs' records, not the app's own."
+    )
+
+
+def _uid_changed_note(summary: SessionSummary) -> str:
+    """A process named the package started under a uid the read's answer did not hold (or empty)."""
+    changed = summary.package_uid_changed
+    if not changed:
+        return ""
+    return (
+        f"Uid changed: system_server started a process named the package under uid "
+        f"{', '.join(str(uid) for uid in changed)}, which the package's uids as asked when "
+        f"this session began do not include -- reinstalled or installed for another user "
+        f"since (or another app named its process after the package), so jank/StrictMode "
+        f"under that uid went uncounted; start a new session."
     )
 
 
@@ -1281,6 +1487,11 @@ def _disclosures(summary: SessionSummary) -> list[str]:
         _unverified_note(summary),
         _unnamed_note(summary),
         _dropped_note(summary),
+        _uid_note(summary),
+        _shared_note(summary),
+        _isolated_note(summary),
+        _sdk_sandbox_note(summary),
+        _uid_changed_note(summary),
         _unattributed_note(summary),
         _duplicate_note(summary),
         _ambiguous_note(summary),
@@ -1314,6 +1525,30 @@ def _markers(summary: SessionSummary) -> str:
         marks.append("jank/StrictMode drops not recorded")
     elif summary.unnamed_dropped:
         marks.append(counted(summary.unnamed_dropped, "jank/StrictMode record", "dropped unnamed"))
+    if summary.uid_attribution == UID_PACKAGE_UIDS_UNKNOWN:
+        marks.append("no uid attribution: package uids unknown")
+    elif summary.uid_attribution is None:
+        marks.append("uid attribution not recorded")
+    if summary.events_without_uid:
+        marks.append(counted(summary.events_without_uid, "jank/StrictMode event", "without a uid"))
+    if summary.uid_attribution == UID_ATTRIBUTED and summary.shared_uid is None:
+        marks.append("shared uid unknown")
+    elif summary.uid_attribution == UID_ATTRIBUTED and summary.shared_uid:
+        marks.append(f"uid shared with {counted(len(summary.shared_uid), 'package', '')}".strip())
+    if summary.isolated_unattributed:
+        marks.append(
+            counted(summary.isolated_unattributed, "isolated jank/StrictMode record", "not counted")
+        )
+    if summary.sdk_sandbox_unattributed:
+        marks.append(
+            counted(
+                summary.sdk_sandbox_unattributed,
+                "SDK sandbox jank/StrictMode record",
+                "not counted",
+            )
+        )
+    if summary.package_uid_changed:
+        marks.append("package uid changed during the session")
     if summary.unattributed_anrs:
         marks.append(counted(summary.unattributed_anrs, "ANR", "unattributed"))
     if summary.possible_duplicates:
@@ -1427,9 +1662,10 @@ def format_cluster_detail(
         lines.append(f"  {_incomplete_note(incomplete_reason)}")
     for event in events[:20]:
         frame_str = f" frames={event.frames}" if event.frames is not None else ""
+        uid_str = f" uid={event.uid}" if event.uid is not None else ""
         lines.append(
             f"  · t={event.delta_ms}ms duration={event.duration_ms:.0f}ms{frame_str} "
-            f"tag={event.process} pid={event.pid}"
+            f"tag={event.process} pid={event.pid}{uid_str}"
         )
         if event.raw_message:
             lines.append(f"      msg: {event.raw_message[:120]}")
@@ -1622,12 +1858,19 @@ def diff_sessions(
     ``unconfirmed`` holds the clusters one session has and the other lacks
     while it was saved ``incomplete`` or holds evidence it did not count (an
     ``ambiguous_tail``, ``unattributed_anrs``; for a jank or StrictMode
-    cluster, ``unnamed_dropped``) -- each with ``session`` (where it is) and
-    ``absent_from`` -- in place of calling them resolved or new; the verdict
-    names what was not counted. With either side incomplete -- or, for a jank
-    or StrictMode cluster, holding such records it dropped -- ``not_compared``
-    holds the clusters both have, in place of a drift or stability verdict:
-    that side's maximum is only a lower bound.
+    cluster, ``unnamed_dropped`` or ``isolated_unattributed``) -- each with
+    ``session`` (where it is) and ``absent_from`` -- in place of calling them
+    resolved or new; the verdict names what was not counted. With either side
+    incomplete -- or, for a jank or StrictMode cluster, holding such records
+    it did not count -- ``not_compared`` holds the clusters both have, in
+    place of a drift or stability verdict: that side's maximum is only a
+    lower bound.
+
+    When one side attributed ``--package``'s jank/StrictMode by each record's
+    uid and the other did not (``uid_attribution``: a summary an earlier
+    version saved, or one without the package's uids), the verdict says so
+    -- "inconclusive: <id> has no uid attribution (...)" in place of "no
+    change" -- since the two sides kept those records by different rules.
     """
     if summary_a.fingerprint_version != summary_b.fingerprint_version:
         return {
@@ -1668,19 +1911,15 @@ def diff_sessions(
     )
     because = " and ".join(f"{sid} is incomplete" for sid in incomplete_ids)
     # Each side's drops, said once; a side is read off its summary, not its id.
-    dropped = list(
-        dict.fromkeys(_dropped_unnamed(s) for s in (summary_a, summary_b) if s.unnamed_dropped != 0)
-    )
+    # Isolated processes' jank/StrictMode, never counted, is held back the
+    # same way: it may be the package's.
+    dropped = list(dict.fromkeys(_held_back(s) for s in (summary_a, summary_b) if _holds_back(s)))
     short_by = {
         key: list(
             dict.fromkeys(
                 [
                     *(f"{sid} is incomplete" for sid in incomplete_ids),
-                    *(
-                        _dropped_unnamed(s)
-                        for s in (summary_a, summary_b)
-                        if _may_hold(s, b_map[key])
-                    ),
+                    *(_held_back(s) for s in (summary_a, summary_b) if _may_hold(s, b_map[key])),
                 ]
             )
         )
@@ -1819,6 +2058,12 @@ def diff_sessions(
             f"incomplete or holds evidence it did not count"
         )
     caveats.extend(f"{sid} {why}" for sid, why in uncounted.items())
+    # One side attributed --package's jank/StrictMode by each record's uid and
+    # the other did not -- saved by an earlier version, or without the
+    # package's uids: what each holds was kept by a different rule. Said,
+    # whatever else the verdict found; neither the drops nor an incomplete
+    # summary say it (a summary from v0.8.0 records neither).
+    caveats.extend(_attribution_gap(summary_a, summary_b))
     # Said whether or not anything is missing or shared: a dropped record may
     # be a cluster the other session lacks -- one this side would have added.
     short = list(dict.fromkeys(reason for key in sorted(short_by) for reason in short_by[key]))
@@ -1880,14 +2125,92 @@ def _dropped_unnamed(summary: SessionSummary) -> str:
     )
 
 
-def _may_hold(summary: SessionSummary, cluster: Cluster) -> bool:
-    """Whether what ``summary`` dropped for want of a name may be of ``cluster``.
+def _isolated_held(summary: SessionSummary) -> str:
+    """The isolated processes' jank/StrictMode a summary did not count, in words."""
+    count, uids = summary.isolated_unattributed, len(summary.isolated_unattributed_uids)
+    return (
+        f"{summary.session_id} did not count {count} jank/StrictMode "
+        f"record{'s' if count != 1 else ''} of {uids} isolated "
+        f"uid{'s' if uids != 1 else ''}, which may be the package's"
+    )
 
-    Only jank and StrictMode are dropped so, so only a cluster of those kinds
-    may be among them: an ANR's absence, or its maximum, still shows. A
+
+def _sdk_sandbox_held(summary: SessionSummary) -> str:
+    """The package's SDK sandbox's jank/StrictMode a summary did not count, in words."""
+    count = summary.sdk_sandbox_unattributed
+    return (
+        f"{summary.session_id} did not count {count} jank/StrictMode "
+        f"record{'s' if count != 1 else ''} of the package's SDK sandbox"
+    )
+
+
+def _uid_changed_held(summary: SessionSummary) -> str:
+    """The uids a summary saw the package start under but did not count, in words."""
+    uids = ", ".join(str(uid) for uid in summary.package_uid_changed)
+    return (
+        f"{summary.session_id} saw the package's uid changed during the session (uid {uids}), "
+        f"whose jank/StrictMode went uncounted"
+    )
+
+
+def _holds_back(summary: SessionSummary) -> bool:
+    """Whether a summary left jank/StrictMode uncounted that may be the package's."""
+    return (
+        summary.unnamed_dropped != 0
+        or bool(summary.isolated_unattributed)
+        or bool(summary.sdk_sandbox_unattributed)
+        or bool(summary.package_uid_changed)
+    )
+
+
+def _held_back(summary: SessionSummary) -> str:
+    """What a summary left uncounted of jank/StrictMode that may be the package's, in words."""
+    said = []
+    if summary.unnamed_dropped != 0:
+        said.append(_dropped_unnamed(summary))
+    if summary.isolated_unattributed:
+        said.append(_isolated_held(summary))
+    if summary.sdk_sandbox_unattributed:
+        said.append(_sdk_sandbox_held(summary))
+    if summary.package_uid_changed:
+        said.append(_uid_changed_held(summary))
+    return " and ".join(said)
+
+
+def _attribution_gap(summary_a: SessionSummary, summary_b: SessionSummary) -> list[str]:
+    """The sides that attributed no jank/StrictMode by uid while the other did, in words.
+
+    Empty when neither side or both did, or a side did not filter by package
+    (it kept everything, attributed or not).
+    """
+    sides = (summary_a, summary_b)
+    if not any(s.uid_attribution == UID_ATTRIBUTED for s in sides):
+        return []
+    why = {
+        None: "recorded by an earlier version, whose --package kept jank/StrictMode only when a "
+        "Start proc it saw named the process",
+        UID_PACKAGE_UIDS_UNKNOWN: "the device did not give the package's uids",
+    }
+    return [
+        f"{s.session_id} has no uid attribution ({why[s.uid_attribution]})"
+        for s in sides
+        if s.uid_attribution in why
+    ]
+
+
+def _may_hold(summary: SessionSummary, cluster: Cluster) -> bool:
+    """Whether what ``summary`` left uncounted may be of ``cluster``.
+
+    What --package dropped for want of a name (``unnamed_dropped``), the
+    isolated processes' and the package's SDK sandbox's records it never
+    counts (``isolated_unattributed``, ``sdk_sandbox_unattributed``), and
+    what went uncounted under a uid the package changed to
+    (``package_uid_changed``).
+    Only jank and StrictMode are held back so, so only a cluster of those
+    kinds may be among them: an ANR's absence, or its maximum, still shows. A
     summary that does not say (None) may hold any number.
     """
-    return summary.unnamed_dropped != 0 and cluster.sample_event.kind in PID_NAMED_KINDS
+    return _holds_back(summary) and cluster.sample_event.kind in PID_NAMED_KINDS
 
 
 def _signature(cluster: Cluster) -> str:
@@ -1952,6 +2275,20 @@ def summary_to_json(summary: SessionSummary) -> dict:
             else {"records": summary.unnamed_dropped, "pids": summary.unnamed_dropped_pids}
         ),
         "possible_duplicates": summary.possible_duplicates,
+        # null: not recorded (SessionSummary.uid_attribution).
+        "uid_attribution": summary.uid_attribution,
+        "events_without_uid": summary.events_without_uid,
+        # null: the device's uid table could not be read.
+        "shared_uid": summary.shared_uid,
+        "isolated_unattributed": {
+            "records": summary.isolated_unattributed,
+            "uids": summary.isolated_unattributed_uids,
+        },
+        "sdk_sandbox_unattributed": {
+            "records": summary.sdk_sandbox_unattributed,
+            "uids": summary.sdk_sandbox_unattributed_uids,
+        },
+        "package_uid_changed": summary.package_uid_changed,
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
     }
@@ -1963,6 +2300,11 @@ def summary_from_json(payload: dict) -> SessionSummary:
     # Absent (a summary saved before drops were counted) or null: unknown, not 0.
     dropped = payload.get("unnamed_dropped")
     dropped = dropped if isinstance(dropped, dict) else None
+    isolated = payload.get("isolated_unattributed")
+    isolated = isolated if isinstance(isolated, dict) else {}
+    sandbox = payload.get("sdk_sandbox_unattributed")
+    sandbox = sandbox if isinstance(sandbox, dict) else {}
+    shared = payload.get("shared_uid", [])
     return SessionSummary(
         session_id=payload["session_id"],
         started_at=payload["started_at"],
@@ -1987,6 +2329,16 @@ def summary_from_json(payload: dict) -> SessionSummary:
         unnamed_dropped=None if dropped is None else dropped.get("records", 0),
         unnamed_dropped_pids=[] if dropped is None else list(dropped.get("pids", [])),
         possible_duplicates=payload.get("possible_duplicates", 0),
+        # Absent: a summary an earlier version saved, which recorded no uid
+        # attribution -- unknown, not "unfiltered".
+        uid_attribution=payload.get("uid_attribution"),
+        events_without_uid=payload.get("events_without_uid", 0),
+        shared_uid=list(shared) if isinstance(shared, list) else None,
+        isolated_unattributed=isolated.get("records", 0),
+        isolated_unattributed_uids=list(isolated.get("uids", [])),
+        sdk_sandbox_unattributed=sandbox.get("records", 0),
+        sdk_sandbox_unattributed_uids=list(sandbox.get("uids", [])),
+        package_uid_changed=list(payload.get("package_uid_changed") or []),
     )
 
 
@@ -2026,6 +2378,9 @@ def _event_from_dict(payload: dict) -> NormalisedEvent:
         process_name=payload.get("process_name"),
         possible_duplicate=bool(payload.get("possible_duplicate", False)),
         attribution=payload.get("attribution"),
+        # Optional: an earlier version wrote no uid. A required key would
+        # raise KeyError, which read_events answers by skipping the event.
+        uid=payload.get("uid"),
     )
 
 
@@ -2082,4 +2437,7 @@ class SummaryBuilder:
             aggregates=aggregates,
             fingerprint_version=self.fingerprint_version,
             possible_duplicates=sum(1 for event in events if event.possible_duplicate),
+            events_without_uid=sum(
+                1 for event in events if event.kind in PID_NAMED_KINDS and event.uid is None
+            ),
         )

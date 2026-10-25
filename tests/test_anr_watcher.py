@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 import anr_watcher
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
 from fake_toolchain import (
     SCRIPTS,
     FakeToolchain,
@@ -1740,8 +1741,9 @@ def test_a_session_lists_the_pids_it_could_not_name(recorded, tmp_path):
     """Review of PR #34: a warm app's jank was keyed by pid -- and only metadata said so.
 
     Only a process whose verified `Start proc` the session saw is named; one
-    already running when it began is not, and `--package` drops its jank. The
-    summary now lists those pids, in JSON and in one sentence of text. The
+    already running when it began is not. The summary lists those pids, in
+    JSON and in one sentence of text, which says how `--package` goes by the
+    record's uid for them instead (it dropped their jank before v0.9.0). The
     recorded jank record, its process started before the stream.
     """
     jank = _jank_records(recorded, (80,))[0]
@@ -1763,7 +1765,8 @@ def test_a_session_lists_the_pids_it_could_not_name(recorded, tmp_path):
 
     assert json.loads(stopped.stdout)["unnamed_pids"] == {"count": 1, "pids": [pid]}
     (sentence,) = [line for line in details.stdout.splitlines() if line.startswith("Unnamed:")]
-    assert f"1 pid ({pid})" in sentence and "--package drops them" in sentence, sentence
+    assert f"1 pid ({pid})" in sentence, sentence
+    assert "--package their jank/StrictMode is the package's only by the record's uid" in sentence
 
 
 def test_a_session_that_cannot_authenticate_an_anr_says_so(recorded, tmp_path):
@@ -3821,10 +3824,11 @@ def _launch(recorded, index: int) -> tuple[Frame, Frame]:
     return start, jank
 
 
-def _package_session(store, records: list[Frame], recorded, tmp_path) -> str:
+def _package_session(store, records: list[Frame], recorded, tmp_path, names=None) -> str:
     """A ``--package`` session over ``records``, read as the worker reads its first stream.
 
-    Its meta records the package, as --start records it.
+    Its meta records the package, as --start records it. ``names`` is the
+    worker's resolver (default: the device's recorded answers, ``_names``).
     """
     meta = store.create({"package": PACKAGE})
     counters = _run_worker_over(
@@ -3834,10 +3838,23 @@ def _package_session(store, records: list[Frame], recorded, tmp_path) -> str:
         tmp_path,
         boundary=anr_watcher._CaptureBoundary(),
         package=PACKAGE,
-        process_names=_names(recorded),
+        process_names=names or _names(recorded),
     )
     _worker_finished(store, meta.session_id, counters)
     return meta.session_id
+
+
+def _no_package_uids(recorded) -> anr_watcher._ProcessNames:
+    """The worker's resolver when the device does not give the package's uids (the lookup failed).
+
+    system_server's pid as measured with the restart recording, and no
+    package uids: neither a record's uid nor a `Start proc` can show whose a
+    jank record is, so ``--package`` drops it and counts it
+    (``unnamed_dropped``). Since v0.9.0 this is how a session comes to drop
+    one; before, a `Start proc` missing from the stream was enough.
+    """
+    system_server, _ = _restart_oracles(recorded)
+    return anr_watcher._ProcessNames(system_server_pid=lambda: system_server)
 
 
 @pytest.mark.parametrize("absent_from", ["second", "first"])
@@ -3848,18 +3865,21 @@ def test_jank_package_dropped_unnamed_is_never_read_as_resolved(
 
     Session A reads the recorded `Start proc` of the fixture app's first
     process, then that process's recorded jank. Session B reads the same jank
-    with the `Start proc` moved out of its stream -- the process started
-    before the capture -- after the reviewer's neutral first record. Under
-    --package, B dropped the jank for naming no package and kept only its pid
-    (``unnamed_pids``), so `--diff A B` said "improvement: 1 resolved" with
-    nothing unconfirmed (and B A "regression: 1 new"). B holds evidence it
-    did not count: the jank is unconfirmed, and the verdict says what B
-    dropped.
+    after the reviewer's neutral first record, the device giving no uids for
+    the package (``_no_package_uids``; the reviewer's B had its `Start proc`
+    moved out of the stream, which uid attribution now answers). Under
+    --package, B dropped the jank for want of anything showing whose it was
+    and kept only its pid (``unnamed_pids``), so `--diff A B` said
+    "improvement: 1 resolved" with nothing unconfirmed (and B A "regression:
+    1 new"). B holds evidence it did not count: the jank is unconfirmed, and
+    the verdict says what B dropped.
     """
     start, jank = _launch(recorded, 0)
     buster = anr_watcher.AnrBuster(store=store)
     named = _package_session(store, [start, jank], recorded, tmp_path)
-    unnamed = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    unnamed = _package_session(
+        store, [_neutral(recorded), jank], recorded, tmp_path, names=_no_package_uids(recorded)
+    )
     buster.stop(named)
     buster.stop(unnamed)
     first, second = (named, unnamed) if absent_from == "second" else (unnamed, named)
@@ -3881,17 +3901,24 @@ def test_jank_package_dropped_unnamed_makes_a_shared_maximum_a_lower_bound(
     """Absence is one conclusion it cannot support; a maximum is the other.
 
     Both sessions read the first process's recorded `Start proc` and jank (33
-    frames). B also reads the second process's recorded jank (50 frames) with
-    its `Start proc` moved out of the stream, so --package dropped it -- a
-    jank of the package's, uncounted. A cluster both hold compared as
-    "stable" on B's 33 frames, a maximum B was missing a record above.
+    frames). B also reads the second process's recorded jank (50 frames),
+    which --package left uncounted. In the reviewer's replay its `Start proc`
+    was moved out of the stream; uid attribution now counts that, so here
+    its uid is set to an isolated process's in the package's user, which
+    --package never counts (``isolated_unattributed``) -- a jank that may be
+    the package's, uncounted. A cluster both hold compared as "stable" on
+    B's 33 frames, a maximum B was missing a record above.
     """
     start, jank = _launch(recorded, 0)
     _, other_jank = _launch(recorded, 1)
+    isolated = (other_jank.uid // 100_000) * 100_000 + 99_007
     buster = anr_watcher.AnrBuster(store=store)
     before = _package_session(store, [_neutral(recorded), start, jank], recorded, tmp_path)
     after = _package_session(
-        store, [_neutral(recorded), start, jank, other_jank], recorded, tmp_path
+        store,
+        [_neutral(recorded), start, jank, other_jank.replace(uid=isolated)],
+        recorded,
+        tmp_path,
     )
     buster.stop(before)
     buster.stop(after)
@@ -3900,7 +3927,7 @@ def test_jank_package_dropped_unnamed_makes_a_shared_maximum_a_lower_bound(
 
     assert (result["drift"], result["stable_count"]) == ([], 0), result
     (shared,) = result["not_compared"]
-    assert f"{after} dropped 1 jank/StrictMode record" in shared["reason"], shared
+    assert f"{after} did not count 1 jank/StrictMode record" in shared["reason"], shared
     assert result["verdict"].startswith("inconclusive: "), result["verdict"]
 
 
@@ -3908,15 +3935,23 @@ def test_a_session_discloses_the_jank_package_dropped_unnamed(recorded, store, t
     """--stop says what --package dropped for want of a name: JSON, text and the one-line form.
 
     The reviewer's session B: the recorded jank of a process whose `Start
-    proc` the stream never showed. One below the frame threshold -- the
-    same record, its count set to 5 -- would have been dropped named or
-    not, so it is not counted as lost. Without --package nothing is dropped:
-    the jank is kept, keyed by pid.
+    proc` the stream never showed, the device giving no uids for the package
+    (``_no_package_uids``), so nothing shows whose it is. One below the frame
+    threshold -- the same record, its count set to 5 -- would have been
+    dropped either way, so it is not counted as lost. The summary also says
+    it attributed nothing by uid. Without --package nothing is dropped: the
+    jank is kept, keyed by pid.
     """
     _, jank = _launch(recorded, 0)
     (small,) = _jank_records(recorded, (5,), pid=jank.pid)
     buster = anr_watcher.AnrBuster(store=store)
-    session = _package_session(store, [_neutral(recorded), jank, small], recorded, tmp_path)
+    session = _package_session(
+        store,
+        [_neutral(recorded), jank, small],
+        recorded,
+        tmp_path,
+        names=_no_package_uids(recorded),
+    )
     everything = _session_starting_on(
         store, [_neutral(recorded), jank], tmp_path, process_names=_names(recorded)
     )
@@ -3924,22 +3959,28 @@ def test_a_session_discloses_the_jank_package_dropped_unnamed(recorded, store, t
     payload = json.loads(buster.stop(session, json_mode=True))
 
     assert payload["unnamed_dropped"] == {"records": 1, "pids": [int(jank.pid)]}, payload
+    assert payload["uid_attribution"] == "package_uids_unknown", payload
     assert payload["incomplete"] is False, payload
     details = buster.get_details(session)
     assert f"--package dropped 1 jank/StrictMode record of pid {jank.pid}" in details, details
+    assert "No uid attribution: the device did not give the package's uids" in details, details
     terse = buster.stop(session, terse=True)
     assert "1 jank/StrictMode record dropped unnamed" in terse, terse
+    assert "no uid attribution: package uids unknown" in terse, terse
     unfiltered = json.loads(buster.stop(everything, json_mode=True))
     assert unfiltered["unnamed_dropped"] == {"records": 0, "pids": []}, unfiltered
+    assert unfiltered["uid_attribution"] == "unfiltered", unfiltered
 
 
 def test_since_with_package_says_what_it_dropped_unnamed(toolchain, recorded):
     """The same shape in the legacy reader: --package dropped jank, and said nothing.
 
-    --watch and --since name no process, so under --package every jank and
-    StrictMode record is dropped -- documented, but the summary read "No
-    ANR/jank events detected." with no word of it. The dump is the recorded
-    Choreographer record; it is dropped, and counted, and said.
+    --watch and --since named no process, so under --package every jank and
+    StrictMode record was dropped -- documented, but the summary read "No
+    ANR/jank events detected." with no word of it. They attribute by uid
+    now; this device answers no `cmd package`, so the package's uids are
+    unknown and nothing can show whose the recorded Choreographer record is:
+    it is dropped, and counted, and said.
     """
     toolchain.install(
         "adb",
@@ -4227,11 +4268,15 @@ def _forget_drop_metadata(store, session_id: str) -> None:
 
     That version wrote no such field, so a summary it saved -- still
     fingerprint version 3, so compared -- reads as if nothing was dropped.
+    It wrote no uid attribution either, so those keys go too.
     """
     path = store.session_dir(session_id) / "summary.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert "unnamed_dropped" in payload, "the summary no longer has the field this derives"
     del payload["unnamed_dropped"]
+    for key in UID_SUMMARY_KEYS:
+        assert key in payload, f"the summary no longer has {key}, which this derives"
+        del payload[key]
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -4243,22 +4288,31 @@ def test_a_package_summary_saved_without_drop_metadata_shows_nothing_about_jank(
 
     Derived from the reviewer's sessions: B is the replay session B (or, for
     the maximum, the session that also read the second process's jank),
-    stopped, then saved again with only ``unnamed_dropped`` deleted from its
+    stopped, then saved again with ``unnamed_dropped`` (and the uid
+    attribution keys, which main wrote neither) deleted from its
     summary.json -- what main saved for it. Read as "nothing dropped", the
     replay said "improvement: 1 resolved" and the shared cluster "stable".
     What it dropped is unknown, so it shows neither, and the reason names the
-    missing field.
+    missing field. B's jank goes uncounted as this version can leave it: the
+    device giving no uids for the package (absence), or the second jank
+    record's uid an isolated process's (maximum).
     """
     start, jank = _launch(recorded, 0)
     _, other_jank = _launch(recorded, 1)
+    isolated = (other_jank.uid // 100_000) * 100_000 + 99_007
     buster = anr_watcher.AnrBuster(store=store)
     if shape == "absence":
         a = _package_session(store, [start, jank], recorded, tmp_path)
-        b = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+        b = _package_session(
+            store, [_neutral(recorded), jank], recorded, tmp_path, names=_no_package_uids(recorded)
+        )
     else:
         a = _package_session(store, [_neutral(recorded), start, jank], recorded, tmp_path)
         b = _package_session(
-            store, [_neutral(recorded), start, jank, other_jank], recorded, tmp_path
+            store,
+            [_neutral(recorded), start, jank, other_jank.replace(uid=isolated)],
+            recorded,
+            tmp_path,
         )
     buster.stop(a)
     buster.stop(b)
@@ -4283,18 +4337,24 @@ def test_stopping_an_older_workers_package_session_records_drops_as_unknown(
     """REQUIRED 2's other half: --stop of a session whose worker counted no drops.
 
     An earlier version's worker persisted counters without ``unnamed_dropped``
-    -- derived: the replay session B's counters with only that key removed.
-    --stop read that as zero; it is unknown now (``null``), and --diff shows
-    no jank absence from it. A's worker, this version's, dropped nothing and
-    says so: zero, not unknown.
+    -- derived: the replay session B's counters (the device giving no uids
+    for the package, so its jank was dropped) with that key, and the uid
+    attribution keys that worker did not keep either, removed. --stop read
+    that as zero; it is unknown now (``null``), and --diff shows no jank
+    absence from it. A's worker, this version's, dropped nothing and says
+    so: zero, not unknown.
     """
     start, jank = _launch(recorded, 0)
     buster = anr_watcher.AnrBuster(store=store)
     a = _package_session(store, [start, jank], recorded, tmp_path)
-    b = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    b = _package_session(
+        store, [_neutral(recorded), jank], recorded, tmp_path, names=_no_package_uids(recorded)
+    )
     path = store.session_dir(b) / "meta.json"
     left = json.loads(path.read_text(encoding="utf-8"))
-    del left["extras"]["line_counters"]["unnamed_dropped"]
+    for key in ("unnamed_dropped", *UID_SUMMARY_KEYS):
+        left["extras"]["line_counters"].pop(key, None)
+    assert not {"unnamed_dropped", *UID_SUMMARY_KEYS} & left["extras"]["line_counters"].keys()
     path.write_text(json.dumps(left), encoding="utf-8")
 
     counted = json.loads(buster.stop(a, json_mode=True))
@@ -4303,8 +4363,10 @@ def test_stopping_an_older_workers_package_session_records_drops_as_unknown(
 
     assert counted["unnamed_dropped"] == {"records": 0, "pids": []}, counted
     assert payload["unnamed_dropped"] is None, payload
+    assert payload["uid_attribution"] is None, payload
     assert result["resolved_clusters"] == [], result["verdict"]
     assert [c["absent_from"] for c in result["unconfirmed"]] == [b], result
+    assert f"{b} has no uid attribution (recorded by an earlier version" in result["verdict"]
 
 
 def test_an_unfiltered_summary_without_drop_metadata_still_compares(
@@ -5747,8 +5809,29 @@ def test_sessions_an_earlier_version_saved_still_load_and_answer(tmp_path, monke
         ids["running"]: "running",
     }
     assert all(m["lifecycle"] is None for m in listed), "a key was invented for main's sessions"
-    assert (details_status, details) == (0, saved)
-    assert stopped[0] == stopped[1] == (0, saved)
+    # Main's keys answer as main saved them; the uid-attribution keys it did
+    # not write are added, read as what their absence means for a session
+    # without --package: nothing to attribute, nothing held back.
+    read_absent = {
+        "uid_attribution": "unfiltered",
+        "events_without_uid": 0,
+        "shared_uid": [],
+        "isolated_unattributed": {"records": 0, "uids": []},
+        "sdk_sandbox_unattributed": {"records": 0, "uids": []},
+        "package_uid_changed": [],
+    }
+    assert not read_absent.keys() & saved.keys(), "main's summary grew a key this reads as absent"
+    # So does each cluster's sample event: main's events carry no uid (null).
+    assert all("uid" not in c["sample_event"] for c in saved["clusters"]), saved["clusters"]
+    as_read = {
+        **saved,
+        **read_absent,
+        "clusters": [
+            {**c, "sample_event": {**c["sample_event"], "uid": None}} for c in saved["clusters"]
+        ],
+    }
+    assert details_status == 0 and details == as_read, details
+    assert stopped[0] == stopped[1] == (0, as_read)
     status, refusal = crashed[0]
     assert crashed[1] == crashed[0]
     assert status == 3 and "as it ended, `adb logcat` said" in refusal["error"], refusal
@@ -6432,3 +6515,963 @@ def test_no_reader_answers_from_a_session_a_previous_versions_worker_may_still_w
         assert "earlier version" in answer["error"] and str(old.pid) in answer["error"], answer
         assert f"--stop {session_id}" in answer["remedy"], answer
         assert once_gone[0] == 0, once_gone
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0: jank and StrictMode are the package's by the record's uid
+# ---------------------------------------------------------------------------
+#
+# A session named a jank or StrictMode record's pid only from system_server's
+# `Start proc`, and --watch / --since named none, so under --package every
+# such record of an app already running was dropped. Both are written by the
+# app's own process, and logd stamps every record with its writer's uid, from
+# the socket's credentials (common.logcat): a record is the package's when
+# its uid is one of the package's uids.
+
+API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
+STRICTMODE = "logcat_strictmode_records"
+# AOSP android.os.Process: the uid range of one user, and the app-ids of an
+# isolated process (FIRST_ISOLATED_UID 99000 .. 99999) and of one an app
+# zygote spawns (FIRST_APP_ZYGOTE_ISOLATED_UID 90000 .. 98999). Written out
+# here rather than imported, so the code is held against AOSP's numbers.
+PER_USER = 100_000
+FIRST_ISOLATED = 99_000
+FIRST_APP_ZYGOTE = 90_000
+# The keys a summary carries for uid attribution: deleted, it is the shape
+# v0.8.0 saved.
+UID_SUMMARY_KEYS = (
+    "uid_attribution",
+    "events_without_uid",
+    "shared_uid",
+    "isolated_unattributed",
+    "sdk_sandbox_unattributed",
+    "package_uid_changed",
+)
+# The question for the device's whole uid table: unfiltered, so another
+# package on the same uid is in the answer.
+WHOLE_UID_TABLE = ["cmd", "package", "list", "packages", "-U"]
+# Each recorded window, its kind, and how many such records it holds.
+UID_STREAMS = {
+    "jank-api35": ("emulator-api35", RESTART, "jank", 3),
+    "strictmode-api33": ("emulator-api33", STRICTMODE, "strictmode", 10),
+}
+
+
+def _profile(name: str) -> RecordedFixtures:
+    return RecordedFixtures(RECORDED_ROOT / name)
+
+
+def _app_window(fixtures, name: str) -> list[Frame]:
+    """``name``'s recorded records, every `Start proc` record removed: the app was already running.
+
+    Whole records deleted; nothing else changed.
+    """
+    records = frames(fixtures.data(f"{name}.bin"))
+    kept = [f for f in records if not f.message.startswith("Start proc ")]
+    if len(kept) == len(records):
+        pytest.fail(f"{name} no longer holds a Start proc record to remove")
+    return kept
+
+
+def _uid_listing(fixtures, name: str) -> str:
+    """`cmd package list packages -U <package>` as measured in ``name``'s own run."""
+    return _entry(fixtures, name)["package_uid_listing"]["output"]
+
+
+def _app_uid(fixtures, name: str) -> int:
+    (uid,) = parse_package_uids(_uid_listing(fixtures, name), PACKAGE)
+    return uid
+
+
+def _with_uid(window: list[Frame], uid: int, tag: str = "Choreographer") -> list[Frame]:
+    """``window`` with the uid of each ``tag`` record -- logd's -- set to ``uid``."""
+    derived = [f.replace(uid=uid) if f.tag == tag else f for f in window]
+    if derived == window:
+        pytest.fail(f"the window holds no {tag} record whose uid this derives")
+    return derived
+
+
+def _isolated_uid(fixtures, name: str, app_id: int) -> int:
+    """A uid of ``app_id`` in the package's own user (its recorded uid's user)."""
+    return (_app_uid(fixtures, name) // PER_USER) * PER_USER + app_id
+
+
+def _uid_session(store, records: list[Frame], tmp_path, package: str, names) -> str:
+    """A ``--package`` session over ``records`` (the first `-T 1`'s replay), ended as its worker ends it."""
+    meta = store.create({"package": package})
+    counters = _run_worker_over(
+        store,
+        meta.session_id,
+        records,
+        tmp_path,
+        boundary=anr_watcher._CaptureBoundary(),
+        package=package,
+        process_names=names,
+    )
+    _worker_finished(store, meta.session_id, counters)
+    return meta.session_id
+
+
+def _listing_names(listing: str) -> anr_watcher._ProcessNames:
+    """A resolver whose only answer is the package's uid listing: it names no pid."""
+    return anr_watcher._ProcessNames(
+        package_uids=lambda package: parse_package_uids(listing, package)
+    )
+
+
+def _strip_uid_attribution(store, session_id: str) -> None:
+    """Delete the uid-attribution keys from a saved summary.json: the shape v0.8.0 saved."""
+    path = store.session_dir(session_id) / "summary.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for key in UID_SUMMARY_KEYS:
+        payload.pop(key, None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize("stream", sorted(UID_STREAMS))
+@pytest.mark.parametrize(
+    "mode", [("--since", "1m"), ("--watch", "--duration", "3")], ids=["since", "watch"]
+)
+def test_package_keeps_an_already_running_apps_records_by_uid(mode, stream, toolchain, recorded):
+    """The defect: --watch / --since named no process, so --package dropped every record.
+
+    The recorded window with its `Start proc` removed -- the app was running
+    before the read. Every jank record (API 35) or StrictMode record (API 33)
+    in it carries the app's uid, which that run's own listing names: each is
+    printed as the package's, with that uid, and nothing is said dropped.
+    """
+    profile, name, kind, count = UID_STREAMS[stream]
+    fixtures = _profile(profile)
+    window = _app_window(fixtures, name)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("cmd", "package"), stdout=_uid_listing(fixtures, name)),
+            Rule(
+                ("logcat",),
+                buffered=framed(window[:1]),
+                stdout=framed(window[1:]),
+                hang=mode[0] == "--watch",
+            ),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", *mode, "--package", PACKAGE, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    uid = _app_uid(fixtures, name)
+    assert [(e["kind"], e.get("app"), e.get("uid")) for e in events] == [
+        (kind, PACKAGE, uid)
+    ] * count, events
+    assert "dropped" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("stream", sorted(UID_STREAMS))
+def test_a_package_session_keeps_an_already_running_apps_records_by_uid(
+    stream, store, tmp_path, no_device
+):
+    """The same windows through the session worker's reader: no `Start proc`, counted by uid."""
+    profile, name, kind, count = UID_STREAMS[stream]
+    fixtures = _profile(profile)
+    session = _uid_session(
+        store,
+        _app_window(fixtures, name),
+        tmp_path,
+        PACKAGE,
+        _listing_names(_uid_listing(fixtures, name)),
+    )
+
+    events = store.read_events(session)
+    uid = _app_uid(fixtures, name)
+    assert [(e.kind, e.app, getattr(e, "uid", None)) for e in events] == [
+        (kind, PACKAGE, uid)
+    ] * count, events
+    summary = json.loads(anr_watcher.AnrBuster(store=store).stop(session, json_mode=True))
+    assert summary["unnamed_dropped"] == {"records": 0, "pids": []}, summary
+    assert summary.get("uid_attribution") == "uid", summary
+
+
+def test_a_record_from_another_uid_is_not_the_packages(toolchain, recorded):
+    """The recorded window, each jank record's uid set to another app's: none is the package's.
+
+    The other uid is com.google.android.gms's row of the recorded whole
+    package table. Shown to be another uid's, the records are no longer "may
+    be the package's": nothing is printed, and nothing is said dropped for
+    want of a name.
+    """
+    other = min(parse_package_uids(recorded.text("package_list_uid_all"), "com.google.android.gms"))
+    assert other != _app_uid(recorded, RESTART)
+    window = _with_uid(_app_window(recorded, RESTART), other)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
+            Rule(("logcat",), stdout=framed(window)),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--package", PACKAGE, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "", result.stdout
+    assert "dropped" not in result.stderr, result.stderr
+
+
+def test_a_package_session_does_not_count_another_uids_records(
+    recorded, store, tmp_path, no_device
+):
+    """The same derivation through the session's reader: nothing counted, nothing dropped unnamed."""
+    other = min(parse_package_uids(recorded.text("package_list_uid_all"), "com.google.android.gms"))
+    session = _uid_session(
+        store,
+        _with_uid(_app_window(recorded, RESTART), other),
+        tmp_path,
+        PACKAGE,
+        _listing_names(_uid_listing(recorded, RESTART)),
+    )
+
+    summary = json.loads(anr_watcher.AnrBuster(store=store).stop(session, json_mode=True))
+
+    assert summary["event_count"] == 0, summary
+    assert summary["unnamed_dropped"] == {"records": 0, "pids": []}, summary
+
+
+def test_events_jsonl_carries_the_records_uid_and_an_event_without_one_still_loads(
+    recorded, tmp_path, monkeypatch
+):
+    """The uid is carried into events.jsonl, and v0.8.0's events, which have none, still load.
+
+    The recorded jank record, through the record-to-event path and the
+    events.jsonl codec. Then v0.8.0's own events.jsonl
+    (tests/fixtures/anr_legacy_sessions), which has no uid key: decoded, not
+    skipped -- a required key would raise KeyError, which read_events
+    answers by skipping the line.
+    """
+    from common.anr_pipeline import event_from_jsonl, event_from_record
+
+    jank = next(
+        r for r in logcat.parse_records(recorded.data(f"{RESTART}.bin")) if r.tag == "Choreographer"
+    )
+    event = build_normalised_event(event_from_record(jank), session_start_ms=0, current_ms=1)
+    decoded = event_from_jsonl(event_to_jsonl(event))
+    assert getattr(decoded, "uid", None) == jank.uid == _app_uid(recorded, RESTART)
+
+    legacy_store, ids = _legacy_store(tmp_path, monkeypatch)
+    assert '"uid"' not in legacy_store.read_raw_events(ids["stopped"])
+    (legacy,) = legacy_store.read_events(ids["stopped"])
+    assert getattr(legacy, "uid", "missing") is None
+
+
+def test_a_package_sessions_events_without_a_uid_are_said_unattributed(
+    recorded, store, tmp_path, no_device
+):
+    """An earlier version's worker wrote no uid: its events are reported as attributed without one.
+
+    The session's events.jsonl as this version writes it, the uid key deleted
+    from each line (the shape v0.8.0's worker wrote), and the worker's
+    counters without the attribution it records.
+    """
+    window = [_neutral(recorded), *_app_window(recorded, RESTART)]
+    session = _uid_session(
+        store, window, tmp_path, PACKAGE, _listing_names(_uid_listing(recorded, RESTART))
+    )
+    path = store.events_path(session)
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert all("uid" in line for line in lines if "fingerprint" in line), lines
+    path.write_text(
+        "".join(json.dumps({k: v for k, v in line.items() if k != "uid"}) + "\n" for line in lines),
+        encoding="utf-8",
+    )
+    with store.transaction(session) as meta:
+        meta.extras["line_counters"].pop("uid_attribution", None)
+        store._write_meta(meta)
+
+    buster = anr_watcher.AnrBuster(store=store)
+    summary = json.loads(buster.stop(session, json_mode=True))
+
+    assert summary["event_count"] == 3, summary
+    assert summary.get("events_without_uid") == 3, summary
+    assert summary.get("uid_attribution") is None, summary
+    assert "carry no uid" in buster.get_details(session)
+
+
+@pytest.mark.parametrize("order", ["earlier first", "earlier second"])
+def test_diff_says_when_one_side_has_no_uid_attribution(
+    order, recorded, store, tmp_path, no_device
+):
+    """--diff reads summaries: one saved before uid attribution must say so in the verdict.
+
+    Two --package sessions over the same recorded window (no `Start proc`);
+    one summary has the uid-attribution keys deleted, the shape v0.8.0 saved.
+    Its jank was attributed only by a `Start proc` it saw, so what it holds is
+    not what the other side holds by the same rule: the verdict says it.
+    Diffed against an identical session that kept them, it is "no change".
+    """
+    window = [_neutral(recorded), *_app_window(recorded, RESTART)]
+    names = _listing_names(_uid_listing(recorded, RESTART))
+    buster = anr_watcher.AnrBuster(store=store)
+    current, twin, earlier = (
+        _uid_session(store, window, tmp_path, PACKAGE, names) for _ in range(3)
+    )
+    for session in (current, twin, earlier):
+        buster.stop(session)
+    _strip_uid_attribution(store, earlier)
+    first, second = (earlier, current) if order == "earlier first" else (current, earlier)
+
+    result = json.loads(buster.diff(first, second, json_mode=True))
+
+    assert f"{earlier} has no uid attribution" in result["verdict"], result["verdict"]
+    assert f"{current} has no uid attribution" not in result["verdict"], result["verdict"]
+    control = json.loads(buster.diff(current, twin, json_mode=True))
+    assert control["verdict"] == "no change", control["verdict"]
+
+
+def test_the_record_a_package_session_starts_on_keeps_its_uid(recorded, store, tmp_path, no_device):
+    """--since and `-T 1`'s replay share the record-to-event path: the replay's evidence has the uid.
+
+    The session's first record -- shown, never counted -- is the recorded
+    jank record of the app already running. It was dropped for want of a
+    name before it could be shown; now it is the package's by its uid, and
+    ``ambiguous_tail`` keeps the uid with it.
+    """
+    jank = next(f for f in _app_window(recorded, RESTART) if f.tag == "Choreographer")
+    session = _uid_session(
+        store,
+        [jank, _neutral(recorded)],
+        tmp_path,
+        PACKAGE,
+        _listing_names(_uid_listing(recorded, RESTART)),
+    )
+
+    summary = json.loads(anr_watcher.AnrBuster(store=store).stop(session, json_mode=True))
+
+    assert summary["event_count"] == 0, summary
+    assert [(t["kind"], t["app"], t.get("uid")) for t in summary["ambiguous_tail"]] == [
+        ("jank", PACKAGE, jank.uid)
+    ], summary["ambiguous_tail"]
+
+
+def test_watch_prints_the_record_it_starts_on_with_its_uid(toolchain, recorded):
+    """--watch's `-T 1` replay: the app's jank record, printed as the package's, marked, with its uid."""
+    window = _app_window(recorded, RESTART)
+    jank = next(f for f in window if f.tag == "Choreographer")
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
+            Rule(("logcat",), buffered=framed([jank]), stdout=framed(window[:1]), hang=True),
+        ],
+    )
+
+    result = toolchain.run(
+        "anr_watcher.py", "--watch", "--duration", "2", "--package", PACKAGE, "--json"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e["kind"], e.get("app"), e.get("uid"), e.get("ambiguous_tail")) for e in events] == [
+        ("jank", PACKAGE, jank.uid, True)
+    ], events
+
+
+@pytest.mark.parametrize(
+    ("what", "app_id"), [("isolated", FIRST_ISOLATED + 7), ("app zygote", FIRST_APP_ZYGOTE + 7)]
+)
+def test_jank_from_an_isolated_process_is_listed_never_counted(
+    what, app_id, recorded, store, tmp_path, no_device
+):
+    """An isolated process runs under a uid of its own, which no package's listing names.
+
+    Unrecorded end to end: no recorded process table holds an isolated
+    process, so the uid is derived -- the package's own user (from its
+    recorded uid), an app-id in AOSP's isolated or app-zygote range. Its
+    jank may be the package's (an isolated service of its) or any app's in
+    that user: listed under ``isolated_unattributed``, never counted, never
+    "dropped unnamed".
+    """
+    uid = _isolated_uid(recorded, RESTART, app_id)
+    window = [_neutral(recorded), *_with_uid(_app_window(recorded, RESTART), uid)]
+    session = _uid_session(
+        store, window, tmp_path, PACKAGE, _listing_names(_uid_listing(recorded, RESTART))
+    )
+    buster = anr_watcher.AnrBuster(store=store)
+
+    summary = json.loads(buster.stop(session, json_mode=True))
+
+    assert summary["event_count"] == 0, summary
+    assert summary.get("isolated_unattributed") == {"records": 3, "uids": [uid]}, summary
+    assert summary["unnamed_dropped"] == {"records": 0, "pids": []}, summary
+    assert "Isolated: 3 jank/StrictMode records" in buster.get_details(session)
+
+
+def test_since_says_what_it_did_not_count_from_isolated_processes(toolchain, recorded):
+    """--since: the same isolated jank is not printed, and stderr says why."""
+    uid = _isolated_uid(recorded, RESTART, FIRST_ISOLATED + 7)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
+            Rule(("logcat",), stdout=framed(_with_uid(_app_window(recorded, RESTART), uid))),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--package", PACKAGE, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "", result.stdout
+    assert "3 jank/StrictMode records from isolated processes" in result.stderr, result.stderr
+
+
+def test_a_jank_cluster_missing_beside_isolated_records_is_unconfirmed(
+    recorded, store, tmp_path, no_device
+):
+    """--diff: isolated jank may be the package's, so a jank cluster absent beside it is not resolved."""
+    window = [_neutral(recorded), *_app_window(recorded, RESTART)]
+    uid = _isolated_uid(recorded, RESTART, FIRST_ISOLATED + 7)
+    names = _listing_names(_uid_listing(recorded, RESTART))
+    buster = anr_watcher.AnrBuster(store=store)
+    before = _uid_session(store, window, tmp_path, PACKAGE, names)
+    after = _uid_session(
+        store, [_neutral(recorded), *_with_uid(window[1:], uid)], tmp_path, PACKAGE, names
+    )
+    buster.stop(before)
+    buster.stop(after)
+
+    result = json.loads(buster.diff(before, after, json_mode=True))
+
+    assert result["resolved_clusters"] == [], result["verdict"]
+    assert [c["absent_from"] for c in result["unconfirmed"]] == [after], result
+    assert result["verdict"].startswith("inconclusive: "), result["verdict"]
+    assert "isolated" in result["verdict"], result["verdict"]
+
+
+def test_a_shared_uid_is_counted_and_said(recorded, store, tmp_path, no_device):
+    """sharedUserId: the whole uid table gives the package's uid to other packages too.
+
+    The recorded whole table (package_list_uid_all) lists several packages on
+    one uid; the jank records' uid is set to it, under --package one of them.
+    The jank is counted -- it may be the package's -- and the summary names
+    the others (``shared_uid``), never attributing it silently.
+    """
+    from common.device_utils import parse_uid_table
+
+    table_text = recorded.text("package_list_uid_all")
+    table = parse_uid_table(table_text)
+    package = "com.android.providers.media"
+    (uid,) = table[package]
+    others = sorted(name for name, uids in table.items() if name != package and uid in uids)
+    assert len(others) >= 2, others
+    names = anr_watcher._ProcessNames(
+        package_uids=lambda wanted: parse_package_uids(table_text, wanted),
+        uid_table=lambda: parse_uid_table(table_text),
+    )
+    window = [_neutral(recorded), *_with_uid(_app_window(recorded, RESTART), uid)]
+    session = _uid_session(store, window, tmp_path, package, names)
+    buster = anr_watcher.AnrBuster(store=store)
+
+    summary = json.loads(buster.stop(session, json_mode=True))
+
+    assert summary["event_count"] == 3, summary
+    assert summary["shared_uid"] == others, summary
+    details = buster.get_details(session)
+    assert f"Shared uid: the package's uid is also {', '.join(others)}'s" in details, details
+
+
+def test_since_marks_records_of_a_shared_uid(toolchain, recorded):
+    """--since --json: each such event names the other packages on its uid, and stderr says so."""
+    from common.device_utils import parse_uid_table
+
+    table_text = recorded.text("package_list_uid_all")
+    table = parse_uid_table(table_text)
+    package = "com.android.providers.media"
+    (uid,) = table[package]
+    others = sorted(name for name, uids in table.items() if name != package and uid in uids)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("cmd", "package"), stdout=table_text),
+            Rule(("logcat",), stdout=framed(_with_uid(_app_window(recorded, RESTART), uid))),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--package", package, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e.get("app"), e.get("shared_uid")) for e in events] == [(package, others)] * 3, events
+    assert "may be theirs" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("listing", "counted"), [("package_list_uid_two_users", 3), ("package_list_uid", 0)]
+)
+def test_a_secondary_users_uid_is_the_packages_only_where_it_is_installed(
+    listing, counted, recorded, store, tmp_path, no_device
+):
+    """The uid is kept whole, user component included.
+
+    The jank records' uid set to the package's uid in the second user, as
+    the recorded two-user listing gives it: the package's there. Against the
+    one-user listing that uid is no uid of the package's -- it is installed
+    for no such user -- and is not counted.
+    """
+    secondary = max(parse_package_uids(recorded.text("package_list_uid_two_users"), PACKAGE))
+    assert secondary // PER_USER > 0
+    window = [_neutral(recorded), *_with_uid(_app_window(recorded, RESTART), secondary)]
+    session = _uid_session(store, window, tmp_path, PACKAGE, _listing_names(recorded.text(listing)))
+
+    summary = json.loads(anr_watcher.AnrBuster(store=store).stop(session, json_mode=True))
+
+    assert summary["event_count"] == counted, summary
+    assert summary["unnamed_dropped"] == {"records": 0, "pids": []}, summary
+
+
+def test_the_uid_classifier_on_recorded_uids(recorded):
+    """``classify_uid`` on uids the recordings hold, and isolated ones derived in the package's users.
+
+    The package's uids are the recorded two-user listing's; system_server's
+    is ps_all_pid_uid's row for the pid measured with it; a shared uid is the
+    whole table's. An isolated or app-zygote uid is the package's user plus
+    AOSP's app-id range -- no recording holds one.
+    """
+    from common.anr_pipeline import classify_uid
+
+    package_uids = parse_package_uids(recorded.text("package_list_uid_two_users"), PACKAGE)
+    users = sorted(uid // PER_USER for uid in package_uids)
+    assert len(users) == 2, users
+    system_server = parse_ps_uids(recorded.text("ps_all_pid_uid"))[
+        _entry(recorded, "ps_all_pid_uid")["system_server_pid"]
+    ]
+    shared = min(
+        parse_package_uids(recorded.text("package_list_uid_all"), "com.android.providers.media")
+    )
+    absent_user = max(users) + 1
+
+    for uid in package_uids:
+        assert classify_uid(uid, package_uids) == "package", uid
+    for user in users:
+        for app_id in (FIRST_ISOLATED, FIRST_ISOLATED + 999, FIRST_APP_ZYGOTE, 98_999):
+            assert classify_uid(user * PER_USER + app_id, package_uids) == "isolated", (
+                user,
+                app_id,
+            )
+    assert classify_uid(absent_user * PER_USER + FIRST_ISOLATED, package_uids) == "other"
+    assert classify_uid(system_server, package_uids) == "other"
+    assert classify_uid(shared, package_uids) == "other"
+    assert classify_uid(None, package_uids) == "unknown"
+    assert classify_uid(min(package_uids), None) == "unknown"
+
+
+def test_the_whole_uid_table_parses_on_both_levels(recorded):
+    """parse_uid_table reads every row of `cmd package list packages -U`, comma-separated uids too."""
+    from common.device_utils import parse_uid_table
+
+    for fixtures in (recorded, API33):
+        text = fixtures.text("package_list_uid_all")
+        table = parse_uid_table(text)
+        assert len(table) == len(text.splitlines()), fixtures.name
+        assert table["android"] == frozenset({1000}), fixtures.name
+    two_users = recorded.text("package_list_uid_two_users")
+    assert parse_uid_table(two_users) == {PACKAGE: parse_package_uids(two_users, PACKAGE)}
+
+
+def test_uid_attribution_loop_from_start_to_diff(recorded, tmp_path):
+    """The capability end to end, each step reading the skill's own output.
+
+    A live device (``_LiveDevice``) whose logcat replays the recorded window
+    with its `Start proc` removed: --start --package prints the session id;
+    --stop --json, given it, prints the summary, whose jank is the
+    package's; --get-details --raw prints its events.jsonl, each line
+    decoded and carrying the app's uid. A second session over the window
+    less its second jank record goes the same way, and --diff of the two ids
+    the --stops printed reads the drift between them.
+    """
+    from common.anr_pipeline import event_from_jsonl
+
+    window = _app_window(recorded, RESTART)
+    assert window[0] == _history(recorded)
+    jank = [f for f in window if f.tag == "Choreographer"]
+    assert len(jank) == 3
+    shorter = [f for f in window if f is not jank[1]]
+    uid = _app_uid(recorded, RESTART)
+    stopped_ids = []
+    for records, count in ((window, 3), (shorter, 2)):
+        device = _LiveDevice(tmp_path, _device_answers(recorded, records))
+        started = device.run("--start", "--serial", "emulator-5554", "--package", PACKAGE, "--json")
+        assert started.returncode == 0, started.stdout + started.stderr
+        session_id = json.loads(started.stdout)["session_id"]
+        try:
+            deadline = time.monotonic() + 30
+            while len(device.store.read_events(session_id)) < count:
+                if time.monotonic() > deadline:
+                    pytest.fail(f"the worker wrote {device.store.read_events(session_id)}")
+                time.sleep(0.05)
+            stopped = device.run("--stop", session_id, "--json")
+        finally:
+            device.kill_workers()
+        assert stopped.returncode == 0, stopped.stderr
+        summary = json.loads(stopped.stdout)
+        assert summary.get("uid_attribution") == "uid", summary
+        # The device's whole uid table was asked, and names no other package.
+        assert summary.get("shared_uid") == [], summary
+        assert _jank_clusters(summary) == [(PACKAGE, "package")], summary["clusters"]
+        raw = device.run("--get-details", summary["session_id"], "--raw")
+        assert raw.returncode == 0, raw.stderr
+        printed = [
+            event_from_jsonl(line)
+            for line in raw.stdout.splitlines()
+            if line.strip() and "fingerprint" in line
+        ]
+        assert [(e.kind, e.app, getattr(e, "uid", None)) for e in printed] == [
+            ("jank", PACKAGE, uid)
+        ] * count, raw.stdout
+        stopped_ids.append(summary["session_id"])
+        whole_table = [call for call in device.calls() if call[-5:] == WHOLE_UID_TABLE]
+        assert len(whole_table) == len(stopped_ids), device.calls()
+
+    diffed = device.run("--diff", *stopped_ids, "--json")
+
+    assert diffed.returncode == 0, diffed.stderr
+    result = json.loads(diffed.stdout)
+    assert result["verdict"] == "drift: 0 worsened, 1 improved", result
+    (drift,) = result["drift"]
+    assert drift["max_duration_ms_b"] < drift["max_duration_ms_a"], drift
+
+
+# --- what main already attributed, attributed alike ---------------------------
+#
+# The --package filter now reads a jank or StrictMode record's uid, and the
+# events.jsonl decoder reads an optional uid. Each place that narrows what is
+# kept is held to what main already attributed correctly: a verified ANR, a
+# jank record whose pid a `Start proc` named, and main's own events.
+
+
+@pytest.mark.parametrize(
+    "mode", [("--since", "1m"), ("--watch", "--duration", "2")], ids=["since", "watch"]
+)
+def test_package_keeps_the_verified_anr_main_kept(mode, toolchain, recorded):
+    """An ANR is untouched by uid attribution: filed under the package, verified, printed once.
+
+    The recorded broadcast ANR's records, its process shown to be the
+    package's as the device shows it (the recorded uid listing, and
+    ps_pid_uid for the report's own PID:, substituted) -- as
+    test_one_stall_in_the_stream_is_one_printed_event reads it, here under
+    --package.
+    """
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, BROADCAST) + "\n"),
+            *uid_rules(recorded, PACKAGE, _stated_pid(_anr_record(recorded, BROADCAST))),
+            Rule(
+                ("logcat",),
+                buffered=framed([_history(recorded)]),
+                stdout=recorded.data(f"{BROADCAST}.bin"),
+                hang=mode[0] == "--watch",
+            ),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", *mode, "--package", PACKAGE, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e["kind"], e["anr_package"], e["attribution"]) for e in events] == [
+        ("anr", PACKAGE, "verified")
+    ], events
+    assert "dropped" not in result.stderr, result.stderr
+
+
+def test_a_package_session_keeps_the_verified_anr_main_kept(recorded, store, tmp_path, no_device):
+    """The same ANR through a --package session's reader: one event, the package's, verified."""
+    session = _package_session(
+        store,
+        [_history(recorded), *_frames(recorded, BROADCAST)],
+        recorded,
+        tmp_path,
+        names=_oracle(recorded, BROADCAST),
+    )
+
+    (event,) = store.read_events(session)
+
+    assert (event.kind, event.app, event.attribution) == ("anr", PACKAGE, "verified"), event
+    summary = json.loads(anr_watcher.AnrBuster(store=store).stop(session, json_mode=True))
+    assert summary["unattributed_anrs"] == 0, summary
+
+
+def test_a_jank_record_a_start_proc_named_is_the_packages_as_on_main(
+    recorded, store, tmp_path, no_device
+):
+    """A pid system_server's `Start proc` named keeps its name, its site and its fingerprint.
+
+    The recorded first launch -- `Start proc`, then the process's jank, its
+    uid the package's -- read by a --package session and by a session without
+    --package (main's naming path). Both key the jank by the package, with
+    one fingerprint, and the pid is named (not listed as unnamed).
+    """
+    start, jank = _launch(recorded, 0)
+    records = [_neutral(recorded), start, jank]
+    filtered = _package_session(store, records, recorded, tmp_path)
+    unfiltered = _session_starting_on(store, records, tmp_path, process_names=_names(recorded))
+
+    (kept,) = store.read_events(filtered)
+    (named,) = store.read_events(unfiltered)
+
+    assert (kept.app, kept.identity) == (named.app, named.identity) == (PACKAGE, "package")
+    assert kept.fingerprint == named.fingerprint
+    summary = json.loads(anr_watcher.AnrBuster(store=store).stop(filtered, json_mode=True))
+    assert summary["unnamed_pids"] == {"count": 0, "pids": []}, summary
+    assert summary["clusters"][0]["identity"] == "package", summary["clusters"]
+
+
+def test_mains_jank_events_decode_as_they_did(recorded, store, tmp_path, no_device):
+    """The decoder reads ``uid`` only when it is there: main's events decode field for field.
+
+    This version's events of the recorded first launch (named by its `Start
+    proc`), rewritten without the uid key -- the shape main's worker wrote --
+    read back equal to the originals but for ``uid``, which is None.
+    """
+    start, jank = _launch(recorded, 0)
+    session = _package_session(store, [_neutral(recorded), start, jank], recorded, tmp_path)
+    before = store.read_events(session)
+    path = store.events_path(session)
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    path.write_text(
+        "".join(json.dumps({k: v for k, v in ln.items() if k != "uid"}) + "\n" for ln in lines),
+        encoding="utf-8",
+    )
+
+    after = store.read_events(session)
+
+    assert before and all(event.uid is not None for event in before), before
+    assert after == [replace(event, uid=None) for event in before], after
+
+
+@pytest.mark.parametrize("sides", ["both earlier", "unfiltered beside uid"])
+def test_diff_adds_no_uid_caveat_when_both_sides_kept_by_one_rule(
+    sides, recorded, store, tmp_path, no_device
+):
+    """The new caveat says only a difference of rule: where there is none, the verdict is main's.
+
+    Two --package summaries both saved without the uid keys (main's shape)
+    were kept by one rule; a session without --package beside a uid one
+    attributed nothing it could have dropped. Over the same recorded first
+    launch (named by its `Start proc`), each pair is "no change".
+    """
+    start, jank = _launch(recorded, 0)
+    records = [_neutral(recorded), start, jank]
+    buster = anr_watcher.AnrBuster(store=store)
+    if sides == "both earlier":
+        first = _package_session(store, records, recorded, tmp_path)
+        second = _package_session(store, records, recorded, tmp_path)
+        for session in (first, second):
+            buster.stop(session)
+            _strip_uid_attribution(store, session)
+    else:
+        first = _session_starting_on(store, records, tmp_path, process_names=_names(recorded))
+        second = _package_session(store, records, recorded, tmp_path)
+        buster.stop(first)
+        buster.stop(second)
+
+    result = json.loads(buster.diff(first, second, json_mode=True))
+
+    assert result["verdict"] == "no change", result["verdict"]
+
+
+# --- the package's SDK sandbox, and a uid that changed mid-read ---------------
+#
+# AOSP Process.toSdkSandboxUid: an app's SDK sandbox runs under the app's uid
+# plus 10000 (FIRST_SDK_SANDBOX_UID 20000 - FIRST_APPLICATION_UID 10000), in
+# the same user -- app ids 20000..29999. It is no package's uid in any
+# listing, and the app's SDKs, not the app, write its records: like an
+# isolated process's, they may be the package's doing, so they are listed,
+# never counted, never dropped unsaid (Codex review of PR 3: they were
+# dropped silently, and --diff read the missing jank as "1 resolved").
+SDK_SANDBOX_OFFSET = 10_000
+
+
+def _sandbox_jank(recorded) -> tuple[Frame, int]:
+    """The restart recording's first jank record (pid 32437), its writer uid set to the app's sandbox's.
+
+    Derived: only the uid logd stamped is changed, to the recorded app uid
+    plus AOSP's SDK sandbox offset. No recording holds an SDK sandbox record.
+    """
+    _, jank = _launch(recorded, 0)
+    sandbox = _app_uid(recorded, RESTART) + SDK_SANDBOX_OFFSET
+    return jank.replace(uid=sandbox), sandbox
+
+
+@pytest.mark.parametrize(
+    "mode", [("--since", "1m"), ("--watch", "--duration", "2")], ids=["since", "watch"]
+)
+def test_package_says_what_it_did_not_count_from_its_sdk_sandbox(mode, toolchain, recorded):
+    """--watch / --since: the sandbox's jank is not printed, and stderr says so -- never silently."""
+    jank, sandbox = _sandbox_jank(recorded)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
+            Rule(
+                ("logcat",),
+                buffered=framed([_neutral(recorded)]),
+                stdout=framed([jank]),
+                hang=mode[0] == "--watch",
+            ),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", *mode, "--package", PACKAGE, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "", result.stdout
+    said = f"1 jank/StrictMode record from the package's SDK sandbox (uid {sandbox})"
+    assert said in result.stderr, result.stderr
+
+
+def test_a_package_session_lists_its_sdk_sandboxs_jank_never_counted(
+    recorded, store, tmp_path, no_device
+):
+    """A session: the sandbox's jank is listed under ``sdk_sandbox_unattributed``, not counted."""
+    jank, sandbox = _sandbox_jank(recorded)
+    session = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    buster = anr_watcher.AnrBuster(store=store)
+
+    summary = json.loads(buster.stop(session, json_mode=True))
+
+    assert summary["event_count"] == 0, summary
+    assert summary.get("sdk_sandbox_unattributed") == {"records": 1, "uids": [sandbox]}, summary
+    assert summary["unnamed_dropped"] == {"records": 0, "pids": []}, summary
+    assert "SDK sandbox: 1 jank/StrictMode record" in buster.get_details(session)
+
+
+def test_a_jank_cluster_missing_beside_sdk_sandbox_records_is_not_resolved(
+    recorded, store, tmp_path, no_device
+):
+    """Codex's replay: an ordinary session, then one whose jank came from the app's SDK sandbox.
+
+    `--diff` said "improvement: 1 resolved" -- the sandbox session dropped
+    its jank silently. It holds evidence it did not count: the cluster is
+    unconfirmed, and the verdict says what was not counted.
+    """
+    _, jank = _launch(recorded, 0)
+    sandboxed, _ = _sandbox_jank(recorded)
+    ordinary = _package_session(store, [_neutral(recorded), jank], recorded, tmp_path)
+    sandbox = _package_session(store, [_neutral(recorded), sandboxed], recorded, tmp_path)
+    buster = anr_watcher.AnrBuster(store=store)
+    buster.stop(ordinary)
+    buster.stop(sandbox)
+
+    result = json.loads(buster.diff(ordinary, sandbox, json_mode=True))
+
+    assert "improvement" not in result["verdict"], result["verdict"]
+    assert result["resolved_clusters"] == [], result["verdict"]
+    assert [c["absent_from"] for c in result["unconfirmed"]] == [sandbox], result
+    assert "SDK sandbox" in result["verdict"], result["verdict"]
+
+
+def test_the_uid_classifier_names_the_packages_sdk_sandbox(recorded):
+    """The package's uid + 10000, in each of its users, is its SDK sandbox; another app's is not."""
+    from common.anr_pipeline import classify_uid
+
+    package_uids = parse_package_uids(recorded.text("package_list_uid_two_users"), PACKAGE)
+    other = min(
+        parse_package_uids(recorded.text("package_list_uid_all"), "com.android.providers.media")
+    )
+
+    for uid in package_uids:
+        assert classify_uid(uid + SDK_SANDBOX_OFFSET, package_uids) == "sdk_sandbox", uid
+    assert classify_uid(other + SDK_SANDBOX_OFFSET, package_uids) == "other"
+
+
+def _restarted_under(recorded, uid: int) -> list[Frame]:
+    """The second launch's `Start proc` and jank, as if the app had been reinstalled under ``uid``.
+
+    Derived: system_server's recorded `Start proc` record with its u0a<n>
+    uid replaced by ``uid``'s (u0a240: the uid the recorded whole package
+    table, package_list_uid_all, gives the app after a reinstall), and the
+    process's recorded jank with its writer uid set to ``uid``.
+    """
+    start, jank = _launch(recorded, 1)
+    app_id = uid % 100_000 - 10_000
+    message = start.message.replace("/u0a205 ", f"/u0a{app_id} ")
+    if message == start.message:
+        pytest.fail("the recorded Start proc no longer names u0a205")
+    return [start.replace(message=message), jank.replace(uid=uid)]
+
+
+def _reinstalled_uid(recorded) -> int:
+    (uid,) = parse_package_uids(recorded.text("package_list_uid_all"), PACKAGE)
+    assert uid != _app_uid(recorded, RESTART), "the whole table no longer shows a reinstall"
+    return uid
+
+
+def test_since_says_when_the_packages_uid_changed_during_the_read(toolchain, recorded):
+    """The package's uids are asked once per read: a `Start proc` under another uid is said.
+
+    The first launch's jank (the package's uid, as asked), then the second
+    launch as if the app had been reinstalled (``_restarted_under``): its
+    jank is another uid's to the read's answer, so it goes uncounted -- and
+    stderr says the package's uid changed, to start a new read.
+    """
+    _, jank = _launch(recorded, 0)
+    reinstalled = _reinstalled_uid(recorded)
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("pidof", "system_server"), stdout=_system_server(recorded, RESTART) + "\n"),
+            Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
+            Rule(
+                ("logcat",),
+                stdout=framed([_neutral(recorded), jank, *_restarted_under(recorded, reinstalled)]),
+            ),
+        ],
+    )
+
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--package", PACKAGE, "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(result.stdout.splitlines()) == 1, result.stdout
+    assert f"under uid {reinstalled}" in result.stderr, result.stderr
+    assert "start a new read" in result.stderr, result.stderr
+
+
+def test_a_package_session_says_when_the_packages_uid_changed(recorded, store, tmp_path, no_device):
+    """A session records it (``package_uid_changed``), and --diff concludes nothing about jank from it."""
+    _, jank = _launch(recorded, 0)
+    reinstalled = _reinstalled_uid(recorded)
+    changed = _package_session(
+        store,
+        [_neutral(recorded), jank, *_restarted_under(recorded, reinstalled)],
+        recorded,
+        tmp_path,
+    )
+    steady = _package_session(
+        store, [_neutral(recorded), *_launch(recorded, 1)], recorded, tmp_path
+    )
+    buster = anr_watcher.AnrBuster(store=store)
+
+    summary = json.loads(buster.stop(changed, json_mode=True))
+    buster.stop(steady)
+    result = json.loads(buster.diff(steady, changed, json_mode=True))
+
+    assert summary.get("package_uid_changed") == [reinstalled], summary
+    assert "Uid changed:" in buster.get_details(changed)
+    assert (result["drift"], result["stable_count"]) == ([], 0), result
+    assert "uid changed" in result["verdict"], result["verdict"]

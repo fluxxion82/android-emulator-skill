@@ -802,8 +802,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       deletes nothing when it rejects one
     - Every reader — `--watch`, `--since` and a session's worker — reads
       logd's records (`logcat -B`, `common/logcat.py`), never text: each
-      record carries the pid logd took from the writing socket, and an ANR
-      report arrives whole, as one record
+      record carries the pid and uid logd took from the writing socket, and
+      an ANR report arrives whole, as one record. Each event keeps that uid
+      (`"uid"` in `--watch`/`--since` JSON and in a session's
+      `events.jsonl`; `uid=` in `--get-details --cluster N`); an event an
+      earlier version wrote has none and still loads
     - An ANR is counted once per incident as far as the log can show it.
       ActivityManager logs an ANR as ONE record of many lines; its `PID:` (the
       stalled app's own pid — the record's pid is system_server's) and
@@ -894,13 +897,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       against when a line was *read*, and a line read late was given a
       recycled pid's new owner. **So only a process started while the session
       runs is named**: an app already running when `--start` was called (warm
-      in the background) is keyed by pid. Jank whose process could not be
-      named is keyed by pid (`identity: "pid"`), and the summary lists those
-      pids — `"unnamed_pids": {"count": N, "pids": [...]}` and one `Unnamed:`
-      sentence in text; `--diff` lists it under `not_comparable` instead of
-      calling it resolved or new, and so does a named cluster whose only
-      possible counterpart in the other session is such a pid-keyed cluster of
-      the same kind and text
+      in the background) is keyed by pid. A name is a label: under
+      `--package`, whose a jank or StrictMode record is goes by its uid
+      (below), named or not. Jank whose process could not be named is keyed
+      by pid (`identity: "pid"`) — unless `--package` attributed it by uid,
+      which keys it by the package — and the summary lists those pids —
+      `"unnamed_pids": {"count": N, "pids": [...]}` and one `Unnamed:`
+      sentence in text; `--diff` lists a pid-keyed cluster under
+      `not_comparable` instead of calling it resolved or new, and so does a
+      named cluster whose only possible counterpart in the other session is
+      such a pid-keyed cluster of the same kind and text
     - `--stop` signals the session's worker only once the process at its
       recorded pid is shown to still be it: the random token `--start` put on
       its command line, and the start time `ps` gave when it claimed the pid.
@@ -957,8 +963,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `--terse` cuts clusters, never a disclosure: the one-line form keeps
       them as a bracketed clause (`[stream broken; 1 record cut by the stop;
       1 stream restart losing a gap; 2 ANR records unverified; 1 pid unnamed;
-      1 jank/StrictMode record dropped unnamed; 1 record may predate the
-      session, not counted]`)
+      1 jank/StrictMode record dropped unnamed; no uid attribution: package
+      uids unknown; uid shared with 2 packages; 1 isolated jank/StrictMode
+      record not counted; 1 record may predate the session, not counted]`)
     - `--diff` never says "no change" about what it could not see: with
       clusters set aside as not comparable, or a session saved incomplete, and
       nothing else changed, the verdict is `inconclusive: …` naming why; a
@@ -971,13 +978,26 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       or `unattributed_anrs` — whose missing cluster may be right there: its
       absences are `unconfirmed`, and the verdict names what it did not count
       (a counted ANR against the same ANR held only as either read
-      "improvement: 1 resolved"). And a `--package` session that dropped
-      jank or StrictMode for want of a name (`unnamed_dropped`, below): a
-      jank or StrictMode cluster absent from it is `unconfirmed` (the same
-      jank, its process started before the capture, read as "improvement: 1
-      resolved"), and the verdict says what it dropped, even when nothing is
-      missing — the dropped record may be a cluster the other session lacks.
-      Its ANR clusters still compare: a dropped jank record is no ANR. A
+      "improvement: 1 resolved"). And a `--package` session that left jank or
+      StrictMode uncounted that may be the package's — dropped because
+      nothing could show whose it was (`unnamed_dropped`, below), written by
+      an isolated process or the package's SDK sandbox
+      (`isolated_unattributed`, `sdk_sandbox_unattributed`, below), or under
+      a uid the package changed to during the session
+      (`package_uid_changed`, below): a jank or
+      StrictMode cluster absent from it is `unconfirmed` (the same jank, its
+      process started before the capture, read as "improvement: 1
+      resolved"), and the verdict says what it left uncounted, even when
+      nothing is missing — the uncounted record may be a cluster the other
+      session lacks. Its ANR clusters still compare: a dropped jank record is
+      no ANR. When one side attributed `--package`'s jank and StrictMode by
+      uid and the other did not — a summary an earlier version saved
+      (`uid_attribution` absent or `null`), or a session the device gave no
+      uids for the package (`"package_uids_unknown"`) — the verdict says so:
+      `inconclusive: <id> has no uid attribution (recorded by an earlier
+      version, whose --package kept jank/StrictMode only when a Start proc it
+      saw named the process)` in place of "no change", the same caveat after
+      a verdict that found a change. A
       `--package` summary saved before drops were counted has no
       `unnamed_dropped` (`--stop` of a session an earlier version's worker
       ran gives `"unnamed_dropped": null`, and a `Dropped: not recorded`
@@ -988,9 +1008,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       A cluster both hold does not drift either when one side is incomplete —
       its maximum there is only a lower bound — but is listed under
       `not_compared` with `"reason": "not comparable: <id> is incomplete"`;
-      so is a jank or StrictMode cluster against a side that dropped such
-      records unnamed (`"<id> dropped N jank/StrictMode records of M pids it
-      never named, which --package could not attribute"`)
+      so is a jank or StrictMode cluster against a side that left such
+      records uncounted (`"<id> dropped N jank/StrictMode records of M pids it
+      never named, which --package could not attribute"`, `"<id> did not
+      count N jank/StrictMode records of M isolated uids, which may be the
+      package's"`, `"<id> did not count N jank/StrictMode records of the
+      package's SDK sandbox"`, `"<id> saw the package's uid changed during
+      the session (uid N), whose jank/StrictMode went uncounted"`)
     - A session keeps the fingerprint version it was captured with — `--stop`
       on an older session does not restamp it — and `--diff` refuses (exit 1,
       naming both versions) two sessions captured under different versions.
@@ -1064,29 +1088,84 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       before the next starts
     - `--package PKG` keeps an event only when its package is exactly PKG, by
       the identity the reader established: the package ActivityManager's ANR
-      report names (or its component's), or the name a session verified for
-      a jank record's process. It used to match substrings of the message
-      and tag, and the package's last segment alone, so the recorded
-      Choreographer text "The application may…" passed `com.example.app` and
-      `com.example.application` alike. A session keeps its own jank when it
-      named the janking process — that is, when the process started while the
-      session ran (above); a process already running is keyed by pid, and
-      `--package` drops its jank (its pid is listed under `unnamed_pids`).
-      What it drops so is counted, never dropped unsaid — it may be the
-      package's: `"unnamed_dropped": {"records": N, "pids": [...]}` in the
-      summary (records at or above the frame threshold), a `Dropped:` line in
-      text, and `--diff` concludes nothing about jank from such a session
-      (above). **The cost:** under `--package`, one such jank or StrictMode
-      record from ANY process the session did not see start — an unrelated
-      app already running, SystemUI, the launcher, the app itself warm —
-      makes that session's jank/StrictMode conclusions in `--diff`
-      inconclusive; its ANR conclusions stand. Start the session before the
-      app, on a device with little else running, to keep them.
-      **`--watch` and `--since` do not name processes**: a
-      Choreographer or StrictMode record names no package, so under `--package`
-      they drop all jank and StrictMode events, and say how many on stderr
-      (`warning: --package dropped N jank/StrictMode records`; the `--since`
-      text summary says so too)
+      report names (or its component's), or, for jank and StrictMode, the
+      record's uid. It used to match substrings of the message and tag, and
+      the package's last segment alone, so the recorded Choreographer text
+      "The application may…" passed `com.example.app` and
+      `com.example.application` alike. **A jank or StrictMode record is the
+      package's when its uid is one of the package's uids** — in every mode,
+      `--watch`, `--since` and a session, and whether or not the process
+      started while the read ran. Choreographer and StrictMode write from
+      inside the app, and logd stamps each record with the writing process's
+      uid, which no app can choose (recorded: every jank record of the
+      fixture app on API 35 carries its uid 10205, every StrictMode record on
+      API 33 its uid 10174). The package's uids are `cmd package list packages
+      -U <package>`'s, one per user it is installed for, each kept whole: the
+      package's uid in a second user counts, the same app id in a user it is
+      not installed for does not. The event then reads `"app": "<package>"`
+      (a session keys its jank by the package, so a restart or a warm start
+      is one site). A record another uid wrote is not the package's and is
+      dropped, as another package's ANR is. What it cannot decide, or decides
+      with a doubt, is said:
+      - **`shared_uid`**: when the device's whole uid table (`cmd package
+        list packages -U`, unfiltered, asked once) gives the package's uid to
+        other packages too (sharedUserId), their jank is the same uid's: it is
+        counted, and the summary names them — `"shared_uid": ["<other>",
+        ...]` (`null` when the table could not be read), a `Shared uid: the
+        package's uid is also <others>'s (sharedUserId), so jank/StrictMode
+        counted for it by uid may be theirs.` line in text. `--watch` /
+        `--since` put `"shared_uid"` on each such event (`[uid shared with
+        …]` in text) and warn on stderr
+      - **`isolated_unattributed`**: an isolated process
+        (`android:isolatedProcess`) or one an app zygote spawned runs under a
+        uid of its own (app id 99000–99999 or 90000–98999) that no package's
+        listing names, so its record may be the package's or any app's in
+        that user. It is never counted: `"isolated_unattributed": {"records":
+        N, "uids": [...]}` in the summary (records at or above the frame
+        threshold), an `Isolated:` line in text, `warning: --package did not
+        count N jank/StrictMode records from isolated processes (uid …)` on
+        stderr from `--watch` / `--since`, and `--diff` concludes nothing
+        about jank from such a session (above)
+      - **`sdk_sandbox_unattributed`**: the package's own SDK sandbox (the
+        Privacy Sandbox process that runs its SDKs) has the package's uid
+        plus 10000 in the same user (app id 20000–29999). Its records are the
+        SDKs', not the app's, and no listing names the uid: never counted,
+        never dropped unsaid — `"sdk_sandbox_unattributed": {"records": N,
+        "uids": [...]}`, an `SDK sandbox:` line in text, `warning: --package
+        did not count N jank/StrictMode records from the package's SDK
+        sandbox (uid …)` on stderr, and `--diff` concludes nothing about jank
+        from such a session. Another app's sandbox is that app's (the mapping
+        is fixed) and is dropped as another uid's. Dropped silently before,
+        a sandbox's jank read as "improvement: 1 resolved"
+      - **The package's uids are asked once per read** (`--watch`, `--since`,
+        a session) and kept, as is the whole uid table. Installing,
+        reinstalling, or adding a user for the package during a read gives it
+        a uid that answer lacks, and its records then read as another uid's:
+        start a new read after any of those. When system_server starts a
+        process named exactly the package under such a uid, it is said —
+        `warning: system_server started a process named <package> under uid
+        N, which the package's uids as this read asked them at its start do
+        not include … -- start a new read.` on stderr from `--watch` /
+        `--since`; `"package_uid_changed": [N]`, a `Uid changed:` line in
+        text, and no jank conclusion in `--diff` from a session. (Another app
+        may name its process after the package too, which that sentence
+        cannot rule out.)
+      - **`unnamed_dropped`**: when the device did not give the package's
+        uids, no record can be shown to be the package's — nor can a `Start
+        proc` name its process — so every jank and StrictMode record is
+        dropped, counted, never dropped unsaid: `"unnamed_dropped":
+        {"records": N, "pids": [...]}` and `"uid_attribution":
+        "package_uids_unknown"` in the summary, `Dropped:` and `No uid
+        attribution:` lines in text, `warning: --package dropped N
+        jank/StrictMode records` on stderr from `--watch` / `--since` (their
+        text summary says so too), and `--diff` concludes nothing about jank
+        from such a session (above)
+      - **`uid_attribution`**: a session summary says how it attributed —
+        `"uid"` (by each record's uid), `"package_uids_unknown"`,
+        `"unfiltered"` (no `--package`), or `null`: not recorded, a summary
+        an earlier version saved, which `--diff` names (above).
+        `"events_without_uid": N` counts the jank/StrictMode events written
+        with no uid (an earlier version's worker), a `No uid:` line in text
     - Legacy: `--watch [--duration N]`, `--since 5m`. A logcat read that adb
       ends with a failure is a refusal, not "no ANRs": exit 3 when the device
       is unavailable (an unknown `--serial` is caught before streaming), 1
@@ -1539,14 +1618,27 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
 
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
-- `anr_watcher --watch` / `--since` with `--package` drop every jank and
-  StrictMode event, and say how many they dropped: those lines name no
-  package, and only session mode names the process behind a pid. Use
-  `--start`/`--stop` to keep an app's jank.
-- An ANR session names only a process started while it runs (system_server's
-  `Start proc` is the only evidence it takes); an app already running when
-  `--start` is called is keyed by pid, listed under `unnamed_pids`, and its
-  jank is dropped under `--package`. Start the session before the app.
+- `anr_watcher --package` cannot attribute jank or StrictMode written by an
+  isolated process (`android:isolatedProcess`), one an app zygote spawned,
+  or the package's SDK sandbox: each runs under a uid of its own that no
+  package's listing names, so its records are listed under
+  `isolated_unattributed` / `sdk_sandbox_unattributed`, never counted for the
+  package, and `--diff` concludes nothing about jank beside them. A coverage
+  limit, said rather than closed. Unrecorded end to end: no recorded process
+  table holds such a process, so the classifier is tested on uids derived
+  from the package's recorded uid and AOSP's app-id ranges.
+- `anr_watcher --package` asks the package's uids (and the whole uid table)
+  once per watch or session and never refreshes them: install, reinstall or
+  add a user for the package during a read and its records under the new
+  uid go uncounted. A `Start proc` naming the package under such a uid is
+  said (`package_uid_changed`), but one the read never sees — lost in a
+  restarted stream's gap — is not; start a new read after changing the
+  install.
+- Without `--package`, an ANR session names only a process started while it
+  runs (system_server's `Start proc` is the only evidence it takes); an app
+  already running when `--start` is called is keyed by pid, listed under
+  `unnamed_pids`, and `--diff` does not compare its jank. Under `--package`
+  its jank and StrictMode are the package's by uid.
 - **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is
   promised, and what is not yet:
   - A *typed* failure — a missing `adb` or SDK tool, an adb call that failed, a
