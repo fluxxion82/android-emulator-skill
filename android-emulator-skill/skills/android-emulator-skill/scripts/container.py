@@ -28,6 +28,7 @@ documented, safe mechanism and is what real debugging workflows rely on.
 """
 
 import argparse
+import codecs
 import json
 import subprocess
 import sys
@@ -71,6 +72,26 @@ _EXPORTED_DIRS = ("shared_prefs", "databases")
 
 # What a run-as refusal looks like is decided once, in common.run_as
 # (run_as_refused): model_inspector reads app files through the same run-as.
+
+
+def _decode_capped(raw: bytes, cap: int) -> str:
+    """``raw`` as UTF-8 text, cut to at most ``cap`` bytes on a character boundary.
+
+    The cap is a byte count, so it can fall inside a multibyte character. That
+    incomplete sequence at the cut, and only that one, is dropped: the decoder
+    is not told the input ended there (``final=False``), so it holds back a
+    trailing partial character instead of failing on it, while any invalid
+    byte before the cut still raises. Slicing and then strict-decoding called a
+    UTF-8 text file binary whenever its cap split a character (D10; recorded:
+    run_as_cat_utf8_cap). Uncapped, the whole file is decoded strictly: a file
+    that itself ends mid-character is not UTF-8.
+
+    Raises:
+        UnicodeDecodeError: ``raw`` is not UTF-8 text up to the cut.
+    """
+    if len(raw) <= cap:
+        return raw.decode("utf-8")
+    return codecs.getincrementaldecoder("utf-8")().decode(raw[:cap], final=False)
 
 
 class RunAsDeniedError(RuntimeError):
@@ -165,10 +186,9 @@ class ContainerInspector:
 
         size_bytes = len(raw)
         truncated = size_bytes > CAT_MAX_BYTES
-        body = raw[:CAT_MAX_BYTES] if truncated else raw
 
         try:
-            content = body.decode("utf-8")
+            content = _decode_capped(raw, CAT_MAX_BYTES)
             content_type = "text"
         except UnicodeDecodeError:
             return True, {

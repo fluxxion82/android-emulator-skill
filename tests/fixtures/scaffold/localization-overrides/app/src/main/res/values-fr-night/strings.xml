@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- French, night mode: overrides one key and drops its placeholder. -->
+<resources>
+    <string name="greeting">Bonsoir !</string>
+</resources>

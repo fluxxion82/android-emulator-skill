@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="greeting">Bonjour, %1$s !</string>
+    <string name="theme_label">Thème clair</string>
+    <plurals name="items">
+        <item quantity="one">%d article</item>
+        <item quantity="other">%d articles</item>
+    </plurals>
+    <string-array name="sizes">
+        <item>Petit</item>
+        <item>Grand</item>
+    </string-array>
+</resources>

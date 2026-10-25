@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- German in landscape only: no farewell. -->
+<resources>
+    <string name="greeting">Hallo, %1$s!</string>
+    <string name="status">%1$d neue Nachrichten</string>
+    <string name="theme_label">Helles Design</string>
+</resources>

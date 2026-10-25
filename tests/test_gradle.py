@@ -263,6 +263,74 @@ def test_a_configuration_failure_reports_a_file_and_line(recorded_gradle):
         )
 
 
+def test_a_configuration_failure_is_located_at_its_build_file_line(recorded_gradle):
+    """D8: the `* Where:` block becomes the failure's location, not nulls."""
+    parsed = parse_build_output(recorded_gradle("gradle_where_block"), "")
+    gradle_errors = [e for e in parsed["errors"] if e["type"] == "gradle"]
+    assert len(gradle_errors) == 1, parsed["errors"]
+    error = gradle_errors[0]
+    assert "Could not find method implementaion()" in error["message"]
+    assert error["location"] == {"file": "/scaffold/build.gradle", "line": 11, "column": None}
+
+    # The reporter already prints any location it is given; now there is one.
+    assert "Location: /scaffold/build.gradle:11" in OutputFormatter.format_errors(parsed["errors"])
+
+
+def _from(lines: list[str], prefix: str) -> int:
+    return next(i for i, line in enumerate(lines) if line.startswith(prefix))
+
+
+@pytest.mark.parametrize("derivation", ["try-between", "next-report"])
+def test_a_where_block_does_not_locate_the_next_failure(recorded_gradle, derivation):
+    """A `Where:` belongs to the `What went wrong` after it in the SAME failure.
+
+    Derived from two recordings by line surgery only, so that the where-block
+    failure has a `* Where:` and no `* What went wrong:` and the task-lookup
+    failure after it must not take its build file and line:
+
+    - try-between: gradle_where_block without its `* What went wrong:` section
+      and its `BUILD FAILED` line, then gradle_task_not_found from its
+      `* What went wrong:` on. Only the `* Try:` between them separates the two.
+    - next-report: gradle_where_block cut at its `* What went wrong:` (the
+      `* Where:` kept), then gradle_task_not_found whole. Only the next
+      report's `FAILURE:` line separates them.
+    """
+    where = recorded_gradle("gradle_where_block").splitlines(keepends=True)
+    lookup = recorded_gradle("gradle_task_not_found").splitlines(keepends=True)
+    wrong, tried = _from(where, "* What went wrong:"), _from(where, "* Try:")
+    if derivation == "try-between":
+        kept = [
+            line for line in where[:wrong] + where[tried:] if not line.startswith("BUILD FAILED")
+        ]
+        derived = "".join(kept + lookup[_from(lookup, "* What went wrong:") :])
+    else:
+        derived = "".join(where[:wrong] + lookup)
+
+    gradle_errors = [e for e in parse_build_output(derived, "")["errors"] if e["type"] == "gradle"]
+    assert len(gradle_errors) == 1, gradle_errors
+    assert "Cannot locate tasks" in gradle_errors[0]["message"]
+    assert gradle_errors[0]["location"] == {"file": None, "line": None, "column": None}
+
+
+RECORDED_GRADLE = Path(__file__).resolve().parent / "fixtures" / "recorded"
+
+
+@pytest.mark.parametrize(
+    "log",
+    sorted(
+        str(p.relative_to(RECORDED_GRADLE))
+        for p in RECORDED_GRADLE.glob("gradle-*/*.txt")
+        if "* Where:" not in p.read_text(encoding="utf-8")
+    ),
+)
+def test_a_failure_without_a_where_block_has_no_location(log):
+    """Every other recorded Gradle log: its failures stay unlocated, never borrowed."""
+    text = (RECORDED_GRADLE / log).read_text(encoding="utf-8")
+    for error in parse_build_output(text, "")["errors"]:
+        if error["type"] == "gradle":
+            assert error["location"] == {"file": None, "line": None, "column": None}, error
+
+
 def test_find_and_aggregate_test_results(tmp_path: Path, recorded_gradle):
     """Aggregation across the three suites one real `test` task produced.
 

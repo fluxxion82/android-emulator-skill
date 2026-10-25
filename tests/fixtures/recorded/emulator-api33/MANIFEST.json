@@ -354,6 +354,30 @@
         "<app>,<system_server>"
       ],
       "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "run_as_cat_fixture_db",
+      "file": "run_as_cat_fixture_db.db",
+      "command": "adb shell -T run-as com.example.composefixture cat /data/data/com.example.composefixture/databases/fixture.db",
+      "description": "container.py's --cat read of the fixture app's databases/fixture.db: a binary file, read by the same argv as run_as_cat_utf8_cap and written byte for byte. Its first byte that is not valid UTF-8 is early in the SQLite header, so it is binary whole and binary when capped anywhere past that byte; forgiving the character a cap cuts must not forgive this. emulator_only only because a capture callable reads it; it changes nothing.",
+      "catches": [
+        "D10"
+      ],
+      "bytes": 32768,
+      "recorded_at": "2026-10-25T01:15:56Z"
+    },
+    {
+      "name": "run_as_cat_utf8_cap",
+      "file": "run_as_cat_utf8_cap.txt",
+      "command": "adb push <70161 bytes of UTF-8 text> /data/local/tmp/aes_utf8_cap.txt; adb shell -T run-as com.example.composefixture cp /data/local/tmp/aes_utf8_cap.txt /data/data/com.example.composefixture/files/aes_utf8_cap.txt; adb shell -T run-as com.example.composefixture cat /data/data/com.example.composefixture/files/aes_utf8_cap.txt",
+      "description": "container.py's --cat read (`adb shell -T run-as <pkg> cat <absolute path>`) of a UTF-8 text file longer than its 65,536-byte cap, pushed into the fixture app's files/ for the purpose and removed after. Mixed-script lines (German, Japanese, accented Latin), with the header padded so the cap cuts a three-byte character after its second byte (manifest: cap_bytes, split_character_starts_at). Written byte for byte and refused unless it is exactly the file pushed. Slicing to the cap and strict-decoding the slice calls this file binary: the only invalid bytes are the incomplete character the cut itself made.",
+      "catches": [
+        "D10"
+      ],
+      "bytes": 70161,
+      "cap_bytes": 65536,
+      "split_character_starts_at": 65534,
+      "recorded_at": "2026-10-25T01:15:56Z"
     }
   ]
 }

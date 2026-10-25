@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The default locale. Every locale directory beside it translates all four
+     keys; the other values-* directories are partial overrides by a
+     qualifier that is not a locale, and must not be audited as translations. -->
+<resources>
+    <string name="app_name" translatable="false">Fixture</string>
+    <string name="greeting">Hello, %1$s!</string>
+    <string name="theme_label">Light theme</string>
+    <plurals name="items">
+        <item quantity="one">%d item</item>
+        <item quantity="other">%d items</item>
+    </plurals>
+    <string-array name="sizes">
+        <item>Small</item>
+        <item>Large</item>
+    </string-array>
+</resources>

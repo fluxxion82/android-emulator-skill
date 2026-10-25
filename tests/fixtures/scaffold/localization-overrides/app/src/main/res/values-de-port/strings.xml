@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- German in portrait only: no theme_label. -->
+<resources>
+    <string name="greeting">Hallo, %1$s!</string>
+    <string name="status">%1$d neue Nachrichten</string>
+    <string name="farewell">Auf Wiedersehen</string>
+</resources>

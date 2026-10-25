@@ -9,7 +9,14 @@ there is no ``--serial`` flag; the audit operates on a ``res/`` tree on disk).
 Android-native (NOT an iOS .xcstrings port):
   - Locale resolution follows Android resource-qualifier rules: ``values/`` is
     the default (typically English), and ``values-<locale>/`` (e.g.
-    ``values-es/``, ``values-fr/``, ``values-zh-rCN/``) hold translations.
+    ``values-es/``, ``values-fr/``, ``values-zh-rCN/``, ``values-b+sr+Latn/``)
+    hold translations. A directory whose qualifiers name no locale
+    (``values-night/``, ``values-sw600dp/``, ``values-v31/``), or a locale's
+    qualified directory beside its plain one (``values-fr-night/`` beside
+    ``values-fr/``), is an override: held to no key, but every string it
+    supplies is checked against ``values/``. Overrides are listed under
+    ``skipped`` with the reason. A locale with no plain directory is audited
+    per qualified directory (``de (land)``), never as their union.
   - All resource types are parsed: ``<string>``, ``<plurals>`` (per-quantity
     ``<item>``), and ``<string-array>`` (ordered ``<item>`` list).
 
@@ -50,23 +57,52 @@ RES_REMEDY = "Pass the res/ directory that holds values/strings.xml, e.g. --res 
 # === TYPES ===
 
 
+# Every audited set and every finding names its set three ways: ``locale``, the
+# code ``--locale`` takes (``fr``, ``fr-rCA``, ``b+sr+Latn``, or ``default`` for
+# an override of the default language); ``qualifiers``, the directory's other
+# qualifiers (``land``, ``night``) or None; and ``label``, how text output shows
+# it (``fr``, ``de (land)``, ``default (night)``).
+DEFAULT_LANGUAGE = "default"
+
+
+@dataclass
+class AuditedSet:
+    """A translation the audit held to every default key."""
+
+    locale: str
+    qualifiers: str | None
+    label: str
+
+
 @dataclass
 class MissingKey:
     """A key present in the default locale but absent from a translation."""
 
     key: str
     locale: str
+    qualifiers: str | None
+    label: str
     kind: str  # "string", "plurals", or "string-array"
 
 
 @dataclass
 class PlaceholderMismatch:
-    """A key whose format specifiers differ between default and a translation."""
+    """A key whose format specifiers differ between default and a translation or override."""
 
     key: str
     locale: str
+    qualifiers: str | None
+    label: str
     default_placeholders: list[str]
     locale_placeholders: list[str]
+
+
+@dataclass
+class SkippedDir:
+    """An override: a ``values-*`` directory not held to every key (its strings are checked)."""
+
+    directory: str
+    reason: str
 
 
 @dataclass
@@ -76,11 +112,12 @@ class AuditReport:
     res_dir: str
     default_locale: str
     total_keys: int
-    locales: list[str]
+    locales: list[AuditedSet]
     missing_keys: list[MissingKey] = field(default_factory=list)
     placeholder_mismatches: list[PlaceholderMismatch] = field(default_factory=list)
     undefined_in_resources: list[str] = field(default_factory=list)  # used in code, undefined
     unused_in_source: list[str] = field(default_factory=list)  # defined, never referenced
+    skipped: list[SkippedDir] = field(default_factory=list)  # overrides, held to no key
 
     def has_findings(self) -> bool:
         return bool(
@@ -118,18 +155,60 @@ def _extract_placeholders(value: str) -> list[str]:
 # === RESOURCE PARSING ===
 
 
-def locale_from_dir(dir_name: str) -> str:
+# Android's resource-qualifier grammar for the locale, as aapt2 parses it:
+# optional MCC/MNC first (`mcc310`, `mnc004`), then the locale, then any other
+# qualifiers in their fixed order. The locale is a two- or three-letter
+# language, any case, optionally followed by `r` and a two-letter region
+# (`fr`, `fr-rCA`), or a BCP 47 tag behind `b+` (`b+sr+Latn`, `b+es+419`).
+# "car" is three letters and the UI-mode qualifier, so it is not a language.
+# A locale after another qualifier is not a locale (aapt2 37.0.0 refuses
+# `values-night-fr` as an invalid configuration), nor is `r419` a region.
+_MCC_MNC_RE = re.compile(r"^(?:mcc|mnc)\d+$", re.IGNORECASE)
+_LANGUAGE_RE = re.compile(r"^[a-z]{2,3}$", re.IGNORECASE)
+_REGION_RE = re.compile(r"^r[a-z]{2}$", re.IGNORECASE)
+_BCP47_RE = re.compile(r"^b\+[a-z]{2,3}(?:\+[a-z0-9]{2,8})*$", re.IGNORECASE)
+_NOT_A_LANGUAGE = frozenset({"car"})
+
+
+def split_values_dir(dir_name: str) -> tuple[str | None, list[str]]:
+    """Split a ``values*`` directory name into its locale and its other qualifiers.
+
+    ``values`` -> ``("", [])``, the default locale. ``values-fr-rCA-night`` ->
+    ``("fr-rCA", ["night"])``. ``values-night`` -> ``(None, ["night"])``: no
+    locale. MCC/MNC qualifiers count among the others.
+    """
+    if dir_name == "values":
+        return "", []
+    parts = dir_name.removeprefix("values-").split("-")
+    at = 0
+    while at < len(parts) and _MCC_MNC_RE.match(parts[at]):
+        at += 1
+    others = parts[:at]
+    if at < len(parts) and _BCP47_RE.match(parts[at]):
+        return parts[at], others + parts[at + 1 :]
+    if (
+        at < len(parts)
+        and _LANGUAGE_RE.match(parts[at])
+        and parts[at].lower() not in _NOT_A_LANGUAGE
+    ):
+        end = at + 1
+        if end < len(parts) and _REGION_RE.match(parts[end]):
+            end += 1
+        return "-".join(parts[at:end]), others + parts[end:]
+    return None, parts
+
+
+def locale_from_dir(dir_name: str) -> str | None:
     """
     Derive a locale code from a ``values*`` resource directory name.
 
     ``values`` -> "" (the default locale). ``values-es`` -> "es".
-    ``values-zh-rCN`` -> "zh-rCN". Non-locale qualifiers (e.g. ``values-night``,
-    ``values-sw600dp``) still produce a token here; callers decide relevance by
-    whether a ``strings.xml`` exists with translatable keys.
+    ``values-zh-rCN`` -> "zh-rCN". ``values-b+sr+Latn`` -> "b+sr+Latn".
+    ``values-fr-night`` -> "fr": French, in night mode. A directory whose
+    qualifiers hold no locale (``values-night``, ``values-sw600dp``,
+    ``values-v31``, ``values-land``) -> None: it is not a translation.
     """
-    if dir_name == "values":
-        return ""
-    return dir_name.removeprefix("values-")
+    return split_values_dir(dir_name)[0]
 
 
 def _node_text(node: ET.Element) -> str:
@@ -182,15 +261,60 @@ def parse_strings_xml(path: Path) -> dict[str, dict[str, Any]]:
     return entries
 
 
-def load_locales(res_dir: Path) -> dict[str, dict[str, dict[str, Any]]]:
-    """
-    Load every ``values*/strings.xml`` under ``res_dir``.
+@dataclass
+class ResourceSet:
+    """One ``values*/strings.xml`` the audit compares with the default.
 
-    Returns a map ``locale -> {key -> entry}``. The default locale ("") comes
-    from ``values/strings.xml``. Directories without a ``strings.xml`` are
-    ignored. Raises ValueError if any file is malformed.
+    Attributes:
+        locale: The locale code ``--locale`` selects it by: the locale
+            qualifier, or ``default`` for an override of the default language.
+        qualifiers: Its directory's other qualifiers (``land``), or None.
+        entries: Its parsed keys (:func:`parse_strings_xml`).
+        complete: Held to every default key (a translation), or not (an override).
     """
-    locales: dict[str, dict[str, dict[str, Any]]] = {}
+
+    locale: str
+    qualifiers: str | None
+    entries: dict[str, dict[str, Any]]
+    complete: bool
+
+    @property
+    def label(self) -> str:
+        """``fr``; ``de (land)`` for a qualified set; ``default (night)``."""
+        return f"{self.locale} ({self.qualifiers})" if self.qualifiers else self.locale
+
+
+def load_resources(
+    res_dir: Path,
+) -> tuple[dict[str, dict[str, Any]] | None, list[ResourceSet], list[SkippedDir]]:
+    """
+    Load every ``values*/strings.xml`` under ``res_dir`` as the audit reads it.
+
+    Android picks ONE configuration for a string and falls back to
+    ``values/``; it never merges two qualified directories. So:
+
+    - ``values/`` is the default; ``values-fr/`` (a locale and nothing else)
+      is a translation, held to every default key.
+    - ``values-fr-night/`` beside ``values-fr/`` is an override of French, and
+      ``values-night/`` (no locale, L6) an override of the default language:
+      held to no key, but every string they supply is checked.
+    - ``values-de-land/`` with no ``values-de/`` is German in landscape, a
+      translation of its own (``de (land)``): ``values-de-port/`` beside it is
+      another, each held to every default key. Their union read as complete
+      German when each lacked a different key.
+
+    Directories without a ``strings.xml`` are ignored.
+
+    Returns:
+        ``(default, sets, skipped)``: the default's entries (None when there is
+        no ``values/strings.xml``), every other set, and one
+        :class:`SkippedDir` per override, saying what is checked.
+
+    Raises:
+        ValueError: A ``strings.xml`` is malformed.
+    """
+    default: dict[str, dict[str, Any]] | None = None
+    found: list[tuple[str, list[str], Path]] = []
     for child in sorted(res_dir.iterdir()):
         if not child.is_dir():
             continue
@@ -199,9 +323,40 @@ def load_locales(res_dir: Path) -> dict[str, dict[str, dict[str, Any]]]:
         strings_file = child / "strings.xml"
         if not strings_file.is_file():
             continue
-        locale = locale_from_dir(child.name)
-        locales[locale] = parse_strings_xml(strings_file)
-    return locales
+        locale, others = split_values_dir(child.name)
+        if locale == "":
+            default = parse_strings_xml(strings_file)
+        else:
+            found.append((locale or "", others, strings_file))
+
+    plain = {locale: path for locale, others, path in found if locale and not others}
+    sets: list[ResourceSet] = []
+    skipped: list[SkippedDir] = []
+    for locale, others, path in found:
+        entries = parse_strings_xml(path)
+        code = locale or DEFAULT_LANGUAGE
+        qualifiers = "-".join(others) or None
+        if not others:
+            sets.append(ResourceSet(code, None, entries, complete=True))
+        elif locale and locale not in plain:
+            sets.append(ResourceSet(code, qualifiers, entries, complete=True))
+        else:
+            sets.append(ResourceSet(code, qualifiers, entries, complete=False))
+            of = (
+                f"{locale} with qualifiers {qualifiers}: an override of {plain[locale].parent.name}"
+                if locale
+                else f"no locale qualifier in {qualifiers}: an override of the default language"
+            )
+            skipped.append(
+                SkippedDir(
+                    directory=path.parent.name,
+                    reason=(
+                        f"{of}, held to no key; the strings it supplies are checked "
+                        f"against values/"
+                    ),
+                )
+            )
+    return default, sets, skipped
 
 
 # === SOURCE SCANNER ===
@@ -248,43 +403,49 @@ class LocalizationAuditor:
     def _collect_missing(
         self,
         default: dict[str, dict[str, Any]],
-        locales: dict[str, dict[str, dict[str, Any]]],
-        translation_locales: list[str],
+        translations: list[ResourceSet],
     ) -> list[MissingKey]:
-        """Find default keys absent from each translation locale."""
+        """Find default keys absent from each translation (never from an override)."""
         missing: list[MissingKey] = []
-        for locale in translation_locales:
-            translated = locales[locale]
+        for resource in translations:
             for key, entry in default.items():
-                if key not in translated:
-                    missing.append(MissingKey(key=key, locale=locale, kind=entry["kind"]))
-        return sorted(missing, key=lambda m: (m.locale, m.key))
+                if key not in resource.entries:
+                    missing.append(
+                        MissingKey(
+                            key=key,
+                            locale=resource.locale,
+                            qualifiers=resource.qualifiers,
+                            label=resource.label,
+                            kind=entry["kind"],
+                        )
+                    )
+        return sorted(missing, key=lambda m: (m.label, m.key))
 
     def _check_placeholders(
         self,
         default: dict[str, dict[str, Any]],
-        locales: dict[str, dict[str, dict[str, Any]]],
-        translation_locales: list[str],
+        resources: list[ResourceSet],
     ) -> list[PlaceholderMismatch]:
-        """Compare format specifiers between default and each translation."""
+        """Compare format specifiers between default and every string a set supplies."""
         mismatches: list[PlaceholderMismatch] = []
-        for locale in translation_locales:
-            translated = locales[locale]
+        for resource in resources:
             for key, entry in default.items():
-                if key not in translated:
-                    continue  # already reported as missing
+                if key not in resource.entries:
+                    continue  # a translation's gap is reported as missing
                 default_ph = sorted(_extract_placeholders(entry["value"]))
-                locale_ph = sorted(_extract_placeholders(translated[key]["value"]))
+                locale_ph = sorted(_extract_placeholders(resource.entries[key]["value"]))
                 if default_ph != locale_ph:
                     mismatches.append(
                         PlaceholderMismatch(
                             key=key,
-                            locale=locale,
+                            locale=resource.locale,
+                            qualifiers=resource.qualifiers,
+                            label=resource.label,
                             default_placeholders=default_ph,
                             locale_placeholders=locale_ph,
                         )
                     )
-        return sorted(mismatches, key=lambda m: (m.locale, m.key))
+        return sorted(mismatches, key=lambda m: (m.label, m.key))
 
     def audit(self) -> AuditReport:
         """Run the full audit and return a structured report.
@@ -292,43 +453,52 @@ class LocalizationAuditor:
         Raises:
             ValueError: A ``strings.xml`` is malformed.
             cli.Failure: There is nothing to audit -- no default
-                ``values/strings.xml`` under ``res_dir``, or no translation for
-                the ``--locale`` asked about. Every check compares a locale
-                with the default, so either way the audit would inspect nothing
-                and report "No issues found." at exit 0 (N11).
+                ``values/strings.xml`` under ``res_dir``, or no set for the
+                ``--locale`` code asked about (a translation such as
+                ``values-de/`` or ``values-de-land/``, or ``default`` for the
+                default language's overrides). Every check compares a set with
+                the default, so either way the audit would inspect nothing and
+                report "No issues found." at exit 0 (N11).
         """
-        locales = load_locales(self.res_dir)
+        default, resources, skipped = load_resources(self.res_dir)
 
-        translation_locales = sorted(loc for loc in locales if loc != "")
-        found = ", ".join(translation_locales) or "none"
-        if "" not in locales:
+        if default is None:
+            found = ", ".join(sorted({r.locale for r in resources if r.complete})) or "none"
             cli.fail(
                 f"nothing to audit: no values/strings.xml under {self.res_dir} "
                 f"(translation locales found: {found})",
                 RES_REMEDY,
             )
-        if self.locale_filter and self.locale_filter not in translation_locales:
+        codes = sorted({r.locale for r in resources})
+        if self.locale_filter and self.locale_filter not in codes:
+            choices = ", ".join(codes) or "none"
             cli.fail(
-                f"nothing to audit: no values-{self.locale_filter}/strings.xml under "
-                f"{self.res_dir} (translation locales found: {found})",
-                "Pass --locale with one of the locales found, or omit it to audit them all.",
+                f"nothing to audit: no values-{self.locale_filter}/ or "
+                f"values-{self.locale_filter}-*/ strings.xml under {self.res_dir} "
+                f"(locale codes found: {choices})",
+                f"Pass --locale one of: {choices}; or omit it to audit them all.",
+                details={"locale_codes": codes},
             )
 
-        default = locales[""]
         if self.locale_filter:
-            translation_locales = [loc for loc in translation_locales if loc == self.locale_filter]
+            resources = [r for r in resources if r.locale == self.locale_filter]
+            skipped = [
+                entry
+                for entry in skipped
+                if (split_values_dir(entry.directory)[0] or DEFAULT_LANGUAGE) == self.locale_filter
+            ]
+        translations = sorted((r for r in resources if r.complete), key=lambda r: r.label)
 
         report = AuditReport(
             res_dir=str(self.res_dir),
             default_locale="values",
             total_keys=len(default),
-            locales=translation_locales,
+            locales=[AuditedSet(r.locale, r.qualifiers, r.label) for r in translations],
+            skipped=skipped,
         )
 
-        report.missing_keys = self._collect_missing(default, locales, translation_locales)
-        report.placeholder_mismatches = self._check_placeholders(
-            default, locales, translation_locales
-        )
+        report.missing_keys = self._collect_missing(default, translations)
+        report.placeholder_mismatches = self._check_placeholders(default, resources)
 
         if self.source_dir:
             referenced = scan_source_refs(self.source_dir)
@@ -346,7 +516,7 @@ def _format_default(report: AuditReport) -> str:
     """Compact summary — a few lines."""
     missing_by_locale: dict[str, int] = {}
     for m in report.missing_keys:
-        missing_by_locale[m.locale] = missing_by_locale.get(m.locale, 0) + 1
+        missing_by_locale[m.label] = missing_by_locale.get(m.label, 0) + 1
     missing_summary = (
         ", ".join(f"{count} in {loc}" for loc, count in sorted(missing_by_locale.items())) or "none"
     )
@@ -363,6 +533,11 @@ def _format_default(report: AuditReport) -> str:
         lines.append(f"Defined but unused: {len(report.unused_in_source)} keys.")
     if not report.has_findings():
         lines.append("No issues found.")
+    if report.skipped:
+        names = [entry.directory for entry in report.skipped]
+        shown = ", ".join(names[:MAX_LISTED_KEYS])
+        more = f" and {len(names) - MAX_LISTED_KEYS} more" if len(names) > MAX_LISTED_KEYS else ""
+        lines.append(f"Overrides (strings checked, held to no key): {shown}{more}.")
     return "\n".join(lines)
 
 
@@ -385,18 +560,18 @@ def _format_verbose(report: AuditReport) -> str:
         sections.append("=== Missing Keys ===")
         current = None
         for m in report.missing_keys:
-            if m.locale != current:
-                sections.append(f"\n[{m.locale}]")
-                current = m.locale
+            if m.label != current:
+                sections.append(f"\n[{m.label}]")
+                current = m.label
             sections.append(f"  {m.kind:13s}  {m.key}")
 
     if report.placeholder_mismatches:
         sections.append("\n=== Placeholder Mismatches ===")
         for m in report.placeholder_mismatches:
             sections.append(
-                f"  [{m.locale}] {m.key}\n"
+                f"  [{m.label}] {m.key}\n"
                 f"    values: {m.default_placeholders}\n"
-                f"    {m.locale}: {m.locale_placeholders}"
+                f"    {m.label}: {m.locale_placeholders}"
             )
 
     if report.undefined_in_resources:
@@ -406,6 +581,10 @@ def _format_verbose(report: AuditReport) -> str:
     if report.unused_in_source:
         sections.append("\n=== Defined in Resources, Unused in Source ===")
         sections.extend(f"  {k}" for k in report.unused_in_source)
+
+    if report.skipped:
+        sections.append("\n=== Overrides (strings checked, held to no key) ===")
+        sections.extend(f"  {entry.directory}: {entry.reason}" for entry in report.skipped)
 
     return "\n".join(sections)
 

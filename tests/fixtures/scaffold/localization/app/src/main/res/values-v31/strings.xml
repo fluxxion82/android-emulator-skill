@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 31 and up: overrides one key. Not a locale. -->
+<resources>
+    <string name="theme_label">Dynamic theme</string>
+</resources>

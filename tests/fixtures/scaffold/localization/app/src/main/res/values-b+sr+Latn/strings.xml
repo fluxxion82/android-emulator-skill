@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="greeting">Zdravo, %1$s!</string>
+    <string name="theme_label">Svetla tema</string>
+    <plurals name="items">
+        <item quantity="one">%d stavka</item>
+        <item quantity="other">%d stavki</item>
+    </plurals>
+    <string-array name="sizes">
+        <item>Malo</item>
+        <item>Veliko</item>
+    </string-array>
+</resources>

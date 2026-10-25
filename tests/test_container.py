@@ -23,6 +23,7 @@ from pathlib import Path
 
 import container
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
 from container import (
     ContainerInspector,
     RunAsDeniedError,
@@ -1224,6 +1225,139 @@ def test_cat_truncates_large_file(monkeypatch):
     # Cached because it exceeds the cache threshold; note mentions the cap.
     assert "cache_id" in result
     assert "capped" in result["note"]
+
+
+# --- D10: the cap cuts a character, not a text file ---------------------------
+#
+# Both reads are recordings of container.py's own argv on the API 33 emulator
+# (record_fixtures.py: run_as_cat_utf8_cap, run_as_cat_fixture_db). The UTF-8
+# file is longer than the cap, and its manifest entry says where the cap falls:
+# inside a three-byte character, after its second byte.
+
+API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
+
+
+def _manifest_entry(name: str) -> dict:
+    return next(e for e in API33.manifest["fixtures"] if e["name"] == name)
+
+
+def _cat_recorded(monkeypatch, payload: bytes, *, cap: int) -> dict:
+    """--cat of a file whose read is ``payload``, under a cap of ``cap`` bytes, inline."""
+    monkeypatch.setattr(container, "CAT_MAX_BYTES", cap)
+    monkeypatch.setattr(container, "CAT_CACHE_BYTES", 10 * len(payload))
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=payload, stderr=b"")
+
+    monkeypatch.setattr(container.subprocess, "run", fake_run)
+    ok, result = ContainerInspector().cat_file(FIXTURE_PKG, "files/aes_utf8_cap.txt")
+    assert ok is True, result
+    return result
+
+
+def test_cat_keeps_a_utf8_file_text_when_the_cap_cuts_a_character(monkeypatch):
+    """D10: a UTF-8 text file whose cap lands mid-character is text, cut on the character."""
+    entry = _manifest_entry("run_as_cat_utf8_cap")
+    payload = API33.data(entry["file"])
+    cap, split = entry["cap_bytes"], entry["split_character_starts_at"]
+    assert len(payload) > cap > split, "the recording no longer puts the cap inside a character"
+
+    result = _cat_recorded(monkeypatch, payload, cap=cap)
+    assert result["content_type"] == "text", result.get("content")
+    assert result["truncated"] is True
+    assert result["size_bytes"] == len(payload)
+    # Everything up to the split character, and nothing of it: the content is
+    # the file's text, ending at its last whole character before the cap.
+    assert result["content"] == payload[:split].decode("utf-8")
+    assert payload.decode("utf-8").startswith(result["content"])
+
+
+def test_a_file_ending_mid_character_without_a_cut_is_still_binary(monkeypatch):
+    """Only the cut is forgiven: the same bytes, whole and uncapped, are not UTF-8."""
+    entry = _manifest_entry("run_as_cat_utf8_cap")
+    ends_mid_character = API33.data(entry["file"])[: entry["cap_bytes"]]
+
+    result = _cat_recorded(monkeypatch, ends_mid_character, cap=len(ends_mid_character) + 1)
+    assert result["truncated"] is False
+    assert result["content_type"] == "binary", result
+
+
+def test_a_file_exactly_at_the_cap_that_ends_mid_character_is_binary(monkeypatch):
+    """``len(raw) == cap`` is the whole file, uncut: its partial character is not forgiven."""
+    entry = _manifest_entry("run_as_cat_utf8_cap")
+    ends_mid_character = API33.data(entry["file"])[: entry["cap_bytes"]]
+
+    result = _cat_recorded(monkeypatch, ends_mid_character, cap=len(ends_mid_character))
+    assert result["truncated"] is False
+    assert result["content_type"] == "binary", result
+
+
+# The byte(s) at a cut, in front of the recorded file's first line (which is
+# ASCII, so it ends on a character boundary) and behind it the rest of the
+# recording, so the file runs past the cap. The cap falls right after the
+# probe. The 2- and 3-byte leads are the recording's own (from "ü" and "日");
+# the recording holds no 4-byte character, so that lead is F0 9F 98, the first
+# three bytes of U+1F600. Every malformed one is invalid where it stands, so
+# no amount of following input could complete it.
+MALFORMED_AT_THE_CUT = {
+    "FF": b"\xff",
+    "C0": b"\xc0",
+    "lone 80": b"\x80",
+    "F4 90": b"\xf4\x90",
+    "F5": b"\xf5",
+    "E0 80": b"\xe0\x80",
+}
+
+
+def _probe_file(probe: bytes) -> tuple[bytes, bytes, int]:
+    payload = API33.data(_manifest_entry("run_as_cat_utf8_cap")["file"])
+    head = payload[: payload.index(b"\n") + 1]
+    return head, head + probe + payload[len(head) :], len(head) + len(probe)
+
+
+@pytest.mark.parametrize("probe", sorted(MALFORMED_AT_THE_CUT))
+def test_a_malformed_sequence_at_the_cut_is_binary(monkeypatch, probe):
+    _head, raw, cap = _probe_file(MALFORMED_AT_THE_CUT[probe])
+    result = _cat_recorded(monkeypatch, raw, cap=cap)
+    assert result["truncated"] is True
+    assert result["content_type"] == "binary", result
+
+
+def _recorded_lead(character: str, length: int) -> bytes:
+    payload = API33.data(_manifest_entry("run_as_cat_utf8_cap")["file"])
+    encoded = character.encode("utf-8")
+    assert encoded in payload, f"the recording no longer holds {character!r}"
+    return encoded[:length]
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        pytest.param(lambda: _recorded_lead("ü", 1), id="2-byte, 1 of 2"),
+        pytest.param(lambda: _recorded_lead("日", 2), id="3-byte, 2 of 3"),
+        pytest.param(lambda: _recorded_lead("日", 1), id="3-byte, 1 of 3"),
+        pytest.param(lambda: b"\xf0\x9f\x98", id="4-byte, 3 of 4"),
+    ],
+)
+def test_a_valid_partial_character_at_the_cut_is_withheld(monkeypatch, lead):
+    head, raw, cap = _probe_file(lead())
+    result = _cat_recorded(monkeypatch, raw, cap=cap)
+    assert result["truncated"] is True
+    assert result["content_type"] == "text", result
+    assert result["content"] == head.decode("utf-8")
+
+
+@pytest.mark.parametrize("cap", [1024, 65_536])
+def test_a_recorded_binary_file_stays_binary_capped_or_whole(monkeypatch, cap):
+    """fixture.db: invalid bytes before the cut make it binary, cut or not."""
+    payload = API33.data(_manifest_entry("run_as_cat_fixture_db")["file"])
+    with pytest.raises(UnicodeDecodeError) as raised:
+        payload.decode("utf-8")
+    assert raised.value.start < 1024, "the database's first invalid byte moved past the cap"
+
+    result = _cat_recorded(monkeypatch, payload, cap=cap)
+    assert result["truncated"] is (len(payload) > cap)
+    assert result["content_type"] == "binary", result
 
 
 def test_databases_list_separates_sidecars(monkeypatch, recorded):

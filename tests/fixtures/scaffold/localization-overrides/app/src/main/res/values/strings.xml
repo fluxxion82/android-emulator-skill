@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The default locale. Beside it: a complete French translation; two
+     overrides that each DROP a placeholder (values-fr-night, values-night);
+     and German only in two configurations (values-de-land, values-de-port),
+     each missing a different key. -->
+<resources>
+    <string name="greeting">Hello, %1$s!</string>
+    <string name="status">%1$d new messages</string>
+    <string name="theme_label">Light theme</string>
+    <string name="farewell">Goodbye</string>
+</resources>

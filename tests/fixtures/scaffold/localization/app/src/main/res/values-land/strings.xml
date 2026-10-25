@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Landscape: overrides one key. Not a locale. -->
+<resources>
+    <string name="greeting">Hello there, %1$s!</string>
+</resources>
