@@ -59,6 +59,7 @@ if _script_dir not in sys.path:
 
 from common import cli, log_lifecycle, logcat  # noqa: E402
 from common.adb_exec import (  # noqa: E402
+    _ADB_OWN_PREFIXES,
     AdbCommandError,
     AdbError,
     AdbTimeoutError,
@@ -144,7 +145,11 @@ STREAM_END_GRACE_SECONDS = 0.5
 # How much of what adb wrote on stderr is read back, from its start and from
 # its end: adb's error may come first and chatter follow it, and a tail alone
 # lost it (second review of PR #42). A stream's stderr is a file of its own.
+# What lies between the two is scanned, not kept (_adb_own_lines).
 STDERR_KEPT_BYTES = 64 * 1024
+# The lines adb_exec._classify reads -- adb's own, by their start -- as bytes:
+# all a scan of stderr between its kept head and tail keeps.
+_ADB_OWN_LINE_STARTS = tuple(prefix.encode() for prefix in _ADB_OWN_PREFIXES)
 # How much of it a message shows, first and last: the rest is in no refusal.
 STDERR_SHOWN_CHARS = 200
 # Bound on each question the worker puts to the device while it reads: which
@@ -1575,7 +1580,10 @@ class AnrBuster:
         Read under the session's lock, so the summary and the events it is
         drilled into are one --stop's, never one half-way through another's.
         A session an earlier version's worker may still write is refused, as
-        --stop refuses it (``_refuse_reading_a_live_legacy_session``).
+        --stop refuses it (``_refuse_reading_a_live_legacy_session``). So is
+        one with no summary whose worker is gone without having published how
+        its capture ended (``_unpublished_end``), with --stop's answer for it:
+        it used to be sent to `--stop <id> first`, which refuses it.
 
         Raises:
             SessionError: The session is unknown, has no summary yet, or the
@@ -1588,6 +1596,9 @@ class AnrBuster:
         try:
             with self.store.transaction(session_id) as meta:
                 _refuse_reading_a_live_legacy_session(meta, "--get-details")
+                unpublished = _unpublished_end(meta)
+                if unpublished is not None and self._load_summary(session_id) is None:
+                    _refuse_details_of_an_unpublished_end(meta, unpublished)
                 return self._details(session_id, cluster, raw, json_mode)
         except FileNotFoundError as error:
             raise SessionError(
@@ -1644,8 +1655,29 @@ class AnrBuster:
         ``provisional`` (with ``provisional_reason``; a mark in text): what
         its meta says may still change. The other modes refuse it (review of
         PR #44); a listing of every session cannot.
+
+        A session whose meta says its worker is at work (``running`` /
+        ``deciding``) while that worker is gone -- by --stop's test,
+        ``worker_identity``, not pid liveness -- never published how its
+        capture ended: killed, or out of time for its session's lock. Its
+        persisted ``status`` is kept, and qualified: ``unpublished_end`` true,
+        with ``unpublished_end_reason``; in text its status reads ``gone``,
+        and the line says the worker is gone and its capture end unpublished.
+        It was listed ``running``, a worker --stop refuses as gone.
         """
         metas = self.store.list_sessions()
+        unpublished: dict[str, str] = {}
+        for index, meta in enumerate(metas):
+            why = _unpublished_end(meta)
+            if why is None:
+                continue
+            # Read again once its worker is shown gone: it may have published
+            # its end, and exited, after the listing read it. Gone, it writes
+            # nothing more.
+            with contextlib.suppress(FileNotFoundError, ValueError):
+                metas[index] = meta = self.store.load_meta(meta.session_id)
+            if meta.status in LIVE_STATES:
+                unpublished[meta.session_id] = why
         provisional = {meta.session_id: _provisional(meta) for meta in metas}
         if json_mode:
             return json.dumps(
@@ -1654,6 +1686,12 @@ class AnrBuster:
                         **m.to_json(),
                         "provisional": provisional[m.session_id] is not None,
                         "provisional_reason": provisional[m.session_id],
+                        "unpublished_end": m.session_id in unpublished,
+                        "unpublished_end_reason": (
+                            _unpublished_reason(unpublished[m.session_id])
+                            if m.session_id in unpublished
+                            else None
+                        ),
                     }
                     for m in metas
                 ],
@@ -1673,9 +1711,17 @@ class AnrBuster:
             restart_str = f"  restarts={restarts}" if restarts else ""
             reason = provisional[meta.session_id]
             provisional_str = f"  provisional: {reason}" if reason else ""
+            status = meta.status
+            gone_str = ""
+            if meta.session_id in unpublished:
+                status = "gone"
+                gone_str = (
+                    f"  worker gone, capture end unpublished: "
+                    f"{unpublished[meta.session_id]} (its meta says {meta.status})"
+                )
             lines.append(
-                f"  {meta.session_id}  {meta.status:8s}  started={meta.started_at}  "
-                f"stopped={stopped}{duration_str}{restart_str}{provisional_str}"
+                f"  {meta.session_id}  {status:8s}  started={meta.started_at}  "
+                f"stopped={stopped}{duration_str}{restart_str}{provisional_str}{gone_str}"
             )
         if len(metas) > 20:
             lines.append(f"  ... {len(metas) - 20} more")
@@ -2332,6 +2378,47 @@ def _provisional(meta: SessionMeta) -> str | None:
     return f"pid {meta.pid} may be an earlier version's worker, still writing it ({why})"
 
 
+def _unpublished_end(meta: SessionMeta) -> str | None:
+    """Why a session's worker reads as gone without having published its capture's end, or None.
+
+    Its meta says a worker is at work (``LIVE_STATES``), and the process at
+    the recorded pid is shown not to be that worker (``worker_identity``: the
+    token on its command line and the start time recorded at its claim, not
+    pid liveness). A worker publishes its end before it exits -- unless it is
+    killed, or cannot take the session's lock in
+    ``WORKER_END_LOCK_TIMEOUT_SECONDS`` -- so nothing will now. --stop refuses
+    such a session (``_refuse_unconcluded``); its readers say the same.
+    """
+    if meta.status not in LIVE_STATES:
+        return None
+    identity, why = worker_identity(meta)
+    if identity is not Identity.GONE:
+        return None
+    return why
+
+
+def _unpublished_reason(why: str) -> str:
+    """``_unpublished_end``'s answer as a clause: the worker gone, and why it reads so."""
+    return f"its worker is gone ({why}) and its capture end is unpublished"
+
+
+def _refuse_details_of_an_unpublished_end(meta: SessionMeta, why: str) -> NoReturn:
+    """--get-details' refusal for a session with no summary whose worker is gone unpublished.
+
+    --stop's answer for it (``_refuse_unconcluded``), not a pointer to that
+    --stop: `Run --stop <id> first` sent the caller to a refusal.
+    """
+    session_id = meta.session_id
+    cli.fail(
+        f"Session {session_id} has no summary: {_unpublished_reason(why)}. The worker was "
+        f"killed, or died before it could say how its capture ended, so whether its stream "
+        f"failed is unknown, and --stop refuses the session for that reason: stopping it "
+        f"saves no summary either.",
+        f"--stop {session_id} --abandon saves what was read, marked incomplete and abandoned; "
+        f"then --get-details {session_id} reads it. Or --start a new session.",
+    )
+
+
 def _refuse_reading_a_live_legacy_session(meta: SessionMeta, mode: str) -> None:
     """A reader's refusal while an earlier version's worker may still write the session.
 
@@ -2524,6 +2611,16 @@ def _exit_and_stderr(
     adb, still writing at it -- where it is: its first and its last
     ``STDERR_KEPT_BYTES``, in whole lines. Its last alone lost an error adb
     wrote first and then chattered past (second review of PR #42).
+
+    What lies between the two is scanned line by line as it is read, and
+    only adb's own lines in it are kept (``_adb_own_lines``, up to a
+    ``STDERR_KEPT_BYTES`` budget of distinct lines), placed between head and
+    tail: the device-error classification reads what this returns. A device
+    error there is typed unless more than that budget of distinct
+    adb-prefixed lines, or a single line over ``STDERR_KEPT_BYTES``, precedes
+    it. One adb wrote only there was never seen -- `adb
+    get-state` then answered `device`, and the read was refused for how adb
+    exited, exit 1 where adb had said why (v0.9.0 planning adjudication).
     """
     try:
         returncode = process.wait(timeout=timeout)
@@ -2534,10 +2631,57 @@ def _exit_and_stderr(
     if size <= 2 * STDERR_KEPT_BYTES:
         said = os.pread(fd, size, 0)
     else:
-        head = os.pread(fd, STDERR_KEPT_BYTES, 0).rpartition(b"\n")[0]
-        tail = os.pread(fd, STDERR_KEPT_BYTES, size - STDERR_KEPT_BYTES).partition(b"\n")[2]
-        said = head + b"\n" + tail
+        head, newline, _cut = os.pread(fd, STDERR_KEPT_BYTES, 0).rpartition(b"\n")
+        middle_start = len(head) + 1 if newline else 0
+        _cut, newline, tail = os.pread(fd, STDERR_KEPT_BYTES, size - STDERR_KEPT_BYTES).partition(
+            b"\n"
+        )
+        middle_end = size - len(tail) if newline else size
+        said = head + b"\n" + _adb_own_lines(fd, middle_start, middle_end) + tail
     return returncode, said.decode("utf-8", errors="replace")
+
+
+def _adb_own_lines(fd: int, start: int, end: int) -> bytes:
+    """adb's own lines among stderr's bytes ``start`` to ``end``, each with its newline.
+
+    Read a block at a time with ``pread``; every line is looked at as it
+    arrives and dropped unless it starts as adb's own do (``adb: ``,
+    ``error: ``) -- the only lines ``adb_exec._classify`` reads. Bounded
+    memory: the line being read is kept to its first ``STDERR_KEPT_BYTES``,
+    and the lines kept, each distinct one once, to ``STDERR_KEPT_BYTES``. So
+    what is kept classifies as the whole stream does unless more than that
+    budget of distinct adb-prefixed lines, or a single line over
+    ``STDERR_KEPT_BYTES``, comes before a device error, which is then missed
+    (as it was before the middle was scanned); neither is adb's real output.
+    """
+    kept: list[bytes] = []
+    seen: set[bytes] = set()
+    budget = STDERR_KEPT_BYTES
+    line = b""
+    offset = start
+
+    def keep(candidate: bytes) -> None:
+        nonlocal budget
+        if (
+            candidate.startswith(_ADB_OWN_LINE_STARTS)
+            and candidate not in seen
+            and len(candidate) < budget
+        ):
+            kept.append(candidate)
+            seen.add(candidate)
+            budget -= len(candidate) + 1
+
+    while offset < end:
+        block = os.pread(fd, min(STDERR_KEPT_BYTES, end - offset), offset)
+        if not block:
+            break
+        offset += len(block)
+        *complete, line = (line + block).split(b"\n")
+        line = line[:STDERR_KEPT_BYTES]
+        for candidate in complete:
+            keep(candidate)
+    keep(line)
+    return b"".join(candidate + b"\n" for candidate in kept)
 
 
 def _shown(stderr: str) -> str:

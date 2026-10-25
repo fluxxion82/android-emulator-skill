@@ -4536,6 +4536,81 @@ def test_a_device_error_adb_wrote_first_survives_a_long_stderr(
     assert len(refusal["error"]) < 2000, "the refusal printed adb's chatter whole"
 
 
+def _stderr_with_the_error_in_its_middle(recorded, said: str) -> str:
+    """Recorded logcat text, the recorded device-error line, the logcat text again.
+
+    Derived: logcat_threadtime (recorded `adb logcat -v threadtime` text, no
+    line of it adb's own -- asserted below) repeated until it is past
+    ``STDERR_KEPT_BYTES``, then ``said`` (one recorded not-found line), then
+    the same padding. Both padding blocks are longer than a kept window, so
+    the line is in neither the head nor the tail -- the bytes between them,
+    which only a scan of the whole stream sees.
+    """
+    padding = recorded.text("logcat_threadtime")
+    assert not [ln for ln in padding.splitlines() if ln.startswith(("adb: ", "error: "))]
+    block = padding * (anr_watcher.STDERR_KEPT_BYTES // len(padding.encode()) + 1)
+    assert len(block.encode()) > anr_watcher.STDERR_KEPT_BYTES
+    return block + said + block
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["adb_shell_device_not_found", "adb_device_not_found"],
+    ids=["adb-prefix", "error-prefix"],
+)
+@pytest.mark.parametrize("mode", ["watch", "session"])
+def test_a_device_error_adb_wrote_between_the_kept_windows_is_still_typed(
+    mode, fixture, toolchain, recorded, recorded_anywhere
+):
+    """v0.9.0 PR 7 (a): only stderr's first and last 64 KiB were classified.
+
+    adb exits 255 after the recorded crash dump, having written over 64 KiB
+    of recorded logcat text, the recorded not-found line, and over 64 KiB
+    more (``_stderr_with_the_error_in_its_middle``). The line is the
+    shell-protocol form (``adb_shell_device_not_found``: `adb logcat` is a
+    shell command on adb's client, as `adb shell` is) and get-state's form
+    (``adb_device_not_found``); adb_exec._classify reads either prefix. The
+    classification ran on the head and tail kept for display, so the line
+    was never seen: `adb get-state` answered `device`, and the read was
+    refused for how adb exited -- exit 1 where adb had said why, 3. The
+    whole stream is scanned for adb's own lines; only head and tail are kept.
+    """
+    said = recorded_anywhere(fixture)
+    long_said = _stderr_with_the_error_in_its_middle(recorded, said)
+    data = long_said.encode()
+    kept = anr_watcher.STDERR_KEPT_BYTES
+    at = data.index(said.strip().encode())
+    assert kept < at < len(data) - kept - len(said.encode()), "the line is in a kept window"
+    toolchain.install(
+        "adb",
+        [
+            Rule(("devices",), stdout=recorded.text("adb_devices_single")),
+            Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(
+                ("logcat",),
+                stdout=recorded.data(f"{CRASH_DUMP}.bin"),
+                stderr=long_said,
+                exit=255,
+            ),
+        ],
+    )
+
+    if mode == "watch":
+        result = toolchain.run("anr_watcher.py", "--watch", "--duration", "30", "--json")
+        refusal = assert_refusal(
+            result, json_mode=True, naming=("not attached",), status=3, streaming=True
+        )
+    else:
+        store = SessionStore(base_dir=toolchain.home / "anr-sessions")
+        _session_id, result = _session_until_crashed(
+            lambda *argv: toolchain.run("anr_watcher.py", *argv, ANDROID_EMU_ANR_MAX_RESTARTS="0"),
+            store,
+        )
+        refusal = assert_refusal(result, json_mode=True, naming=("not attached",), status=3)
+    assert refusal["remedy"].startswith(NOT_FOUND_REMEDY), refusal
+    assert len(refusal["error"]) < 2000, "the refusal printed adb's stderr whole"
+
+
 def test_a_watch_of_bytes_that_are_not_records_keeps_the_device_error_adb_wrote(
     recorded, recorded_anywhere, tmp_path
 ):
@@ -6204,6 +6279,98 @@ def test_an_abandoned_sessions_answers_ignore_what_its_worker_appends_after(
     assert again == abandoned, "a later --stop answered from what was appended after"
     assert details_again == details
     assert raw_again == raw
+
+
+def _cli_text(monkeypatch, capsys, *argv: str) -> tuple[int, str]:
+    """``anr_watcher.py <argv>`` (text) through main and the boundary: (status, stdout + stderr)."""
+    monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", *argv])
+    with pytest.raises(SystemExit) as exc:
+        cli.run(anr_watcher.main)
+    captured = capsys.readouterr()
+    return exc.value.code, captured.out + captured.err
+
+
+def test_a_worker_gone_without_publishing_its_end_is_neither_listed_running_nor_sent_to_stop(
+    store, monkeypatch, capsys
+):
+    """v0.9.0 PR 7 (b): readers took a dead worker's last word, `running`, for its state.
+
+    A worker that cannot take its session's lock in
+    ``WORKER_END_LOCK_TIMEOUT_SECONDS`` exits without publishing its end; so
+    does one killed. --stop refuses that session by name (worker gone, end
+    unknown). --list-sessions printed its persisted status, `running`, and
+    --get-details sent the caller to `Run --stop <id> first` -- the --stop
+    that refuses. A real store, a real worker identity (a process carrying
+    the session's token, claimed, then killed): while it lives the listing
+    says nothing more; once it is gone, both readers give --stop's answer --
+    the worker is gone and its capture end unpublished -- and --get-details
+    names --abandon, not the --stop that refuses. Abandoned, it is an
+    ordinary ended session again.
+    """
+    meta = store.create({"package": None})
+    sid = meta.session_id
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; print('ready', flush=True); time.sleep(60)",
+            anr_watcher.WORKER_TOKEN_FLAG,
+            meta.worker_token,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert worker.stdout.readline().strip() == "ready"
+        store.claim_worker(sid, pid=worker.pid, token=meta.worker_token)
+        assert worker_identity(store.load_meta(sid))[0] is Identity.WORKER
+        _alive_status, while_alive = _cli_json(monkeypatch, capsys, "--list-sessions")
+    finally:
+        worker.kill()
+        worker.wait(timeout=30)
+        worker.stdout.close()
+    assert worker_identity(store.load_meta(sid))[0] is Identity.GONE
+
+    listed_status, listed = _cli_json(monkeypatch, capsys, "--list-sessions")
+    text_status, text = _cli_text(monkeypatch, capsys, "--list-sessions")
+    details_status, details = _cli_json(monkeypatch, capsys, "--get-details", sid)
+    plain_status, plain = _cli_text(monkeypatch, capsys, "--get-details", sid)
+    stop_status, stop = _cli_json(monkeypatch, capsys, "--stop", sid)
+    abandoned_status, _abandoned = _cli_json(monkeypatch, capsys, "--stop", sid, "--abandon")
+    after_status, _after = _cli_json(monkeypatch, capsys, "--get-details", sid)
+    _status, relisted = _cli_json(monkeypatch, capsys, "--list-sessions")
+
+    assert text_status == 0
+    line = next(ln for ln in text.splitlines() if sid in ln)
+    assert "worker gone" in line and "capture end unpublished" in line, text
+    assert line.split()[1] != "running", text
+    # --stop, unchanged: it refuses the session, naming the gone worker.
+    assert stop_status == 1 and "worker is gone" in stop["error"], stop
+    # --get-details gives that answer, and does not send the caller to it.
+    assert details_status == 1, details
+    assert "worker is gone" in details["error"] and "unpublished" in details["error"], details
+    assert f"pid {worker.pid}" in details["error"], details
+    assert f"--stop {sid} first" not in details["error"] + details["remedy"], details
+    assert f"--stop {sid} --abandon" in details["remedy"], details
+    assert plain_status == 1 and "worker is gone" in plain, plain
+    # The listing's JSON: the persisted status, and the field that qualifies it.
+    (alive,) = while_alive
+    assert (alive["status"], alive["unpublished_end"], alive["unpublished_end_reason"]) == (
+        "running",
+        False,
+        None,
+    ), alive
+    (entry,) = listed
+    assert listed_status == 0, listed
+    assert entry["status"] == "running", "the persisted status was rewritten by a reader"
+    assert entry["unpublished_end"] is True, entry
+    reason = entry["unpublished_end_reason"]
+    assert "worker is gone" in reason and f"pid {worker.pid}" in reason, entry
+    assert "unpublished" in reason, entry
+    # Abandoned, it has ended: answered, and listed as what it now is.
+    assert (abandoned_status, after_status) == (0, 0)
+    (entry,) = relisted
+    assert (entry["status"], entry["unpublished_end"]) == ("abandoned", False), entry
 
 
 @pytest.mark.parametrize("reader", ["details", "diff", "list"])

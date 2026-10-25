@@ -691,7 +691,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       foresaw; a SIGTERM meanwhile only asks for a stop): `stopped`, or
       `crashed` with its failure, in one write — unless it cannot have the
       lock within 5 minutes or the session was deleted, when `--stop` finds
-      it gone without having said, and `--abandon` is the way out. The CLI
+      it gone without having said, and `--abandon` is the way out.
+      `--list-sessions` and `--get-details` give that answer too, judging the
+      worker as `--stop` does (its token and recorded start time, not pid
+      liveness): the listing keeps the persisted `status` (`running` /
+      `deciding`) and adds `"unpublished_end": true` with
+      `unpublished_end_reason` in JSON (`false` / `null` for every other
+      session), and in text shows `gone` and `worker gone, capture end
+      unpublished: <why>`; `--get-details` on such a session, which has no
+      summary, refuses (exit 1) naming `--stop ID --abandon` — it said `Run
+      --stop ID first`, and that `--stop` refuses. The CLI
       owns `cancelled`, `abandoned` and `summary.json`. `events.jsonl` is not
       locked: the worker appends to it as it reads. A worker whose claim is
       refused — its session cancelled, already claimed, or not its token —
@@ -986,9 +995,14 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       finish (the session worker's grace too), which may name a device error
       (exit 3). adb's stderr is read from its start and its end (64 KiB
       each): an error adb wrote first and then chattered past was lost with a
-      tail alone. An error only in the middle of more than 128 KiB of stderr
-      is not read, so it is not typed: exit 1 where it is 3. A message shows
-      adb's stderr shortened.
+      tail alone. What lies between the two is scanned line by line as it is
+      read, not kept: only adb's own lines (`adb: ` / `error: `, the lines
+      the device-error classification reads) are, up to 64 KiB of distinct
+      lines, so a device error anywhere in the stream is typed — unless more
+      than that much of distinct adb-prefixed lines, or a single line over
+      64 KiB, comes before it — exit 3 where, between the two windows of more
+      than 128 KiB, it was exit 1 once `adb get-state` found the device back.
+      A message shows adb's stderr shortened.
       A session's worker does not restart either kind of
       stream: it keeps each stream's stderr (it went to `/dev/null`) and reads
       what adb has said whether or not adb has exited, takes a device error
