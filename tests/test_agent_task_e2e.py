@@ -15,7 +15,8 @@ order, and `test_quick_start_contract.py` enforces that: the documented path and
 the verified path have to be the same path. In particular step 3 takes its
 target from what step 2 *printed* in its default output, not from `--json` and
 not from a literal in this file — that is the loop, and it is the one the agent
-is told to run.
+is told to run. Step 0, the environment check, is a shell script and runs
+under bash (``run_skill`` picks the interpreter from the suffix).
 
 The target is the Compose fixture app (`tests/fixtures/scaffold/compose/`),
 deliberately: Jetpack Compose is the default Android UI toolkit, and until R11
@@ -38,6 +39,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,7 @@ from app_launcher import parse_am_start
 # exactly one such resolver or the live lane and the mocked one can disagree
 # about what "the right control" means.
 from test_agent_loop_from_output import _expected_rect
+from test_android_health_check import CHECK_NAMES as HEALTH_CHECK_NAMES
 
 from common.device_utils import parse_focused_activity
 from common.hierarchy import capture_hierarchy
@@ -120,8 +123,16 @@ def run_skill(compose_device: str):
     """Invoke one of the skill's scripts the way an agent would."""
 
     def _run(script: str, *args: str) -> subprocess.CompletedProcess:
+        if script.endswith(".sh"):
+            # Run under bash, as SKILL.md writes it. The one shell script in
+            # Quick Start, the health check, inspects the HOST and takes no
+            # --serial: it would ignore one, and passing it anyway would claim
+            # a targeting the script does not do.
+            argv = ["bash", str(SCRIPTS / script), *args]
+        else:
+            argv = [sys.executable, str(SCRIPTS / script), "--serial", compose_device, *args]
         return subprocess.run(
-            [sys.executable, str(SCRIPTS / script), "--serial", compose_device, *args],
+            argv,
             capture_output=True,
             text=True,
             timeout=STEP_TIMEOUT,
@@ -182,7 +193,42 @@ def compose_app(run_skill, adb: str, compose_device: str):
 
     Returns the package, and the focused activity as the test last saw it, so a
     shortfall can say which screen was actually mapped.
+
+    Quick Start step 0, the environment check, runs first, here, because step
+    1 is the launch below.
     """
+    # --- 0. Check the environment (Quick Start step 0) ----------------------
+    #
+    # This host is about to run the whole walk, so it is healthy by
+    # construction: the check must say so, at exit 0, in one JSON object that
+    # carries every check. A check that failed a host this test then drives
+    # successfully would be telling the agent to stop for nothing.
+    health = run_skill("android_health_check.sh", "--json")
+    assert health.returncode == 0, (
+        f"the health check failed a host the walk runs on (exit {health.returncode}):\n"
+        f"  stdout: {health.stdout.strip()}\n  stderr: {health.stderr.strip()[-2000:]}"
+    )
+    report = json.loads(health.stdout)
+    assert report["success"] is True, report
+    # The report itself, not a count: every expected check by name (an
+    # ANDROID_HOME naming a missing directory adds one SDK warning, so extra
+    # copies of a known name are allowed), nothing else, each fully formed.
+    names = [check.get("name") for check in report["checks"]]
+    missing = Counter(HEALTH_CHECK_NAMES) - Counter(names)
+    unknown = sorted({str(name) for name in names} - set(HEALTH_CHECK_NAMES))
+    assert not missing and not unknown, (
+        f"the report's checks are not the health check's: missing {dict(missing)}, "
+        f"unknown {unknown}"
+    )
+    malformed = [
+        check
+        for check in report["checks"]
+        if set(check) != {"section", "name", "status", "message"}
+        or check["status"] not in ("passed", "warning")
+        or not check["message"]
+    ]
+    assert not malformed, f"checks a successful report should not carry: {malformed}"
+
     # Force-stop first, and check that it worked. The lane boots from a saved
     # snapshot, so whatever state the app was left in at the end of the previous
     # run comes back with it -- including an ANR dialog, whose "Close app" /

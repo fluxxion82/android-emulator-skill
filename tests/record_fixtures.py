@@ -117,6 +117,12 @@ HIERARCHY_DESCRIPTION = (
     "against a 48 'dp' constant wrong."
 )
 
+# Captured out-of-band too, on the HOST: one selector, one file per JDK major
+# installed here (`java_version_<major>.txt`), so how many files it writes
+# depends on the machine rather than on a FIXTURES entry. The device is not
+# touched; `record` still reads its getprop for the profile's provenance.
+JAVA_VERSION_FIXTURE = "java_version"
+
 
 @dataclass(frozen=True)
 class Capture:
@@ -5919,7 +5925,110 @@ def _command_of(fixture: Fixture) -> str:
 
 def _known_names() -> set[str]:
     """Every fixture name this tool can record."""
-    return {f.name for f in FIXTURES} | {HIERARCHY_FIXTURE}
+    return {f.name for f in FIXTURES} | {HIERARCHY_FIXTURE, JAVA_VERSION_FIXTURE}
+
+
+# macOS's JDK registry. `-V` lists every installed JDK on stderr, one per line,
+# ending in its home: `    17.0.20 (arm64) "Amazon.com Inc." - "Amazon
+# Corretto 17" /Users/<user>/Library/Java/JavaVirtualMachines/.../Contents/Home`.
+_JAVA_HOME_TOOL = Path("/usr/libexec/java_home")
+_JAVA_HOME_ENTRY = re.compile(r'"\s+(/.+)$')
+
+# The major in a `java -version` banner's quoted version: "17.0.20.1" is 17,
+# and before Java 9 the scheme was "1.8.0_392", whose major is 8. Used only to
+# NAME the file; the health check's own parser is tested against what is in it.
+_JAVA_BANNER_MAJOR = re.compile(r'version "(?:1\.)?(\d+)')
+
+
+def _host_java_binaries() -> list[tuple[str, Path]]:
+    """Every JDK on this host, as ``(how it was found, its java binary)``.
+
+    The JDKs ``java_home -V`` registers, newest first as it lists them, then
+    the ``java`` on PATH: that is the one the health check runs, and a
+    Homebrew JDK is on PATH without being registered.
+    """
+    found: list[tuple[str, Path]] = []
+    if _JAVA_HOME_TOOL.exists():
+        listing = _run_host([str(_JAVA_HOME_TOOL), "-V"])
+        for line in listing.stderr.splitlines():
+            entry = _JAVA_HOME_ENTRY.search(line)
+            if entry:
+                found.append(("java_home -V", Path(entry.group(1)) / "bin" / "java"))
+    on_path = shutil.which("java")
+    if on_path:
+        found.append(("PATH", Path(on_path)))
+    return found
+
+
+# How a banner line starts: Oracle prints `java version "`, every OpenJDK
+# build `openjdk version "`.
+_JAVA_BANNER_LINE = re.compile(r'(?:java|openjdk) version "')
+
+
+def _java_version_line(text: str) -> str | None:
+    """The banner line of ``java -version`` output, or None.
+
+    The first line that STARTS ``java version "`` or ``openjdk version "``.
+    Not simply the first line: with JAVA_TOOL_OPTIONS set the JVM prints
+    ``Picked up JAVA_TOOL_OPTIONS: ...`` ahead of its banner. And not the first
+    line that merely contains ``version "``: that notice echoes the options
+    verbatim, so it can carry ``version "21"`` of its own. The same rule as
+    android_health_check.sh's java check.
+    """
+    return next((line for line in text.splitlines() if _JAVA_BANNER_LINE.match(line)), None)
+
+
+def _capture_java_versions() -> list[tuple[int, str, Path, Capture]]:
+    """``java -version`` from one JDK per major installed on this host.
+
+    The first JDK found for a major is the one recorded. The whole output is
+    kept, all three lines: the health check picks the first line itself, and a
+    fixture that did that for it would leave the selection untested.
+    """
+    by_major: dict[int, tuple[int, str, Path, Capture]] = {}
+    for source, java in _host_java_binaries():
+        capture = _run_host([str(java), "-version"])
+        line = _java_version_line(capture.text)
+        found = _JAVA_BANNER_MAJOR.search(line) if line is not None else None
+        if found is None:
+            raise CaptureError(f"{java} -version printed no version: {capture.text[:200]!r}")
+        first = capture.text.splitlines()[0]
+        if first != line:
+            # Refused, not committed with the notice: a fixture is the banner a
+            # plain `java -version` prints, and the notice case is derived
+            # from it where it is tested.
+            raise CaptureError(
+                f"{java} -version printed {first!r} before its banner, a startup "
+                f"notice; unset JAVA_TOOL_OPTIONS (and JDK_JAVA_OPTIONS, "
+                f"_JAVA_OPTIONS) and record again"
+            )
+        major = int(found.group(1))
+        by_major.setdefault(major, (major, source, java, capture))
+    if not by_major:
+        raise CaptureError("no JDK found: java_home -V listed none and no java is on PATH")
+    return [by_major[major] for major in sorted(by_major)]
+
+
+# `java_version_<major>`: the names the java_version selector writes.
+_JAVA_VERSION_NAME = re.compile(rf"{JAVA_VERSION_FIXTURE}_(\d+)")
+
+
+def _java_version_text(major: int) -> tuple[str, str]:
+    """``(command, description)`` for ``java_version_<major>``.
+
+    Neither names the JDK's path or how it was found: both depend on the host,
+    and the manifest's text must be what :func:`recorder_text` says without
+    one. The scrubbed path and its source go in the entry's ``java`` and
+    ``found_by`` fields instead.
+    """
+    return (
+        f"<JDK {major}>/bin/java -version",
+        (
+            f"`java -version` from a JDK {major} on the recording host, all of it. "
+            f"android_health_check.sh reads its first line and fails a JDK below "
+            f"17, AGP 8's floor. Host-only: no adb."
+        ),
+    )
 
 
 def _capture_hierarchy(serial: str, timeout: int = DEFAULT_TIMEOUT) -> str:
@@ -6003,6 +6112,9 @@ def recorder_text(name: str) -> tuple[str, str]:
     """
     if name == HIERARCHY_FIXTURE:
         return HIERARCHY_COMMAND, HIERARCHY_DESCRIPTION
+    java = _JAVA_VERSION_NAME.fullmatch(name)
+    if java:
+        return _java_version_text(int(java.group(1)))
     for fixture in FIXTURES:
         if fixture.name == name:
             return _command_of(fixture), fixture.description
@@ -6047,9 +6159,10 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
     """Record fixtures, write MANIFEST.json, and report what was written."""
     selected = [f for f in FIXTURES if only is None or f.name in only]
     if only:
-        # The hierarchy dump is captured out-of-band (it needs exec-out, not the
-        # plain adb call every other fixture uses), so it is not in FIXTURES.
-        unknown = only - {f.name for f in FIXTURES} - {HIERARCHY_FIXTURE}
+        # The hierarchy dump and the host JDK banners are captured out-of-band
+        # (exec-out; a file count that depends on the host), so neither is in
+        # FIXTURES.
+        unknown = only - _known_names()
         if unknown:
             print(f"Unknown fixture(s): {', '.join(sorted(unknown))}", file=sys.stderr)
             print(f"Known: {', '.join(sorted(_known_names()))}", file=sys.stderr)
@@ -6256,6 +6369,25 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
                 ext="xml",
             )
 
+    if only is None or JAVA_VERSION_FIXTURE in only:
+        # Host-only: java_home and each JDK's java, never adb. The getprop
+        # above is the run's provenance, not part of this capture.
+        try:
+            banners = _capture_java_versions()
+        except CaptureError as exc:
+            failures.append((JAVA_VERSION_FIXTURE, str(exc)))
+            print(f"  FAIL  {JAVA_VERSION_FIXTURE}: {exc}", file=sys.stderr)
+        else:
+            for major, source, java, capture in banners:
+                _record_one(
+                    f"{JAVA_VERSION_FIXTURE}_{major}",
+                    *_java_version_text(major),
+                    [],
+                    _redact_private_packages(_strip_cr(capture.text), redactions),
+                    capture=capture,
+                    extra={"java": _scrub_home_paths(str(java)), "found_by": source},
+                )
+
     manifest = {
         "profile": profile,
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -6338,6 +6470,7 @@ def main() -> None:
         print(
             f"{HIERARCHY_FIXTURE:<{width}}  adb exec-out uiautomator dump /dev/tty" "  [catches S7]"
         )
+        print(f"{JAVA_VERSION_FIXTURE:<{width}}  <each host JDK>/bin/java -version  [host]")
         return
 
     sys.exit(record(args.serial, set(args.only) if args.only else None, args.profile))

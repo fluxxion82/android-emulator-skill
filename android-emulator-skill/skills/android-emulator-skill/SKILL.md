@@ -24,6 +24,9 @@ The examples below are written with `$SKILL_DIR` set that way.
 ## Quick Start
 
 ```bash
+# 0. Check the environment (exit 1 names what to fix: adb, a JDK below 17, ...)
+bash "$SKILL_DIR/scripts/android_health_check.sh" --json
+
 # 1. Launch app
 python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app
 
@@ -509,7 +512,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 #### Discovery & Device State (14 scripts) ⭐ NEW
 
-23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing.
+23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing or the JDK is below 17. Quick Start step 0.
+    - The JDK floor is 17 (AGP 8 runs Gradle on nothing older). The major is
+      read from the first line of `java -version`, including the pre-Java-9
+      `"1.8.0_392"` form (major 8); `--json` carries it as `java_major`, or
+      `null` when java is missing or its banner has no readable version
+      (that case is a warning, not a failure).
     - Every probe is bounded (10 s), the Python version and Pillow probes
       included. A `python3` on PATH that cannot run is a warning saying so,
       not "Python 0.0 found"

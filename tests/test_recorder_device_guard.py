@@ -16,10 +16,16 @@ appears in this file.
 
 from __future__ import annotations
 
+import json
 import shlex
 
 import pytest
 import record_fixtures as rf
+from test_android_health_check import (
+    TOOL_OPTIONS_NOTICE,
+    VERSION_IN_NOTICE,
+    _tool_options_banner,
+)
 
 PHONE_SHAPED = "98ZZ1FFBA00000"
 EMULATOR = "emulator-5554"
@@ -248,6 +254,73 @@ def test_every_adb_call_of_a_full_run_names_the_resolved_serial(monkeypatch, tmp
         f"adb -s {EMULATOR} shell log -t aes-recorder",
     ):
         assert any(line.startswith(step) for line in issued), f"never issued: {step}"
+
+
+def test_the_java_version_selector_runs_no_adb_of_its_own(monkeypatch, tmp_path, recorded):
+    """`--only java_version` is host-only: past the run's getprop, no adb at all.
+
+    No java_home here and one java on PATH, answering with the recorded JDK 17
+    banner. What the manifest says about the file must be what
+    ``recorder_text`` says, with the host's path kept out of it.
+    """
+    banner = recorded.text("java_version_17")
+    java = "/opt/jdk-17/bin/java"
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv[0] == "adb":
+            return rf.subprocess.CompletedProcess(argv, 0, "35\n", "")
+        return rf.subprocess.CompletedProcess(argv, 0, "", banner)
+
+    which = rf.shutil.which
+    monkeypatch.setattr(rf.subprocess, "run", fake_run)
+    monkeypatch.setattr(rf, "RECORDED_ROOT", tmp_path)
+    monkeypatch.setattr(rf, "_JAVA_HOME_TOOL", tmp_path / "no-java_home")
+    monkeypatch.setattr(rf.shutil, "which", lambda name: java if name == "java" else which(name))
+
+    assert rf.record(EMULATOR, {rf.JAVA_VERSION_FIXTURE}, "host") == 0
+
+    adb = [argv for argv in calls if argv[0] == "adb"]
+    assert adb and all(argv[:5] == ["adb", "-s", EMULATOR, "shell", "getprop"] for argv in adb)
+    assert [argv for argv in calls if argv[0] != "adb"] == [[java, "-version"]]
+    (entry,) = json.loads((tmp_path / "host" / "MANIFEST.json").read_text("utf-8"))["fixtures"]
+    assert entry["name"] == "java_version_17" and entry["java"] == java
+    assert (entry["command"], entry["description"]) == rf.recorder_text(entry["name"])
+    assert (tmp_path / "host" / "java_version_17.txt").read_text("utf-8") == banner
+
+
+NOTICES = [
+    pytest.param(TOOL_OPTIONS_NOTICE, id="plain-notice"),
+    pytest.param(VERSION_IN_NOTICE, id="notice-saying-version-21"),
+]
+
+
+@pytest.mark.parametrize("notice", NOTICES)
+def test_the_recorder_finds_the_version_line_past_a_startup_notice(recorded, notice):
+    banner = _tool_options_banner(recorded.text("java_version_11"), notice)
+
+    assert rf._java_version_line(banner) == recorded.lines("java_version_11")[0]
+
+
+@pytest.mark.parametrize("notice", NOTICES)
+def test_a_banner_recorded_under_java_tool_options_is_refused(monkeypatch, recorded, notice):
+    """The committed banners are what a plain `java -version` prints, verbatim.
+
+    A capture with a notice ahead of the version line is refused rather than
+    committed with it, whatever the notice says -- one that echoes
+    ``version "21"`` must not be taken for a JDK 21's banner. The notice case
+    is the health check's to handle, and its test derives that input from
+    these recordings.
+    """
+    java = rf.Path("/opt/jdk-11/bin/java")
+    banner = _tool_options_banner(recorded.text("java_version_11"), notice)
+    monkeypatch.setattr(rf, "_host_java_binaries", lambda: [("PATH", java)])
+    monkeypatch.setattr(rf, "_run_host", lambda _argv: rf.Capture("", banner, 0))
+
+    with pytest.raises(rf.CaptureError, match="before its banner") as refused:
+        rf._capture_java_versions()
+    assert "unset JAVA_TOOL_OPTIONS" in str(refused.value)
 
 
 def test_a_read_only_fixture_is_not_refused(adb_calls):

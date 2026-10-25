@@ -1,8 +1,8 @@
 """Quick Start is the contract; the e2e test is the proof it holds.
 
 SKILL.md's Quick Start block is the whole navigation strategy an agent is given:
-five commands, in order, that it will run before it runs anything else. Nothing
-verified that any of them worked as documented.
+six commands, steps 0 to 5, in order, that it will run before it runs anything
+else. Nothing verified that any of them worked as documented.
 
 The v0.6.0 e2e test looked like it did. It reads `screen_mapper --json`, checks
 that "Submit Order" is among the labels, then acts with `--find-type EditText`,
@@ -34,6 +34,11 @@ Inc 1 extended `test_agent_task_e2e.py` to walk all five Quick Start commands --
 including step 3, `navigator --find-text --tap`, seeded from what step 2 printed
 -- so the coverage assertion is green and its `xfail(strict=True)` marker is
 gone. The e2e baseline below was updated in that same commit.
+
+Step 0, `bash ... android_health_check.sh --json`, was added later, and the
+guard could not see it: both extractors kept only `.py` tokens, so the new
+line parsed to nothing and the coverage assertion stayed green with the e2e
+test never running the script. Both now take `SCRIPT_SUFFIXES`.
 """
 
 from __future__ import annotations
@@ -48,12 +53,20 @@ E2E_TEST = Path(__file__).resolve().parent / "test_agent_task_e2e.py"
 
 QUICK_START_HEADING = "## Quick Start"
 
+# What a script token ends in, on both sides. Step 0 is `bash ...
+# android_health_check.sh --json`, and with `.py` alone both extractors were
+# blind to it: the Quick Start line parsed to nothing, so the coverage
+# assertion passed while the e2e test never ran the script. A suffix added
+# here must be added to both sides at once -- it is one constant for that.
+SCRIPT_SUFFIXES = (".py", ".sh")
+
 # Every command SKILL.md's Quick Start block documents, normalised. Complete,
 # not a count: a count survives an extractor that drops `--launch` from
 # app_launcher and picks up a stray line elsewhere, and that mutation is exactly
 # what would make the coverage assertion below quietly stop checking step 1.
 QUICK_START_BASELINE = (
     ("accessibility_audit.py", ()),
+    ("android_health_check.sh", ("--json",)),
     ("app_launcher.py", ("--launch",)),
     ("navigator.py", ("--enter-text", "--find-type")),
     ("navigator.py", ("--find-text", "--tap")),
@@ -67,6 +80,7 @@ QUICK_START_BASELINE = (
 # this baseline is updated in the same commit, which is the point of stating it.
 E2E_BASELINE = (
     ("accessibility_audit.py", ()),
+    ("android_health_check.sh", ("--json",)),
     ("app_launcher.py", ("--json", "--launch")),
     ("app_launcher.py", ("--json", "--terminate")),
     ("log_monitor.py", ("--duration", "--json")),
@@ -125,7 +139,7 @@ def _command(line: str) -> tuple[str, frozenset[str]] | None:
     except ValueError:
         return None
 
-    script = next((Path(token).name for token in tokens if token.endswith(".py")), None)
+    script = next((Path(token).name for token in tokens if token.endswith(SCRIPT_SUFFIXES)), None)
     if script is None:
         return None
     return script, frozenset(token for token in tokens if token.startswith("--"))
@@ -168,7 +182,7 @@ def e2e_invocations() -> list[tuple[str, frozenset[str]]]:
             for argument in node.args
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
         ]
-        script = next((value for value in literals if value.endswith(".py")), None)
+        script = next((value for value in literals if value.endswith(SCRIPT_SUFFIXES)), None)
         if script is None:
             continue
         calls.append((script, frozenset(value for value in literals if value.startswith("--"))))
