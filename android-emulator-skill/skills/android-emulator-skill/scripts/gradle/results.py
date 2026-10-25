@@ -281,6 +281,91 @@ _FAILURE_SECTION_RE = re.compile(r"^\*\s*(?P<heading>.+?):\s*$")
 _FAILURE_NOISE_PREFIXES = ("> Run ", "> Get more help", "> For more on ", "> Run with ")
 
 
+# The one `* Where:` form recorded (gradle_where_block, Gradle 8.13): a build
+# script's evaluation failed at a line. Gradle prints the absolute path.
+#     Build file '/scaffold/build.gradle' line: 11
+# Other forms -- a settings file, an applied script plugin, an init script --
+# are not recorded and are left unlocated rather than parsed from memory.
+_WHERE_BUILD_FILE_RE = re.compile(r"^Build file '(?P<file>.+)' line: (?P<line>\d+)$")
+
+
+# The lines that open and close a failure report (recorded in every failing
+# log: gradle_where_block, gradle_task_not_found, ...).
+_FAILURE_BOUNDARY_RE = re.compile(r"^(?:FAILURE:|BUILD FAILED)")
+
+
+def _no_location() -> dict:
+    return {"file": None, "line": None, "column": None}
+
+
+def _where_location(body: list[str]) -> dict:
+    """The location a ``* Where:`` block names, or nulls for a form not recorded."""
+    for line in body:
+        where = _WHERE_BUILD_FILE_RE.match(line)
+        if where:
+            return {"file": where.group("file"), "line": int(where.group("line")), "column": None}
+    return _no_location()
+
+
+def extract_failures(text: str) -> list[dict]:
+    """Each Gradle failure report as ``{"message", "location"}``.
+
+    ``message`` is the body of a ``* What went wrong:`` section,
+    whitespace-collapsed. ``location`` is ``{file, line, column}`` from the
+    ``* Where:`` section Gradle prints just above it, when there is one, and
+    all nulls otherwise. A ``Where:`` belongs only to the ``What went wrong``
+    that directly follows it in the same failure: any other section (``Try:``,
+    ``Exception is:``) and a ``FAILURE:`` or ``BUILD FAILED`` line drop a
+    location still pending, so it is never carried to the next failure.
+
+    Args:
+        text: Combined Gradle stdout/stderr.
+
+    Returns:
+        One dict per failure section. Empty if the build did not fail.
+    """
+    failures: list[dict] = []
+    heading: str | None = None
+    body: list[str] = []
+    location = _no_location()
+
+    def close() -> None:
+        nonlocal location
+        if heading == "where":
+            location = _where_location(body)
+            return
+        if heading == "what went wrong" and body:
+            failures.append({"message": " ".join(body).strip(), "location": location})
+        location = _no_location()
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if _FAILURE_BOUNDARY_RE.match(line):
+            # Between failure reports: nothing pending survives it.
+            close()
+            heading, body, location = None, [], _no_location()
+            continue
+        section = _FAILURE_SECTION_RE.match(line.strip())
+
+        if section:
+            # A new section ends whatever we were collecting.
+            close()
+            heading = section.group("heading").strip().lower()
+            body = []
+            continue
+
+        if heading not in ("where", "what went wrong"):
+            continue
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith(_FAILURE_NOISE_PREFIXES):
+            continue
+        body.append(stripped)
+
+    close()
+    return failures
+
+
 def extract_failure_reasons(text: str) -> list[str]:
     """Pull the body of each ``* What went wrong:`` section from Gradle output.
 
@@ -301,34 +386,7 @@ def extract_failure_reasons(text: str) -> list[str]:
         >>> extract_failure_reasons("FAILURE: Build failed\\n\\n* What went wrong:\\nBoom\\n")
         ['Boom']
     """
-    reasons: list[str] = []
-    collecting = False
-    body: list[str] = []
-
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        section = _FAILURE_SECTION_RE.match(line.strip())
-
-        if section:
-            # A new section ends whatever we were collecting.
-            if collecting and body:
-                reasons.append(" ".join(body).strip())
-            body = []
-            collecting = section.group("heading").strip().lower() == "what went wrong"
-            continue
-
-        if not collecting:
-            continue
-
-        stripped = line.strip()
-        if not stripped or stripped.startswith(_FAILURE_NOISE_PREFIXES):
-            continue
-        body.append(stripped)
-
-    if collecting and body:
-        reasons.append(" ".join(body).strip())
-
-    return reasons
+    return [failure["message"] for failure in extract_failures(text)]
 
 
 def _split_kotlin_body(body: str) -> dict:
@@ -494,15 +552,9 @@ def parse_build_output(stdout: str, stderr: str) -> dict:
     # Gradle's own failure report. Kept last so a compile error that already
     # explains the failure stays first in the list, and deduplicated against it
     # so a task-level failure is not reported twice.
-    for reason in extract_failure_reasons(combined):
-        if any(reason in existing["message"] for existing in errors):
+    for failure in extract_failures(combined):
+        if any(failure["message"] in existing["message"] for existing in errors):
             continue
-        errors.append(
-            {
-                "message": reason,
-                "type": "gradle",
-                "location": {"file": None, "line": None, "column": None},
-            }
-        )
+        errors.append({**failure, "type": "gradle"})
 
     return {"errors": errors, "warnings": warnings, "failed_tasks": failed_tasks}

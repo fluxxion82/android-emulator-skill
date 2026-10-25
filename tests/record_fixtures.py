@@ -1131,6 +1131,89 @@ def _listing(directory: str) -> list[str]:
     return ["shell", "run-as", COMPOSE_PACKAGE, *argv]
 
 
+# --- Reading a file: container.py's --cat --------------------------------------
+#
+# container.py reads a file with common.run_as.read_command (`adb shell -T
+# run-as <pkg> cat <absolute path>`). These fixtures run that argv, built by the
+# skill's own code, and keep stdout byte for byte (capture_bytes): the text
+# pipeline's decode and newline translation would hide the very bytes --cat
+# decides "text" or "binary" on.
+
+
+def _read_file(path: str) -> list[str]:
+    """`adb shell -T run-as <fixture app> cat <path>`, as container.py builds it."""
+    _make_scripts_importable()
+    from common.run_as import read_command
+
+    return read_command(None, COMPOSE_PACKAGE, ["cat", path])[1:]
+
+
+# container.py's default CAT_MAX_BYTES. The recording is the WHOLE file; the
+# cap is applied by the script, so the manifest says where it falls.
+CAT_CAP_BYTES = 65_536
+UTF8_CAP_NAME = "aes_utf8_cap.txt"
+UTF8_CAP_STAGED = f"/data/local/tmp/{UTF8_CAP_NAME}"
+UTF8_CAP_PATH = f"{COMPOSE_DATA_DIR}/files/{UTF8_CAP_NAME}"
+_UTF8_CAP_LINE = "Grüße aus Köln — 日本語のテキスト — naïve café, señor\n"
+
+
+def _utf8_cap_text() -> bytes:
+    """UTF-8 text longer than CAT_CAP_BYTES whose cap cuts a three-byte character after two.
+
+    Numbered lines of mixed-script text, behind an ASCII header padded until
+    byte CAT_CAP_BYTES - 1 is the second byte of a CJK character: the cut then
+    leaves an incomplete sequence at the very end and nothing invalid before it.
+    """
+    lines = "".join(f"{n:05d} {_UTF8_CAP_LINE}" for n in range(1, 900))
+    for pad in range(64):
+        data = (f"# --cat cap probe{'.' * pad}\n" + lines).encode("utf-8")
+        lead = data[CAT_CAP_BYTES - 2]
+        if 0xE0 <= lead <= 0xEF:
+            return data
+    raise CaptureError("no padding puts the cap inside a three-byte character")
+
+
+def _push_utf8_cap(scratch: Path, serial: str) -> None:
+    """Push :func:`_utf8_cap_text` into the fixture app's files/ (staged in /data/local/tmp)."""
+    local = scratch / UTF8_CAP_NAME
+    local.write_bytes(_utf8_cap_text())
+    for argv in (
+        ["push", str(local), UTF8_CAP_STAGED],
+        ["shell", "-T", "run-as", COMPOSE_PACKAGE, "cp", UTF8_CAP_STAGED, UTF8_CAP_PATH],
+    ):
+        result = _run(argv, serial)
+        if result.returncode != 0:
+            raise CaptureError(f"`adb {' '.join(argv)}` exited {result.returncode}: {result.text}")
+
+
+def _utf8_cap_read(serial: str, extra: dict) -> bytes:
+    """The app's own read of the pushed file, refused unless it is the file pushed."""
+    payload = _run_bytes(_read_file(UTF8_CAP_PATH), serial)
+    if payload != _utf8_cap_text():
+        raise CaptureError(
+            f"read back {len(payload)} bytes that are not the {len(_utf8_cap_text())} pushed"
+        )
+    head = payload[:CAT_CAP_BYTES]
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason != "unexpected end of data" or exc.end != len(head):
+            raise CaptureError(f"the cap does not fall inside a character: {exc}") from exc
+        extra["cap_bytes"] = CAT_CAP_BYTES
+        extra["split_character_starts_at"] = exc.start
+    else:
+        raise CaptureError("the first CAT_CAP_BYTES bytes decode whole: the cap is on a boundary")
+    return payload
+
+
+def _sqlite_read(serial: str, _extra: dict) -> bytes:
+    """The app's own read of databases/fixture.db, refused unless it is an SQLite file."""
+    payload = _run_bytes(_read_file(f"{COMPOSE_DATA_DIR}/databases/fixture.db"), serial)
+    if not payload.startswith(b"SQLite format 3\x00"):
+        raise CaptureError(f"databases/fixture.db is not an SQLite file: {payload[:16]!r}")
+    return payload
+
+
 def _both_streams(args: list[str], name: str) -> Callable[[Path, str, dict], Capture]:
     """Capture ``adb <args>`` once; stdout is fixture ``name``, stderr its twin ``name``_stderr.
 
@@ -4725,6 +4808,59 @@ FIXTURES: list[Fixture] = [
             "would be. Nothing in the result says the read failed, so a caller that "
             "reads files this way takes the error text for the file -- the transport "
             "container.py's --cat, --shared-prefs NAME and --export used."
+        ),
+    ),
+    Fixture(
+        name="run_as_cat_utf8_cap",
+        emulator_only=True,
+        args=_read_file(UTF8_CAP_PATH),
+        command=(
+            f"adb push <{len(_utf8_cap_text())} bytes of UTF-8 text> {UTF8_CAP_STAGED}; "
+            f"adb shell -T run-as {COMPOSE_PACKAGE} cp {UTF8_CAP_STAGED} {UTF8_CAP_PATH}; "
+            f"adb {' '.join(_read_file(UTF8_CAP_PATH))}"
+        ),
+        prepare=_push_utf8_cap,
+        capture_bytes=_utf8_cap_read,
+        catches=("D10",),
+        description=(
+            "container.py's --cat read (`adb shell -T run-as <pkg> cat <absolute "
+            "path>`) of a UTF-8 text file longer than its 65,536-byte cap, pushed "
+            "into the fixture app's files/ for the purpose and removed after. "
+            "Mixed-script lines (German, Japanese, accented Latin), with the header "
+            "padded so the cap cuts a three-byte character after its second byte "
+            "(manifest: cap_bytes, split_character_starts_at). Written byte for "
+            "byte and refused unless it is exactly the file pushed. Slicing to the "
+            "cap and strict-decoding the slice calls this file binary: the only "
+            "invalid bytes are the incomplete character the cut itself made."
+        ),
+        setup=[
+            ["shell", "run-as", COMPOSE_PACKAGE, "rm", "-f", UTF8_CAP_PATH],
+            ["shell", "rm", "-f", UTF8_CAP_STAGED],
+        ],
+        teardown=[
+            ["shell", "run-as", COMPOSE_PACKAGE, "rm", "-f", UTF8_CAP_PATH],
+            ["shell", "rm", "-f", UTF8_CAP_STAGED],
+        ],
+        teardown_verify=_all_of(
+            _device_path_absent(["shell", "run-as", COMPOSE_PACKAGE, "ls", UTF8_CAP_PATH]),
+            _device_path_absent(["shell", "ls", UTF8_CAP_STAGED]),
+        ),
+    ),
+    Fixture(
+        name="run_as_cat_fixture_db",
+        emulator_only=True,
+        args=_read_file(f"{COMPOSE_DATA_DIR}/databases/fixture.db"),
+        ext="db",
+        capture_bytes=_sqlite_read,
+        catches=("D10",),
+        description=(
+            "container.py's --cat read of the fixture app's databases/fixture.db: "
+            "a binary file, read by the same argv as run_as_cat_utf8_cap and "
+            "written byte for byte. Its first byte that is not valid UTF-8 is "
+            "early in the SQLite header, so it is binary whole and binary when "
+            "capped anywhere past that byte; forgiving the character a cap cuts "
+            "must not forgive this. emulator_only only because a capture "
+            "callable reads it; it changes nothing."
         ),
     ),
     Fixture(

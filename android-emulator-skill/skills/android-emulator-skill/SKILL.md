@@ -201,6 +201,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 10. **build_and_test.py** - Gradle build/test automation with progressive disclosure (backed by the `gradle/` subpackage)
     - One-line summary + a result ID by default; drill in on demand
     - Parses JUnit XML for pass/fail counts + failed test names; extracts Gradle/Kotlin/Java errors & warnings
+    - A Gradle failure's `location` (`file`, `line`) is its `* Where:` line, in the one form recorded
+      (`Build file '<path>' line: N`, a build script that failed to evaluate). A failure without one,
+      or with a form not recorded (a settings file, an applied script, an init script), has a null
+      location
     - For `--module ... --test`, the module's report directory is Gradle's own answer: it runs
       `./gradlew -q <module>:properties --property projectDir` first (one extra configuration of the
       build per such run; a build without `--test` does not ask) and never reads the settings script
@@ -558,8 +562,28 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 26. **localization_audit.py** - Audit `res/values*/strings.xml` for missing keys per locale and placeholder mismatches; optional source cross-reference.
     - An audit of nothing is a refusal (exit 1), never "No issues found": a
       `--res` with no `values/strings.xml` (often a path one level off, e.g.
-      `app/src/main` for `app/src/main/res`), or a `--locale` with no
-      `values-<code>/strings.xml` there. `--strict`'s exit 2 stays for findings
+      `app/src/main` for `app/src/main/res`), or a `--locale` code with no set
+      there (no `values-<code>/` and no `values-<code>-*/` strings.xml; the
+      refusal lists the codes it would accept). `--locale de` selects every
+      German set, `values-de-land` and `values-de-port` alike; `--locale
+      default` selects the default language's overrides. `--strict`'s exit 2
+      stays for findings
+    - Only a locale qualifier makes a translation, read by Android's grammar
+      (optional `mcc`/`mnc`, then `fr`, `fr-rCA` or `b+sr+Latn`; other
+      qualifiers may follow). A `values-*` directory with no locale
+      (`values-night`, `values-sw600dp`, `values-v31`, `values-land`), or a
+      locale's qualified directory beside its plain one (`values-fr-night`
+      beside `values-fr`), is an override: it is held to no key, but every
+      string it supplies is checked against `values/` (findings labelled
+      `default (night)`, `fr (night)`), and it is listed in `skipped` with the
+      reason. A locale with no plain directory is audited per configuration,
+      each against `values/` (`de (land)`, `de (port)`), never as their union
+    - Under `--json`, each audited set (`locales`) and each finding
+      (`missing_keys`, `placeholder_mismatches`) names its set three ways:
+      `locale`, the code `--locale` takes (`de`, `fr-rCA`, `b+sr+Latn`, or
+      `default` for an override of the default language); `qualifiers`, the
+      directory's other qualifiers (`land`, `night`) or null; and `label`, the
+      display string text output uses (`de (land)`, `default (night)`)
     - Options: `--res DIR`, `--source DIR`, `--locale CODE`, `--strict`, `--json`, `--verbose`
 
 27. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
@@ -603,7 +627,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       with no version, is refused (exit 1) and nothing is read or written
     - Files are read with `adb shell -T`, so a failed read is a failure: `--cat`
       of a missing file exits 1 (over `exec-out` it answered with the error text
-      as the content). `--export` counts a listed file it could not read in
+      as the content). `--cat` reads the whole file and caps its output at
+      `ANDROID_EMU_CONTAINER_CAT_MAX_BYTES` (64 KiB), cut on a character: a
+      UTF-8 file whose output cap falls inside a character is `text`, ending
+      at its last whole character, with `truncated: true`; any invalid byte
+      before the cut, or a whole file that ends mid-character, is `binary`. `--export`
+      counts a listed file it could not read in
       `unread` / `unread_entries` and exits 1, and refuses (exit 1, nothing
       written) a name that would land outside the snapshot
     - `--export` lists `shared_prefs/` and `databases/` only when the data dir

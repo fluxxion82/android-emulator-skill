@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="greeting">Bonjour, %1$s !</string>
+    <string name="status">%1$d nouveaux messages</string>
+    <string name="theme_label">Thème clair</string>
+    <string name="farewell">Au revoir</string>
+</resources>
