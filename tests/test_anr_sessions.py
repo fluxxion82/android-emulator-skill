@@ -40,6 +40,19 @@ def _rewrite(store, meta) -> None:
         store._write_meta(meta)
 
 
+def _ended(store, session_id: str) -> str:
+    """End a pending session as --stop does (cancelled): only an ended session is pruned (D11)."""
+    with store.transaction(session_id) as held:
+        store.mark_cancelled(held)
+    return session_id
+
+
+def _backdate(store, session_id: str, hours: int) -> None:
+    meta = store.load_meta(session_id)
+    meta.started_at_ms = int((datetime.now() - timedelta(hours=hours)).timestamp() * 1000)
+    _rewrite(store, meta)
+
+
 # --- create / meta round-trip ----------------------------------------------
 
 
@@ -237,28 +250,26 @@ def test_the_clis_transitions_apply_only_from_the_state_they_expect(transition, 
 
 def test_prune_expired_drops_old_sessions(tmp_path):
     store = _store(tmp_path)
-    fresh = store.create({})
-    old = store.create({})
-    # Backdate the old session past the TTL.
-    old_meta = store.load_meta(old.session_id)
-    stale = datetime.now() - timedelta(hours=48)
-    old_meta.started_at_ms = int(stale.timestamp() * 1000)
-    _rewrite(store, old_meta)
+    fresh = _ended(store, store.create({}).session_id)
+    old = _ended(store, store.create({}).session_id)
+    pending = store.create({}).session_id
+    # Backdate the old session, and a pending one, past the TTL.
+    _backdate(store, old, hours=48)
+    _backdate(store, pending, hours=48)
 
     deleted = store.prune_expired(ttl_hours=24)
     assert deleted == 1
-    assert not store.session_dir(old.session_id).exists()
-    assert store.session_dir(fresh.session_id).exists()
+    assert not store.session_dir(old).exists()
+    assert store.session_dir(fresh).exists()
+    # Not ended, it is kept however old: no age proves no worker will claim it (D11).
+    assert store.load_meta(pending).status == "pending"
 
 
 def test_prune_expired_respects_env_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("ANDROID_EMU_ANR_SESSION_TTL_HOURS", "1")
     store = _store(tmp_path)
-    old = store.create({})
-    old_meta = store.load_meta(old.session_id)
-    stale = datetime.now() - timedelta(hours=2)
-    old_meta.started_at_ms = int(stale.timestamp() * 1000)
-    _rewrite(store, old_meta)
+    old = _ended(store, store.create({}).session_id)
+    _backdate(store, old, hours=2)
     # Default ttl now resolves to 1h from the env var.
     assert store.prune_expired() == 1
 
@@ -269,8 +280,12 @@ def test_prune_expired_respects_env_ttl(tmp_path, monkeypatch):
 def test_prune_to_aggregate_cap_evicts_oldest(tmp_path):
     store = _store(tmp_path)
     sessions = []
-    for i in range(3):
+    for i in range(4):
         meta = store.create({})
+        # The oldest stays pending; the rest end, and only they may be evicted (D11).
+        if i > 0:
+            _ended(store, meta.session_id)
+        meta = store.load_meta(meta.session_id)
         # Stagger started_at_ms so eviction order is deterministic (oldest first).
         meta.started_at_ms = 1000 + i
         _rewrite(store, meta)
@@ -278,19 +293,27 @@ def test_prune_to_aggregate_cap_evicts_oldest(tmp_path):
         with open(store.events_path(meta.session_id), "w") as handle:
             handle.write("x" * 1000)
         sessions.append(meta.session_id)
+    pending, first, second, newest = sessions
+    sizes = {session_id: store.session_total_bytes(session_id) for session_id in sessions}
+    # Under the cap once the two oldest ended sessions are gone, and not before.
+    cap = sum(sizes.values()) - sizes[first] - sizes[second]
 
-    # Cap below total -> oldest session(s) evicted.
-    deleted = store.prune_to_aggregate_cap(max_bytes=1500)
-    assert deleted >= 1
-    # The oldest (sessions[0]) goes first.
-    assert not store.session_dir(sessions[0]).exists()
-    assert store.session_dir(sessions[-1]).exists()
+    capped = store.prune_to_aggregate_cap(max_bytes=cap)
+
+    assert capped.deleted == 2
+    # The oldest ended sessions go first.
+    assert not store.session_dir(first).exists()
+    assert not store.session_dir(second).exists()
+    assert store.session_dir(newest).exists()
+    # The oldest of all is pending: kept, however far over the cap it is.
+    assert store.load_meta(pending).status == "pending"
+    assert capped.over_cap is None
 
 
 def test_prune_to_aggregate_cap_noop_under_limit(tmp_path):
     store = _store(tmp_path)
     store.create({})
-    assert store.prune_to_aggregate_cap(max_bytes=100 * 1024 * 1024) == 0
+    assert store.prune_to_aggregate_cap(max_bytes=100 * 1024 * 1024).deleted == 0
 
 
 # --- env-var storage root override (tests must not touch real home) --------
@@ -322,12 +345,14 @@ def test_list_sessions_newest_first(tmp_path):
     assert metas[0].session_id == second.session_id
 
 
-def test_clear_all_sessions(tmp_path):
+def test_clear_removes_every_ended_session_and_keeps_a_pending_one(tmp_path):
     store = _store(tmp_path)
-    store.create({})
-    store.create({})
+    _ended(store, store.create({}).session_id)
+    _ended(store, store.create({}).session_id)
+    pending = store.create({}).session_id
     assert store.clear() == 2
-    assert store.list_sessions() == []
+    # A pending session is --stop's to cancel, not clear()'s to delete (D11).
+    assert [meta.session_id for meta in store.list_sessions()] == [pending]
 
 
 # --- --start's wait for its worker -------------------------------------------

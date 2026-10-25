@@ -110,7 +110,8 @@ def _toolchain(root: Path, logcat: Rule) -> FakeToolchain:
 
 
 def _session_dir(toolchain: FakeToolchain) -> Path:
-    (session,) = (toolchain.home / "anr-sessions").iterdir()
+    # Not locks/: a later version keeps its session locks beside the sessions.
+    (session,) = [p for p in (toolchain.home / "anr-sessions").iterdir() if p.name != "locks"]
     return session
 
 

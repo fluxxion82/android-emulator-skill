@@ -416,6 +416,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       id; each later `--step "description"` captures the current screen into
       it; `--stop` writes `report.md` + `manifest.json`. `--step` and `--stop`
       default to the newest session, or target one with `--session ID`.
+    - Run its commands on one session one at a time: overlapping ones are
+      unsupported — `--step` reads the session's meta and writes it back
+      after its capture, so a `--stop` landing in between can be lost.
     - Each step records a screenshot and the UI hierarchy, plus optional
       `--screen`, `--state` and `--assert` (`--assert-failed` marks it failed).
     - Sessions live under `~/.android-emulator-skill`, not in an output
@@ -666,7 +669,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `crashed`, or `pending` → `cancelled` (a `--stop` or a `--start` that
       gave up on its worker), or `running`/`deciding` → `abandoned` (`--stop
       --abandon`). Every read-modify-write of a session's `meta.json` and
-      `summary.json` is made under its lock (`flock` on `<session>/lock`; the
+      `summary.json` is made under its lock (`flock` on
+      `anr-sessions/locks/<session>.lock`, outside the session's directory, so
+      deleting a session never unlinks a lock a process holds; every opener
+      takes `locks/.base` first and lets it go once it holds the session's; the
       wait for it is bounded, not the hold, and a wait past the bound is a
       refusal, exit 1, "run the same command again"), by one owner per
       transition, and only from the state it expects — otherwise it is
@@ -710,6 +716,27 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       version's worker ran on (exit 0, then the device loss it persisted),
       and an abandoned session's answer growing with every event appended
       after the abandonment
+    - **Pruning removes only sessions that have ended.** The TTL
+      (`ANDROID_EMU_ANR_SESSION_TTL_HOURS`) and the aggregate cap
+      (`ANDROID_EMU_ANR_TOTAL_CAP_MB`), both applied on every `--start`, and
+      `--clear-sessions` remove a `stopped`, `crashed`, `cancelled` or
+      `abandoned` session — each under its lock, skipped while another command
+      holds it — and never a `pending`, `running` or `deciding` one, nor an
+      earlier version's whose worker cannot be shown gone; nothing goes by age
+      alone. A session directory with no `meta.json` whose lock is free is a
+      creation that died half-way, and is removed. `--start` creates a session
+      under its lock, from before the directory exists until its meta does, so
+      a prune running beside it cannot take it for one. A `pending` session
+      whose `--start` died before its worker claimed it stays until `--stop`
+      cancels it; a `running` one whose worker died without saying how it
+      ended stays until `--stop --abandon`. Only directories named as
+      `--start` names them (`anr-YYYYMMDD-HHMMSS-XXXX`) are sessions to any of
+      these, or to `--list-sessions`: `locks/` and anything else kept there
+      are left alone. The cap is best effort: when the sessions it may not
+      remove exceed it on their own, `--start` still starts, and warns on
+      stderr (`warning: ANR sessions hold N bytes over
+      ANDROID_EMU_ANR_TOTAL_CAP_MB (M MB): the K session(s) left have not
+      ended, or another command holds them, ...`); stdout stays the id
     - An unknown session, a session with no summary yet, or a `--cluster` past
       the end exits 1 and says what to run instead (the refusal object under
       `--json`) — it does not print the sentence and exit 0
@@ -1037,15 +1064,23 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `--start` of that version still in flight can claim a session this
       version cancelled — that version's claim checks nothing. Sessions this
       version writes are not for older binaries (no forward compatibility),
-      and two versions writing one session is unsupported. While an earlier
+      and two versions writing one session is unsupported. That includes the
+      version just before this one: its worker carries `lifecycle` in its
+      meta, so the fence above cannot see it, and it locks `<session>/lock`
+      inside the session's directory where this version locks
+      `locks/<session>.lock`, so nothing excludes the two — stop its sessions
+      before upgrading too. An older version's prune also takes `locks/` for a
+      session with no meta and deletes it; this version makes it again, but a
+      lock held at that moment then excludes no one. A `lock` file left in an
+      old session's directory is just a file now. While an earlier
       version's worker may be alive or cannot be identified, `--stop` and
       `--stop --abandon` both refuse; with `ps` unavailable and the pid
       present that lasts until `ps` works again or the process exits —
       otherwise the only recovery is outside the skill: delete the session's
-      directory (or `--clear-sessions`) once you have established yourself
-      that the worker has ended. A session of the earlier version whose
-      worker is gone answers from the summary it saved; run `--stop` first to
-      rebuild it from what that worker persisted
+      directory once you have established yourself that the worker has ended
+      (`--clear-sessions` keeps it, for the same reason). A session of the
+      earlier version whose worker is gone answers from the summary it saved;
+      run `--stop` first to rebuild it from what that worker persisted
     - `ANDROID_EMU_ANR_MAX_RESTARTS`, `_TOTAL_CAP_MB`, `_DEFAULT_TOP_N` and
       `_BUDGET_TOKENS` take `0` (no restarts, no cap, no top-N cap, no budget);
       it used to be raised to 1. A restart happens unless adb or `adb

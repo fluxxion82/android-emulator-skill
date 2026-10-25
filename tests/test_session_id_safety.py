@@ -112,8 +112,11 @@ def test_unknown_but_wellformed_id_is_a_normal_miss(store):
 
 def test_clear_still_removes_real_sessions(store):
     """clear() enumerates the root, so validation must not break it."""
-    store.create({"package": "com.example.app"})
-    store.create({"package": "com.example.other"})
+    for package in ("com.example.app", "com.example.other"):
+        meta = store.create({"package": package})
+        # Ended, as --stop ends a pending one: clear() removes only ended sessions.
+        with store.transaction(meta.session_id) as held:
+            store.mark_cancelled(held)
     assert store.clear() == 2
 
 
