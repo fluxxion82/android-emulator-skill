@@ -39,10 +39,10 @@ repos:
     hooks:
       - id: trailing-whitespace
         name: Trim trailing whitespace
-        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png)$
+        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png|gpx)$
       - id: end-of-file-fixer
         name: Fix end of files
-        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png)$
+        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png|gpx)$
       - id: check-yaml
         name: Check YAML syntax
       - id: check-added-large-files
@@ -51,7 +51,7 @@ repos:
       - id: mixed-line-ending
         name: Fix mixed line endings
         args: ['--fix=lf']
-        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png)$
+        exclude: ^tests/fixtures/recorded/.*\.(txt|xml|trace|png|gpx)$
 
   # Commit messages end at their last content line: no Co-Authored-By, no
   # Signed-off-by, no generated-with footer. A hook rather than a note in the

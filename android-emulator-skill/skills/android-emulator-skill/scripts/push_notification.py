@@ -72,7 +72,7 @@ from dataclasses import asdict, dataclass
 
 from common import adb_exec, cli
 from common.device_utils import (
-    UserSectionMissingError,
+    UserStateUnreadableError,
     build_adb_command,
     permission_state,
     quote_for_device_shell,
@@ -406,19 +406,14 @@ class NotificationTester:
 
         try:
             state = permission_state(dump, POST_NOTIFICATIONS)
-        except UserSectionMissingError:
-            # The package is in the dump but user 0 -- whom `pm grant` without
-            # --user targets -- has no section in it, so there is no state to
-            # read back. Never answered from another user's section.
-            result["error"] = (
-                f"pm {verb} exited 0, but the dump of {package} has no `User 0:` section, "
-                f"so its state for user 0 could not be read back"
-            )
-            result["remedy"] = (
-                "Check `adb shell pm list users` and `adb shell dumpsys package "
-                f"{package}`; install the app for user 0 with `adb shell pm "
-                f"install-existing --user 0 {package}`, then retry."
-            )
+        except UserStateUnreadableError as unreadable:
+            # User 0 -- whom `pm grant` without --user targets -- has no section
+            # in the dump, or its section reads installed=false (where the grant
+            # is recorded, granted=true, for an app that does not exist for that
+            # user). Either way there is no held state to verify, and it is never
+            # answered from another user's section.
+            result["error"] = f"pm {verb} exited 0, but {unreadable.describe(package)}"
+            result["remedy"] = unreadable.remedy(package)
             return False, result
         result["state"] = state
         if state is granted or (not granted and state is None):

@@ -94,7 +94,9 @@ SCANNED_HELPERS = ("fake_toolchain.py",)
 # documented exception for "text built by transforming recorded lines", which
 # several tests do deliberately (substituting a frame count into a real
 # Choreographer line, renaming a stack frame in a real crash).
-RECORDED_SOURCES = frozenset({"recorded", "recorded_anywhere", "recorded_gradle", "any_profile"})
+RECORDED_SOURCES = frozenset(
+    {"recorded", "recorded_anywhere", "recorded_gradle", "recorded_gpx", "any_profile"}
+)
 
 # Substitution helpers whose SUBJECT -- the text being reshaped -- is the third
 # positional argument rather than the receiver.
@@ -167,16 +169,17 @@ RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
 #     shaped to make the checks it was written beside pass. Recording it found
 #     L3, which Inc 1 then fixed (see test_accessibility_audit.py).
 #
+#   test_location.py — was listed as an EXCEPTION ("nothing produces GPX"),
+#     which is true of the Android toolchain and not of the world: GPX
+#     libraries write it. gpxpy's to_xml() output for a chosen route is
+#     recorded verbatim under recorded/gpxpy-1.6.2/ in GPX 1.1 and 1.0 by
+#     tests/record_gpx_fixtures.py (the `recorded_gpx` fixture), and every
+#     other GPX the tests need, the malformed ones included, is derived from
+#     it by a documented edit.
+#
 # STILL OUTSTANDING — one line each, and what would retire it:
 KNOWN_VIOLATIONS = frozenset(
     {
-        # EXCEPTION, not debt: GPX is a document the USER hands to
-        # `location.py --gpx` (a GPS device or mapping service writes it), so
-        # there is no tool for a recorder to run, nothing in the Android SDK
-        # emits it, and a real track is somebody's movements. The flagged line
-        # is deliberately MALFORMED (`lat="north"`), which by definition
-        # nothing produces. See the module docstring of test_location.py.
-        "test_location.py::parse_gpx",
         # `offline` and `unauthorized` device states, which parse_adb_devices
         # reports and no recording has. Record `adb devices -l` with a device
         # in each state (a second emulator killed mid-boot gives `offline`).

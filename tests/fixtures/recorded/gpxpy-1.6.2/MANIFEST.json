@@ -1,0 +1,46 @@
+{
+  "profile": "gpxpy-1.6.2",
+  "recorded_at": "2026-10-25T07:41:38Z",
+  "gpxpy_version": "1.6.2",
+  "python_version": "3.12.10",
+  "command": "uvx --python 3.12 --with gpxpy==1.6.2 python tests/record_gpx_fixtures.py",
+  "route": [
+    {
+      "lat": 37.422,
+      "lon": -122.0841,
+      "ele": 12.5,
+      "time": "2026-10-25T10:00:00+00:00"
+    },
+    {
+      "lat": 37.4226,
+      "lon": -122.085,
+      "ele": 13.0,
+      "time": "2026-10-25T10:00:30+00:00"
+    },
+    {
+      "lat": 37.4232,
+      "lon": -122.0838,
+      "ele": null,
+      "time": null
+    }
+  ],
+  "note": "GPX is a document a GPS tool writes and a user hands to `location.py --gpx`; nothing in the Android toolchain writes one. These are gpxpy's to_xml() output for the route above, verbatim (one <trk>/<trkseg>, three <trkpt>, the first two with <ele> and <time>), in GPX 1.1 and GPX 1.0. The route is chosen, the document's form is gpxpy's.",
+  "fixtures": [
+    {
+      "name": "gpxpy_route_gpx11",
+      "file": "gpxpy_route_gpx11.gpx",
+      "call": "build_route().to_xml(version='1.1')",
+      "gpx_version": "1.1",
+      "sha256": "9a35fa358501ebdec78800009fd0507aa7c3850d632a536c135fec68c703076a",
+      "bytes": 711
+    },
+    {
+      "name": "gpxpy_route_gpx10",
+      "file": "gpxpy_route_gpx10.gpx",
+      "call": "build_route().to_xml(version='1.0')",
+      "gpx_version": "1.0",
+      "sha256": "a330ba0deaa7cff9e8534decef9aaab826dde11dd21e42b4b35b2175a3be1d42",
+      "bytes": 711
+    }
+  ]
+}

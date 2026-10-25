@@ -54,9 +54,11 @@ from datetime import datetime
 
 from common import adb_exec, cli
 from common.device_utils import (
+    UserNotInstalledError,
     parse_package_permissions,
     parse_user_ids,
     quote_for_device_shell,
+    user_state_error,
 )
 from common.env_config import env_int
 
@@ -328,23 +330,21 @@ class PrivacyManager:
 
         Never falls back to another user's section: a read-back that cannot
         find the one asked for is a failure, because the only alternative is
-        reporting a state nobody checked.
+        reporting a state nobody checked. The rule itself is
+        :func:`common.device_utils.user_state_error`, the same one
+        ``permission_state`` (and so push_notification) goes through.
         """
-        user = self.user
         if not parsed["found"]:
             return f"{package} is not installed on this device"
-        if not parsed["user_found"]:
+        unreadable = user_state_error(parsed)
+        if unreadable is None:
+            return None
+        if isinstance(unreadable, UserNotInstalledError):
             return (
-                f"the dump of {package} has no `User {user}:` section, so its state for "
-                f"user {user} could not be read"
+                f"{unreadable.describe(package)}; install it with "
+                f"`{unreadable.install_command(package)}`"
             )
-        if parsed["user_installed"] is False:
-            return (
-                f"{package} is not installed for user {user} (`User {user}:` reads "
-                f"installed=false); install it with `adb shell pm install-existing --user "
-                f"{user} {package}`"
-            )
-        return None
+        return unreadable.describe(package)
 
     def reset_permission(self, package: str, permission: str) -> tuple:
         """

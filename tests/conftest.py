@@ -217,6 +217,23 @@ def recorded_gradle():
     return _load
 
 
+@pytest.fixture(scope="session")
+def recorded_gpx():
+    """A GPX document gpxpy wrote, verbatim, by file name.
+
+    For input this skill READS but nothing in the Android toolchain produces:
+    the GPX ``location.py --gpx`` replays. Recorded by
+    ``tests/record_gpx_fixtures.py`` (run through uvx; ``gpxpy-<version>/
+    MANIFEST.json`` holds the command, the version and the route). Like
+    ``recorded_gradle``, a tool corpus rather than a device profile.
+    """
+
+    def _load(name: str, version: str = "1.6.2") -> str:
+        return RecordedFixtures(RECORDED_ROOT / f"gpxpy-{version}").text(name)
+
+    return _load
+
+
 @pytest.fixture(params=_available_profiles())
 def any_profile(request) -> RecordedFixtures:
     """Each recorded device profile in turn.

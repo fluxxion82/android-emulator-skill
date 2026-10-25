@@ -26,6 +26,7 @@ from device_list import parse_adb_devices
 
 from common import anr_pipeline
 from common.device_utils import (
+    UserNotInstalledError,
     UserSectionMissingError,
     parse_package_permissions,
     parse_package_uids,
@@ -485,6 +486,21 @@ def test_a_user_the_package_is_not_installed_for_reads_installed_false():
     assert parse_package_permissions(API33.text("dumpsys_package_user_not_installed"))[
         "user_installed"
     ]
+
+
+def test_a_grant_under_an_installed_false_user_is_not_reported_as_held():
+    """The shared read-back refuses that grant=true: the app does not exist for the user.
+
+    One rule for every caller of ``permission_state``: privacy_manager refused this
+    shape on its own, push_notification read it as a verified grant.
+    """
+    text = API33.text("dumpsys_package_user_not_installed")
+    user = _secondary("dumpsys_package_user_not_installed")
+    with pytest.raises(UserNotInstalledError) as refused:
+        permission_state(text, CAMERA, user=user)
+    assert refused.value.user == user
+    assert f"pm install-existing --user {user} {PACKAGE}" in refused.value.remedy(PACKAGE)
+    assert permission_state(text, CAMERA) is False
 
 
 def test_a_revoked_permission_with_no_entry_left_parses_as_denied():
