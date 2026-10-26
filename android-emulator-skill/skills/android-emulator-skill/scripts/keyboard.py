@@ -343,7 +343,7 @@ class KeyboardSimulator:
 
 
 def main(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Android keyboard and button simulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

@@ -44,13 +44,20 @@ its own. That is why it is one line rather than indented.
 
 Exit status
 -----------
-``1`` failure. ``3`` the device is unavailable: not found, offline or
-unauthorized, whether device resolution noticed or adb did mid-run. (Several
-devices and no ``--serial`` is ``1``: nothing is unavailable, the caller has to
-choose.) ``130`` interrupted. Everything a script exits with itself passes
-through untouched -- argparse's ``2`` for a usage error, and the statuses
-that mean a *finding*: ``crash_triage --fail-on-crash`` and
-``localization_audit --strict`` exit ``2`` when they find something, and
+``1`` failure. ``2`` a usage error. ``3`` the device is unavailable: not
+found, offline or unauthorized, whether device resolution noticed or adb did
+mid-run. (Several devices and no ``--serial`` is ``1``: nothing is
+unavailable, the caller has to choose.) ``130`` interrupted.
+
+A usage error never reaches :func:`run` as an exception: argparse reports it
+while parsing. So every script builds its parser with :func:`parser`, whose
+error path is the same object under ``--json`` -- ``error`` is argparse's
+message, ``remedy`` the usage line -- at exit 2, and argparse's own prose on
+stderr otherwise. :func:`run` lets that ``SystemExit(2)`` through untouched.
+
+Everything else a script exits with itself passes through untouched too,
+including the statuses that mean a *finding*: ``crash_triage --fail-on-crash``
+and ``localization_audit --strict`` exit ``2`` when they find something, and
 ``accessibility_audit`` exits ``1`` when a critical issue is present. So ``2``
 is not always a usage error, and ``1`` is not always a failure.
 
@@ -81,13 +88,16 @@ Known limitation: ``--json`` is detected by scanning argv, not by parsing. It
 has to be -- the failure may have happened *during* parsing, or before the
 script got that far. The scan stops at ``--`` (after it, ``--json`` is a
 positional value, e.g. a file name), and a script with an alias for ``--json``
-names it (``cli.run(main, json_flags=("--json", "--details"))``). An argparse
-abbreviation such as ``--js`` is not recognised and gets the text form.
+names it (``cli.run(main, json_flags=("--json", "--details"))``, and the same
+``json_flags=`` to :func:`parser`). An argparse abbreviation such as ``--js``
+is not recognised and gets the text form.
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import functools
 import json
 import os
 import subprocess
@@ -101,6 +111,7 @@ from .hierarchy import HierarchyError
 from .sdk_tools import SdkToolError
 
 EXIT_FAILURE = 1
+EXIT_USAGE = 2
 EXIT_DEVICE_UNAVAILABLE = 3
 EXIT_INTERRUPTED = 130
 
@@ -323,6 +334,115 @@ def exit_code_for(error: BaseException) -> int:
     return EXIT_DEVICE_UNAVAILABLE if isinstance(error, DEVICE_UNAVAILABLE) else EXIT_FAILURE
 
 
+USAGE_HELP_REMEDY = "run with --help"
+
+
+class _UsageParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` whose usage error is the refusal object under ``--json``.
+
+    Built by :func:`parser`; see there. ``--json`` is read from the argv this
+    parser was handed (or ``sys.argv[1:]`` when it was handed none, as a router's
+    delegate is), because the error happens *during* parsing, when there are no
+    parsed arguments to ask. A subparser asks its root's argv, so ``--json``
+    before the subcommand counts as well as after it.
+    """
+
+    def __init__(
+        self,
+        *args,
+        json_flags: Sequence[str] = JSON_FLAGS,
+        usage_root: _UsageParser | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.json_flags = tuple(json_flags)
+        self._usage_root = usage_root
+        self._argv: list[str] | None = None
+        self._parsing = False
+
+    # Every public entry point records the argv it was handed, because they do
+    # not all route through one another: on 3.12.10 parse_intermixed_args never
+    # reaches parse_known_args. The outermost call wins -- an entry point that
+    # argparse calls from inside another (with the remaining args) is not a new
+    # command line -- and each new call replaces the last, so nothing is stale.
+    # Recording is all this does: one parser, one pass.
+
+    @contextlib.contextmanager
+    def _recording(self, args):
+        if self._parsing:
+            yield
+            return
+        self._argv = list(sys.argv[1:] if args is None else args)
+        self._parsing = True
+        try:
+            yield
+        finally:
+            self._parsing = False
+
+    def parse_args(self, args=None, namespace=None):
+        with self._recording(args):
+            return super().parse_args(args, namespace)
+
+    def parse_known_args(self, args=None, namespace=None):
+        with self._recording(args):
+            return super().parse_known_args(args, namespace)
+
+    def parse_intermixed_args(self, args=None, namespace=None):
+        with self._recording(args):
+            return super().parse_intermixed_args(args, namespace)
+
+    def parse_known_intermixed_args(self, args=None, namespace=None):
+        with self._recording(args):
+            return super().parse_known_intermixed_args(args, namespace)
+
+    def add_subparsers(self, **kwargs):
+        # A child built from any other class would answer its usage errors in
+        # prose under --json, so only this class (or a subclass) may build one.
+        parser_class = kwargs.get("parser_class", _UsageParser)
+        if not (isinstance(parser_class, type) and issubclass(parser_class, _UsageParser)):
+            raise TypeError(
+                f"parser_class={parser_class!r}: a cli.parser's subparsers must be built "
+                "by cli's own parser class, or their usage errors bypass --json"
+            )
+        kwargs["parser_class"] = functools.partial(
+            parser_class, json_flags=self.json_flags, usage_root=self._usage_root or self
+        )
+        return super().add_subparsers(**kwargs)
+
+    def _command_line(self) -> list[str]:
+        root = self._usage_root or self
+        return sys.argv[1:] if root._argv is None else root._argv
+
+    def error(self, message: str) -> NoReturn:
+        if not wants_json(self._command_line(), self.json_flags):
+            super().error(message)
+        usage = _one_line(self.format_usage())
+        report(_one_line(message), usage or USAGE_HELP_REMEDY, json_mode=True)
+        self.exit(EXIT_USAGE)
+
+
+def parser(*args, json_flags: Sequence[str] = JSON_FLAGS, **kwargs) -> argparse.ArgumentParser:
+    """The ``argparse`` parser every script builds its command line with.
+
+    It takes exactly ``argparse.ArgumentParser``'s arguments and behaves the
+    same in every respect but one: a usage error -- an unknown flag, a bad value
+    for a typed flag, a missing required argument, or the script's own
+    ``parser.error(...)`` -- when ``--json`` was asked for prints ONE line on
+    stdout, ``{"success": false, "error": <argparse's message>, "remedy": <the
+    usage line>}``, and exits 2. Without ``--json`` it is argparse's prose on
+    stderr at exit 2, as before; ``--help`` is unchanged. ``--json`` is found
+    by :func:`wants_json` (it stops at ``--``), and a subparser inherits all
+    of this. ``tests/test_cli_boundary.py`` holds every script to it.
+
+    Args:
+        *args: Passed to ``argparse.ArgumentParser``.
+        json_flags: The spellings of "answer in JSON" for this script -- the
+            same ``json_flags`` it hands :func:`run`.
+        **kwargs: Passed to ``argparse.ArgumentParser``.
+    """
+    return _UsageParser(*args, json_flags=json_flags, **kwargs)
+
+
 def run(
     main: Callable[[list[str] | None], int | None],
     argv: list[str] | None = None,
@@ -331,7 +451,8 @@ def run(
 ) -> NoReturn:
     """Run a script's ``main`` and turn its outcome into the process exit.
 
-    ``SystemExit`` is not caught: argparse's exit 2 and every script's own
+    ``SystemExit`` is not caught: a usage error's exit 2 (already reported by
+    the :func:`parser`) and every script's own
     ``sys.exit`` on its success and ordinary-failure paths pass straight through.
 
     An exception outside the typed family is a bug in the skill. It is still

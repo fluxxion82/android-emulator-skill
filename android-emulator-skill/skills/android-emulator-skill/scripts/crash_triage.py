@@ -634,7 +634,7 @@ class CrashTriage:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description=(
             "Triage Android crashes from the dedicated crash buffer "
             "(`adb logcat -b crash -d`), grouped and deduplicated."

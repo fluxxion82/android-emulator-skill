@@ -391,7 +391,7 @@ def _guide() -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Parser for the router's own flags only; verbs are dispatched before this."""
-    return argparse.ArgumentParser(
+    return cli.parser(
         prog="avd.py",
         description=(
             "Manage Android virtual devices. One entry point over the skill's "
@@ -451,6 +451,17 @@ def main(argv: list[str] | None = None) -> int:
     # where the nearest verb is one of the two that destroy things, which is
     # asked rather than assumed. See suggest_verb.
     if args and not args[0].startswith("-"):
+        if cli.wants_json(args):
+            # A usage error under --json is the refusal object, like every
+            # parser's (cli.parser); the hint rides in the remedy.
+            hint = " ".join(suggest_verb(args[0]).split())
+            cli.report(
+                f"Unknown verb {args[0]!r}.",
+                f"{hint + ' ' if hint else ''}The verbs are {', '.join(ROUTES_BY_NAME)}; "
+                "run avd.py --help for what each one does.",
+                json_mode=True,
+            )
+            return 2
         print(f"Unknown verb {args[0]!r}.\n\n{_guide()}{suggest_verb(args[0])}", file=sys.stderr)
         return 2
 

@@ -340,7 +340,7 @@ class GestureSimulator:
 
 
 def main(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Android touch gesture simulator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

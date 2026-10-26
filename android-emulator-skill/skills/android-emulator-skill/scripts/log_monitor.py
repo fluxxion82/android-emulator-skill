@@ -1767,7 +1767,7 @@ def _severity_list(text: str) -> list[str]:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Monitor and analyze Android device/emulator logs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

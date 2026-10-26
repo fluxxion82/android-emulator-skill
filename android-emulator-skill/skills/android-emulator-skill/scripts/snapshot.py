@@ -563,7 +563,7 @@ def _refuse(result: dict) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description=(
             "List, save, load and delete Android emulator snapshots through the "
             "emulator console, reporting failure that `adb emu` hides."

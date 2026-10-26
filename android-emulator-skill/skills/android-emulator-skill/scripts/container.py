@@ -1221,7 +1221,7 @@ def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """Parse arguments and dispatch the requested inspection action."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Inspect a DEBUGGABLE Android app's sandbox via 'adb run-as'.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

@@ -1029,35 +1029,6 @@ class Navigator:
         return elements
 
 
-class _JsonAwareParser(argparse.ArgumentParser):
-    """An argparse parser that answers a usage error in JSON when asked to.
-
-    A caller that passed ``--json`` parses stdout. argparse writes usage prose
-    to stderr and exits 2, so `--tap --json` with no criterion -- the very thing
-    C2 added -- produced an empty stdout and a status the caller could see but
-    not read. Exit 2 is still correct for a usage error; the payload is what was
-    missing.
-
-    ``--json`` is read from argv rather than from parsed arguments because the
-    error happens *during* parsing, when there are none -- and from the argv
-    this parser was handed, not ``sys.argv``, because ``cli.run`` hands ``main``
-    one and the two can differ.
-    """
-
-    _argv: list[str] | None = None
-
-    def parse_args(self, args=None, namespace=None):
-        self._argv = list(sys.argv[1:] if args is None else args)
-        return super().parse_args(args, namespace)
-
-    def error(self, message: str):
-        argv = sys.argv[1:] if self._argv is None else self._argv
-        if cli.wants_json(argv):
-            print(json_lib.dumps({"error": message}, indent=2))
-            sys.exit(2)
-        super().error(message)
-
-
 # What to do when a lookup finds nothing, or finds only a label. The message
 # already says which, and how far the search went.
 NOT_FOUND_REMEDY = (
@@ -1087,7 +1058,10 @@ def _scroll_budget(value: str) -> int:
 
 
 def main(argv: list[str] | None = None):
-    parser = _JsonAwareParser(
+    # cli.parser: `--tap --json` with no criterion -- the very thing C2 added --
+    # is a usage error, and under --json it is the refusal object at exit 2
+    # rather than prose behind an empty stdout.
+    parser = cli.parser(
         description="Android semantic element navigation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

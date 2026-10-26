@@ -466,7 +466,7 @@ class ScreenMapper:
 
 
 def main(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Analyze current Android screen for navigation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

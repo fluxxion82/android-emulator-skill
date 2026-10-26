@@ -229,7 +229,7 @@ def _guide() -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Parser for the router's own flags only; verbs are dispatched before this."""
-    return argparse.ArgumentParser(
+    return cli.parser(
         prog="logs.py",
         description=(
             "Read an Android device's logs. One entry point over the skill's "
@@ -287,6 +287,16 @@ def main(argv: list[str] | None = None) -> int:
     if args and not args[0].startswith("-"):
         suggestion = difflib.get_close_matches(args[0], ROUTES_BY_NAME, n=1, cutoff=0.4)
         hint = f"\nDid you mean: logs.py {suggestion[0]}" if suggestion else ""
+        if cli.wants_json(args):
+            # A usage error under --json is the refusal object, like every
+            # parser's (cli.parser); the hint rides in the remedy.
+            cli.report(
+                f"Unknown verb {args[0]!r}.",
+                f"{hint.strip() + '. ' if hint else ''}The verbs are "
+                f"{', '.join(ROUTES_BY_NAME)}; run logs.py --help for what each one does.",
+                json_mode=True,
+            )
+            return 2
         print(f"Unknown verb {args[0]!r}.\n\n{_guide()}{hint}", file=sys.stderr)
         return 2
 

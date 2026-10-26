@@ -215,12 +215,12 @@ BOUNDARY = "common/cli.py"
 
 _EXITS = frozenset({"sys.exit", "exit", "quit", "os._exit"})
 
-# Exact. A new entry fails, and so does a stale one. The first four are usage
-# errors (exit 2), which common.cli passes through untouched and has no form
-# for yet; the routers' `_normalise_exit` is the interpreter's own convention.
+# Exact. A new entry fails, and so does a stale one. The routers' `main`
+# entries are their text-mode usage errors (exit 2), which print the route
+# guide rather than a bare usage line; under --json an unknown verb is the
+# refusal object, and every parser's usage error is `common.cli.parser`'s.
+# The routers' `_normalise_exit` is the interpreter's own convention.
 KNOWN_FAILURE_PRINTERS: dict[tuple[str, str], str] = {
-    ("emulator_delete.py", "_fail_usage"): "--old 0 and friends: `{error}` / `Error:`, exit 2",
-    ("navigator.py", "error"): "ArgumentParser.error under --json: `{error}`, exit 2",
     ("avd.py", "main"): "an unknown or missing verb: the route guide on stderr, exit 2",
     ("logs.py", "main"): "an unknown or missing verb: the route guide on stderr, exit 2",
     ("avd.py", "_normalise_exit"): (

@@ -510,7 +510,7 @@ class AccessibilityAuditor:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Audit Android screen for accessibility issues",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

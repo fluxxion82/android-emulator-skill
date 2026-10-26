@@ -437,7 +437,7 @@ def _read_gpx_file(path: str) -> list[tuple[float, float]]:
 
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Simulate GPS location on an Android emulator (emu geo fix)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

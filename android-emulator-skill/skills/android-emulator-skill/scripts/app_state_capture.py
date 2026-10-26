@@ -775,7 +775,7 @@ def _report_failure(
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Capture complete Android app state for debugging",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

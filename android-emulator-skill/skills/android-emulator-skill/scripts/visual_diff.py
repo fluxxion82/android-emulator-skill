@@ -10,7 +10,6 @@ Usage: python scripts/visual_diff.py baseline.png current.png [options]
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -143,7 +142,10 @@ class VisualDiffer:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Compare screenshots for visual differences")
+    parser = cli.parser(
+        description="Compare screenshots for visual differences",
+        json_flags=("--json", "--details"),
+    )
     parser.add_argument("baseline", help="Path to baseline screenshot")
     parser.add_argument("current", help="Path to current screenshot")
     parser.add_argument(

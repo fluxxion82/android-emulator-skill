@@ -593,7 +593,7 @@ def _format_verbose(report: AuditReport) -> str:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Audit Android res/values*/strings.xml for localization gaps.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

@@ -578,7 +578,7 @@ def _refuse(result: dict) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description=(
             "Deliver an inbound SMS to an emulator, read the inbox back, and "
             "extract a one-time code from the newest message."
