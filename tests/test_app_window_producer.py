@@ -459,6 +459,7 @@ def _injection_device(toolchain, recorded) -> None:
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("shell", "pidof", "system_server"), stdout=oracle["system_server"]),
             *uid_rules(recorded, PACKAGE, oracle["alive"]),
             Rule(("shell", "pidof"), stdout=oracle["alive"]),
@@ -518,6 +519,7 @@ def _install(toolchain, recorded, window: list[Frame], *, system_server: str | N
     rules = [
         Rule(("devices",), stdout=recorded.text("adb_devices_single")),
         Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+        Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
     ]
     if system_server is not None:
         rules.append(Rule(("shell", "pidof", "system_server"), stdout=system_server))
@@ -545,6 +547,7 @@ def test_log_monitor_keeps_only_the_pidof_pid_with_the_packages_uid(toolchain, r
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("shell", "pidof", "system_server"), stdout=system_server),
             *uid_rules(recorded, PACKAGE, alive),
             Rule(("shell", "pidof"), stdout=" ".join((alive, system_server))),
@@ -649,6 +652,7 @@ def test_log_monitor_keeps_an_attackers_crash_record_out_of_its_victims_window(t
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("shell", "pidof", "system_server"), stdout=_system_server(recorded)),
             Rule(("cmd", "package"), stdout=listing),
             Rule(("shell", "ps"), stdout=ps),
@@ -789,6 +793,7 @@ def test_log_monitor_keeps_the_app_running_as_its_second_user(toolchain, recorde
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("shell", "pidof", "system_server"), stdout=system_server),
             Rule(("cmd", "package"), stdout=recorded.text("package_list_uid_two_users")),
             Rule(("shell", "ps"), stdout=ps_answer),

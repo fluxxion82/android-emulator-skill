@@ -54,13 +54,20 @@ def _shown(records: list[bytes]) -> int:
 
 @pytest.fixture(autouse=True)
 def attached(monkeypatch, recorded):
-    """adb answering ``get-state`` as recorded for an attached device (A4's preflight)."""
+    """adb answering ``get-state`` as recorded for an attached device (A4's preflight).
+
+    And the API level a live read asks once, as the recorded API 35 emulator
+    answers it (getprop_sdk): a level that streams. API 33 reads by dumps
+    instead (tests/test_log_monitor_catch_up.py).
+    """
     asked: list[list[str]] = []
 
     def run(cmd, **_kwargs):
         asked.append(cmd)
         if "get-state" in cmd:
             return subprocess.CompletedProcess(cmd, 0, recorded.text("adb_get_state"), "")
+        if "ro.build.version.sdk" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, recorded.text("getprop_sdk"), "")
         raise AssertionError(f"unexpected adb call {cmd}")
 
     monkeypatch.setattr(adb_exec.subprocess, "run", run)
@@ -317,7 +324,8 @@ def test_failed_logcat_is_reported_as_failure(fake_popen, attached):
 
     assert "exited with status 1" in str(raised.value)
     assert "--serial" in raised.value.remedy
-    assert [cmd[-1] for cmd in attached] == ["get-state", "get-state"]
+    # get-state, the API level (which streams), get-state again.
+    assert [cmd[-1] for cmd in attached] == ["get-state", "ro.build.version.sdk", "get-state"]
 
 
 def test_a_read_we_stopped_inside_a_record_loses_it_and_says_so(fake_popen, recorded, capsys):
@@ -342,6 +350,39 @@ def test_a_read_we_stopped_inside_a_record_loses_it_and_says_so(fake_popen, reco
     proc.read = interrupted_read
 
     assert monitor.stream_logs() is True
+    assert monitor.cut_records == 1
+    assert monitor.total_lines == _shown(records[:3])
+    assert "stopped while a record was arriving" in capsys.readouterr().err
+    assert monitor.get_json_output()["statistics"]["cut_records"] == 1
+    assert "INCOMPLETE" in monitor.get_summary()
+
+
+def test_a_last_dump_an_interrupt_cut_inside_a_record_loses_it_and_says_so(
+    fake_popen, recorded, capsys
+):
+    """``--last``'s own cut: Ctrl-C while a record of the dump was arriving.
+
+    The same disclosure as a live read's (``cut_records``, a stderr note, an
+    INCOMPLETE line), pinned for the dump on its own: the API 33 rework reads
+    live by dumps and leaves ``--last`` as it was, so a regression there must
+    not hide behind the live read's test. Derived as that test is: three
+    recorded records, then the first 10 bytes of a fourth.
+    """
+    records = _real_records(recorded, limit=4)
+    complete = b"".join(records[:3])
+    proc = fake_popen([*records[:3], records[3][:10]])
+    monitor = log_monitor.LogMonitor()
+    read = proc.read
+
+    def interrupted_read(size=-1):
+        if proc._stream.tell() >= len(complete):
+            monitor.interrupted = True
+        return read(size)
+
+    proc.read = interrupted_read
+
+    assert monitor.stream_logs(last_minutes=5) is True
+    assert logcat.BINARY_FLAG in fake_popen.created["cmd"] and "-d" in fake_popen.created["cmd"]
     assert monitor.cut_records == 1
     assert monitor.total_lines == _shown(records[:3])
     assert "stopped while a record was arriving" in capsys.readouterr().err
@@ -376,7 +417,8 @@ def test_a_live_read_that_ends_by_itself_is_refused_with_what_it_read(
     assert "ended the live read by itself (exit status 0)" in str(raised.value)
     assert f"It had read {_shown(records)} line(s)" in str(raised.value)
     assert raised.value.details["partial"]["statistics"]["total_lines"] == _shown(records)
-    assert [cmd[-1] for cmd in attached] == ["get-state", "get-state"]
+    # get-state, the API level (which streams), get-state again.
+    assert [cmd[-1] for cmd in attached] == ["get-state", "ro.build.version.sdk", "get-state"]
 
 
 # ---------------------------------------------------------------------------

@@ -22,11 +22,15 @@ from __future__ import annotations
 import json
 import os
 import signal
+import struct
 import subprocess
 import time
 
 import pytest
-from fake_toolchain import FakeToolchain, Rule, assert_refusal
+from conftest import RECORDED_ROOT, RecordedFixtures
+from fake_toolchain import FakeToolchain, Rule, assert_refusal, framed, frames
+
+API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
 
 REFUSAL = {"success": False, "error": "`sdkmanager` was not found", "remedy": "Install it."}
 
@@ -149,8 +153,9 @@ def test_a_run_past_its_limit_leaves_no_stub_running(tmp_path, recorded):
 
     ``log_monitor --follow`` over a ``logcat`` that waits never ends: the limit
     is its end here. ``subprocess.run`` killed the script alone, and the stub
-    (``hang=True``, an hour's sleep) outlived it, one per timed-out run. Both
-    answers are recorded: adb_get_state, then adb_waiting_for_device's banner.
+    (``hang=True``, an hour's sleep) outlived it, one per timed-out run. Every
+    answer is recorded: adb_get_state, getprop_sdk (a level that streams), then
+    adb_waiting_for_device's banner.
     """
     chain = FakeToolchain(tmp_path / "toolchain")
     chain.assert_isolated()
@@ -158,6 +163,7 @@ def test_a_run_past_its_limit_leaves_no_stub_running(tmp_path, recorded):
         "adb",
         [
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
         ],
     )
@@ -171,3 +177,80 @@ def test_a_run_past_its_limit_leaves_no_stub_running(tmp_path, recorded):
         # Red or not, nothing is left behind.
         os.kill(stubs[0], signal.SIGKILL)
     assert gone, f"the hanging logcat stub (pid {stubs[0]}) outlived the run that started it"
+
+
+# --- the stub's `-t <epoch>` over recorded records -------------------------------
+
+
+def _ask_adb(chain: FakeToolchain, *argv: str) -> bytes:
+    return subprocess.run(
+        [str(chain.bin / "adb"), *argv],
+        env=chain.env(),
+        capture_output=True,
+        timeout=30,
+        check=True,
+    ).stdout
+
+
+def _epoch(frame, delta_ns: int = 0) -> str:
+    sec, nsec = struct.unpack_from("<II", frame.raw, 12)
+    total = sec * 1_000_000_000 + nsec + delta_ns
+    return f"{total // 1_000_000_000}.{total % 1_000_000_000:09d}"
+
+
+def test_the_fakes_epoch_reads_the_records_stamped_after_it(tmp_path):
+    """As logcat does (measured: logcat_stream_marks_records, ``since_is_strict``)."""
+    window = frames(API33.data("logcat_stream_marks_window_records.bin"))
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.install("adb", [Rule(("logcat",), stdout=framed(window))])
+
+    assert _ask_adb(chain, "logcat", "-d", "-B", "-t", _epoch(window[2])) == framed(window[3:])
+    assert _ask_adb(chain, "logcat", "-d", "-B", "-t", _epoch(window[2], -1)) == framed(window[2:])
+
+
+@pytest.mark.parametrize("kept", [5, 25], ids=["inside-the-header", "inside-the-payload"])
+def test_the_fakes_epoch_keeps_a_cut_dump_cut(kept, tmp_path):
+    """A dump cut inside a record stays cut when ``-t`` filters it.
+
+    The filter dropped a cut shorter than eight bytes, and filtered a longer
+    one by the stamp it may not even hold -- turning a cut dump into a clean
+    one, which a reader then took for the whole window (review of closure B).
+    Derived: a recorded window and the first ``kept`` bytes of its last record.
+    """
+    window = frames(API33.data("logcat_stream_marks_window_records.bin"))
+    cut = window[-1].raw[:kept]
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.install("adb", [Rule(("logcat",), stdout=framed(window) + cut)])
+
+    answer = _ask_adb(chain, "logcat", "-d", "-B", "-t", _epoch(window[2]))
+
+    assert answer == framed(window[3:]) + cut
+
+
+# --- the stub's `logged=`: the line a `shell log` call wrote, in the buffer after it ------
+
+
+def test_the_fakes_placeholder_frame_is_the_line_shell_log_wrote_once_it_was_written(tmp_path):
+    """Absent before the call; after it, the recorded frame carrying the call's tag and message.
+
+    Derived: the marks window, a shell record (uid 2000) of it carrying a
+    placeholder. ``-T`` counts the frame only once it is there.
+    """
+    window = frames(API33.data("logcat_stream_marks_window_records.bin"))
+    shell = next(frame for frame in window if frame.uid == 2000)
+    placeholder = shell.replace(message="placeholder")
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.install(
+        "adb",
+        [
+            Rule(("shell", "log")),
+            Rule(("logcat",), buffered=framed([*window, placeholder]), logged="placeholder"),
+        ],
+    )
+
+    assert _ask_adb(chain, "logcat", "-d", "-B", "-T", "1") == window[-1].raw
+    _ask_adb(chain, "shell", "log", "-t", "aes-log-monitor", "anchor-1")
+    written = shell.replace(tag="aes-log-monitor", message="anchor-1")
+
+    assert _ask_adb(chain, "logcat", "-d", "-B", "-T", "1") == written.raw
+    assert _ask_adb(chain, "logcat", "-d", "-B") == framed([*window, written])

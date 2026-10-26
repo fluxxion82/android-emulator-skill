@@ -91,6 +91,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -329,18 +330,21 @@ def _run(args: list[str], serial: str, timeout: int = DEFAULT_TIMEOUT) -> Captur
     return capture
 
 
-def _run_bytes(args: list[str], serial: str, timeout: int = DEFAULT_TIMEOUT) -> bytes:
+def _run_bytes(
+    args: list[str], serial: str, timeout: int = DEFAULT_TIMEOUT, *, allow_empty: bool = False
+) -> bytes:
     """Run one adb command and return its stdout as raw bytes.
 
     ``_run`` decodes with ``text=True``, which mangles a PNG beyond repair.
-    Used only by the screencap fixtures.
+    Used by the screencap fixtures and the binary logcat reads. ``allow_empty``
+    accepts no output at exit 0 -- a logcat window nothing was logged in.
     """
     cmd = _adb_argv(serial, args)
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise CaptureError(f"timed out after {timeout}s") from exc
-    if result.returncode != 0 or not result.stdout:
+    if result.returncode != 0 or not (result.stdout or allow_empty):
         raise CaptureError(
             f"{' '.join(args)} produced no bytes "
             f"(exit {result.returncode}): {result.stderr[:200]!r}"
@@ -2716,6 +2720,342 @@ def _logcat_tail_zero(_scratch: Path, serial: str, extra: dict) -> Capture:
     return capture
 
 
+# --- v0.9.0 slice 1: what a live `logcat -B` has delivered when it is stopped --
+#
+# A live read is stopped by its reader: log_monitor's --duration terminates
+# `adb logcat -B -T 1`, and so do the ANR readers. Whatever logcat had written
+# but not yet flushed is lost with it. Each scenario below records, in one run:
+#
+#   <name>_records         what `logcat -B -T 1` delivered before the recorder
+#                          stopped it (complete records; see "kept" below)
+#   <name>_open_records    `logcat -d -B -T 1` just before the stream opened: the
+#                          newest record the device held; the window runs after it
+#   <name>_window_records  `logcat -d -B -t <the open record's epoch - 1 ns>` once
+#                          the stream is gone: the same window read back in dump
+#                          mode, which exits by itself and so writes everything it
+#                          read -- starting with the open record itself (manifest
+#                          `window.open_record_at`), which is how a reader proves
+#                          the buffer still holds the window's beginning
+#
+# The newest record at the stop is asked too, before the stream is terminated,
+# so the manifest can say how much of the window the stream had delivered by
+# then (`window.records_through_close`, `of_them_delivered_by_the_stream`).
+#
+# Kept: records a uid below 10000 wrote (system daemons, and the shell, which
+# writes the recorder's marks), each with private package names aliased; an
+# app's free text is not ours to publish. What the stream delivered and when
+# -- every chunk, timed, before that filter -- is measured on the whole stream
+# and kept in the manifest (`stream`, `window`).
+
+_STREAM_ARGV = ["logcat", "-B", "-T", "1"]
+_NEWEST_ARGV = ["logcat", "-d", "-B", "-T", "1"]
+# How long each scenario's stream runs before the recorder stops it.
+_STREAM_SECONDS = 5
+# Android's first app uid (AID_APP_START): below it, a system daemon or the shell.
+_FIRST_APP_UID = 10_000
+_MAX_NEWEST_TRIES = 20
+
+
+def _record_uid(raw: bytes) -> int:
+    """The uid logd stamped on one raw record (``struct logger_entry``'s last field)."""
+    return struct.unpack_from("<I", raw, 24)[0]
+
+
+def _publishable(raw: bytes) -> bool:
+    """Whether a record's writer was a system daemon or the shell, not an app."""
+    return _record_uid(raw) < _FIRST_APP_UID
+
+
+def _epoch_before(raw: bytes) -> str:
+    """One nanosecond before a record's time, as ``-t`` reads an epoch."""
+    sec, nsec = _record_time(raw)
+    return f"{sec}.{nsec - 1:09d}" if nsec else f"{sec - 1}.999999999"
+
+
+def _epoch(raw: bytes) -> str:
+    """A record's time as logcat's ``-t`` reads an epoch: always with a fraction.
+
+    ``-t 1792912778`` would be a COUNT of records (logcat --help: "count is
+    pure numerical"); the nine-digit fraction keeps it a time.
+    """
+    sec, nsec = _record_time(raw)
+    return f"{sec}.{nsec:09d}"
+
+
+def _complete_records(data: bytes) -> tuple[list[bytes], bytes]:
+    """The whole records of a stopped stream, and the bytes of the one it was cut inside."""
+    records: list[bytes] = []
+    offset = 0
+    while len(data) - offset >= _LOGGER_ENTRY.size:
+        length, header = struct.unpack_from("<HH", data, offset)
+        if header < _LOGGER_ENTRY.size:
+            raise CaptureError(f"the stream is not logd's records at byte {offset}")
+        if offset + header + length > len(data):
+            break
+        records.append(data[offset : offset + header + length])
+        offset += header + length
+    return records, data[offset:]
+
+
+def _ours_partial(trailing: bytes) -> bool:
+    """Whether a cut record's visible bytes are the recorder's own mark."""
+    if len(trailing) < _LOGGER_ENTRY.size + 1 + len(_WINDOW_TAG) + 1:
+        return False
+    header = struct.unpack_from("<H", trailing, 2)[0]
+    tag = trailing[header + 1 : header + 1 + len(_WINDOW_TAG) + 1]
+    return _publishable(trailing) and tag == _WINDOW_TAG.encode() + b"\0"
+
+
+def _newest_record(serial: str, *, mark: str | None) -> bytes:
+    """``logcat -d -B -T 1``: the newest record, retried until it can be kept.
+
+    With ``mark``, the recorder logs ``<mark>-<try>`` first and takes the
+    answer only when it is that mark; without, only when a uid below 10000
+    wrote it. Another process logging in between moves the newest record on,
+    so the question is put again.
+    """
+    for attempt in range(_MAX_NEWEST_TRIES):
+        expected = f"{mark}-{attempt}" if mark is not None else None
+        if expected is not None:
+            _run(["shell", "log", "-t", _WINDOW_TAG, expected], serial, timeout=15)
+        records = _split_records(_run_bytes(_NEWEST_ARGV, serial, timeout=30))
+        if len(records) != 1:
+            raise CaptureError(f"`logcat -d -B -T 1` returned {len(records)} records, not one")
+        raw = records[0][1]
+        if expected is None and _publishable(raw):
+            return raw
+        if expected is not None and _tag_and_message(raw) == (_WINDOW_TAG, expected):
+            return raw
+        time.sleep(0.3)
+    raise CaptureError(f"no keepable newest record in {_MAX_NEWEST_TRIES} tries")
+
+
+class _StreamTap:
+    """A live ``adb logcat`` whose stdout is read on a thread, every chunk timed."""
+
+    def __init__(self, serial: str, args: list[str]) -> None:
+        self.started = time.monotonic()
+        self.child = subprocess.Popen(
+            _adb_argv(serial, args),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+        self.chunks: list[tuple[float, bytes]] = []
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        assert self.child.stdout is not None
+        while chunk := self.child.stdout.read1(65536):
+            self.chunks.append((time.monotonic() - self.started, chunk))
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def stop(self) -> int:
+        """Terminate the stream as log_monitor's deadline does; its exit status."""
+        self.child.terminate()
+        try:
+            self.child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.child.kill()
+            self.child.wait(timeout=DEFAULT_TIMEOUT)
+        self._reader.join(timeout=10)
+        if self._reader.is_alive():
+            raise CaptureError("the stream's reader did not finish after the stream was stopped")
+        return self.child.returncode
+
+
+def _since_is_strict(serial: str, raw: bytes) -> dict:
+    """Does ``-t <epoch>`` include a record stamped exactly then? And one ns earlier?"""
+    answers = {}
+    for name, since in (("at_its_epoch", _epoch(raw)), ("one_ns_earlier", _epoch_before(raw))):
+        data = _run_bytes(["logcat", "-d", "-B", "-t", since], serial, timeout=60, allow_empty=True)
+        answers[name] = {
+            "since": since,
+            "includes_the_record": raw in [record for _pid, record in _split_records(data)],
+        }
+    return answers
+
+
+def _stream_scenario(
+    name: str, *, marks: int = 0, padding: int = 0
+) -> Callable[[str, dict], bytes]:
+    """``<name>_records``' ``capture_bytes``: the stream's records; open and window as twins.
+
+    ``marks`` is how many marks the recorder logs into the window, half a
+    second after the stream opens -- each ``stream-mark-<run>-<n>`` plus
+    ``padding`` bytes, so a few can fill logcat's 4 KiB stdio buffer. With
+    none, the recorder writes nothing to the device and only reads (the
+    scenario recorded on a device that is not ours to write).
+    """
+
+    def capture(serial: str, extra: dict) -> bytes:
+        run = os.urandom(4).hex()
+        ours = marks > 0
+        opened = _newest_record(serial, mark=f"stream-open-{run}" if ours else None)
+        tap = _StreamTap(serial, _STREAM_ARGV)
+        written: list[str] = []
+        try:
+            if ours:
+                time.sleep(0.5)
+                for index in range(marks):
+                    text = f"stream-mark-{run}-{index}" + (f" {'x' * padding}" if padding else "")
+                    _run(["shell", "log", "-t", _WINDOW_TAG, text], serial, timeout=15)
+                    written.append(text)
+            time.sleep(max(0.0, _STREAM_SECONDS - tap.elapsed()))
+            stopped_at = tap.elapsed()
+            closed = _newest_record(serial, mark=f"stream-close-{run}" if ours else None)
+        finally:
+            exit_status = tap.stop()
+        window = [
+            raw
+            for _pid, raw in _split_records(
+                _run_bytes(
+                    ["logcat", "-d", "-B", "-t", _epoch_before(opened)],
+                    serial,
+                    timeout=60,
+                    allow_empty=True,
+                )
+            )
+        ]
+        if opened not in window:
+            raise CaptureError("the window read back does not hold the open record")
+        after = window[len(window) - window[::-1].index(opened) :]
+        delivered = b"".join(chunk for _at, chunk in tap.chunks)
+        complete, trailing = _complete_records(delivered)
+        end = _record_time(closed)
+        through_close = [raw for raw in after if _record_time(raw) <= end]
+        streamed = set(complete)
+        extra["stream"] = {
+            "argv": ["adb", "-s", "<serial>", *_STREAM_ARGV],
+            "stopped_after_s": round(stopped_at, 3),
+            "exit_status_after_terminate": exit_status,
+            "bytes_delivered": len(delivered),
+            "chunks_at_s_and_bytes": [[round(at, 3), len(chunk)] for at, chunk in tap.chunks],
+            "complete_records_delivered": len(complete),
+            "cut_record_bytes": len(trailing),
+        }
+        extra["window"] = {
+            "argv": ["adb", "-s", "<serial>", "logcat", "-d", "-B", "-t", "<open's epoch - 1 ns>"],
+            "open_epoch": _epoch(opened),
+            "close_epoch": _epoch(closed),
+            "open_record_at": window.index(opened),
+            "records_after_open": len(after),
+            "records_through_close": len(through_close),
+            "of_them_delivered_by_the_stream": sum(raw in streamed for raw in through_close),
+        }
+        if ours:
+            texts = [_tag_and_message(raw) for raw in through_close]
+            arrived = [_tag_and_message(raw) for raw in complete]
+            extra["marks"] = {
+                "written": len(written),
+                "padding_bytes": padding,
+                "in_window": sum((_WINDOW_TAG, text) in texts for text in written),
+                "delivered_by_the_stream": sum((_WINDOW_TAG, text) in arrived for text in written),
+            }
+            if extra["marks"]["in_window"] != len(written):
+                raise CaptureError(f"the window holds {extra['marks']} of the marks written")
+            first_mark = next(
+                raw for raw in through_close if _tag_and_message(raw) == (_WINDOW_TAG, written[0])
+            )
+            extra["since_is_strict"] = _since_is_strict(serial, first_mark)
+        kept = [_aliased_record(raw) for raw in complete if _publishable(raw)]
+        cut_kept = bool(trailing) and _ours_partial(trailing)
+        window_kept = [_aliased_record(raw) for raw in window if _publishable(raw)]
+        extra["kept"] = {
+            "rule": f"records whose uid is below {_FIRST_APP_UID}, private package names aliased",
+            "stream_records": len(kept),
+            "cut_record_kept": cut_kept,
+            "window_records": len(window_kept),
+        }
+        provenance = {"first_half": f"{name}_records", "run": run}
+        _stash_twin(f"{name}_open_records", _aliased_record(opened), provenance)
+        _stash_twin(f"{name}_window_records", b"".join(window_kept), provenance)
+        return b"".join(kept) + (trailing if cut_kept else b"")
+
+    return capture
+
+
+def _stream_fixtures(
+    name: str, description: str, *, marks: int = 0, padding: int = 0
+) -> list[Fixture]:
+    """One stream scenario's three fixtures, recorded together (``_stream_scenario``)."""
+    together = f"recorded in {name}_records' run"
+    halves = (
+        (
+            "open",
+            _NEWEST_ARGV,
+            "The newest record the device held just before the stream opened: the "
+            "window runs after it (the twin's `-t` is one nanosecond before its epoch).",
+        ),
+        (
+            "window",
+            ["logcat", "-d", "-B", "-t", "<open's epoch - 1 ns>"],
+            "The stream's window read back in dump mode once the stream was gone: the "
+            "open record itself (manifest `window.open_record_at`), then every record "
+            "after it that was still in the buffer.",
+        ),
+    )
+    return [
+        Fixture(
+            name=f"{name}_records",
+            # Its marks write to the device's log; the read-only scenario still
+            # takes a capture callable, which the device guard cannot see into.
+            emulator_only=True,
+            ext="bin",
+            args=[],
+            command=(
+                f"adb -s <serial> logcat -B -T 1, stopped by the recorder after "
+                f"{_STREAM_SECONDS} s" + (f", {marks} marks logged into it" if marks else "")
+            ),
+            description=description,
+            capture_bytes=_stream_scenario(name, marks=marks, padding=padding),
+        ),
+        *(
+            Fixture(
+                name=f"{name}_{half}_records",
+                emulator_only=True,
+                ext="bin",
+                args=args,
+                command=f"{together}: adb -s <serial> {' '.join(args)}",
+                description=text,
+                capture_bytes=_twin(f"{name}_{half}_records", f"{name}_records"),
+            )
+            for half, args, text in halves
+        ),
+    ]
+
+
+_TAIL_COUNTS = (1, 5, 50, 500)
+
+
+def _tail_records(serial: str, extra: dict) -> bytes:
+    """``logcat -d -B -T N`` for N in 1, 5, 50, 500: how many whole frames each answers.
+
+    Only reads. The manifest's ``measured`` gives, per N, the bytes, the whole
+    frames and the bytes left over after them (a cut record); the file keeps
+    the publishable records (uid below 10000, private package names aliased)
+    of the ``-T 50`` answer.
+    """
+    measured: dict[str, dict[str, int]] = {}
+    kept: list[bytes] = []
+    for count in _TAIL_COUNTS:
+        data = _run_bytes(["logcat", "-d", "-B", "-T", str(count)], serial, timeout=60)
+        complete, cut = _complete_records(data)
+        measured[str(count)] = {"bytes": len(data), "frames": len(complete), "cut_bytes": len(cut)}
+        if count == 50:
+            kept = [_aliased_record(raw) for raw in complete if _publishable(raw)]
+    extra["measured"] = measured
+    extra["kept"] = {
+        "rule": f"records whose uid is below {_FIRST_APP_UID}, private package names aliased",
+        "of": "the -T 50 answer",
+        "records": len(kept),
+    }
+    return b"".join(kept)
+
+
 # --- v0.9.0 Inc 0: ground truth for uid ownership, users and adb states -------
 
 # A serial adb gives an emulator. Every other serial -- a USB handset's, an
@@ -3778,6 +4118,46 @@ FIXTURES: list[Fixture] = [
         catches=("A4",),
     ),
     Fixture(
+        name="getprop_sdk",
+        args=["shell", "getprop", "ro.build.version.sdk"],
+        description=(
+            "The device's API level, as log_monitor reads it once before a live read: "
+            "Android 13 (API 33) is the one release whose logcat holds `-B` records back "
+            "(logcat_stream_quiet_records), so there the read is made by dumps instead of "
+            "a stream."
+        ),
+    ),
+    Fixture(
+        name="getprop_unset",
+        args=["shell", "getprop", "ro.aes_recorder.not_a_property"],
+        description=(
+            "What getprop answers for a property the device does not have: an empty line, "
+            "exit 0 -- no error at all. So a device that does not say its API level (one "
+            "still booting, or a getprop that fails) answers ro.build.version.sdk this way, "
+            "and log_monitor refuses the live read rather than guessing the level: a "
+            "guessed stream on API 33 is the zero-line success it exists to prevent."
+        ),
+        record_both_streams=True,
+    ),
+    Fixture(
+        name="logcat_tail_records",
+        # It only reads, but it is a capture callable, which
+        # tests/test_recorder_device_guard.py cannot see into: the conservative mark.
+        emulator_only=True,
+        ext="bin",
+        args=[],
+        command="adb -s <serial> logcat -d -B -T N, for N in 1, 5, 50, 500",
+        description=(
+            "Count-based tails of logd's order as records: `-T N` answers the newest N whole "
+            "frames while the buffer holds N (manifest `measured`: bytes, frames, and the bytes "
+            "of any cut record, per N). log_monitor's dump-made read on API 33 finds its cursor "
+            "in such a tail, doubling N until the tail reaches it or comes back short: no "
+            "timestamp positions the read. The file keeps the publishable records of the -T 50 "
+            "answer."
+        ),
+        capture_bytes=_tail_records,
+    ),
+    Fixture(
         name="adb_waiting_for_device",
         args=[],
         command=(
@@ -4547,6 +4927,42 @@ FIXTURES: list[Fixture] = [
             "are not recorded."
         ),
         post=_requires("-T 0 invalid"),
+    ),
+    *_stream_fixtures(
+        "logcat_stream_quiet",
+        (
+            "What a live `logcat -B -T 1` delivers in 5 s on a device left alone, before "
+            "its reader stops it; the recorder writes nothing to the device. On API 33 "
+            "(Android 13) it delivers nothing: logcat writes `-B` records through stdio and "
+            "flushes only after a TEXT record (AOSP system/logging logcat.cpp, "
+            "android13-release), so records wait in its 4 KiB buffer and are lost when the "
+            "stream is terminated. On API 35 each record arrives as it is logged. Manifest: "
+            "every chunk the stream delivered, timed (`stream`), and how many of the "
+            "window's records it had delivered by the stop (`window`)."
+        ),
+    ),
+    *_stream_fixtures(
+        "logcat_stream_marks",
+        (
+            "As logcat_stream_quiet_records, with 5 marks (`aes-recorder: "
+            "stream-mark-<run>-<n>`) logged half a second in. On API 33 the stream delivers "
+            "none of them, and its window read back in dump mode holds all five. Also "
+            "measured (`since_is_strict`): `-t <epoch>` leaves out a record stamped exactly "
+            "then and includes it from one nanosecond earlier."
+        ),
+        marks=5,
+    ),
+    *_stream_fixtures(
+        "logcat_stream_block",
+        (
+            "As logcat_stream_marks_records, each mark padded with 900 bytes so six of "
+            "them pass 4096: on API 33 the stream delivers whole 4 KiB blocks only -- the "
+            "last cut inside a record -- and the marks after the last block reach the "
+            "reader only in the window read back in dump mode. The cut mark's visible "
+            "bytes are kept when they are the recorder's (`kept.cut_record_kept`)."
+        ),
+        marks=6,
+        padding=900,
     ),
     Fixture(
         name="pm_grant_not_changeable",

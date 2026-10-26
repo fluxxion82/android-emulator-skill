@@ -1064,6 +1064,46 @@ def transform_screenshot_coords(
     return (device_x, device_y)
 
 
+class UnknownSdkLevelError(RuntimeError):
+    """The device did not say its API level: getprop failed, or answered no number."""
+
+    remedy = (
+        "Check the device has finished booting and answers `adb shell getprop "
+        "ro.build.version.sdk` with a number, then retry."
+    )
+
+
+def get_sdk_level(serial: str | None = None, *, timeout: int | None = None) -> int:
+    """The device's API level (``getprop ro.build.version.sdk``).
+
+    Recorded: getprop_sdk (``33`` on the API 33 emulator, ``35`` on API 35).
+    A property a device does not have answers an empty line at exit 0
+    (getprop_unset), so "no number" is the failure, whatever the status.
+
+    Args:
+        serial: Device serial.
+        timeout: Seconds to allow the call; adb_exec's default when None.
+
+    Returns:
+        The level.
+
+    Raises:
+        UnknownSdkLevelError: getprop exited non-zero or answered anything but
+            digits; the message quotes its answer.
+        adb_exec.DeviceError: The device could not be reached.
+        adb_exec.AdbTimeoutError: The call took longer than ``timeout``.
+    """
+    result = run_adb("shell", serial, "getprop", "ro.build.version.sdk", timeout=timeout)
+    value = result.stdout.strip()
+    if result.ok and value.isdigit():
+        return int(value)
+    said = " ".join(result.stderr.split())[:200]
+    raise UnknownSdkLevelError(
+        f"`adb shell getprop ro.build.version.sdk` answered {value[:80]!r} at exit "
+        f"{result.returncode}" + (f" ({said})" if said else "") + ", which is no API level."
+    )
+
+
 def get_system_server_pid(
     serial: str | None = None, *, not_one_of: Iterable[str] = (), timeout: int | None = None
 ) -> str | None:

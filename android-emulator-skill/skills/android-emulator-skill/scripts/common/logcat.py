@@ -55,10 +55,17 @@ For a reader adopting it, two rules:
   the capture is incomplete: re-check the device (gone: exit 3) and refuse
   otherwise. Any other framing error is not records at all: refuse.
 
+On Android 13 (API 33) a live ``-B`` stream holds records back and loses them
+when it is stopped, so a live read there is made of dumps that each continue
+from a cursor: :func:`read_after` (log_monitor's live read on that level; the
+ANR readers are meant to adopt it next). Like every logd reader, stream or
+dump, it reads what logd DELIVERED: logd may drop records it prunes while a
+reader is behind, and nothing a reader does can certify a window complete.
+
 This module is pure: it builds argv and parses bytes and strings, and never
-touches a device. Execution stays with ``common.adb_exec`` (bounded, typed
-errors) or, for the two streaming readers, their own watchdog-terminated
-``Popen``.
+touches a device (:func:`read_after` is handed the dump to run). Execution
+stays with ``common.adb_exec`` (bounded, typed errors) or, for the two
+streaming readers, their own watchdog-terminated ``Popen``.
 """
 
 from __future__ import annotations
@@ -381,7 +388,20 @@ def parse_records(data: bytes) -> list[LogRecord]:
         LogFramingError: The bytes are not whole records -- including a dump
             that ends inside one, which a complete dump never does.
     """
-    records: list[LogRecord] = []
+    return [record for _raw, record in parse_frames(data)]
+
+
+def parse_frames(data: bytes) -> list[tuple[bytes, LogRecord]]:
+    """:func:`parse_records`, each record beside its frame: the bytes logd sent, whole.
+
+    For a reader that must tell one record from another (:func:`read_after`):
+    two records can decode alike -- a payload that is not UTF-8 decodes with
+    replacement characters -- and only their bytes are theirs.
+
+    Raises:
+        LogFramingError: As :func:`parse_records`.
+    """
+    records: list[tuple[bytes, LogRecord]] = []
     offset = 0
     while offset < len(data):
         if len(data) - offset < _ENTRY_SIZES.size:
@@ -394,10 +414,366 @@ def parse_records(data: bytes) -> list[LogRecord]:
         if end > len(data):
             raise LogFramingError("the dump ended inside a record", offset=offset, truncated=True)
         records.append(
-            _decode_record(data[offset : offset + header_size], data[offset + header_size : end])
+            (
+                data[offset:end],
+                _decode_record(
+                    data[offset : offset + header_size], data[offset + header_size : end]
+                ),
+            )
         )
         offset = end
     return records
+
+
+# --- a live read made of dumps: the cursor read --------------------------------
+#
+# A live ``logcat -B`` is stopped by terminating it, and whatever logcat had
+# not yet written dies with it. Android 13's logcat (API 33) writes ``-B``
+# records through stdio and flushes only after a TEXT record (AOSP
+# system/logging logcat.cpp, android13-release: the binary branch is an
+# ``fwrite`` with no ``fflush``; Android 12 wrote each record with ``write``,
+# 14 and 15 flush after either branch), so its records wait in a 4 KiB buffer.
+# Recorded on the API 33 emulator: a 5 s stream delivered no byte while its
+# window held records (logcat_stream_quiet_records, logcat_stream_marks_records),
+# or whole 4096-byte blocks only (logcat_stream_block_records). API 35 delivered
+# each record as it was logged.
+#
+# A dump ends by itself and writes everything it read, so on that release a
+# live read is made of dumps instead, each continuing from a cursor: the newest
+# record a system process wrote that the read has reached -- an identity no app
+# can forge; when the buffer holds none, a marker the read writes as shell --
+# kept as its frame, byte for byte, with the frames that followed it, and found
+# again in a count-based tail of logd's order. Timestamps position nothing.
+#
+# What a cursor read proves, and what it does not: finding the cursor's frame
+# and what followed it in the dump proves logd still held the window's start
+# when the dump began.
+# It does not prove the window is complete. A capture is what logd delivered,
+# and logd may drop records it prunes while any reader is behind -- Android
+# 13's SerializedLogBuffer prunes while it flushes to a slow reader without
+# disconnecting it, a property of every logd reader, streams included, on
+# every level. So no completeness is claimed, and none is to be added.
+
+# The one release whose logcat holds ``-B`` records back while it streams.
+BUFFERED_BINARY_SDK = 33
+
+
+# A record's uid is logd's, from the writing socket's credentials (SO_PEERCRED;
+# AOSP logd LogListener), and the one part of a frame an app cannot choose:
+# below AID_APP_START within its user, the writer is the platform's -- root,
+# system_server, the daemons, and shell (2000), which is what `adb shell log`
+# writes as. Apps, isolated processes, app zygotes and SDK sandboxes are all at
+# or above it (AOSP android_filesystem_config.h). Only such a record identifies
+# where a read is: an app can send the same datagram twice, time, tid and
+# payload included, and logd stores two byte-identical frames.
+AID_APP_START = 10_000
+AID_USER_OFFSET = 100_000
+
+
+def system_written(record: LogRecord) -> bool:
+    """Whether a system process wrote ``record``: its uid below AID_APP_START in its user."""
+    return record.uid % AID_USER_OFFSET < AID_APP_START
+
+
+@dataclass(frozen=True)
+class Cursor:
+    """Where a dump-made read continues: the newest system record read, and what followed it.
+
+    There is always such a record: a read whose buffer holds none writes one
+    (:func:`find_anchor`), so no read ever continues from app-written bytes
+    alone -- an app's copies of its own records can reproduce them exactly.
+
+    Attributes:
+        raw: That record's frame, as logd sent it; an app cannot write one
+            like it (:func:`system_written`).
+        record: The same record, decoded (for what a refusal says of it).
+        suffix: The frames that followed it in logd's order, all already
+            read, byte for byte -- an app's, none of them a system record.
+    """
+
+    raw: bytes
+    record: LogRecord
+    suffix: tuple[bytes, ...] = ()
+
+
+class CursorLostError(RuntimeError):
+    """The dump does not hold the read's place: logd's buffer turned over past it.
+
+    The cursor's record is gone, or a record read after it is: the window's
+    start is gone, and records logged after it may have gone with it, so the
+    read is refused rather than reported from a later point.
+    """
+
+    remedy = (
+        "Capture for less time, or enlarge the device's log buffer (`adb logcat -G 16M`) and "
+        "retry."
+    )
+
+
+class AmbiguousCursorError(RuntimeError):
+    """The dump holds the cursor's frame more than once, so where the read resumes is a guess.
+
+    The cursor is a system process's record, and system writers do not send
+    one datagram twice; were one to, which copy is the cursor cannot be told,
+    and no copy is picked.
+    """
+
+    remedy = (
+        "Retry: the next read starts from a newer record. If it repeats, a system process "
+        "on the device is logging byte-identical records; read the window with --last instead."
+    )
+
+
+class AnchorNotFoundError(RuntimeError):
+    """The marker the read wrote to anchor itself is not in the device's log buffer."""
+
+    remedy = (
+        "Retry. If it repeats, check that `adb shell log -t aes-log-monitor test` shows up in "
+        "`adb logcat -d -s aes-log-monitor`."
+    )
+
+
+class CursorBeyondCapError(RuntimeError):
+    """The cursor is not in the largest tail the byte cap allows: what followed it is too much."""
+
+    remedy = (
+        "Capture for less time, or raise ANDROID_EMU_LOG_DUMP_CAP_BYTES; on a busy device, a "
+        "shorter ANDROID_EMU_LOG_POLL_SECONDS keeps each read small."
+    )
+
+
+# The read is positioned by logd's own order, never by time. A record's time is
+# its WRITER's (AOSP logd LogListener takes `realtime` from the header a process
+# sends to /dev/socket/logdw), on a clock that can step (NTP, a manual set), so
+# `-t <time>` -- logd filtering by those stamps -- could be moved past real
+# records by one record stamped in the future, or by a clock stepping back;
+# four rounds of review found a new such interleaving each time. A count-based
+# tail, `-d -B -T N`, is the newest N records in logd's order (measured on API
+# 33: exactly N whole frames, logcat_tail_records), whatever their stamps: a
+# suffix of the sequence the cursor sits in.
+
+# The first tail a read asks for, and the floor of every later one.
+INITIAL_TAIL = 64
+
+
+def tail_args(count: int) -> list[str]:
+    """``-d -B -T <count>``: the newest ``count`` records, as a dump that ends by itself."""
+    return logcat_args(dump=True, binary=True, tail=count)
+
+
+def newest_args() -> list[str]:
+    """``-d -B -T 1``: the newest record the device holds, where the opening search starts."""
+    return tail_args(1)
+
+
+def cursor_from(data: bytes) -> Cursor | None:
+    """The cursor a dump places: its newest system record and the frames after it; None if none.
+
+    Raises:
+        LogFramingError: The dump is not whole records.
+    """
+    return _placed(parse_frames(data))
+
+
+def _placed(frames: list[tuple[bytes, LogRecord]]) -> Cursor | None:
+    for index in range(len(frames) - 1, -1, -1):
+        raw, record = frames[index]
+        if system_written(record):
+            return Cursor(raw, record, tuple(later for later, _r in frames[index + 1 :]))
+    return None
+
+
+def _cap_check(count: int, data: bytes, max_bytes: int | None, missing: str) -> None:
+    if max_bytes is not None and 2 * len(data) > max_bytes:
+        raise CursorBeyondCapError(
+            f"the newest {count} records ({len(data)} bytes) {missing}, and twice as many "
+            f"would pass the {max_bytes}-byte cap."
+        )
+
+
+def open_cursor(
+    dump: Callable[[list[str]], bytes], *, max_bytes: int | None = None
+) -> Cursor | None:
+    """Where a read opens: the newest system record the device holds, and what followed it.
+
+    Asks for the newest record (``-d -B -T 1``) and doubles the tail until it
+    holds a system record (:func:`system_written`); the records after it were
+    logged before the read opened and are its suffix, never the window's. A
+    tail that comes back short is the whole buffer: with no system record in
+    it -- empty, as after ``--clear``, or only apps' -- there is nothing to
+    open on (None), and the caller writes one (:func:`find_anchor`). Apps'
+    records alone never place a read: copies of one datagram can reproduce
+    them byte for byte after the originals turn over.
+
+    Raises:
+        CursorBeyondCapError: No system record before the tail would pass
+            ``max_bytes``.
+        LogFramingError: A dump is not whole records.
+    """
+    count = 1
+    while True:
+        data = dump(tail_args(count))
+        frames = parse_frames(data)
+        cursor = _placed(frames)
+        if cursor is not None:
+            return cursor
+        if len(frames) < count:
+            return None
+        _cap_check(count, data, max_bytes, "hold no record a system process wrote")
+        count *= 2
+
+
+# The tag of the marker a read writes when the buffer holds no system record.
+ANCHOR_TAG = "aes-log-monitor"
+
+
+def find_anchor(
+    dump: Callable[[list[str]], bytes], message: str, *, max_bytes: int | None = None
+) -> Cursor:
+    """The marker the caller just wrote, as the read's cursor: what follows it is the window.
+
+    The caller wrote ``message`` under :data:`ANCHOR_TAG` with ``adb shell
+    log``, as shell (uid 2000: a system writer, :func:`system_written`) -- a
+    frame no app can write, and ``message`` holds a nonce no one else has. The
+    tail is doubled from the newest record until it holds that frame; the
+    records after it were logged after it was, and are the window's (an empty
+    suffix), those before it not.
+
+    Raises:
+        AnchorNotFoundError: The whole buffer does not hold it.
+        AmbiguousCursorError: A tail holds it more than once.
+        CursorBeyondCapError: Not found before the tail would pass ``max_bytes``.
+        LogFramingError: A dump is not whole records.
+    """
+    count = 1
+    while True:
+        data = dump(tail_args(count))
+        frames = parse_frames(data)
+        found = [
+            (raw, record)
+            for raw, record in frames
+            if system_written(record) and record.tag == ANCHOR_TAG and record.message == message
+        ]
+        if len(found) > 1:
+            raise AmbiguousCursorError(
+                f"the dump holds the marker the read wrote ({ANCHOR_TAG}: {message}) "
+                f"{len(found)} times, so where the read starts cannot be told."
+            )
+        if found:
+            return Cursor(*found[0])
+        if len(frames) < count:
+            raise AnchorNotFoundError(
+                f"the marker the read wrote to anchor itself ({ANCHOR_TAG}: {message}) is not "
+                f"in the device's log buffer ({len(frames)} records), so where the window "
+                "begins cannot be told."
+            )
+        _cap_check(count, data, max_bytes, "do not reach the marker the read wrote")
+        count *= 2
+
+
+def read_after(
+    cursor: Cursor,
+    dump: Callable[[list[str]], bytes],
+    *,
+    tail: int = INITIAL_TAIL,
+    max_bytes: int | None = None,
+) -> tuple[list[LogRecord], Cursor]:
+    """The records logd delivered after ``cursor``, found in a tail of its order; and the next cursor.
+
+    Asks for the newest ``tail`` records (:func:`tail_args`). A tail is a
+    suffix of logd's order, so a tail that holds the cursor's record holds
+    everything after it. That record must be there exactly once, byte for
+    byte; twice or more, where to resume is a guess
+    (:class:`AmbiguousCursorError`). Absent from a tail of ``tail`` records,
+    more than that followed it: the tail is doubled and asked again. Absent
+    from a tail that came back short -- the whole buffer -- logd's buffer
+    turned over past it (:class:`CursorLostError`). Right after it, the
+    cursor's suffix must follow, frame for frame (logd's order does not
+    change); a frame of it missing or different is the same turnover
+    (:class:`CursorLostError`). What follows the suffix is the read's.
+    Without a new system record, the remembered suffix and the required dump
+    grow until turnover or the byte cap refuses continuation.
+
+    The cursor is a system process's record, the one identity an app cannot
+    forge (:func:`system_written`): an app resending its own records -- the
+    cursor's neighbours, or all of them -- adds records; it cannot move the
+    read. Trusted writers must not replay complete frames; duplicate
+    detection covers copies present in the searched dump. No record's
+    timestamp positions anything, so a stamp a writer
+    forged, ahead or behind, or a clock that stepped, can neither move the
+    read nor hide what follows the cursor.
+
+    What this proves, and what it does not: the cursor's record and its suffix
+    prove logd still held the window's start when the dump began. It does NOT
+    prove the window complete. The records returned are what logd delivered,
+    and logd may drop records it prunes while a reader is behind. Zero records
+    means logd delivered none after the cursor.
+
+    Args:
+        cursor: Where the read is (:func:`open_cursor`, :func:`find_anchor`,
+            or a previous call's).
+        dump: Runs ``adb logcat <args>`` to its end and returns what it wrote.
+            The caller's, so its bounds and its failures are the caller's, and
+            this module stays one that never touches a device.
+        tail: The first tail to ask for (at least ``INITIAL_TAIL``).
+        max_bytes: Stop doubling before a tail of about twice the last one's
+            bytes would pass this (:class:`CursorBeyondCapError`).
+
+    Returns:
+        The records after the cursor and its suffix, in logd's order, and the
+        cursor to read on from: the newest system record of the dump with the
+        frames after it -- or, with none among the new records, the same
+        record with the new frames added to its suffix.
+
+    Raises:
+        CursorLostError: The whole buffer does not hold the cursor's record,
+            or a frame of its suffix is not right after it.
+        AmbiguousCursorError: A tail holds the cursor's frame more than once.
+        CursorBeyondCapError: The tail that would hold it would pass ``max_bytes``.
+        LogFramingError: A dump is not whole records.
+    """
+    count = max(INITIAL_TAIL, tail)
+    while True:
+        data = dump(tail_args(count))
+        frames = parse_frames(data)
+        start = _suffix_at(cursor, frames, whole=len(frames) < count)
+        if start is not None:
+            end = start + len(cursor.suffix)
+            if tuple(raw for raw, _record in frames[start:end]) != cursor.suffix:
+                raise CursorLostError(
+                    "the device's log buffer no longer holds every record the read took after "
+                    f"{_named(cursor)}: one is gone, so what was logged after it may have gone "
+                    "with it."
+                )
+            after = frames[end:]
+            placed = _placed(after) or Cursor(
+                cursor.raw, cursor.record, tuple(raw for raw, _record in frames[start:])
+            )
+            return [record for _raw, record in after], placed
+        _cap_check(count, data, max_bytes, "do not reach the record the read continues after")
+        count *= 2
+
+
+def _named(cursor: Cursor) -> str:
+    return (
+        f"the record the read continues from (stamped {cursor.record.sec}.{cursor.record.nsec:09d})"
+    )
+
+
+def _suffix_at(cursor: Cursor, frames: list[tuple[bytes, LogRecord]], whole: bool) -> int | None:
+    """Where ``cursor``'s suffix starts in ``frames``; None when the tail must double."""
+    found = [index for index, (raw, _record) in enumerate(frames) if raw == cursor.raw]
+    if len(found) > 1:
+        raise AmbiguousCursorError(
+            f"the dump holds {_named(cursor)} {len(found)} times, byte for byte, so where the "
+            "read resumes cannot be told."
+        )
+    if not found and whole:
+        raise CursorLostError(
+            f"the device's log buffer no longer holds {_named(cursor)}: it turned over, and what "
+            "was logged after that record may have gone with it."
+        )
+    return found[0] + 1 if found else None
 
 
 def records_text(records: Iterable[LogRecord], tz: tzinfo | None = None) -> str:

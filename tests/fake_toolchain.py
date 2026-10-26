@@ -32,7 +32,10 @@ logcat_crash_buffer). In a recorded threadtime transcript a record is a run of
 lines sharing one header (``-v usec``: to the microsecond), and the buffer's
 separator line before it is printed too; in recorded ``-B`` bytes
 (``stdout``/``buffered`` given as bytes) a record is logd's own frame.
-Everything else ``logcat`` can be asked (``-t``, ``*:W``, ``-b``) is ignored,
+``-t <epoch>`` over recorded records answers only those stamped AFTER it --
+logcat's own reading of an epoch ``-t`` (measured: logcat_stream_marks_records'
+``since_is_strict``), which the live readers' catch-up asks for. Everything
+else ``logcat`` can be asked (a ``MM-DD`` ``-t``, ``*:W``, ``-b``) is ignored,
 which only ever makes the stub answer *more* than a device would.
 
 Replayed text is byte-exact: a carriage return inside a recorded line stays
@@ -45,7 +48,11 @@ not attached waits (recorded: adb_waiting_for_device); ``follows=True`` does
 the same for a following ``logcat`` only (no ``-d``), as a device's live read
 never ends by itself, so its reader has to stop it; and ``once=True``
 answers the first call it matches only, so a device can be there for one
-question and gone for the next. A script that never stops such a stub is
+question and gone for the next. And ``logged=<placeholder>`` stands for logd
+storing what ``adb shell log -t TAG MSG`` wrote: a recorded frame whose message
+is the placeholder is absent from the answer until such a call is in the log,
+then carries that call's tag and message (the latest call's) -- the line the
+script wrote is in the buffer only after it wrote it, where the test put it. A script that never stops such a stub is
 stopped by :meth:`FakeToolchain.run`'s limit, which takes the stub with it.
 
 Every invocation of every stub is appended to a log, so a spec can say both
@@ -145,6 +152,51 @@ def binary_records(data):
         offset = end
     return records
 
+def whole_records(data):
+    # (the whole frames, the bytes after them): a dump cut inside a record --
+    # however few of its bytes arrived -- stays cut when it is filtered.
+    frames, offset = [], 0
+    while offset + 20 <= len(data):
+        length, header = struct.unpack_from("<HH", data, offset)
+        end = offset + header + length
+        if header < 20 or end > len(data):
+            break
+        frames.append(data[offset:end])
+        offset = end
+    return frames, data[offset:]
+
+def logged_lines():
+    # (tag, message) of every `shell log -t TAG MSG` asked of this toolchain, in order.
+    out = []
+    with open(spec["log"], encoding="utf-8") as handle:
+        for line in handle:
+            call = json.loads(line)[1:]
+            at = next((i for i in range(len(call) - 1) if call[i : i + 2] == ["shell", "log"]), None)
+            if at is not None and "-t" in call[at:]:
+                tag = call.index("-t", at)
+                out.append((call[tag + 1], " ".join(call[tag + 2 :])))
+    return out
+
+def with_logged(data, placeholder):
+    # A frame whose message is the placeholder: gone until a `shell log` call is in
+    # the log, then that call's line -- the frame's header, its tag and message.
+    logged = logged_lines()
+    out = b""
+    for _, raw in binary_records(data):
+        header = struct.unpack_from("<H", raw, 2)[0]
+        payload = raw[header:]
+        _tag, _, rest = payload[1:].partition(b"\\0")
+        message, _, trailer = rest.partition(b"\\0")
+        if message != placeholder.encode("utf-8"):
+            out += raw
+            continue
+        if not logged:
+            continue
+        tag, text = logged[-1]
+        body = payload[:1] + tag.encode("utf-8") + b"\\0" + text.encode("utf-8") + b"\\0" + trailer
+        out += struct.pack("<H", len(body)) + raw[2:header] + body
+    return out
+
 def tail_text(data, count):
     items = text_records(data)
     recs = [i for i, (kind, _) in enumerate(items) if kind == "rec"]
@@ -183,6 +235,8 @@ for index, rule in enumerate(spec["rules"]):
     if rule["buffered"]:
         # logcat -T N: the last N RECORDS already buffered, then what follows.
         history = read(rule["buffered"])
+        if rule["logged"]:
+            history = with_logged(history, rule["logged"])
         if tail is not None:
             history = (
                 b"".join(raw for _, raw in binary_records(history)[-int(tail):])
@@ -191,7 +245,11 @@ for index, rule in enumerate(spec["rules"]):
             )
         out = history
     if rule["stdout"]:
-        out += read(rule["stdout"])
+        out += (
+            with_logged(read(rule["stdout"]), rule["logged"])
+            if rule["logged"]
+            else read(rule["stdout"])
+        )
     pid = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("--pid=")), None)
     if rule["filter_pid"] and pid is not None:
         # logcat --pid=N: only the records whose pid is N.
@@ -202,6 +260,14 @@ for index, rule in enumerate(spec["rules"]):
                 line for line in split_lines(out)
                 if len(line.split()) > 2 and line.split()[2] == pid.encode()
             )
+    since = next((argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-t"), None)
+    if binary and since is not None and re.fullmatch(r"\\d+\\.\\d+", since):
+        # logcat -t <epoch>: the records stamped after it, to the nanosecond.
+        # A cut record after them is not filtered away: a cut dump stays cut.
+        seconds, _, fraction = since.partition(".")
+        limit = (int(seconds), int(fraction.ljust(9, "0")[:9]))
+        whole, cut = whole_records(out)
+        out = b"".join(raw for raw in whole if struct.unpack_from("<II", raw, 12) > limit) + cut
     sys.stdout.buffer.write(out)
     sys.stdout.flush()
     if rule["stderr"]:
@@ -255,6 +321,10 @@ class Rule:
     # Answer only the first call it matches; later ones go to the next rule --
     # a device that answers `get-state` once, then is gone.
     once: bool = False
+    # A placeholder message: a recorded frame carrying it stands for the line an
+    # `adb shell log -t TAG MSG` call wrote -- absent from the answer until such
+    # a call is in the log, then that call's tag and message. Binary rules only.
+    logged: str = ""
 
     @property
     def binary(self) -> bool:
@@ -324,6 +394,7 @@ class FakeToolchain:
                     "hang": rule.hang,
                     "follows": rule.follows,
                     "once": rule.once,
+                    "logged": rule.logged,
                 }
                 for rule in rules
             ],
