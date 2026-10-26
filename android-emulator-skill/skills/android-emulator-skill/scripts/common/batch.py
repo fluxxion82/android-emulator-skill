@@ -82,12 +82,16 @@ class Batch:
         key: The item field that names an item ("operation", "avd").
         items: The items, in order.
         stopped: The device error that ended a one-device batch, or None.
+        stopped_at: The index of the item that met it, or None. Recorded when
+            the error is caught: an earlier item may have failed on its own,
+            so "the first failed item" is not where the batch stopped.
     """
 
     noun: str
     key: str
     items: list[dict] = field(default_factory=list)
     stopped: BaseException | None = None
+    stopped_at: int | None = None
 
     @property
     def failed(self) -> int:
@@ -126,6 +130,7 @@ class Batch:
                 self.items.append(item(fields, False, message, remedy=own_remedy))
                 if one_device:
                     self.stopped = error
+                    self.stopped_at = len(self.items) - 1
                     self._not_attempted(steps[index + 1 :], fields, own_remedy)
                     return self
                 continue
@@ -173,13 +178,12 @@ class Batch:
     def _verdict(self) -> tuple[str, str]:
         """The batch's ``error`` and ``remedy``."""
         nouns = f"{self.noun}s"
-        if self.stopped is not None:
+        if self.stopped is not None and self.stopped_at is not None:
             message, remedy = cli.describe(self.stopped)
-            at = next(entry for entry in self.items if not entry["success"])
-            done = self.items.index(at)
+            at = self.items[self.stopped_at]
             return (
-                f"the batch stopped at {self.noun} {at.get(self.key)} ({done} of "
-                f"{len(self.items)} {nouns} done): {message}",
+                f"the batch stopped at {self.noun} {at.get(self.key)} ({self.stopped_at} of "
+                f"{len(self.items)} {nouns} ran before it): {message}",
                 remedy,
             )
         failures = [entry for entry in self.items if not entry["success"]]

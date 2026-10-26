@@ -81,6 +81,21 @@
       "recorded_at": "2026-10-24T18:30:17Z"
     },
     {
+      "name": "adb_uninstall_echo",
+      "file": "adb_uninstall_echo.txt",
+      "command": "adb uninstall '<echo text>'",
+      "description": "app_launcher --uninstall with <echo text> (see pm_grant_permission_echo) as the package, passed as app_launcher passes it: 'Failure [DELETE_FAILED_INTERNAL_ERROR]' on STDOUT, exit 1, stderr empty; the name is not printed back.",
+      "catches": [],
+      "bytes": 39,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 39,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T08:06:16Z"
+    },
+    {
       "name": "adb_version",
       "file": "adb_version.txt",
       "command": "adb version",
@@ -105,6 +120,21 @@
       "agent_text_on": "neither",
       "forged_line_starts_on": [],
       "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
+      "name": "am_force_stop_echo",
+      "file": "am_force_stop_echo.txt",
+      "command": "adb shell am force-stop '<echo text>'",
+      "description": "app_launcher --terminate for a package named by <echo text> (see pm_grant_permission_echo): nothing on either stream, exit 0 -- an unknown package is not an error to force-stop.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 0,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T08:06:16Z"
     },
     {
       "name": "am_start_component_echo",
@@ -154,6 +184,25 @@
       "exit_status": 255,
       "stream": "stdout",
       "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "cmd_notification_post_echo",
+      "file": "cmd_notification_post_echo.txt",
+      "command": "adb shell cmd notification post '-<echo text>' '<echo text>'",
+      "description": "push_notification --post with <echo text> (see pm_grant_permission_echo) as the text and, behind a `-`, as the tag -- the one way its two arguments made `cmd notification post` refuse. The refusal ('Error occurred. Check logcat for details. No argument expected after \"<tag>\"') prints the tag back on STDOUT, exit 0, stderr empty; nothing is posted.",
+      "catches": [],
+      "bytes": 123,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 123,
+      "stderr_bytes": 0,
+      "agent_text_on": [
+        "stdout"
+      ],
+      "forged_line_starts_on": [
+        "stdout"
+      ],
+      "recorded_at": "2026-10-26T08:06:16Z"
     },
     {
       "name": "cmd_statusbar_help",
@@ -813,6 +862,25 @@
       "recorded_at": "2026-10-26T07:16:27Z"
     },
     {
+      "name": "pm_dump_echo",
+      "file": "pm_dump_echo.txt",
+      "command": "adb shell pm dump '<echo text>' | head -n 3",
+      "description": "device_utils.get_package_info's `pm dump` for a package named by <echo text> (see pm_grant_permission_echo): 'Unable to find package: <name>' on STDOUT, exit 0. Only the first three lines are kept, by a device-side `head`: after them `pm dump` dumps every other service's state, which is not this fixture's to publish. The pipe takes stdout only, so stderr's size is pm's own (0).",
+      "catches": [],
+      "bytes": 100,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 100,
+      "stderr_bytes": 0,
+      "agent_text_on": [
+        "stdout"
+      ],
+      "forged_line_starts_on": [
+        "stdout"
+      ],
+      "recorded_at": "2026-10-26T08:06:16Z"
+    },
+    {
       "name": "pm_grant_permission_echo",
       "file": "pm_grant_permission_echo.txt",
       "command": "adb shell pm grant --user 0 com.android.settings 'android.permission.<echo text>'",
@@ -948,6 +1016,21 @@
         "<app>,<system_server>"
       ],
       "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "resolve_activity_echo",
+      "file": "resolve_activity_echo.txt",
+      "command": "adb shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER '<echo text>'",
+      "description": "app_launcher's launcher-activity lookup for a package named by <echo text> (see pm_grant_permission_echo): 'No activity found' on STDOUT, exit 0; the name is not printed back.",
+      "catches": [],
+      "bytes": 18,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 18,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T08:06:16Z"
     },
     {
       "name": "run_as_cat_fixture_db",

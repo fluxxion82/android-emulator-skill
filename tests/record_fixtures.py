@@ -5398,6 +5398,125 @@ FIXTURES: list[Fixture] = [
         post=_requires("NullPointerException"),
     ),
     Fixture(
+        name="am_force_stop_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "am", "force-stop", shlex.quote(ECHO_TEXT)],
+        command="adb shell am force-stop '<echo text>'",
+        description=(
+            "app_launcher --terminate for a package named by <echo text> (see "
+            "pm_grant_permission_echo): nothing on either stream, exit 0 -- an unknown "
+            "package is not an error to force-stop."
+        ),
+        capture_with=_echo_capture(["shell", "am", "force-stop", shlex.quote(ECHO_TEXT)], on=()),
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="adb_uninstall_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["uninstall", ECHO_TEXT],
+        command="adb uninstall '<echo text>'",
+        description=(
+            "app_launcher --uninstall with <echo text> (see pm_grant_permission_echo) as the "
+            "package, passed as app_launcher passes it: 'Failure "
+            "[DELETE_FAILED_INTERNAL_ERROR]' on STDOUT, exit 1, stderr empty; the name is "
+            "not printed back."
+        ),
+        capture_with=_echo_capture(["uninstall", ECHO_TEXT], on=()),
+        post=_requires("DELETE_FAILED"),
+    ),
+    Fixture(
+        name="resolve_activity_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            shlex.quote(ECHO_TEXT),
+        ],
+        command=(
+            "adb shell cmd package resolve-activity --brief -c "
+            "android.intent.category.LAUNCHER '<echo text>'"
+        ),
+        description=(
+            "app_launcher's launcher-activity lookup for a package named by <echo text> "
+            "(see pm_grant_permission_echo): 'No activity found' on STDOUT, exit 0; the "
+            "name is not printed back."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-c",
+                "android.intent.category.LAUNCHER",
+                shlex.quote(ECHO_TEXT),
+            ],
+            on=(),
+        ),
+        post=_requires("No activity found"),
+    ),
+    Fixture(
+        name="pm_dump_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "pm", "dump", shlex.quote(ECHO_TEXT), "|", "head", "-n", "3"],
+        command="adb shell pm dump '<echo text>' | head -n 3",
+        description=(
+            "device_utils.get_package_info's `pm dump` for a package named by <echo text> "
+            "(see pm_grant_permission_echo): 'Unable to find package: <name>' on STDOUT, "
+            "exit 0. Only the first three lines are kept, by a device-side `head`: after "
+            "them `pm dump` dumps every other service's state, which is not this fixture's "
+            "to publish. The pipe takes stdout only, so stderr's size is pm's own (0)."
+        ),
+        capture_with=_echo_capture(
+            ["shell", "pm", "dump", shlex.quote(ECHO_TEXT), "|", "head", "-n", "3"],
+            on=("stdout",),
+        ),
+        post=_requires("Unable to find package", ECHO_FORGED),
+    ),
+    Fixture(
+        name="cmd_notification_post_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "cmd",
+            "notification",
+            "post",
+            shlex.quote(f"-{ECHO_TEXT}"),
+            shlex.quote(ECHO_TEXT),
+        ],
+        command="adb shell cmd notification post '-<echo text>' '<echo text>'",
+        description=(
+            "push_notification --post with <echo text> (see pm_grant_permission_echo) as "
+            "the text and, behind a `-`, as the tag -- the one way its two arguments made "
+            "`cmd notification post` refuse. The refusal ('Error occurred. Check logcat for "
+            'details. No argument expected after "<tag>"\') prints the tag back on STDOUT, '
+            "exit 0, stderr empty; nothing is posted."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "cmd",
+                "notification",
+                "post",
+                shlex.quote(f"-{ECHO_TEXT}"),
+                shlex.quote(ECHO_TEXT),
+            ],
+            on=("stdout",),
+        ),
+        post=_requires("Error occurred", ECHO_FORGED),
+    ),
+    Fixture(
         name="dumpsys_package_permissions",
         args=["shell", "dumpsys", "package", "com.google.android.deskclock"],
         description=(

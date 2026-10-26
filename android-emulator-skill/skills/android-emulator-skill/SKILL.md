@@ -1892,10 +1892,15 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     read as adb's own, and ask `run_adb` for the same confirmation:
     `privacy_manager`'s `pm grant` / `pm revoke` (an unknown permission's
     name), `appearance --locale` (`setprop` names the value it refused) and
-    `app_launcher --install` (adb's own `adb: failed to stat <path>`). The
-    rest were recorded too (`tests/record_fixtures.py`, the `*_echo`
-    fixtures): their text comes back on stdout, or not at all, and is never
-    classified. The probe cannot tell such an echo from a real loss followed
+    `app_launcher --install` (adb's own `adb: failed to stat <path>`). These
+    were recorded alongside them (`tests/record_fixtures.py`, the `*_echo`
+    fixtures), and their text comes back on stdout, or not at all, so it is
+    never classified: `privacy_manager`'s `dumpsys package`; `app_launcher`'s
+    launch, `--open-url`, `--terminate`, `--uninstall` and launcher lookup;
+    `device_utils`' `pm dump` and package-uid lookup; `pidof` (`log_monitor`'s
+    stream path, `app_state_capture`, `app_launcher --state`) and
+    `app_state_capture`'s version probe; `status_bar --mobile-type`;
+    `keyboard` / `navigator` `input text`; and `push_notification --post`. The probe cannot tell such an echo from a real loss followed
     by a recovery before it, so a caller whose stderr is adb's alone does not
     ask.
 - Instrumented tests are not a feature. Nothing here drives

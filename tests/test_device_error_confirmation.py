@@ -8,10 +8,16 @@ text an agent handed it can print a line that reads as adb's, and the script
 reports the device unavailable (exit 3) while it answers.
 
 Which callers do that was recorded, not guessed: ``tests/record_fixtures.py``'s
-``*_echo`` fixtures (profile emulator-api33) run each ``run_adb`` caller whose
-argv carries agent text with that text holding a newline and a forged
-``adb: device 'aes-spoof' not found`` line, and the manifest says which stream
-brought it back. Three print it back on stderr where the classifier reads it:
+17 ``*_echo`` fixtures (profile emulator-api33) run the recorded callers --
+privacy_manager's pm grant/revoke and dumpsys package; app_launcher's install,
+launch, open-url, force-stop, uninstall and launcher lookup; device_utils' pm
+dump and package-uid lookup; pidof (log_monitor's stream path, app_state_capture,
+app_launcher --state) and app_state_capture's version probe; appearance's
+setprop; status_bar's demo broadcast; keyboard/navigator's input text; and
+push_notification's post -- with the agent text holding a newline and a
+forged ``adb: device 'aes-spoof' not found`` line, and the manifest says which
+stream brought it back. Three print it back on stderr where the classifier
+reads it:
 
 - ``pm grant`` / ``pm revoke`` (privacy_manager): ``Unknown permission: <name>``
   (pm_grant_permission_echo, pm_revoke_permission_echo);
@@ -150,6 +156,35 @@ def test_the_recordings_carry_the_forged_line_where_the_classifier_reads_it():
             assert "not found" in lines[0] and "device" in lines[0], lines
         else:
             assert any(line.startswith(rf.ECHO_FORGED) for line in lines), (caller, lines)
+
+
+# The recordings whose agent text came back on stderr: exactly the opted-in calls.
+OPTED_IN = frozenset(
+    {
+        "pm_grant_permission_echo",
+        "pm_revoke_permission_echo",
+        "setprop_locale_echo",
+        "adb_install_missing_apk_echo",
+    }
+)
+
+
+def test_only_the_opted_in_recordings_carry_agent_text_on_stderr():
+    """Every ``*_echo`` recording says where its text went; stderr means opt in.
+
+    The others came back on stdout, or not at all, so run_adb never classifies
+    them; a new recording that lands on stderr fails here until its caller
+    opts in (and gets a spec above).
+    """
+    echoes = {
+        entry["name"]: entry
+        for entry in API33.manifest["fixtures"]
+        if entry["name"].endswith("_echo")
+    }
+    assert len(echoes) == 17, sorted(echoes)
+    on_stderr = {name for name, entry in echoes.items() if "stderr" in entry["agent_text_on"]}
+    assert on_stderr == OPTED_IN, sorted(on_stderr ^ OPTED_IN)
+    assert {caller.fixture for caller in CALLERS} == OPTED_IN
 
 
 @pytest.mark.parametrize("caller", CALLERS, ids=lambda c: f"{c.script} {c.argv[0]}")

@@ -1320,8 +1320,92 @@ def test_a_batch_that_succeeded_is_success_and_items_at_exit_0(tmp_path):
     assert item["error"] is None and item["remedy"] is None, item
 
 
+def test_a_device_lost_after_an_item_failed_is_named_where_it_stopped(tmp_path):
+    """Battery fails its own check, then the device goes during Wi-Fi.
+
+    The top-level error must name the item that met the device error (wifi),
+    not the first failed one (battery, which ran and failed on its own), and
+    count the items that ran before it (1 of 3).
+    """
+    case = next(case for case in BATCH_CASES if case.ident == "status_bar device gone")
+    argv = ("--battery", "150", "--wifi", "--time", "9:41", "--serial", _single_serial())
+    result = case.run(tmp_path, (*argv, "--json"))
+    shown = f"\nstdout: {result.stdout[-1200:]!r}\nstderr: {result.stderr[-400:]!r}"
+    assert result.returncode == DEVICE_UNAVAILABLE, shown
+    payload = json.loads(result.stdout)
+    assert [item["success"] for item in payload["items"]] == [False, False, False], shown
+    assert "not attempted" in payload["items"][2]["error"], shown
+    assert "stopped at operation wifi" in payload["error"], shown
+    assert "1 of 3" in payload["error"], shown
+
+
+def _uses_the_batch_runner(source: str) -> bool:
+    """Whether a script reports through common.batch, read from its AST.
+
+    An import of ``common.batch`` (or anything from it), or a reference to
+    ``BatchFailure`` -- the two ways a script can produce the batch shape.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module == "common.batch":
+            return True
+        if isinstance(node, ast.ImportFrom) and node.module == "common":
+            if any(alias.name == "batch" for alias in node.names):
+                return True
+        if isinstance(node, ast.Import) and any(a.name == "common.batch" for a in node.names):
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "BatchFailure":
+            return True
+        if isinstance(node, ast.Name) and node.id == "BatchFailure":
+            return True
+    return False
+
+
+def _batch_scripts() -> set[str]:
+    """Every script that uses the batch runner, discovered from the code."""
+    return {
+        script
+        for script in _python_scripts()
+        if _uses_the_batch_runner((SCRIPTS / script).read_text(encoding="utf-8"))
+    }
+
+
+def _uncovered(scripts: set[str], cases) -> dict[str, list[str]]:
+    """Batch scripts missing a one-failed or an all-failed case."""
+    one = {case.script for case in cases if 0 < len(case.failed) < case.planned}
+    every = {case.script for case in cases if len(case.failed) == case.planned}
+    missing: dict[str, list[str]] = {}
+    for script in sorted(scripts):
+        lacking = [
+            name
+            for name, have in (("one failed", one), ("all failed", every))
+            if script not in have
+        ]
+        if lacking:
+            missing[script] = lacking
+    return missing
+
+
 def test_every_batch_script_has_a_one_failed_case_and_an_all_failed_case():
-    one = {case.script for case in BATCH_CASES if 0 < len(case.failed) < case.planned}
-    every = {case.script for case in BATCH_CASES if len(case.failed) == case.planned}
-    assert one == set(BATCH_SCRIPTS), sorted(set(BATCH_SCRIPTS) ^ one)
-    assert every == set(BATCH_SCRIPTS), sorted(set(BATCH_SCRIPTS) ^ every)
+    """Read off the scripts: a new user of common.batch must get its cases here."""
+    found = _batch_scripts()
+    assert found == set(BATCH_SCRIPTS), (
+        f"batch users found in the code {sorted(found)} differ from BATCH_SCRIPTS "
+        f"{sorted(BATCH_SCRIPTS)}"
+    )
+    assert not _uncovered(found, BATCH_CASES), _uncovered(found, BATCH_CASES)
+
+
+def test_the_batch_guard_catches_a_new_batch_script_with_no_cases():
+    """Anti-vacuity: the discovery sees each import form, and a script without cases fails."""
+    for source in (
+        "from common.batch import Batch\n",
+        "from common import batch\n",
+        "import common.batch\n",
+        "from common import cli\nraise cli.BatchFailure('e', 'r')\n",
+    ):
+        assert _uses_the_batch_runner(source), source
+    assert not _uses_the_batch_runner("from common import cli\ncli.fail('e', 'r')\n")
+    assert _uncovered({"new_batch.py"}, BATCH_CASES) == {
+        "new_batch.py": ["one failed", "all failed"]
+    }
+    assert "status_bar.py" not in _uncovered({"status_bar.py"}, BATCH_CASES)

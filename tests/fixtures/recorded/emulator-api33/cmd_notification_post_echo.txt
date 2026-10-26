@@ -1,0 +1,2 @@
+Error occurred. Check logcat for details. No argument expected after "-com.example.echo
+adb: device 'aes-spoof' not found"
