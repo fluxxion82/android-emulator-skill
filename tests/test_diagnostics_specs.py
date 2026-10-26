@@ -925,6 +925,9 @@ def test_x6_a_device_that_is_not_there_is_not_a_quiet_watch(
             # and gone after, as adb answers the same question once logcat has
             # failed (#32: a device verdict is confirmed by `get-state`).
             Rule(("get-state",), stdout=recorded.text("adb_get_state"), once=True),
+            # The API level a live read asks first, answered (the recorded
+            # API 35 emulator's): the read under test is logcat's.
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule((), stderr=recorded_anywhere("adb_shell_device_not_found"), exit=1),
         ],
     )

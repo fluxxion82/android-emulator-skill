@@ -57,8 +57,9 @@ For a reader adopting it, two rules:
 
 On Android 13 (API 33) a live ``-B`` stream holds records back and loses them
 when it is stopped, so a live read there is made of dumps that each continue
-from a cursor: :func:`read_after` (log_monitor's live read on that level; the
-ANR readers are meant to adopt it next). Like every logd reader, stream or
+from a cursor: :func:`read_after` (the live read on that level of log_monitor
+and of anr_watcher's --watch and session worker, made by common.dump_read,
+which runs the dumps). Like every logd reader, stream or
 dump, it reads what logd DELIVERED: logd may drop records it prunes while a
 reader is behind, and nothing a reader does can certify a window complete.
 

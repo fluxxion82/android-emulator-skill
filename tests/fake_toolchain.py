@@ -567,6 +567,28 @@ def recorded_ps_answer(recorded, pid: str) -> str:
     )
 
 
+# The real Popen, kept before any spec replaces it.
+_REAL_POPEN = subprocess.Popen
+
+
+def answering_the_api_level(fake, level: str):
+    """``fake`` as ``subprocess.Popen``, but for the API level a live read asks first.
+
+    `adb shell getprop ro.build.version.sdk` is answered by a real child printing
+    ``level`` -- recorded text (getprop_sdk) -- so ``subprocess.run``, which
+    ``run_adb`` is built on, reads it as it reads adb; every other command goes
+    to ``fake``. For a spec that replaces Popen to stand in for `adb logcat`.
+    """
+
+    def popen(cmd, *args, **kwargs):
+        if list(cmd[-2:]) == ["getprop", "ro.build.version.sdk"]:
+            script = "import sys; sys.stdout.write(sys.argv[1])"
+            return _REAL_POPEN([sys.executable, "-c", script, level], *args, **kwargs)
+        return fake(cmd, *args, **kwargs)
+
+    return popen
+
+
 def uid_rules(recorded, package: str, pid: str | None) -> list[Rule]:
     """The package's uid, and -- when ``pid`` is given -- that pid's, as the package's."""
     rules = [Rule(("cmd", "package"), stdout=recorded_package_listing(recorded, package))]
