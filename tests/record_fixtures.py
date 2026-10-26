@@ -2979,9 +2979,20 @@ def _stream_scenario(
 
 
 def _stream_fixtures(
-    name: str, description: str, *, marks: int = 0, padding: int = 0
+    name: str,
+    description: str,
+    *,
+    marks: int = 0,
+    padding: int = 0,
+    capture: Callable[[str, dict], bytes] | None = None,
+    command: str | None = None,
 ) -> list[Fixture]:
-    """One stream scenario's three fixtures, recorded together (``_stream_scenario``)."""
+    """One stream scenario's three fixtures, recorded together (``_stream_scenario``).
+
+    ``capture`` and ``command`` replace the scenario's own, for one that
+    provokes something inside the stream (``_jank_scenario``); it stashes the
+    same two twins.
+    """
     together = f"recorded in {name}_records' run"
     halves = (
         (
@@ -3006,12 +3017,13 @@ def _stream_fixtures(
             emulator_only=True,
             ext="bin",
             args=[],
-            command=(
+            command=command
+            or (
                 f"adb -s <serial> logcat -B -T 1, stopped by the recorder after "
                 f"{_STREAM_SECONDS} s" + (f", {marks} marks logged into it" if marks else "")
             ),
             description=description,
-            capture_bytes=_stream_scenario(name, marks=marks, padding=padding),
+            capture_bytes=capture or _stream_scenario(name, marks=marks, padding=padding),
         ),
         *(
             Fixture(
@@ -3054,6 +3066,213 @@ def _tail_records(serial: str, extra: dict) -> bytes:
         "records": len(kept),
     }
     return b"".join(kept)
+
+
+# --- v0.9.0 slice 2: an app's own event inside a live read on API 33 ----------
+#
+# anr_watcher's live reads -- `--watch` and the session worker -- streamed
+# `logcat -B -T 1` and stopped it by terminating it. On API 33 that stream holds
+# records back in a 4 KiB stdio buffer (logcat_stream_*), and the loss measured
+# was an app's own event: a Choreographer jank logged 2 s into a 4.5 s session
+# was not in its summary. This scenario records the case with a real jank: the
+# fixture app cold-started inside a live stream until Choreographer logs a skip
+# of at least anr_watcher's default threshold, the stream stopped a moment
+# later, and the window read back in dump mode.
+#
+# Kept: what logcat_stream_* keeps (a uid below 10000, private package names
+# aliased) and the fixture app's own records, by its uid -- the repo's own app,
+# whose records are ours to publish. Every other app's records are left out.
+
+_COMPOSE_COLD_START = ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"]
+_COMPOSE_FORCE_STOP = ["shell", "am", "force-stop", COMPOSE_PACKAGE]
+# anr_watcher's DEFAULT_MIN_FRAMES: a skip below it is dropped, not an event.
+_JANK_FRAMES = 30
+_JANK_COLD_STARTS = 6
+# How long each cold start is watched for its skip, and how often.
+_JANK_WAIT_S = 4.0
+_JANK_POLL_S = 0.05
+_SKIPPED_FRAMES = re.compile(r"Skipped (\d+) frames!")
+# What a stopped stream can still hold back: logcat's stdio buffer on API 33.
+_STDIO_BLOCK = 4096
+
+
+def _compose_uid(serial: str) -> tuple[int, Capture]:
+    """The fixture app's uid, from `cmd package list packages -U` (and that answer)."""
+    listing = _run(
+        ["shell", "cmd", "package", "list", "packages", "-U", COMPOSE_PACKAGE], serial, timeout=15
+    )
+    found = re.search(
+        rf"^package:{re.escape(COMPOSE_PACKAGE)} uid:(\d+)\s*$", listing.text, re.MULTILINE
+    )
+    if found is None:
+        raise CaptureError(
+            f"no uid listing for {COMPOSE_PACKAGE}: {listing.text.strip()!r}. Install the "
+            "fixture app (cd tests/fixtures/scaffold/compose && gradle :app:installDebug)."
+        )
+    return int(found.group(1)), listing
+
+
+def _records_since(serial: str, opened: bytes) -> list[bytes]:
+    """Every record after ``opened`` still in the buffer: the window read back in dump mode."""
+    data = _run_bytes(
+        ["logcat", "-d", "-B", "-t", _epoch_before(opened)], serial, timeout=60, allow_empty=True
+    )
+    window = [raw for _pid, raw in _split_records(data)]
+    if opened not in window:
+        raise CaptureError("the window read back does not hold the open record")
+    return window[len(window) - window[::-1].index(opened) :]
+
+
+def _skips(records: list[bytes], uid: int) -> list[tuple[bytes, int]]:
+    """``(record, frames skipped)`` for every Choreographer skip the app's uid wrote."""
+    found = []
+    for raw in records:
+        if _record_uid(raw) != uid:
+            continue
+        tag, message = _tag_and_message(raw)
+        skipped = _SKIPPED_FRAMES.match(message) if tag == "Choreographer" else None
+        if skipped:
+            found.append((raw, int(skipped.group(1))))
+    return found
+
+
+def _cold_start_until_jank(serial: str, uid: int, opened: bytes, extra: dict) -> bytes:
+    """Cold-start the fixture app until Choreographer logs a skip of ``_JANK_FRAMES`` or more.
+
+    A cold start janks when the emulator is busy enough, which is not fixed:
+    on the API 33 emulator two of three cold starts skipped 32 and 37 frames.
+    Each start is watched for ``_JANK_WAIT_S``; every skip it logged, big or
+    small, stays in the window as logged.
+    """
+    skipped: list[int] = []
+    for attempt in range(1, _JANK_COLD_STARTS + 1):
+        _run(_COMPOSE_FORCE_STOP, serial, timeout=15)
+        launched = _run(_COMPOSE_COLD_START, serial, timeout=30)
+        if launched.returncode != 0:
+            raise CaptureError(f"`am start` exited {launched.returncode}: {launched.text[:200]!r}")
+        deadline = time.monotonic() + _JANK_WAIT_S
+        while True:
+            skips = _skips(_records_since(serial, opened), uid)
+            jank = next((raw for raw, frames in skips if frames >= _JANK_FRAMES), None)
+            if jank is not None or time.monotonic() > deadline:
+                break
+            time.sleep(_JANK_POLL_S)
+        skipped = [frames for _raw, frames in skips]
+        if jank is not None:
+            extra["cold_starts"] = attempt
+            extra["skips_in_window"] = skipped
+            return jank
+    raise CaptureError(
+        f"no Choreographer skip of {_JANK_FRAMES} frames or more in {_JANK_COLD_STARTS} cold "
+        f"starts (skips seen: {skipped}); the emulator was not busy enough -- record again"
+    )
+
+
+def _jank_scenario(name: str) -> Callable[[str, dict], bytes]:
+    """``<name>_records``' ``capture_bytes``: a live stream with the app's jank in it.
+
+    The recorder logs its open mark, starts ``logcat -B -T 1``, cold-starts the
+    fixture app until it janks (``_cold_start_until_jank``), and stops the
+    stream as soon as it sees the jank in the buffer -- a reader stopped then,
+    as `--stop` or a `--duration` stops one -- and logs its close mark right
+    after. The twins are the open record and the window read back in dump
+    mode, as logcat_stream_*'s.
+
+    Refused when the stream delivered the jank: logcat's buffer then filled
+    after it, and the capture does not record the case it exists for. Record
+    again.
+    """
+
+    def capture(serial: str, extra: dict) -> bytes:
+        run = os.urandom(4).hex()
+        uid, listing = _compose_uid(serial)
+        _run(_COMPOSE_FORCE_STOP, serial, timeout=15)
+        opened = _newest_record(serial, mark=f"stream-open-{run}")
+        tap = _StreamTap(serial, _STREAM_ARGV)
+        app: dict = {}
+        try:
+            time.sleep(0.5)
+            jank = _cold_start_until_jank(serial, uid, opened, app)
+        finally:
+            stopped_at = tap.elapsed()
+            exit_status = tap.stop()
+        try:
+            closed = _newest_record(serial, mark=f"stream-close-{run}")
+        finally:
+            _run(_COMPOSE_FORCE_STOP, serial, timeout=15)
+        after = _records_since(serial, opened)
+        window = [opened, *after]
+        delivered = b"".join(chunk for _at, chunk in tap.chunks)
+        complete, trailing = _complete_records(delivered)
+        end = _record_time(closed)
+        through_close = [raw for raw in after if _record_time(raw) <= end]
+        streamed = set(complete)
+        from_jank = through_close[through_close.index(jank) :]
+        extra["stream"] = {
+            "argv": ["adb", "-s", "<serial>", *_STREAM_ARGV],
+            "stopped_after_s": round(stopped_at, 3),
+            "exit_status_after_terminate": exit_status,
+            "bytes_delivered": len(delivered),
+            "chunks_at_s_and_bytes": [[round(at, 3), len(chunk)] for at, chunk in tap.chunks],
+            "complete_records_delivered": len(complete),
+            "cut_record_bytes": len(trailing),
+        }
+        extra["window"] = {
+            "argv": ["adb", "-s", "<serial>", "logcat", "-d", "-B", "-t", "<open's epoch - 1 ns>"],
+            "open_epoch": _epoch(opened),
+            "close_epoch": _epoch(closed),
+            "open_record_at": 0,
+            "records_after_open": len(after),
+            "records_through_close": len(through_close),
+            "of_them_delivered_by_the_stream": sum(raw in streamed for raw in through_close),
+            "bytes_through_close": sum(len(raw) for raw in through_close),
+        }
+        frames = _skips([jank], uid)[0][1]
+        extra["jank"] = {
+            "frames": frames,
+            "uid": uid,
+            "pid": struct.unpack_from("<i", jank, 4)[0],
+            "delivered_by_the_stream": jank in streamed,
+            "bytes_from_it_through_close": sum(len(raw) for raw in from_jank),
+            "stdio_block_bytes": _STDIO_BLOCK,
+        }
+        extra["app"] = {
+            "package": COMPOSE_PACKAGE,
+            "package_uid_listing": {
+                "command": f"adb shell cmd package list packages -U {COMPOSE_PACKAGE}",
+                "exit_status": listing.returncode,
+                "output": _strip_cr(listing.text),
+            },
+            **app,
+        }
+        extra.update(_system_server_pid(serial))
+        extra.update(_device_zone(serial))
+        if jank in streamed:
+            raise CaptureError(
+                "the stream delivered the jank (logcat's buffer filled after it), so this "
+                "capture does not record a reader losing it; record again"
+            )
+
+        def kept(raw: bytes) -> bool:
+            return _publishable(raw) or _record_uid(raw) == uid
+
+        stream_kept = [_aliased_record(raw) for raw in complete if kept(raw)]
+        window_kept = [_aliased_record(raw) for raw in window if kept(raw)]
+        extra["kept"] = {
+            "rule": (
+                f"records whose uid is below {_FIRST_APP_UID}, and the fixture app's "
+                f"(uid {uid}); private package names aliased"
+            ),
+            "stream_records": len(stream_kept),
+            "cut_record_kept": False,
+            "window_records": len(window_kept),
+        }
+        provenance = {"first_half": f"{name}_records", "run": run}
+        _stash_twin(f"{name}_open_records", _aliased_record(opened), provenance)
+        _stash_twin(f"{name}_window_records", b"".join(window_kept), provenance)
+        return b"".join(stream_kept)
+
+    return capture
 
 
 # --- v0.9.0 Inc 0: ground truth for uid ownership, users and adb states -------
@@ -5026,6 +5245,38 @@ FIXTURES: list[Fixture] = [
         ),
         marks=6,
         padding=900,
+    ),
+    *_stream_fixtures(
+        "logcat_stream_jank",
+        (
+            "A real jank inside a live `logcat -B -T 1`: the fixture app cold-started in it "
+            "until Choreographer logged a skip of 30 frames or more (anr_watcher's default "
+            "threshold), the stream stopped as soon as the recorder saw it in the buffer. On API "
+            "33 the stream withholds it -- what followed it did not fill logcat's 4 KiB stdio "
+            "buffer -- and the window read back in dump mode holds it, so a reader stopped "
+            "then (`anr_watcher --watch`'s deadline, a session's `--stop`) loses the app's "
+            "event. Kept: records a uid below 10000 wrote and the fixture app's own, by its "
+            "uid. Manifest: `jank` (its frames, uid, pid, when, whether the stream delivered "
+            "it, and the bytes from it to the close), `app` (its uid listing and how many cold "
+            "starts it took), `system_server_pid`, `timezone`."
+        ),
+        capture=_jank_scenario("logcat_stream_jank"),
+        command=(
+            "adb -s <serial> logcat -B -T 1, the fixture app cold-started in it until "
+            "Choreographer skips 30 frames or more, stopped by the recorder then"
+        ),
+    ),
+    Fixture(
+        name="boot_id",
+        args=["shell", "cat", "/proc/sys/kernel/random/boot_id"],
+        description=(
+            "The kernel's id for the boot the device is in: a random UUID it makes at boot "
+            "(`/proc/sys/kernel/random/boot_id`), readable by the shell. `ro.boot.bootreason` "
+            "is no id -- it names why the device last booted (`reboot,shell`), the same "
+            "words every time. anr_watcher's session worker on API 33 ties the read cursor "
+            "it persists to the device's serial and this id, so a read resumed after a "
+            "reboot is refused rather than placed in another boot's log."
+        ),
     ),
     Fixture(
         name="pm_grant_not_changeable",

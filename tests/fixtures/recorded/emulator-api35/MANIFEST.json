@@ -289,6 +289,18 @@
       "bytes": 8184
     },
     {
+      "name": "boot_id",
+      "file": "boot_id.txt",
+      "command": "adb shell cat /proc/sys/kernel/random/boot_id",
+      "description": "The kernel's id for the boot the device is in: a random UUID it makes at boot (`/proc/sys/kernel/random/boot_id`), readable by the shell. `ro.boot.bootreason` is no id -- it names why the device last booted (`reboot,shell`), the same words every time. anr_watcher's session worker on API 33 ties the read cursor it persists to the device's serial and this id, so a read resumed after a reboot is refused rather than placed in another boot's log.",
+      "catches": [],
+      "bytes": 37,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-26T05:53:09Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
       "name": "cmd_notification_help",
       "file": "cmd_notification_help.txt",
       "command": "adb shell cmd notification",
