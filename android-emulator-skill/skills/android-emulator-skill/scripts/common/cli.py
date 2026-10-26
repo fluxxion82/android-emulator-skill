@@ -63,8 +63,11 @@ is not always a usage error, and ``1`` is not always a failure.
 
 Where a device error deliberately does NOT reach this boundary
 ----------------------------------------------------------------
-A single-target operation lets ``adb_exec.DeviceError`` through; a batch (an
-``--all`` loop) decides at the loop whether to go on. These six catch it on
+A single-target operation lets ``adb_exec.DeviceError`` through; a batch
+decides at the loop whether to go on, in :mod:`common.batch`: a one-device
+batch stops there and is reported with its items (:class:`BatchFailure`, exit
+3 for an unavailable device), a batch over several emulators records that
+item's failure and goes on. Besides the batch runner, these six catch it on
 purpose and are the only ones that may:
 
 - ``emulator_boot.EmulatorBooter._is_boot_completed`` -- polls a booting
@@ -135,6 +138,31 @@ class Failure(Exception):  # noqa: N818 -- reads as `cli.Failure` at the call si
         self.details = dict(details or {})
 
 
+class BatchFailure(Failure):
+    """A batch in which an item failed: the refusal object, carrying every item.
+
+    Raised by :meth:`common.batch.Batch.finish`, reported by :func:`run` like
+    any :class:`Failure` -- ``success`` / ``error`` / ``remedy`` first, then the
+    batch's own keys and ``items`` -- at :attr:`exit_status`.
+
+    Attributes:
+        exit_status: 1 when items failed and the batch ran to its end; the
+            stopping device error's own status (3 for an unavailable device)
+            when one ended it.
+    """
+
+    def __init__(
+        self,
+        error: str,
+        remedy: str,
+        details: Mapping[str, object] | None = None,
+        *,
+        exit_status: int = EXIT_FAILURE,
+    ):
+        super().__init__(error, remedy, details)
+        self.exit_status = exit_status
+
+
 def fail(error: str, remedy: str, *, details: Mapping[str, object] | None = None) -> NoReturn:
     """Raise a failure the script detected itself, for :func:`run` to report (exit 1).
 
@@ -174,6 +202,8 @@ TYPED_FAMILY: tuple[type[BaseException], ...] = (
 # RuntimeErrors that are never an expected failure: something in the skill is
 # wrong, and saying so -- with the traceback -- is the honest report.
 _DEFECTS: tuple[type[BaseException], ...] = (NotImplementedError, RecursionError)
+# Public for common.batch, whose per-item catch must let these through too.
+DEFECTS = _DEFECTS
 
 # The device the command needed is not available. A separate exit status
 # because the agent's next move differs: boot, reconnect or re-select a device,
@@ -330,7 +360,12 @@ def _neutralize(stream) -> None:
 
 
 def exit_code_for(error: BaseException) -> int:
-    """The exit status for a typed failure: 3 when the device is unavailable, else 1."""
+    """The exit status for a typed failure: 3 when the device is unavailable, else 1.
+
+    A :class:`BatchFailure` carries its own: the stopping device error's, or 1.
+    """
+    if isinstance(error, BatchFailure):
+        return error.exit_status
     return EXIT_DEVICE_UNAVAILABLE if isinstance(error, DEVICE_UNAVAILABLE) else EXIT_FAILURE
 
 

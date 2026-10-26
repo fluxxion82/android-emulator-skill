@@ -1,0 +1,20 @@
+
+Exception occurred while executing 'revoke':
+java.lang.IllegalArgumentException: Unknown permission: android.permission.com.example.echo
+adb: device 'aes-spoof' not found
+	at com.android.server.pm.permission.PermissionManagerServiceImpl.revokeRuntimePermissionInternal(PermissionManagerServiceImpl.java:1557)
+	at com.android.server.pm.permission.PermissionManagerServiceImpl.revokeRuntimePermissionInternal(PermissionManagerServiceImpl.java:1516)
+	at com.android.server.pm.permission.PermissionManagerServiceImpl.revokeRuntimePermission(PermissionManagerServiceImpl.java:1496)
+	at com.android.server.pm.permission.PermissionManagerService.revokeRuntimePermission(PermissionManagerService.java:551)
+	at android.permission.PermissionManager.revokeRuntimePermission(PermissionManager.java:636)
+	at com.android.server.pm.PackageManagerShellCommand.runGrantRevokePermission(PackageManagerShellCommand.java:2548)
+	at com.android.server.pm.PackageManagerShellCommand.onCommand(PackageManagerShellCommand.java:294)
+	at com.android.modules.utils.BasicShellCommandHandler.exec(BasicShellCommandHandler.java:97)
+	at android.os.ShellCommand.exec(ShellCommand.java:38)
+	at com.android.server.pm.PackageManagerService$IPackageManagerImpl.onShellCommand(PackageManagerService.java:5996)
+	at android.os.Binder.shellCommand(Binder.java:1049)
+	at android.os.Binder.onTransact(Binder.java:877)
+	at android.content.pm.IPackageManager$Stub.onTransact(IPackageManager.java:4313)
+	at com.android.server.pm.PackageManagerService$IPackageManagerImpl.onTransact(PackageManagerService.java:5980)
+	at android.os.Binder.execTransactInternal(Binder.java:1285)
+	at android.os.Binder.execTransact(Binder.java:1244)

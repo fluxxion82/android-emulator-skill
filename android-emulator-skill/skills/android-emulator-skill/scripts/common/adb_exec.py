@@ -351,8 +351,8 @@ def _confirm_device_error(error: AdbError, serial: str | None) -> AdbError | Non
     shows that the original failure belongs to the remote command. Every other
     outcome retains the original, more specific verdict and remedy.
 
-    Only for a caller whose stderr can carry such a field (``run_argv``'s
-    ``confirm_device_errors``): on any other, a probe answering ``device``
+    Only for a caller whose stderr can carry such a field (``run_adb``'s and
+    ``run_argv``'s ``confirm_device_errors``): on any other, a probe answering ``device``
     after a real device error only hides it.
     """
     try:
@@ -369,6 +369,7 @@ def run_adb(
     timeout: int | None = None,
     check: bool = False,
     raw_text: bool = False,
+    confirm_device_errors: bool = False,
 ) -> AdbResult:
     """Run one adb command, bounded, with typed errors.
 
@@ -383,6 +384,16 @@ def run_adb(
             frames lines with ``\\n`` only and leaves an app's ``\\r`` raw, so
             in text mode an app could start a forged "line" mid-message
             (security review of #27). Split such output on ``\\n`` only.
+        confirm_device_errors: Put a device error to one ``adb get-state``
+            before raising it, and drop it when the device answers ``device``
+            (as :func:`run_argv`'s). Only for a call whose stderr prints the
+            text an agent passed back -- recorded, per caller, by the
+            ``*_echo`` fixtures: ``pm grant`` / ``pm revoke`` (``Unknown
+            permission: <name>``), ``setprop`` (``Failed to set property ... to
+            '<value>'``) and ``adb install`` (adb's own ``adb: failed to stat
+            <path>``). The probe cannot tell that echo from a real loss
+            followed by a recovery before it, so a call whose stderr is
+            adb's alone does not ask.
 
     Returns:
         The :class:`AdbResult`.
@@ -436,6 +447,8 @@ def run_adb(
 
     if not result.ok:
         device_error = _classify(result.stderr, serial)
+        if device_error is not None and confirm_device_errors:
+            device_error = _confirm_device_error(device_error, serial)
         if device_error is not None:
             device_error.command = cmd
             device_error.result = result

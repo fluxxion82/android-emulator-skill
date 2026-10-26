@@ -36,10 +36,11 @@ Locale caveat:
 """
 
 import argparse
-import json
+import functools
 import sys
 
 from common import adb_exec, cli
+from common.batch import Batch
 from common.device_utils import (
     build_adb_command,
     quote_for_device_shell,
@@ -58,6 +59,12 @@ TEXT_SIZE_XL_SCALE = env_float("ANDROID_EMU_TEXT_SIZE_XL_SCALE", 1.3)
 
 # Default appearance values used by --reset.
 DEFAULT_FONT_SCALE = 1.0
+
+# What to do about one change that did not take; its message says which.
+APPEARANCE_REMEDY = (
+    "Fix what the error names (a font scale must be above 0; a locale write needs root "
+    "or a reboot on most devices), then retry that change."
+)
 
 
 class AppearanceController:
@@ -152,7 +159,7 @@ class AppearanceController:
 
     # === DEVICE OPERATIONS ===
 
-    def _run_built(self, cmd: list) -> None:
+    def _run_built(self, cmd: list, *, confirm_device_errors: bool = False) -> None:
         """Run an argv produced by one of the ``build_*_command`` helpers.
 
         Those helpers are the tested source of truth for these commands, so
@@ -164,12 +171,21 @@ class AppearanceController:
 
         Args:
             cmd: Complete adb argv from a ``build_*_command`` helper.
+            confirm_device_errors: Confirm a device error with one ``get-state``
+                (common.adb_exec): for the locale write, whose refusal prints the
+                value back on stderr (recorded: setprop_locale_echo).
 
         Raises:
             adb_exec.AdbCommandError: the command ran and returned non-zero.
             adb_exec.AdbError: adb never reached a device (surfaces at main()).
         """
-        adb_exec.run_adb("shell", self.serial, *cmd[cmd.index("shell") + 1 :], check=True)
+        adb_exec.run_adb(
+            "shell",
+            self.serial,
+            *cmd[cmd.index("shell") + 1 :],
+            check=True,
+            confirm_device_errors=confirm_device_errors,
+        )
 
     def set_theme(self, theme: str) -> tuple:
         """
@@ -246,7 +262,7 @@ class AppearanceController:
         """
         cmd = self.build_locale_command(locale)
         try:
-            self._run_built(cmd)
+            self._run_built(cmd, confirm_device_errors=True)
             return True, (
                 f"Locale write attempted: {locale} (best-effort — a reboot may be "
                 "required, and unprivileged devices may ignore this)"
@@ -372,45 +388,39 @@ the property write succeeded; it does not guarantee apps re-localize.
     serial = resolve_device_identifier(args.serial)
 
     controller = AppearanceController(serial=serial)
-    results: list[dict] = []
+    partial = functools.partial
 
-    # A device-level adb failure (ambiguous target, wrong serial, offline,
-    # unauthorized) means the command never ran; it raises, and common.cli
-    # reports the remedy the error already carries.
+    # One item per change, in this order (common.batch). A device that goes
+    # away (wrong serial, offline, unauthorized) stops the batch at exit 3 with
+    # the items so far; a change that fails otherwise is that item's failure.
+    steps = []
     if args.reset:
-        success, message = controller.reset()
-        results.append({"operation": "reset", "success": success, "message": message})
+        steps.append(({"operation": "reset"}, controller.reset))
     else:
         if args.theme:
-            success, message = controller.set_theme(args.theme)
-            results.append({"operation": "theme", "success": success, "message": message})
-
+            steps.append(({"operation": "theme"}, partial(controller.set_theme, args.theme)))
         if args.text_size:
-            success, message = controller.set_text_size(args.text_size)
-            results.append({"operation": "text_size", "success": success, "message": message})
-
+            steps.append(
+                ({"operation": "text_size"}, partial(controller.set_text_size, args.text_size))
+            )
         if args.font_scale is not None:
-            success, message = controller.set_font_scale(args.font_scale)
-            results.append({"operation": "font_scale", "success": success, "message": message})
-
+            steps.append(
+                ({"operation": "font_scale"}, partial(controller.set_font_scale, args.font_scale))
+            )
         if args.locale:
-            success, message = controller.set_locale(args.locale)
-            results.append({"operation": "locale", "success": success, "message": message})
+            steps.append(({"operation": "locale"}, partial(controller.set_locale, args.locale)))
 
-    if args.json:
-        print(json.dumps({"results": results}, indent=2))
-    elif args.verbose:
+    batch = Batch("operation", "operation").run(steps, remedy=APPEARANCE_REMEDY)
+    if args.verbose and not args.json:
         device_label = serial if serial else "default device"
         print(f"Device: {device_label}")
-        for result in results:
-            status = "OK" if result["success"] else "FAIL"
-            print(f"  [{status}] {result['operation']}: {result['message']}")
-    else:
-        for result in results:
-            print(result["message"])
-
-    all_success = all(r["success"] for r in results)
-    sys.exit(0 if all_success else 1)
+        for item in batch.items:
+            status = "OK" if item["success"] else "FAIL"
+            print(f"  [{status}] {item['operation']}: {item['message']}")
+    elif not args.json:
+        for item in batch.items:
+            print(item["message"])
+    sys.exit(batch.finish(json_mode=args.json))
 
 
 if __name__ == "__main__":

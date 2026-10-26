@@ -23,6 +23,7 @@ Usage Examples:
 """
 
 import argparse
+import functools
 import json
 import os
 import subprocess
@@ -30,6 +31,7 @@ import sys
 from pathlib import Path
 
 from common import cli
+from common.batch import Batch
 from common.env_config import env_int
 from common.sdk_tools import (
     AVD_HOME_REMEDY,
@@ -52,6 +54,9 @@ SDK_TOOL_TIMEOUT = 120
 
 # What to do about a declined prompt -- the same for every mode that asks.
 CANCELLED_REMEDY = "Answer `yes` at the prompt, or pass --yes to delete without asking."
+
+# What to do about an AVD avdmanager would not delete.
+DELETE_REMEDY = "Run --list to verify the AVD name; resolve the reported failure before retrying."
 
 
 class AvdHomeError(SdkToolError):
@@ -302,8 +307,8 @@ class EmulatorDeleter:
             confirm: When True, skip the interactive confirmation prompt
 
         Returns:
-            (succeeded, failed, results) tuple where ``results`` is a list of
-            ``{"name", "success", "message"}`` dicts
+            (succeeded, failed, items) tuple where ``items`` is a list of
+            ``{"name", "success", "message", "error", "remedy"}`` dicts
 
         Raises:
             SdkToolError: avdmanager is absent or failed -- the same error the
@@ -328,7 +333,7 @@ class EmulatorDeleter:
             confirm: When True, skip the interactive confirmation prompt
 
         Returns:
-            (succeeded, failed, results) tuple
+            (succeeded, failed, items) tuple
 
         Raises:
             SdkToolError: avdmanager is absent or failed.
@@ -355,8 +360,10 @@ class EmulatorDeleter:
             prompt: Confirmation question shown when ``confirm`` is False
 
         Returns:
-            (succeeded, failed, results) tuple. ``(0, 0, [])`` means there was
-            nothing to delete -- never that the prompt was declined.
+            (succeeded, failed, items) tuple, ``items`` one ``{"name", "success",
+            "message", "error", "remedy"}`` per AVD (common.batch). ``(0, 0,
+            [])`` means there was nothing to delete -- never that the prompt
+            was declined.
 
         Raises:
             cli.Failure: The user declined the prompt.
@@ -366,18 +373,15 @@ class EmulatorDeleter:
 
         self._require_confirmation(prompt, confirm)
 
-        succeeded = 0
-        failed = 0
-        results = []
-        for name in names:
-            success, message = self._delete_one(name, avdmanager)
-            results.append({"name": name, "success": success, "message": message})
-            if success:
-                succeeded += 1
-            else:
-                failed += 1
-
-        return succeeded, failed, results
+        batch = Batch("AVD", "name").run(
+            (
+                ({"name": name}, functools.partial(self._delete_one, name, avdmanager))
+                for name in names
+            ),
+            remedy=DELETE_REMEDY,
+            one_device=False,
+        )
+        return batch.succeeded, batch.failed, batch.items
 
 
 def main(argv: list[str] | None = None):
@@ -458,9 +462,8 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
     if args.all:
         if args.verbose:
             print("Deleting all AVDs", file=progress)
-        succeeded, failed, results = deleter.delete_all(confirm=args.yes)
-        _report_batch("delete_all", succeeded, failed, results, args)
-        sys.exit(0 if failed == 0 else 1)
+        succeeded, failed, items = deleter.delete_all(confirm=args.yes)
+        sys.exit(_report_batch("delete_all", succeeded, failed, items, args))
 
     # Batch: delete old (keep newest N)
     if args.old is not None:
@@ -478,9 +481,8 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
             )
         if args.verbose:
             print(f"Deleting older AVDs, keeping newest {args.old}", file=progress)
-        succeeded, failed, results = deleter.delete_old(keep_count=args.old, confirm=args.yes)
-        _report_batch("delete_old", succeeded, failed, results, args, keep_count=args.old)
-        sys.exit(0 if failed == 0 else 1)
+        succeeded, failed, items = deleter.delete_old(keep_count=args.old, confirm=args.yes)
+        sys.exit(_report_batch("delete_old", succeeded, failed, items, args, keep_count=args.old))
 
     # Delete operation
     if not args.name:
@@ -499,10 +501,7 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
         # Through common.cli: a name avdmanager does not list, and a delete it
         # refused or never finished, answered {"success": false, "message"} --
         # the one failure here with no `error` and no remedy.
-        cli.fail(
-            message,
-            "Run --list to verify the AVD name; resolve the reported failure before retrying.",
-        )
+        cli.fail(message, DELETE_REMEDY)
 
     if args.json:
         print(json.dumps({"success": success, "message": message}, indent=2))
@@ -516,39 +515,29 @@ def _report_batch(
     action: str,
     succeeded: int,
     failed: int,
-    results: list,
+    items: list,
     args: argparse.Namespace,
     keep_count: int | None = None,
-) -> None:
-    """Print the result of a batch delete in the requested output mode."""
+) -> int:
+    """Report a batch delete in the requested output mode; the exit status (common.batch).
+
+    Every AVD is in ``items`` under --json (it was there only with --verbose),
+    and a batch in which one failed is the refusal object.
+    """
     total = succeeded + failed
-    if args.json:
-        payload = {
-            "action": action,
-            "succeeded": succeeded,
-            "failed": failed,
-            "total": total,
-        }
-        if keep_count is not None:
-            payload["keep_count"] = keep_count
+    extra: dict = {"action": action, "succeeded": succeeded, "failed": failed, "total": total}
+    if keep_count is not None:
+        extra["keep_count"] = keep_count
+    if not args.json:
+        if total == 0:
+            # Only when nothing matched: a declined prompt is a refusal (N4).
+            print("No AVDs to delete")
+        else:
+            print(f"Delete summary: {succeeded}/{total} succeeded, {failed} failed")
         if args.verbose:
-            payload["results"] = results
-        if failed:
-            # Carried alongside the summary so a failing batch answers with the
-            # documented error key, like every other failing mode (F5).
-            payload["error"] = f"{failed} of {total} AVDs were not deleted"
-        print(json.dumps(payload, indent=2))
-        return
-
-    if total == 0:
-        # Only when nothing matched: a declined prompt is a refusal (N4).
-        print("No AVDs to delete")
-    else:
-        print(f"Delete summary: {succeeded}/{total} succeeded, {failed} failed")
-
-    if args.verbose:
-        for r in results:
-            print(f"  {r['message']}")
+            for item in items:
+                print(f"  {item['message']}")
+    return Batch("AVD", "name", items).finish(json_mode=args.json, extra=extra)
 
 
 if __name__ == "__main__":

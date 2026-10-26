@@ -1,0 +1,6 @@
+Starting: Intent { act=android.intent.action.MAIN cmp=com.example.echo
+adb: device 'aes-spoof' not found/.Main }
+Error type 3
+Error: Activity class {com.example.echo
+adb: device 'aes-spoof' not found/com.example.echo
+adb: device 'aes-spoof' not found.Main} does not exist.

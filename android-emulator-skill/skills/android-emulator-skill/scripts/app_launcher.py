@@ -338,12 +338,17 @@ class AppLauncher:
         """
         try:
             install_args = ["-r", apk_path] if replace else [apk_path]
+            # adb names the path in its own error line (`adb: failed to stat
+            # <path>: ...`, recorded: adb_install_missing_apk_echo_stderr), so a
+            # path that says "device ... not found" reads as a lost device:
+            # one `get-state` confirms it first.
             result = adb_exec.run_adb(
                 "install",
                 self.serial,
                 *install_args,
                 timeout=INSTALL_TIMEOUT_SECONDS,
                 check=True,
+                confirm_device_errors=True,
             )
 
             if "Success" in result.stdout:

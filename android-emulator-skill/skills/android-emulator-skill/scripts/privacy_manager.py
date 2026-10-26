@@ -47,12 +47,14 @@ Note on --reset:
 """
 
 import argparse
+import functools
 import json
 import re
 import sys
 from datetime import datetime
 
 from common import adb_exec, cli
+from common.batch import Batch
 from common.device_utils import (
     UserNotInstalledError,
     parse_package_permissions,
@@ -72,10 +74,23 @@ ADB_TIMEOUT_SECONDS = env_int("ANDROID_EMU_PRIVACY_ADB_TIMEOUT", 30, min_value=1
 # - `pm` refusing (a SecurityException for an install-time permission, an
 #   unknown package) is AdbCommandError. It is caught where CalledProcessError
 #   was, reported as that permission's failure, and a batch goes on to the next.
-# - A device that is gone (not found, offline, unauthorized), several devices
-#   and no --serial, a missing adb, a timeout: these raise. A batch stops at the
+# - A device that is gone (not found, offline, unauthorized), or several devices
+#   and no --serial: these raise, and the batch (common.batch) stops at the
 #   first one -- continuing against a device that is not there only repeats the
-#   error -- and common.cli reports it: exit 3 for an unavailable device, else 1.
+#   error -- and reports the permissions so far: exit 3 for an unavailable
+#   device, else 1. A missing adb or a timeout is that permission's failure.
+# - `pm grant` / `pm revoke` print an unknown permission's name back on stderr
+#   (recorded: pm_grant_permission_echo, pm_revoke_permission_echo), so a name
+#   holding a newline and an `adb: device ... not found` line reads as adb's
+#   own. Those two calls ask run_adb to confirm a device error with one
+#   `get-state` first (confirm_device_errors).
+
+# What to do about one permission that was not changed; its message says why.
+PERMISSION_REMEDY = (
+    "Fix what the error names -- an unknown permission (`--list-permissions` lists the "
+    "short names), a package that is not installed, or one that does not request the "
+    "permission -- then retry it."
+)
 
 # "java.lang.SecurityException: Package X has not requested permission Y" --
 # the line of `pm`'s stack trace that says why (recorded: pm_grant_not_changeable
@@ -192,6 +207,7 @@ class PrivacyManager:
                 quote_for_device_shell(full_permission),
                 timeout=ADB_TIMEOUT_SECONDS,
                 check=True,
+                confirm_device_errors=True,
             )
         except adb_exec.AdbCommandError as e:
             error_msg = e.stderr if e.stderr else str(e)
@@ -242,6 +258,7 @@ class PrivacyManager:
                 quote_for_device_shell(full_permission),
                 timeout=ADB_TIMEOUT_SECONDS,
                 check=True,
+                confirm_device_errors=True,
             )
         except adb_exec.AdbCommandError as e:
             error_msg = e.stderr if e.stderr else str(e)
@@ -688,32 +705,31 @@ Examples:
             continue
 
         permissions = [p.strip() for p in raw.split(",")]
-        results = []
+        batch = Batch("permission", "permission").run(
+            (
+                ({"permission": permission}, functools.partial(action_fn, args.package, permission))
+                for permission in permissions
+            ),
+            remedy=PERMISSION_REMEDY,
+        )
 
-        for permission in permissions:
-            success, message = action_fn(args.package, permission)
-            results.append({"permission": permission, "success": success, "message": message})
-
-            # Not under --json: the message is in `results`, and a line printed
-            # ahead of the JSON object made stdout unparseable.
-            if not args.json and (args.verbose or not success):
-                print(message)
+        # Not under --json: the message is in `items`, and a line printed ahead
+        # of the JSON object made stdout unparseable.
+        if not args.json:
+            for item in batch.items:
+                if args.verbose or not item["success"]:
+                    print(item["message"])
 
         test_trail = build_test_trail(args.scenario, args.step)
-
-        if args.json:
-            output: dict = {"action": action, "results": results}
-            if test_trail is not None:
-                output["test_trail"] = test_trail
-            print(json.dumps(output, indent=2))
-        elif test_trail is not None and args.verbose:
+        extra: dict = {"action": action}
+        if test_trail is not None:
+            extra["test_trail"] = test_trail
+        if not args.json and test_trail is not None and args.verbose:
             location = f" (step {args.step})" if args.step is not None else ""
             scenario_info = f" in {args.scenario}" if args.scenario is not None else ""
             print(f"[Test trail] {test_trail['timestamp']}: {action}{scenario_info}{location}")
 
-        # Exit with error if any failed
-        all_success = all(r["success"] for r in results)
-        sys.exit(0 if all_success else 1)
+        sys.exit(batch.finish(json_mode=args.json, extra=extra))
 
     # No operation specified. cli.fail rather than a usage error: argparse's
     # exit 2 is prose on stderr and nothing on stdout, and under --json this

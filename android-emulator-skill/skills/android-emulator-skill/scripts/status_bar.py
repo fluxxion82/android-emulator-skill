@@ -32,11 +32,12 @@ Usage Examples:
 """
 
 import argparse
-import json
+import functools
 import re
 import sys
 
 from common import adb_exec, cli
+from common.batch import Batch
 from common.device_utils import quote_for_device_shell
 from common.env_config import env_int
 
@@ -48,6 +49,12 @@ PRESET_TESTING_BATTERY_LEVEL = env_int("ANDROID_EMU_PRESET_TESTING_BATTERY_LEVEL
 
 # H:MM or HH:MM. ASCII digits only: `\d` would also take other scripts' digits.
 _TIME_PATTERN = re.compile(r"([0-9]{1,2}):([0-9]{2})")
+
+# What to do about one operation that did not take; its message says which (a
+# level out of range, SystemUI refusing the broadcast).
+STATUS_BAR_REMEDY = (
+    "Fix what the error names, then retry that operation; `--reset` leaves demo mode."
+)
 
 TIME_REMEDY = "Pass the time as H:MM or HH:MM on a 24-hour clock, e.g. --time 9:41 or --time 13:05."
 
@@ -618,54 +625,52 @@ Examples:
             cli.fail(str(e), TIME_REMEDY)
 
     controller = StatusBarController(serial=args.device_serial)
-    results = []
+    partial = functools.partial
 
-    # A device-level failure (no device, several devices, offline, unauthorized)
-    # means the command never ran at all, so it is raised rather than returned,
-    # and common.cli reports it with the remedy its message carries.
-
-    # Reset operation
+    # One item per operation, in this order (common.batch). A device that goes
+    # away (no device, offline, unauthorized) stops the batch at exit 3 with the
+    # items so far; an operation that fails otherwise is that item's failure,
+    # and the rest still run.
+    steps = []
     if args.reset:
-        success, message = controller.reset()
-        results.append({"operation": "reset", "success": success, "message": message})
-
-    # Preset operation (atomic, coherent group via demo mode)
+        steps.append(({"operation": "reset"}, controller.reset))
     if args.preset:
-        success, message = controller.apply_preset(args.preset)
-        results.append(
-            {
-                "operation": "preset",
-                "preset": args.preset,
-                "success": success,
-                "message": message,
-            }
+        # Atomic, coherent group via demo mode.
+        steps.append(
+            (
+                {"operation": "preset", "preset": args.preset},
+                partial(controller.apply_preset, args.preset),
+            )
         )
-
-    # Battery operation
     if args.battery is not None:
-        success, message = controller.set_battery(args.battery, args.charging)
-        results.append({"operation": "battery", "success": success, "message": message})
-
-    # WiFi operation
-    if args.wifi is not None:
-        success, message = controller.set_wifi(args.wifi == "show", args.wifi_level)
-        results.append({"operation": "wifi", "success": success, "message": message})
-
-    # Mobile data operation
-    if args.mobile is not None:
-        success, message = controller.set_mobile_data(
-            args.mobile == "show", args.mobile_level, args.mobile_type
+        steps.append(
+            ({"operation": "battery"}, partial(controller.set_battery, args.battery, args.charging))
         )
-        results.append({"operation": "mobile", "success": success, "message": message})
-
-    # Time operation
+    if args.wifi is not None:
+        steps.append(
+            (
+                {"operation": "wifi"},
+                partial(controller.set_wifi, args.wifi == "show", args.wifi_level),
+            )
+        )
+    if args.mobile is not None:
+        steps.append(
+            (
+                {"operation": "mobile"},
+                partial(
+                    controller.set_mobile_data,
+                    args.mobile == "show",
+                    args.mobile_level,
+                    args.mobile_type,
+                ),
+            )
+        )
     if args.time is not None:
-        success, message = controller.set_time(args.time)
-        results.append({"operation": "time", "success": success, "message": message})
+        steps.append(({"operation": "time"}, partial(controller.set_time, args.time)))
 
-    # Output results. No operation is a refusal: the help text went to
-    # stdout, the whole of what a --json caller got.
-    if not results:
+    # No operation is a refusal: the help text went to stdout, the whole of
+    # what a --json caller got.
+    if not steps:
         if not args.json:
             parser.print_help(file=sys.stderr)
         cli.fail(
@@ -673,16 +678,12 @@ Examples:
             "Pass --preset, --battery, --wifi, --mobile, --time or --reset.",
         )
 
-    if args.json:
-        print(json.dumps({"results": results}, indent=2))
-    else:
-        for result in results:
-            if args.verbose or not result["success"]:
-                print(result["message"])
-
-    # Exit with error if any failed
-    all_success = all(r["success"] for r in results)
-    sys.exit(0 if all_success else 1)
+    batch = Batch("operation", "operation").run(steps, remedy=STATUS_BAR_REMEDY)
+    if not args.json:
+        for item in batch.items:
+            if args.verbose or not item["success"]:
+                print(item["message"])
+    sys.exit(batch.finish(json_mode=args.json))
 
 
 if __name__ == "__main__":

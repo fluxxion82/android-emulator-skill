@@ -3498,6 +3498,69 @@ def _offline_window(_scratch: Path, serial: str, extra: dict) -> Capture:
     return capture
 
 
+# --- agent text in a failing command's streams ---------------------------------
+#
+# run_adb types a device error from any stderr line that starts with `adb: ` or
+# `error: ` and names a device problem, and an `adb shell` command's own stderr
+# arrives on that same pipe. So a command that ECHOES the text an agent handed
+# it -- a package, a permission, a path, a locale -- can print a line that reads
+# as adb's, and the device "vanishes" (exit 3) while it answers. These record,
+# for each run_adb caller whose argv carries agent text, one representative call
+# with that text holding a newline and a forged adb line, and say which stream,
+# if any, carried it back. The marker is under com.example. so the aliaser keeps
+# it whole.
+ECHO_FORGED = "adb: device 'aes-spoof' not found"
+ECHO_TEXT = f"com.example.echo\n{ECHO_FORGED}"
+# The path an agent would pass to `app_launcher --install`: adb reads it on the
+# host and names it in its OWN error line, so no newline is needed.
+ECHO_APK = "/nonexistent/device 'aes-spoof' not found.apk"
+_ECHO_STREAMS = ("stdout", "stderr")
+
+
+def _echo_capture(
+    args: list[str],
+    *,
+    on: tuple[str, ...],
+    name: str | None = None,
+    marker: str = "com.example.echo",
+) -> Callable[[Path, str, dict], Capture]:
+    """Run ``args`` once; require ``marker`` on exactly the streams in ``on``.
+
+    The manifest says where it was (``agent_text_on``) and whether a line on
+    that stream STARTS with the forged adb line (``forged_line_starts_on``),
+    which is what adb_exec's classifier reads. ``name`` set: the run printed on
+    both streams, the file holds stdout and stderr goes to the twin
+    ``<name>_stderr`` (:func:`_text_twin`).
+    """
+
+    def capture(_scratch: Path, serial: str, extra: dict) -> Capture:
+        result = _run(args, serial)
+        streams = {"stdout": result.stdout, "stderr": result.stderr}
+        found = tuple(s for s in _ECHO_STREAMS if marker in streams[s])
+        if found != on:
+            raise CaptureError(
+                f"the agent text came back on {found or 'neither stream'}, not {on or 'neither'}"
+                f" (exit {result.returncode}, stdout {result.stdout[:200]!r}, "
+                f"stderr {result.stderr[:200]!r})"
+            )
+        extra["agent_text_on"] = list(found) or "neither"
+        extra["forged_line_starts_on"] = [
+            s
+            for s in _ECHO_STREAMS
+            if any(line.startswith(ECHO_FORGED) for line in streams[s].split("\n"))
+        ]
+        if name is not None:
+            if not (result.stdout.strip() and result.stderr.strip()):
+                raise CaptureError(f"{name}: expected output on both streams")
+            _TEXT_TWINS[f"{name}_stderr"] = (
+                Capture(result.stderr, "", result.returncode),
+                {"first_half": name, "exit_status": result.returncode, "stream": "stderr"},
+            )
+        return result
+
+    return capture
+
+
 FIXTURES: list[Fixture] = [
     # --- device discovery -------------------------------------------------
     Fixture(
@@ -5002,6 +5065,456 @@ FIXTURES: list[Fixture] = [
             "is exactly what a no-op looks like."
         ),
         post=_requires("exit=0"),
+    ),
+    # --- agent text echoed by a failing command (see ECHO_TEXT) ---------------
+    Fixture(
+        name="pm_grant_permission_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "pm",
+            "grant",
+            "--user",
+            "0",
+            "com.android.settings",
+            shlex.quote(f"android.permission.{ECHO_TEXT}"),
+        ],
+        command="adb shell pm grant --user 0 com.android.settings 'android.permission.<echo text>'",
+        description=(
+            "privacy_manager --grant with a permission name an agent typed. <echo text> is "
+            "`com.example.echo`, a newline and `adb: device 'aes-spoof' not found`, quoted for "
+            "the device shell as the script quotes it. `pm` exits 255 and its "
+            "IllegalArgumentException ('Unknown permission: <name>') prints the name back "
+            "on STDERR, newline and all, so the forged line starts a line of the stderr "
+            "run_adb classifies (forged_line_starts_on)."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "pm",
+                "grant",
+                "--user",
+                "0",
+                "com.android.settings",
+                shlex.quote(f"android.permission.{ECHO_TEXT}"),
+            ],
+            on=("stderr",),
+        ),
+        post=_requires("Unknown permission", ECHO_FORGED),
+    ),
+    Fixture(
+        name="pm_revoke_permission_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "pm",
+            "revoke",
+            "--user",
+            "0",
+            "com.android.settings",
+            shlex.quote(f"android.permission.{ECHO_TEXT}"),
+        ],
+        command="adb shell pm revoke --user 0 com.android.settings 'android.permission.<echo text>'",
+        description=(
+            "pm_grant_permission_echo for privacy_manager --revoke / --reset: the same "
+            "exception, the name printed back on stderr, exit 255."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "pm",
+                "revoke",
+                "--user",
+                "0",
+                "com.android.settings",
+                shlex.quote(f"android.permission.{ECHO_TEXT}"),
+            ],
+            on=("stderr",),
+        ),
+        post=_requires("Unknown permission", ECHO_FORGED),
+    ),
+    Fixture(
+        name="dumpsys_package_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "dumpsys", "package", shlex.quote(ECHO_TEXT)],
+        command="adb shell dumpsys package '<echo text>'",
+        description=(
+            "privacy_manager's read-back and --list for a package named by <echo text> (see "
+            "pm_grant_permission_echo): 'Unable to find package: <name>' on STDOUT, exit 0, "
+            "stderr empty. Not classified: run_adb reads stderr, and only on a non-zero exit."
+        ),
+        capture_with=_echo_capture(
+            ["shell", "dumpsys", "package", shlex.quote(ECHO_TEXT)], on=("stdout",)
+        ),
+        post=_requires("Unable to find package", ECHO_FORGED),
+    ),
+    Fixture(
+        name="adb_install_missing_apk_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["install", ECHO_APK],
+        command=f"adb install {shlex.quote(ECHO_APK)}",
+        description=(
+            "app_launcher --install with a path that does not exist and that names a device "
+            "problem itself -- no newline needed. Exit 1; stdout 'Performing Streamed "
+            "Install' (this file); on stderr (adb_install_missing_apk_echo_stderr, same run) "
+            "adb's OWN line, `adb: failed to stat <path>: No such file or directory`. It "
+            "starts with `adb: ` and carries 'device' and 'not found' from the path, which "
+            "is what run_adb's classifier matches."
+        ),
+        capture_with=_echo_capture(
+            ["install", ECHO_APK],
+            on=("stderr",),
+            name="adb_install_missing_apk_echo",
+            marker="aes-spoof",
+        ),
+        post=_requires("Performing Streamed Install"),
+    ),
+    Fixture(
+        name="adb_install_missing_apk_echo_stderr",
+        emulator_only=True,
+        args=["install", ECHO_APK],
+        command="recorded in adb_install_missing_apk_echo's run: its stderr",
+        description="The stderr of adb_install_missing_apk_echo's one run, byte for byte.",
+        capture_with=_text_twin(
+            "adb_install_missing_apk_echo_stderr", "adb_install_missing_apk_echo"
+        ),
+        post=_requires("adb: failed to stat", "not found"),
+    ),
+    Fixture(
+        name="am_start_component_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-n",
+            shlex.quote(f"{ECHO_TEXT}/.Main"),
+            "-a",
+            "android.intent.action.MAIN",
+        ],
+        command="adb shell am start -W -n '<echo text>/.Main' -a android.intent.action.MAIN",
+        description=(
+            "app_launcher --launch with a package named by <echo text> (see "
+            "pm_grant_permission_echo). The component is printed back twice, newline and "
+            "all, on STDOUT ('Starting: Intent { ... cmp=...' and 'Error: Activity class "
+            "{...} does not exist.'); stderr empty. The exit status is in the manifest."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-n",
+                shlex.quote(f"{ECHO_TEXT}/.Main"),
+                "-a",
+                "android.intent.action.MAIN",
+            ],
+            on=("stdout",),
+        ),
+        post=_requires("does not exist", ECHO_FORGED),
+    ),
+    Fixture(
+        name="am_start_view_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            shlex.quote(ECHO_TEXT),
+        ],
+        command="adb shell am start -W -a android.intent.action.VIEW -d '<echo text>'",
+        description=(
+            "app_launcher --open-url with <echo text> (see pm_grant_permission_echo) as the "
+            "URL: 'unable to resolve Intent', the data cut short as am_start_wait_view_"
+            "unresolved describes, on STDOUT; stderr empty."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                shlex.quote(ECHO_TEXT),
+            ],
+            on=("stdout",),
+        ),
+        post=_requires("unable to resolve Intent"),
+    ),
+    Fixture(
+        name="package_list_uid_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "cmd", "package", "list", "packages", "-U", shlex.quote(ECHO_TEXT)],
+        command="adb shell cmd package list packages -U '<echo text>'",
+        description=(
+            "device_utils.get_package_uids (log_monitor --app, app_state_capture, "
+            "anr_watcher --package) for a package named by <echo text> (see "
+            "pm_grant_permission_echo): nothing on either stream, exit 0."
+        ),
+        capture_with=_echo_capture(
+            ["shell", "cmd", "package", "list", "packages", "-U", shlex.quote(ECHO_TEXT)],
+            on=(),
+        ),
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="pidof_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "pidof", shlex.quote(ECHO_TEXT)],
+        command="adb shell pidof '<echo text>'",
+        description=(
+            "`pidof` for a package named by <echo text> (see pm_grant_permission_echo) -- "
+            "log_monitor --app's stream path, app_state_capture, app_launcher --state: "
+            "nothing on either stream, exit 1, as pidof_not_running."
+        ),
+        capture_with=_echo_capture(["shell", "pidof", shlex.quote(ECHO_TEXT)], on=()),
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="dumpsys_package_versionname_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "dumpsys", "package", shlex.quote(ECHO_TEXT), "|", "grep", "versionName"],
+        command="adb shell dumpsys package '<echo text>' | grep versionName",
+        description=(
+            "app_state_capture's version probe for a package named by <echo text> (see "
+            "pm_grant_permission_echo). The device-side grep drops dumpsys's 'Unable to find "
+            "package' line: nothing on either stream, exit 1."
+        ),
+        capture_with=_echo_capture(
+            ["shell", "dumpsys", "package", shlex.quote(ECHO_TEXT), "|", "grep", "versionName"],
+            on=(),
+        ),
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="setprop_locale_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "setprop", "persist.sys.locale", shlex.quote(ECHO_TEXT)],
+        command="adb shell setprop persist.sys.locale '<echo text>'",
+        description=(
+            "appearance --locale with <echo text> (see pm_grant_permission_echo): refused, "
+            "exit 1, and `Failed to set property 'persist.sys.locale' to '<value>'.` prints "
+            "the value back on STDERR, newline and all, so the forged line starts a line of "
+            "the stderr run_adb classifies. The property reads `com.example.app1` in the "
+            "file: the aliaser takes `persist.sys.locale` for a package name (departure 2)."
+        ),
+        capture_with=_echo_capture(
+            ["shell", "setprop", "persist.sys.locale", shlex.quote(ECHO_TEXT)], on=("stderr",)
+        ),
+        post=_requires("Failed to set property", ECHO_FORGED),
+    ),
+    Fixture(
+        name="am_broadcast_demo_datatype_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "am",
+            "broadcast",
+            "-a",
+            "com.android.systemui.demo",
+            "-e",
+            "command",
+            "network",
+            "-e",
+            "mobile",
+            "show",
+            "-e",
+            "level",
+            "4",
+            "-e",
+            "datatype",
+            shlex.quote(ECHO_TEXT),
+        ],
+        command=(
+            "adb shell am broadcast -a com.android.systemui.demo -e command network "
+            "-e mobile show -e level 4 -e datatype '<echo text>'"
+        ),
+        description=(
+            "status_bar --mobile-type with <echo text> (see pm_grant_permission_echo): the "
+            "only free text status_bar sends. The broadcast is delivered whatever the extra "
+            "says -- 'Broadcast completed: result=0' on stdout, exit 0 -- and the value is "
+            "not printed back (`(has extras)`)."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "am",
+                "broadcast",
+                "-a",
+                "com.android.systemui.demo",
+                "-e",
+                "command",
+                "network",
+                "-e",
+                "mobile",
+                "show",
+                "-e",
+                "level",
+                "4",
+                "-e",
+                "datatype",
+                shlex.quote(ECHO_TEXT),
+            ],
+            on=(),
+        ),
+        post=_requires("Broadcast completed"),
+    ),
+    Fixture(
+        name="input_text_nonascii_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "input", "text", shlex.quote(f"hé{ECHO_TEXT}".replace(" ", "%s"))],
+        command="adb shell input text 'hé<echo text>' (spaces sent as %s)",
+        description=(
+            "keyboard --type / navigator --enter-text with <echo text> (see "
+            "pm_grant_permission_echo) behind a non-ASCII letter, the one recorded way "
+            "`input text` fails: exit 255 and a NullPointerException on stderr that does "
+            "NOT print the text back. (ASCII text with a newline is typed: exit 0, "
+            "silent.)"
+        ),
+        capture_with=_echo_capture(
+            ["shell", "input", "text", shlex.quote(f"hé{ECHO_TEXT}".replace(" ", "%s"))],
+            on=(),
+        ),
+        post=_requires("NullPointerException"),
+    ),
+    Fixture(
+        name="am_force_stop_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "am", "force-stop", shlex.quote(ECHO_TEXT)],
+        command="adb shell am force-stop '<echo text>'",
+        description=(
+            "app_launcher --terminate for a package named by <echo text> (see "
+            "pm_grant_permission_echo): nothing on either stream, exit 0 -- an unknown "
+            "package is not an error to force-stop."
+        ),
+        capture_with=_echo_capture(["shell", "am", "force-stop", shlex.quote(ECHO_TEXT)], on=()),
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="adb_uninstall_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["uninstall", ECHO_TEXT],
+        command="adb uninstall '<echo text>'",
+        description=(
+            "app_launcher --uninstall with <echo text> (see pm_grant_permission_echo) as the "
+            "package, passed as app_launcher passes it: 'Failure "
+            "[DELETE_FAILED_INTERNAL_ERROR]' on STDOUT, exit 1, stderr empty; the name is "
+            "not printed back."
+        ),
+        capture_with=_echo_capture(["uninstall", ECHO_TEXT], on=()),
+        post=_requires("DELETE_FAILED"),
+    ),
+    Fixture(
+        name="resolve_activity_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            shlex.quote(ECHO_TEXT),
+        ],
+        command=(
+            "adb shell cmd package resolve-activity --brief -c "
+            "android.intent.category.LAUNCHER '<echo text>'"
+        ),
+        description=(
+            "app_launcher's launcher-activity lookup for a package named by <echo text> "
+            "(see pm_grant_permission_echo): 'No activity found' on STDOUT, exit 0; the "
+            "name is not printed back."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-c",
+                "android.intent.category.LAUNCHER",
+                shlex.quote(ECHO_TEXT),
+            ],
+            on=(),
+        ),
+        post=_requires("No activity found"),
+    ),
+    Fixture(
+        name="pm_dump_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=["shell", "pm", "dump", shlex.quote(ECHO_TEXT), "|", "head", "-n", "3"],
+        command="adb shell pm dump '<echo text>' | head -n 3",
+        description=(
+            "device_utils.get_package_info's `pm dump` for a package named by <echo text> "
+            "(see pm_grant_permission_echo): 'Unable to find package: <name>' on STDOUT, "
+            "exit 0. Only the first three lines are kept, by a device-side `head`: after "
+            "them `pm dump` dumps every other service's state, which is not this fixture's "
+            "to publish. The pipe takes stdout only, so stderr's size is pm's own (0)."
+        ),
+        capture_with=_echo_capture(
+            ["shell", "pm", "dump", shlex.quote(ECHO_TEXT), "|", "head", "-n", "3"],
+            on=("stdout",),
+        ),
+        post=_requires("Unable to find package", ECHO_FORGED),
+    ),
+    Fixture(
+        name="cmd_notification_post_echo",
+        emulator_only=True,
+        record_both_streams=True,
+        args=[
+            "shell",
+            "cmd",
+            "notification",
+            "post",
+            shlex.quote(f"-{ECHO_TEXT}"),
+            shlex.quote(ECHO_TEXT),
+        ],
+        command="adb shell cmd notification post '-<echo text>' '<echo text>'",
+        description=(
+            "push_notification --post with <echo text> (see pm_grant_permission_echo) as "
+            "the text and, behind a `-`, as the tag -- the one way its two arguments made "
+            "`cmd notification post` refuse. The refusal ('Error occurred. Check logcat for "
+            'details. No argument expected after "<tag>"\') prints the tag back on STDOUT, '
+            "exit 0, stderr empty; nothing is posted."
+        ),
+        capture_with=_echo_capture(
+            [
+                "shell",
+                "cmd",
+                "notification",
+                "post",
+                shlex.quote(f"-{ECHO_TEXT}"),
+                shlex.quote(ECHO_TEXT),
+            ],
+            on=("stdout",),
+        ),
+        post=_requires("Error occurred", ECHO_FORGED),
     ),
     Fixture(
         name="dumpsys_package_permissions",

@@ -14,12 +14,14 @@ Key features:
 """
 
 import argparse
+import functools
 import json
 import subprocess
 import sys
 import time
 
 from common import adb_exec, cli
+from common.batch import Batch
 from common.device_utils import get_connected_devices
 from common.emu_console import avd_name_for_serial, survey_emulators
 from common.env_config import env_float, env_int
@@ -269,25 +271,25 @@ class EmulatorBooter:
             headless: Boot each AVD in headless mode (no GUI)
 
         Returns:
-            (succeeded, failed, results) tuple where ``results`` is a list of
-            ``{"avd": name, "success": bool, "message": str}`` dicts.
+            (succeeded, failed, items) tuple where ``items`` is a list of
+            ``{"avd", "success", "message", "error", "remedy"}`` dicts
+            (common.batch). Each AVD is its own emulator, so one that fails
+            any way at all is that item's failure and the rest still boot.
         """
-        avds = list_avds()
-        succeeded = 0
-        failed = 0
-        results: list[dict] = []
-
-        for avd in avds:
-            name = avd["name"]
-            booter = EmulatorBooter(name)
-            success, message = booter.boot(wait_ready=False, headless=headless)
-            if success:
-                succeeded += 1
-            else:
-                failed += 1
-            results.append({"avd": name, "success": success, "message": message})
-
-        return succeeded, failed, results
+        batch = Batch("AVD", "avd").run(
+            (
+                (
+                    {"avd": avd["name"]},
+                    functools.partial(
+                        EmulatorBooter(avd["name"]).boot, wait_ready=False, headless=headless
+                    ),
+                )
+                for avd in list_avds()
+            ),
+            remedy=BOOT_REMEDY,
+            one_device=False,
+        )
+        return batch.succeeded, batch.failed, batch.items
 
 
 def list_avds() -> list:
@@ -416,26 +418,16 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
 
     # Boot-all mode
     if args.all:
-        succeeded, failed, results = EmulatorBooter.boot_all(headless=args.headless)
+        succeeded, failed, items = EmulatorBooter.boot_all(headless=args.headless)
         total = succeeded + failed
-        if args.json:
+        if not args.json:
             print(
-                json.dumps(
-                    {
-                        "action": "boot_all",
-                        "succeeded": succeeded,
-                        "failed": failed,
-                        "total": total,
-                        "results": results,
-                    },
-                    indent=2,
-                )
+                f"Boot summary: {succeeded}/{total} succeeded, {failed} failed"
+                if total
+                else "No AVDs found"
             )
-        elif total == 0:
-            print("No AVDs found")
-        else:
-            print(f"Boot summary: {succeeded}/{total} succeeded, {failed} failed")
-        sys.exit(0 if failed == 0 else 1)
+        extra = {"action": "boot_all", "succeeded": succeeded, "failed": failed, "total": total}
+        sys.exit(Batch("AVD", "avd", items).finish(json_mode=args.json, extra=extra))
 
     # Boot mode. The help text goes to stderr, and only in text mode: printed
     # to stdout it was the whole answer a --json caller got.

@@ -1,0 +1,2 @@
+Unable to find package: com.example.echo
+adb: device 'aes-spoof' not found

@@ -74,7 +74,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from fake_toolchain import ANDROID_TOOLS, assert_refusal
+from conftest import RECORDED_ROOT, RecordedFixtures
+from fake_toolchain import ANDROID_TOOLS, FakeToolchain, Rule, assert_refusal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "android-emulator-skill" / "skills" / "android-emulator-skill" / "scripts"
@@ -837,3 +838,574 @@ def test_every_script_with_a_typed_flag_has_a_bad_value_case():
     covered = {*TYPED_USAGE_ERRORS, *TYPED_EXEMPT} - {"localization_audit.py"}
     stale = sorted(script for script in covered if not _fallible_typed_flags(script))
     assert not stale, f"bad-value cases for scripts with no fallible typed flag: {stale}"
+
+
+# ===========================================================================
+# Per-item batches: in the schema too (one object, items, exit 1 or 3)
+# ===========================================================================
+#
+# A batch reports per item -- per operation in status_bar and appearance, per
+# permission in privacy_manager's grant/revoke/reset, per AVD or emulator in the
+# emulator_* --all modes (and emulator_delete --old). Each used to print its own
+# summary (`{"results": [...]}`, `{"action", "results"}`, counts only) and exit 1
+# beside the failure schema. Now every one answers ONE object: `success` false
+# when any item failed, `error` and `remedy` as every refusal has them, and
+# `items`, each with its own fields plus `success`, `error` and `remedy` (null
+# when it succeeded). Exit 1 when an item failed, 0 only when all succeeded. A
+# device that goes away in a one-device batch stops it at exit 3: the item that
+# met the device error and every item after it are reported failed. The
+# emulator_* modes act on several devices, so there one emulator going away is
+# that item's failure and the batch goes on.
+#
+# Each case runs the real CLI against a fake toolchain that replays recorded
+# output (a device-not-found, a refused avdmanager delete, a broadcast), and
+# items fail for reasons the scripts check themselves (a battery level of 150,
+# an unknown permission name, a userdata file that is a directory).
+
+PRIMARY = RecordedFixtures(RECORDED_ROOT / "emulator-api35")
+BATCH_API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
+
+# The batch scripts. A new one is added here and gets its cases below.
+BATCH_SCRIPTS = (
+    "status_bar.py",
+    "appearance.py",
+    "privacy_manager.py",
+    "emulator_boot.py",
+    "emulator_shutdown.py",
+    "emulator_erase.py",
+    "emulator_delete.py",
+)
+
+DESKCLOCK = "com.google.android.deskclock"
+
+
+def _single_serial() -> str:
+    rows = [line.split() for line in PRIMARY.lines("adb_devices_single")[1:] if line.strip()]
+    assert len(rows) == 1, rows
+    return rows[0][0]
+
+
+def _serials() -> list[str]:
+    return [line.split()[0] for line in PRIMARY.lines("adb_devices_multiple")[1:] if line.strip()]
+
+
+def _adb_device(chain: FakeToolchain, *rules: Rule) -> None:
+    """adb: the recorded single-device listing, then ``rules`` in order."""
+    chain.install("adb", [Rule(("devices",), stdout=PRIMARY.text("adb_devices_single")), *rules])
+
+
+def _gone(*match: str) -> Rule:
+    """The device is not there for this call: adb's recorded device-not-found."""
+    return Rule(match, stderr=PRIMARY.text("adb_shell_device_not_found"), exit=1)
+
+
+def _broadcast() -> Rule:
+    """A demo-mode broadcast SystemUI took: the recorded `am broadcast` answer."""
+    return Rule(("broadcast",), stdout=BATCH_API33.text("am_broadcast_demo_datatype_echo"))
+
+
+def _derived_names(listing: str, *suffixes: str) -> tuple[str, str]:
+    """A one-AVD listing as if it held more: the recorded name, substituted per suffix."""
+    name = listing.split(maxsplit=1)[0]
+    return name, "".join(listing.replace(name, f"{name}{suffix}") for suffix in suffixes)
+
+
+def _status_bar_ok(chain, _tmp):
+    _adb_device(chain, Rule(("settings", "put"), exit=0), _broadcast())
+
+
+def _status_bar_gone(chain, _tmp):
+    _adb_device(chain, Rule(("settings", "put"), exit=0), _gone("command", "network"), _broadcast())
+
+
+def _appearance_ok(chain, _tmp):
+    _adb_device(chain, Rule(("uimode",), exit=0))
+
+
+def _appearance_gone(chain, _tmp):
+    _adb_device(chain, Rule(("uimode",), exit=0), _gone("font_scale"))
+
+
+def _dump() -> Rule:
+    """deskclock's recorded dump: POST_NOTIFICATIONS granted, READ_CALENDAR denied."""
+    return Rule(("dumpsys", "package"), stdout=PRIMARY.text("dumpsys_package_permissions"))
+
+
+def _privacy_ok(chain, _tmp):
+    _adb_device(chain, Rule(("pm", "grant"), exit=0), Rule(("pm", "revoke"), exit=0), _dump())
+
+
+def _privacy_gone(chain, _tmp):
+    _adb_device(
+        chain,
+        _gone("grant", "android.permission.CAMERA"),
+        Rule(("pm", "grant"), exit=0),
+        _dump(),
+    )
+
+
+def _boot(*suffixes: str):
+    """AVDs listed per suffix; the recorded emulator is the AVD named without one."""
+
+    def setup(chain, _tmp):
+        _name, listing = _derived_names(PRIMARY.text("emulator_list_avds"), *suffixes)
+        chain.install("emulator", [Rule(("-list-avds",), stdout=listing)])
+        _adb_device(chain, Rule(("emu", "avd", "name"), stdout=PRIMARY.text("emu_avd_name")))
+
+    return setup
+
+
+def _shutdown(*gone: int):
+    """Both recorded emulators listed; the ones at ``gone`` vanish before their kill."""
+
+    def setup(chain, _tmp):
+        serials = _serials()
+        chain.install(
+            "adb",
+            [
+                Rule(("devices",), stdout=PRIMARY.text("adb_devices_multiple")),
+                Rule(("emu", "avd", "name"), stdout=PRIMARY.text("emu_avd_name")),
+                *(_gone(serials[i], "emu", "kill") for i in gone),
+                Rule(("emu", "kill"), exit=0),
+            ],
+        )
+
+    return setup
+
+
+def _erase(*broken: str):
+    """An AVD home holding A and B; a userdata file that is a directory cannot be erased."""
+
+    def setup(_chain, tmp):
+        home = tmp / "avd"
+        for name in ("A", "B"):
+            avd = home / f"{name}.avd"
+            avd.mkdir(parents=True)
+            if name in broken:
+                (avd / "userdata-qemu.img").mkdir()
+            else:
+                (avd / "userdata-qemu.img").write_bytes(b"")
+        return {"ANDROID_AVD_HOME": str(home)}
+
+    return setup
+
+
+def _delete(*missing: str, old: bool = False):
+    """avdmanager lists the recorded AVD and two derived twins; the ``missing`` refuse."""
+
+    def setup(chain, tmp):
+        name, listing = _derived_names(PRIMARY.text("avdmanager_list_avd_compact"), "", "_b", "_c")
+        chain.install(
+            "avdmanager",
+            [
+                Rule(("list", "avd", "-c"), stdout=listing),
+                *(
+                    Rule(
+                        ("--name", f"{name}{suffix}"),
+                        stderr=PRIMARY.text("avdmanager_delete_missing"),
+                        exit=1,
+                    )
+                    for suffix in missing
+                ),
+                Rule(("delete", "avd"), stdout=PRIMARY.text("avdmanager_delete")),
+            ],
+        )
+        if not old:
+            return {}
+        home = tmp / "avd"
+        for age, suffix in enumerate(("", "_b", "_c")):
+            avd = home / f"{name}{suffix}.avd"
+            avd.mkdir(parents=True)
+            stamp = 1_700_000_000 - age * 3600
+            os.utime(avd, (stamp, stamp))
+        return {"ANDROID_AVD_HOME": str(home)}
+
+    return setup
+
+
+class BatchCase(NamedTuple):
+    ident: str
+    script: str
+    argv: tuple[str, ...]
+    key: str  # the item field that names it
+    planned: int  # how many items the batch has
+    failed: tuple[str, ...]  # the names of the items that must fail
+    status: int  # 1 when items failed, 3 when the device went
+    setup: object  # (chain, workdir) -> extra env or None
+
+    def run(self, tmp_path: Path, argv: tuple[str, ...] | None = None):
+        chain = FakeToolchain(tmp_path / "toolchain")
+        chain.assert_isolated()
+        env = self.setup(chain, tmp_path) or {}
+        return chain.run(self.script, *(self.argv if argv is None else argv), **env)
+
+
+def _batch_cases() -> list[BatchCase]:
+    on = ("--serial", _single_serial(), "--json")
+    perm = ("--package", DESKCLOCK, *on)
+    avd = PRIMARY.text("emulator_list_avds").split()[0]
+    named = PRIMARY.text("avdmanager_list_avd_compact").split()[0]
+    first, second = _serials()[:2]
+    status_bar, appearance, privacy = "status_bar.py", "appearance.py", "privacy_manager.py"
+    boot, shutdown = "emulator_boot.py", "emulator_shutdown.py"
+    erase, delete = "emulator_erase.py", "emulator_delete.py"
+    kill = ("--all", "--no-verify", "--json")
+    return [
+        # --- one item failing ---------------------------------------------------
+        BatchCase(
+            "status_bar one failed",
+            status_bar,
+            ("--battery", "150", "--wifi", *on),
+            "operation",
+            2,
+            ("battery",),
+            FAILURE,
+            _status_bar_ok,
+        ),
+        BatchCase(
+            "appearance one failed",
+            appearance,
+            ("--theme", "dark", "--font-scale", "0", *on),
+            "operation",
+            2,
+            ("font_scale",),
+            FAILURE,
+            _appearance_ok,
+        ),
+        BatchCase(
+            "privacy_manager grant one failed",
+            privacy,
+            ("--grant", "notification,bogus", *perm),
+            "permission",
+            2,
+            ("bogus",),
+            FAILURE,
+            _privacy_ok,
+        ),
+        BatchCase(
+            "privacy_manager reset one failed",
+            privacy,
+            ("--reset", "calendar,bogus", *perm),
+            "permission",
+            2,
+            ("bogus",),
+            FAILURE,
+            _privacy_ok,
+        ),
+        BatchCase(
+            "emulator_boot one failed",
+            boot,
+            ("--all", "--json"),
+            "avd",
+            2,
+            (f"{avd}_b",),
+            FAILURE,
+            _boot("", "_b"),
+        ),
+        BatchCase(
+            "emulator_shutdown one failed",
+            shutdown,
+            kill,
+            "serial",
+            2,
+            (second,),
+            FAILURE,
+            _shutdown(1),
+        ),
+        BatchCase(
+            "emulator_erase one failed",
+            erase,
+            ("--all", "--force", "--json"),
+            "avd",
+            2,
+            ("B",),
+            FAILURE,
+            _erase("B"),
+        ),
+        BatchCase(
+            "emulator_delete --all one failed",
+            delete,
+            ("--all", "--yes", "--json"),
+            "name",
+            3,
+            (f"{named}_b",),
+            FAILURE,
+            _delete("_b"),
+        ),
+        BatchCase(
+            "emulator_delete --old one failed",
+            delete,
+            ("--old", "1", "--yes", "--json"),
+            "name",
+            2,
+            (f"{named}_c",),
+            FAILURE,
+            _delete("_c", old=True),
+        ),
+        # --- every item failing: still one object, no early exit -----------------
+        BatchCase(
+            "status_bar all failed",
+            status_bar,
+            ("--battery", "150", "--wifi", "--wifi-level", "9", *on),
+            "operation",
+            2,
+            ("battery", "wifi"),
+            FAILURE,
+            _status_bar_ok,
+        ),
+        BatchCase(
+            "appearance all failed",
+            appearance,
+            ("--font-scale", "0", *on),
+            "operation",
+            1,
+            ("font_scale",),
+            FAILURE,
+            _appearance_ok,
+        ),
+        BatchCase(
+            "privacy_manager all failed",
+            privacy,
+            ("--grant", "bogus,nonsense", *perm),
+            "permission",
+            2,
+            ("bogus", "nonsense"),
+            FAILURE,
+            _privacy_ok,
+        ),
+        BatchCase(
+            "emulator_boot all failed",
+            boot,
+            ("--all", "--json"),
+            "avd",
+            2,
+            (f"{avd}_b", f"{avd}_c"),
+            FAILURE,
+            _boot("_b", "_c"),
+        ),
+        BatchCase(
+            "emulator_shutdown all failed",
+            shutdown,
+            kill,
+            "serial",
+            2,
+            (first, second),
+            FAILURE,
+            _shutdown(0, 1),
+        ),
+        BatchCase(
+            "emulator_erase all failed",
+            erase,
+            ("--all", "--force", "--json"),
+            "avd",
+            2,
+            ("A", "B"),
+            FAILURE,
+            _erase("A", "B"),
+        ),
+        BatchCase(
+            "emulator_delete all failed",
+            delete,
+            ("--all", "--yes", "--json"),
+            "name",
+            3,
+            (named, f"{named}_b", f"{named}_c"),
+            FAILURE,
+            _delete("", "_b", "_c"),
+        ),
+        # --- the device goes away mid-batch: exit 3, the rest not attempted -------
+        BatchCase(
+            "status_bar device gone",
+            status_bar,
+            ("--battery", "50", "--wifi", "--time", "9:41", *on),
+            "operation",
+            3,
+            ("wifi", "time"),
+            DEVICE_UNAVAILABLE,
+            _status_bar_gone,
+        ),
+        BatchCase(
+            "appearance device gone",
+            appearance,
+            ("--theme", "dark", "--font-scale", "1.3", "--locale", "fr-FR", *on),
+            "operation",
+            3,
+            ("font_scale", "locale"),
+            DEVICE_UNAVAILABLE,
+            _appearance_gone,
+        ),
+        BatchCase(
+            "privacy_manager device gone",
+            privacy,
+            ("--grant", "notification,camera,contacts", *perm),
+            "permission",
+            3,
+            ("camera", "contacts"),
+            DEVICE_UNAVAILABLE,
+            _privacy_gone,
+        ),
+    ]
+
+
+BATCH_CASES = _batch_cases()
+
+
+def assert_batch(result: subprocess.CompletedProcess, case: BatchCase) -> dict:
+    """The batch shape: one object, ``items`` with per-item verdicts, the exact status."""
+    shown = f"\n{case.ident}\nstdout: {result.stdout[-1500:]!r}\nstderr: {result.stderr[-800:]!r}"
+    assert "Traceback" not in result.stdout + result.stderr, f"crashed:{shown}"
+    assert result.returncode == case.status, f"exit {result.returncode}, not {case.status}:{shown}"
+    payload = json.loads(result.stdout)  # the whole of stdout is the one object
+    assert isinstance(payload, dict), shown
+    assert "results" not in payload, f"`results` is `items` now:{shown}"
+    assert payload["success"] is False, shown
+    for key in ("error", "remedy"):
+        assert isinstance(payload.get(key), str) and payload[key].strip(), f"no {key}:{shown}"
+    items = payload.get("items")
+    assert isinstance(items, list) and len(items) == case.planned, f"items {items!r}:{shown}"
+    for item in items:
+        assert isinstance(item.get(case.key), str), f"no {case.key} in {item}:{shown}"
+        assert isinstance(item.get("success"), bool), f"no success in {item}:{shown}"
+        assert {"error", "remedy"} <= set(item), f"no error/remedy keys in {item}:{shown}"
+        if item["success"]:
+            assert item["error"] is None and item["remedy"] is None, f"{item}:{shown}"
+        else:
+            assert isinstance(item["error"], str) and item["error"].strip(), f"{item}:{shown}"
+            assert isinstance(item["remedy"], str) and item["remedy"].strip(), f"{item}:{shown}"
+    failed = sorted(item[case.key] for item in items if not item["success"])
+    assert failed == sorted(case.failed), f"failed {failed}, not {sorted(case.failed)}:{shown}"
+    return payload
+
+
+@pytest.mark.parametrize("case", BATCH_CASES, ids=lambda case: case.ident)
+def test_a_batch_is_one_object_with_its_items_and_the_exact_status(case: BatchCase, tmp_path):
+    payload = assert_batch(case.run(tmp_path), case)
+    if case.status == DEVICE_UNAVAILABLE:
+        items = payload["items"]
+        stop = case.planned - len(case.failed)
+        assert all(item["success"] for item in items[:stop]), items
+        assert "not attached" in items[stop]["error"], items[stop]
+        for item in items[stop + 1 :]:
+            assert "not attempted" in item["error"], item
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in BATCH_CASES if case.status == FAILURE and case.planned > len(case.failed)],
+    ids=lambda case: case.ident,
+)
+def test_a_batch_that_failed_is_error_and_remedy_in_text_mode(case: BatchCase, tmp_path):
+    """Without --json: the items as before on stdout, then Error: / Remedy: on stderr."""
+    result = case.run(tmp_path, tuple(arg for arg in case.argv if arg != "--json"))
+    shown = f"\n{case.ident}\nstdout: {result.stdout[-800:]!r}\nstderr: {result.stderr[-800:]!r}"
+    assert "Traceback" not in result.stdout + result.stderr, shown
+    assert result.returncode == case.status, shown
+    lines = result.stderr.splitlines()
+    assert any(line.startswith("Error:") for line in lines), shown
+    assert any(line.startswith("Remedy:") for line in lines), shown
+    assert not result.stdout.lstrip().startswith("{"), f"JSON in text mode:{shown}"
+
+
+def test_a_batch_that_succeeded_is_success_and_items_at_exit_0(tmp_path):
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    _privacy_ok(chain, tmp_path)
+    argv = ("--grant", "notification", "--package", DESKCLOCK, "--serial", _single_serial())
+    result = chain.run("privacy_manager.py", *argv, "--json")
+    assert result.returncode == 0, result
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True and payload["action"] == "grant", payload
+    (item,) = payload["items"]
+    assert item["permission"] == "notification" and item["success"] is True, item
+    assert item["error"] is None and item["remedy"] is None, item
+
+
+def test_a_device_lost_after_an_item_failed_is_named_where_it_stopped(tmp_path):
+    """Battery fails its own check, then the device goes during Wi-Fi.
+
+    The top-level error must name the item that met the device error (wifi),
+    not the first failed one (battery, which ran and failed on its own), and
+    count the items that ran before it (1 of 3).
+    """
+    case = next(case for case in BATCH_CASES if case.ident == "status_bar device gone")
+    argv = ("--battery", "150", "--wifi", "--time", "9:41", "--serial", _single_serial())
+    result = case.run(tmp_path, (*argv, "--json"))
+    shown = f"\nstdout: {result.stdout[-1200:]!r}\nstderr: {result.stderr[-400:]!r}"
+    assert result.returncode == DEVICE_UNAVAILABLE, shown
+    payload = json.loads(result.stdout)
+    assert [item["success"] for item in payload["items"]] == [False, False, False], shown
+    assert "not attempted" in payload["items"][2]["error"], shown
+    assert "stopped at operation wifi" in payload["error"], shown
+    assert "1 of 3" in payload["error"], shown
+
+
+def _uses_the_batch_runner(source: str) -> bool:
+    """Whether a script reports through common.batch, read from its AST.
+
+    An import of ``common.batch`` (or anything from it), or a reference to
+    ``BatchFailure`` -- the two ways a script can produce the batch shape.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module == "common.batch":
+            return True
+        if isinstance(node, ast.ImportFrom) and node.module == "common":
+            if any(alias.name == "batch" for alias in node.names):
+                return True
+        if isinstance(node, ast.Import) and any(a.name == "common.batch" for a in node.names):
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "BatchFailure":
+            return True
+        if isinstance(node, ast.Name) and node.id == "BatchFailure":
+            return True
+    return False
+
+
+def _batch_scripts() -> set[str]:
+    """Every script that uses the batch runner, discovered from the code."""
+    return {
+        script
+        for script in _python_scripts()
+        if _uses_the_batch_runner((SCRIPTS / script).read_text(encoding="utf-8"))
+    }
+
+
+def _uncovered(scripts: set[str], cases) -> dict[str, list[str]]:
+    """Batch scripts missing a one-failed or an all-failed case."""
+    one = {case.script for case in cases if 0 < len(case.failed) < case.planned}
+    every = {case.script for case in cases if len(case.failed) == case.planned}
+    missing: dict[str, list[str]] = {}
+    for script in sorted(scripts):
+        lacking = [
+            name
+            for name, have in (("one failed", one), ("all failed", every))
+            if script not in have
+        ]
+        if lacking:
+            missing[script] = lacking
+    return missing
+
+
+def test_every_batch_script_has_a_one_failed_case_and_an_all_failed_case():
+    """Read off the scripts: a new user of common.batch must get its cases here."""
+    found = _batch_scripts()
+    assert found == set(BATCH_SCRIPTS), (
+        f"batch users found in the code {sorted(found)} differ from BATCH_SCRIPTS "
+        f"{sorted(BATCH_SCRIPTS)}"
+    )
+    assert not _uncovered(found, BATCH_CASES), _uncovered(found, BATCH_CASES)
+
+
+def test_the_batch_guard_catches_a_new_batch_script_with_no_cases():
+    """Anti-vacuity: the discovery sees each import form, and a script without cases fails."""
+    for source in (
+        "from common.batch import Batch\n",
+        "from common import batch\n",
+        "import common.batch\n",
+        "from common import cli\nraise cli.BatchFailure('e', 'r')\n",
+    ):
+        assert _uses_the_batch_runner(source), source
+    assert not _uses_the_batch_runner("from common import cli\ncli.fail('e', 'r')\n")
+    assert _uncovered({"new_batch.py"}, BATCH_CASES) == {
+        "new_batch.py": ["one failed", "all failed"]
+    }
+    assert "status_bar.py" not in _uncovered({"status_bar.py"}, BATCH_CASES)
