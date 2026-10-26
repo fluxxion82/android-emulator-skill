@@ -64,6 +64,8 @@ its three tests, so all three describe the same run.
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import shutil
 import subprocess
@@ -626,3 +628,212 @@ def test_the_sweep_covers_the_scripts_n5_named():
     assert any(
         mode.script == "emulator_create.py" and "--device" in mode.argv for mode in MODES
     ), "no create is swept"
+
+
+# ===========================================================================
+# Usage errors: in the schema too (exit 2, one object under --json)
+# ===========================================================================
+#
+# argparse's own error path prints prose to stderr and exits 2. Under --json
+# that left a caller parsing stdout with an empty document behind a status it
+# could see but not read. Every script builds its parser through
+# ``common.cli.parser`` (held there by test_cli_boundary's guard), which keeps
+# exit 2 and answers in the shared refusal shape when --json was asked for.
+# These run the real CLIs, in the broken toolchain, and require that no tool
+# was reached: a rejected command line must not have touched a device.
+
+USAGE = 2
+
+# Defined by no script: argparse's "unrecognized arguments" (or, where the
+# script has a required argument, the missing-argument error argparse reports
+# first -- still a usage error).
+UNKNOWN_FLAG = "--no-such-flag-anywhere"
+
+# A value the flag's own type rejects, for every script with a typed flag that
+# can reject one. Kept honest by the test at the end of this file, which reads
+# each script's AST for such flags and requires an entry here or a reason in
+# TYPED_EXEMPT.
+TYPED_USAGE_ERRORS: dict[str, tuple[str, ...]] = {
+    "anr_watcher.py": ("--top", "many"),
+    "app_state_capture.py": ("--log-lines", "many"),
+    "appearance.py": ("--font-scale", "big"),
+    "emulator_boot.py": ("--timeout", "soon"),
+    "emulator_create.py": ("--api", "latest"),
+    "emulator_delete.py": ("--old", "some"),
+    "emulator_erase.py": ("--timeout", "soon"),
+    "emulator_selector.py": ("--count", "many"),
+    "emulator_shutdown.py": ("--timeout", "soon"),
+    "gesture.py": ("--swipe", "sideways"),
+    "keyboard.py": ("--count", "many"),
+    "location.py": ("--lat", "north"),
+    "log_monitor.py": ("--severity", "loud"),
+    "navigator.py": ("--max-scrolls", "0"),
+    "privacy_manager.py": ("--step", "big"),
+    "sms.py": ("--limit", "many"),
+    "snapshot.py": ("--timeout", "soon"),
+    "status_bar.py": ("--battery", "full"),
+    "test_recorder.py": ("--size", "huge"),
+    "visual_diff.py": ("--threshold", "low"),
+}
+
+TYPED_EXEMPT: dict[str, str] = {
+    "localization_audit.py": "--res and --source are type=Path, which accepts any string",
+    "avd.py": "its one typed argument is the verb, routed before argparse: see the verb cases",
+    "logs.py": "its one typed argument is the verb, routed before argparse: see the verb cases",
+}
+
+# A router hands everything after the verb to the delegate's own parser, so a
+# usage error inside a verb is the delegate's -- and must still be JSON.
+SUBCOMMAND_USAGE_ERRORS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("avd.py", ("list", UNKNOWN_FLAG)),
+    ("avd.py", ("start", "--timeout", "soon")),
+    ("logs.py", ("tail", UNKNOWN_FLAG)),
+    ("logs.py", ("tail", "--severity", "loud")),
+)
+
+
+def _python_scripts() -> list[str]:
+    """Every Python script, from the boundary guard's positive enumeration."""
+    from test_cli_boundary import SCRIPT_NAMES
+
+    return list(SCRIPT_NAMES)
+
+
+def _usage_cases() -> list:
+    def _param(script: str, argv: tuple[str, ...], what: str):
+        return pytest.param(script, argv, id=f"{script.removesuffix('.py')} {what}")
+
+    cases = [_param(script, (UNKNOWN_FLAG,), "unknown flag") for script in _python_scripts()]
+    cases += [
+        _param(script, argv, " ".join(argv)) for script, argv in sorted(TYPED_USAGE_ERRORS.items())
+    ]
+    cases += [_param(script, argv, " ".join(argv)) for script, argv in SUBCOMMAND_USAGE_ERRORS]
+    return cases
+
+
+def _run_usage(script: str, argv: tuple[str, ...], toolchains, tmp_path: Path) -> Outcome:
+    """Run one command line in the broken toolchain, in a fresh working directory."""
+    workdir = tmp_path / f"run-{len(list(tmp_path.iterdir()))}"
+    workdir.mkdir()
+    mode = Mode(script, argv, None, "usage error", (), USAGE)
+    return _invoke(mode, toolchains["broken"], workdir)
+
+
+def _fold(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _argparse_message(stderr: str) -> str:
+    """The message from argparse's ``<prog>: error: <message>`` line."""
+    assert ": error: " in stderr, f"no argparse error line on stderr: {stderr[-600:]!r}"
+    return _fold(stderr.split(": error: ", 1)[1])
+
+
+def _assert_one_usage_object(outcome: Outcome, label: str) -> dict:
+    """Exit 2, and stdout is one line holding exactly the three contract keys."""
+    shown = f"\n{label}\nstdout: {outcome.stdout[-600:]!r}\nstderr: {outcome.stderr[-600:]!r}"
+    assert "Traceback" not in outcome.stdout + outcome.stderr, f"crashed:{shown}"
+    assert outcome.returncode == USAGE, f"exit {outcome.returncode}, not {USAGE}:{shown}"
+    lines = outcome.stdout.splitlines()
+    assert len(lines) == 1, f"stdout is {len(lines)} lines, not one JSON object:{shown}"
+    payload = json.loads(lines[0])
+    assert isinstance(payload, dict), f"not an object:{shown}"
+    assert set(payload) == {"success", "error", "remedy"}, f"keys {sorted(payload)}:{shown}"
+    assert payload["success"] is False, shown
+    assert isinstance(payload["error"], str) and payload["error"].strip(), shown
+    assert isinstance(payload["remedy"], str) and payload["remedy"].strip(), shown
+    assert outcome.tools == (), f"a rejected command line reached {outcome.tools}:{shown}"
+    assert outcome.stderr == "", f"the JSON usage error also wrote stderr:{shown}"
+    return payload
+
+
+@pytest.mark.parametrize(("script", "argv"), _usage_cases())
+def test_a_usage_error_under_json_is_one_refusal_object_at_exit_2(
+    script: str, argv: tuple[str, ...], toolchains, tmp_path
+):
+    """The same command line twice: without --json it is prose, with it the object.
+
+    The object's ``error`` is argparse's own message -- the one the prose run
+    prints after ``error:`` -- so the two modes cannot disagree about what was
+    wrong, and its ``remedy`` carries the usage line.
+    """
+    label = f"{script} {' '.join(argv)}"
+    text = _run_usage(script, argv, toolchains, tmp_path)
+    assert "Traceback" not in text.stdout + text.stderr, f"{label} crashed:\n{text.stderr[-800:]}"
+    assert text.returncode == USAGE, f"{label}: exit {text.returncode}\n{text.stderr[-600:]}"
+    assert text.stdout == "", f"{label}: a text-mode usage error wrote stdout: {text.stdout!r}"
+    assert text.stderr.startswith("usage:"), f"{label}: not argparse prose: {text.stderr!r}"
+    assert text.tools == (), f"{label}: a rejected command line reached {text.tools}"
+    message = _argparse_message(text.stderr)
+
+    payload = _assert_one_usage_object(
+        _run_usage(script, (*argv, "--json"), toolchains, tmp_path), f"{label} --json"
+    )
+    assert (
+        payload["error"] == message
+    ), f"{label}: --json says {payload['error']!r}, the prose says {message!r}"
+    assert "usage:" in payload["remedy"], f"{label}: the remedy has no usage line: {payload}"
+
+
+def test_a_scripts_alias_for_json_gets_the_object_too(toolchains, tmp_path):
+    """visual_diff's ``--details`` is its published alias for ``--json``."""
+    _assert_one_usage_object(
+        _run_usage("visual_diff.py", (UNKNOWN_FLAG, "--details"), toolchains, tmp_path),
+        "visual_diff --details",
+    )
+
+
+@pytest.mark.parametrize("router", ["avd.py", "logs.py"])
+def test_an_unknown_verb_under_json_is_the_object(router: str, toolchains, tmp_path):
+    """The router's own usage error: the verb table in prose, or one object."""
+    text = _run_usage(router, ("frobnicate",), toolchains, tmp_path)
+    assert text.returncode == USAGE and text.stdout == "", text
+    assert "Unknown verb 'frobnicate'" in text.stderr, text.stderr
+
+    payload = _assert_one_usage_object(
+        _run_usage(router, ("frobnicate", "--json"), toolchains, tmp_path),
+        f"{router} frobnicate --json",
+    )
+    assert "frobnicate" in payload["error"], payload
+
+
+def test_json_after_the_end_of_options_is_a_value_not_the_flag(toolchains, tmp_path):
+    """``--`` ends the options: a ``--json`` after it is a positional (a file), so prose."""
+    argv = (UNKNOWN_FLAG, "--", "--json", "b.png")
+    outcome = _run_usage("visual_diff.py", argv, toolchains, tmp_path)
+    assert outcome.returncode == USAGE, outcome
+    assert outcome.stdout == "", f"`-- --json` was read as the flag: {outcome.stdout!r}"
+    assert outcome.stderr.startswith("usage:"), outcome.stderr
+    assert _argparse_message(outcome.stderr) == f"unrecognized arguments: {UNKNOWN_FLAG}"
+
+
+def _fallible_typed_flags(script: str) -> list[str]:
+    """Flags whose ``type=`` (other than str / Path) or ``choices=`` can reject a value."""
+    tree = ast.parse((SCRIPTS / script).read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            continue
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+        if "choices" in keywords or keywords.get("type", "str") not in ("str", "Path"):
+            found.append(ast.unparse(node.args[0]) if node.args else "?")
+    return found
+
+
+def test_every_script_with_a_typed_flag_has_a_bad_value_case():
+    """Derived from the scripts: a new typed flag on an uncovered script fails here."""
+    uncovered = {
+        script: flags
+        for script in _python_scripts()
+        if (flags := _fallible_typed_flags(script))
+        and script not in TYPED_USAGE_ERRORS
+        and script not in TYPED_EXEMPT
+    }
+    assert not uncovered, f"typed flags with no bad-value usage case: {uncovered}"
+    covered = {*TYPED_USAGE_ERRORS, *TYPED_EXEMPT} - {"localization_audit.py"}
+    stale = sorted(script for script in covered if not _fallible_typed_flags(script))
+    assert not stale, f"bad-value cases for scripts with no fallible typed flag: {stale}"

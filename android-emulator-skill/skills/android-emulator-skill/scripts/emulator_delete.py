@@ -382,7 +382,7 @@ class EmulatorDeleter:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Delete Android Virtual Devices (AVDs)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -469,9 +469,9 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
             # by a typo, by an ANDROID_EMU_DELETE_KEEP of 0, or by reading
             # "--old 0" as "0 days old". Two flags for the same irreversible
             # act, one of them by accident, is not a spelling worth keeping
-            # (part of L5's evidence).
-            _fail_usage(
-                args,
+            # (part of L5's evidence). A usage error through the parser: under
+            # --json the shared refusal object, at exit 2.
+            parser.error(
                 f"--old {args.old} keeps no AVDs, which deletes every one of "
                 f"them. Use `--all --yes` if that is what you mean, or pass "
                 f"--old N with N >= 1.",
@@ -510,20 +510,6 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
         print(message)
 
     sys.exit(0)
-
-
-def _fail_usage(args: argparse.Namespace, message: str) -> None:
-    """Reject a usage error the way the rest of the skill does: exit 2.
-
-    ``--json`` gets ``{"error": ...}`` on stdout rather than argparse prose on
-    stderr, because a caller that asked for JSON parses stdout and would
-    otherwise see an empty document behind a non-zero status.
-    """
-    if args.json:
-        print(json.dumps({"error": message}, indent=2))
-    else:
-        print(f"Error: {message}", file=sys.stderr)
-    sys.exit(2)
 
 
 def _report_batch(

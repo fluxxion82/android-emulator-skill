@@ -824,8 +824,11 @@ def test_stop_with_a_malformed_id_is_a_usage_error_like_the_other_modes(monkeypa
 
     assert exc.value.code == 2
     captured = capsys.readouterr()
-    assert "Invalid session id" in captured.err
-    assert captured.out == "", "a usage error printed a JSON object"
+    # A usage error under --json is the shared refusal object (common.cli.parser).
+    payload = json.loads(captured.out)
+    assert payload["success"] is False
+    assert "Invalid session id" in payload["error"]
+    assert captured.err == ""
 
 
 def test_stop_on_a_damaged_session_is_the_boundarys_refusal(monkeypatch, capsys, store):

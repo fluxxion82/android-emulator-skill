@@ -284,7 +284,7 @@ class AppearanceController:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Control Android device appearance (theme, font scale, locale)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

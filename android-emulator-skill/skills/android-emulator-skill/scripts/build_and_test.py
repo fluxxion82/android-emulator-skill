@@ -184,7 +184,7 @@ def _emit_result(args: argparse.Namespace, result, build_id: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Build and test Android Gradle projects with progressive disclosure",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

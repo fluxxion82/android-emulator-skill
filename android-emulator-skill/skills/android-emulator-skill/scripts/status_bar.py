@@ -540,7 +540,7 @@ class StatusBarController:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Control Android status bar appearance",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

@@ -291,7 +291,7 @@ SHUTDOWN_REMEDY = (
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Shutdown Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

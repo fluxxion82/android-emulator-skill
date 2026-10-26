@@ -689,7 +689,7 @@ def main(argv: list[str] | None = None):
 
 
 def _run(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Suggest, list, and boot the best Android AVD for a task",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

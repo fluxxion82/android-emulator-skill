@@ -557,7 +557,7 @@ def _refuse(result: dict) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description=(
             "Post a notification into the shade as the system shell, verify what an "
             "app actually posted, and toggle POST_NOTIFICATIONS."

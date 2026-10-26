@@ -642,3 +642,164 @@ def test_only_the_boundary_module_ends_the_process():
         f"library modules that end the process: {sorted(exiting)}. Only "
         f"{BOUNDARY_MODULE} may; everything under common/ and gradle/ raises."
     )
+
+
+# ===========================================================================
+# (f) every parser comes from cli.parser
+# ===========================================================================
+#
+# A usage error is reported by the parser, before main() has anything to
+# raise, so cli.run cannot shape it. cli.parser builds a parser that does --
+# one object under --json, argparse's prose otherwise -- and this holds every
+# script to it, positively: each script must construct its parser through the
+# factory, and nothing under scripts/ but common/cli.py may construct, subclass
+# or import argparse.ArgumentParser itself. navigator's hand-rolled
+# `_JsonAwareParser` was the one script that got this right, in its own shape.
+
+_FACTORY_CALLEES = frozenset({"cli.parser", "common.cli.parser"})
+
+
+def _parser_constructions(tree: ast.Module) -> tuple[list[ast.Call], list[str]]:
+    """(calls to the factory, every direct reference to argparse.ArgumentParser).
+
+    Read from the AST, so a docstring or comment that names the class is not a
+    use, and neither is an annotation (``-> argparse.ArgumentParser`` describes
+    what cli.parser returns). Everything else is: any ``ArgumentParser`` name
+    or attribute -- called, subclassed, aliased, handed on as
+    ``parser_class=``, or reached through it (``.__call__``) -- a
+    ``getattr(..., "ArgumentParser")``, and ``from argparse import
+    ArgumentParser``. Constructing is not the only way to get a parser that
+    answers in prose, so referring to the class at all is what is refused.
+    """
+    annotations: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arguments = node.args
+            every = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+            every += [arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None]
+            hints = [arg.annotation for arg in every] + [node.returns]
+        elif isinstance(node, ast.AnnAssign):
+            hints = [node.annotation]
+        else:
+            continue
+        for hint in hints:
+            if hint is not None:
+                annotations.update(id(sub) for sub in ast.walk(hint))
+
+    factory: list[ast.Call] = []
+    direct: list[str] = []
+    for node in ast.walk(tree):
+        if id(node) in annotations:
+            continue
+        if isinstance(node, ast.Call):
+            if ast.unparse(node.func) in _FACTORY_CALLEES:
+                factory.append(node)
+            elif (
+                ast.unparse(node.func) == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "ArgumentParser"
+            ):
+                direct.append(f"line {node.lineno}: {ast.unparse(node)}")
+        elif (isinstance(node, ast.Name) and node.id == "ArgumentParser") or (
+            isinstance(node, ast.Attribute) and node.attr == "ArgumentParser"
+        ):
+            direct.append(f"line {node.lineno}: {ast.unparse(node)}")
+        elif isinstance(node, ast.ImportFrom) and node.module == "argparse":
+            for alias in node.names:
+                if alias.name == "ArgumentParser":
+                    direct.append(f"line {node.lineno}: from argparse import ArgumentParser")
+    return factory, direct
+
+
+def _run_json_flags(tree: ast.Module) -> tuple[str, ...]:
+    """The json_flags the script hands cli.run (the default when it hands none)."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in ("cli.run", "common.cli.run"):
+            for keyword in node.keywords:
+                if keyword.arg == "json_flags":
+                    return tuple(ast.literal_eval(keyword.value))
+    return cli.JSON_FLAGS
+
+
+@pytest.mark.parametrize("script", SCRIPT_NAMES)
+def test_every_script_builds_its_parser_through_cli_parser(script: str):
+    tree = _tree(script)
+    factory, direct = _parser_constructions(tree)
+    assert not direct, (
+        f"{script} builds an argparse parser itself: {direct}. Use cli.parser(...), "
+        f"which answers a usage error in the refusal shape under --json."
+    )
+    assert factory, f"{script} never calls cli.parser(...): where does its parser come from?"
+
+    # The parser and the boundary must agree on what "answer in JSON" is spelled,
+    # or an alias (visual_diff's --details) gets JSON for a failure and prose
+    # for a usage error.
+    expected = _run_json_flags(tree)
+    for call in factory:
+        given = cli.JSON_FLAGS
+        for keyword in call.keywords:
+            if keyword.arg == "json_flags":
+                given = tuple(ast.literal_eval(keyword.value))
+        assert given == expected, (
+            f"{script} line {call.lineno}: cli.parser(json_flags={given}) but "
+            f"cli.run(json_flags={expected})"
+        )
+
+
+def _parser_offenders(root: Path) -> dict[str, list[str]]:
+    """Every module under ``root``, at any depth, that uses ArgumentParser but the factory's."""
+    offenders = {}
+    for path in sorted(root.rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        if relative == BOUNDARY_MODULE:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        _, direct = _parser_constructions(tree)
+        if direct:
+            offenders[relative] = direct
+    return offenders
+
+
+def test_no_module_builds_a_parser_around_the_factory():
+    """Nothing anywhere under scripts/ builds a parser, except the factory itself."""
+    offenders = _parser_offenders(SCRIPTS)
+    assert not offenders, f"argparse parsers built outside cli.parser: {offenders}"
+
+
+def test_the_module_scan_reaches_every_file_but_the_factory(tmp_path):
+    """Recursive, and the one exemption is common/cli.py by path, not by directory."""
+    direct = "import argparse\nparser = argparse.ArgumentParser()\n"
+    for relative in ("common/cli.py", "common/helpers.py", "gradle/deep/nested.py", "tool.py"):
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(direct, encoding="utf-8")
+    assert sorted(_parser_offenders(tmp_path)) == [
+        "common/helpers.py",
+        "gradle/deep/nested.py",
+        "tool.py",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "factory_calls", "direct_uses"),
+    [
+        ('"""argparse.ArgumentParser( in a docstring."""\nparser = cli.parser()', 1, 0),
+        ("# argparse.ArgumentParser( in a comment\nparser = cli.parser()", 1, 0),
+        ("def f() -> argparse.ArgumentParser:\n    return cli.parser()", 1, 0),
+        ("parser = argparse.ArgumentParser()", 0, 1),
+        ("import argparse as ap\nparser = ap.ArgumentParser()", 0, 1),
+        ("from argparse import ArgumentParser\nparser = ArgumentParser()", 0, 2),
+        ("class P(argparse.ArgumentParser):\n    pass", 0, 1),
+        ("parser = common.cli.parser(prog='x')", 1, 0),
+        ("x: argparse.ArgumentParser = cli.parser()", 1, 0),
+        ("def f(p: argparse.ArgumentParser) -> None:\n    pass", 0, 0),
+        ('parser = getattr(argparse, "ArgumentParser")()', 0, 1),
+        ("parser = argparse.ArgumentParser.__call__(argparse)", 0, 1),
+        ("make = argparse.ArgumentParser\nparser = make()", 0, 1),
+        ("cli.parser().add_subparsers(parser_class=argparse.ArgumentParser)", 1, 1),
+    ],
+)
+def test_the_parser_guard_reads_code_not_text(source, factory_calls, direct_uses):
+    """A guard that grepped would flag its own docstring, and miss an alias."""
+    factory, direct = _parser_constructions(ast.parse(source))
+    assert (len(factory), len(direct)) == (factory_calls, direct_uses), direct

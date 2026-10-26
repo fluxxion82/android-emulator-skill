@@ -795,7 +795,7 @@ def _remove_tree(path: Path) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Record an Android test run: screenshots + UI hierarchy per step.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

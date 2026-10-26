@@ -358,8 +358,10 @@ def test_d1_an_unknown_severity_name_is_a_usage_error(severity, toolchain, recor
     assert (
         result.returncode == 2
     ), f"--severity {severity} exited {result.returncode}:\n{result.stdout[:400]}"
+    # Under --json the usage error is the shared refusal object on stdout.
+    error = json.loads(result.stdout)["error"]
     for name in ACCEPTED_SEVERITIES:
-        assert name in result.stderr, f"the usage error does not name {name!r}:\n{result.stderr}"
+        assert name in error, f"the usage error does not name {name!r}:\n{error}"
     logcat_calls = [call for call in toolchain.calls("adb") if "logcat" in call]
     assert not logcat_calls, f"logs were read under a filter that was refused: {logcat_calls}"
 

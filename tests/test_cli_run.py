@@ -88,6 +88,184 @@ def test_an_argparse_usage_error_keeps_argparses_exit_2(capsys):
     assert "invalid int value" in err
 
 
+# ---------------------------------------------------------------------------
+# cli.parser: a usage error in the same shape
+# ---------------------------------------------------------------------------
+
+
+def _parsing_main(build=None, **parser_kwargs):
+    """A main whose whole job is to parse: ``--count`` is an int, ``files`` free."""
+
+    def main(argv):
+        parser = cli.parser(prog="script.py", **parser_kwargs)
+        parser.add_argument("--count", type=int)
+        parser.add_argument("--json", action="store_true")
+        parser.add_argument("files", nargs="*")
+        if build is not None:
+            build(parser)
+        parser.parse_args(argv)
+        return 0
+
+    return main
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--count", "many", "--json"], "argument --count: invalid int value: 'many'"),
+        (["--json", "--bogus"], "unrecognized arguments: --bogus"),
+    ],
+)
+def test_a_usage_error_under_json_is_one_object_at_exit_2(argv, message, capsys):
+    code, out, err = _run(_parsing_main(), argv, capsys)
+    assert code == 2
+    assert err == ""
+    assert out.count("\n") == 1, f"not one line: {out!r}"
+    payload = json.loads(out)
+    assert set(payload) == KEYS
+    assert payload["success"] is False
+    assert payload["error"] == message
+    assert payload["remedy"].startswith("usage: script.py"), payload["remedy"]
+
+
+def test_without_json_a_usage_error_is_argparses_prose(capsys):
+    code, out, err = _run(_parsing_main(), ["--count", "many"], capsys)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("usage: script.py")
+    assert "script.py: error: argument --count: invalid int value: 'many'" in err
+
+
+@pytest.mark.parametrize("argv", [["--bogus", "--", "--json"], ["--count", "x", "--", "--json"]])
+def test_json_after_the_end_of_options_does_not_ask_for_the_object(argv, capsys):
+    """``--`` ends the options: ``--json`` after it is a file name, so the error is prose."""
+    code, out, err = _run(_parsing_main(), argv, capsys)
+    assert code == 2
+    assert out == "", f"`-- --json` was taken for the flag: {out!r}"
+    assert "script.py: error:" in err
+
+
+def test_help_is_unchanged_by_json(capsys):
+    code, out, err = _run(_parsing_main(), ["--json", "--help"], capsys)
+    assert code == 0
+    assert out.startswith("usage: script.py")
+    assert err == ""
+
+
+def test_the_parser_honours_an_alias_for_json(capsys):
+    def _alias(parser):
+        parser.add_argument("--details", dest="json", action="store_true")
+
+    main = _parsing_main(build=_alias, json_flags=("--json", "--details"))
+    code, out, _ = _run(main, ["--details", "-x"], capsys)
+    assert code == 2
+    assert json.loads(out)["error"] == "unrecognized arguments: -x"
+
+
+def test_a_parser_handed_no_argv_reads_the_command_line(monkeypatch, capsys):
+    """What a router does: it sets sys.argv and calls the delegate's main()."""
+    monkeypatch.setattr(sys, "argv", ["avd.py list", "--bogus", "--json"])
+
+    def main():
+        parser = cli.parser(prog="avd.py list")
+        parser.add_argument("--json", action="store_true")
+        parser.parse_args()
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "unrecognized arguments: --bogus"
+
+
+def _with_a_subcommand(parser):
+    sub = parser.add_subparsers(dest="verb")
+    child = sub.add_parser("go")
+    child.add_argument("--speed", type=int)
+
+
+@pytest.mark.parametrize(
+    "argv", [["go", "--speed", "fast", "--json"], ["--json", "go", "--speed", "fast"]]
+)
+def test_a_subparser_inherits_the_object(argv, capsys):
+    """Wherever --json sits, an error in the subcommand is still the object."""
+    code, out, err = _run(_parsing_main(build=_with_a_subcommand), argv, capsys)
+    assert code == 2, err
+    payload = json.loads(out)
+    assert payload["error"] == "argument --speed: invalid int value: 'fast'"
+    # The subcommand's own usage line, not the root's.
+    assert payload["remedy"].endswith("go [-h] [--speed SPEED]"), payload["remedy"]
+
+
+def test_a_subparser_class_that_is_not_the_factorys_is_refused():
+    """A plain ArgumentParser child would answer its usage errors in prose under --json."""
+    with pytest.raises(TypeError, match="parser_class"):
+        cli.parser(prog="script.py").add_subparsers(parser_class=argparse.ArgumentParser)
+
+
+def _intermixed_parser():
+    parser = cli.parser(prog="script.py")
+    parser.add_argument("--count", type=int)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("files", nargs="*")
+    return parser
+
+
+def _exit_of(call) -> int:
+    with pytest.raises(SystemExit) as exc:
+        call()
+    return exc.value.code
+
+
+def test_intermixed_parsing_reads_the_argv_it_was_handed(monkeypatch, capsys):
+    """Not the ambient command line: an explicit ``--json`` there asks for the object."""
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    parser = _intermixed_parser()
+    assert _exit_of(lambda: parser.parse_intermixed_args(["--json", "--bogus"])) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["error"] == "unrecognized arguments: --bogus"
+
+
+def test_each_parse_records_its_own_argv_so_nothing_is_stale(monkeypatch, capsys):
+    """A second parse without --json answers in prose, whatever the first one asked."""
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    parser = _intermixed_parser()
+    parser.parse_args(["--json"])
+    capsys.readouterr()
+    assert _exit_of(lambda: parser.parse_intermixed_args(["--bogus"])) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "", f"the earlier parse's --json answered this one: {captured.out!r}"
+    assert "script.py: error: unrecognized arguments: --bogus" in captured.err
+
+
+@pytest.mark.parametrize(
+    "parse",
+    ["parse_args", "parse_known_args", "parse_intermixed_args", "parse_known_intermixed_args"],
+)
+def test_an_ambient_json_does_not_override_an_explicit_end_of_options(parse, monkeypatch, capsys):
+    """``-- --json`` handed to the parser is a file name, even when sys.argv says --json."""
+    monkeypatch.setattr(sys, "argv", ["script.py", "--json"])
+    parser = _intermixed_parser()
+    assert _exit_of(lambda: getattr(parser, parse)(["--count", "x", "--", "--json"])) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "", f"{parse} took the ambient --json: {captured.out!r}"
+    assert "invalid int value: 'x'" in captured.err
+
+
+def test_a_scripts_own_parser_error_call_is_the_object_too(capsys):
+    """``parser.error(...)`` after parsing -- a cross-flag check -- takes the same path."""
+
+    def main(argv):
+        parser = cli.parser(prog="script.py")
+        parser.add_argument("--json", action="store_true")
+        parser.parse_args(argv)
+        parser.error("--abandon goes with --stop SESSION_ID")
+
+    code, out, _ = _run(main, ["--json"], capsys)
+    assert code == 2
+    assert json.loads(out)["error"] == "--abandon goes with --stop SESSION_ID"
+
+
 def test_keyboard_interrupt_exits_130_and_prints_nothing_on_stdout(capsys):
     code, out, err = _run(_raising(KeyboardInterrupt()), ["--json"], capsys)
     assert code == 130

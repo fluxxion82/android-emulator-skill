@@ -492,7 +492,7 @@ def _print_summary(data: dict) -> None:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="List Android targets (connected devices + defined AVDs)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

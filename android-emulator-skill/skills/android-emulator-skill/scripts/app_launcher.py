@@ -643,7 +643,7 @@ def _report_action(
 
 
 def main(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Android app lifecycle management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

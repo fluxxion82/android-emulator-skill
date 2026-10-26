@@ -563,7 +563,7 @@ def require_user_on_device(manager: PrivacyManager) -> None:
 
 def main(argv: list[str] | None = None):
     """Main entry point."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Manage Android app permissions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

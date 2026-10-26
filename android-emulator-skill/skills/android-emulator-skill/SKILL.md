@@ -445,8 +445,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       is the shared refusal — `{"success": false, "error": ..., "remedy": ...}`
       under `--json`, `Error:` / `Remedy:` on stderr otherwise (it was the
       message alone on stdout), exit 1 — and a lookup's refusal carries its
-      `search` detail in the object. A usage error still prints `{"error": ...}`
-      at exit 2 (see Failures under Known gaps).
+      `search` detail in the object. A usage error is the same object at exit
+      2 (see Failures under Known gaps).
     - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible
       screen, and `Not found` is indistinguishable from "the item is two rows down". The default
       path now says which it was: `(searched 1 screen; this screen scrolls -- retry with
@@ -1796,6 +1796,14 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
   - A device that is **unavailable** (not found, offline, unauthorized) is the
     same object and exits **3** — whether `--serial` resolution noticed or adb
     did mid-run. Several devices and no `--serial` is 1.
+  - A **usage error** — an unknown flag, a bad value for a typed flag, a
+    missing required argument, a flag combination the script rejects, an
+    unknown `avd.py` / `logs.py` verb — exits **2** and is the same object
+    under `--json`: one line on stdout, `error` argparse's message, `remedy`
+    the usage line (for an unknown verb, the verbs). Inside a router verb it
+    is the delegate's own (`avd.py list --bogus --json`). Without `--json` it
+    is argparse's prose on stderr (the route guide for an unknown verb).
+    `--json` after `--` is a positional value, not the flag.
   - A script's own exit statuses pass through unchanged, including the ones
     that mean a *finding*: `crash_triage --fail-on-crash` and
     `localization_audit --strict` exit 2 when they find something, and
@@ -1825,11 +1833,9 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     Quick Start command and the modes its table lists twice — with the Android
     tools present and failing, and with none on PATH at all — and
     asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
-    naming the tool; the exact status), not just a non-zero exit.
-  - Not in the schema yet: a usage error (exit 2 — argparse's prose on stderr,
-    or a script's own `{"error": ...}` where it answers usage errors in JSON,
-    as `navigator` and `emulator_delete` do), and batches that report per item
-    — per operation in `status_bar` and `appearance`, per permission in
+    naming the tool; the exact status), not just a non-zero exit. It runs a
+    usage error through every script in both modes too.
+  - Not in the schema yet: batches that report per item — per operation in `status_bar` and `appearance`, per permission in
     `privacy_manager`'s grant/revoke, per AVD in the `emulator_*` `--all`
     modes — which exit 1 with their own summary when one item failed.
   - Device-error confirmation applies to app-file reads (`container` and

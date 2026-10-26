@@ -1121,7 +1121,7 @@ def format_live(result: dict, *, verbose: bool) -> str:
 
 def main(argv: list[str] | None = None) -> None:
     """Parse arguments and dispatch the selected inspection mode."""
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description=(
             "Inspect Android persistence models: Room annotations (--source), "
             "Room exported schema JSON (--schema), or a live debuggable app's "

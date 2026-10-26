@@ -349,7 +349,7 @@ ERASE_REMEDY = (
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Erase/Reset Android Virtual Devices to factory state",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

@@ -3253,7 +3253,7 @@ def _add_mode_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description=(
             "Watch for Android ANR/jank events via adb logcat. Use --watch/--since "
             "for the live stream, or --start/--stop for ANRBuster session mode."

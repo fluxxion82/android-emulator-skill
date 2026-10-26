@@ -352,7 +352,7 @@ def main(argv: list[str] | None = None):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = cli.parser(
         description="Boot Android emulators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
