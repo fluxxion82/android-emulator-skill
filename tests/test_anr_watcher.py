@@ -40,6 +40,7 @@ from fake_toolchain import (
     FakeToolchain,
     Frame,
     Rule,
+    answering_the_api_level,
     assert_refusal,
     framed,
     frames,
@@ -127,7 +128,9 @@ def test_watch_uses_subprocess_without_shell(monkeypatch):
         def wait(self, timeout=None):
             return 0
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(_FakePopen, STREAMING_LEVEL)
+    )
     try:
         ok = anr_watcher.AnrWatcher().watch(duration_seconds=1, json_mode=True)
     finally:
@@ -569,8 +572,18 @@ def test_n16_a_stop_while_the_stream_is_open_keeps_every_record_already_delivere
 # ---------------------------------------------------------------------------
 
 
+# The API level a live read asks once -- --watch first, a worker before it
+# claims its session: the recorded API 35 emulator's answer (getprop_sdk), a
+# level that streams, the read these specs are about. API 33 reads by dumps
+# (test_anr_watcher_api33.py).
+STREAMING_LEVEL = RecordedFixtures(RECORDED_ROOT / "emulator-api35").text("getprop_sdk")
+
+
 def _logcat_through(monkeypatch, fake) -> None:
     """Answer the worker's `adb logcat` with ``fake``, run the host's `ps`, refuse the rest.
+
+    The API level the worker asks first is answered as the recorded API 35
+    emulator answered it (getprop_sdk): a level that streams.
 
     The worker asks the host's `ps` about its own pid when it claims its
     session (common.anr_sessions), and ``subprocess.run`` is built on Popen --
@@ -586,7 +599,9 @@ def _logcat_through(monkeypatch, fake) -> None:
             return fake(cmd, **kwargs)
         raise AssertionError(f"the test's worker ran {cmd}")
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(popen, STREAMING_LEVEL)
+    )
 
 
 def test_n14_max_restarts_zero_spawns_the_stream_once(tmp_path, monkeypatch):
@@ -629,7 +644,7 @@ def test_n14_max_restarts_zero_spawns_the_stream_once(tmp_path, monkeypatch):
     _logcat_through(monkeypatch, _StreamThatEnds)
     # The device answers `device` whenever the worker asks -- it asks when a
     # stream ends by itself (review of PR #42): these streams end, it stays.
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     store = SessionStore(base_dir=tmp_path / "anr-sessions")
     meta = store.create({"serial": "emulator-5554"})
     try:
@@ -886,6 +901,7 @@ def test_one_stall_in_the_stream_is_one_printed_event(mode, name, reason, toolch
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, name) + "\n"),
             *uid_rules(recorded, PACKAGE, _stated_pid(_anr_record(recorded, name))),
             Rule(
@@ -912,6 +928,7 @@ def test_text_mode_shows_what_timed_out(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, INPUT) + "\n"),
             Rule(("logcat",), stdout=recorded.data(f"{INPUT}.bin")),
         ],
@@ -959,6 +976,7 @@ def test_logcat_failing_for_a_reason_adb_does_not_type_is_still_a_failure(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), exit=1),
         ],
     )
@@ -1616,6 +1634,7 @@ def _device_answers(recorded, logcat_records: list[Frame], **lookups: _Answer) -
     return [
         _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
         _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+        _Answer(("getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
         _Answer(("logcat",), stdout=framed(logcat_records), hold=True),
         lookups.get(
             "system_server", _Answer(("pidof", "system_server"), stdout=system_server + "\n")
@@ -1700,6 +1719,7 @@ def test_a_session_does_not_name_a_pid_from_a_header_forged_in_a_tag(recorded, t
         [
             _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
             _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+            _Answer(("getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             _Answer(
                 ("logcat", "-B"),
                 stdout=framed([_history(recorded), forging, victim, jank]),
@@ -1817,6 +1837,7 @@ def test_since_says_when_it_could_not_authenticate_an_anr(json_mode, toolchain, 
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stdout=recorded.data(f"{BROADCAST}.bin")),
         ],
     )
@@ -1845,6 +1866,7 @@ def test_since_does_not_count_an_anr_an_app_wrote(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, BROADCAST) + "\n"),
             Rule(("logcat",), stdout=framed([forged])),
         ],
@@ -1898,6 +1920,7 @@ def test_since_is_not_fooled_by_a_header_forged_in_a_tag(claim, toolchain, recor
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, INJECTION) + "\n"),
             Rule(("logcat", "-B"), stdout=framed([*before, forging.replace(message=message)])),
             Rule(("logcat",), stdout=printed + text.replace(forging.message, message)),
@@ -2013,7 +2036,7 @@ def test_a_stream_restart_forgets_who_held_each_pid(
     )
     # The device answers `device` whenever the worker asks -- it asks when a
     # stream ends by itself (review of PR #42): these streams end, it stays.
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     store = SessionStore(base_dir=tmp_path / "anr-sessions")
     meta = store.create({"serial": "emulator-5554"})
     try:
@@ -2041,6 +2064,7 @@ def test_start_json_answers_an_object_whose_session_id_stop_accepts(recorded, tm
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stdout=recorded.data(f"{BROADCAST}.bin")),
         ],
     )
@@ -2141,7 +2165,7 @@ def _worker_over_streams(store, streams: list[list[Frame]], tmp_path, monkeypatc
     _logcat_through(monkeypatch, _next_stream)
     # The device answers `device` whenever the worker asks -- it asks when a
     # stream ends by itself (review of PR #42): these streams end, it stays.
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     meta = store.create({"serial": "emulator-5554"})
     try:
         anr_watcher.AnrBuster(store=store).run_worker(meta.session_id, token=meta.worker_token)
@@ -2278,7 +2302,11 @@ def test_watch_prints_the_record_it_starts_on_marked_as_possibly_older(
     jank = _jank_records(recorded, (80,))[0]
     later = _moved(jank, 5)
     stream = _OpenLogcat(framed([jank, later]))
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", lambda *_a, **_k: stream)
+    monkeypatch.setattr(
+        anr_watcher.subprocess,
+        "Popen",
+        answering_the_api_level(lambda *_a, **_k: stream, STREAMING_LEVEL),
+    )
     watcher = anr_watcher.AnrWatcher(serial="emulator-5554")
 
     try:
@@ -2374,6 +2402,7 @@ def test_a_logcat_failure_is_typed_whatever_adb_wrote_before_it(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stderr=stderr, exit=1),
         ],
     )
@@ -2566,7 +2595,9 @@ def test_watch_prints_an_anr_record_while_the_stream_is_still_open(recorded, tmp
         streams.append(proc)
         return proc
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", _stand_in)
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(_stand_in, STREAMING_LEVEL)
+    )
     system_server = _system_server(recorded, BROADCAST)
     monkeypatch.setattr(anr_watcher, "get_system_server_pid", lambda *_a, **_k: system_server)
     # Whose process the report's pid is, as the device answered (recorded).
@@ -2878,6 +2909,7 @@ def test_a_read_cut_by_itself_asks_the_device_then_refuses(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             *get_state,
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stdout=jank.raw + _anr_record(recorded).raw[:40], exit=adb_exit),
         ],
     )
@@ -2908,7 +2940,11 @@ def test_watch_stopped_while_a_record_arrives_on_an_open_stream_says_so(
     """
     jank = _jank_records(recorded, (80,))[0]
     stream = _OpenLogcat(jank.raw + _anr_record(recorded).raw[:40])
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", lambda *_a, **_k: stream)
+    monkeypatch.setattr(
+        anr_watcher.subprocess,
+        "Popen",
+        answering_the_api_level(lambda *_a, **_k: stream, STREAMING_LEVEL),
+    )
     watcher = anr_watcher.AnrWatcher(serial="emulator-5554")
     try:
         assert watcher.watch(duration_seconds=1, json_mode=True) is True
@@ -3216,6 +3252,7 @@ def test_a_watch_whose_stream_ends_by_itself_asks_the_device_and_never_succeeds(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             *get_state,
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stdout=framed([_history(recorded)]), exit=0),
         ],
     )
@@ -3265,7 +3302,9 @@ def test_a_watch_whose_stream_gives_no_exit_status_asks_the_device(
         asked.append(args)
         raise DeviceNotFoundError(recorded_anywhere("adb_device_not_found").strip())
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", _ClosedNoStatus)
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(_ClosedNoStatus, STREAMING_LEVEL)
+    )
     monkeypatch.setattr(anr_watcher, "run_adb", _gone)
     monkeypatch.setattr(anr_watcher, "STREAM_EXIT_TIMEOUT_SECONDS", 0.1)
 
@@ -3547,6 +3586,7 @@ def test_since_reads_a_windows_title_as_text(title, toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, INPUT) + "\n"),
             *uid_rules(recorded, PACKAGE, _stated_pid(_anr_record(recorded, INPUT))),
             Rule(("logcat",), stdout=framed(records)),
@@ -3589,6 +3629,7 @@ def test_a_since_dump_that_times_out_asks_the_device(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             *get_state,
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stderr=recorded.text("adb_waiting_for_device"), hang=True),
         ],
     )
@@ -3640,6 +3681,7 @@ def test_since_does_not_file_an_anr_under_the_package_its_process_is_named_after
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, FOREIGN) + "\n"),
             Rule(("cmd", "package"), stdout=_foreign_listing(recorded)),
             Rule(("shell", "ps"), stdout=entry["ps_alive"]["output"]),
@@ -3714,6 +3756,7 @@ def test_since_text_says_what_it_could_not_attribute(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, FOREIGN) + "\n"),
             Rule(("cmd", "package"), stdout=_foreign_listing(recorded)),
             Rule(("shell", "ps"), stdout=entry["ps_alive"]["output"]),
@@ -3746,6 +3789,7 @@ def test_since_text_says_a_window_report_may_be_a_duplicate(toolchain, recorded)
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, BROADCAST) + "\n"),
             *uid_rules(recorded, PACKAGE, _stated_pid(report)),
             Rule(("logcat",), stdout=framed(records[: window + 1])),
@@ -3990,6 +4034,7 @@ def test_since_with_package_says_what_it_dropped_unnamed(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stdout=framed(_jank_records(recorded, (80,)))),
         ],
     )
@@ -4019,6 +4064,7 @@ def _cut_stream(toolchain, recorded, recorded_anywhere, adb_exit: int, said: str
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(
                 ("logcat",),
                 stdout=recorded.data(f"{CRASH_DUMP}.bin")[:-1],
@@ -4162,6 +4208,7 @@ def test_a_session_whose_stream_ends_saying_the_device_went_refuses_with_it(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(
                 ("logcat",),
                 stdout=recorded.data(f"{CRASH_DUMP}.bin"),
@@ -4209,6 +4256,7 @@ def test_a_session_whose_stream_keeps_ending_by_itself_is_never_a_quiet_success(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             *get_state,
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("logcat",), stdout=recorded.data(f"{CRASH_DUMP}.bin"), exit=0),
         ],
     )
@@ -4246,6 +4294,7 @@ def test_a_session_keeps_what_adb_said_before_it_exited(recorded, recorded_anywh
         [
             _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
             _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+            _Answer(("getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             _Answer(
                 ("logcat",),
                 stdout=bytes(raw),
@@ -4440,7 +4489,7 @@ def test_a_stream_whose_process_outlives_it_is_reaped_before_the_next_starts(
     monkeypatch.setattr(anr_watcher, "STREAM_EXIT_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
     _logcat_through(monkeypatch, _Lingering)
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     store = SessionStore(base_dir=tmp_path / "anr-sessions")
     meta = store.create({"serial": "emulator-5554"})
 
@@ -4515,6 +4564,7 @@ def test_a_stop_while_the_worker_decides_how_its_stream_ended_waits_for_the_answ
         [
             _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
             _Answer(("get-state",), stdout=recorded.text("adb_get_state"), once=True),
+            _Answer(("getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             late,
             _Answer(("logcat",), stdout=recorded.data(f"{CRASH_DUMP}.bin"), delay=2),
         ],
@@ -4576,6 +4626,7 @@ def test_a_device_error_adb_wrote_first_survives_a_long_stderr(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(
                 ("logcat",),
                 stdout=recorded.data(f"{CRASH_DUMP}.bin"),
@@ -4651,6 +4702,7 @@ def test_a_device_error_adb_wrote_between_the_kept_windows_is_still_typed(
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(
                 ("logcat",),
                 stdout=recorded.data(f"{CRASH_DUMP}.bin"),
@@ -4693,6 +4745,7 @@ def test_a_watch_of_bytes_that_are_not_records_keeps_the_device_error_adb_wrote(
         [
             _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
             _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+            _Answer(("getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             _Answer(
                 ("logcat",),
                 stdout=bytes(raw),
@@ -4821,12 +4874,14 @@ def test_start_answers_for_a_worker_that_registered_and_ended_before_it_looked(
             return None
         raise AssertionError(f"the test ran {cmd}")
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(popen, STREAMING_LEVEL)
+    )
     monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
     # The device is attached and answers `device` when asked.
     monkeypatch.setattr(anr_watcher, "resolve_device_identifier", lambda serial: serial)
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     monkeypatch.setattr(
         anr_watcher.sys,
@@ -4931,7 +4986,7 @@ def test_a_stop_that_comes_once_the_decision_has_begun_does_not_skip_it(
     )
     _logcat_through(monkeypatch, logcat_class)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     deciding = store.worker_deciding
     said_deciding: list[str] = []
@@ -5076,6 +5131,7 @@ def test_a_watch_gives_adb_the_workers_grace_before_reading_what_it_said(
         [
             _Answer(("devices",), stdout=recorded.text("adb_devices_single")),
             _Answer(("get-state",), stdout=recorded.text("adb_get_state")),
+            _Answer(("getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             _Answer(
                 ("logcat",),
                 stdout=bytes(raw),
@@ -5300,7 +5356,7 @@ def test_a_stop_during_the_end_of_stream_grace_does_not_skip_the_decision(
 
     _logcat_through(monkeypatch, _Logcat)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     meta = store.create({"serial": "emulator-5554", "package": None})
     try:
@@ -5372,7 +5428,7 @@ def test_a_stop_never_answers_with_a_summary_while_the_worker_is_unfinished(
 
     _logcat_through(monkeypatch, _Logcat)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setattr(anr_watcher, "WORKER_EXIT_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     meta = store.create({"serial": "emulator-5554", "package": None})
@@ -5508,7 +5564,7 @@ def test_a_stop_whose_identity_check_outlasts_the_worker_does_not_erase_its_fail
 
     _logcat_through(monkeypatch, _Logcat)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setattr(anr_watcher, "WORKER_EXIT_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     meta = store.create({"serial": "emulator-5554", "package": None})
@@ -5565,7 +5621,7 @@ def test_a_worker_that_claims_after_its_session_was_stopped_records_nothing(
     _logcat_through(monkeypatch, logcat_class)
     monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     try:
         worker_exit = anr_watcher.AnrBuster(store=store).run_worker(
@@ -5654,11 +5710,13 @@ def test_start_never_succeeds_once_its_workers_failure_is_published(
             return None
         raise AssertionError(f"the test ran {cmd}")
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(popen, STREAMING_LEVEL)
+    )
     monkeypatch.setattr(anr_watcher.signal, "signal", lambda *_a, **_k: None)
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
     monkeypatch.setattr(anr_watcher, "resolve_device_identifier", lambda serial: serial)
-    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial: None)
+    monkeypatch.setattr(anr_watcher, "_require_device", lambda _serial, timeout=None: None)
     monkeypatch.setenv("ANDROID_EMU_ANR_MAX_RESTARTS", "0")
     monkeypatch.setattr(
         anr_watcher.sys,
@@ -5873,6 +5931,7 @@ case " $* " in
     if [ -e "$d/dead" ]; then cat "$d/not_found" >&2; exit 1; fi
     cat "$d/get_state"; exit 0 ;;
   *" devices "*) cat "$d/devices"; exit 0 ;;
+  *" getprop "*) cat "$d/getprop"; exit 0 ;;
   *" logcat "*)
     cat "$d/records"
     if [ -e "$d/dies_on_stop" ]; then
@@ -6010,6 +6069,7 @@ def _stress_lane(lane: int, seed: int, root, recorded, recorded_anywhere) -> lis
         (device / "not_found").write_text(recorded_anywhere("adb_device_not_found"))
         (device / "get_state").write_text(recorded.text("adb_get_state"))
         (device / "devices").write_text(recorded.text("adb_devices_single"))
+        (device / "getprop").write_text(recorded.text("getprop_sdk"))
         kind = ("never", "at once", "near", "on stop")[cycle % 4]
         if kind == "on stop":
             (device / "dies_on_stop").write_text(f"{rng.uniform(0.0, 0.4):.3f}")
@@ -6108,6 +6168,7 @@ case " $* " in
     fi
     cat "$d/get_state"; exit 0 ;;
   *" devices "*) cat "$d/devices"; exit 0 ;;
+  *" getprop "*) cat "$d/getprop"; exit 0 ;;
   *" logcat "*)
     cat "$d/records"
     if [ ! -e "$d/ends_after" ]; then exec sleep 60; fi
@@ -6150,6 +6211,7 @@ class _LegacyWorker:
         (device / "not_found").write_text(recorded_anywhere("adb_device_not_found"))
         (device / "get_state").write_text(recorded.text("adb_get_state"))
         (device / "devices").write_text(recorded.text("adb_devices_single"))
+        (device / "getprop").write_text(recorded.text("getprop_sdk"))
         (device / "get_state_delay").write_text("4")
         if ends_after is not None:
             (device / "ends_after").write_text(f"{ends_after}")
@@ -6651,6 +6713,7 @@ def test_package_keeps_an_already_running_apps_records_by_uid(mode, stream, tool
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("cmd", "package"), stdout=_uid_listing(fixtures, name)),
             Rule(
                 ("logcat",),
@@ -6713,6 +6776,7 @@ def test_a_record_from_another_uid_is_not_the_packages(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
             Rule(("logcat",), stdout=framed(window)),
         ],
@@ -6868,6 +6932,7 @@ def test_watch_prints_the_record_it_starts_on_with_its_uid(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
             Rule(("logcat",), buffered=framed([jank]), stdout=framed(window[:1]), hang=True),
         ],
@@ -6922,6 +6987,7 @@ def test_since_says_what_it_did_not_count_from_isolated_processes(toolchain, rec
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
             Rule(("logcat",), stdout=framed(_with_uid(_app_window(recorded, RESTART), uid))),
         ],
@@ -7003,6 +7069,7 @@ def test_since_marks_records_of_a_shared_uid(toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("cmd", "package"), stdout=table_text),
             Rule(("logcat",), stdout=framed(_with_uid(_app_window(recorded, RESTART), uid))),
         ],
@@ -7177,6 +7244,7 @@ def test_package_keeps_the_verified_anr_main_kept(mode, toolchain, recorded):
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, BROADCAST) + "\n"),
             *uid_rules(recorded, PACKAGE, _stated_pid(_anr_record(recorded, BROADCAST))),
             Rule(
@@ -7328,6 +7396,7 @@ def test_package_says_what_it_did_not_count_from_its_sdk_sandbox(mode, toolchain
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
             Rule(
                 ("logcat",),
@@ -7438,6 +7507,7 @@ def test_since_says_when_the_packages_uid_changed_during_the_read(toolchain, rec
         [
             Rule(("devices",), stdout=recorded.text("adb_devices_single")),
             Rule(("get-state",), stdout=recorded.text("adb_get_state")),
+            Rule(("shell", "getprop", "ro.build.version.sdk"), stdout=recorded.text("getprop_sdk")),
             Rule(("pidof", "system_server"), stdout=_system_server(recorded, RESTART) + "\n"),
             Rule(("cmd", "package"), stdout=_uid_listing(recorded, RESTART)),
             Rule(

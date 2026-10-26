@@ -17,6 +17,13 @@ Two surfaces live in this file:
 The shared filter pipeline lives in ``common/anr_pipeline.py``; session
 storage in ``common/anr_sessions.py``.
 
+On API 33 (Android 13), whose logcat holds ``-B`` records back while it
+streams and loses them when it is stopped, both live readers -- --watch and
+the session worker -- read by dumps instead, as log_monitor does there
+(``common/dump_read.py``; ``ANDROID_EMU_LOG_POLL_SECONDS``,
+``ANDROID_EMU_LOG_DUMP_CAP_BYTES`` and ``ANDROID_EMU_LOG_STATE_TIMEOUT`` bound
+that read). Every other level streams.
+
 Android signals recognised (see ``common.anr_pipeline.parse_logcat_anr``):
 
 - Choreographer ``Skipped N frames!`` jank (duration ~= N * 16.7ms).
@@ -35,6 +42,7 @@ Environment variables (all ``ANDROID_EMU_ANR_`` prefixed):
 """
 
 import argparse
+import base64
 import contextlib
 import json
 import os
@@ -44,10 +52,11 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import NoReturn
@@ -57,7 +66,7 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-from common import cli, log_lifecycle, logcat  # noqa: E402
+from common import cli, dump_read, log_lifecycle, logcat  # noqa: E402
 from common.adb_exec import (  # noqa: E402
     _ADB_OWN_PREFIXES,
     AdbCommandError,
@@ -103,8 +112,10 @@ from common.anr_sessions import (  # noqa: E402
     CRASHED,
     DECIDING,
     LIVE_STATES,
+    OPENING,
     PENDING,
     RUNNING,
+    STOPPED_WHILE_OPENING,
     WORKER_END_LOCK_TIMEOUT_SECONDS,
     WORKER_TOKEN_FLAG,
     Identity,
@@ -195,7 +206,28 @@ DECIDING_TIMEOUT_SECONDS = (
 # write is refused -- its session abandoned or deleted -- finds out and stops.
 COUNTERS_PERSIST_SECONDS = 5.0
 # How long --start waits for its worker to claim the session before it cancels it.
+# The claim is the worker's first act: the device is asked nothing before it.
 REGISTRATION_TIMEOUT_SECONDS = 3.0
+# The bound a worker keeps on opening its read, from its claim (the session is
+# ``opening`` meanwhile): the device's level, and on API 33 its boot id and the
+# search for the newest record a system process wrote. One deadline for all of
+# it, passed down: every question inside -- each dump, the `get-state` after a
+# dump or a getprop that timed out, the anchor's write, the failure's own
+# question of the device -- gets only what is left, and none is asked once
+# nothing is. Past it, the opening can still take a stopped dump's reap
+# (KILL_REAP_TIMEOUT), adb's device listing in a refusal naming several devices
+# (DEVICE_LIST_TIMEOUT_SECONDS, common.adb_exec), and the write that publishes
+# how it ended (PUBLICATION_SECONDS: the write; a lock another command holds
+# longer delays it). That is OPENING_OVERRUN_SECONDS, and --start and --stop
+# wait for an opening session exactly OPENING_TIMEOUT_SECONDS +
+# OPENING_OVERRUN_SECONDS after it began (``_opening_until``).
+OPENING_TIMEOUT_SECONDS = dump_read.NEWEST_TIMEOUT
+PUBLICATION_SECONDS = 2.0
+OPENING_OVERRUN_SECONDS = (
+    dump_read.KILL_REAP_TIMEOUT + DEVICE_LIST_TIMEOUT_SECONDS + PUBLICATION_SECONDS
+)
+# How often --start, waiting on an opening, asks `ps` whether its worker is still there.
+OPENING_WORKER_CHECK_SECONDS = 0.5
 
 _LOGCAT_REMEDY = (
     "Check the device is connected (`adb devices`) and, with more than one attached, "
@@ -279,7 +311,7 @@ def _raise_device_error_said(returncode: int | None, stderr: str, serial: str | 
             raise device_error
 
 
-def _require_device(serial: str | None) -> None:
+def _require_device(serial: str | None, timeout: float = GET_STATE_TIMEOUT_SECONDS) -> None:
     """Refuse before any logcat read starts when adb has no device to give it (B4).
 
     `adb logcat` does not fail when its device is not there: it writes "-
@@ -296,9 +328,9 @@ def _require_device(serial: str | None) -> None:
             (MultipleDevicesError, exit 1).
         DeviceOfflineError: adb names the device in a state other than
             ``device`` -- logcat would wait for it too.
-        AdbError: adb could not be run, or did not answer in time.
+        AdbError: adb could not be run, or did not answer in time (``timeout``).
     """
-    result = run_adb("get-state", serial, timeout=GET_STATE_TIMEOUT_SECONDS, check=True)
+    result = run_adb("get-state", serial, timeout=timeout, check=True)
     state = result.stdout.strip()
     if state != "device":
         remedy = "Wait for the device to finish booting or reconnect it, then retry."
@@ -493,6 +525,20 @@ class _ProcessNames:
     def system_server_pid(self) -> str | None:
         """system_server's pid as this stream asked it (once): for the ANR assembler too."""
         return self._reader.system_server()
+
+    def forget_unanswered(self) -> None:
+        """A read that recovered: every question the device did not answer is asked again.
+
+        system_server's pid, a package's uids, the whole uid table, who a pid
+        ran as -- each only when the answer was "cannot say". What it answered,
+        and every owner learned from the log, is kept: a read made of dumps is
+        one continuous read, so no pid changed hands unseen.
+        """
+        self._reader.forget_unanswered()
+        self._answers = {name: uids for name, uids in self._answers.items() if uids is not None}
+        self._pid_uids = {pid: uid for pid, uid in self._pid_uids.items() if uid is not None}
+        if self._uid_table_asked and self._uid_table is None:
+            self._uid_table_asked = False
 
     def reset(self) -> None:
         """A new stream: forget every owner, and who system_server was."""
@@ -740,6 +786,10 @@ class _CaptureBoundary:
       after the session's first record, and is read. Nothing is compared by
       timestamp alone, so no clock -- a year turning over, a clock stepped
       back -- can move the line.
+
+    A session read by dumps (API 33) has none: its cursor already excludes
+    what it consumed, and an app may send one datagram twice, so skipping a
+    record because it equals one consumed would drop a new one.
     """
 
     # How many of the latest consumed records a restart's replay is held
@@ -770,6 +820,178 @@ class _CaptureBoundary:
         first = not self._consumed
         self._consumed.append(record)
         return self.AMBIGUOUS if first else self.READ
+
+
+class _SessionRecords:
+    """A session's records -> its events: the one pipeline both of its readers feed.
+
+    The stream (every level but API 33, ``_read_stream_into_events``) and the
+    dumps (API 33, ``_read_dumps_into_events``) hand records here in logd's
+    order. What happens to each -- the capture boundary, the names
+    system_server's sentences give, uid attribution under ``--package``, the
+    frame threshold, the events file -- is the same whichever read them.
+    """
+
+    def __init__(
+        self,
+        *,
+        out_handle,
+        counters: dict,
+        package: str | None,
+        min_frames: int,
+        session_start_ms: int,
+        names: _ProcessNames,
+        boundary: _CaptureBoundary | None,
+        assembler: AnrRecordAssembler,
+    ) -> None:
+        # Declared, not only grown: --stop reads a missing count as one this
+        # worker did not keep (an earlier version's), not as zero.
+        counters.setdefault("unnamed_dropped", {"records": 0, "pids": []})
+        counters.setdefault("uid_attribution", UID_ATTRIBUTED if package else UID_UNFILTERED)
+        counters.setdefault("shared_uid", [])
+        counters.setdefault("isolated_unattributed", {"records": 0, "uids": []})
+        counters.setdefault("sdk_sandbox_unattributed", {"records": 0, "uids": []})
+        counters.setdefault("package_uid_changed", [])
+        self._out_handle = out_handle
+        self._counters = counters
+        self._package = package
+        self._min_frames = min_frames
+        self._session_start_ms = session_start_ms
+        self._names = names
+        self._boundary = boundary
+        self._assembler = assembler
+        # Held reports released from the hold whose event could not be written.
+        self._lost = 0
+
+    def record(self, raw_events: list[dict], *, just_read: bool = False) -> None:
+        """Count, threshold and write the events the assembler completed: the one way one is written.
+
+        Every event -- completed as a record is read (``feed``), released from
+        the hold by quiet (``flush``) or at the read's end (``close``) -- is
+        written here and nowhere else (``_record_one``). A held WindowManager
+        report leaves the hold before its event is written, so a write that
+        fails counts what it had not written: the reports of this batch the
+        assembler released from its hold, from the one that failed on, and
+        those it still holds, into ``counters["held_unwritten"]``. Then the
+        error goes on, and ends the session as any does. An earlier failure
+        is not counted twice: the lost are kept, the held recounted (a later
+        ``close`` that writes them leaves only the lost). A report released by
+        quiet and then unwritable ended a session with zero events and no
+        count (Codex, final gate of c832cdf).
+        """
+        done = 0
+        try:
+            for raw_event in raw_events:
+                self._record_one(raw_event, just_read=just_read)
+                done += 1
+        except BaseException:
+            assembler = self._assembler
+            self._lost += sum(1 for event in raw_events[done:] if assembler.was_held(event))
+            self._say_unwritten()
+            raise
+
+    def _say_unwritten(self) -> None:
+        """``held_unwritten``: the held reports lost to a failed write, and those still held."""
+        unwritten = self._lost + self._assembler.held
+        if unwritten:
+            self._counters["held_unwritten"] = unwritten
+        else:
+            self._counters.pop("held_unwritten", None)
+
+    def _record_one(self, raw_event: dict, *, just_read: bool) -> None:
+        """One event: counted, thresholded, and -- if it is kept -- written. Only ``record`` calls it."""
+        names, package, counters = self._names, self._package, self._counters
+        min_frames, out_handle = self._min_frames, self._out_handle
+        session_start_ms = self._session_start_ms
+        verdict = None
+        # Both are logged from inside the app, so the record's pid and
+        # uid are the app process's own -- and neither text says which
+        # app that is. The pid is named only as the record is read, by
+        # what the stream said before it: a label. Under --package the
+        # uid says whose it is.
+        if raw_event["kind"] in PID_NAMED_KINDS:
+            raw_event["app"] = names.name_of(raw_event["pid"]) if just_read else None
+            if package:
+                verdict = _attribute_by_uid(raw_event, package, names)
+                _note_uid_attribution(counters, raw_event, verdict, package, names)
+        frames = raw_event.get("frames")
+        # Only Choreographer jank is frame-thresholded; ANRs (frames=None) pass.
+        below = frames is not None and frames < min_frames
+        if package and not matches_package(raw_event, package):
+            if _unattributed(raw_event):
+                counters["unattributed_anrs"] = counters.get("unattributed_anrs", 0) + 1
+            elif verdict == UID_ISOLATED and not below:
+                # An isolated process's uid is no package's: it may be
+                # the package's or another app's. Never counted, and
+                # listed, so --diff concludes nothing from its absence.
+                _count_uncounted(counters, "isolated_unattributed", raw_event["uid"])
+            elif verdict == UID_SDK_SANDBOX and not below:
+                # The package's SDK sandbox: its SDKs' records, not the
+                # app's. Never counted, and listed, likewise.
+                _count_uncounted(counters, "sdk_sandbox_unattributed", raw_event["uid"])
+            elif verdict == UID_UNKNOWN and not raw_event["app"] and not below:
+                # Nothing showed whose it is -- the package's uids
+                # unknown, and no `Start proc` named its process -- so
+                # it may be the package's: dropped, and counted, so
+                # --diff concludes nothing from its absence (closure
+                # review of v0.8.0). One below the threshold would
+                # have been dropped anyway.
+                _count_unnamed_drop(counters, raw_event["pid"])
+            return
+        if raw_event.get("ambiguous_tail"):
+            # Shown in the summary, kept out of every count, cluster
+            # and diff: nothing shows it was logged after --start.
+            if not below:
+                counters.setdefault("ambiguous_tail", []).append(_tail_evidence(raw_event))
+            return
+        counters["matched"] += 1
+        if below:
+            counters["dropped"] += 1
+            return
+        normalised = build_normalised_event(
+            raw_event,
+            session_start_ms=session_start_ms,
+            current_ms=int(time.time() * 1000),
+        )
+        if normalised is not None:
+            out_handle.write(event_to_jsonl(normalised) + "\n")
+
+    def take(self, records: list[logcat.LogRecord]) -> None:
+        """Read records in logd's order: admitted, named, assembled into events."""
+        boundary, counters, names = self._boundary, self._counters, self._names
+        package, assembler, record = self._package, self._assembler, self.record
+        for log_record in records:
+            verdict = _CaptureBoundary.READ if boundary is None else boundary.admit(log_record)
+            if verdict == _CaptureBoundary.REPLAYED:
+                continue
+            counters["total"] += 1
+            sentence = names.observe(log_record)
+            changed = names.changed_uid(package, sentence) if package else None
+            if changed is not None and changed not in counters["package_uid_changed"]:
+                # The package's uids were asked when the session began;
+                # what follows under this uid goes uncounted, and is said.
+                counters["package_uid_changed"] = [*counters["package_uid_changed"], changed]
+            ambiguous = verdict == _CaptureBoundary.AMBIGUOUS
+            record(assembler.feed(log_record, ambiguous=ambiguous), just_read=True)
+
+    def close(self) -> None:
+        """The read has ended: what the assembler still holds was seen; and what it could not see.
+
+        A WindowManager report nothing answered goes out, and the pids no
+        owner was found for and the ANR records set aside unauthenticated are
+        kept for the summary to disclose. A held report lives in memory until
+        its event is written, through ``record`` as every event is: what it
+        cannot write it counts (``counters["held_unwritten"]``) before the
+        error goes on, so none is ever dropped unsaid by a worker that ends
+        itself.
+        """
+        self.record(self._assembler.close())
+        # Written now, the held are no longer counted: only those lost stay.
+        self._say_unwritten()
+        self._counters["unnamed_pids"] = self._names.unnamed_pids
+        self._counters["unverified_anr_lines"] = (
+            self._counters.get("unverified_anr_lines", 0) + self._assembler.unverified
+        )
 
 
 # === LEGACY WATCHER ===
@@ -825,14 +1047,22 @@ class AnrWatcher:
         # against the package's uids, with the whole uid table asked once for
         # who else shares them (_attribute_by_uid).
         # Asked only until the watch is stopped, as the session worker asks:
-        # after Ctrl-C a lookup under way finishes, and no other starts.
+        # after Ctrl-C a lookup under way finishes, and no other starts --
+        # except on API 33, until the read's last poll is over: that poll
+        # comes after the Ctrl-C, and reads what was logged since the one
+        # before it (_watch_by_dumps).
+        self._reading_by_dumps = False
         self._names = _ProcessNames(
-            *_device_lookups(serial, may_ask=lambda: not self.interrupted),
-            uid_table=_uid_table_lookup(serial, may_ask=lambda: not self.interrupted),
+            *_device_lookups(serial, may_ask=self._may_ask),
+            uid_table=_uid_table_lookup(serial, may_ask=self._may_ask),
         )
         self._assembler = AnrRecordAssembler(
             self._names.system_server_pid, subject_owner=self._names.owns
         )
+
+    def _may_ask(self) -> bool:
+        """Whether the device may be asked who a pid is: until the watch stops, or its last read ends."""
+        return not self.interrupted or self._reading_by_dumps
 
     def build_logcat_command(self, since: str | None = None) -> list[str]:
         """Build the ``adb logcat -B`` command (pure arg→command map).
@@ -877,6 +1107,11 @@ class AnrWatcher:
         already buffered, which may predate the watch: its events are printed
         with ``"ambiguous_tail": true`` (see ``_CaptureBoundary``).
 
+        On API 33 the read is made of dumps instead (``_watch_by_dumps``): that
+        release's logcat holds ``-B`` records back while it streams and loses
+        them when it is stopped. The level is asked once; one the device does
+        not say is refused, never guessed to stream.
+
         Raises:
             DeviceError: adb ended the stream because the device is not
                 available, or the stream ended by itself and `adb get-state`
@@ -888,6 +1123,8 @@ class AnrWatcher:
                 ended inside one by itself while the device is still there.
                 Cut by our own stop, the lost record is said on stderr instead.
         """
+        if self._holds_binary_back():
+            return self._watch_by_dumps(duration_seconds, package, json_mode)
         cmd = self.build_logcat_command()
         if not json_mode:
             print("Watching for ANR/jank events", file=sys.stderr)
@@ -997,6 +1234,118 @@ class AnrWatcher:
                         self._process.wait(timeout=2)
                 if self._process and self._process.stdout:
                     self._process.stdout.close()
+
+    def _holds_binary_back(self) -> bool:
+        """Whether the device's logcat is Android 13's: asked once (``common.dump_read``).
+
+        Raises:
+            cli.Failure: The level is unknown, or getprop did not answer and
+                the device is still there (exit 1), with ``partial``.
+            adb_exec.DeviceError: As getprop raised it, or -- after a timeout
+                -- as ``get-state`` then says (exit 3).
+        """
+        try:
+            return dump_read.holds_binary_back(self.serial, "anr_watcher")
+        except (dump_read.ReadRefusedError, dump_read.DeviceGoneError) as error:
+            self._refuse_read(error)
+
+    def _watch_by_dumps(
+        self, duration_seconds: int | None, package: str | None, json_mode: bool
+    ) -> bool:
+        """--watch on API 33: a series of dumps one poll apart, never a stream.
+
+        That release's logcat holds ``-B`` records back while it streams and
+        loses them when it is stopped (recorded: logcat_stream_jank_records,
+        the fixture app's jank withheld by a stream stopped just after it, and
+        in the window dumped back). So the watch reads as log_monitor does on
+        that level (``common.dump_read``): it opens on the newest record a
+        system process wrote (a buffer with none gets a marker line, said on
+        stderr) and, every ``ANDROID_EMU_LOG_POLL_SECONDS`` (1 s), takes what
+        logd delivered after the records it has read -- found by logd's order,
+        never by a timestamp or an app's record -- then once more at
+        ``--duration`` and at Ctrl-C (that read may still ask the device who a
+        pid is, as any poll does). Each poll's records go through the same
+        record -> event pipeline as a streamed one (``_handle_record``: the
+        assembler, uid attribution under ``--package``); a poll that brings
+        none is the read going quiet (``_flush``). An event is printed about
+        one poll after it was logged.
+
+        Nothing it reads may predate the watch -- it reads only what follows
+        its opening record -- so nothing is ``ambiguous_tail``. What it shows
+        is what logd delivered: logd may drop records it prunes while a reader
+        is behind, as with any reader on any level.
+
+        Raises:
+            cli.Failure: A dump failed, overran its budget or its byte cap, was
+                not whole records, or the read lost its place (its record
+                gone from the buffer, held twice, past the cap) -- refused,
+                with the events already shown under ``partial``. One whose
+                device went is also that device error (exit 3).
+        """
+        if not json_mode:
+            print("Watching for ANR/jank events", file=sys.stderr)
+            if package:
+                print(f"Post-parse filter: {package}", file=sys.stderr)
+        stop = threading.Event()
+
+        def interrupt(_signum, _frame) -> None:
+            self.interrupted = True
+            stop.set()
+
+        # As _register_signal_handler: outside the main thread, no Ctrl-C.
+        with contextlib.suppress(ValueError):
+            signal.signal(signal.SIGINT, interrupt)
+        reader = dump_read.DumpRead(self.serial)
+        last_record_at = time.monotonic()
+
+        def take(records: list[logcat.LogRecord], _cursor: logcat.Cursor) -> None:
+            nonlocal last_record_at
+            if not records:
+                # Quiet for a poll: a held report nothing answered may be due.
+                self._flush(package, json_mode, time.monotonic() - last_record_at)
+                return
+            last_record_at = time.monotonic()
+            for record in records:
+                self._handle_record(record, package, json_mode)
+
+        failure: dump_read.ReadRefusedError | dump_read.DeviceGoneError | None = None
+        # Lookups go on through the last read, which comes after a Ctrl-C.
+        self._reading_by_dumps = True
+        try:
+            try:
+                opening = (
+                    min(dump_read.NEWEST_TIMEOUT, duration_seconds)
+                    if duration_seconds
+                    else dump_read.NEWEST_TIMEOUT
+                )
+                cursor = reader.open(opening)
+                deadline = time.monotonic() + duration_seconds if duration_seconds else None
+                dump_read.poll(reader, cursor, stop=stop, deadline=deadline, on_read=take)
+            except (dump_read.ReadRefusedError, dump_read.DeviceGoneError) as error:
+                failure = error
+        finally:
+            self._reading_by_dumps = False
+            # Whatever is still held when the read ends -- or breaks -- was
+            # seen, and goes out before anything else is said.
+            self._close(package, json_mode)
+            self._disclose_unverified()
+            self._disclose_unattributed()
+            self._disclose_jank_attribution()
+        if failure is not None:
+            self._refuse_read(failure)
+        return True
+
+    def _refuse_read(
+        self, error: dump_read.ReadRefusedError | dump_read.DeviceGoneError
+    ) -> NoReturn:
+        """Refuse a dump-made watch, the events it had shown under ``partial`` (exit 3 or 1)."""
+        shown = len(self.events)
+        dump_read.refuse(
+            error,
+            f" The watch had shown {shown} event{'s' if shown != 1 else ''}: under `partial` "
+            "(--json), not the whole watch.",
+            {"partial": self.get_json_output()},
+        )
 
     def _stream_exit(self, adb_stderr) -> tuple[int | None, str]:
         """``(adb's exit status, its stderr)`` once the stream has ended on its own.
@@ -1426,8 +1775,14 @@ class AnrBuster:
     def start(self, args: dict, serial: str | None) -> str:
         """Create session, detach worker, return session_id once its worker is recording.
 
-        Succeeds only on a worker that claimed the session and is ``running``:
-        a failure is published only with the session's end, in one write
+        Succeeds only on a worker that claimed the session and opened its
+        read: ``running``. A worker still ``opening`` is waited for exactly to
+        the bound it published with its claim (``_opening_until``); past it,
+        the session is stopped -- the worker cancels its opening and publishes
+        ``cancelled`` -- and --start refuses (exit 1), naming the opening and
+        how long it ran. A worker gone while it opened is answered as --stop
+        answers a worker gone without publishing its end. A failure is
+        published only with the session's end, in one write
         (``SessionStore.finish_worker``), so a running session holds none. A
         worker deciding how its stream ended is waited for, to that
         decision's bound; one that has already crashed is answered for as
@@ -1489,6 +1844,8 @@ class AnrBuster:
         except TimeoutError:
             registered = self._give_up_on_registration(session_id)
         settled = self._decided(registered)
+        if settled.status == OPENING:
+            settled = self._give_up_on_opening(settled)
         if settled.status != RUNNING or settled.counters.get("stream_failure"):
             self._refuse_unstarted(settled)
         return session_id
@@ -1526,6 +1883,39 @@ class AnrBuster:
             f"Read it with --get-details {session_id}, and --start again.",
         )
 
+    def _give_up_on_opening(self, waited: SessionMeta) -> SessionMeta:
+        """--start's answer for a worker still ``opening`` once its wait is over; the meta if not.
+
+        Under the session's lock. Opened, or ended, meanwhile: that meta,
+        answered as any other. Gone -- killed while it opened -- it is --stop's
+        answer for a worker gone without publishing its end
+        (``_refuse_unconcluded``). Otherwise the stop is recorded in the meta
+        (``SessionStore.mark_stop_requested``) and the worker signalled: it
+        cancels its opening, a dump under way stopped and reaped, and
+        publishes ``cancelled`` -- read under the lock, so even a read already
+        open is never published ``running``; --start refuses, exit 1, naming the opening
+        and how long it ran. A session that is not recording is never
+        answered as started: --start answered success over an opening with no
+        cursor (Codex, second review of the opening).
+        """
+        identity, why, signalled = Identity.UNRESOLVED, "", False
+        with self.store.transaction(waited.session_id) as meta:
+            if meta.status == OPENING:
+                # Recorded before the signal, under the lock the worker's
+                # publication that its read is open takes: whenever it handles
+                # the signal, it publishes ``cancelled``, never ``running``.
+                self.store.mark_stop_requested(meta)
+                identity, why = worker_identity(meta)
+                if identity is Identity.WORKER:
+                    try:
+                        os.kill(meta.pid, signal.SIGTERM)
+                        signalled = True
+                    except (ProcessLookupError, PermissionError):
+                        identity, why = worker_identity(meta)
+        if meta.status == OPENING:
+            _refuse_opening(meta, identity, why, signalled)
+        return meta
+
     def _give_up_on_registration(self, session_id: str) -> SessionMeta:
         """Cancel a session no worker claimed in time; the claimed meta when one just did."""
         with self.store.transaction(session_id) as meta:
@@ -1534,7 +1924,7 @@ class AnrBuster:
                 # this is refused, where one that did went on to record into a
                 # session --start had refused (fourth review of PR #42).
                 self.store.mark_cancelled(meta)
-        if meta.status == CANCELLED:
+        if meta.status == CANCELLED and meta.claimed_at_ms is None:
             cli.fail(
                 f"The worker for {session_id} did not register within "
                 f"{REGISTRATION_TIMEOUT_SECONDS:g}s, so the session is cancelled: a worker "
@@ -1551,14 +1941,32 @@ class AnrBuster:
         ``running`` session that holds a failure -- which this version's worker
         never writes (its failure comes with its end), but whose ``running``
         must never read as started: --start answered `{"success": true}` over
-        a DeviceNotFoundError already persisted (fourth review of PR #42).
+        a DeviceNotFoundError already persisted (fourth review of PR #42). A
+        worker ``opening`` its read is waited for to the bound it published
+        (``_opening_until``), so whatever is logged once --start has answered
+        follows its opening -- unless it is gone (``worker_identity``, every
+        ``OPENING_WORKER_CHECK_SECONDS``: --start's own child, killed, lingers
+        as a zombie a signal still reaches).
         """
         first_seen = time.time()
-        while meta.status == DECIDING or (
-            meta.status == RUNNING and meta.counters.get("stream_failure")
-        ):
-            since = _deciding_since(meta) or first_seen
-            if time.time() > since + DECIDING_TIMEOUT_SECONDS:
+        asked_at = time.monotonic()
+        while True:
+            if meta.status == DECIDING or (
+                meta.status == RUNNING and meta.counters.get("stream_failure")
+            ):
+                since = _deciding_since(meta) or first_seen
+                if time.time() > since + DECIDING_TIMEOUT_SECONDS:
+                    break
+            elif meta.status == OPENING:
+                if time.time() > _opening_until(meta):
+                    break
+                if time.monotonic() - asked_at >= OPENING_WORKER_CHECK_SECONDS:
+                    asked_at = time.monotonic()
+                    if worker_identity(meta)[0] is Identity.GONE:
+                        # It may have published its end just before it went.
+                        meta = self.store.load_meta(meta.session_id)
+                        break
+            else:
                 break
             time.sleep(0.05)
             meta = self.store.load_meta(meta.session_id)
@@ -1641,6 +2049,13 @@ class AnrBuster:
         failure = meta.counters.get("stream_failure")
         if isinstance(failure, dict):
             _refuse_broken_stream(session_id, failure)
+        if meta.status == CANCELLED and meta.claimed_at_ms is not None:
+            cli.fail(
+                f"Session {session_id}'s worker was still opening its read when it was asked "
+                f"to stop, so it cancelled the opening and recorded nothing: the session is "
+                f"cancelled.",
+                "Run --start again, and --stop the id it prints once it has printed it.",
+            )
         if meta.status == CANCELLED:
             cli.fail(
                 f"Session {session_id} had no worker recording yet when --stop came (it was "
@@ -1683,7 +2098,11 @@ class AnrBuster:
         """--stop's first step, under the lock: cancel a pending session, or signal its worker.
 
         Returns the pid signalled, None when nothing was. Writes nothing but a
-        cancellation: what the worker writes is the worker's.
+        cancellation, or, for a session of this lifecycle at work, that a stop
+        was asked (``SessionStore.mark_stop_requested``) -- before the signal,
+        so the worker's next publication, under this lock, reads it: an
+        opening asked to stop ends ``cancelled``, never ``running`` (third
+        review of the opening). What the worker writes is the worker's.
         """
         with self.store.transaction(session_id) as meta:
             if meta.status == PENDING:
@@ -1691,6 +2110,8 @@ class AnrBuster:
                 return None
             if meta.status not in LIVE_STATES and not _legacy_worker(meta):
                 return None
+            if meta.status in LIVE_STATES and meta.lifecycle is not None:
+                self.store.mark_stop_requested(meta)
             identity, _why = worker_identity(meta)
             if identity is not Identity.WORKER:
                 return None
@@ -1708,7 +2129,12 @@ class AnrBuster:
         to the same bound. A worker deciding how its stream ended is waited for
         to that decision's own bound (``DECIDING_TIMEOUT_SECONDS`` from when
         it began): answering before it saved a summary at exit 0 while the
-        worker went on to find the device gone (second review of PR #42).
+        worker went on to find the device gone (second review of PR #42). A
+        worker ``opening`` its read exactly to the end its opening published
+        (``_opening_until``), never a stop allowance on top: a stop asked 1 s
+        before that end answered 5.5 s after it (third review of the opening).
+        It cancels at once between its questions, and one under way is
+        bounded by what is left of the opening.
         """
         deadline = time.monotonic() + WORKER_EXIT_TIMEOUT_SECONDS
         while True:
@@ -1718,12 +2144,16 @@ class AnrBuster:
             ended = meta.status not in LIVE_STATES and not _legacy_worker(meta)
             if ended or not _alive(pid):
                 return
-            limit = deadline
-            since = _deciding_since(meta)
-            if since is not None:
-                limit = max(
-                    limit, time.monotonic() + since + DECIDING_TIMEOUT_SECONDS - time.time()
-                )
+            if meta.status == OPENING:
+                # Opening its read: to the end the opening published, no later.
+                limit = time.monotonic() + _opening_until(meta) - time.time()
+            else:
+                limit = deadline
+                since = _deciding_since(meta)
+                if since is not None:
+                    limit = max(
+                        limit, time.monotonic() + since + DECIDING_TIMEOUT_SECONDS - time.time()
+                    )
             if time.monotonic() >= limit:
                 return
             time.sleep(0.05)
@@ -1773,6 +2203,9 @@ class AnrBuster:
         sandbox = line_counters.get("sdk_sandbox_unattributed")
         sandbox = sandbox if isinstance(sandbox, dict) else {}
         changed = line_counters.get("package_uid_changed")
+        # WindowManager reports held in memory that the worker could not write
+        # as its read ended (_SessionRecords.close).
+        held = int(line_counters.get("held_unwritten", 0))
         summary = replace(
             summary,
             verification=VERIFICATION_UNKNOWN if unverified else None,
@@ -1794,6 +2227,11 @@ class AnrBuster:
             package_uid_changed=(
                 sorted(int(uid) for uid in changed) if isinstance(changed, list) else []
             ),
+            # Said only by a read made of dumps (API 33), which may write one.
+            anchor_written=(
+                anchor if isinstance(anchor := line_counters.get("anchor_written"), bool) else None
+            ),
+            held_unwritten=held,
         )
         # Every way this capture can be missing events, so --diff concludes
         # nothing from what is absent (Codex review of PR #34: a broken or
@@ -1810,11 +2248,17 @@ class AnrBuster:
                 (
                     "no worker recorded into it: it was cancelled before its worker started, "
                     "so nothing was captured",
-                    meta.status == CANCELLED,
+                    meta.status == CANCELLED and meta.claimed_at_ms is None,
+                ),
+                (
+                    "no worker recorded into it: it was cancelled while its worker was still "
+                    "opening its read, so nothing was captured",
+                    meta.status == CANCELLED and meta.claimed_at_ms is not None,
                 ),
                 (
                     f"abandoned with --abandon ({meta.extras.get('abandoned')}), so what its "
-                    f"worker read after that, and how its stream ended, are not in here",
+                    f"worker read after that, and how its stream ended, are not in here; "
+                    f"{HELD_UNKNOWN}",
                     meta.status == ABANDONED,
                 ),
                 (
@@ -1839,6 +2283,11 @@ class AnrBuster:
                     bool(restarts),
                 ),
                 (VERIFICATION_UNKNOWN, bool(unverified)),
+                (
+                    f"{_held_unwritten_text(held)} (WindowManager ANR reports held in memory "
+                    f"for ActivityManager's when the worker ended)",
+                    bool(held),
+                ),
             )
             if applies
         ]
@@ -1944,8 +2393,8 @@ class AnrBuster:
         its meta says may still change. The other modes refuse it (review of
         PR #44); a listing of every session cannot.
 
-        A session whose meta says its worker is at work (``running`` /
-        ``deciding``) while that worker is gone -- by --stop's test,
+        A session whose meta says its worker is at work (``opening`` /
+        ``running`` / ``deciding``) while that worker is gone -- by --stop's test,
         ``worker_identity``, not pid liveness -- never published how its
         capture ended: killed, or out of time for its session's lock. Its
         persisted ``status`` is kept, and qualified: ``unpublished_end`` true,
@@ -1997,6 +2446,8 @@ class AnrBuster:
             )
             duration_str = f"  capture={duration_s:.1f}s" if duration_s is not None else ""
             restart_str = f"  restarts={restarts}" if restarts else ""
+            if counters.get("anchor_written") is True:
+                restart_str += "  anchor line written to the device's log"
             reason = provisional[meta.session_id]
             provisional_str = f"  provisional: {reason}" if reason else ""
             status = meta.status
@@ -2039,6 +2490,15 @@ class AnrBuster:
         for session_id, summary in ((session_a, summary_a), (session_b, summary_b)):
             if summary is not None:
                 _refuse_reading_a_live_legacy_session(self.store.load_meta(session_id), "--diff")
+        for session_id, summary in ((session_a, summary_a), (session_b, summary_b)):
+            if summary is None:
+                # Not `Run --stop <id>` for a worker gone unpublished: that
+                # --stop refuses it (#50), as --get-details says.
+                with contextlib.suppress(FileNotFoundError, ValueError):
+                    meta = self.store.load_meta(session_id)
+                    unpublished = _unpublished_end(meta)
+                    if unpublished is not None:
+                        _refuse_details_of_an_unpublished_end(meta, unpublished)
         if summary_a is None or summary_b is None:
             missing = [s for s, x in [(session_a, summary_a), (session_b, summary_b)] if x is None]
             raise SessionError(
@@ -2067,10 +2527,14 @@ class AnrBuster:
     def run_worker(self, session_id: str, token: str | None = None) -> int:
         """Long-running worker entrypoint. Returns exit code.
 
-        Layout: claim meta → build ``adb logcat -B -T 1`` command → open
-        events.jsonl line-buffered → for each restart attempt, spawn logcat and
-        read records until EOF or subprocess death. SIGTERM flushes and exits
-        cleanly. A stream that ends by itself is asked about as --watch asks
+        Layout: claim meta (``opening``, with the bound the opening keeps) →
+        open the read (``_open_session_read``: the device's level, and on API
+        33 where the read starts) → ``running`` → build ``adb logcat -B -T 1``
+        command → open events.jsonl line-buffered → for each restart
+        attempt, spawn logcat and read records until EOF or subprocess death.
+        On API 33 the worker reads by dumps instead of the loop of streams
+        (``_read_session_by_dumps``), and a level the device does not say ends
+        the session with that reason. SIGTERM flushes and exits cleanly. A stream that ends by itself is asked about as --watch asks
         (``_ended_by_itself``): a device error in adb's words, or from `adb
         get-state`, ends the session as that error; with the device there, it
         is restarted (``ANDROID_EMU_ANR_MAX_RESTARTS``), and once no restart is
@@ -2102,9 +2566,12 @@ class AnrBuster:
         then, and the session's answers ignore them.
         """
         stop_flag = {"value": False}
+        # The same request, for a read that waits between its polls (API 33).
+        stopping = threading.Event()
 
         def _on_sigterm(_signum, _frame):
             stop_flag["value"] = True
+            stopping.set()
 
         # Before the claim: once it has claimed, --stop may signal this pid,
         # and a SIGTERM's default action would end the worker before it had
@@ -2112,14 +2579,6 @@ class AnrBuster:
         signal.signal(signal.SIGTERM, _on_sigterm)
         signal.signal(signal.SIGINT, _on_sigterm)
         pid = os.getpid()
-        try:
-            meta = self.store.claim_worker(session_id, pid=pid, token=token)
-        except (TransitionRefusedError, SessionBusyError, FileNotFoundError, ValueError):
-            # Not this worker's to record: cancelled by a --stop, or by a
-            # --start that gave up on it; claimed already; not its token.
-            # Nothing is written (fourth review of PR #42: a late claim
-            # recorded a device loss into a session --stop had answered for).
-            return 2
         counters = {
             "total": 0,
             "matched": 0,
@@ -2132,6 +2591,21 @@ class AnrBuster:
             "unnamed_dropped": {"records": 0, "pids": []},
             "ambiguous_tail": [],
         }
+        # Published with the claim: the session is ``opening``, within this
+        # bound -- one deadline, every question of the opening given only what
+        # is left of it. --start and --stop wait for it (_opening_until).
+        bound = {"since_ms": int(time.time() * 1000), "within_s": OPENING_TIMEOUT_SECONDS}
+        opening_deadline = time.monotonic() + OPENING_TIMEOUT_SECONDS
+        try:
+            meta = self.store.claim_worker(
+                session_id, pid=pid, token=token, counters=counters, opening=bound
+            )
+        except (TransitionRefusedError, SessionBusyError, FileNotFoundError, ValueError):
+            # Not this worker's to record: cancelled by a --stop, or by a
+            # --start that gave up on it; claimed already; not its token.
+            # Nothing is written (fourth review of PR #42: a late claim
+            # recorded a device loss into a session --stop had answered for).
+            return 2
 
         def own(write) -> None:
             """One of this worker's writes; refused, the session is no longer its own."""
@@ -2151,6 +2625,9 @@ class AnrBuster:
 
         proc: subprocess.Popen | None = None
         disowned = False
+        # Its end published already: a stop recorded before the read could be
+        # published open made that write ``cancelled`` (worker_opened).
+        published = False
         # A stream ended by itself and is to be restarted, which has not happened yet.
         restart_due = False
         try:
@@ -2166,13 +2643,49 @@ class AnrBuster:
                 "ANDROID_EMU_ANR_MAX_RESTARTS", DEFAULT_MAX_STREAM_RESTARTS, min_value=0
             )
             events_path = self.store.events_path(session_id)
+            # The read's opening, the session now this worker's and
+            # ``opening``: the device's level, and on API 33 its boot id and
+            # where the read opens. --start waits for it; whatever is logged
+            # once --start has answered follows the opening.
+            opening = self._open_session_read(serial, opening_deadline, stopping)
+            if opening.reader is not None:
+                # A read made of dumps says whether it wrote a marker line into
+                # the device's log -- in the meta now, whatever becomes of the
+                # session. A stream writes none, and says nothing of one.
+                counters["anchor_written"] = opening.reader.anchor_written
+            if opening.cursor is not None:
+                # The read's place, in the same write that says it is open.
+                counters["cursor"] = _checkpoint(opening.cursor, serial, opening.boot_id)
+            if opening.cancelled:
+                # A stop came before the read opened: nothing is recorded, and
+                # the end below publishes ``cancelled`` (finish_worker).
+                counters["cancelled"] = STOPPED_WHILE_OPENING
+                return 0
+            if opening.failure is None:
+                # Under the lock a stop is recorded under: a stop recorded
+                # first makes this write ``cancelled`` instead of ``running``.
+                try:
+                    opened = self.store.worker_opened(session_id, pid, counters)
+                except (TransitionRefusedError, FileNotFoundError) as error:
+                    raise _Disowned(str(error)) from error
+                if opened.status != RUNNING:
+                    published = True
+                    return 0
+            # The device is asked who a pid is until a stop is requested -- or,
+            # on API 33, until the read's last poll is over: that poll comes
+            # after the stop, and reads what was logged since the one before it.
+            reading_after_stop = {"value": False}
+
+            def may_ask() -> bool:
+                return not stop_flag["value"] or reading_after_stop["value"]
+
             # One of each for the whole session. The resolver forgets its owners
             # on every stream (re)start but keeps what it learned of packages; the
             # boundary remembers what was consumed, which a restart's replay is
             # held against.
             process_names = _ProcessNames(
-                *_device_lookups(serial, may_ask=lambda: not stop_flag["value"]),
-                uid_table=_uid_table_lookup(serial, may_ask=lambda: not stop_flag["value"]),
+                *_device_lookups(serial, may_ask=may_ask),
+                uid_table=_uid_table_lookup(serial, may_ask=may_ask),
             )
             boundary = _CaptureBoundary()
             cmd = AnrWatcher(serial=serial).build_logcat_command()
@@ -2218,7 +2731,42 @@ class AnrBuster:
                         counters["ended_unrestarted"] = True
                     return stop_flag["value"]
 
-                for attempt in range(max_restarts + 1):
+                # API 33 reads by dumps, never a stream (_read_session_by_dumps),
+                # and a level that could not be told, or a read that could not
+                # open, ends the session as it was found. Every other level
+                # streams, as it always has: the loop below, run there only.
+                dumps = opening.reader is not None or opening.failure is not None
+                if opening.failure is not None:
+                    counters["stream_failure"] = opening.failure
+                    note("stream_failed", **opening.failure)
+                elif dumps:
+                    reading_after_stop["value"] = True
+                    try:
+                        self._read_session_by_dumps(
+                            opening=opening,
+                            session_id=session_id,
+                            serial=serial,
+                            counters=counters,
+                            out_handle=out_handle,
+                            note=note,
+                            deciding=deciding,
+                            checkpoint=checkpoint,
+                            stopping=stopping,
+                            package=package,
+                            min_frames=min_frames,
+                            session_start_ms=meta.started_at_ms,
+                            process_names=process_names,
+                            max_restarts=max_restarts,
+                        )
+                    finally:
+                        reading_after_stop["value"] = False
+                    failure = counters.get("stream_failure")
+                    if failure is not None:
+                        note("stream_failed", **failure)
+                    else:
+                        note("stream_ended")
+
+                for attempt in range(0 if dumps else max_restarts + 1):
                     if stopped():
                         break
                     if attempt > 0:
@@ -2335,7 +2883,7 @@ class AnrBuster:
                 _reap(proc)
             # Never left saying it is deciding: it no longer is.
             counters.pop("deciding", None)
-            if not disowned:
+            if not disowned and not published:
                 # The worker's last write: how the session ended, with its
                 # counters and any failure, before it exits.
                 with contextlib.suppress(
@@ -2346,6 +2894,377 @@ class AnrBuster:
                     )
 
         return 2 if disowned or counters.get("stream_failure") else 0
+
+    def _open_session_read(
+        self, serial: str | None, deadline: float, stopping: threading.Event
+    ) -> "_Opening":
+        """After the claim: the device's level and, on API 33, where the session's read opens.
+
+        The level is asked once (``getprop``); one the device does not say
+        ends the session with that reason, never a stream. On API 33 the
+        device's boot id is read too (``/proc/sys/kernel/random/boot_id``) and
+        the opening placed (``common.dump_read.DumpRead.open``: the newest
+        record a system process wrote, or a marker line the read writes). All
+        of it within ``deadline`` (``OPENING_TIMEOUT_SECONDS`` from the claim),
+        passed down: every question -- a `get-state` after a getprop or dump,
+        and the failure's own question of the device (``_read_failure``)
+        included -- gets no more than what is left, and none is asked once
+        nothing is, so the opening ends within its stated bound. A failure is
+        kept for the worker to publish. A stop (``stopping``) ends it between
+        questions, and a dump under way is stopped and reaped: ``cancelled``.
+        """
+
+        def left() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise dump_read.ReadRefusedError(
+                    f"the read's opening did not finish within its {OPENING_TIMEOUT_SECONDS:g}s.",
+                    "Check the device answers `adb shell getprop` and `adb logcat -d` promptly, "
+                    "then retry.",
+                )
+            return remaining
+
+        def go_on() -> None:
+            if stopping.is_set():
+                raise dump_read.ReadCancelledError("the read was asked to stop before it opened.")
+
+        reader: dump_read.DumpRead | None = None
+        try:
+            go_on()
+            if not dump_read.holds_binary_back(
+                serial,
+                "anr_watcher",
+                timeout=min(dump_read.STATE_TIMEOUT, left()),
+                deadline=deadline,
+            ):
+                return _Opening()
+            go_on()
+            reader = dump_read.DumpRead(serial)
+            boot = dump_read.boot_id(serial, timeout=min(dump_read.STATE_TIMEOUT, left()))
+            go_on()
+            cursor = reader.open(
+                min(dump_read.NEWEST_TIMEOUT, left()), deadline=deadline, stop=stopping
+            )
+        except dump_read.ReadCancelledError:
+            return _Opening(reader=reader, cancelled=True)
+        except (dump_read.ReadRefusedError, dump_read.DeviceGoneError, AdbError) as error:
+            if stopping.is_set():
+                # A stop came first, or as the question failed: the stop is
+                # the answer. A worker held past its bound (a host too loaded
+                # to run it) resumes into a question already timed out, and
+                # --start, which asked it to stop, said it ends cancelled.
+                return _Opening(reader=reader, cancelled=True)
+            return _Opening(
+                reader=reader,
+                failure=_read_failure(error, serial, "could not start", deadline=deadline),
+            )
+        if stopping.is_set():
+            # Opened, but the stop came before the read was published open:
+            # nothing is recorded into it, as for any stop during the opening.
+            return _Opening(reader=reader, cancelled=True)
+        return _Opening(reader=reader, cursor=cursor, boot_id=boot)
+
+    def _read_session_by_dumps(
+        self,
+        *,
+        opening: "_Opening",
+        session_id: str,
+        serial: str | None,
+        counters: dict,
+        out_handle,
+        note: Callable[..., None],
+        deciding: Callable[[bool], None],
+        checkpoint: Callable[[], None],
+        stopping: threading.Event,
+        package: str | None,
+        min_frames: int,
+        session_start_ms: int,
+        process_names: _ProcessNames,
+        max_restarts: int,
+    ) -> None:
+        """The session's read on API 33: dumps one poll apart from its cursor, never a stream.
+
+        That release's logcat holds ``-B`` records back while it streams and
+        loses them when it is stopped: a session's stream stopped by --stop
+        lost the jank logged just before it (recorded:
+        logcat_stream_jank_records). So the worker reads as log_monitor does
+        on that level (``common.dump_read``): from the cursor it opened after
+        its claim, every ``ANDROID_EMU_LOG_POLL_SECONDS`` (1 s) it takes what
+        logd delivered after the records it has read, through the same
+        pipeline as a streamed record (``_read_dumps_into_events``) -- and at
+        --stop's SIGTERM, once more before it publishes ``stopped``. That last
+        read may still ask the device who a pid is (its lookups, each bounded
+        at ``LOOKUP_TIMEOUT_SECONDS``): it reads what was logged since the poll
+        before it, as any poll does; a stream's drain asks nothing.
+
+        **One logical read.** A failed dump is not the end of a stream: the
+        assembler, its held WindowManager reports and every correlation, the
+        names learned from the log, and the pipeline outlive it, and are closed
+        once, at the read's real end -- a stop, or what ends the session. Only
+        an answer the device could not give is asked again after a restart
+        (``_ProcessNames.forget_unanswered``, the assembler's likewise). No
+        replay is suppressed: the cursor already excludes what was read.
+
+        **The checkpoint.** The read's place -- the cursor: a system
+        process's frame and the frames read after it, base64 -- is kept in
+        the worker's counters (``counters["cursor"]``, ``_checkpoint``) with
+        the device's serial and the boot id it was opened in, and is written
+        to the session's meta with every write of the worker's, under the
+        session's lock: the periodic counter write, ``deciding``, and its end.
+        It covers the records read and processed: it moves on once every
+        record before it has gone through the pipeline, and before any write
+        publishes it the events file is synced -- a sync that fails puts the
+        checkpoint back to the last one whose events were synced and ends the
+        session, incomplete, saying so (``_kept_durable``). A WindowManager
+        report held for ActivityManager's lives in memory, in the assembler,
+        until its event is written, so a checkpoint may be past it. The
+        checkpoint resumes only this worker's own read (a restart below),
+        where the assembler and its held reports survive; a crashed or killed
+        worker's session is never resumed from it. Every event is written by
+        one function (``_SessionRecords.record``), which counts the held
+        reports it could not write: when the worker itself ends -- any failure
+        it can observe -- the session ends ``crashed``, incomplete, saying
+        exactly how many (``held_unwritten``). When it is killed, or the
+        session abandoned, reports it held in memory, if any, are lost and
+        their number is unknown (``HELD_UNKNOWN``, said in the gone-worker
+        answer, the --abandon remedy and the abandoned session's reason).
+
+        **A restart.** A dump that fails with the device still there -- it
+        did not finish, exited non-zero, passed the cap, `get-state` itself
+        failed -- ends that attempt; the worker publishes ``deciding`` (the
+        checkpoint with it), asks the device, and restarts the read up to
+        ``ANDROID_EMU_ANR_MAX_RESTARTS`` times, from the checkpoint its meta
+        holds, never from memory alone (``_resume``): on the same device and
+        boot, or not at all. What was logged while it was down follows the
+        cursor, and is read. A restart loses nothing logd still holds, so it
+        does not make the summary incomplete; each is counted
+        (``dump_restarts``) and noted in the events file.
+
+        **Its end.** A stop, after its final read: ``stopped``. Otherwise the
+        session ends ``crashed`` with ``counters["stream_failure"]`` --
+        incomplete, with the reason, and --stop refuses it (exit 3 for a
+        device gone): the read lost its place (the cursor turned over, is held
+        twice, or is past the cap), a dump was not records, the device went,
+        the restarts ran out, a restart found another boot or no checkpoint,
+        or the events file could not be synced.
+        """
+        # The opening's checkpoint is in the meta already: the worker wrote it
+        # with the end of its opening (run_worker).
+        reader, cursor, boot = opening.reader, opening.cursor, opening.boot_id
+        assembler = AnrRecordAssembler(
+            process_names.system_server_pid, subject_owner=process_names.owns
+        )
+        pipeline = _SessionRecords(
+            out_handle=out_handle,
+            counters=counters,
+            package=package,
+            min_frames=min_frames,
+            session_start_ms=session_start_ms,
+            names=process_names,
+            boundary=None,
+            assembler=assembler,
+        )
+        now = time.monotonic()
+        progress = _DumpProgress(last_record_at=now, last_written=now, durable=counters["cursor"])
+
+        def decide() -> dict | None:
+            """``deciding``, its checkpoint durable first; the sync's failure, if it failed."""
+            unsynced = _kept_durable(out_handle, counters, progress)
+            deciding(True)
+            return unsynced
+
+        failure: dict | None = None
+        try:
+            for attempt in range(max_restarts + 1):
+                what = "lost its place in logd's buffer"
+                try:
+                    if attempt > 0:
+                        counters["dump_restarts"] = attempt
+                        note("dump_restart", attempt=attempt)
+                        # A stop cuts the wait short; the read below still runs
+                        # once, from the checkpoint, before the worker ends.
+                        stopping.wait(RESTART_BACKOFF_SECONDS)
+                        what = "could not resume"
+                        cursor = self._resume(session_id, serial)
+                        what = "lost its place in logd's buffer"
+                        process_names.forget_unanswered()
+                        assembler.forget_unanswered()
+                    self._read_dumps_into_events(
+                        reader=reader,
+                        cursor=cursor,
+                        stopping=stopping,
+                        pipeline=pipeline,
+                        assembler=assembler,
+                        progress=progress,
+                        out_handle=out_handle,
+                        counters=counters,
+                        checkpoint=checkpoint,
+                        serial=serial,
+                        boot_id=boot,
+                    )
+                    break
+                except _NotDurable as error:
+                    deciding(True)
+                    failure = error.failure
+                    break
+                except dump_read.DeviceGoneError as error:
+                    failure = _with_unsynced(
+                        decide(), _read_failure(error, serial, "lost its device")
+                    )
+                    break
+                except dump_read.NotRecordsError as error:
+                    failure = _with_unsynced(decide(), _read_failure(error, serial, "broke"))
+                    break
+                except dump_read.PlaceLostError as error:
+                    failure = _with_unsynced(decide(), _read_failure(error, serial, what))
+                    break
+                except dump_read.ReadRefusedError as error:
+                    # A dump failed with the device still there: asked again, as
+                    # a stream that ended by itself is, and restarted while a
+                    # restart is left.
+                    unsynced = decide()
+                    if unsynced is not None:
+                        failure = unsynced
+                        break
+                    device = _device_availability(serial)
+                    said = " ".join(str(error).split())
+                    if "error_class" in device:
+                        failure = {
+                            "error": said,
+                            "truncated": False,
+                            "what": "lost its device",
+                            "device": device,
+                        }
+                        break
+                    if attempt == max_restarts:
+                        times = attempt + 1
+                        failure = {
+                            "error": f"its dumps failed {times} time{'s' if times != 1 else ''} "
+                            f"with the device there, with no restart left "
+                            f"(ANDROID_EMU_ANR_MAX_RESTARTS={max_restarts}); the last time: "
+                            f"{said}",
+                            "truncated": False,
+                            "what": "failed",
+                            "device": device,
+                        }
+                        break
+                    deciding(False)
+        finally:
+            # The read's real end, however it came: what the assembler still
+            # holds was seen, and goes out now -- once. Then what closing
+            # wrote, and everything before it, is synced before the end is
+            # published with the checkpoint -- on every path, an error nothing
+            # foresaw included (it published a checkpoint no sync had kept:
+            # Codex, second review of the opening) -- unless a sync has failed
+            # already. The checkpoint published is the last one synced. A
+            # closure that fails -- a held report's event not written (ENOSPC)
+            # -- puts the checkpoint back to the last one synced instead, and
+            # the session ends with its error: it raised past the sync, and an
+            # advanced cursor was published unsynced (third review).
+            try:
+                pipeline.close()
+            except Exception as error:
+                counters["cursor"] = progress.durable
+                failure = _with_unsynced(
+                    _unclosed(error, int(counters.get("held_unwritten", 0))), failure
+                )
+            else:
+                if failure is None or failure.get("what") != _NOT_DURABLE:
+                    failure = _with_unsynced(_kept_durable(out_handle, counters, progress), failure)
+            if failure is not None:
+                counters["stream_failure"] = failure
+
+    def _resume(self, session_id: str, serial: str | None) -> logcat.Cursor:
+        """Where a restarted read continues: the cursor the session's meta holds, in the same boot.
+
+        Read back from the meta -- written under the session's lock by the
+        worker's ``deciding`` as it decided to restart -- never from memory
+        alone, so a restart reads on from what the session says was
+        consumed. The checkpoint must be this session's device's (its serial)
+        and the boot it was taken in (``/proc/sys/kernel/random/boot_id``): a
+        device that rebooted since holds another boot's log, where the read's
+        place is not to be looked for.
+
+        Raises:
+            dump_read.PlaceLostError: No checkpoint, one that does not decode,
+                or another device or boot.
+            dump_read.ReadRefusedError, dump_read.DeviceGoneError: The boot id
+                could not be read.
+        """
+        checkpoint = self.store.load_meta(session_id).counters.get("cursor")
+        try:
+            cursor, taken_on, boot = _cursor_of(checkpoint)
+        except (KeyError, TypeError, ValueError, logcat.LogFramingError) as error:
+            raise dump_read.PlaceLostError(
+                f"the session's meta holds no checkpoint of its read to resume from "
+                f"({type(error).__name__}: {error}).",
+                "Record the scenario again.",
+            ) from error
+        if taken_on != serial:
+            raise dump_read.PlaceLostError(
+                f"the read's checkpoint is of device {taken_on!r}, not {serial!r}.",
+                "Record the scenario again.",
+            )
+        now = dump_read.boot_id(serial)
+        if now != boot:
+            raise dump_read.PlaceLostError(
+                f"the device's boot id is {now}, not {boot} as when the read's checkpoint was "
+                "taken: it rebooted, and the log it holds is another boot's, so what was logged "
+                "between that checkpoint and the reboot is gone.",
+                "Record the scenario again once the device has booted.",
+            )
+        return cursor
+
+    def _read_dumps_into_events(
+        self,
+        *,
+        reader: dump_read.DumpRead,
+        cursor: logcat.Cursor,
+        stopping: threading.Event,
+        pipeline: _SessionRecords,
+        assembler: AnrRecordAssembler,
+        progress: "_DumpProgress",
+        out_handle,
+        counters: dict,
+        checkpoint: Callable[[], None],
+        serial: str | None,
+        boot_id: str | None,
+    ) -> None:
+        """Read by dumps from ``cursor`` until a stop, then once more (``common.dump_read.poll``).
+
+        Each poll's records go through the session's pipeline
+        (``_SessionRecords``), as a streamed record does; a poll that brings
+        none is the read going quiet (a held WindowManager report may be
+        due). After each, the checkpoint moves to the cursor after those
+        records, and every ``COUNTERS_PERSIST_SECONDS`` the events file is
+        synced and the counters, checkpoint with them, written to the meta.
+        The pipeline is the caller's, and outlives a failed dump.
+
+        Raises:
+            dump_read.ReadRefusedError, dump_read.DeviceGoneError: A read
+                failed (``common.dump_read.DumpRead.read``).
+            _NotDurable: The events file could not be synced: the checkpoint is
+                back at the last one whose events were.
+            _Disowned: A counter write was refused: the session is not this
+                worker's any more.
+        """
+
+        def on_read(records: list[logcat.LogRecord], after: logcat.Cursor) -> None:
+            if records:
+                progress.last_record_at = time.monotonic()
+                pipeline.take(records)
+            else:
+                pipeline.record(assembler.flush(time.monotonic() - progress.last_record_at))
+            # Only now, every record before it through the pipeline.
+            counters["cursor"] = _checkpoint(after, serial, boot_id)
+            if time.monotonic() - progress.last_written >= COUNTERS_PERSIST_SECONDS:
+                unsynced = _kept_durable(out_handle, counters, progress)
+                if unsynced is not None:
+                    raise _NotDurable(unsynced)
+                checkpoint()
+                progress.last_written = time.monotonic()
+
+        dump_read.poll(reader, cursor, stop=stopping, deadline=None, on_read=on_read)
 
     def _read_stream_into_events(
         self,
@@ -2404,14 +3323,6 @@ class AnrBuster:
         """
         if proc.stdout is None:
             return _ReadEnd.ENDED
-        # Declared, not only grown: --stop reads a missing count as one this
-        # worker did not keep (an earlier version's), not as zero.
-        counters.setdefault("unnamed_dropped", {"records": 0, "pids": []})
-        counters.setdefault("uid_attribution", UID_ATTRIBUTED if package else UID_UNFILTERED)
-        counters.setdefault("shared_uid", [])
-        counters.setdefault("isolated_unattributed", {"records": 0, "uids": []})
-        counters.setdefault("sdk_sandbox_unattributed", {"records": 0, "uids": []})
-        counters.setdefault("package_uid_changed", [])
         stream = _FdRecords(proc.stdout)
         names = process_names or _ProcessNames()
         # A new stream: any pid may have changed hands while there was none,
@@ -2422,75 +3333,19 @@ class AnrBuster:
             boundary.new_stream()
         broken = False
 
-        def record(raw_events: list[dict], *, just_read: bool = False) -> None:
-            for raw_event in raw_events:
-                verdict = None
-                # Both are logged from inside the app, so the record's pid and
-                # uid are the app process's own -- and neither text says which
-                # app that is. The pid is named only as the record is read, by
-                # what the stream said before it: a label. Under --package the
-                # uid says whose it is.
-                if raw_event["kind"] in PID_NAMED_KINDS:
-                    raw_event["app"] = names.name_of(raw_event["pid"]) if just_read else None
-                    if package:
-                        verdict = _attribute_by_uid(raw_event, package, names)
-                        _note_uid_attribution(counters, raw_event, verdict, package, names)
-                frames = raw_event.get("frames")
-                # Only Choreographer jank is frame-thresholded; ANRs (frames=None) pass.
-                below = frames is not None and frames < min_frames
-                if package and not matches_package(raw_event, package):
-                    if _unattributed(raw_event):
-                        counters["unattributed_anrs"] = counters.get("unattributed_anrs", 0) + 1
-                    elif verdict == UID_ISOLATED and not below:
-                        # An isolated process's uid is no package's: it may be
-                        # the package's or another app's. Never counted, and
-                        # listed, so --diff concludes nothing from its absence.
-                        _count_uncounted(counters, "isolated_unattributed", raw_event["uid"])
-                    elif verdict == UID_SDK_SANDBOX and not below:
-                        # The package's SDK sandbox: its SDKs' records, not the
-                        # app's. Never counted, and listed, likewise.
-                        _count_uncounted(counters, "sdk_sandbox_unattributed", raw_event["uid"])
-                    elif verdict == UID_UNKNOWN and not raw_event["app"] and not below:
-                        # Nothing showed whose it is -- the package's uids
-                        # unknown, and no `Start proc` named its process -- so
-                        # it may be the package's: dropped, and counted, so
-                        # --diff concludes nothing from its absence (closure
-                        # review of v0.8.0). One below the threshold would
-                        # have been dropped anyway.
-                        _count_unnamed_drop(counters, raw_event["pid"])
-                    continue
-                if raw_event.get("ambiguous_tail"):
-                    # Shown in the summary, kept out of every count, cluster
-                    # and diff: nothing shows it was logged after --start.
-                    if not below:
-                        counters.setdefault("ambiguous_tail", []).append(_tail_evidence(raw_event))
-                    continue
-                counters["matched"] += 1
-                if below:
-                    counters["dropped"] += 1
-                    continue
-                normalised = build_normalised_event(
-                    raw_event,
-                    session_start_ms=session_start_ms,
-                    current_ms=int(time.time() * 1000),
-                )
-                if normalised is not None:
-                    out_handle.write(event_to_jsonl(normalised) + "\n")
-
-        def take(records: list[logcat.LogRecord]) -> None:
-            for log_record in records:
-                verdict = _CaptureBoundary.READ if boundary is None else boundary.admit(log_record)
-                if verdict == _CaptureBoundary.REPLAYED:
-                    continue
-                counters["total"] += 1
-                sentence = names.observe(log_record)
-                changed = names.changed_uid(package, sentence) if package else None
-                if changed is not None and changed not in counters["package_uid_changed"]:
-                    # The package's uids were asked when the session began;
-                    # what follows under this uid goes uncounted, and is said.
-                    counters["package_uid_changed"] = [*counters["package_uid_changed"], changed]
-                ambiguous = verdict == _CaptureBoundary.AMBIGUOUS
-                record(assembler.feed(log_record, ambiguous=ambiguous), just_read=True)
+        # Every record goes through the session's one pipeline, the one API
+        # 33's dumps feed too (_SessionRecords).
+        pipeline = _SessionRecords(
+            out_handle=out_handle,
+            counters=counters,
+            package=package,
+            min_frames=min_frames,
+            session_start_ms=session_start_ms,
+            names=names,
+            boundary=boundary,
+            assembler=assembler,
+        )
+        record, take = pipeline.record, pipeline.take
 
         def read(timeout: float) -> list[logcat.LogRecord] | None:
             """The stream's next records; None once it has ended or broken."""
@@ -2565,13 +3420,9 @@ class AnrBuster:
             return _ReadEnd.STOPPED
         finally:
             # However this stream ended, what the assembler still holds was
-            # seen: a WindowManager report nothing answered.
-            record(assembler.close())
-            # What this stream could not see, for the summary to disclose.
-            counters["unnamed_pids"] = names.unnamed_pids
-            counters["unverified_anr_lines"] = (
-                counters.get("unverified_anr_lines", 0) + assembler.unverified
-            )
+            # seen: a WindowManager report nothing answered. And what this
+            # stream could not see, for the summary to disclose.
+            pipeline.close()
 
     # === PRIVATE ===
 
@@ -2610,6 +3461,217 @@ class AnrBuster:
         # Not re-wrapped: a bare RuntimeError lost DeviceNotFoundError, so an
         # unavailable device exited 1 here and 3 everywhere else.
         return resolve_device_identifier(serial)
+
+
+@dataclass(frozen=True)
+class _Opening:
+    """What a session's worker found opening its read, after its claim: how it will read.
+
+    ``reader``, ``cursor`` and ``boot_id`` on API 33 (a read made of dumps);
+    ``failure`` when the level, the boot id or the opening could not be had --
+    the session ends with it, never streams; ``cancelled`` when a stop came
+    first; all unset: the level streams.
+    """
+
+    reader: dump_read.DumpRead | None = None
+    cursor: logcat.Cursor | None = None
+    boot_id: str | None = None
+    failure: dict | None = None
+    cancelled: bool = False
+
+
+def _checkpoint(cursor: logcat.Cursor, serial: str | None, boot_id: str | None) -> dict:
+    """The read's place as the session's meta keeps it: the cursor, tied to its device and boot.
+
+    The system record's frame and the frames read after it (its suffix), each
+    base64 of logd's own bytes, with the serial the session reads and the boot
+    id the read was opened in.
+    """
+    return {
+        "serial": serial,
+        "boot_id": boot_id,
+        "frame": base64.b64encode(cursor.raw).decode("ascii"),
+        "suffix": [base64.b64encode(raw).decode("ascii") for raw in cursor.suffix],
+    }
+
+
+def _cursor_of(checkpoint) -> tuple[logcat.Cursor, str | None, str | None]:
+    """A checkpoint read back: ``(cursor, serial, boot id)``.
+
+    Raises:
+        KeyError, TypeError, ValueError: Not a checkpoint a worker wrote --
+            missing, not base64, or its frame not one record a system process
+            wrote.
+        logcat.LogFramingError: Its frame is not logd's framing.
+    """
+    frames = logcat.parse_frames(base64.b64decode(checkpoint["frame"], validate=True))
+    if len(frames) != 1 or not logcat.system_written(frames[0][1]):
+        raise ValueError("its frame is not one record a system process wrote")
+    suffix = tuple(base64.b64decode(item, validate=True) for item in checkpoint["suffix"])
+    raw, record = frames[0]
+    return logcat.Cursor(raw, record, suffix), checkpoint["serial"], checkpoint["boot_id"]
+
+
+@dataclass
+class _DumpProgress:
+    """A session's read made of dumps between its polls, kept across a restart.
+
+    Attributes:
+        last_record_at: When a poll last brought a record (``time.monotonic``):
+            the quiet a held WindowManager report waits out.
+        last_written: When the counters were last written to the meta.
+        durable: The last checkpoint whose events the events file holds synced.
+    """
+
+    last_record_at: float
+    last_written: float
+    durable: dict
+
+
+# How a session that could not sync its events file says it ended.
+_NOT_DURABLE = "could not keep its events"
+
+
+class _NotDurable(Exception):  # noqa: N818 -- a signal out of the read, carrying its failure
+    """The events file could not be synced: the read ends, its checkpoint put back."""
+
+    def __init__(self, failure: dict) -> None:
+        super().__init__(failure["error"])
+        self.failure = failure
+
+
+def _kept_durable(out_handle, counters: dict, progress: _DumpProgress) -> dict | None:
+    """Sync the events file; the checkpoint then stands -- else it goes back, and why.
+
+    A checkpoint is published only with every write of the worker's, so it is
+    never ahead of the events of the records it covers, read and processed:
+    synced, it becomes the durable one; not, ``counters["cursor"]`` is put
+    back to the last durable one and the failure returned, for the session
+    to end with (incomplete, said). A WindowManager report held for
+    ActivityManager's is not yet an event, and stays in memory: a durable
+    checkpoint may be past it. Only this worker resumes from the checkpoint,
+    its held reports with it; one that ends itself without writing them says
+    exactly how many (``held_unwritten``). One killed, or abandoned, cannot:
+    their number is unknown (``HELD_UNKNOWN``).
+    """
+    try:
+        out_handle.flush()
+        os.fsync(out_handle.fileno())
+    except OSError as error:
+        counters["cursor"] = progress.durable
+        return {
+            "error": f"the events file could not be synced ({error}), so the read's place in "
+            "the meta is kept at the last records whose events were, and what was read after "
+            "them may not be on disk",
+            "truncated": False,
+            "what": _NOT_DURABLE,
+            "device": {"state": "not asked"},
+        }
+    progress.durable = counters["cursor"]
+    return None
+
+
+def _unclosed(error: Exception, held: int) -> dict:
+    """The failure of a read whose closure could not write what it still held."""
+    return {
+        "error": f"the read's last events could not be written as it closed "
+        f"({type(error).__name__}: {error}): {_held_unwritten_text(held)}, and the read's "
+        "place in the meta is kept at the last records whose events were synced",
+        "truncated": False,
+        "what": _NOT_DURABLE,
+        "device": {"state": "not asked"},
+    }
+
+
+# What a session whose worker was killed, or abandoned, says of the reports it
+# held for correlation in memory: lost, and their number unknown. The count
+# (``held_unwritten``) is exact only when the worker itself ends.
+HELD_UNKNOWN = (
+    "reports the worker held for correlation, if any, were not written; their number is unknown"
+)
+
+
+def _held_unwritten_text(held: int) -> str:
+    """``N held report(s) were not written``, in words: WindowManager reports lost at the end."""
+    if held == 1:
+        return "1 held report was not written"
+    return f"{held} held reports were not written"
+
+
+def _with_unsynced(unsynced: dict | None, failure: dict | None) -> dict | None:
+    """A read's failure with a failed sync said beside it; either alone; or neither."""
+    if unsynced is None:
+        return failure
+    if failure is None:
+        return unsynced
+    return {**failure, "error": f"{failure['error']}; then {unsynced['error']}"}
+
+
+def _opening_since(meta: SessionMeta) -> float | None:
+    """When (epoch s) the worker began opening its read: the bound published with its claim."""
+    opening = meta.extras.get("opening")
+    since = opening.get("since_ms") if isinstance(opening, dict) else None
+    if not isinstance(since, int | float):
+        since = meta.claimed_at_ms
+    return since / 1000 if isinstance(since, int | float) else None
+
+
+def _opening_within(meta: SessionMeta) -> float:
+    """The bound (s) the worker published for its opening; this version's when it did not."""
+    opening = meta.extras.get("opening")
+    within = opening.get("within_s") if isinstance(opening, dict) else None
+    return within if isinstance(within, int | float) else OPENING_TIMEOUT_SECONDS
+
+
+def _opening_until(meta: SessionMeta) -> float:
+    """Until when (epoch s) a session ``opening`` its read is waited for, by --start and --stop.
+
+    The bound its worker published with its claim (``extras["opening"]``:
+    ``since_ms``, ``within_s``), and what the opening can still take past it
+    (``OPENING_OVERRUN_SECONDS``): exactly how long it can stay ``opening``
+    with its worker running.
+    """
+    since = _opening_since(meta)
+    if since is None:
+        return 0.0
+    return since + _opening_within(meta) + OPENING_OVERRUN_SECONDS
+
+
+def _read_failure(
+    error: BaseException, serial: str | None, what: str, *, deadline: float | None = None
+) -> dict:
+    """A dump-made read's failure as the session's ``stream_failure``, for --stop to answer with.
+
+    A device gone -- adb's words as a dump ended (``"source": "logcat"``), or
+    adb's answer when asked -- is kept as that error: --stop raises it again
+    (exit 3). Anything else asks the device once more, as a broken stream's
+    failure does (``_device_availability``), and keeps the read's remedy.
+    Within ``deadline`` (an opening's, ``time.monotonic()``) that question
+    gets only what is left, and is not asked once nothing is: it asked with
+    a fresh ``GET_STATE_TIMEOUT_SECONDS`` of its own, past the opening's bound.
+    """
+    if isinstance(error, dump_read.DeviceGoneError):
+        device = _device_answer(error.error)
+        if error.source == "logcat":
+            device["source"] = "logcat"
+    elif isinstance(error, DeviceError):
+        device = _device_answer(error)
+    elif deadline is None:
+        device = _device_availability(serial)
+    elif (left := deadline - time.monotonic()) > 0:
+        device = _device_availability(serial, timeout=min(GET_STATE_TIMEOUT_SECONDS, left))
+    else:
+        device = {"state": "not asked", "message": "the opening's bound had passed"}
+    failure = {
+        "error": " ".join(str(error).split()),
+        "truncated": False,
+        "what": what,
+        "device": device,
+    }
+    remedy = getattr(error, "remedy", None)
+    if remedy and "error_class" not in device:
+        failure["remedy"] = remedy
+    return failure
 
 
 def _unattributed(event: dict) -> bool:
@@ -2693,7 +3755,12 @@ def _record_worker_error(counters: dict, error: BaseException) -> None:
             f"{type(error).__name__}: {error}"
         )
     else:
-        counters["stream_failure"] = _worker_failed(error)
+        counters["stream_failure"] = failure = _worker_failed(error)
+    # Reports the read's closure could not write: said with the failure.
+    held = int(counters.get("held_unwritten", 0))
+    said = _held_unwritten_text(held)
+    if held and said not in failure.get("error", ""):
+        failure["error"] = f"{failure.get('error', 'the worker failed')}; {said}"
 
 
 def _deciding_since(meta: SessionMeta) -> float | None:
@@ -2765,7 +3832,7 @@ def _unpublished_reason(why: str) -> str:
 
 
 def _refuse_details_of_an_unpublished_end(meta: SessionMeta, why: str) -> NoReturn:
-    """--get-details' refusal for a session with no summary whose worker is gone unpublished.
+    """--get-details' (and --diff's) refusal for a session with no summary, its worker gone.
 
     --stop's answer for it (``_refuse_unconcluded``), not a pointer to that
     --stop: `Run --stop <id> first` sent the caller to a refusal.
@@ -2774,10 +3841,11 @@ def _refuse_details_of_an_unpublished_end(meta: SessionMeta, why: str) -> NoRetu
     cli.fail(
         f"Session {session_id} has no summary: {_unpublished_reason(why)}. The worker was "
         f"killed, or died before it could say how its capture ended, so whether its stream "
-        f"failed is unknown, and --stop refuses the session for that reason: stopping it "
-        f"saves no summary either.",
-        f"--stop {session_id} --abandon saves what was read, marked incomplete and abandoned; "
-        f"then --get-details {session_id} reads it. Or --start a new session.",
+        f"failed is unknown, {HELD_UNKNOWN}, and --stop refuses the session for that reason: "
+        f"stopping it saves no summary either.",
+        f"--stop {session_id} --abandon saves what its events file holds, marked incomplete "
+        f"and abandoned ({HELD_UNKNOWN}); then --get-details {session_id} reads it. Or "
+        f"--start a new session.",
     )
 
 
@@ -2842,6 +3910,35 @@ def _unconcluded(meta: SessionMeta, identity: Identity, why: str) -> str:
     return f"its worker was gone without saying how it ended: {why}"
 
 
+def _refuse_opening(meta: SessionMeta, identity: Identity, why: str, signalled: bool) -> NoReturn:
+    """--start's refusal for a session still ``opening`` once its wait is over (exit 1).
+
+    Its worker gone: --stop's answer for a worker gone without publishing its
+    end (``_refuse_unconcluded``). Otherwise the refusal names the opening and
+    how long it ran, and whether the worker was asked to stop.
+    """
+    if identity is Identity.GONE:
+        _refuse_unconcluded(meta, identity, why, signalled=False)
+    session_id = meta.session_id
+    serial = meta.args.get("serial") or "the device"
+    since = _opening_since(meta)
+    ran = f"{time.time() - since:.0f}s" if since is not None else "past its bound"
+    asked = (
+        "it is asked to stop: it cancels its opening and ends cancelled, nothing recorded into it"
+        if signalled
+        else f"it could not be asked to stop ({why})"
+    )
+    cli.fail(
+        f"The worker for {session_id} was still opening its read of {serial}'s log {ran} after "
+        f"it began -- the device's API level, its boot id and the newest record a system "
+        f"process wrote, within {_opening_within(meta):g}s, with {OPENING_OVERRUN_SECONDS:g}s "
+        f"more for its last step and its publication -- so the session is not recording, and "
+        f"{asked}.",
+        f"Check the device answers `adb -s {serial} logcat -d -B -T 1` promptly, then --start "
+        f"again; --stop {session_id} answers how this one ended.",
+    )
+
+
 def _refuse_unconcluded(
     meta: SessionMeta, identity: Identity, why: str, signalled: bool
 ) -> NoReturn:
@@ -2855,9 +3952,9 @@ def _refuse_unconcluded(
     """
     session_id = meta.session_id
     abandon = (
-        f"--stop {session_id} --abandon saves what was read, marked incomplete and abandoned "
-        f"(no meta write of the worker's is applied after that; events it still appends "
-        f"are ignored)"
+        f"--stop {session_id} --abandon saves what its events file holds, marked incomplete "
+        f"and abandoned (no meta write of the worker's is applied after that; events it "
+        f"still appends are ignored; {HELD_UNKNOWN})"
     )
     if identity is Identity.WORKER:
         asked = (
@@ -2865,7 +3962,16 @@ def _refuse_unconcluded(
             if signalled
             else "and was not asked to stop (it could not be shown to be the worker then)"
         )
-        deciding = ", still deciding how its logcat stream ended" if meta.status == DECIDING else ""
+        if signalled and meta.status == OPENING:
+            asked = (
+                f"by the end its opening published "
+                f"({_opening_within(meta) + OPENING_OVERRUN_SECONDS:g}s after it began), though "
+                f"asked to stop"
+            )
+        deciding = {
+            DECIDING: ", still deciding how its logcat stream ended",
+            OPENING: ", still opening its read",
+        }.get(meta.status, "")
         cli.fail(
             f"The worker for {session_id} (pid {meta.pid}) had not finished {asked}"
             f"{deciding}, so nothing is concluded from this session yet, and no summary is "
@@ -2888,7 +3994,7 @@ def _refuse_unconcluded(
     cli.fail(
         f"Session {session_id}'s worker is gone ({why}) without having said how its capture "
         f"ended{earlier}: it was killed, or died before it could, so whether its stream "
-        f"failed is unknown, and no summary is saved.",
+        f"failed is unknown, {HELD_UNKNOWN}, and no summary is saved.",
         f"{abandon[:1].upper()}{abandon[1:]}; or --start a new session.",
     )
 
@@ -2945,10 +4051,14 @@ def _refuse_broken_stream(
             remedy=f"{remedy} {saved}",
         )
     how = "was not logd's records to its end" if what == "broke" else what
+    # A read made of dumps (API 33) keeps its own remedy -- a lost place
+    # wants a shorter capture or a larger buffer -- said first.
+    remedy = failure.get("remedy")
     cli.fail(
         f"Session {session_id}'s logcat stream {how} ({error}); the session stopped there, "
         f"so it is incomplete. The device, asked then: {_availability_text(device)}.",
-        f"Read what was captured with --get-details {session_id}, and record the scenario "
+        (f"{remedy} " if remedy else "")
+        + f"Read what was captured with --get-details {session_id}, and record the scenario "
         f"again; if it repeats, restart adb (`adb kill-server && adb start-server`).",
     )
 
@@ -3195,8 +4305,8 @@ def _device_answer(error: AdbError) -> dict:
     return answer
 
 
-def _device_availability(serial: str | None) -> dict:
-    """What `adb get-state` says of the device, asked once, kept whole for --stop.
+def _device_availability(serial: str | None, timeout: float = GET_STATE_TIMEOUT_SECONDS) -> dict:
+    """What `adb get-state` says of the device, asked once (within ``timeout``), kept for --stop.
 
     ``state`` is ``available``; ``unavailable`` only for what the boundary
     calls unavailable (``cli.DEVICE_UNAVAILABLE``: exit 3); ``error`` for
@@ -3207,7 +4317,7 @@ def _device_availability(serial: str | None) -> dict:
     "not found", exit 3 and "Reconnect the device" (wave 4).
     """
     try:
-        _require_device(serial)
+        _require_device(serial, timeout=timeout)
     except AdbError as error:
         return _device_answer(error)
     return {"state": "available"}

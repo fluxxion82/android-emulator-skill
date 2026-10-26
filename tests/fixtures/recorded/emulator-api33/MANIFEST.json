@@ -173,6 +173,17 @@
       "recorded_at": "2026-10-26T07:16:27Z"
     },
     {
+      "name": "boot_id",
+      "file": "boot_id.txt",
+      "command": "adb shell cat /proc/sys/kernel/random/boot_id",
+      "description": "The kernel's id for the boot the device is in: a random UUID it makes at boot (`/proc/sys/kernel/random/boot_id`), readable by the shell. `ro.boot.bootreason` is no id -- it names why the device last booted (`reboot,shell`), the same words every time. anr_watcher's session worker on API 33 ties the read cursor it persists to the device's serial and this id, so a read resumed after a reboot is refused rather than placed in another boot's log.",
+      "catches": [],
+      "bytes": 37,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-10-26T05:51:46Z"
+    },
+    {
       "name": "cmd_notification_help",
       "file": "cmd_notification_help.txt",
       "command": "adb shell cmd notification",
@@ -558,6 +569,114 @@
       "first_half": "logcat_stream_block_records",
       "run": "799c4c31",
       "recorded_at": "2026-10-25T08:40:34Z"
+    },
+    {
+      "name": "logcat_stream_jank_open_records",
+      "file": "logcat_stream_jank_open_records.bin",
+      "command": "recorded in logcat_stream_jank_records' run: adb -s <serial> logcat -d -B -T 1",
+      "description": "The newest record the device held just before the stream opened: the window runs after it (the twin's `-t` is one nanosecond before its epoch).",
+      "catches": [],
+      "bytes": 65,
+      "first_half": "logcat_stream_jank_records",
+      "run": "45427700",
+      "recorded_at": "2026-10-26T05:52:22Z"
+    },
+    {
+      "name": "logcat_stream_jank_records",
+      "file": "logcat_stream_jank_records.bin",
+      "command": "adb -s <serial> logcat -B -T 1, the fixture app cold-started in it until Choreographer skips 30 frames or more, stopped by the recorder then",
+      "description": "A real jank inside a live `logcat -B -T 1`: the fixture app cold-started in it until Choreographer logged a skip of 30 frames or more (anr_watcher's default threshold), the stream stopped as soon as the recorder saw it in the buffer. On API 33 the stream withholds it -- what followed it did not fill logcat's 4 KiB stdio buffer -- and the window read back in dump mode holds it, so a reader stopped then (`anr_watcher --watch`'s deadline, a session's `--stop`) loses the app's event. Kept: records a uid below 10000 wrote and the fixture app's own, by its uid. Manifest: `jank` (its frames, uid, pid, when, whether the stream delivered it, and the bytes from it to the close), `app` (its uid listing and how many cold starts it took), `system_server_pid`, `timezone`.",
+      "catches": [],
+      "bytes": 11382,
+      "stream": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-B",
+          "-T",
+          "1"
+        ],
+        "stopped_after_s": 1.766,
+        "exit_status_after_terminate": -15,
+        "bytes_delivered": 12288,
+        "chunks_at_s_and_bytes": [
+          [
+            0.593,
+            4096
+          ],
+          [
+            1.025,
+            4096
+          ],
+          [
+            1.54,
+            4096
+          ]
+        ],
+        "complete_records_delivered": 87,
+        "cut_record_bytes": 146
+      },
+      "window": {
+        "argv": [
+          "adb",
+          "-s",
+          "<serial>",
+          "logcat",
+          "-d",
+          "-B",
+          "-t",
+          "<open's epoch - 1 ns>"
+        ],
+        "open_epoch": "1792993939.951961916",
+        "close_epoch": "1792993941.801170833",
+        "open_record_at": 0,
+        "records_after_open": 151,
+        "records_through_close": 114,
+        "of_them_delivered_by_the_stream": 87,
+        "bytes_through_close": 16535
+      },
+      "jank": {
+        "frames": 30,
+        "uid": 10174,
+        "pid": 16298,
+        "delivered_by_the_stream": false,
+        "bytes_from_it_through_close": 2549,
+        "stdio_block_bytes": 4096
+      },
+      "app": {
+        "package": "com.example.composefixture",
+        "package_uid_listing": {
+          "command": "adb shell cmd package list packages -U com.example.composefixture",
+          "exit_status": 0,
+          "output": "package:com.example.composefixture uid:10174\n"
+        },
+        "cold_starts": 1,
+        "skips_in_window": [
+          30
+        ]
+      },
+      "system_server_pid": "565",
+      "timezone": "America/Los_Angeles",
+      "kept": {
+        "rule": "records whose uid is below 10000, and the fixture app's (uid 10174); private package names aliased",
+        "stream_records": 83,
+        "cut_record_kept": false,
+        "window_records": 135
+      },
+      "recorded_at": "2026-10-26T05:52:22Z"
+    },
+    {
+      "name": "logcat_stream_jank_window_records",
+      "file": "logcat_stream_jank_window_records.bin",
+      "command": "recorded in logcat_stream_jank_records' run: adb -s <serial> logcat -d -B -t <open's epoch - 1 ns>",
+      "description": "The stream's window read back in dump mode once the stream was gone: the open record itself (manifest `window.open_record_at`), then every record after it that was still in the buffer.",
+      "catches": [],
+      "bytes": 17573,
+      "first_half": "logcat_stream_jank_records",
+      "run": "45427700",
+      "recorded_at": "2026-10-26T05:52:22Z"
     },
     {
       "name": "logcat_stream_marks_open_records",

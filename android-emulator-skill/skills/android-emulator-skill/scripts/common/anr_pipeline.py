@@ -402,6 +402,15 @@ class SessionSummary:
     # a process after it). Records of that uid went uncounted: said, and
     # --diff concludes nothing about jank from it.
     package_uid_changed: list[int] = field(default_factory=list)
+    # API 33's read made of dumps found no record a system process wrote to
+    # open on, and wrote one marker line into the device's log
+    # (``aes-log-monitor: anchor-<nonce>``): a change to the device, said.
+    # None: not a read made of dumps (a stream writes none), and not said.
+    anchor_written: bool | None = None
+    # WindowManager reports held for ActivityManager's -- in memory, not yet
+    # events -- that the worker could not write as its read ended: lost, and
+    # the session incomplete. 0 when none was (the JSON then says nothing).
+    held_unwritten: int = 0
 
 
 # What a summary says when its ANR reports could not be authenticated.
@@ -716,9 +725,39 @@ class AnrRecordAssembler:
         self._reported_at: list[tuple[int, str]] = []
         self._system_server = system_server_pid
         self._system_server_asked = not callable(system_server_pid)
+        self._ask_system_server = system_server_pid if callable(system_server_pid) else None
         self._subject_owner = subject_owner
         # Report records set aside because system_server's pid was unknown.
         self.unverified = 0
+        # The events the last release took out of the hold (``was_held``).
+        self._released: list[dict] = []
+
+    @property
+    def held(self) -> int:
+        """How many WindowManager reports are held for ActivityManager's: in memory, not events."""
+        return len(self._held)
+
+    def was_held(self, event: dict) -> bool:
+        """Whether ``event`` is a report the last release took out of the hold (by identity).
+
+        A held report leaves the hold before its event is written: its writer
+        asks this of what it could not write, to count it.
+        """
+        return any(event is released for released in self._released)
+
+    def forget_unanswered(self) -> None:
+        """A read that recovered: system_server's pid, if the device could not say it, is asked again.
+
+        Held reports and every correlation are kept: only an unknown answer is
+        forgotten.
+        """
+        if (
+            self._system_server_asked
+            and self._system_server is None
+            and self._ask_system_server is not None
+        ):
+            self._system_server = self._ask_system_server
+            self._system_server_asked = False
 
     def _written_by_system_server(self, writer: int) -> bool | None:
         """True or False -- or None when system_server's pid is unknown."""
@@ -880,6 +919,7 @@ class AnrRecordAssembler:
                 held.event["possible_duplicate_of"] = near[-1]
             released.append(held.event)
         self._held = [held for held in self._held if not due(held.at_ms)]
+        self._released = released
         return released
 
 
@@ -1472,6 +1512,16 @@ def _duplicate_note(summary: SessionSummary) -> str:
     )
 
 
+def _anchor_note(summary: SessionSummary) -> str:
+    """The marker line the read wrote into the device's log (empty when it wrote none)."""
+    if not summary.anchor_written:
+        return ""
+    return (
+        "Anchor written: the log held no record a system process wrote to start from, so one "
+        "marker line (aes-log-monitor) was written to the device's log."
+    )
+
+
 def _incomplete_note(reason: str | None) -> str:
     """The Incomplete: line, saying why when the summary recorded why."""
     if not reason:
@@ -1495,6 +1545,7 @@ def _disclosures(summary: SessionSummary) -> list[str]:
         _unattributed_note(summary),
         _duplicate_note(summary),
         _ambiguous_note(summary),
+        _anchor_note(summary),
     )
     return [*notes, *(note for note in found if note)]
 
@@ -1555,6 +1606,10 @@ def _markers(summary: SessionSummary) -> str:
         marks.append(counted(summary.possible_duplicates, "window ANR", "possibly a duplicate"))
     if summary.ambiguous_tail:
         marks.append("1 record may predate the session, not counted")
+    if summary.anchor_written:
+        marks.append("1 marker line written to the device's log")
+    if summary.held_unwritten:
+        marks.append(counted(summary.held_unwritten, "held report", "not written"))
     return f" [{'; '.join(marks)}]" if marks else ""
 
 
@@ -2289,6 +2344,12 @@ def summary_to_json(summary: SessionSummary) -> dict:
             "uids": summary.sdk_sandbox_unattributed_uids,
         },
         "package_uid_changed": summary.package_uid_changed,
+        # Only a read made of dumps (API 33) says it: a stream writes none.
+        **(
+            {"anchor_written": summary.anchor_written} if summary.anchor_written is not None else {}
+        ),
+        # Only when the worker ended with held reports it could not write.
+        **({"held_unwritten": summary.held_unwritten} if summary.held_unwritten else {}),
         "clusters": [cluster_to_json(c) for c in summary.clusters],
         "aggregates": summary.aggregates,
     }
@@ -2339,6 +2400,10 @@ def summary_from_json(payload: dict) -> SessionSummary:
         sdk_sandbox_unattributed=sandbox.get("records", 0),
         sdk_sandbox_unattributed_uids=list(sandbox.get("uids", [])),
         package_uid_changed=list(payload.get("package_uid_changed") or []),
+        anchor_written=(
+            anchor if isinstance(anchor := payload.get("anchor_written"), bool) else None
+        ),
+        held_unwritten=int(payload.get("held_unwritten") or 0),
     )
 
 

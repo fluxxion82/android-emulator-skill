@@ -49,7 +49,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### Implemented (32 scripts)
 
-#### Core Utilities (15 modules in `common/`)
+#### Core Utilities (16 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
@@ -63,7 +63,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    **hierarchy.py** (the one way to capture the UI hierarchy — no temp files,
    so concurrent runs cannot read each other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
    fails), **logcat.py** (the one place that builds an `adb logcat` argv and
-   parses a duration, shared by all four log readers), **sdk_tools.py** (resolves
+   parses a duration, shared by all four log readers), **dump_read.py** (the
+   live read made of dumps on API 33, whose logcat holds `-B` records back
+   while it streams: the level asked once, the opening, each poll's read after
+   the cursor, and every dump's one bounded ending, shared by `log_monitor`
+   and `anr_watcher`'s live readers), **sdk_tools.py** (resolves
    SDK binaries; `emulator` by bare name hits the `<sdk>/emulator` *directory* on an
    SDK-root PATH and raises `PermissionError`), **run_as.py** (reads a
    debuggable app's files with `adb shell -T run-as`, never `exec-out`, which
@@ -341,7 +345,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       refused by the dump's own verdict. Every other level streams, as
       before. The level is asked once (`getprop ro.build.version.sdk`),
       before `--clear` or any other logcat call; a device that does not
-      answer a number is refused (exit 1), not guessed to stream
+      answer a number is refused (exit 1), not guessed to stream. This read,
+      its bounds and its five-step dump ending live in
+      `common/dump_read.py`, shared with `anr_watcher`'s live readers on API
+      33
     - A stream that ends inside a record is never a complete capture: on a
       `--last` dump, or a live read that ended by itself, the device is asked
       again (gone: exit 3) and otherwise the capture is refused (exit 1). Only
@@ -838,10 +845,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Session mode: `--start [--package PKG]` → id (the bare id as text, for
       `SID=$(...)`; `{"success": true, "session_id": ...}` under `--json`); `--stop ID [--abandon]` → token-tight summary; `--get-details ID [--cluster N]`; `--list-sessions`; `--clear-sessions`; `--diff A B`
     - **A session's lifecycle is serialised** (`common/anr_sessions.py`):
-      `pending` → (the worker claims it) `running` ⇄ `deciding` → `stopped` |
-      `crashed`, or `pending` → `cancelled` (a `--stop` or a `--start` that
-      gave up on its worker), or `running`/`deciding` → `abandoned` (`--stop
-      --abandon`). Every read-modify-write of a session's `meta.json` and
+      `pending` → (the worker claims it) `opening` → (its read open)
+      `running` ⇄ `deciding` → `stopped` | `crashed`; `opening` → `crashed`
+      (the opening failed) | `cancelled` (a stop came first); `pending` →
+      `cancelled` (a `--stop` or a `--start` that gave up on its worker); or
+      `opening`/`running`/`deciding` → `abandoned` (`--stop --abandon`). Every read-modify-write of a session's `meta.json` and
       `summary.json` is made under its lock (`flock` on
       `anr-sessions/locks/<session>.lock`, outside the session's directory, so
       deleting a session never unlinks a lock a process holds; every opener
@@ -850,8 +858,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       refusal, exit 1, "run the same command again"), by one owner per
       transition, and only from the state it expects — otherwise it is
       refused, never applied — and goes to a temporary file of its own,
-      renamed into place. The worker owns its claim, `deciding`, its
-      counters and its end, which it publishes before it exits (a stop, a
+      renamed into place. The worker owns its claim, the opening's end,
+      `deciding`, its counters and its end, which it publishes before it exits (a stop, a
       device lost, restarts exhausted, a stream that broke, an error nothing
       foresaw; a SIGTERM meanwhile only asks for a stop): `stopped`, or
       `crashed` with its failure, in one write — unless it cannot have the
@@ -1168,6 +1176,130 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       read, whole, and reads one it never did (logged while the stream was
       down); nothing is compared by timestamp, so no clock change moves that
       boundary. `--since` reads its own window
+    - **On API 33 (Android 13) `--watch` and a session's worker read by
+      dumps, never by a stream they stop** -- the read `log_monitor` makes
+      there, shared (`common/dump_read.py`). That release's logcat holds `-B`
+      records back in a 4 KiB stdio buffer and loses them when its reader
+      stops it: recorded on the API 33 emulator
+      (`logcat_stream_jank_records`), the fixture app's real jank (30 frames
+      skipped) was withheld by a stream stopped just after it, and a session
+      over that recording ended `event_count: 0`, `incomplete: false`;
+      measured live, a jank line logged 2 s into a 4.5 s session ended
+      `event_count: 0`, `total_lines: 0`, and `--watch --duration 6` showed
+      nothing, at exit 0. Now the read opens on the newest record a system
+      process wrote (a buffer with none gets one marker line, `aes-log-monitor:
+      anchor-<128-bit hex>`, said on stderr by `--watch`; a session says it
+      as `anchor_written` in its meta counters as soon as the opening ends,
+      in its summary (`"anchor_written": true`, an `Anchor written:` line, a
+      bracketed mark in the one-line form) and on its `--list-sessions` line,
+      even when the session then fails; `false` when it wrote none -- the key
+      is in a summary read by dumps only, as in log_monitor's JSON) and, every
+      `ANDROID_EMU_LOG_POLL_SECONDS` (1 s, log_monitor's setting), takes what
+      logd delivered after the records it has read, found by logd's own order
+      -- never by a timestamp or an app's record -- then once more at
+      `--duration`, at Ctrl-C, and at `--stop` before the worker publishes
+      `stopped`. **Poll latency:** an event is printed (or written to the
+      session's events file) about one poll after it is logged, plus the
+      dump's own time (tens of ms on the emulator); the read at the end leaves
+      none of it behind. Each poll's records go through the same pipeline as
+      a streamed record (the assembler, `Start proc` naming, uid attribution
+      under `--package`, the frame threshold); a poll that brings none is the
+      read going quiet. It reads only what follows its opening record, so
+      nothing it reads may predate it and `ambiguous_tail` stays empty there.
+      A session's worker claims the session first -- it asks the device
+      nothing before -- into a status of its own, `opening`, published with the
+      bound it keeps: `ANDROID_EMU_LOG_STATE_TIMEOUT` (15 s) for the level, the
+      boot id and the opening search together. One deadline, passed down:
+      every question inside -- each dump, the `get-state` after one or after a
+      getprop that timed out, the anchor's write, the failure's own question
+      of the device -- gets only what is left, and none is asked once nothing
+      is. Past it the opening can still take 14 s (a stopped dump's 2 s reap,
+      adb's 10 s device listing in a refusal naming several devices, the 2 s
+      write that publishes its end), so it stays `opening` at most 29 s with
+      its worker running. It leaves by one write of its own: `running` (the
+      write that publishes its checkpoint), `crashed` (the opening failed,
+      with the reason) or `cancelled` (a stop came first: a dump under way
+      stopped and reaped, nothing recorded). `--start` answers success only on
+      `running`, waiting exactly that long, so what is logged once it has
+      returned follows the opening; past it, it stops the session and refuses
+      (exit 1), naming the opening and how long it ran, and a worker gone
+      while it opened is refused as `--stop` refuses a worker gone. A stop
+      -- `--stop`'s, or `--start`'s past its wait -- is recorded in the
+      session's meta under its lock before the worker is signalled
+      (`stop_requested_ms`), and the write that would publish `running` reads
+      it under the same lock: a stop that takes the lock first makes the
+      session `cancelled`, however late the worker handles its signal, even
+      with its read already open; a publication that takes it first makes it
+      `running`, and the stop an ordinary one. `--stop` waits for an opening
+      exactly to the end it published, never longer, and refuses a cancelled
+      one (nothing recorded); `--list-sessions` shows `opening` (`gone` once its
+      worker is), and `--get-details` and `--diff` refuse it, as a running
+      session. `--start`'s own 3 s is for the worker's claim alone. The level is
+      asked once per read (`getprop ro.build.version.sdk`); a device that does
+      not say is refused by `--watch` (exit 1, with `partial`) and ends a
+      session with the reason (`--start` refuses it, its summary saved
+      incomplete) -- never guessed to stream. Every other level streams as
+      before
+      - **A session's checkpoint.** Its cursor -- the system record's frame
+        and the frames read after it, base64 -- with the device's serial and
+        boot id (`/proc/sys/kernel/random/boot_id`; `ro.boot.bootreason` is
+        no id) is kept in the session's meta (`line_counters.cursor`), written
+        with every write of the worker's under the session's lock (every 5 s
+        while it reads, as it decides how a read ended, and at its end). It
+        covers the records read and processed: it moves on only once every
+        record before it has gone through the pipeline, and before any write
+        publishes it the events file is synced, on every path its end can
+        take; a sync that fails, or a closing read that cannot write what it
+        still held, puts the checkpoint back to the last one whose events were
+        synced and ends the session, incomplete, saying so. A WindowManager
+        report held for ActivityManager's (up to 10 s) lives in memory until
+        its event is written, so a checkpoint may be past it: the checkpoint
+        resumes only the same worker's read, where held reports survive, and
+        a crashed or killed worker's session is never resumed from it. Every
+        event is written by one function, which counts the held reports it
+        could not write. The count is exact when the worker itself ends (any
+        failure it can observe): the session ends `crashed`, incomplete,
+        with `held_unwritten: N` in its meta counters and summary and "N held
+        report(s) were not written" in its reason. When the worker is killed
+        (SIGKILL: an unpublished end, `--stop`'s gone-worker answer) or the
+        session abandoned (`--stop --abandon` saves what its events file
+        holds), reports it held in memory, if any, are lost and their number
+        is unknown: the gone-worker answer, the `--abandon` remedy and an
+        abandoned session's incomplete reason say "reports the worker held for
+        correlation, if any, were not written; their number is unknown". A dump that
+        fails with the device still there ends that attempt, not the read: the
+        worker publishes `deciding`, asks the device, and restarts the read
+        (`ANDROID_EMU_ANR_MAX_RESTARTS`, default 3; counted as
+        `dump_restarts`, noted in the events file) from the checkpoint the meta
+        holds -- not from memory -- once the boot id says the device is in the
+        same boot. The read is one logical read across it: the assembler keeps
+        a WindowManager report it holds for ActivityManager's (recorded: an
+        input ANR's two reports, 836 ms apart, split across a failed dump are
+        one ANR, not two), and the names learned from the log are kept; only a
+        lookup the device could not answer is asked again. Nothing is skipped
+        as a replay: the cursor excludes what was read, and an app's
+        byte-identical resend right after it is a new record. What was logged
+        while the read was down follows the cursor and is read, so a restart
+        does not make the summary incomplete
+      - **What ends a session there**, `crashed` and incomplete with the
+        reason -- `--stop` saves the summary, `--diff` concludes nothing from
+        it, and `--stop` refuses (exit 3 for a device gone, else 1): the read
+        lost its place in logd's buffer (its record turned over, is held
+        twice, or is past `ANDROID_EMU_LOG_DUMP_CAP_BYTES`), a dump was not
+        records, the device went, the restarts ran out, a restart found
+        another boot or no checkpoint, or the events file could not be synced
+        (the meta's checkpoint then the last one whose events were). `--watch`
+        refuses the same failures
+        (exit 3 or 1) with the events it had shown under `partial`, never a
+        clean exit
+      - Each dump is bounded as `log_monitor`'s are (below). The last read --
+        at `--stop`, at Ctrl-C, at `--duration` -- may still ask the device
+        who a pid is (each lookup at most 3 s), as any poll does, where a
+        stream's drain asks nothing; `--stop` waits up to 5.5 s for the worker to
+        publish its end, that read included, and refuses "had not finished"
+        past it -- run `--stop` again. The capture contract is log_monitor's
+        on that level (Known gaps): what logd delivered, never a certificate
+        that the window is complete
     - A stream that is not logd's records to its end is never read as if it
       were. A record still arriving when our own stop — `--duration`, Ctrl-C,
       `--stop` — ends the read, on a stream still open or one that ended, is
@@ -1761,24 +1893,9 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
   said (`package_uid_changed`), but one the read never sees — lost in a
   restarted stream's gap — is not; start a new read after changing the
   install.
-- On Android 13 (API 33) the ANR live readers -- `anr_watcher --watch` and
-  the session worker -- lose every record logcat had not yet written when
-  they stop it: that release's logcat writes `-B` records through a 4 KiB
-  stdio buffer and flushes only after a text record (AOSP logcat.cpp,
-  android13-release; Android 12 writes each record, 14 and later flush it),
-  and the readers stop it by terminating it. So a `--watch` ended by
-  `--duration` or Ctrl-C, and a session at `--stop`, drop everything logged
-  since the stream's last full 4 KiB block -- on a quiet device, all of it.
-  Measured on the API 33 emulator: a jank record logged 2 s into a 4.5 s
-  session was missing from its `--stop` summary, which said `event_count:
-  0`, `incomplete: false`; with 5 KB logged after it, the jank arrived and
-  the summary said one record was cut (`cut_records: 1`) while the rest of
-  the unwritten tail went unsaid; `--watch --duration 6` showed the same.
-  While the stream is open, an event can also sit unseen in that buffer
-  until 4 KiB more arrive. `log_monitor` reads by dumps on that level, so
-  that buffering does not affect it.
-- `log_monitor`'s capture is what logd delivered, never a certificate that
-  the window is complete. logd may drop records it prunes while a reader is
+- A capture by `log_monitor`, or by `anr_watcher`'s live readers on API 33,
+  is what logd delivered, never a certificate that the window is complete.
+  logd may drop records it prunes while a reader is
   behind -- Android 13's buffer prunes while it flushes to a slow reader
   and does not disconnect it -- on every level and for every reader, stream
   or dump; nothing on our side can tell a pruned record from one never
