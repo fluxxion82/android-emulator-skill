@@ -41,6 +41,35 @@
       "recorded_at": "2026-10-24T18:17:35Z"
     },
     {
+      "name": "adb_install_missing_apk_echo",
+      "file": "adb_install_missing_apk_echo.txt",
+      "command": "adb install '/nonexistent/device '\"'\"'aes-spoof'\"'\"' not found.apk'",
+      "description": "app_launcher --install with a path that does not exist and that names a device problem itself -- no newline needed. Exit 1; stdout 'Performing Streamed Install' (this file); on stderr (adb_install_missing_apk_echo_stderr, same run) adb's OWN line, `adb: failed to stat <path>: No such file or directory`. It starts with `adb: ` and carries 'device' and 'not found' from the path, which is what run_adb's classifier matches.",
+      "catches": [],
+      "bytes": 28,
+      "exit_status": 1,
+      "stream": "stdout",
+      "stdout_bytes": 28,
+      "stderr_bytes": 93,
+      "agent_text_on": [
+        "stderr"
+      ],
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
+      "name": "adb_install_missing_apk_echo_stderr",
+      "file": "adb_install_missing_apk_echo_stderr.txt",
+      "command": "recorded in adb_install_missing_apk_echo's run: its stderr",
+      "description": "The stderr of adb_install_missing_apk_echo's one run, byte for byte.",
+      "catches": [],
+      "bytes": 93,
+      "exit_status": 1,
+      "stream": "stderr",
+      "first_half": "adb_install_missing_apk_echo",
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
       "name": "adb_shell_device_not_found",
       "file": "adb_shell_device_not_found.txt",
       "command": "adb -s no-such-serial-xyz shell getprop ro.build.version.sdk",
@@ -61,6 +90,57 @@
       "exit_status": 0,
       "stream": "stdout",
       "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "am_broadcast_demo_datatype_echo",
+      "file": "am_broadcast_demo_datatype_echo.txt",
+      "command": "adb shell am broadcast -a com.android.systemui.demo -e command network -e mobile show -e level 4 -e datatype '<echo text>'",
+      "description": "status_bar --mobile-type with <echo text> (see pm_grant_permission_echo): the only free text status_bar sends. The broadcast is delivered whatever the extra says -- 'Broadcast completed: result=0' on stdout, exit 0 -- and the value is not printed back (`(has extras)`).",
+      "catches": [],
+      "bytes": 111,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 111,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
+      "name": "am_start_component_echo",
+      "file": "am_start_component_echo.txt",
+      "command": "adb shell am start -W -n '<echo text>/.Main' -a android.intent.action.MAIN",
+      "description": "app_launcher --launch with a package named by <echo text> (see pm_grant_permission_echo). The component is printed back twice, newline and all, on STDOUT ('Starting: Intent { ... cmp=...' and 'Error: Activity class {...} does not exist.'); stderr empty. The exit status is in the manifest.",
+      "catches": [],
+      "bytes": 273,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 273,
+      "stderr_bytes": 0,
+      "agent_text_on": [
+        "stdout"
+      ],
+      "forged_line_starts_on": [
+        "stdout"
+      ],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
+      "name": "am_start_view_echo",
+      "file": "am_start_view_echo.txt",
+      "command": "adb shell am start -W -a android.intent.action.VIEW -d '<echo text>'",
+      "description": "app_launcher --open-url with <echo text> (see pm_grant_permission_echo) as the URL: 'unable to resolve Intent', the data cut short as am_start_wait_view_unresolved describes, on STDOUT; stderr empty.",
+      "catches": [],
+      "bytes": 208,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 208,
+      "stderr_bytes": 0,
+      "agent_text_on": [
+        "stdout"
+      ],
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
     },
     {
       "name": "cmd_notification_help",
@@ -100,6 +180,25 @@
       "exit_status": 0,
       "stream": "stdout",
       "recorded_at": "2026-10-24T18:30:17Z"
+    },
+    {
+      "name": "dumpsys_package_echo",
+      "file": "dumpsys_package_echo.txt",
+      "command": "adb shell dumpsys package '<echo text>'",
+      "description": "privacy_manager's read-back and --list for a package named by <echo text> (see pm_grant_permission_echo): 'Unable to find package: <name>' on STDOUT, exit 0, stderr empty. Not classified: run_adb reads stderr, and only on a non-zero exit.",
+      "catches": [],
+      "bytes": 75,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 75,
+      "stderr_bytes": 0,
+      "agent_text_on": [
+        "stdout"
+      ],
+      "forged_line_starts_on": [
+        "stdout"
+      ],
+      "recorded_at": "2026-10-26T07:16:27Z"
     },
     {
       "name": "dumpsys_package_shared_uid",
@@ -178,6 +277,21 @@
       "recorded_at": "2026-10-25T01:29:49Z"
     },
     {
+      "name": "dumpsys_package_versionname_echo",
+      "file": "dumpsys_package_versionname_echo.txt",
+      "command": "adb shell dumpsys package '<echo text>' | grep versionName",
+      "description": "app_state_capture's version probe for a package named by <echo text> (see pm_grant_permission_echo). The device-side grep drops dumpsys's 'Unable to find package' line: nothing on either stream, exit 1.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 1,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
       "name": "getprop_sdk",
       "file": "getprop_sdk.txt",
       "command": "adb shell getprop ro.build.version.sdk",
@@ -200,6 +314,21 @@
       "stdout_bytes": 1,
       "stderr_bytes": 0,
       "recorded_at": "2026-10-25T09:34:34Z"
+    },
+    {
+      "name": "input_text_nonascii_echo",
+      "file": "input_text_nonascii_echo.txt",
+      "command": "adb shell input text 'h\u00e9<echo text>' (spaces sent as %s)",
+      "description": "keyboard --type / navigator --enter-text with <echo text> (see pm_grant_permission_echo) behind a non-ASCII letter, the one recorded way `input text` fails: exit 255 and a NullPointerException on stderr that does NOT print the text back. (ASCII text with a newline is typed: exit 0, silent.)",
+      "catches": [],
+      "bytes": 907,
+      "exit_status": 255,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 907,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
     },
     {
       "name": "logcat_anr_broadcast_records",
@@ -642,6 +771,21 @@
       "recorded_at": "2026-10-24T18:13:33Z"
     },
     {
+      "name": "package_list_uid_echo",
+      "file": "package_list_uid_echo.txt",
+      "command": "adb shell cmd package list packages -U '<echo text>'",
+      "description": "device_utils.get_package_uids (log_monitor --app, app_state_capture, anr_watcher --package) for a package named by <echo text> (see pm_grant_permission_echo): nothing on either stream, exit 0.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 0,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
       "name": "package_list_uid_two_users",
       "file": "package_list_uid_two_users.txt",
       "command": "adb shell pm create-user; pm install-existing --user <id> <package>; cmd package list packages -U <package>; pm remove-user <id>",
@@ -652,6 +796,40 @@
       "stream": "stdout",
       "secondary_user": "10",
       "recorded_at": "2026-10-24T18:13:33Z"
+    },
+    {
+      "name": "pidof_echo",
+      "file": "pidof_echo.txt",
+      "command": "adb shell pidof '<echo text>'",
+      "description": "`pidof` for a package named by <echo text> (see pm_grant_permission_echo) -- log_monitor --app's stream path, app_state_capture, app_launcher --state: nothing on either stream, exit 1, as pidof_not_running.",
+      "catches": [],
+      "bytes": 0,
+      "exit_status": 1,
+      "stream": "empty",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "agent_text_on": "neither",
+      "forged_line_starts_on": [],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
+      "name": "pm_grant_permission_echo",
+      "file": "pm_grant_permission_echo.txt",
+      "command": "adb shell pm grant --user 0 com.android.settings 'android.permission.<echo text>'",
+      "description": "privacy_manager --grant with a permission name an agent typed. <echo text> is `com.example.echo`, a newline and `adb: device 'aes-spoof' not found`, quoted for the device shell as the script quotes it. `pm` exits 255 and its IllegalArgumentException ('Unknown permission: <name>') prints the name back on STDERR, newline and all, so the forged line starts a line of the stderr run_adb classifies (forged_line_starts_on).",
+      "catches": [],
+      "bytes": 1541,
+      "exit_status": 255,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 1541,
+      "agent_text_on": [
+        "stderr"
+      ],
+      "forged_line_starts_on": [
+        "stderr"
+      ],
+      "recorded_at": "2026-10-26T07:16:27Z"
     },
     {
       "name": "pm_grant_user",
@@ -717,6 +895,25 @@
       "recorded_at": "2026-10-25T01:29:49Z"
     },
     {
+      "name": "pm_revoke_permission_echo",
+      "file": "pm_revoke_permission_echo.txt",
+      "command": "adb shell pm revoke --user 0 com.android.settings 'android.permission.<echo text>'",
+      "description": "pm_grant_permission_echo for privacy_manager --revoke / --reset: the same exception, the name printed back on stderr, exit 255.",
+      "catches": [],
+      "bytes": 1684,
+      "exit_status": 255,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 1684,
+      "agent_text_on": [
+        "stderr"
+      ],
+      "forged_line_starts_on": [
+        "stderr"
+      ],
+      "recorded_at": "2026-10-26T07:16:27Z"
+    },
+    {
       "name": "ps_all_pid_uid",
       "file": "ps_all_pid_uid.txt",
       "command": "adb shell ps -A -o PID,UID",
@@ -775,6 +972,25 @@
       "cap_bytes": 65536,
       "split_character_starts_at": 65534,
       "recorded_at": "2026-10-25T01:15:56Z"
+    },
+    {
+      "name": "setprop_locale_echo",
+      "file": "setprop_locale_echo.txt",
+      "command": "adb shell setprop persist.sys.locale '<echo text>'",
+      "description": "appearance --locale with <echo text> (see pm_grant_permission_echo): refused, exit 1, and `Failed to set property 'persist.sys.locale' to '<value>'.` prints the value back on STDERR, newline and all, so the forged line starts a line of the stderr run_adb classifies. The property reads `com.example.app1` in the file: the aliaser takes `persist.sys.locale` for a package name (departure 2).",
+      "catches": [],
+      "bytes": 127,
+      "exit_status": 1,
+      "stream": "stderr",
+      "stdout_bytes": 0,
+      "stderr_bytes": 129,
+      "agent_text_on": [
+        "stderr"
+      ],
+      "forged_line_starts_on": [
+        "stderr"
+      ],
+      "recorded_at": "2026-10-26T07:18:21Z"
     }
   ]
 }

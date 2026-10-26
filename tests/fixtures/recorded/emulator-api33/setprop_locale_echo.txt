@@ -1,0 +1,3 @@
+Failed to set property 'com.example.app1' to 'com.example.echo
+adb: device 'aes-spoof' not found'.
+See dmesg for error reason.

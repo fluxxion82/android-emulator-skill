@@ -1,0 +1,4 @@
+Starting: Intent { act=android.intent.action.VIEW dat=com.example.echo
+adb: }
+Error: Activity not started, unable to resolve Intent { act=android.intent.action.VIEW dat=com.example.echo
+adb: flg=0x10000000 }

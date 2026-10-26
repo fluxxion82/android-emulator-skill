@@ -117,7 +117,12 @@ def test_emulator_shutdown_all_goes_on_past_one_that_is_gone(monkeypatch):
 
     monkeypatch.setattr(emulator_shutdown.EmulatorShutdown, "shutdown", _shutdown)
 
-    assert emulator_shutdown.shutdown_all_emulators() == (1, 1)
+    succeeded, failed, items = emulator_shutdown.shutdown_all_emulators()
+    assert (succeeded, failed) == (1, 1)
+    assert [(item["serial"], item["success"]) for item in items] == [
+        (GONE, False),
+        ("emulator-5558", True),
+    ]
 
 
 @pytest.mark.parametrize(

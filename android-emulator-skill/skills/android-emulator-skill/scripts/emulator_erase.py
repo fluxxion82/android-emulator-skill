@@ -26,12 +26,14 @@ Usage Examples:
 """
 
 import argparse
+import functools
 import json
 import sys
 import time
 from pathlib import Path
 
 from common import cli
+from common.batch import Batch
 from common.emu_console import RunningVerdict, avd_running
 from common.env_config import env_float, env_int
 from common.sdk_tools import AVD_HOME_REMEDY, resolve_avd_home
@@ -307,27 +309,28 @@ class EmulatorEraser:
             timeout_seconds: Maximum seconds to poll per AVD when ``verify`` is set
 
         Returns:
-            (succeeded, failed, results) tuple where ``results`` is a list of
-            ``{"avd": name, "success": bool, "message": str}`` dicts.
+            (succeeded, failed, items) tuple where ``items`` is a list of
+            ``{"avd", "success", "message", "error", "remedy"}`` dicts
+            (common.batch); an AVD that fails any way is that item's failure.
         """
-        succeeded = 0
-        failed = 0
-        results: list[dict] = []
-
-        for name in self.list_avds():
-            success, message = self.erase(
-                name,
-                force=force,
-                verify=verify,
-                timeout_seconds=timeout_seconds,
-            )
-            if success:
-                succeeded += 1
-            else:
-                failed += 1
-            results.append({"avd": name, "success": success, "message": message})
-
-        return succeeded, failed, results
+        batch = Batch("AVD", "avd").run(
+            (
+                (
+                    {"avd": name},
+                    functools.partial(
+                        self.erase,
+                        name,
+                        force=force,
+                        verify=verify,
+                        timeout_seconds=timeout_seconds,
+                    ),
+                )
+                for name in self.list_avds()
+            ),
+            remedy=ERASE_REMEDY,
+            one_device=False,
+        )
+        return batch.succeeded, batch.failed, batch.items
 
 
 def main(argv: list[str] | None = None):
@@ -420,36 +423,30 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.all:
         if args.verbose:
             print("Erasing all AVDs", file=progress)
-        succeeded, failed, results = eraser.erase_all(
+        succeeded, failed, items = eraser.erase_all(
             force=args.force, verify=args.verify, timeout_seconds=args.timeout
         )
         total = succeeded + failed
-        if args.json:
-            payload = {
-                "action": "erase_all",
-                "succeeded": succeeded,
-                "failed": failed,
-                "total": total,
-                "results": results,
-            }
-            if succeeded:
-                payload["snapshots"] = SNAPSHOT_NOTE
-            if failed:
-                # The batch keeps its per-AVD report AND carries the documented
-                # error key, so "every failing mode answers {"error": ...}" is
-                # true of this one too without losing what it found (F5).
-                payload["error"] = f"{failed} of {total} AVDs were not erased"
-            print(json.dumps(payload, indent=2))
-        elif total == 0:
+        extra: dict = {
+            "action": "erase_all",
+            "succeeded": succeeded,
+            "failed": failed,
+            "total": total,
+        }
+        if succeeded:
+            extra["snapshots"] = SNAPSHOT_NOTE
+        if not args.json and total == 0:
             print("No AVDs found")
-        else:
+        elif not args.json:
             print(f"Erase summary: {succeeded}/{total} succeeded, {failed} failed")
             if args.verbose:
-                for result in results:
-                    print(f"  {result['message']}")
+                for item in items:
+                    print(f"  {item['message']}")
             if succeeded:
                 print(SNAPSHOT_NOTE)
-        sys.exit(0 if failed == 0 else 1)
+        # A failed batch is the refusal object, with every AVD in `items`
+        # (common.batch): the `error` key F5 asked for, and the remedy beside it.
+        sys.exit(Batch("AVD", "avd", items).finish(json_mode=args.json, extra=extra))
 
     # Erase operation
     if not args.name:

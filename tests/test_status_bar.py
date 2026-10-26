@@ -541,7 +541,7 @@ def test_cli_time_reaches_the_device_padded(captured_cmds, capsys):
 
     assert excinfo.value.code == 0
     assert _hhmm_sent(captured_cmds) == ["0941"]
-    assert json.loads(capsys.readouterr().out)["results"][0]["success"] is True
+    assert json.loads(capsys.readouterr().out)["items"][0]["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +571,7 @@ def test_cli_radio_flag_shows_or_hides(captured_cmds, capsys, radio, argv_tail, 
     sent = _radio_cmds(captured_cmds, radio)
     assert len(sent) == 1
     assert sent[0][sent[0].index(radio) + 1] == state
-    result = json.loads(capsys.readouterr().out)["results"][0]
+    result = json.loads(capsys.readouterr().out)["items"][0]
     assert result["operation"] == radio
     assert result["success"] is True
     assert ("hidden" in result["message"]) is (state == "hide")

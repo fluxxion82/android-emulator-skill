@@ -49,14 +49,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 ### Implemented (32 scripts)
 
-#### Core Utilities (14 modules in `common/`)
+#### Core Utilities (15 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
 2. **common/screenshot_utils.py** - Screenshot capture and processing
 3. **common/cache_utils.py** - Progressive disclosure cache system
 
    Also in `common/`: **cli.py** (the error boundary every script ends in,
    `cli.run(main)`; its contract, and what it does not cover yet, is the
-   **Failures** entry under Known gaps below), **adb_exec.py** (the one bounded
+   **Failures** entry under Known gaps below), **batch.py** (the one shape of a
+   batch that reports per item -- `items`, each with `success` / `error` /
+   `remedy` -- and when a device error stops one), **adb_exec.py** (the one bounded
    entry point for every adb call, with typed errors that name a remedy),
    **hierarchy.py** (the one way to capture the UI hierarchy — no temp files,
    so concurrent runs cannot read each other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
@@ -102,6 +104,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      under `--json`) — "no AVDs" and
      "could not look" are different answers. `--all` reports the same failure
      the same way
+   - `--all` is a batch (see **Failures**): one object, `{"success", "action",
+     "succeeded", "failed", "total", "items"}`, one item per AVD with `avd`,
+     `message`, `success`, `error`, `remedy`; exit 1 with `error` / `remedy`
+     on top when any AVD failed. **Breaking in v0.9.0:** `results` is now
+     `items`
    - Refuses to boot while any attached emulator cannot say which AVD it is
      (a non-`device` state, or a console that will not answer), or while the
      emulators cannot be listed at all: it may be this AVD, and a second
@@ -127,7 +134,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      "remedy": ...}` under `--json`, `Error:` / `Remedy:` on stderr otherwise,
      exit 1 (3 when adb says the device is not there)
    - Optional verification of shutdown completion
-   - Batch shutdown operations (running emulators only)
+   - Batch shutdown operations (running emulators only). `--all` is a batch
+     (see **Failures**): `{"success", "action", "success_count", "fail_count",
+     "items"}`, one item per emulator with `serial`, `message`, `success`,
+     `error`, `remedy` (it reported counts only); one that vanished before its
+     kill is that item's failure and the rest still stop. Exit 1 when any
+     failed
    - Options: `--serial`, `--name`, `--verify`, `--timeout`, `--all`, `--json`
 
 7. **emulator_create.py** ⭐ NEW - Create AVDs dynamically
@@ -170,8 +182,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `--old` no longer answer a "no" with an empty batch at exit 0
    - Failures answer `{"success": false, "error": ..., "remedy": ...}` under
      `--json` — including a `--name` that is not listed, and a delete
-     avdmanager refused or did not finish; a batch keeps its summary and
-     carries `error` alongside it when any AVD failed (exit 1)
+     avdmanager refused or did not finish. `--all` / `--old` are batches (see
+     **Failures**): the summary (`action`, `succeeded`, `failed`, `total`,
+     `keep_count`) and `items`, one per AVD with `name`, `message`, `success`,
+     `error`, `remedy` -- always, not only with `--verbose`, where they were
+     `results`. **Breaking in v0.9.0.** Exit 1 with `error` / `remedy` on top
+     when any AVD failed
    - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
 
 9. **emulator_erase.py** ⭐ NEW - Factory reset AVDs
@@ -189,8 +205,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      state and the remedy — `--force` erases anyway
    - Every failure is the shared refusal: `{"success": false, "error": ...,
      "remedy": ...}` under `--json`, `Error:` / `Remedy:` on stderr otherwise,
-     exit 1. `--all` keeps its per-AVD summary and carries `error` alongside it
-     when any AVD failed
+     exit 1. `--all` is a batch (see **Failures**): its summary and `items`,
+     one per AVD with `avd`, `message`, `success`, `error`, `remedy`, and the
+     refusal's `error` / `remedy` on top when any AVD failed (exit 1).
+     **Breaking in v0.9.0:** `results` is now `items`
    - **Snapshots are kept**: a successful erase prints "snapshots kept; use
      snapshot.py --delete `<name>` to remove them", because a later
      `snapshot.py --load` can otherwise undo the factory state
@@ -564,7 +582,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Grant/revoke permissions
     - List app permissions
     - Support for 20+ permission types
-    - Batch operations
+    - Batch operations: `--grant` / `--revoke` / `--reset` take a
+      comma-separated list and answer one object, `{"success", "action",
+      "items"}` (plus `test_trail`), one item per permission with
+      `permission`, `message`, `success`, `error`, `remedy`; exit 1 with
+      `error` / `remedy` on top when any failed, 3 when the device went (see
+      **Failures**). **Breaking in v0.9.0:** it was `{"action", "results"}`
     - `--user <id>` acts on one Android user (a secondary user or a work
       profile): the id goes into `pm grant/revoke --user`, and the read-back
       and `--list` read that user's `User <id>:` section of `dumpsys package`
@@ -585,6 +608,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `HH:MM` (`9:41` reaches SystemUI as `0941`); anything else is refused
     - Demo mode support
     - Options: `--preset`, `--battery`, `--charging`, `--wifi`, `--mobile`, `--time`, `--reset`, `--serial`, `--json`
+    - One item per operation asked for (see **Failures**): `{"success",
+      "items"}`, each with `operation`, `message`, `success`, `error`,
+      `remedy`. **Breaking in v0.9.0:** it was `{"results": [...]}`
     - All of these drive SystemUI **demo mode**, which changes what the status
       bar *draws*. It does not change what the app reads from the system
       (`BatteryManager` still reports the real level).
@@ -695,6 +721,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 27. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
     - Options: `--theme {light,dark}`, `--text-size {small,default,large,xl}`, `--font-scale`, `--locale`, `--reset`, `--serial`, `--json`
+    - One item per change asked for (see **Failures**): `{"success",
+      "items"}`, each with `operation`, `message`, `success`, `error`,
+      `remedy`. **Breaking in v0.9.0:** it was `{"results": [...]}`
 
 28. **location.py** - Simulate GPS on an emulator via `adb emu geo fix` (fixed coords, city presets, GPX route replay). Emulator-only.
     - Options: `--lat`/`--lng`, `--city`, `--gpx FILE`, `--interval`/`--speed`, `--clear`, `--list-cities`, `--serial`, `--json`
@@ -1835,16 +1864,40 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
     naming the tool; the exact status), not just a non-zero exit. It runs a
     usage error through every script in both modes too.
-  - Not in the schema yet: batches that report per item — per operation in `status_bar` and `appearance`, per permission in
-    `privacy_manager`'s grant/revoke, per AVD in the `emulator_*` `--all`
-    modes — which exit 1 with their own summary when one item failed.
+  - A **batch** that reports per item — per operation in `status_bar` and
+    `appearance`, per permission in `privacy_manager`'s grant/revoke/reset,
+    per AVD or emulator in `emulator_boot` / `emulator_shutdown` /
+    `emulator_erase` `--all` and `emulator_delete` `--all` / `--old`
+    (`common/batch.py`) — is one object: `success` false when ANY item failed,
+    then `error` and `remedy` as above, the batch's own keys, and `items`,
+    each item its own fields plus `success`, `error`, `remedy` (null when it
+    succeeded). Exit 0 only when every item succeeded, 1 when one failed; a
+    batch whose every item failed is still that one object. **Breaking in
+    v0.9.0:** each of these printed `results` (or, `emulator_shutdown`,
+    counts only); it is `items` now. In a one-device batch (`status_bar`,
+    `appearance`, `privacy_manager`) a device that goes away stops the batch
+    at the item that met it: that item carries the device error, every item
+    after it says `not attempted`, and the object exits 3 (1 for several
+    devices and no `--serial`). In the `emulator_*` batches each item is its
+    own emulator, so one that vanished is that item's failure and the rest
+    still run. (`anr_watcher --all` keeps every ANR cluster; it is not a
+    batch.)
   - Device-error confirmation applies to app-file reads (`container` and
     `model_inspector` ask `run_argv` for it with `confirm_device_errors`): their
     stderr is a device command's, and a file name can print an `adb: …` line.
     logcat's readers do not ask: that stderr is adb's own, and a probe finding
-    the device a moment later turned a real device error into exit 1. Other
-    shell commands use `run_adb`; their arguments are agent-supplied and
-    matching stderr is not yet confirmed (follow-up).
+    the device a moment later turned a real device error into exit 1. Of the
+    `run_adb` callers whose arguments are agent-supplied, three print that
+    text back on stderr where a forged `adb: device ... not found` line would
+    read as adb's own, and ask `run_adb` for the same confirmation:
+    `privacy_manager`'s `pm grant` / `pm revoke` (an unknown permission's
+    name), `appearance --locale` (`setprop` names the value it refused) and
+    `app_launcher --install` (adb's own `adb: failed to stat <path>`). The
+    rest were recorded too (`tests/record_fixtures.py`, the `*_echo`
+    fixtures): their text comes back on stdout, or not at all, and is never
+    classified. The probe cannot tell such an echo from a real loss followed
+    by a recovery before it, so a caller whose stderr is adb's alone does not
+    ask.
 - Instrumented tests are not a feature. Nothing here drives
   `connectedAndroidTest`; the build and test scripts run unit tests.
 

@@ -387,8 +387,8 @@ def test_a_refused_permission_does_not_stop_the_batch(
 
     assert code == 1, "one permission failed, so the batch did"
     report = json.loads(out)  # one object: no message line printed ahead of it
-    assert [r["success"] for r in report["results"]] == [False, True]
-    assert "SecurityException" in report["results"][0]["message"]
+    assert [r["success"] for r in report["items"]] == [False, True]
+    assert "SecurityException" in report["items"][0]["error"]
 
 
 def test_a_device_lost_mid_batch_stops_it_with_the_boundary_shape(
@@ -396,7 +396,8 @@ def test_a_device_lost_mid_batch_stops_it_with_the_boundary_shape(
 ):
     """The first grant lands; the device is gone for the second. Going on would
     repeat the same error for every permission left, so the batch stops and
-    common.cli reports it: exit 3, the refusal object and nothing else."""
+    common.batch reports it: exit 3, the refusal object with the permissions
+    so far -- the one granted, and the one the device error stopped at."""
     fake_adb.when(
         "android.permission.READ_CALENDAR",
         returncode=1,
@@ -417,8 +418,9 @@ def test_a_device_lost_mid_batch_stops_it_with_the_boundary_shape(
 
     assert code == 3
     payload = json.loads(out)
-    assert set(payload) == {"success", "error", "remedy"}
+    assert set(payload) == {"success", "error", "remedy", "action", "items"}
     assert payload["success"] is False
+    assert [item["success"] for item in payload["items"]] == [True, False]
     assert len(fake_adb.commands_matching("pm", "grant")) == 2, "the batch did not stop there"
 
 
@@ -775,9 +777,9 @@ def test_cli_grant_for_a_listed_user_reaches_that_user(fake_adb, monkeypatch, ca
 
     assert code == 1, out
     report = json.loads(out)
-    assert set(report) == {"action", "results"}, "the output shape is unchanged"
-    assert report["results"][0]["success"] is False
-    assert f"not installed for user {user}" in report["results"][0]["message"]
+    assert set(report) == {"success", "error", "remedy", "action", "items"}, report
+    assert report["items"][0]["success"] is False
+    assert f"not installed for user {user}" in report["items"][0]["error"]
     (grant,) = fake_adb.commands_matching("pm", "grant")
     assert _contains(grant, ("--user", str(user)))
 

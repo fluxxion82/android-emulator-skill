@@ -19,11 +19,13 @@ Tunables (env, ANDROID_EMU_ prefix):
 """
 
 import argparse
+import functools
 import json
 import sys
 import time
 
 from common import adb_exec, cli
+from common.batch import Batch
 from common.device_utils import get_connected_devices
 from common.emu_console import (
     EmulatorProbeError,
@@ -239,7 +241,9 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
         verify: Verify shutdown completion
 
     Returns:
-        (success_count, fail_count) tuple
+        (success_count, fail_count, items) tuple; ``items`` holds one
+        ``{"serial", "success", "message", "error", "remedy"}`` per emulator
+        (common.batch).
 
     Raises:
         adb_exec.AdbError: If adb cannot be run or the device query fails. Left
@@ -253,26 +257,21 @@ def shutdown_all_emulators(verify: bool = False) -> tuple:
     survey = survey_emulators(get_connected_devices)
     if survey.unavailable:
         raise EmulatorProbeError(survey.unavailable)
-    emulators = [{"serial": probe.serial} for probe in survey.probes]
-
-    success_count = 0
-    fail_count = 0
-
-    for emu in emulators:
-        shutdown = EmulatorShutdown(emu["serial"])
-        try:
-            success, _ = shutdown.shutdown(verify=verify)
-        except adb_exec.DeviceError:
-            # One emulator went away between the survey and its kill. The batch
-            # goes on to the others: continuing is the batch's call, made here,
-            # not the single-target shutdown's.
-            success = False
-        if success:
-            success_count += 1
-        else:
-            fail_count += 1
-
-    return (success_count, fail_count)
+    # One emulator that went away between the survey and its kill is that
+    # item's failure, and the batch goes on to the others: continuing is the
+    # batch's call (one_device=False), not the single-target shutdown's.
+    batch = Batch("emulator", "serial").run(
+        (
+            (
+                {"serial": probe.serial},
+                functools.partial(EmulatorShutdown(probe.serial).shutdown, verify=verify),
+            )
+            for probe in survey.probes
+        ),
+        remedy=SHUTDOWN_REMEDY,
+        one_device=False,
+    )
+    return batch.succeeded, batch.failed, batch.items
 
 
 def main(argv: list[str] | None = None):
@@ -345,24 +344,14 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Run the requested mode. Exits the process; never returns normally."""
     # Shutdown all mode
     if args.all:
-        success_count, fail_count = shutdown_all_emulators(verify=args.verify)
-        if args.json:
-            print(
-                json.dumps(
-                    {
-                        "action": "shutdown_all",
-                        "success_count": success_count,
-                        "fail_count": fail_count,
-                    },
-                    indent=2,
-                )
-            )
-        else:
+        success_count, fail_count, items = shutdown_all_emulators(verify=args.verify)
+        if not args.json:
             print(
                 f"Shutdown complete: {success_count} succeeded, {fail_count} failed "
                 f"(total: {success_count + fail_count})"
             )
-        sys.exit(0 if fail_count == 0 else 1)
+        extra = {"action": "shutdown_all", "success_count": success_count, "fail_count": fail_count}
+        sys.exit(Batch("emulator", "serial", items).finish(json_mode=args.json, extra=extra))
 
     # Resolve target serial: explicit --serial wins; otherwise resolve --name.
     serial = args.serial
