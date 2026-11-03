@@ -185,7 +185,7 @@ def test_record_refuses_before_running_anything(args, monkeypatch, capsys):
     assert repr(args[0]) in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("serial", [None, "", "3C211FDJH0030R", "127.0.0.1:5555"])
+@pytest.mark.parametrize("serial", [None, "", "98ZZ1FFBA00000", "127.0.0.1:5555"])
 def test_the_recorder_refuses_anything_but_an_emulator(serial, monkeypatch):
     # A shell-level ANDROID_SERIAL is deliberately not a fallback.
     monkeypatch.setenv("ANDROID_SERIAL", "emulator-5554")
