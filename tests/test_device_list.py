@@ -47,11 +47,11 @@ def test_a_hardware_serial_is_typed_as_a_device_not_an_emulator(recorded):
     test. Emulator-vs-device is what the shutdown path keys off, so it needs
     coverage rather than deletion.
     """
-    listing = recorded.text("adb_devices_single").replace("emulator-5554", "9B021FFAZ0057H")
+    listing = recorded.text("adb_devices_single").replace("emulator-5554", "98ZZ1FFBA00000")
     devices = device_list.parse_adb_devices(listing)
 
     assert len(devices) == 1
-    assert devices[0]["serial"] == "9B021FFAZ0057H"
+    assert devices[0]["serial"] == "98ZZ1FFBA00000"
     assert devices[0]["type"] == "device"
 
 
