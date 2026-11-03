@@ -66,7 +66,7 @@ from test_log_monitor import (
     _system_server,
 )
 
-from common import adb_exec, cli, logcat
+from common import adb_exec, cli, dump_read, logcat
 
 API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
 API35 = RecordedFixtures(RECORDED_ROOT / "emulator-api35")
@@ -755,8 +755,8 @@ def test_a_dump_that_closes_its_output_but_lingers_is_killed_before_the_refusal(
         return started[-1]
 
     lingering = [sys.executable, "-c", "import os, time; os.close(1); time.sleep(30)", "logcat"]
-    monkeypatch.setattr(log_monitor, "build_adb_command", lambda *_a: lingering)
-    monkeypatch.setattr(log_monitor.subprocess, "Popen", popen)
+    monkeypatch.setattr(dump_read, "build_adb_command", lambda *_a: lingering)
+    monkeypatch.setattr(dump_read.subprocess, "Popen", popen)
     # The device is asked once the dump is stopped: answered as recorded, attached.
     monkeypatch.setattr(
         adb_exec.subprocess,
@@ -881,7 +881,7 @@ def test_a_dump_needs_no_select(monkeypatch, recorded):
     writer = ("import sys; sys.stdout.buffer.write(open(sys.argv[1], 'rb').read())",)
     path = RECORDED_ROOT / "emulator-api33" / "logcat_stream_marks_window_records.bin"
     command = [sys.executable, "-c", *writer, str(path), "logcat"]
-    monkeypatch.setattr(log_monitor, "build_adb_command", lambda *_a: command)
+    monkeypatch.setattr(dump_read, "build_adb_command", lambda *_a: command)
     monkeypatch.setattr(
         adb_exec.subprocess,
         "run",
@@ -1011,7 +1011,7 @@ _OUTCOMES = (
 _RECHECKS = ("answers", "gone", "times_out", "command_error")
 _STDERRS = ("clean", "device_not_found")
 _READS = ("ok", "stderr_raises", "stdout_raises")
-_REAL_TEMPORARY_FILE = log_monitor.tempfile.TemporaryFile
+_REAL_TEMPORARY_FILE = dump_read.tempfile.TemporaryFile
 _WINDOW = API33.data("logcat_stream_marks_window_records.bin")
 
 
@@ -1211,15 +1211,15 @@ def test_every_dump_ending_passes_the_same_steps(
         events.append("stop")
         return real_stop(process)
 
-    real_classify = log_monitor.classify_device_error
-    real_stop = log_monitor.LogMonitor._stop
-    monkeypatch.setattr(log_monitor.LogMonitor, "_stop", staticmethod(stop))
-    monkeypatch.setattr(log_monitor.tempfile, "TemporaryFile", temporary_file)
-    monkeypatch.setattr(log_monitor.subprocess, "Popen", popen)
-    monkeypatch.setattr(log_monitor, "classify_device_error", classify)
-    monkeypatch.setattr(log_monitor, "DUMP_CAP_BYTES", _CAP)
-    monkeypatch.setattr(log_monitor, "KILL_REAP_TIMEOUT", 0.1)
-    monkeypatch.setattr(log_monitor, "run_adb", _recheck(recorded, recheck, events))
+    real_classify = dump_read.classify_device_error
+    real_stop = dump_read.DumpRead._stop
+    monkeypatch.setattr(dump_read.DumpRead, "_stop", staticmethod(stop))
+    monkeypatch.setattr(dump_read.tempfile, "TemporaryFile", temporary_file)
+    monkeypatch.setattr(dump_read.subprocess, "Popen", popen)
+    monkeypatch.setattr(dump_read, "classify_device_error", classify)
+    monkeypatch.setattr(dump_read, "DUMP_CAP_BYTES", _CAP)
+    monkeypatch.setattr(dump_read, "KILL_REAP_TIMEOUT", 0.1)
+    monkeypatch.setattr(dump_read, "run_adb", _recheck(recorded, recheck, events))
     monkeypatch.setattr(adb_exec, "_attached_serials", lambda: ["emulator-5554"])
     expected, steps = _expected(outcome, recheck, said, reads)
 
@@ -1464,7 +1464,7 @@ def test_a_second_ctrl_c_during_the_cleanup_does_not_swallow_the_diagnostic(
         child.kill = kill
         return child
 
-    monkeypatch.setattr(log_monitor.subprocess, "Popen", popen)
+    monkeypatch.setattr(dump_read.subprocess, "Popen", popen)
     previous = signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         with pytest.raises(KeyboardInterrupt):
@@ -1821,3 +1821,27 @@ def test_the_anchor_is_said_in_the_text_summary_and_only_api_33_has_the_key(tool
     prompt = _scenario(API35, "logcat_stream_quiet")
     _device(toolchain, recorded, prompt, level=API35)
     assert "anchor_written" not in _capture(toolchain)
+
+
+def test_a_dump_outside_the_api_33_read_adds_no_anchor_key(monkeypatch, recorded):
+    """``anchor_written`` belongs to API 33's dump-made read alone (PR #55's ruling).
+
+    A dump made on its own -- through ``LogMonitor._dump``, outside that read --
+    and refused (it exits 1) carries ``partial`` without the key, and the
+    monitor's JSON stays without it afterwards, as main's did.
+    """
+    events: list[str] = []
+
+    def popen(_command, **kwargs):
+        return _ScriptedDump("nonzero", kwargs["stdout"], kwargs["stderr"], b"", events)
+
+    monkeypatch.setattr(dump_read.subprocess, "Popen", popen)
+    monkeypatch.setattr(dump_read, "run_adb", _recheck(recorded, "answers", events))
+    monitor = log_monitor.LogMonitor(device_serial=SERIAL)
+
+    with pytest.raises(cli.Failure) as refused:
+        monitor._dump(["-d", "-B"], _BUDGET)
+
+    assert "exited with status 1" in str(refused.value)
+    assert "anchor_written" not in refused.value.details["partial"]
+    assert "anchor_written" not in monitor.get_json_output()

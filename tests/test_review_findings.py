@@ -30,6 +30,8 @@ import subprocess
 import threading
 
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
+from fake_toolchain import answering_the_api_level
 
 from common import adb_exec, device_utils
 
@@ -148,7 +150,12 @@ def test_legacy_watch_stops_even_when_the_device_is_silent(monkeypatch):
     import anr_watcher
 
     proc = _SilentProc()
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", lambda *_a, **_k: proc)
+    # The API level the watch asks first: the recorded API 35 emulator's, a
+    # level that streams.
+    level = RecordedFixtures(RECORDED_ROOT / "emulator-api35").text("getprop_sdk")
+    monkeypatch.setattr(
+        anr_watcher.subprocess, "Popen", answering_the_api_level(lambda *_a, **_k: proc, level)
+    )
 
     finished = threading.Event()
 

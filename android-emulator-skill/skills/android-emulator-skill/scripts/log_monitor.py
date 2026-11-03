@@ -36,38 +36,26 @@ Usage Examples:
 import argparse
 import bisect
 import contextlib
-import functools
 import json
-import os
 import re
-import secrets
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
-from common import cli, logcat
+from common import cli, dump_read, logcat
 from common.adb_exec import (
-    DEFAULT_TIMEOUT,
     AdbCommandError,
-    AdbError,
-    AdbTimeoutError,
-    DeviceError,
-    DeviceOfflineError,
     classify_device_error,
     run_adb,
 )
 from common.device_utils import (
-    UnknownSdkLevelError,
-    build_adb_command,
     get_package_uids,
     get_pid_uids,
-    get_sdk_level,
     get_system_server_pid,
     quote_for_device_shell,
 )
@@ -93,88 +81,18 @@ LOG_PENDING_CAP = env_int("ANDROID_EMU_LOG_PENDING_CAP", 2000)
 # Grace period for a terminated logcat to exit before it is killed. Bounded
 # so shutdown can never become the hang it is meant to prevent.
 STREAM_SHUTDOWN_TIMEOUT = env_int("ANDROID_EMU_LOG_SHUTDOWN_TIMEOUT", 5)
-# Budget for `adb get-state`, asked before every read and again when a live
-# read ends by itself. It answers at once either way (measured: `device`, or
-# `error: device '...' not found` exit 1); the bound is for a wedged server.
-STATE_TIMEOUT = env_int("ANDROID_EMU_LOG_STATE_TIMEOUT", 15)
 # Deadline for a `--last` dump. A dump ends by itself, so it is bounded
 # whatever the caller asked -- the one mode with no --duration to arm a timer
 # had none, and a read blocked on a stalled pipe (three bytes of a record's
 # header, then nothing) waited until something outside closed it (review 2 of
-# v0.8.0, item 10). Twice adb's per-call budget (ANDROID_EMU_ADB_TIMEOUT, 30 s):
-# the 60 s app_state_capture and anr_watcher --since give the same `logcat -d`,
-# raised with that variable. Measured on the API 35 emulator: its whole
-# 12.9 MB buffer dumps as records in 0.2 s.
-DUMP_TIMEOUT = 2 * DEFAULT_TIMEOUT
-# A live read on API 33 is a series of dumps, nominally one poll apart
-# (LogMonitor._read_by_dumps; a dump that takes longer than a poll is followed
-# at once by a catch-up one). Its bounds, each separate:
-# - each dump of the opening search for the newest system record:
-#   NEWEST_TIMEOUT, and never more than a --duration;
-# - each dump's own deadline: DUMP_FLOOR seconds plus the seconds since the
-#   last read (about one poll interval), never more than DUMP_TIMEOUT, the
-#   same for every doubled tail within one read;
-# - a dump still running when it ends -- its deadline, the byte cap, an output
-#   closed early -- gets KILL_REAP_TIMEOUT more to be reaped: it runs in a
-#   session of its own, so one left running would outlive the CLI;
-# - after each dump, whatever its outcome, and before any verdict on it:
-#   `adb get-state`, bounded by STATE_TIMEOUT. A device error in adb's own
-#   stderr is exit 3 before that, after the bounded `adb devices` its message
-#   lists the attached devices from (common.adb_exec).
-DUMP_FLOOR = 5
-NEWEST_TIMEOUT = STATE_TIMEOUT
-KILL_REAP_TIMEOUT = 2
-# How often a dump-made read asks again, whatever its mode.
-POLL_SECONDS = env_int("ANDROID_EMU_LOG_POLL_SECONDS", 1)
-# How often a running dump is checked against its deadline and the byte cap.
-DUMP_WAIT_SECONDS = 0.05
-# The output size past which a dump is stopped and refused, unread: the sum of a
-# device's log buffers bounds a window, and 32 MiB is past the API 33
-# emulator's four 2 MiB rings many times over (measured: `logcat -g`). A
-# DETECTION threshold, not a maximum: it is checked every DUMP_WAIT_SECONDS, so
-# the file can overshoot it by what adb writes in that time and before the kill
-# lands. A read also stops doubling its tail before one of about twice the
-# last dump's bytes would pass it (common.logcat.read_after). Raise it for a
-# device whose rings are larger (`adb logcat -g`).
-DUMP_CAP_BYTES = env_int("ANDROID_EMU_LOG_DUMP_CAP_BYTES", 32 * 1024 * 1024)
-# The most of a dump's stderr that is read: its last 64 KiB, which holds adb's
-# own final words, whatever the child wrote before them.
-SAID_TAIL_BYTES = 64 * 1024
-
-
-@contextlib.contextmanager
-def _sigint_held():
-    """Hold SIGINT off while the block runs, where the platform can (POSIX ``pthread_sigmask``).
-
-    A Ctrl-C meanwhile is delivered when the block ends; without
-    ``pthread_sigmask`` (Windows) the block runs unshielded.
-    """
-    mask = getattr(signal, "pthread_sigmask", None)
-    if mask is None:
-        yield
-        return
-    held = mask(signal.SIG_BLOCK, {signal.SIGINT})
-    try:
-        yield
-    finally:
-        mask(signal.SIG_SETMASK, held)
-
-
-def _tail(file, limit: int) -> str:
-    """The last ``limit`` bytes of an open binary ``file``, decoded: never more, however large."""
-    size = os.fstat(file.fileno()).st_size
-    file.seek(max(0, size - limit))
-    return file.read(limit).decode("utf-8", errors="replace")
-
-
-@functools.cache
-def _device_refusal_type(device_error: type[DeviceError]) -> type[cli.Failure]:
-    """A refusal that is both a ``cli.Failure`` and ``device_error`` (exit 3, ``partial``)."""
-    return type(
-        f"PartialCapture{device_error.__name__}",
-        (cli.Failure, device_error),
-        {"__doc__": f"A dump-made read refused because of a {device_error.__name__}."},
-    )
+# v0.8.0, item 10). The bound on any one dump (common.dump_read): twice adb's
+# per-call budget (ANDROID_EMU_ADB_TIMEOUT, 30 s), as app_state_capture and
+# anr_watcher --since give the same `logcat -d`. On API 33 a live read is a
+# series of dumps too; its bounds, its poll interval
+# (ANDROID_EMU_LOG_POLL_SECONDS) and its byte cap
+# (ANDROID_EMU_LOG_DUMP_CAP_BYTES) are common.dump_read's, shared with
+# anr_watcher's live reads on that level.
+DUMP_TIMEOUT = dump_read.DUMP_TIMEOUT
 
 
 class LogMonitor:
@@ -243,13 +161,8 @@ class LogMonitor:
         # silently dropped; a cut the stream made by itself fails the capture.
         self.cut_records = 0
 
-        # The dump-made read (API 33): the tail its next read asks for first
-        # (common.logcat.read_after) -- twice the records the last read found,
-        # never under INITIAL_TAIL.
-        self._tail = logcat.INITIAL_TAIL
-        # Whether the dump-made read wrote its own anchor (``_write_anchor``):
-        # None for any other read, so its JSON has no such key.
-        self.anchor_written: bool | None = None
+        # The dump-made read (API 33; common.dump_read), None for any other.
+        self._reader: dump_read.DumpRead | None = None
 
         # Deduplication, per severity, so a warning cannot hide an error with
         # the same text.
@@ -956,14 +869,43 @@ class LogMonitor:
             )
         return finished
 
+    @property
+    def anchor_written(self) -> bool | None:
+        """Whether the dump-made read wrote its own anchor (``common.dump_read``).
+
+        None for any other read, so its JSON has no such key.
+        """
+        return None if self._reader is None else self._reader.anchor_written
+
+    @contextlib.contextmanager
+    def _refusals(self):
+        """A dump-made read's typed failures (``common.dump_read``) as this capture's refusals.
+
+        Each carries what was read before it under ``partial`` (empty counts
+        before the first read), its attribution settled; a device gone is
+        exit 3, anything else exit 1.
+        """
+        try:
+            yield
+        except (dump_read.ReadRefusedError, dump_read.DeviceGoneError) as error:
+            if self.app_package and self.attribution is None:
+                self._settle_attribution(None)
+            dump_read.refuse(
+                error,
+                f" It had read {self.total_lines} line(s): under `partial` (--json), not "
+                "reported as the capture.",
+                {"partial": self.get_json_output()},
+            )
+
     def _holds_binary_back(self) -> bool:
         """Whether the device's logcat is Android 13's, which holds ``-B`` records back.
 
-        ``getprop ro.build.version.sdk``, asked once (recorded: getprop_sdk).
-        A device that does not say -- getprop failing, or answering an empty
-        line as it does for a property it lacks (getprop_unset) -- is refused:
-        guessed to stream, an API 33 device read quietly as zero lines, the
-        very success this read exists to prevent.
+        ``common.dump_read.holds_binary_back``: ``getprop
+        ro.build.version.sdk``, asked once (recorded: getprop_sdk). A device
+        that does not say -- getprop failing, or answering an empty line as it
+        does for a property it lacks (getprop_unset) -- is refused: guessed to
+        stream, an API 33 device read quietly as zero lines, the very success
+        this read exists to prevent.
 
         Raises:
             cli.Failure: The level is unknown, or getprop did not answer in
@@ -971,20 +913,8 @@ class LogMonitor:
             adb_exec.DeviceError: As getprop raised it, or -- after a timeout --
                 as ``get-state`` then says (exit 3).
         """
-        try:
-            level = get_sdk_level(self.device_serial, timeout=STATE_TIMEOUT)
-        except AdbTimeoutError as error:
-            self._require_device()
-            self._refuse(str(error), error.remedy, live=True)
-        except UnknownSdkLevelError as error:
-            self._refuse(
-                f"{error} log_monitor reads Android 13's logcat differently from every other "
-                "release's (it holds records back while it streams), so it does not read a "
-                "device whose level it cannot tell.",
-                error.remedy,
-                live=True,
-            )
-        return level == logcat.BUFFERED_BINARY_SDK
+        with self._refusals():
+            return dump_read.holds_binary_back(self.device_serial, "log_monitor")
 
     def _read_by_dumps(self, follow: bool, duration: float | None) -> bool:
         """A live read on API 33: a series of dumps one poll apart, never a stream.
@@ -995,19 +925,21 @@ class LogMonitor:
         ends by itself and writes everything it read. So the read opens on the
         newest record a system process wrote (``-d -B -T 1``, doubled until it
         holds one: the cursor, ``common.logcat.open_cursor``; a buffer with
-        none gets a marker line, ``_write_anchor``) and, every
-        ``POLL_SECONDS`` whatever the mode, takes what logd delivered after the
-        cursor and the records already read after it, and moves the cursor on
-        -- printing as it goes under --follow -- then once more at the deadline
-        or the interrupt. Each read follows logd's own order: a count-based
-        tail (``-d -B -T N``), doubled until it reaches the cursor
-        (``common.logcat.read_after``); no timestamp positions it, and no app's
-        record does -- an app can resend a frame byte for byte, so the cursor
-        is always a record a system process wrote, whose uid logd took from
-        the socket. Each read covers about one poll interval, so the cursor
-        stays inside logd's buffer while the window grows, and no dump grows
-        with the window. No stream, no thread, no timer: each dump is bounded
-        on this thread (``_dump``).
+        none gets a marker line, ``common.dump_read.DumpRead.write_anchor``)
+        and, every ``POLL_SECONDS`` whatever the mode, takes what logd
+        delivered after the cursor and the records already read after it, and
+        moves the cursor on -- printing as it goes under --follow -- then once
+        more at the deadline or the interrupt (``common.dump_read.poll``). Each
+        read follows logd's own order: a count-based tail (``-d -B -T N``),
+        doubled until it reaches the cursor (``common.logcat.read_after``); no
+        timestamp positions it, and no app's record does -- an app can resend
+        a frame byte for byte, so the cursor is always a record a system
+        process wrote, whose uid logd took from the socket. Each read covers
+        about one poll interval, so the cursor stays inside logd's buffer
+        while the window grows, and no dump grows with the window. No stream,
+        no thread, no timer: each dump is bounded on this thread
+        (``common.dump_read.DumpRead.dump``), the same read anr_watcher's live
+        readers make on this level.
 
         What a capture is: what logd delivered. The cursor and the records
         after it found in a dump prove logd still held the window's start when
@@ -1036,357 +968,33 @@ class LogMonitor:
             stop.set()
 
         signal.signal(signal.SIGINT, interrupt)
-        self.anchor_written = False
-        opened_within = min(NEWEST_TIMEOUT, duration) if duration else NEWEST_TIMEOUT
-        cursor = self._open(opened_within)
-        opened = last_read = time.monotonic()
-        deadline = opened + duration if duration else None
-        polls = 0
-        while not stop.is_set():
-            # Polls on a fixed schedule from the opening, so a slow dump does
-            # not push every later one back.
-            polls += 1
-            due = opened + polls * POLL_SECONDS
-            if deadline is not None and due >= deadline:
-                due = deadline
-            if stop.wait(max(0.0, due - time.monotonic())):
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            cursor, last_read = self._read_window(cursor, last_read, echo=follow)
-        self._read_window(cursor, last_read, echo=follow)
+        self._reader = dump_read.DumpRead(self.device_serial)
+        opened_within = (
+            min(dump_read.NEWEST_TIMEOUT, duration) if duration else dump_read.NEWEST_TIMEOUT
+        )
+
+        def take(records: list[logcat.LogRecord], _cursor: logcat.Cursor) -> None:
+            for record in records:
+                self._take(record, follow)
+
+        with self._refusals():
+            cursor = self._reader.open(opened_within)
+            deadline = time.monotonic() + duration if duration else None
+            dump_read.poll(self._reader, cursor, stop=stop, deadline=deadline, on_read=take)
         return True
 
-    def _open(self, budget: float) -> logcat.Cursor:
-        """The read's opening cursor (``common.logcat.open_cursor``), each dump within ``budget``.
-
-        ``-d -B -T 1``, doubled until it holds a record a system process wrote;
-        what followed that record was logged before the read opened. A buffer
-        with no such record (empty, as after ``--clear``, or only apps') gets
-        one: ``_write_anchor``, then found by its nonce
-        (``common.logcat.find_anchor``). Refused, with ``partial``, if a dump
-        is not records, the search would pass the byte cap, or the anchor is
-        not found once.
-        """
-
-        def dump(args: list[str]) -> bytes:
-            return self._dump(args, budget)
-
-        try:
-            cursor = logcat.open_cursor(dump, max_bytes=DUMP_CAP_BYTES)
-            if cursor is None:
-                cursor = logcat.find_anchor(dump, self._write_anchor(), max_bytes=DUMP_CAP_BYTES)
-            return cursor
-        except (
-            logcat.CursorBeyondCapError,
-            logcat.AnchorNotFoundError,
-            logcat.AmbiguousCursorError,
-        ) as error:
-            self._refuse(str(error), error.remedy, live=True)
-        except logcat.LogFramingError as error:
-            if error.truncated:
-                self._require_device()
-            self._refuse(
-                f"`adb logcat {' '.join(logcat.newest_args())}` (or a longer tail of it) did not "
-                f"answer whole records ({error}).",
-                logcat.LogFramingError.remedy,
-                live=True,
-            )
-
-    def _write_anchor(self) -> str:
-        """Write one marker line to the device's log, the read's anchor; return its message.
-
-        ``adb shell log -t aes-log-monitor anchor-<128-bit hex>``: written as
-        shell (uid 2000), a system writer no app can impersonate, with a nonce
-        no one else has, so the frame is unique. Only when the buffer holds no
-        system record to open on -- mostly after ``--clear``. Said on stderr,
-        in the text summary and as ``anchor_written`` in the JSON.
-
-        Raises:
-            cli.Failure: The write failed or did not answer within
-                ``STATE_TIMEOUT`` (exit 1), with ``partial``; one whose device
-                went is also that device error (exit 3).
-        """
-        message = f"anchor-{secrets.token_hex(16)}"
-        try:
-            run_adb(
-                "shell",
-                self.device_serial,
-                "log",
-                "-t",
-                quote_for_device_shell(logcat.ANCHOR_TAG),
-                quote_for_device_shell(message),
-                check=True,
-                timeout=STATE_TIMEOUT,
-            )
-        except DeviceError as error:
-            self._device_gone(error)
-        except AdbError as error:
-            self._refuse(
-                f"The log held no record a system process wrote to start from, and `adb shell "
-                f"log` could not write one ({error}).",
-                getattr(error, "remedy", None) or "Check adb and the device, then retry.",
-                live=True,
-            )
-        self.anchor_written = True
-        print(
-            f"The log held no record a system process wrote to start from: wrote one marker "
-            f"line ({logcat.ANCHOR_TAG}: {message}).",
-            file=sys.stderr,
-        )
-        return message
-
-    def _read_window(
-        self, cursor: logcat.Cursor, last_read: float, echo: bool
-    ) -> tuple[logcat.Cursor, float]:
-        """What logd delivered after ``cursor``, taken into the capture in order.
-
-        ``common.logcat.read_after`` finds the cursor in a tail of logd's order:
-        first the larger of ``INITIAL_TAIL`` and twice the records the previous
-        read took, doubled while it does not reach the cursor. Each dump's
-        budget is ``DUMP_FLOOR`` plus the seconds since the last read, never
-        more than ``DUMP_TIMEOUT``. Every failure is a refusal carrying what
-        was read before it (``partial``), or exit 3 for a device gone. A dump
-        reaches ``read_after``'s judgement only after the device has answered
-        (``_dump``), so a vanished device is exit 3, never a cursor "lost" to
-        a buffer that turned over.
-        """
-        now = time.monotonic()
-        budget = min(DUMP_TIMEOUT, DUMP_FLOOR + (now - last_read))
-        try:
-            records, cursor = logcat.read_after(
-                cursor,
-                lambda args: self._dump(args, budget),
-                tail=self._tail,
-                max_bytes=DUMP_CAP_BYTES,
-            )
-        except (
-            logcat.CursorLostError,
-            logcat.AmbiguousCursorError,
-            logcat.CursorBeyondCapError,
-        ) as error:
-            self._refuse(str(error), error.remedy, live=True)
-        except logcat.LogFramingError as error:
-            if error.truncated:
-                self._require_device()
-            self._refuse(
-                f"`adb logcat` did not answer whole records ({error}), so what it read is not "
-                "the window.",
-                logcat.LogFramingError.remedy,
-                live=True,
-            )
-        # The next tail must reach the cursor past its suffix, then about as
-        # many new records as this read took, twice over.
-        self._tail = max(logcat.INITIAL_TAIL, 1 + len(cursor.suffix) + 2 * len(records))
-        for record in records:
-            self._take(record, echo)
-        return cursor, now
-
     def _dump(self, args: list[str], timeout: float) -> bytes:
-        """Run ``adb logcat <args>`` -- a dump, which ends by itself -- and return what it wrote.
+        """One dump through the shared executor (``common.dump_read.DumpRead.dump``), refused as this capture.
 
-        Its output and stderr go to temporary files, and this thread waits
-        for it to exit in ``DUMP_WAIT_SECONDS`` steps, the deadline checked
-        first, then its exit, then the output's size against
-        ``DUMP_CAP_BYTES``: no pipe to block on, no ``select`` (which takes no
-        pipe on Windows), no timer. Its own session, so a Ctrl-C meant for the
-        read does not cut the dump that ends it.
-
-        However the wait ends, the same steps follow, in this order, none
-        skipped:
-
-        1. Stop: still running (its deadline, the cap, an output closed early,
-           the wait itself failing) -> killed, then reaped within
-           ``KILL_REAP_TIMEOUT``, with SIGINT held off meanwhile where the
-           platform can (``_sigint_held``). Whatever raises between the start
-           and here, the stop still runs: an ``OSError`` of the wait is this
-           dump's outcome (the wait failed); anything else (Ctrl-C) is raised
-           again once the child is stopped -- or, if it could not be, once
-           that is said on stderr, still under the mask.
-        2. Read bounded: stderr's last ``SAID_TAIL_BYTES``; the output only for
-           a dump that exited 0 in time under the cap. A read that fails is a
-           fact of the ending, not an exception out of it.
-        3. adb's own words: a device error in that stderr, whatever the exit
-           status -> exit 3, with ``partial``. Skipped, and said, when stderr
-           could not be read.
-        4. ``get-state`` (``_require_device``): gone -> exit 3; any other
-           failure of it -> a refusal at exit 1; both with ``partial``.
-        5. Verdict: could not be stopped, the wait failed, stderr unreadable,
-           cap exceeded, deadline passed (by the time its exit was seen), a
-           non-zero exit, output unreadable -> refused, with ``partial`` and
-           every fact gathered; otherwise its output is the dump's.
+        Every dump ends in the same five steps -- stop, read bounded, adb's
+        own words, ``get-state``, verdict -- in ``common.dump_read``; a
+        failure is this capture's refusal, with ``partial``.
         """
-        command = build_adb_command("logcat", self.device_serial, *args)
-        shown = " ".join(command[command.index("logcat") :])
-        deadline = time.monotonic() + timeout
-        returncode: int | None = None
-        exited_in_time = capped = False
-        wait_failed: OSError | None = None
-        said_failed: OSError | None = None
-        out_failed: OSError | None = None
-        said = ""
-        data = b""
-        with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as said_file:
-            process = subprocess.Popen(
-                command,
-                stdout=out_file,
-                stderr=said_file,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            try:
-                while True:
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        break
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        returncode = process.wait(timeout=min(DUMP_WAIT_SECONDS, left))
-                    exited_in_time = returncode is not None and time.monotonic() <= deadline
-                    if os.fstat(out_file.fileno()).st_size > DUMP_CAP_BYTES:
-                        capped = True
-                        break
-                    if returncode is not None:
-                        break
-            except OSError as error:
-                wait_failed = error
-            except BaseException:
-                # 1. Stop, on the way out of an interruption -- and say so,
-                # still with SIGINT held, if it failed: a second Ctrl-C would
-                # otherwise arrive first and the line would never be printed.
-                with _sigint_held():
-                    stopped, gone = self._stop(process)
-                    if not gone:
-                        print(
-                            f"`adb {shown}` could not be stopped (pid {process.pid}: {stopped}).",
-                            file=sys.stderr,
-                        )
-                raise
-            # 1. Stop.
-            with _sigint_held():
-                stopped, gone = self._stop(process)
-            # 2. Read bounded; the output only for a dump that can be accepted.
-            try:
-                said = _tail(said_file, SAID_TAIL_BYTES)
-            except OSError as error:
-                said_failed = error
-            if exited_in_time and returncode == 0 and not capped and wait_failed is None:
-                try:
-                    if os.fstat(out_file.fileno()).st_size > DUMP_CAP_BYTES:
-                        capped = True
-                    else:
-                        out_file.seek(0)
-                        data = out_file.read()
-                except OSError as error:
-                    out_failed = error
-        detail = " ".join(said.split())[-300:]
-        facts = "" if gone else f" `adb {shown}` {stopped}."
-        if wait_failed is not None:
-            facts += f" Waiting for `adb {shown}` failed ({wait_failed})."
-        if said_failed is not None:
-            facts += (
-                f" Its stderr could not be read ({said_failed}), so adb's own words were not "
-                "checked."
-            )
-        if out_failed is not None:
-            facts += f" It exited 0, but its output could not be read ({out_failed})."
-        # 3. adb's own words, whatever the exit status -- when there are words.
-        if said_failed is None:
-            device_error = classify_device_error(said, self.device_serial)
-            if device_error is not None:
-                self._device_gone(device_error, note=facts)
-        # 4. The device, whatever the outcome.
-        self._require_device(note=facts)
-        # 5. The verdict.
-        retry = "Retry; if it repeats, restart adb (`adb kill-server && adb start-server`)."
-        if facts:
-            self._refuse(
-                facts.strip() + " What it read is not reported as the window.", retry, live=True
-            )
-        if capped:
-            self._refuse(
-                f"`adb {shown}` wrote more than {DUMP_CAP_BYTES} bytes and {stopped}; it is not "
-                "read, and not reported as the window.",
-                "Capture for less time, or raise ANDROID_EMU_LOG_DUMP_CAP_BYTES.",
-                live=True,
-            )
-        if not exited_in_time:
-            self._refuse(
-                f"`adb {shown}` did not finish within {timeout:g}s and {stopped}, so what it "
-                "read is not reported as the window." + (f" adb said: {detail}" if detail else ""),
-                retry,
-                live=True,
-            )
-        if returncode:
-            self._refuse(
-                f"`adb {shown}` exited with status {returncode}."
-                + (f" adb said: {detail}" if detail else ""),
-                "Check the device is connected (`adb devices`) and retry.",
-                live=True,
-            )
-        return data
-
-    @staticmethod
-    def _stop(process: subprocess.Popen) -> tuple[str, bool]:
-        """Stop a dump that is still running; how it ended, and whether it is gone.
-
-        Never raises an ``OSError``: a failed ``poll``, ``kill`` or reap is
-        part of the answer.
-
-        Returns:
-            ``("exited (exit N)", True)`` by itself; ``("was killed (exit N)",
-            True)``, the status the reap returned; or ``("could not be stopped
-            ...", False)`` -- the kill failed, the reap failed, or it was still
-            running after the kill.
-        """
-        with contextlib.suppress(OSError):
-            status = process.poll()
-            if status is not None:
-                return f"exited (exit {status})", True
-        try:
-            process.kill()
-        except OSError as error:
-            return f"could not be stopped ({error})", False
-        try:
-            return f"was killed (exit {process.wait(timeout=KILL_REAP_TIMEOUT)})", True
-        except subprocess.TimeoutExpired:
-            return "could not be stopped: still running after it was killed", False
-        except OSError as error:
-            return f"could not be stopped: its reap failed ({error})", False
-
-    def _require_device(self, note: str = "") -> None:
-        """``get-state`` for the dump-made read, every failure of it a refusal with ``partial``.
-
-        Gone (``DeviceError``) is exit 3; any other failure of the question
-        itself -- it timed out, adb failed -- is a refusal at exit 1. The one
-        place the dump-made read asks, so no caller can ask it unwrapped.
-        """
-        try:
-            self._verify_device_available()
-        except DeviceError as error:
-            self._device_gone(error, note=note)
-        except AdbError as error:
-            self._refuse(
-                f"`adb get-state` failed after a dump ({error}), so the dump is not reported "
-                f"as the window.{note}",
-                getattr(error, "remedy", None) or "Check adb and the device, then retry.",
-                live=True,
-            )
-
-    def _device_gone(self, error: DeviceError, note: str = "") -> NoReturn:
-        """Raise ``error`` as a refusal that is also that device error: exit 3, with ``partial``.
-
-        ``common.cli`` hands ``details`` over only for a ``cli.Failure`` and
-        exits 3 only for a device-unavailable error; this is both, as
-        app_state_capture's partial snapshot is.
-        """
-        if self.app_package and self.attribution is None:
-            self._settle_attribution(None)
-        raise _device_refusal_type(type(error))(
-            f"{error}{note} It had read {self.total_lines} line(s): under `partial` (--json), "
-            "not reported as the capture.",
-            getattr(error, "remedy", None) or "Reconnect the device and retry.",
-            {"partial": self.get_json_output()},
-        ) from error
+        # Outside the API 33 read, a reader of its own, kept nowhere: the
+        # JSON's anchor_written key is that read's alone (PR #55).
+        reader = self._reader or dump_read.DumpRead(self.device_serial)
+        with self._refusals():
+            return reader.dump(args, timeout)
 
     def _verify_device_available(self) -> None:
         """Ask adb whether the device this read targets is there, before trusting a read.
@@ -1398,7 +1006,8 @@ class LogMonitor:
         reported success with zero lines, with or without ``--serial``. So
         every mode asks ``adb get-state`` first (bounded), and asks again when
         a live read ends by itself: older adb exits 0 when the transport goes,
-        current adb 255.
+        current adb 255. The question is ``common.dump_read.verify_device``,
+        the one a dump-made read asks after every dump.
 
         Raises:
             DeviceNotFoundError, DeviceOfflineError, DeviceUnauthorizedError:
@@ -1409,15 +1018,7 @@ class LogMonitor:
             MultipleDevicesError: Several attached and no serial (exit 1).
             AdbCommandError: get-state failed in a way adb did not name.
         """
-        result = run_adb("get-state", self.device_serial, check=True, timeout=STATE_TIMEOUT)
-        state = result.stdout.strip()
-        if state != "device":
-            target = f"Device {self.device_serial!r}" if self.device_serial else "The device"
-            raise DeviceOfflineError(
-                f"{target} is in state {state or 'unknown'!r}, not `device`; logcat cannot "
-                f"read it.",
-                remedy="Wait for it to boot into Android (`adb wait-for-device`), then retry.",
-            )
+        dump_read.verify_device(self.device_serial)
 
     def _start_stderr_drain(self) -> None:
         """Continuously read the child's stderr on a daemon thread.

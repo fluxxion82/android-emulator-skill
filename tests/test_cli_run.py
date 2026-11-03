@@ -18,6 +18,8 @@ from pathlib import Path
 
 import anr_watcher
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
+from fake_toolchain import answering_the_api_level
 
 from common import adb_exec, cli
 from common.device_utils import resolve_device_identifier
@@ -822,7 +824,10 @@ def test_a_streaming_failure_ends_stdout_with_the_refusal_on_its_own_line(
         def wait(self, timeout=None):
             return 0
 
-    monkeypatch.setattr(anr_watcher.subprocess, "Popen", _Logcat)
+    # The API level the watch asks first: the recorded API 35 emulator's, a
+    # level that streams.
+    level = RecordedFixtures(RECORDED_ROOT / "emulator-api35").text("getprop_sdk")
+    monkeypatch.setattr(anr_watcher.subprocess, "Popen", answering_the_api_level(_Logcat, level))
     # --watch asks `adb get-state` before streaming (B4): the device is up. And
     # an ANR report counts only as system_server wrote it: its pid as `pidof`
     # answered in the recording's own run.

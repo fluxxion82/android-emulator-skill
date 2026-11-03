@@ -98,6 +98,7 @@ class Lazy:
     """A value, or a function giving it, asked for at most once."""
 
     def __init__(self, value) -> None:
+        self._source = value
         self._value = value
         self._asked = not callable(value)
 
@@ -106,6 +107,12 @@ class Lazy:
             self._asked = True
             self._value = self._value()
         return self._value
+
+    def forget_if_unanswered(self) -> None:
+        """Ask again next time when the answer was None: the device could not say then."""
+        if self._asked and self._value is None and callable(self._source):
+            self._value = self._source
+            self._asked = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +156,14 @@ class LifecycleReader:
         if record.tag != PROCESS_TAG:
             return writer, None
         return writer, self._sentence(writer, record.message)
+
+    def forget_unanswered(self) -> None:
+        """A read that recovered: system_server's pid and a package's uids, unknown before, asked again.
+
+        What the device did answer is kept.
+        """
+        self.system_server.forget_if_unanswered()
+        self._uids = {name: uids for name, uids in self._uids.items() if uids}
 
     def is_package(self, sentence: Sentence) -> bool:
         """Whether the sentence's process is exactly a package, under one of its uids."""

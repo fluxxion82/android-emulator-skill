@@ -14,20 +14,60 @@ outside the directory a prune deletes (D11, below).
 The lifecycle (fourth review of PR #42: four rounds of closing one timing
 window at a time did not converge, so it is serialised instead)::
 
-    pending --claim (worker)--> running <--> deciding (worker)
-       |                          |  \\          |
-       | cancel (--stop,          |   \\---------+--> stopped  (worker: stopped on request)
-       |  or --start giving up)   |              \\--> crashed  (worker: its stream failed)
-       v                          |
-    cancelled                     +-- abandon (--stop --abandon) --> abandoned
+    pending --claim (worker)--> opening --opened (worker)--> running <--> deciding (worker)
+       |                          |  |  \\                          |  \\          |
+       | cancel (--stop,          |  |   \\--> crashed (worker:     |   \\---------+--> stopped
+       |  or --start giving up)   |  |        the opening failed)  |              \\--> crashed
+       v                          |  \\--> cancelled (worker: a     |
+    cancelled                     |        stop came first)        |
+                                  +---- abandon (--stop --abandon) +--> abandoned
+
+``opening``: the worker has claimed the session and is opening its read --
+the device's level, and on API 33 its boot id and where its read of the log
+starts -- within the bound it published with its claim (``extras["opening"]``:
+``since_ms``, ``within_s``). It leaves it by one write of its own:
+``running`` (the write that publishes its read's checkpoint: the records
+read and processed; anr_watcher keeps a report it holds for correlation in
+memory, resumes the checkpoint only within the same worker, and a worker
+that ends itself holding unwritten reports ends crashed, saying how many --
+killed or abandoned, their number is unknown), ``crashed``
+(the opening failed, with the reason) or ``cancelled`` (a stop came before
+it opened: nothing was recorded). A stop is recorded in the meta under the
+lock before the worker is signalled (``STOP_REQUESTED``), and the write that
+would publish ``running`` reads it under the same lock: whichever takes the
+lock first decides. The stop first: ``cancelled``, whenever the worker
+handles its signal. The publication first: ``running``, and the stop is an
+ordinary stop. It stays ``opening`` past that only when
+its worker is gone (killed), and then until --stop --abandon: a prune never
+takes it (D11). --start answers success only on ``running``. Every wait on an
+opening is exactly the bound published, and what the opening can take past
+it (anr_watcher's ``OPENING_OVERRUN_SECONDS``). What each command answers
+about an ``opening`` session, by its worker (anr_watcher):
+
+    worker        --start               --stop                 --list-sessions   --get-details,
+                                                                                 --diff
+    at work       waits to the bound:   signals it; it         opening           refused, exit 1:
+                  opened, success;      cancels its opening                      no summary yet
+                  past it, stops the    (its dump reaped) and                    (--stop it first)
+                  session and refuses   publishes cancelled;
+                  (exit 1), naming how  --stop refuses (exit
+                  long it ran           1): nothing recorded
+    at work, a    its wait sees         as above; not ended    opening           as above
+    stop          cancelled: refused    by the bound: refused
+    recorded      (exit 1)              (exit 1) at the bound,
+                                        never later; --abandon
+    gone          refused (exit 1):     refused (exit 1):      opening,          refused (exit 1):
+                  the worker is gone,   the worker is gone;    unpublished_end   the worker is
+                  --stop's answer       --abandon: abandoned,  (text: gone)      gone; --abandon
+                                        summary incomplete
 
 Every read-modify-write of a session's meta.json and summary.json happens
 under its lock (``fcntl.flock`` on ``locks/<id>.lock``; how long a writer
 waits for it is bounded, not how long it is held), by exactly one owner per
 transition, and only from the state the transition expects -- anything else
 is refused (:class:`TransitionRefusedError`), not applied. The worker owns
-its claim, ``deciding``, its counters and its end (``stopped`` / ``crashed``,
-which it publishes before it exits, with the counters and any failure in the
+its claim, the opening's end, ``deciding``, its counters and its end
+(``stopped`` / ``crashed`` / ``cancelled``, which it publishes before it exits, with the counters and any failure in the
 same write -- unless the lock cannot be had in
 ``WORKER_END_LOCK_TIMEOUT_SECONDS`` or the session was deleted); the CLI
 owns ``cancelled``, ``abandoned`` and ``summary.json``, and writes no field
@@ -109,6 +149,7 @@ from common.env_config import env_int
 # === CONSTANTS ===
 
 PENDING = "pending"
+OPENING = "opening"
 RUNNING = "running"
 DECIDING = "deciding"
 STOPPED = "stopped"
@@ -116,14 +157,22 @@ CRASHED = "crashed"
 CANCELLED = "cancelled"
 ABANDONED = "abandoned"
 # A worker is at work: it may still write, and how it ends is not yet known.
-LIVE_STATES = frozenset({RUNNING, DECIDING})
+LIVE_STATES = frozenset({OPENING, RUNNING, DECIDING})
 # Nothing writes the session's meta again (a --stop only saves its summary).
 TERMINAL_STATES = frozenset({STOPPED, CRASHED, CANCELLED, ABANDONED})
+# Where a stop asked of a session at work is recorded (``meta.extras``, epoch
+# ms), under the session's lock and before its worker is signalled: the
+# worker's publications read it under the same lock, so a stop and the
+# publication that the read is open are ordered (``mark_stop_requested``).
+STOP_REQUESTED = "stop_requested_ms"
+# How a session asked to stop while its worker opened its read says it ended.
+STOPPED_WHILE_OPENING = "a stop came while the worker was opening its read"
 
 # The lifecycle above. Sessions written before it (v0.8.0 main) have no
 # ``lifecycle`` key: their worker never said how it ended, and their CLI wrote
-# ``stopped`` itself.
-LIFECYCLE_VERSION = 2
+# ``stopped`` itself. 3: ``opening`` is a status of its own (it was ``running``
+# with the opening's bound in the worker's counters).
+LIFECYCLE_VERSION = 3
 
 _DURATION_RE = re.compile(r"(\d+)([smhd])$")
 
@@ -487,7 +536,7 @@ class SessionStore:
 
         Claimed is ``claimed_at_ms``, which only ``claim_worker`` writes -- of a
         pending session, for a worker presenting the session's token, in the
-        same write that makes it running -- so the evidence is this session's
+        same write that makes it opening -- so the evidence is this session's
         own worker, whatever it has done since (it may have ended already:
         CI on PR #42). Counters or a start time lying in the meta are not:
         they were evidence before, whoever wrote them (fourth review of PR #42).
@@ -495,17 +544,31 @@ class SessionStore:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             meta = self.load_meta(session_id)
-            if meta.claimed_at_ms is not None and meta.status not in (PENDING, CANCELLED):
+            # Claimed and cancelled is the worker's own end: a stop came while
+            # it opened its read. Only a pending session is cancelled unclaimed.
+            if meta.claimed_at_ms is not None and meta.status != PENDING:
                 return meta
             time.sleep(0.05)
         raise TimeoutError(f"Worker for {session_id} did not register within {timeout_seconds}s")
 
     # --- the worker's transitions --------------------------------------------
 
-    def claim_worker(self, session_id: str, pid: int, token: str | None) -> SessionMeta:
-        """pending -> running, for the worker presenting the session's token.
+    def claim_worker(
+        self,
+        session_id: str,
+        pid: int,
+        token: str | None,
+        counters: dict | None = None,
+        opening: dict | None = None,
+    ) -> SessionMeta:
+        """pending -> opening (or running), for the worker presenting the session's token.
 
-        Records the pid, its start time and when it claimed. A session that is
+        Records the pid, its start time and when it claimed, and, given, the
+        worker's first counters, in the same write. With ``opening`` -- the
+        bound the worker keeps on opening its read, ``{"since_ms",
+        "within_s"}`` -- the session is ``opening`` until the worker's
+        :meth:`worker_opened` (anr_watcher's worker always opens); without, it
+        is ``running`` at once (a worker with nothing to open). A session that is
         not pending -- cancelled by a --stop or a --start that gave up on its
         worker, or claimed already -- is refused, as is a token that is not
         the session's: a worker that claimed a session already stopped went
@@ -527,7 +590,11 @@ class SessionStore:
             meta.pid = pid
             meta.worker_started = started
             meta.claimed_at_ms = _now_ms()
-            meta.status = RUNNING
+            meta.status = OPENING if opening is not None else RUNNING
+            if opening is not None:
+                meta.extras["opening"] = opening
+            if counters is not None:
+                meta.extras["line_counters"] = counters
             self._write_meta(meta)
             return meta
 
@@ -546,6 +613,32 @@ class SessionStore:
             SessionBusyError: The lock was held past ``timeout``.
         """
         return self._worker_write(session_id, pid, counters, LIVE_STATES, None, timeout)
+
+    def worker_opened(self, session_id: str, pid: int, counters: dict) -> SessionMeta:
+        """opening -> running: the read is open, its checkpoint in ``counters``; or cancelled.
+
+        Read under the lock a stop is recorded under (:meth:`mark_stop_requested`):
+        a stop recorded first makes this write ``cancelled`` -- nothing
+        recorded, ``counters["cancelled"]`` saying why, in the same write --
+        never ``running``. The worker published ``running`` without looking,
+        and a stop --start had answered as a cancellation became an ordinary
+        stop with a last read (third review of the opening). The meta
+        returned says which; a worker whose session is cancelled records
+        nothing and exits.
+
+        Raises:
+            TransitionRefusedError: The session is not opening (abandoned
+                meanwhile), or its pid is not ``pid``.
+        """
+
+        def opened(meta: SessionMeta) -> str:
+            if STOP_REQUESTED in meta.extras:
+                # The same dict the write is about to store (_worker_write).
+                counters.setdefault("cancelled", STOPPED_WHILE_OPENING)
+                return CANCELLED
+            return RUNNING
+
+        return self._worker_write(session_id, pid, counters, {OPENING}, opened)
 
     def worker_deciding(self, session_id: str, pid: int, counters: dict) -> SessionMeta:
         """running -> deciding: the worker is deciding how its stream ended.
@@ -566,7 +659,13 @@ class SessionStore:
         counters: dict,
         timeout: float = WORKER_LOCK_TIMEOUT_SECONDS,
     ) -> SessionMeta:
-        """running | deciding -> crashed (counters hold a stream failure) | stopped.
+        """running | deciding -> crashed (counters hold a stream failure) | stopped;
+        opening -> crashed (the opening failed) | cancelled (a stop came before it opened).
+
+        An opening asked to stop (``STOP_REQUESTED``) ends ``cancelled`` even
+        when its opening failed too -- the stop came first, or as it failed --
+        the failure said in ``counters["cancelled"]``: --start, which asked,
+        answered that it ends cancelled.
 
         The worker's last write, before it exits, on every path that can take
         the lock (``timeout``: the worker passes
@@ -576,7 +675,18 @@ class SessionStore:
         of PR #42: --start answered `{"success": true}` between the two writes
         that published them). Its pid is cleared: the OS may reuse it now.
         """
-        end = CRASHED if counters.get("stream_failure") else STOPPED
+
+        def end(meta: SessionMeta) -> str:
+            if meta.status != OPENING:
+                return CRASHED if counters.get("stream_failure") else STOPPED
+            if counters.get("stream_failure") and STOP_REQUESTED not in meta.extras:
+                return CRASHED
+            # The same dict the write is about to store (_worker_write).
+            failure = counters.pop("stream_failure", None)
+            also = f"; its opening had failed too: {failure.get('error')}" if failure else ""
+            counters["cancelled"] = f"{counters.get('cancelled') or STOPPED_WHILE_OPENING}{also}"
+            return CANCELLED
+
         return self._worker_write(session_id, pid, counters, LIVE_STATES, end, timeout)
 
     # --- the CLI's transitions (inside a ``transaction``) --------------------
@@ -591,6 +701,25 @@ class SessionStore:
             raise TransitionRefusedError(meta.session_id, "cancelled", meta.status)
         meta.status = CANCELLED
         self._mark_ended(meta)
+        self._write_meta(meta)
+
+    def mark_stop_requested(self, meta: SessionMeta) -> None:
+        """Record that a stop was asked of the session's worker -- before it is signalled.
+
+        In ``extras[STOP_REQUESTED]`` (epoch ms; the first ask's is kept), so
+        the worker's publications, made under this same lock, read it: an
+        ``opening`` worker asked to stop publishes ``cancelled``, never
+        ``running``, at whatever moment it handles the signal
+        (:meth:`worker_opened`, :meth:`finish_worker`). A worker that
+        published ``running`` before this write was asked once running, and
+        stops as any worker does.
+
+        Raises:
+            TransitionRefusedError: The session is not at work (``LIVE_STATES``).
+        """
+        if meta.status not in LIVE_STATES:
+            raise TransitionRefusedError(meta.session_id, "asked to stop", meta.status)
+        meta.extras.setdefault(STOP_REQUESTED, _now_ms())
         self._write_meta(meta)
 
     def mark_abandoned(self, meta: SessionMeta, why: str) -> None:
@@ -943,10 +1072,13 @@ class SessionStore:
         pid: int,
         counters: dict,
         expected: Iterable[str],
-        to: str | None,
+        to: str | Callable[[SessionMeta], str] | None,
         timeout: float = WORKER_LOCK_TIMEOUT_SECONDS,
     ) -> SessionMeta:
         """One write of the worker's: its counters, and ``to`` (None: the status kept).
+
+        ``to`` may be a function of the meta as read under the lock: an end
+        that depends on the state it ends from (:meth:`finish_worker`).
 
         Applied only while the session is in one of ``expected`` and still
         claimed by ``pid``; refused otherwise, so a worker the CLI has given up
@@ -963,6 +1095,8 @@ class SessionStore:
                     session_id, f"written by its worker ({to})", meta.status, why
                 )
             meta.extras["line_counters"] = counters
+            if callable(to):
+                to = to(meta)
             if to is not None:
                 meta.status = to
                 if to in TERMINAL_STATES:

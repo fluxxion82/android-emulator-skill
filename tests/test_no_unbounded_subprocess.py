@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
 from dataclasses import dataclass, field
@@ -52,6 +53,10 @@ EXEMPT: dict[str, str] = {
     "emulator_selector.py": "delegates to the emulator binary the same way emulator_boot does",
     "log_monitor.py": "streams `adb logcat`; bounded by its own deadline timer, not subprocess",
     "anr_watcher.py": "streams `adb logcat` in a detached worker with its own restart budget",
+    "dump_read.py": (
+        "runs `adb logcat -d` dumps for the API 33 live readers, each waited on in short steps "
+        "against its own deadline and killed there (the API 33 runs below end at it)"
+    ),
 }
 
 # Modules claiming a streaming exemption must actually enforce a deadline.
@@ -670,6 +675,7 @@ DIRECT_SUBPROCESS_MODULES: frozenset[str] = frozenset(
     {
         "anr_watcher.py",  # streams `adb logcat` in a detached worker
         "common/anr_sessions.py",  # asks the host's `ps` who holds a worker pid, not adb
+        "common/dump_read.py",  # API 33's bounded dumps: output and stderr to files, no pipe
         "common/sdk_tools.py",  # runs SDK binaries (emulator, avdmanager), not adb
         "emulator_boot.py",  # launches the emulator binary detached
         "emulator_create.py",  # avdmanager / sdkmanager
@@ -724,26 +730,36 @@ def test_the_matcher_is_bound_to_the_subprocess_module(tmp_path, source, expecte
     assert _unbounded_calls(path) == expected
 
 
-# --- API 33: the dump-made live read ---------------------------------------------------
+# --- API 33: the dump-made live reads ----------------------------------------------------
 #
-# On API 33 log_monitor's live read is not a stream: it is a series of dumps
-# (log_monitor._read_by_dumps), each bounded on the reading thread -- no Timer
-# for the name check above to find, and the runs above all answer API 35, so
-# none of them reaches it. Its own run: a device that says 33, answers the
-# newest record as recorded, and never finishes the window's dump. With
-# --duration 1s that dump's deadline is DUMP_FLOOR (5 s) plus the 1 s it
+# On API 33 a live read is not a stream: it is a series of dumps
+# (common.dump_read, shared by log_monitor and anr_watcher's live readers),
+# each bounded on the reading thread -- no Timer for the name check above to
+# find, and the runs above all answer API 35, so none of them reaches it. Its
+# own run, for each script that reads that way: a device that says 33, answers
+# the newest record as recorded, and never finishes the window's dump. With a
+# one-second duration that dump's deadline is DUMP_FLOOR (5 s) plus the 1 s it
 # covers; the run must end there, refused, well inside twice that.
 
 API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
-API33_DURATION = TimedMode(
-    bound="DUMP_FLOOR",
-    argv=("--duration", "1s", "--json"),
-    seconds=7,
-    status=1,
-    says="did not finish within",
-)
-# The control: `_dump` waiting on its child with no bound. Python source, not
-# tool output; it must be in log_monitor.py exactly once.
+API33_RUNS: dict[str, TimedMode] = {
+    "log_monitor.py": TimedMode(
+        bound="DUMP_FLOOR",
+        argv=("--duration", "1s", "--json"),
+        seconds=7,
+        status=1,
+        says="did not finish within",
+    ),
+    "anr_watcher.py": TimedMode(
+        bound="DUMP_FLOOR",
+        argv=("--watch", "--duration", "1", "--json"),
+        seconds=7,
+        status=1,
+        says="did not finish within",
+    ),
+}
+# The control: the dump waiting on its child with no bound. Python source, not
+# tool output; it must be in common/dump_read.py exactly once.
 _UNBOUNDED_DUMP_WAIT = (
     "returncode = process.wait(timeout=min(DUMP_WAIT_SECONDS, left))",
     "returncode = process.wait()",
@@ -751,10 +767,9 @@ _UNBOUNDED_DUMP_WAIT = (
 
 
 def _why_the_api_33_read_did_not_end(
-    toolchain: FakeToolchain, recorded, script: Path, **env: str
+    toolchain: FakeToolchain, recorded, script: Path, mode: TimedMode
 ) -> str | None:
-    """Run ``script`` as API 33's --duration over a window dump that never ends; why not on time."""
-    mode = API33_DURATION
+    """Run ``script`` as API 33's live read over a window dump that never ends; why not on time."""
     toolchain.install(
         "adb",
         [
@@ -770,7 +785,7 @@ def _why_the_api_33_read_did_not_end(
     limit = 2 * mode.seconds
     try:
         try:
-            result = toolchain.run(script, *mode.argv, timeout=limit, **env)
+            result = toolchain.run(script, *mode.argv, timeout=limit)
         except subprocess.TimeoutExpired:
             return f"still running {limit}s into its {mode.seconds}s bound"
     finally:
@@ -787,19 +802,33 @@ def _why_the_api_33_read_did_not_end(
     return None
 
 
-def test_the_api_33_live_read_ends_at_its_bound(toolchain, recorded):
-    reason = _why_the_api_33_read_did_not_end(toolchain, recorded, SCRIPTS / "log_monitor.py")
-    assert reason is None, f"log_monitor's API 33 --duration did not end at its bound: {reason}"
-
-
-def test_the_api_33_run_sees_an_unbounded_dump_wait(toolchain, recorded, tmp_path):
-    """The control: with ``_dump`` waiting on its child unbounded, the run must not end."""
+def _scripts_with_an_unbounded_dump_wait(tmp_path: Path) -> Path:
+    """A copy of scripts/ whose common/dump_read.py waits on its dump unbounded."""
+    copy = tmp_path / "scripts"
+    shutil.copytree(SCRIPTS, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    shared = copy / "common" / "dump_read.py"
     old, new = _UNBOUNDED_DUMP_WAIT
-    source = (SCRIPTS / "log_monitor.py").read_text(encoding="utf-8")
-    assert source.count(old) == 1, "the dump's bounded wait is not in log_monitor.py once"
-    copy = tmp_path / "log_monitor.py"
-    copy.write_text(source.replace(old, new), encoding="utf-8")
+    source = shared.read_text(encoding="utf-8")
+    assert source.count(old) == 1, "the dump's bounded wait is not in common/dump_read.py once"
+    shared.write_text(source.replace(old, new), encoding="utf-8")
+    return copy
 
-    reason = _why_the_api_33_read_did_not_end(toolchain, recorded, copy, PYTHONPATH=str(SCRIPTS))
+
+@pytest.mark.parametrize("script", sorted(API33_RUNS))
+def test_the_api_33_live_read_ends_at_its_bound(script, toolchain, recorded):
+    reason = _why_the_api_33_read_did_not_end(
+        toolchain, recorded, SCRIPTS / script, API33_RUNS[script]
+    )
+    assert reason is None, f"{script}'s API 33 live read did not end at its bound: {reason}"
+
+
+@pytest.mark.parametrize("script", sorted(API33_RUNS))
+def test_the_api_33_run_sees_an_unbounded_dump_wait(script, toolchain, recorded, tmp_path):
+    """The control: with the shared dump waiting on its child unbounded, the run must not end."""
+    copy = _scripts_with_an_unbounded_dump_wait(tmp_path)
+
+    reason = _why_the_api_33_read_did_not_end(
+        toolchain, recorded, copy / script, API33_RUNS[script]
+    )
 
     assert reason is not None, "an unbounded dump wait ended at its bound: the run cannot see it"
