@@ -163,15 +163,11 @@ def test_delete_all_empty(monkeypatch, deleter):
 
 
 def test_list_avds_by_recency_orders_newest_first(monkeypatch, tmp_path, deleter):
-    # Build three AVD config dirs with distinct mtimes.
+    # Three AVDs whose config.ini files have distinct mtimes.
     monkeypatch.setattr(deleter, "list_avds", lambda: ["old", "mid", "new"])
     monkeypatch.setattr(deleter, "get_avd_home", lambda: tmp_path)
     for name, mtime in [("old", 100), ("mid", 200), ("new", 300)]:
-        avd_dir = tmp_path / f"{name}.avd"
-        avd_dir.mkdir()
-        import os
-
-        os.utime(avd_dir, (mtime, mtime))
+        _avd(tmp_path, name, config=mtime, directory=mtime)
 
     assert deleter.list_avds_by_recency() == ["new", "mid", "old"]
 
@@ -380,7 +376,7 @@ def test_the_cli_exits_non_zero_without_avdmanager(monkeypatch, capsys, argv):
 def test_an_unresolvable_avd_home_fails_instead_of_ranking_everything_oldest(
     monkeypatch, tmp_path, deleter
 ):
-    """L5: no `.avd` directory means no ranking, not a ranking of zeroes."""
+    """L5: no `.avd/config.ini` means no ranking, not a ranking of zeroes."""
     monkeypatch.setattr(deleter, "list_avds", lambda: ["alpha", "beta", "gamma"])
     monkeypatch.setattr(deleter, "get_avd_home", lambda: tmp_path / "nowhere")
     calls = _capture_run(monkeypatch)
@@ -422,9 +418,7 @@ def test_a_resolvable_home_still_keeps_the_newest_n(monkeypatch, tmp_path, delet
     monkeypatch.setattr(deleter, "list_avds", lambda: ["old", "mid", "new"])
     monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
     for name, mtime in [("old", 100), ("mid", 200), ("new", 300)]:
-        avd_dir = tmp_path / f"{name}.avd"
-        avd_dir.mkdir()
-        os.utime(avd_dir, (mtime, mtime))
+        _avd(tmp_path, name, config=mtime, directory=mtime)
     calls = _capture_run(monkeypatch)
 
     succeeded, failed, _results = deleter.delete_old(keep_count=2, confirm=True)
@@ -546,3 +540,84 @@ def test_a_failed_delete_does_not_hand_on_avdmanagers_stray_null_line(monkeypatc
 
     assert success is False
     assert "null" not in [line.strip() for line in message.splitlines()], message
+
+
+# --- L5-b: rank by config.ini's mtime, and say so ------------------------------
+# The ranking stat'd the `.avd` DIRECTORY, whose mtime moves whenever any file
+# inside is created or removed -- a snapshot, a lock file -- while the
+# docstring promised the config's. Any mtime is a proxy for "last used"; the
+# config's is the one that changes with the AVD's configuration, and the output
+# now names it instead of implying "newest" is a fact about use.
+
+
+def _avd(home: Path, name: str, *, config: int, directory: int) -> None:
+    """``<home>/<name>.avd/config.ini`` with its own mtime, then the directory's.
+
+    The directory last: writing config.ini moves the directory's mtime.
+    """
+    avd_dir = home / f"{name}.avd"
+    avd_dir.mkdir(parents=True)
+    config_ini = avd_dir / "config.ini"
+    config_ini.write_text("hw.lcd.density=420\n")
+    os.utime(config_ini, (config, config))
+    os.utime(avd_dir, (directory, directory))
+
+
+def test_the_ranking_follows_config_ini_not_the_directory(monkeypatch, tmp_path, deleter):
+    """Directory mtimes say A is newer; config.ini says B. The config wins."""
+    monkeypatch.setattr(deleter, "list_avds", lambda: ["A", "B"])
+    monkeypatch.setattr(deleter, "get_avd_home", lambda: tmp_path)
+    _avd(tmp_path, "A", config=100, directory=900)  # a snapshot written later
+    _avd(tmp_path, "B", config=500, directory=200)
+
+    assert deleter.list_avds_by_recency() == ["B", "A"]
+
+
+def test_a_missing_config_ini_fails_the_ranking(monkeypatch, tmp_path, deleter):
+    """L5 holds for the file: an `.avd` directory without config.ini is no timestamp."""
+    monkeypatch.setattr(deleter, "list_avds", lambda: ["A", "B"])
+    monkeypatch.setattr(deleter, "get_avd_home", lambda: tmp_path)
+    _avd(tmp_path, "A", config=100, directory=100)
+    (tmp_path / "B.avd").mkdir()  # the directory is there; its config is not
+
+    with pytest.raises(emulator_delete.AvdHomeError) as excinfo:
+        deleter.list_avds_by_recency()
+
+    message = str(excinfo.value)
+    assert "cannot rank AVDs by age" in message
+    assert "B.avd/config.ini" in message, message
+    assert "--name B" in message, message
+
+
+def test_the_old_prompt_names_what_it_ranks_by(monkeypatch, capsys, deleter):
+    monkeypatch.setattr(deleter, "list_avds_by_recency", lambda: ["new", "old"])
+    calls = _capture_run(monkeypatch)
+    _answer(monkeypatch, "n\n")
+
+    with pytest.raises(cli.Failure):
+        deleter.delete_old(keep_count=1, confirm=False)
+
+    assert calls == []
+    assert "config modification time" in capsys.readouterr().err
+
+
+def test_the_old_summary_names_what_it_ranks_by_and_what_that_is_not(monkeypatch, tmp_path, capsys):
+    _listing(monkeypatch, ["A", "B"])
+    monkeypatch.setenv("ANDROID_AVD_HOME", str(tmp_path))
+    _avd(tmp_path, "A", config=100, directory=100)
+    _avd(tmp_path, "B", config=500, directory=500)
+    calls = _capture_run(monkeypatch)
+
+    text = _run_cli(monkeypatch, capsys, "--old", "1", "--yes")
+
+    assert text.returncode == 0, text
+    assert calls == [["/sdk/avdmanager", "delete", "avd", "--name", "A"]]
+    assert "config modification time" in text.stdout, text.stdout
+    assert "proxy for last use" in text.stdout, text.stdout
+
+    calls.clear()
+    _avd(tmp_path, "C", config=50, directory=50)
+    _listing(monkeypatch, ["B", "C"])
+    payload = json.loads(_run_cli(monkeypatch, capsys, "--old", "1", "--yes", "--json").stdout)
+    assert payload["ranked_by"] == "config modification time", payload
+    assert [item["name"] for item in payload["items"]] == ["C"]

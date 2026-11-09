@@ -18,8 +18,13 @@ Usage Examples:
     # Delete every AVD
     python scripts/emulator_delete.py --all --yes
 
-    # Keep the 3 most-recently-modified AVDs, delete the rest
+    # Keep the 3 AVDs whose config.ini changed most recently, delete the rest
     python scripts/emulator_delete.py --old 3 --yes
+
+``--old`` ranks by config modification time: the mtime of
+``<avd_home>/<name>.avd/config.ini``. That is a proxy for last use, not a
+record of it -- an AVD booted without a configuration change keeps its old
+mtime.
 """
 
 import argparse
@@ -55,12 +60,18 @@ SDK_TOOL_TIMEOUT = 120
 # What to do about a declined prompt -- the same for every mode that asks.
 CANCELLED_REMEDY = "Answer `yes` at the prompt, or pass --yes to delete without asking."
 
+# What `--old` ranks by, in every place that says so.
+RANKED_BY = "config modification time"
+
+# Said once per run, wherever the ranking is reported.
+RANKING_CAVEAT = "a proxy for last use, not a record of it"
+
 # What to do about an AVD avdmanager would not delete.
 DELETE_REMEDY = "Run --list to verify the AVD name; resolve the reported failure before retrying."
 
 
 class AvdHomeError(SdkToolError):
-    """A listed AVD has no ``.avd`` directory under the resolved AVD home.
+    """A listed AVD has no ``.avd/config.ini`` under the resolved AVD home.
 
     Subclasses :class:`common.sdk_tools.SdkToolError` so that every CLI mode
     reports it the one way the L8 fix established -- ``{"error": ...}`` under
@@ -159,34 +170,38 @@ class EmulatorDeleter:
         """
         List AVD names ordered newest-first by config modification time.
 
-        AVD configs live at ``<avd_home>/<name>.avd``. The directory mtime is a
-        reliable, Android-native proxy for how recently an AVD was created or
-        used.
+        The key is the mtime of ``<avd_home>/<name>.avd/config.ini``, the file
+        the emulator rewrites when the AVD's configuration changes. It was the
+        ``.avd`` directory's mtime, which moves whenever any file inside is
+        created or removed (a snapshot, a lock file), although this docstring
+        already said "config" (L5-b). Either is a proxy for "last used", not
+        the fact: an AVD booted without a configuration change keeps its old
+        mtime, and the output says so.
 
-        An AVD whose ``.avd`` directory cannot be stat'd is a **failure**, not
-        a timestamp of ``0.0`` (L5). That fallback sorted every unresolvable
+        An AVD whose ``config.ini`` cannot be stat'd is a **failure**, not a
+        timestamp of ``0.0`` (L5). That fallback sorted every unresolvable
         AVD to the end of a newest-first list -- which is the end ``--old``
         deletes -- so on a host whose AVD home is somewhere this script did not
         look, ``--old 3`` proposed deleting the lot and said nothing about it.
         The ranking either has real mtimes for every name or it has no answer.
 
         Returns:
-            List of AVD names, most-recently-modified first
+            List of AVD names, most recent config modification first
 
         Raises:
-            AvdHomeError: The AVD home holds no ``.avd`` directory for some
+            AvdHomeError: The AVD home holds no ``.avd/config.ini`` for some
                 listed AVD, so the AVDs cannot be ranked by age at all.
         """
         avd_home = self.get_avd_home()
         names = self.list_avds()
 
         def _mtime(name: str) -> float:
-            avd_dir = avd_home / f"{name}.avd"
+            config = avd_home / f"{name}.avd" / "config.ini"
             try:
-                return avd_dir.stat().st_mtime
+                return config.stat().st_mtime
             except OSError as error:
                 raise AvdHomeError(
-                    f"cannot rank AVDs by age: {name}.avd not found under "
+                    f"cannot rank AVDs by age: {name}.avd/config.ini not found under "
                     f"{avd_home} ({error.strerror}); {AVD_HOME_REMEDY}. To "
                     f"delete without ranking, name the AVD: --name {name}."
                 ) from error
@@ -326,10 +341,11 @@ class EmulatorDeleter:
         self, keep_count: int = DEFAULT_KEEP_COUNT, confirm: bool = False
     ) -> tuple[int, int, list]:
         """
-        Delete older AVDs, keeping the newest ``keep_count`` by config mtime.
+        Delete older AVDs, keeping the newest ``keep_count`` by config modification time.
 
         Args:
-            keep_count: Number of most-recently-modified AVDs to keep
+            keep_count: Number of AVDs to keep, those whose ``config.ini``
+                changed most recently (see :meth:`list_avds_by_recency`)
             confirm: When True, skip the interactive confirmation prompt
 
         Returns:
@@ -344,7 +360,10 @@ class EmulatorDeleter:
         keep_count = max(keep_count, 0)
         ordered = self.list_avds_by_recency()
         to_delete = ordered[keep_count:]
-        prompt = f"Delete {len(to_delete)} older AVDs, keeping the newest {keep_count}?"
+        prompt = (
+            f"Delete {len(to_delete)} older AVDs, keeping the newest {keep_count} "
+            f"by {RANKED_BY}?"
+        )
         return self._delete_many(to_delete, avdmanager, confirm, prompt)
 
     def _delete_many(
@@ -403,7 +422,7 @@ Examples:
   # Delete every AVD
   python scripts/emulator_delete.py --all --yes
 
-  # Keep the newest N AVDs, delete the rest
+  # Keep the newest N AVDs by config modification time, delete the rest
   python scripts/emulator_delete.py --old 3 --yes
         """,
     )
@@ -417,8 +436,9 @@ Examples:
         const=DEFAULT_KEEP_COUNT,
         metavar="KEEP_COUNT",
         help=(
-            "Delete older AVDs, keeping the newest KEEP_COUNT by config mtime "
-            f"(default: {DEFAULT_KEEP_COUNT}, override via ANDROID_EMU_DELETE_KEEP). "
+            f"Delete older AVDs, keeping the newest KEEP_COUNT by {RANKED_BY} "
+            f"(the mtime of <name>.avd/config.ini: {RANKING_CAVEAT}; "
+            f"default: {DEFAULT_KEEP_COUNT}, override via ANDROID_EMU_DELETE_KEEP). "
             "KEEP_COUNT must be at least 1; use --all to delete every AVD"
         ),
     )
@@ -480,7 +500,10 @@ def _dispatch(parser: argparse.ArgumentParser, deleter: "EmulatorDeleter", args)
                 f"--old N with N >= 1.",
             )
         if args.verbose:
-            print(f"Deleting older AVDs, keeping newest {args.old}", file=progress)
+            print(
+                f"Deleting older AVDs, keeping the newest {args.old} by {RANKED_BY}",
+                file=progress,
+            )
         succeeded, failed, items = deleter.delete_old(keep_count=args.old, confirm=args.yes)
         sys.exit(_report_batch("delete_old", succeeded, failed, items, args, keep_count=args.old))
 
@@ -526,14 +549,17 @@ def _report_batch(
     """
     total = succeeded + failed
     extra: dict = {"action": action, "succeeded": succeeded, "failed": failed, "total": total}
+    kept = ""
     if keep_count is not None:
         extra["keep_count"] = keep_count
+        extra["ranked_by"] = RANKED_BY
+        kept = f"; kept the newest {keep_count} by {RANKED_BY} ({RANKING_CAVEAT})"
     if not args.json:
         if total == 0:
             # Only when nothing matched: a declined prompt is a refusal (N4).
             print("No AVDs to delete")
         else:
-            print(f"Delete summary: {succeeded}/{total} succeeded, {failed} failed")
+            print(f"Delete summary: {succeeded}/{total} succeeded, {failed} failed{kept}")
         if args.verbose:
             for item in items:
                 print(f"  {item['message']}")
