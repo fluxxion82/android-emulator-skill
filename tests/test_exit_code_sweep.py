@@ -620,8 +620,10 @@ def test_skill_md_states_the_number_of_modes_the_sweep_runs():
     """SKILL.md's count of swept modes is this table's length, not a hand-kept number.
 
     It said 39 after the health check's mode made it 40 (Codex, after slice
-    2). The number is read where SKILL.md states it and compared with the
+    2). The number is read wherever SKILL.md states it and compared with the
     enumeration, so the next mode added or removed fails here until it is said.
+    Every statement must agree with the count; a second accurate one is fine
+    (Codex, closure review: `[40, 40] != [40]` would have failed a true doc).
     """
     import re
 
@@ -631,9 +633,9 @@ def test_skill_md_states_the_number_of_modes_the_sweep_runs():
         r"asserts the payload of (\d+) documented modes", SKILL_MD.read_text("utf-8")
     )
     assert stated, "SKILL.md no longer states how many modes the sweep runs"
-    assert [int(n) for n in stated] == [
+    assert {int(n) for n in stated} == {
         len(MODES)
-    ], f"SKILL.md says {stated}; the sweep runs {len(MODES)} modes"
+    }, f"SKILL.md says {stated}; the sweep runs {len(MODES)} modes"
 
 
 def test_the_sweep_covers_the_scripts_n5_named():

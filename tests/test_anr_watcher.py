@@ -7621,3 +7621,60 @@ def test_help_still_answers_on_a_host_without_fcntl(toolchain, tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "--since" in result.stdout
+
+
+# A macOS or Linux Python whose fcntl extension exists but fails to load: not
+# Windows, and the loader's own words are the diagnosis (Codex, closure review).
+_BROKEN_FCNTL = (
+    "import sys\n"
+    "from importlib.abc import MetaPathFinder\n"
+    "\n"
+    "\n"
+    "class _BrokenFcntl(MetaPathFinder):\n"
+    "    def find_spec(self, name, path, target=None):\n"
+    "        if name == 'fcntl':\n"
+    "            raise ImportError('dlopen fcntl: symbol not found: _flock', name='fcntl')\n"
+    "        return None\n"
+    "\n"
+    "\n"
+    "sys.meta_path.insert(0, _BrokenFcntl())\n"
+)
+
+
+def _with_broken_fcntl(tmp_path) -> dict[str, str]:
+    hook = tmp_path / "broken-fcntl"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_BROKEN_FCNTL, encoding="utf-8")
+    return {"PYTHONPATH": str(hook)}
+
+
+def test_a_broken_fcntl_keeps_the_loaders_diagnosis(toolchain, tmp_path):
+    """An absent module and a broken installation are told apart; the cause survives.
+
+    ``sys.modules["fcntl"] = None`` is Windows: ModuleNotFoundError, and the
+    refusal says to run on macOS or Linux. A Unix host whose fcntl extension
+    fails to load raises a plain ImportError; the same words there would send
+    the user to the host they are already on and drop the loader's message.
+    """
+    result = toolchain.run(
+        "anr_watcher.py", "--since", "1m", "--json", **_with_broken_fcntl(tmp_path)
+    )
+
+    assert "Traceback" not in result.stderr, result.stderr
+    (line,) = result.stdout.splitlines()
+    refusal = json.loads(line)
+    assert refusal["success"] is False, refusal
+    assert "dlopen fcntl: symbol not found: _flock" in refusal["error"], refusal
+    assert "has no fcntl module" not in refusal["error"], refusal
+    assert "Python" in refusal["remedy"], refusal
+    assert result.returncode == cli.EXIT_FAILURE, result.stdout + result.stderr
+    assert toolchain.calls("adb") == []
+
+
+def test_an_absent_fcntl_is_still_called_absent(toolchain, tmp_path):
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--json", **_without_fcntl(tmp_path))
+
+    (line,) = result.stdout.splitlines()
+    refusal = json.loads(line)
+    assert "has no fcntl module" in refusal["error"], refusal
+    assert "dlopen" not in refusal["error"], refusal

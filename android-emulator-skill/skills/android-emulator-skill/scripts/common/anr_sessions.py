@@ -148,13 +148,17 @@ from common.anr_pipeline import (
 )
 from common.env_config import env_int
 
+_FCNTL_IMPORT_ERROR: ImportError | None = None
 try:
     import fcntl
-except ImportError:
+except ImportError as exc:
     # Windows: its Python has no fcntl, so no session lock can be taken. The
     # module still loads, so anr_watcher can refuse in the boundary's shape
-    # (require_file_locking) rather than die importing it.
+    # (require_file_locking) rather than die importing it. The exception is
+    # kept: a macOS or Linux Python whose fcntl extension fails to load is a
+    # different refusal from an absent module, with the loader's words in it.
     fcntl = None
+    _FCNTL_IMPORT_ERROR = exc
 
 # === CONSTANTS ===
 
@@ -259,24 +263,44 @@ class StoreBusyError(SessionBusyError):
 
 
 class FileLockingUnavailableError(RuntimeError):
-    """This host's Python has no ``fcntl`` (Windows), so a session's lock cannot be taken."""
+    """``fcntl`` could not be imported, so a session's lock cannot be taken.
 
-    def __init__(self) -> None:
+    Two hosts arrive here. Windows has no fcntl module at all
+    (ModuleNotFoundError): the remedy is another host. A macOS or Linux Python
+    whose fcntl extension fails to load raises a plain ImportError: the host is
+    the right one and its Python is broken, so the loader's own message is the
+    error and the remedy is the installation.
+    """
+
+    def __init__(self, cause: ImportError | None = None) -> None:
+        self.cause = cause
+        if cause is None or isinstance(cause, ModuleNotFoundError):
+            why = (
+                "this host's Python has no fcntl module: "
+                "anr_watcher.py runs on macOS and Linux only."
+            )
+            self.remedy = "Run anr_watcher.py on a macOS or Linux host."
+        else:
+            why = f"importing fcntl failed on this host: {cause}"
+            self.remedy = (
+                "Repair this host's Python (its fcntl extension did not load), "
+                "or run anr_watcher.py on another macOS or Linux host."
+            )
         super().__init__(
-            "anr_watcher.py needs fcntl (flock) to lock its session storage, and this "
-            "host's Python has no fcntl module: anr_watcher.py runs on macOS and Linux only."
+            f"anr_watcher.py needs fcntl (flock) to lock its session storage, and {why}"
         )
-        self.remedy = "Run anr_watcher.py on a macOS or Linux host."
 
 
 def require_file_locking() -> None:
     """Refuse, typed, on a host without ``fcntl``; nothing at all on one with it.
 
     Raises:
-        FileLockingUnavailableError: ``fcntl`` could not be imported.
+        FileLockingUnavailableError: ``fcntl`` could not be imported; the
+            import's own exception is carried so an absent module (Windows)
+            and a broken extension (a Unix Python) read differently.
     """
     if fcntl is None:
-        raise FileLockingUnavailableError()
+        raise FileLockingUnavailableError(_FCNTL_IMPORT_ERROR)
 
 
 class TransitionRefusedError(RuntimeError):
