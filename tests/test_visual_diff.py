@@ -14,8 +14,9 @@ output. Three contracts:
   exceeds 10. It did so by iterating ``getdata()`` in Python (2.6 M
   comparisons for that screenshot), and Pillow 13 deprecates ``getdata``,
   removed in 14. ``_reference_count`` below is that generator, kept as the
-  oracle: the count must equal it on every input, and its guard forbids
-  ``getdata`` outright.
+  oracle over the same pixel values read with ``tobytes()``, so the tests
+  outlive ``getdata`` too: the count must equal it on every input, and its
+  guard forbids ``getdata`` outright.
 * Without ``--output``, nothing is written into the caller's working
   directory, and every path the script reports is absolute and exists.
 """
@@ -25,7 +26,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import warnings
 from pathlib import Path
 
 import pytest
@@ -199,20 +199,22 @@ def test_images_of_different_sizes_are_refused(tmp_path, base_size, cur_size):
 
 
 def _reference_count(diff_image) -> int:
-    """The original ``_count_different_pixels`` body (PR #63 @ b084d2c), verbatim but for ``self``.
+    """The original ``_count_different_pixels`` generator (PR #63 @ b084d2c), over ``tobytes()``.
 
-    Its ``getdata`` call is deprecated in Pillow 13, so the oracle silences
-    that one warning itself: under ``-W error::DeprecationWarning`` the module
-    then fails only on a ``getdata`` the script makes, which is the point.
+    The original iterated ``getdata()``, which Pillow 14 removes; an oracle
+    that called it would take these tests down with it. An L image's bytes are
+    its pixel levels, one byte each in the same order, so the generator runs
+    over those instead: still a per-pixel comparison, still independent of
+    ``histogram()``, and nothing here warns under
+    ``-W error::DeprecationWarning`` -- the module fails there only on a
+    ``getdata`` the script makes, which is the point.
     """
     # Convert to grayscale for easier processing
     diff_gray = diff_image.convert("L")
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        # Count non-zero pixels (different)
-        pixels = diff_gray.getdata()
-        return sum(1 for pixel in pixels if pixel > 10)  # Threshold for noise
+    # Count non-zero pixels (different)
+    pixels = diff_gray.tobytes()
+    return sum(1 for pixel in pixels if pixel > 10)  # Threshold for noise
 
 
 def _difference(baseline_path: str, current_path: str):
@@ -300,7 +302,9 @@ def test_the_count_makes_no_getdata_call(tmp_path, monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise AssertionError("compare made a getdata call")
 
-    monkeypatch.setattr(Image.Image, "getdata", forbidden)
+    # raising=False: on a Pillow without getdata there is nothing to forbid,
+    # and the guard must not be what fails.
+    monkeypatch.setattr(Image.Image, "getdata", forbidden, raising=False)
 
     result = visual_diff.VisualDiffer().compare(baseline, current)
     monkeypatch.undo()
