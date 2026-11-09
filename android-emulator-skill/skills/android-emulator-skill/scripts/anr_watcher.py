@@ -22,7 +22,10 @@ streams and loses them when it is stopped, both live readers -- --watch and
 the session worker -- read by dumps instead, as log_monitor does there
 (``common/dump_read.py``; ``ANDROID_EMU_LOG_POLL_SECONDS``,
 ``ANDROID_EMU_LOG_DUMP_CAP_BYTES`` and ``ANDROID_EMU_LOG_STATE_TIMEOUT`` bound
-that read). Every other level streams.
+that read). Every other level streams, waiting on adb's pipe with ``select()``.
+
+Unix-only (macOS, Linux): session storage locks with ``fcntl.flock``, so on a
+host without ``fcntl`` (Windows) every mode refuses at entry, exit 1.
 
 Android signals recognised (see ``common.anr_pipeline.parse_logcat_anr``):
 
@@ -123,6 +126,7 @@ from common.anr_sessions import (  # noqa: E402
     SessionMeta,
     SessionStore,
     TransitionRefusedError,
+    require_file_locking,
     worker_identity,
 )
 from common.device_utils import (  # noqa: E402
@@ -4473,6 +4477,10 @@ def main(argv: list[str] | None = None):
     """Main entry point — supports legacy + ANRBuster modes from one parser."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # Every mode, before adb is asked anything: the script is Unix-only as a
+    # whole (its sessions lock with flock), and a host without fcntl gets the
+    # boundary's refusal, never an import traceback (Codex, after slice 2).
+    require_file_locking()
 
     # === ANRBuster worker entry ===
     if args.worker_session_id:

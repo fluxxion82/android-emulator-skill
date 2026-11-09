@@ -80,6 +80,9 @@ answers read (``extras["abandoned_events_bytes"]``), and they read no more.
 ``flock`` needs a filesystem that implements it: a local one. A home on a
 network filesystem serialises only as far as its server and mount options
 honour ``flock``. Telling the worker from another process needs ``ps``.
+A host whose Python has no ``fcntl`` (Windows) can take no lock at all:
+the module loads, and every mode of anr_watcher refuses at its entry
+(:func:`require_file_locking`), as does a lock asked for here.
 
 A session an earlier version wrote has no ``lifecycle`` key: its worker took
 no lock and checked no state, and its --stop could save ``stopped`` while
@@ -121,7 +124,6 @@ touches the real home directory.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
@@ -145,6 +147,14 @@ from common.anr_pipeline import (
     summary_to_json,
 )
 from common.env_config import env_int
+
+try:
+    import fcntl
+except ImportError:
+    # Windows: its Python has no fcntl, so no session lock can be taken. The
+    # module still loads, so anr_watcher can refuse in the boundary's shape
+    # (require_file_locking) rather than die importing it.
+    fcntl = None
 
 # === CONSTANTS ===
 
@@ -246,6 +256,27 @@ class StoreBusyError(SessionBusyError):
             f"for {seconds:g}s.",
         )
         self.remedy = "Run the same command again; the other command's sweep finishes in seconds."
+
+
+class FileLockingUnavailableError(RuntimeError):
+    """This host's Python has no ``fcntl`` (Windows), so a session's lock cannot be taken."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "anr_watcher.py needs fcntl (flock) to lock its session storage, and this "
+            "host's Python has no fcntl module: anr_watcher.py runs on macOS and Linux only."
+        )
+        self.remedy = "Run anr_watcher.py on a macOS or Linux host."
+
+
+def require_file_locking() -> None:
+    """Refuse, typed, on a host without ``fcntl``; nothing at all on one with it.
+
+    Raises:
+        FileLockingUnavailableError: ``fcntl`` could not be imported.
+    """
+    if fcntl is None:
+        raise FileLockingUnavailableError()
 
 
 class TransitionRefusedError(RuntimeError):
@@ -1281,7 +1312,11 @@ def _try_flock(path: Path) -> int | None:
     ``locks/`` itself is made again when it is gone: an earlier version's
     prune takes it for a session with no meta and deletes it (whatever it held
     then excludes no one -- the reason an upgrade is made quiescently).
+
+    Raises:
+        FileLockingUnavailableError: The host has no ``fcntl`` (Windows).
     """
+    require_file_locking()
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except FileNotFoundError:

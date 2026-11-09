@@ -385,6 +385,19 @@ def test_the_session_keeps_its_cursor_in_its_meta_tied_to_serial_and_boot(toolch
     assert suffix == held[newest + 1 :]
 
 
+def _printed_dump_restarts(toolchain: FakeToolchain, session_id: str) -> int | None:
+    """The restarts the script's own ``--list-sessions --json`` prints for the session.
+
+    Where ``dump_restarts`` reaches an agent: the session's meta as listed,
+    its worker's counters under ``extras.line_counters`` (Codex, after slice
+    2: the restart specs read it off the store, never off printed output).
+    """
+    result = toolchain.run("anr_watcher.py", "--list-sessions", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    (listed,) = [entry for entry in json.loads(result.stdout) if entry["session_id"] == session_id]
+    return listed["extras"].get("line_counters", {}).get("dump_restarts")
+
+
 def _dump_fails_once() -> Rule:
     """A tail that exits 1 once, saying nothing, the device still there."""
     return Rule(("logcat", "-d", "-T"), exit=1, once=True)
@@ -437,6 +450,7 @@ def test_a_restarted_read_resumes_from_its_checkpoint_without_duplicates(toolcha
     ]
     assert [n["event"] for n in notes] == ["dump_restart", "stream_ended"], notes
     assert store.load_meta(session_id).counters["dump_restarts"] == 1
+    assert _printed_dump_restarts(toolchain, session_id) == 1
 
 
 def test_a_restarted_read_on_another_boot_ends_the_session_incomplete(toolchain, recorded):
@@ -816,6 +830,7 @@ def test_an_anr_split_across_a_failed_dump_is_one_event(toolchain, recorded):
     assert summary["event_count"] == 1, summary
     assert [c["sample_event"]["kind"] for c in summary["clusters"]] == ["anr"], summary
     assert store.load_meta(session_id).counters["dump_restarts"] == 1
+    assert _printed_dump_restarts(toolchain, session_id) == 1
 
 
 def _live(tmp_path, answers) -> _LiveDevice:
@@ -1182,6 +1197,12 @@ OPENING_CELLS = {
     ("gone", "--diff"): (1, "worker is gone", "opening"),
     ("gone", "--stop"): (1, "worker is gone", "opening"),
     ("gone", "--stop --abandon"): (0, "incomplete, abandoned", "abandoned"),
+    # The docstring's middle row (Codex, after slice 2): the worker at work, a
+    # stop recorded in its meta that it has not yet handled. The observers
+    # answer as for any worker at work: nothing about it reads as ended.
+    ("stop recorded", "--list-sessions"): (0, "opening, unpublished_end false", "opening"),
+    ("stop recorded", "--get-details"): (1, "No summary for", "opening"),
+    ("stop recorded", "--diff"): (1, "No summary.json", "opening"),
 }
 
 
@@ -1192,6 +1213,11 @@ def test_an_opening_session_is_answered_by_every_command(worker, command, openin
     if worker == "gone":
         process.kill()
         process.wait(timeout=10)
+    if worker == "stop recorded":
+        # What --stop (or --start giving up) writes under the lock before it
+        # signals; the worker, unsignalled, is still at work in its opening.
+        with store.transaction(session_id) as meta:
+            store.mark_stop_requested(meta)
     argv = {
         "--list-sessions": ("--list-sessions",),
         "--get-details": ("--get-details", session_id),
@@ -1209,6 +1235,7 @@ def test_an_opening_session_is_answered_by_every_command(worker, command, openin
         (listed,) = [entry for entry in answer if entry["session_id"] == session_id]
         assert listed["status"] == "opening", listed
         assert listed["unpublished_end"] is (worker == "gone"), listed
+        assert (STOP_REQUESTED in listed["extras"]) is (worker == "stop recorded"), listed
     elif exit_status == 0:
         assert answer["incomplete"] is True, answer
         assert "abandoned" in answer["incomplete_reason"], answer
@@ -1221,6 +1248,8 @@ def test_an_opening_session_is_answered_by_every_command(worker, command, openin
         # reaped -- at once, not when that dump's share of the 8 s ran out.
         assert _running_stubs(toolchain) == [], "the opening's dump outlived its worker"
         assert took < 4, f"--stop answered {took:.1f}s later: the dump was waited out"
+    if worker == "stop recorded":
+        assert process.poll() is None, "an observer ended the worker"
     assert store.load_meta(session_id).status == after
 
 

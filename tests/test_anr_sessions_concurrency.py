@@ -249,13 +249,23 @@ def test_a_prune_during_a_creation_never_removes_the_session_being_created(
 # --- (b) what a prune may never remove ---------------------------------------
 
 
-@pytest.mark.parametrize("state", ["pending", "running", "deciding", "legacy-unresolved"])
+@pytest.mark.parametrize(
+    "state", ["pending", "opening", "running", "deciding", "legacy-unresolved"]
+)
 def test_a_prune_never_removes_a_session_whose_writer_may_be_alive(state, tmp_path, monkeypatch):
     """However old: a pending session (its worker may yet claim it, or --stop cancel it), one a
-    worker is at work in, and one whose worker cannot be shown gone (UNRESOLVED -- here an
-    earlier version's, whose ``stopped`` was never a promise its worker had stopped)."""
+    worker is at work in -- opening its read included, the state lifecycle 3 added -- and one
+    whose worker cannot be shown gone (UNRESOLVED -- here an earlier version's, whose
+    ``stopped`` was never a promise its worker had stopped)."""
     store = _store(tmp_path)
     session_id = store.create({}).session_id
+    if state == "opening":
+        store.claim_worker(
+            session_id,
+            pid=4242,
+            token=store.load_meta(session_id).worker_token,
+            opening={"since_ms": 0, "within_s": 8},
+        )
     if state in ("running", "deciding"):
         store.claim_worker(session_id, pid=4242, token=store.load_meta(session_id).worker_token)
     if state == "deciding":
@@ -271,6 +281,7 @@ def test_a_prune_never_removes_a_session_whose_writer_may_be_alive(state, tmp_pa
         monkeypatch.setattr(anr_sessions, "_ps", no_ps)
         assert anr_sessions.worker_identity(meta)[0] is anr_sessions.Identity.UNRESOLVED
     status = store.load_meta(session_id).status
+    assert status == {"legacy-unresolved": "stopped"}.get(state, state)
 
     assert store.prune_expired(ttl_hours=24) == 0
     assert store.clear() == 0
