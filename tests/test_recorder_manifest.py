@@ -197,7 +197,9 @@ def test_emulator_serials_and_the_header_are_left_alone():
     assert rf._redact_serials(listing) == listing
 
 
-@pytest.mark.parametrize("name", ["adb_devices_single", "adb_devices_multiple"])
+@pytest.mark.parametrize(
+    "name", ["adb_devices_single", "adb_devices_multiple", "adb_devices_unauthorized"]
+)
 def test_the_device_listings_redact_serials(name):
     fixture = next(f for f in rf.FIXTURES if f.name == name)
     listing = RecordedFixtures(RECORDED_ROOT / "emulator-api35").text("adb_devices_multiple")

@@ -25,6 +25,7 @@ from conftest import RECORDED_ROOT, RecordedFixtures
 from device_list import parse_adb_devices
 
 from common import anr_pipeline
+from common.adb_exec import DeviceUnauthorizedError, classify_device_error
 from common.device_utils import (
     UserNotInstalledError,
     UserSectionMissingError,
@@ -587,6 +588,40 @@ def test_an_offline_device_parses_as_offline():
 def test_the_offline_listing_publishes_no_device_serial():
     serials = [d["serial"] for d in parse_adb_devices(API33.text("adb_devices_offline"))]
     assert all(re.fullmatch(r"emulator-\d+|SERIALREDACTED", s) for s in serials), serials
+
+
+def test_an_unauthorized_device_parses_as_unauthorized_with_no_model():
+    """An unauthorized row is serial, state and transport_id only: adb cannot ask for more."""
+    entry = _entry("adb_devices_unauthorized")
+    by_serial = {d["serial"]: d for d in parse_adb_devices(API33.text("adb_devices_unauthorized"))}
+    target = by_serial[entry["target_serial"]]
+    assert target["state"] == "unauthorized"
+    assert target["online"] is False
+    assert target["type"] == "emulator"
+    assert target["model"] == ""
+    assert entry["target_fields"] and all(
+        field.startswith("transport_id:") for field in entry["target_fields"]
+    ), entry["target_fields"]
+    assert by_serial[entry["recording_serial"]]["online"] is True
+
+
+def test_the_unauthorized_listing_publishes_no_device_serial():
+    serials = [d["serial"] for d in parse_adb_devices(API33.text("adb_devices_unauthorized"))]
+    assert all(re.fullmatch(r"emulator-\d+|SERIALREDACTED", s) for s in serials), serials
+
+
+def test_adbs_words_for_an_unauthorized_device_are_typed():
+    """`error: device unauthorized.` and three lines of advice, exit 1: typed from the first line."""
+    entry = _entry("adb_unauthorized_get_state")
+    assert entry["exit_status"] == 1
+    assert entry["stream"] == "stderr"
+    text = API33.text("adb_unauthorized_get_state")
+    assert text.startswith("error: device unauthorized.")
+    assert len(text.strip().splitlines()) == 4
+    error = classify_device_error(text, entry["target_serial"])
+    assert isinstance(error, DeviceUnauthorizedError)
+    assert entry["target_serial"] in str(error)
+    assert "prompt" in str(error)
 
 
 def test_the_manifest_is_json_with_one_entry_per_name():

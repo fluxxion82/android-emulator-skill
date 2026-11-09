@@ -150,9 +150,15 @@ RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
 #     database carries android_metadata and sqlite_sequence, so a table count
 #     taken from a hand-written schema is short by two.
 #
-#     PARTLY: test_container.py and test_device_list.py each keep ONE literal,
-#     for platform behaviour the parsers document and no recording covers --
-#     see their entries below. Everything else in both files reads recordings.
+#     test_container.py kept one literal until #19 (v0.8.0's Inc 0 recordings)
+#     and test_device_list.py one until v0.9.0's slice-2 closure: the `offline`
+#     and `unauthorized` device states, now recorded in emulator-api33 (adb_devices_offline,
+#     adb_devices_unauthorized). What the recordings said: an unauthorized row
+#     is serial, state and `transport_id:N` -- no product/model/device, which
+#     adb cannot ask the device for before it is authorized -- where the literal
+#     had written it as serial and state alone, with no transport_id either;
+#     and `adb -s <it> get-state` prints the `error: device unauthorized.` line
+#     plus three lines of advice, exit 1.
 #
 #   test_emulator_shutdown.py — the last f-string feeding `emu avd name` output
 #     is gone: `emu_avd_name` is read from the corpus and only the AVD NAME is
@@ -177,15 +183,9 @@ RE_SUBSTITUTIONS = frozenset({"sub", "subn"})
 #     other GPX the tests need, the malformed ones included, is derived from
 #     it by a documented edit.
 #
-# STILL OUTSTANDING — one line each, and what would retire it:
-KNOWN_VIOLATIONS = frozenset(
-    {
-        # `offline` and `unauthorized` device states, which parse_adb_devices
-        # reports and no recording has. Record `adb devices -l` with a device
-        # in each state (a second emulator killed mid-boot gives `offline`).
-        "test_device_list.py::parse_adb_devices",
-    }
-)
+# STILL OUTSTANDING — none. A new entry here is a decision to carry debt, so it
+# needs a line saying why the input cannot be recorded and what would retire it.
+KNOWN_VIOLATIONS: frozenset[str] = frozenset()
 
 # `_build_parser` is argparse, not a tool-output parser.
 NOT_A_TOOL_PARSER = {"_build_parser"}
@@ -813,12 +813,14 @@ def test_the_detector_actually_detects():
     """Guard against the guard being vacuous.
 
     A detector that matches nothing would make both tests above pass forever.
+    With the debt at zero, `_violations()` being empty is the expected answer,
+    so emptiness proves nothing either way; the synthetic cases below are what
+    show the rule still fires. This keeps the two inputs it runs over from
+    silently becoming empty.
     """
     assert _parser_names(), "no parser functions found; the detector matches nothing"
-    assert _violations(), (
-        "the detector found zero violations, which contradicts KNOWN_VIOLATIONS; "
-        "it has probably stopped working"
-    )
+    assert _scanned_modules(), "no test modules found; the detector scans nothing"
+    assert _violations() == KNOWN_VIOLATIONS
 
 
 # --- Anti-vacuity: synthetic violations the detector must still catch -------

@@ -3904,6 +3904,8 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="adb_devices_unauthorized",
+        # Changes nothing on any device; the mark is the device-change guard's
+        # rule for every capture callable, and the setup is emulators only anyway.
         emulator_only=True,
         args=["devices", "-l"],
         command=(
@@ -3927,6 +3929,8 @@ FIXTURES: list[Fixture] = [
     ),
     Fixture(
         name="adb_unauthorized_get_state",
+        # Changes nothing on any device; the mark is the device-change guard's
+        # rule for every capture callable, and the setup is emulators only anyway.
         emulator_only=True,
         args=["get-state"],
         command="adb -s <the unauthorized emulator> get-state",

@@ -15,6 +15,7 @@ import subprocess
 
 import device_list
 import pytest
+from conftest import RECORDED_ROOT, RecordedFixtures
 
 from common import adb_exec, cli, sdk_tools
 
@@ -74,34 +75,32 @@ def test_parse_adb_devices_skips_daemon_noise(recorded):
     assert devices[0]["serial"] == "emulator-5554"
 
 
-# ---------------------------------------------------------------------------
-# FROZEN DEBT, not an exception. `offline` and `unauthorized` are real adb
-# states that `parse_adb_devices` documents and reports (`online` is False for
-# both), and no recording has either: capturing `unauthorized` needs a handset
-# with the RSA prompt pending, and this lane must never drive one.
-#
-# `test_device_list.py::parse_adb_devices` is frozen in KNOWN_VIOLATIONS for
-# this literal. To pay it off, record `adb devices -l` with a device in each
-# state -- a second emulator killed mid-boot gives `offline` -- as
-# `adb_devices_offline` / `adb_devices_unauthorized`.
-# ---------------------------------------------------------------------------
+def test_offline_and_unauthorized_devices_are_not_online():
+    """Both states adb lists for a device that is attached but not usable, recorded.
 
-ADB_OUTPUT_WITH_BAD_STATES = """List of devices attached
-emulator-5554          device product:sdk_gphone16k_arm64 model:sdk_gphone16k_arm64 device:emu64a16k
-99887766               offline
-77665544               unauthorized
-"""
-
-
-def test_parse_adb_devices_offline_and_unauthorized_not_online():
-    devices = device_list.parse_adb_devices(ADB_OUTPUT_WITH_BAD_STATES)
-    by_serial = {d["serial"]: d for d in devices}
-
-    assert by_serial["emulator-5554"]["online"] is True
-    assert by_serial["99887766"]["online"] is False
-    assert by_serial["99887766"]["state"] == "offline"
-    assert by_serial["77665544"]["online"] is False
-    assert by_serial["77665544"]["state"] == "unauthorized"
+    `offline`: the API 33 emulator mid-reboot. `unauthorized`: a second emulator
+    whose adbd has not accepted the host's key (tests/record_fixtures.py says
+    how it is produced; never a phone). Neither is `online`, and the
+    unauthorized row has no `model:` to read -- adb cannot ask before it is
+    authorized -- which is not a parse failure. Until these were recorded this
+    file held a hand-written listing for the two states, the last entry in
+    tests/test_fixture_policy.py's KNOWN_VIOLATIONS.
+    """
+    api33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
+    for name, state in (
+        ("adb_devices_offline", "offline"),
+        ("adb_devices_unauthorized", "unauthorized"),
+    ):
+        entry = next(e for e in api33.manifest["fixtures"] if e["name"] == name)
+        by_serial = {d["serial"]: d for d in device_list.parse_adb_devices(api33.text(name))}
+        target = by_serial[entry["target_serial"]]
+        assert target["state"] == state, name
+        assert target["online"] is False, name
+    # The unauthorized listing was recorded beside a usable emulator (the recorder
+    # requires it: that device's props stamp the profile); the offline one was
+    # not -- both emulators in it are in a bad state -- so only this one says so.
+    assert by_serial[entry["recording_serial"]]["online"] is True
+    assert target["model"] == ""
 
 
 def test_parse_adb_devices_empty():
