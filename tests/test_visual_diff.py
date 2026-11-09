@@ -1,7 +1,7 @@
-"""visual_diff: the overlay picture, and where the artifacts go (L12).
+"""visual_diff: the overlay picture, the verdict's count, and where the artifacts go (L12).
 
 Every image here is constructed under ``tmp_path`` -- test state, not tool
-output. Two contracts:
+output. Three contracts:
 
 * ``generate_diff_image`` paints every pixel whose per-channel difference sum
   exceeds 30 red over the current image. It did so with a nested
@@ -10,6 +10,13 @@ output. Two contracts:
   pixel for pixel: ``_reference_overlay`` below is the original loop, kept
   verbatim as the reference, and the guard test forbids the per-pixel calls
   outright.
+* ``compare`` counts a pixel as different when the greyscale of its difference
+  exceeds 10. It did so by iterating ``getdata()`` in Python (2.6 M
+  comparisons for that screenshot), and Pillow 13 deprecates ``getdata``,
+  removed in 14. ``_reference_count`` below is that generator, kept as the
+  oracle over the same pixel values read with ``tobytes()``, so the tests
+  outlive ``getdata`` too: the count must equal it on every input, and its
+  guard forbids ``getdata`` outright.
 * Without ``--output``, nothing is written into the caller's working
   directory, and every path the script reports is absolute and exists.
 """
@@ -66,18 +73,27 @@ EDGE_PIXELS = [
 ]
 
 
+_Pixel = tuple[int, int, int]
+_Case = tuple[_Pixel, _Pixel, bool]
+
+
 def _edge_pair(tmp_path: Path) -> tuple[str, str]:
     """A 2-row image pair holding every EDGE_PIXELS case, in each row order."""
-    width = len(EDGE_PIXELS)
+    return _table_pair(tmp_path, EDGE_PIXELS, "edge")
+
+
+def _table_pair(tmp_path: Path, table: list[_Case], stem: str) -> tuple[str, str]:
+    """A 2-row image pair holding every case of ``table``, in each row order."""
+    width = len(table)
     baseline = Image.new("RGB", (width, 2))
     current = Image.new("RGB", (width, 2))
-    for x, (before, after, _) in enumerate(EDGE_PIXELS):
+    for x, (before, after, _) in enumerate(table):
         baseline.putpixel((x, 0), before)
         current.putpixel((x, 0), after)
         # Swapped on the second row, so the difference is taken both ways.
         baseline.putpixel((x, 1), after)
         current.putpixel((x, 1), before)
-    paths = (str(tmp_path / "edge-base.png"), str(tmp_path / "edge-cur.png"))
+    paths = (str(tmp_path / f"{stem}-base.png"), str(tmp_path / f"{stem}-cur.png"))
     baseline.save(paths[0])
     current.save(paths[1])
     return paths
@@ -177,6 +193,123 @@ def test_images_of_different_sizes_are_refused(tmp_path, base_size, cur_size):
     with pytest.raises(ValueError, match="dimensions"):
         visual_diff.VisualDiffer().generate_diff_image(baseline, current, str(tmp_path / "o.png"))
     assert not (tmp_path / "o.png").exists()
+
+
+# --- the verdict's count ------------------------------------------------------
+
+
+def _reference_count(diff_image) -> int:
+    """The original ``_count_different_pixels`` generator (PR #63 @ b084d2c), over ``tobytes()``.
+
+    The original iterated ``getdata()``, which Pillow 14 removes; an oracle
+    that called it would take these tests down with it. An L image's bytes are
+    its pixel levels, one byte each in the same order, so the generator runs
+    over those instead: still a per-pixel comparison, still independent of
+    ``histogram()``, and nothing here warns under
+    ``-W error::DeprecationWarning`` -- the module fails there only on a
+    ``getdata`` the script makes, which is the point.
+    """
+    # Convert to grayscale for easier processing
+    diff_gray = diff_image.convert("L")
+
+    # Count non-zero pixels (different)
+    pixels = diff_gray.tobytes()
+    return sum(1 for pixel in pixels if pixel > 10)  # Threshold for noise
+
+
+def _difference(baseline_path: str, current_path: str):
+    """The image ``compare`` counts over: both inputs as RGB, their per-channel difference."""
+    baseline = Image.open(baseline_path).convert("RGB")
+    current = Image.open(current_path).convert("RGB")
+    return ImageChops.difference(baseline, current)
+
+
+# (baseline pixel, current pixel, counted?) -- the greyscale of the difference
+# at and around the cut-off. The conversion to L weights R, G and B (ITU-R
+# 601-2), so a grey difference of 10 is level 10 while the single-channel
+# differences that land on 10 and 11 are found by that conversion, not by eye:
+# the table test below checks every claim against ``convert("L")`` itself.
+LEVEL_PIXELS: list[_Case] = [
+    ((0, 0, 0), (0, 0, 0), False),  # level 0
+    ((10, 20, 30), (10, 20, 30), False),  # level 0, not black
+    ((50, 50, 50), (60, 60, 60), False),  # grey difference of exactly 10: not counted
+    ((50, 50, 50), (61, 61, 61), True),  # 11: counted
+    ((0, 0, 0), (255, 255, 255), True),  # 255
+    ((100, 100, 100), (110, 110, 111), False),  # painted by the overlay (sum 31), level 10
+    ((0, 0, 0), (35, 0, 0), False),  # red alone: level 10
+    ((0, 0, 0), (36, 0, 0), True),  # red alone: level 11
+    ((0, 0, 0), (0, 17, 0), False),  # green alone: level 10
+    ((0, 0, 0), (0, 18, 0), True),  # green alone: level 11
+    ((0, 0, 0), (0, 0, 92), False),  # blue alone: level 10
+    ((0, 0, 0), (0, 0, 93), True),  # blue alone: level 11
+    ((0, 0, 0), (0, 0, 255), True),  # blue at its ceiling weighs in at 29
+]
+
+
+def _palette_pair(tmp_path: Path) -> tuple[str, str]:
+    """The RGB noise pair saved as palette images, each quantised to a palette of its own."""
+    paths = []
+    for path in _noise_pair(tmp_path, "RGB"):
+        out = Path(path).with_name(Path(path).name.replace("RGB", "P"))
+        Image.open(path).convert("P", palette=Image.Palette.ADAPTIVE).save(out)
+        assert Image.open(out).mode == "P"
+        paths.append(str(out))
+    return paths[0], paths[1]
+
+
+def _pair(tmp_path: Path, name: str) -> tuple[str, str]:
+    if name == "levels":
+        return _table_pair(tmp_path, LEVEL_PIXELS, "levels")
+    if name == "edge":
+        return _edge_pair(tmp_path)
+    if name == "palette":
+        return _palette_pair(tmp_path)
+    return _noise_pair(tmp_path, name.split("-")[1])
+
+
+def test_the_level_pixels_count_as_the_reference_says(tmp_path):
+    """The table's own claims, checked against ``convert("L")`` and the reference."""
+    baseline, current = _table_pair(tmp_path, LEVEL_PIXELS, "levels")
+    levels = _difference(baseline, current).convert("L")
+    for x, (_, _, counted) in enumerate(LEVEL_PIXELS):
+        for y in (0, 1):
+            assert (levels.getpixel((x, y)) > 10) is counted, (LEVEL_PIXELS[x], y)
+    assert _reference_count(_difference(baseline, current)) == 2 * sum(
+        1 for _, _, counted in LEVEL_PIXELS if counted
+    )
+
+
+@pytest.mark.parametrize(
+    "pair",
+    ["levels", "edge", "noise-RGB", "noise-RGBA", "noise-L", "palette"],
+)
+def test_the_count_is_the_reference_number(tmp_path, pair):
+    """Green before and after the vectorisation: the guard that the number did not change."""
+    baseline, current = _pair(tmp_path, pair)
+    expected = _reference_count(_difference(baseline, current))
+
+    result = visual_diff.VisualDiffer().compare(baseline, current)
+
+    assert result["different_pixels"] == expected
+    # Every pair has pixels on both sides of the cut-off, or it proves little.
+    assert 0 < expected < result["total_pixels"], (expected, result["total_pixels"])
+
+
+def test_the_count_makes_no_getdata_call(tmp_path, monkeypatch):
+    """Timing-independent: the count is PIL operations, not a Python loop over ``getdata``."""
+    baseline, current = _noise_pair(tmp_path, "RGB")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("compare made a getdata call")
+
+    # raising=False: on a Pillow without getdata there is nothing to forbid,
+    # and the guard must not be what fails.
+    monkeypatch.setattr(Image.Image, "getdata", forbidden, raising=False)
+
+    result = visual_diff.VisualDiffer().compare(baseline, current)
+    monkeypatch.undo()
+
+    assert result["different_pixels"] == _reference_count(_difference(baseline, current))
 
 
 # --- where the artifacts go ---------------------------------------------------
