@@ -128,8 +128,8 @@ def _observe(line: str) -> None:
     """Print ``line``, and append it to the lane's report when one is named.
 
     Never raises: a report that cannot be written leaves the print, and a
-    stdout that is gone (``BrokenPipeError``) leaves nothing more to say. An
-    outcome is never turned into a test error by what was to carry it.
+    stdout that is gone (a broken pipe, or closed) leaves nothing more to say.
+    An outcome is never turned into a test error by what was to carry it.
     """
     _print(line)
     if not REPORT:
@@ -142,8 +142,9 @@ def _observe(line: str) -> None:
 
 
 def _print(line: str) -> None:
-    # A stdout that is gone (OSError) leaves nothing more to be said.
-    with contextlib.suppress(OSError):
+    # A stdout that is gone leaves nothing more to be said: a broken pipe is
+    # an OSError, a closed stdout a ValueError ("I/O operation on closed file").
+    with contextlib.suppress(OSError, ValueError):
         print(line)
 
 

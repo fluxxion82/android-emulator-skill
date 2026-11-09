@@ -11,7 +11,9 @@ written.
 
 from __future__ import annotations
 
+import io
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -127,31 +129,39 @@ def test_a_report_that_cannot_be_written_falls_back_to_the_print(monkeypatch, tm
     assert "not written to" in out
 
 
-def test_a_reinstall_with_stdout_gone_does_not_raise(monkeypatch, tmp_path, observed):
-    """A broken stdout pipe while reporting a successful reinstall: nothing escapes."""
-    import builtins
+def _stdout_gone(monkeypatch, how: str) -> None:
+    """Take stdout away the two ways a pytest or CI runner can: a broken pipe, or closed."""
+    if how == "broken_pipe":
+        import builtins
 
-    def broken_print(*_args, **_kwargs):
-        raise BrokenPipeError(32, "Broken pipe")
+        def broken_print(*_args, **_kwargs):
+            raise BrokenPipeError(32, "Broken pipe")
 
+        monkeypatch.setattr(builtins, "print", broken_print)
+    else:
+        # print() on a closed file raises ValueError, not OSError.
+        closed = io.StringIO()
+        closed.close()
+        monkeypatch.setattr(sys, "stdout", closed)
+
+
+@pytest.mark.parametrize("how", ["broken_pipe", "closed"])
+def test_a_reinstall_with_stdout_gone_does_not_raise(how, monkeypatch, tmp_path, observed):
+    """Stdout gone while reporting a successful reinstall: nothing escapes."""
     monkeypatch.setattr(live, "_installed", lambda _adb, _device: False)
     monkeypatch.setattr(
         live.subprocess, "run", lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, "", "")
     )
-    monkeypatch.setattr(builtins, "print", broken_print)
+    _stdout_gone(monkeypatch, how)
 
     live._restore_fixture_app(ADB, DEVICE, tmp_path, was_installed=True)
 
     assert "reinstalled" in observed.read_text()
 
 
-def test_an_unwritable_report_with_stdout_gone_does_not_raise(monkeypatch, tmp_path):
-    import builtins
-
-    def broken_print(*_args, **_kwargs):
-        raise BrokenPipeError(32, "Broken pipe")
-
+@pytest.mark.parametrize("how", ["broken_pipe", "closed"])
+def test_an_unwritable_report_with_stdout_gone_does_not_raise(how, monkeypatch, tmp_path):
     monkeypatch.setattr(live, "REPORT", str(tmp_path))
-    monkeypatch.setattr(builtins, "print", broken_print)
+    _stdout_gone(monkeypatch, how)
 
     live._observe("passing run: observed")
