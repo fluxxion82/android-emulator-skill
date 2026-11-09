@@ -42,6 +42,16 @@ jobs:
     name: pytest -m emulator (real AVD)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Gradle's local build cache, for every Gradle in the job. The lane's
+      # instrumented test (tests/test_instrumented_live.py) runs
+      # `build_and_test.py --instrumented` in a temporary COPY of the compose
+      # scaffold, so the outputs the pre-boot build leaves in the scaffold do
+      # not reach it; the cache does, because AGP's and Kotlin's tasks are
+      # relocatable. A local, unrecorded measurement (AGP 8.13.2): a second
+      # copy built its two APKs with most tasks FROM-CACHE, the Kotlin
+      # compiles among them.
+      GRADLE_OPTS: -Dorg.gradle.caching=true
 
     steps:
       - name: Checkout repository
@@ -87,8 +97,13 @@ jobs:
         # wrapper is the only way CI and a laptop agree on the toolchain.
         # Sources are committed; build output is gitignored, so this always
         # builds.
+        #
+        # The androidTest APK too, for the same reason: the instrumented test
+        # builds both APKs before its first connected run, and with the build
+        # cache (job env above) that build is mostly cache hits instead of
+        # kotlinc beside the booted emulator.
         working-directory: tests/fixtures/scaffold/compose
-        run: ./gradlew --no-daemon :app:assembleDebug
+        run: ./gradlew --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
 
       - name: Enable KVM
         # Without this the emulator falls back to software rendering and the
@@ -165,10 +180,12 @@ jobs:
           retries=0
           verdict=1
           retry_exit=""
+          decided=1
           if [[ "${FIRST_OUTCOME}" == "success" ]]; then
             verdict=0
           elif [[ "${FIRST_EXIT}" == "3" ]]; then
             retries=1
+            decided=2
             if [[ "${RETRY_OUTCOME}" == "success" ]]; then
               verdict=0
             fi
@@ -189,6 +206,20 @@ jobs:
             echo "These are the tests that a mocked suite structurally cannot replace:"
             echo "they assert an agent got a usable answer from a device, not that a"
             echo "command was shaped a certain way."
+            echo ""
+            echo "### Instrumented tests (build_and_test --instrumented)"
+            echo ""
+            # Written by tests/test_instrumented_live.py, one line per outcome it
+            # asserted, each a real connected Gradle run on this lane's emulator.
+            outcomes="emulator-lane-outcomes/attempt-${decided}/instrumented.md"
+            if [[ -s "${outcomes}" ]]; then
+              echo "Observed live in attempt ${decided}:"
+              echo ""
+              cat "${outcomes}"
+            else
+              echo "None observed in attempt ${decided}: the instrumented test did not run"
+              echo "or did not reach an assertion."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "${verdict}"
 

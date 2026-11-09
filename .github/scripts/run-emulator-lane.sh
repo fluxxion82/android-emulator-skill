@@ -31,10 +31,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APK="${REPO_ROOT}/tests/fixtures/scaffold/compose/app/build/outputs/apk/debug/app-debug.apk"
 PACKAGE="com.example.composefixture"
 DIAGNOSTICS="${REPO_ROOT}/emulator-lane-diagnostics/attempt-${LANE_ATTEMPT:-1}"
+# What tests/test_instrumented_live.py observed (passing run, failing run,
+# no-results refusal), for the workflow's step summary. Not a diagnostic: it is
+# written on a clean run too, so it lives outside DIAGNOSTICS.
+OUTCOMES="${REPO_ROOT}/emulator-lane-outcomes/attempt-${LANE_ATTEMPT:-1}"
+export EMULATOR_LANE_INSTRUMENTED_REPORT="${OUTCOMES}/instrumented.md"
 
 cd "${REPO_ROOT}"
-mkdir -p "${DIAGNOSTICS}"
-rm -f emulator-lane.log emulator-lane.summary
+mkdir -p "${DIAGNOSTICS}" "${OUTCOMES}"
+rm -f emulator-lane.log emulator-lane.summary "${EMULATOR_LANE_INSTRUMENTED_REPORT}"
 
 # The exit status goes to a file on every exit, so the workflow retries on what
 # this script decided rather than on the runner action's pass/fail. On failure

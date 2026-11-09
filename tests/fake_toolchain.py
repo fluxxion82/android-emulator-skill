@@ -210,6 +210,10 @@ def tail_text(data, count):
 for index, rule in enumerate(spec["rules"]):
     if not all(token in argv for token in rule["match"]):
         continue
+    if any(os.environ.get(key) != value for key, value in rule["env"]):
+        # Asked from an environment the rule does not answer: a Gradle without
+        # ANDROID_SERIAL pinned is a different question from one with it.
+        continue
     if rule["once"]:
         # Answers the first matching call only; later calls fall through.
         used = spec["log"] + ".used-" + spec["name"] + "-" + str(index)
@@ -325,6 +329,11 @@ class Rule:
     # `adb shell log -t TAG MSG` call wrote -- absent from the answer until such
     # a call is in the log, then that call's tag and message. Binary rules only.
     logged: str = ""
+    # Answer only when the tool was started with each of these (name, value)
+    # pairs in its environment -- what a script handed the tool there, which
+    # argv cannot show: a connected Gradle task reads its device from
+    # ANDROID_SERIAL. Asked without them, the next rule (or the default) answers.
+    env: tuple[tuple[str, str], ...] = ()
 
     @property
     def binary(self) -> bool:
@@ -395,6 +404,7 @@ class FakeToolchain:
                     "follows": rule.follows,
                     "once": rule.once,
                     "logged": rule.logged,
+                    "env": [list(pair) for pair in rule.env],
                 }
                 for rule in rules
             ],

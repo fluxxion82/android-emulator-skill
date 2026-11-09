@@ -11,9 +11,11 @@ xcodebuild.
 Timeouts are tunable via the ANDROID_EMU_ prefix:
 - ANDROID_EMU_BUILD_TIMEOUT (default 1800s; also bounds a --module test run's projectDir query)
 - ANDROID_EMU_TEST_TIMEOUT  (default 2700s)
+- ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT (default 3600s)
 """
 
 import contextlib
+import os
 import re
 import shlex
 import subprocess
@@ -24,10 +26,15 @@ from common.env_config import env_int
 
 from .config import Config
 from .results import (
+    INSTRUMENTED_RESULTS,
+    UNIT_RESULTS,
+    ResultDirectory,
+    ResultsRoot,
     aggregate_test_results,
     extract_failure_reasons,
-    find_test_result_directories,
-    find_test_result_files,
+    extract_failures,
+    find_result_directories,
+    flavored_report_variants,
     parse_build_output,
 )
 
@@ -38,6 +45,31 @@ RERUN_UNSUPPORTED = "Unknown command-line option '--rerun'"
 
 BUILD_TIMEOUT = env_int("ANDROID_EMU_BUILD_TIMEOUT", 1800)
 TEST_TIMEOUT = env_int("ANDROID_EMU_TEST_TIMEOUT", 2700)
+# A connected run builds and installs two APKs before a test starts: recorded
+# 8-36 s per run on a warm local arm64 daemon (gradle-8.13 MANIFEST.json,
+# wall_seconds), minutes cold.
+INSTRUMENTED_TEST_TIMEOUT = env_int("ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT", 3600)
+
+# The runner argument that filters a connected run to a class (AGP's way;
+# Gradle's --tests is the unit task's option, not the connected task's).
+INSTRUMENTATION_CLASS_ARG = "-Pandroid.testInstrumentationRunnerArguments.class="
+
+# AGP's sentence when ANDROID_SERIAL names no attached device, in Gradle's
+# "* What went wrong:" block (recorded: connected_android_test_no_device):
+# "> com.android.builder.testing.api.DeviceException: Connected device with
+# serial 'no-such-serial-xyz' not found!"
+_DEVICE_NOT_FOUND = re.compile(
+    r"com\.android\.builder\.testing\.api\.DeviceException: "
+    r"Connected device with serial '(?P<serial>[^']*)' not found!"
+)
+
+# What AndroidJUnitRunner reports when the class filter names a class the test
+# APK does not have (recorded: junit_xml_instrumented_no_match): one failing
+# testcase `<class>.initializationError` whose failure's first line is this.
+_INITIALIZATION_ERROR = ".initializationError"
+_CLASS_NOT_LOADED = re.compile(
+    r"^java\.lang\.RuntimeException: Failed loading specified test class '(?P<cls>[^']+)'$"
+)
 
 # What ``<module>:properties --property projectDir`` prints for the module's
 # directory (recorded: gradle-8.13 and gradle-7.5.1 gradle_properties_project_dir):
@@ -79,6 +111,9 @@ class BuildResult:
         returncode: int | None,
         results_dir: str | None = None,
         timeout_seconds: int | None = None,
+        serial: str | None = None,
+        aggregate_variants: list[str] | None = None,
+        report_written: bool = False,
     ):
         self.success = success
         self.stdout = stdout
@@ -95,6 +130,16 @@ class BuildResult:
         # Where a test run's JUnit XML was looked for; None for a build.
         self.results_dir = results_dir
         self.timeout_seconds = timeout_seconds
+        # The device an instrumented run was pinned to (ANDROID_SERIAL); None otherwise.
+        self.serial = serial
+        # For an instrumented run that wrote no report of its own: the flavored
+        # variants whose reports sit below its directory -- it named a build
+        # type of a flavored project (results.flavored_report_variants).
+        self.aggregate_variants = aggregate_variants or []
+        # Whether this run wrote any JUnit report under its task directory --
+        # direct or flavored, a zero-testcase one included. All were deleted
+        # before the run, so any there now are this run's.
+        self.report_written = report_written
 
     @property
     def timed_out(self) -> bool:
@@ -118,6 +163,50 @@ class BuildResult:
         A run Gradle failed is not this case -- its own failure is the verdict.
         """
         return self.results_dir is not None and self.returncode == 0 and not self.test_results
+
+    @property
+    def unloaded_test_classes(self) -> list[str]:
+        """The classes an instrumented run's filter named that the runner could not load.
+
+        Non-empty only when that is ALL the run reported: every testcase an
+        ``initializationError`` failing with "Failed loading specified test
+        class" (recorded: a ``--suite`` naming no class in the test APK, exit
+        1). No test ran, so it is no test results, not a red test. A run where
+        one named class loaded and another did not is a red run like any other.
+        """
+        if self.serial is None or not self.test_results:
+            return []
+        classes = []
+        for test in self.test_results["failed_tests"]:
+            match = _CLASS_NOT_LOADED.match(test.get("failure_message", ""))
+            if not (match and test.get("test_name", "").endswith(_INITIALIZATION_ERROR)):
+                return []
+            classes.append(match.group("cls"))
+        return classes if len(classes) == self.test_results["total"] else []
+
+    @property
+    def missing_device(self) -> str | None:
+        """The serial AGP said is not attached, for a connected run that failed so.
+
+        AGP raises its ``DeviceException`` while choosing the device, before
+        any test runs (recorded: connected_android_test_no_device, no report
+        written). So a run that wrote a test report had its device:
+        :attr:`report_written` -- any ``TEST-*.xml`` under the task's
+        directory or its ``flavors/<f>/`` directories, a zero-testcase one
+        included, all of which were deleted before the run. Such a run is
+        judged by its reports whatever its log says: the sentence is matched in
+        a ``* What went wrong:`` block, and nothing authenticates that block's
+        provenance, so a test could print one. Only a failed run that wrote no
+        report is read for it. The device was resolved before Gradle started,
+        so this is one that went away in between.
+        """
+        if self.serial is None or self.returncode in (None, 0) or self.report_written:
+            return None
+        for failure in extract_failures(f"{self.stdout}\n{self.stderr}"):
+            match = _DEVICE_NOT_FOUND.search(failure["message"])
+            if match:
+                return match.group("serial")
+        return None
 
 
 class BuildRunner:
@@ -237,6 +326,48 @@ class BuildRunner:
         extra = ["--rerun", *(["--tests", suite] if suite else [])]
         return self._run([task, *extra], clean=clean, timeout=TEST_TIMEOUT, test_task=task)
 
+    def instrumented_test(
+        self, serial: str, clean: bool = False, suite: str | None = None
+    ) -> BuildResult:
+        """Run ``connected<Variant>AndroidTest`` on ONE device and judge its JUnit XML.
+
+        The device is pinned with ``ANDROID_SERIAL=<serial>`` in Gradle's
+        environment: with several devices attached, a connected task without
+        it runs on every one of them (a plugged-in phone included) and
+        uninstalls its APKs from each afterwards. ``serial`` must already be
+        resolved to an attached device; the CLI does that before calling.
+
+        The verdict is the unit tests' (Gradle exit 0, results this run wrote,
+        no ``<failure>``/``<error>``), read from the instrumented results root
+        (:data:`INSTRUMENTED_RESULTS`) after its stale reports are deleted.
+
+        ``--rerun`` is passed for the same reason the unit task gets it, though
+        it was not needed here: measured on AGP 8.13.2, an identical second run
+        without it was NOT up to date -- the task executed and the tests ran
+        again (connected_android_test_repeat) -- and Gradle accepts it bound to
+        the connected task (connected_android_test_rerun).
+
+        Args:
+            serial: The resolved device serial.
+            clean: Run a clean task first.
+            suite: A test class, passed as the runner's ``class`` argument
+                (``-Pandroid.testInstrumentationRunnerArguments.class=``).
+
+        Returns:
+            BuildResult with ``serial`` set.
+        """
+        task = self._task_name("connected") + "AndroidTest"
+        extra = ["--rerun", *([f"{INSTRUMENTATION_CLASS_ARG}{suite}"] if suite else [])]
+        return self._run(
+            [task, *extra],
+            clean=clean,
+            timeout=INSTRUMENTED_TEST_TIMEOUT,
+            test_task=task,
+            results=INSTRUMENTED_RESULTS,
+            env={**os.environ, "ANDROID_SERIAL": serial},
+            serial=serial,
+        )
+
     def _module_path(self) -> str | None:
         """The selected module as a normalised ``:a:b`` Gradle path, or None."""
         if not self.module:
@@ -336,41 +467,59 @@ class BuildRunner:
         # project rather than this process's cwd, then held to the same containment.
         return self.project_dir / answers[0]
 
-    def _report_files(self, root: Path, task: str) -> tuple[list[Path], list[Path]]:
-        """Find reports and prove every resolved path stays in its permitted directory."""
+    def _report_files(
+        self, root: Path, task: str, results: ResultsRoot = UNIT_RESULTS
+    ) -> tuple[list[ResultDirectory], list[Path]]:
+        """Find reports and prove every resolved path stays in its permitted directory.
+
+        ``results`` says which tree: the unit root's ``build/test-results/<task>``
+        or the instrumented root's variant directory under
+        ``build/outputs/androidTest-results/connected``, with its ``flavors/<f>/``
+        directories. The checks are the same for all, component by component.
+
+        Returns:
+            Every directory resolved (task directories, a placeholder, nested
+            directories) and every report in them -- the reports to clear
+            before a run; :meth:`_run` reads only those in ``read`` ones.
+        """
         recursive = self.module is None
-        directories = find_test_result_directories(root, task=task, recursive=recursive)
-        paths = find_test_result_files(root, task=task, recursive=recursive)
+        found = find_result_directories(root, task=task, recursive=recursive, root=results)
+        paths = sorted(
+            path
+            for directory in found
+            if directory.found
+            for path in directory.path.glob("TEST-*.xml")
+            if path.is_file()
+        )
         project = self.project_dir.resolve()
         resolved_directories: list[Path] = []
+        base = "/".join(results.base)
 
-        for directory in directories:
+        for directory in found:
             # Check the lexical path before resolving it. Otherwise an in-project
-            # build/test-results/task symlink can redefine the very boundary used
-            # to decide which reports cleanup is permitted to unlink.
-            module = directory.parents[2]
-            components = (
-                module / "build",
-                module / "build" / "test-results",
-                directory,
+            # symlink anywhere from <module>/build down to the task directory can
+            # redefine the very boundary used to decide which reports cleanup is
+            # permitted to unlink.
+            symlink = next(
+                (component for component in directory.components if component.is_symlink()),
+                None,
             )
-            symlink = next((component for component in components if component.is_symlink()), None)
             if symlink is not None:
-                affected = next((path for path in paths if path.parent == directory), None)
+                affected = next((path for path in paths if path.parent == directory.path), None)
                 report_detail = f"; refusing report {affected}" if affected is not None else ""
                 cli.fail(
                     f"refusing symlinked JUnit report path component: {symlink}{report_detail}",
-                    "Replace symlinks between the module and its test result task directory "
+                    f"Replace symlinks between the module and its {results.noun} "
                     "with real directories, then rerun the Gradle test task.",
                 )
 
-            resolved_module = module.resolve()
-            resolved = directory.resolve()
-            expected = resolved_module / "build" / "test-results" / directory.name
+            resolved_module = directory.module.resolve()
+            resolved = directory.path.resolve()
+            expected = resolved_module.joinpath(*directory.path.relative_to(directory.module).parts)
             if resolved != expected:
                 cli.fail(
-                    f"refusing redirected JUnit report directory: {directory}",
-                    "Restore the module's lexical build/test-results task directory, "
+                    f"refusing redirected JUnit report directory: {directory.path}",
+                    f"Restore the module's lexical {results.label}, "
                     "then rerun the Gradle test task.",
                 )
             resolved_directories.append(resolved)
@@ -386,19 +535,19 @@ class BuildRunner:
             if not resolved.is_relative_to(project) or not permitted:
                 cli.fail(
                     f"refusing to use JUnit report outside its project task directory: {path}",
-                    "Replace build/test-results symlinks with directories inside the project, "
+                    f"Replace {base} symlinks with directories inside the project, "
                     "then rerun the Gradle test task.",
                 )
         for directory in resolved_directories:
             if not directory.is_relative_to(project):
                 cli.fail(
                     f"refusing JUnit report directory outside the project: {directory}",
-                    "Replace build/test-results symlinks with directories inside the project, "
+                    f"Replace {base} symlinks with directories inside the project, "
                     "then rerun the Gradle test task.",
                 )
-        return directories, paths
+        return found, paths
 
-    def _clear_reports(self, root: Path, task: str) -> None:
+    def _clear_reports(self, root: Path, task: str, results: ResultsRoot = UNIT_RESULTS) -> None:
         """Delete the task's ``TEST-*.xml`` reports under ``root`` before Gradle runs.
 
         After the run, everything in the task's results directory is then this
@@ -412,15 +561,20 @@ class BuildRunner:
         These are build outputs, and Gradle regenerates them: the test task
         runs with ``--rerun``, and Gradle itself removes them when the task
         has no source (measured: NO-SOURCE left no ``test-results`` behind).
-        Only ``TEST-*.xml`` directly in ``build/test-results/<task>/`` is
-        touched -- not the task's ``binary/`` results, not another task's
-        reports, not another module's when ``--module`` scopes ``root``.
+        Only ``TEST-*.xml`` directly in the task's directory is touched --
+        ``build/test-results/<task>/`` for unit tests, the variant's directory
+        under ``build/outputs/androidTest-results/connected/`` and its
+        ``flavors/<flavor>/`` directories for instrumented ones -- not the
+        task's ``binary/`` results, not AGP's per-device UTP directory or
+        ``.pb`` files beside the report, not another task's or variant's
+        reports (a flavored ``proDebug`` run leaves ``debug/flavors/free/``
+        alone), not another module's when ``--module`` scopes ``root``.
 
         Raises:
             OSError: A report could not be deleted -- reading results then
                 would be guessing again, so the run does not start.
         """
-        _, paths = self._report_files(root, task)
+        _, paths = self._report_files(root, task, results)
         for path in paths:
             path.unlink(missing_ok=True)
 
@@ -431,6 +585,9 @@ class BuildRunner:
         clean: bool,
         timeout: int,
         test_task: str | None = None,
+        results: ResultsRoot = UNIT_RESULTS,
+        env: dict[str, str] | None = None,
+        serial: str | None = None,
     ) -> BuildResult:
         """
         Execute a gradlew command and assemble a BuildResult.
@@ -446,6 +603,9 @@ class BuildRunner:
             clean: Run a clean task first
             timeout: subprocess timeout in seconds
             test_task: For a test run, the task whose JUnit XML this run wrote
+            results: The results root ``test_task`` writes its JUnit XML to
+            env: Gradle's environment, when it is not this process's own
+            serial: The device an instrumented run is pinned to
 
         Returns:
             BuildResult.
@@ -458,7 +618,7 @@ class BuildRunner:
         # Only a test run reads reports, so only it pays for asking Gradle where they are.
         root = self._results_root() if name is not None else self.project_dir
         if name is not None:
-            self._clear_reports(root, name)
+            self._clear_reports(root, name, results)
         start = time.time()
 
         try:
@@ -469,6 +629,7 @@ class BuildRunner:
                 text=True,
                 check=False,
                 timeout=timeout,
+                **({"env": env} if env is not None else {}),
             )
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -494,6 +655,7 @@ class BuildRunner:
                 duration=round(duration, 2),
                 returncode=None,
                 timeout_seconds=timeout,
+                serial=serial,
             )
 
         duration = time.time() - start
@@ -502,19 +664,26 @@ class BuildRunner:
 
         test_results = None
         results_dir = None
+        aggregate_variants: list[str] = []
+        report_written = False
         if name is not None:
             # The task's reports were cleared before the run, so whatever is
-            # in its directory now, this run wrote (N6).
-            directories, xml_files = self._report_files(root, name)
+            # in its directories now, this run wrote (N6).
+            found, reports = self._report_files(root, name, results)
+            report_written = bool(reports)
+            directories = [directory.path for directory in found if directory.read]
+            read = {directory.path for directory in found if directory.read}
+            xml_files = [path for path in reports if path.parent in read]
+            nested = [path for path in reports if path.parent not in read]
             results_dir = str(
-                directories[0]
-                if len(directories) == 1
-                else root / "**" / "build" / "test-results" / name
+                directories[0] if len(directories) == 1 else results.pattern(root, name)
             )
             aggregate = aggregate_test_results(xml_files)
             # A report with no test case in it (a truncated write parses to
             # zero) is no more a result than no report at all.
             test_results = aggregate if aggregate["total"] else None
+            if test_results is None and nested:
+                aggregate_variants = flavored_report_variants(nested, self.variant)
             success = (
                 success
                 and test_results is not None
@@ -545,4 +714,7 @@ class BuildRunner:
             duration=round(duration, 2),
             returncode=returncode,
             results_dir=results_dir,
+            serial=serial,
+            aggregate_variants=aggregate_variants,
+            report_written=report_written,
         )

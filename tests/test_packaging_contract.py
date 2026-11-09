@@ -25,6 +25,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import test_instrumented_live
 from fake_toolchain import FakeToolchain, Rule
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -889,6 +890,7 @@ def test_the_retry_guard_rejects_each_way_of_widening_the_retry(mutation):
 # ---------------------------------------------------------------------------
 
 FIXTURE_PACKAGE = "com.example.composefixture"
+INSTRUMENTED_REPORT_VARIABLE = test_instrumented_live.REPORT_VARIABLE
 FIXTURE_APK = "tests/fixtures/scaffold/compose/app/build/outputs/apk/debug/app-debug.apk"
 
 # A stand-in pytest that runs the REAL pytest over a scenario module, so the
@@ -924,6 +926,13 @@ _SCENARIO_TESTS = {
     "xpass": ("@pytest.mark.xfail(reason='a pinned defect')", "pass"),
     "strict_xpass": ("@pytest.mark.xfail(strict=True, reason='a fixed defect')", "pass"),
     "warn": ("", "warnings.warn(UserWarning('deprecated'))"),
+    # As tests/test_instrumented_live.py reports an outcome: a line appended
+    # to the file the lane names in the environment.
+    "observe": (
+        "",
+        f"open(__import__('os').environ[{INSTRUMENTED_REPORT_VARIABLE!r}], 'a')"
+        ".write('- an instrumented outcome, observed live\\n')",
+    ),
 }
 
 
@@ -1176,6 +1185,132 @@ def test_a_clean_first_attempt_is_green_with_no_retry(tmp_path):
     status, _, summary = _run_step(_step("verdict"), tmp_path, tmp_path, FIRST_OUTCOME="success")
     assert status == 0
     assert "retries: 0" in summary.splitlines()
+
+
+def test_the_summary_states_the_instrumented_outcomes_the_lane_observed(tmp_path, recorded):
+    """Lane script -> the instrumented test's report -> the verdict step's summary.
+
+    The scenario test writes its outcome where the lane script's environment
+    says, as the live test does; the workflow's own verdict step must print it.
+    """
+    result, repo, _ = _run_lane(tmp_path, ("observe", "pass"), recorded, device_after=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    status, _, summary = _run_step(_step("verdict"), tmp_path, repo, FIRST_OUTCOME="success")
+
+    lines = summary.splitlines()
+    assert status == 0
+    assert "### Instrumented tests (build_and_test --instrumented)" in lines
+    assert "Observed live in attempt 1:" in lines, lines
+    assert "- an instrumented outcome, observed live" in lines, lines
+
+
+def test_after_a_retry_the_summary_reads_the_retrys_outcomes(tmp_path, recorded):
+    """A lost device's retry decides the job, so its outcomes are the ones stated."""
+    root = tmp_path / "retry"
+    result, repo, _ = _run_lane(root, ("observe", "pass"), recorded, device_after=True, attempt="2")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    status, _, summary = _run_step(
+        _step("verdict"),
+        root,
+        repo,
+        FIRST_OUTCOME="failure",
+        FIRST_EXIT="3",
+        RETRY_OUTCOME="success",
+    )
+    assert status == 0
+    assert "Observed live in attempt 2:" in summary.splitlines(), summary
+
+
+PRE_BOOT_TASKS = (":app:assembleDebug", ":app:assembleDebugAndroidTest")
+
+
+def _commands(script: str) -> list[list[str]]:
+    """A `run:` script's commands: comments and blank lines dropped, each line split.
+
+    A line continued with a trailing backslash is joined to the next first. A
+    line shlex cannot split (an unbalanced quote inside a pipeline) is kept as
+    one opaque word, which no check below mistakes for a gradlew command.
+    """
+    commands = []
+    for line in script.replace("\\\n", " ").splitlines():
+        try:
+            words = shlex.split(line, comments=True)
+        except ValueError:
+            words = [line]
+        if words:
+            commands.append(words)
+    return commands
+
+
+def _check_pre_boot_build(workflow: dict) -> None:
+    """Raise AssertionError unless both APKs are built by the wrapper before the boot.
+
+    Parsed, not grepped: an `echo` of the command, or the command commented
+    out beside a `true`, carries every token and builds nothing.
+    """
+    steps = _lane_steps(workflow)
+    boot = next(
+        i for i, step in enumerate(steps) if "android-emulator-runner" in str(step.get("uses"))
+    )
+    builds = [
+        (index, words)
+        for index, step in enumerate(steps)
+        for words in _commands(str(step.get("run") or ""))
+        if words[0] == "./gradlew" or words[0].endswith("/gradlew")
+    ]
+    complete = [index for index, words in builds if all(task in words for task in PRE_BOOT_TASKS)]
+    assert complete, f"no ./gradlew command builds {PRE_BOOT_TASKS}: {builds}"
+    assert min(complete) < boot, "the APKs are built beside the booted emulator"
+    options = shlex.split(str(workflow["jobs"]["emulator"].get("env", {}).get("GRADLE_OPTS", "")))
+    assert "-Dorg.gradle.caching=true" in options, f"the build cache is not on: {options}"
+
+
+def test_the_pre_boot_build_reaches_the_instrumented_tests_copy():
+    """Both APKs are built before the emulator boots, into the job's build cache.
+
+    The live instrumented test builds in a temporary copy of the scaffold, so
+    the scaffold's own build outputs never reach it; the build cache does.
+    """
+    _check_pre_boot_build(_yaml("emulator.yml"))
+
+
+def _pre_boot_step(workflow: dict) -> dict:
+    (step,) = [s for s in _lane_steps(workflow) if "gradlew" in str(s.get("run", ""))]
+    return step
+
+
+def _echoed(workflow: dict) -> None:
+    step = _pre_boot_step(workflow)
+    step["run"] = "echo gradlew " + " ".join(PRE_BOOT_TASKS)
+
+
+def _commented_out(workflow: dict) -> None:
+    step = _pre_boot_step(workflow)
+    step["run"] = "# " + step["run"].strip() + "\ntrue\n"
+
+
+def _cache_misspelled(workflow: dict) -> None:
+    workflow["jobs"]["emulator"]["env"]["GRADLE_OPTS"] = "-Dorg.gradle.caching=trueX"
+
+
+@pytest.mark.parametrize(
+    "mutation", [_echoed, _commented_out, _cache_misspelled], ids=lambda m: m.__name__
+)
+def test_the_pre_boot_guard_fails_a_build_that_does_not_run(mutation):
+    workflow = _yaml("emulator.yml")
+    mutation(workflow)
+
+    with pytest.raises(AssertionError):
+        _check_pre_boot_build(workflow)
+
+
+def test_no_instrumented_outcome_is_said_not_left_out(tmp_path):
+    status, _, summary = _run_step(_step("verdict"), tmp_path, tmp_path, FIRST_OUTCOME="success")
+
+    assert status == 0
+    assert "None observed in attempt 1: the instrumented test did not run" in summary
 
 
 def test_skill_md_does_not_link_nonexistent_docs():

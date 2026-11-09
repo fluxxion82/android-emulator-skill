@@ -77,7 +77,13 @@ import re
 import shlex
 from collections.abc import Iterable
 
-from .adb_exec import AdbCommandError, AdbError, DeviceNotFoundError, run_adb
+from .adb_exec import (
+    AdbCommandError,
+    AdbError,
+    DeviceNotFoundError,
+    MultipleDevicesError,
+    run_adb,
+)
 from .hierarchy import capture_hierarchy_dict
 
 # Every adb call is bounded. An unbounded one wedges the adb connection for
@@ -313,6 +319,39 @@ def resolve_device_identifier(identifier: str | None) -> str | None:
         + "\n".join(f"  - {d['serial']} ({d['type']})" for d in available),
         remedy=remedy,
     )
+
+
+def resolve_one_device(identifier: str | None) -> str:
+    """The one attached device a command must target, as a serial -- never None.
+
+    For a command that must not fan out, such as a connected Gradle task: run
+    without ``ANDROID_SERIAL`` it runs on EVERY attached device. ``identifier``
+    is resolved as :func:`resolve_device_identifier` resolves it; without one,
+    exactly one device in state ``device`` must be attached.
+
+    Raises:
+        DeviceNotFoundError: Nothing attached, or ``identifier`` matches
+            nothing attached (exit 3 at the CLI boundary).
+        MultipleDevicesError: No ``identifier`` and several attached (exit 1).
+    """
+    if identifier is not None:
+        # A serial, or DeviceNotFoundError: never None for a given identifier.
+        return resolve_device_identifier(identifier)
+    available = [d["serial"] for d in get_connected_devices() if d["state"] == "device"]
+    if not available:
+        remedy = (
+            "Start an emulator (`emulator -avd <device-name>`) or connect a device; "
+            "`adb devices` lists what is attached."
+        )
+        raise DeviceNotFoundError(f"No devices or emulators are attached. {remedy}", remedy=remedy)
+    if len(available) > 1:
+        listed = ", ".join(available)
+        remedy = f"Pass --serial with one of: {listed}."
+        raise MultipleDevicesError(
+            f"More than one device is attached ({listed}), and this runs on one. {remedy}",
+            remedy=remedy,
+        )
+    return available[0]
 
 
 def list_devices(device_type: str | None = None, state: str | None = None) -> list:

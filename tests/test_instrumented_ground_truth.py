@@ -203,3 +203,62 @@ def test_the_recorder_pins_the_emulator_in_the_childs_environment(monkeypatch):
     assert recorder._environment(live, "emulator-5554")["ANDROID_SERIAL"] == "emulator-5554"
     # The no-device run ignores --serial: its whole point is a serial that is absent.
     assert recorder._environment(absent, "emulator-5554")["ANDROID_SERIAL"] == "no-such-serial-xyz"
+
+
+# --- v0.9.0 Inc 11: the measurements build_and_test --instrumented rests on ---
+
+
+def test_a_flavored_variant_writes_under_its_build_type_and_flavor(recorded_gradle):
+    """proDebug: connected/debug/flavors/pro/, not connected/proDebug/."""
+    results_path = _entry("connected_android_test_flavored")["results_path"]
+    tree = recorded_gradle("instrumented_flavored_results_tree").splitlines()
+
+    assert results_path.startswith(
+        "app/build/outputs/androidTest-results/connected/debug/flavors/pro/TEST-"
+    ), results_path
+    assert results_path.endswith("-_app-pro.xml"), results_path
+    assert results_path in tree
+    assert not any("/connected/proDebug" in line for line in tree), tree
+    flavored = parse_junit_xml(recorded_gradle("junit_xml_instrumented_flavored"), strict=True)
+    assert flavored["passed"] == flavored["total"] == 1, flavored
+
+
+@pytest.mark.parametrize("run", ["connected_android_test_repeat", "connected_android_test_rerun"])
+def test_an_identical_second_run_is_not_up_to_date(run, recorded_gradle):
+    """Measured for --rerun's sake: the connected task runs again either way."""
+    log = recorded_gradle(run).splitlines()
+
+    assert "> Task :app:connectedDebugAndroidTest" in log
+    assert not any(
+        line.startswith("> Task :app:connectedDebugAndroidTest ") for line in log
+    ), "the connected task carried an outcome label (UP-TO-DATE, SKIPPED, ...)"
+    assert "Finished 1 tests on " in "\n".join(log)
+    # Everything else was up to date: only the connected task executed.
+    assert any(line.endswith(": 1 executed, 66 up-to-date") for line in log), log[-3:]
+    assert _entry(run)["exit_code"] == 0
+    assert "the same command was run once first" in _entry(run)["setup"]
+
+
+def test_rerun_is_accepted_bound_to_the_connected_task():
+    command = _entry("connected_android_test_rerun")["command"].split()
+
+    assert command[command.index(":app:connectedDebugAndroidTest") + 1] == "--rerun", command
+
+
+def test_a_class_filter_matching_nothing_is_one_failing_initialization_error(recorded_gradle):
+    """Not an empty suite and not a missing report: one red test that never existed."""
+    result = parse_junit_xml(recorded_gradle("junit_xml_instrumented_no_match"), strict=True)
+    log = recorded_gradle("connected_android_test_no_match")
+
+    assert _entry("connected_android_test_no_match")["exit_code"] == 1
+    assert result["total"] == result["failed"] == 1, result
+    (failed,) = result["failed_tests"]
+    assert failed["test_name"] == "com.example.composefixture.NoSuchTest.initializationError"
+    assert failed["failure_message"] == (
+        "java.lang.RuntimeException: Failed loading specified test class "
+        "'com.example.composefixture.NoSuchTest'"
+    )
+    assert "> There were failing tests. See the report at: " in log
+    assert _entry("connected_android_test_no_match")["results_path"].startswith(
+        "app/build/outputs/androidTest-results/connected/debug/TEST-"
+    )

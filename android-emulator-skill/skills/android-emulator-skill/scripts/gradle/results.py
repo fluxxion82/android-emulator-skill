@@ -5,8 +5,11 @@ Gradle result parsing.
 Pure functions over text and paths — no subprocess, no gradlew invocation. These
 parse two kinds of output:
 
-1. JUnit XML test reports (``build/test-results/<task>/TEST-*.xml``) into
-   pass/fail/skip counts plus failed-test names and messages.
+1. JUnit XML test reports into pass/fail/skip counts plus failed-test names
+   and messages. Where a run writes them is its *results root*
+   (:class:`ResultsRoot`): ``build/test-results/<task>/TEST-*.xml`` for unit
+   tests, ``build/outputs/androidTest-results/connected/...`` for instrumented
+   ones.
 2. Gradle build stdout/stderr into structured errors and warnings (Kotlin ``e:``
    / ``w:`` lines, Java/Kotlin ``error:`` / ``warning:`` lines, and
    ``> Task ... FAILED`` markers).
@@ -16,15 +19,220 @@ but uses Gradle's JUnit XML + console output instead of Apple's xcresult bundle.
 """
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
 
 from common import cli
 
 
-def find_test_result_directories(
-    search_root: Path, *, task: str, recursive: bool = True
-) -> list[Path]:
+def _unit_candidates(result_root: Path, task: str) -> list[Path]:
+    """``<task>/`` directly below ``build/test-results``, the name compared without case."""
+    wanted = task.casefold()
+    try:
+        return sorted(
+            path
+            for path in result_root.iterdir()
+            if path.is_dir() and path.name.casefold() == wanted
+        )
+    except FileNotFoundError:
+        return []
+
+
+def _subdirectories(directory: Path) -> list[Path]:
+    try:
+        return sorted(path for path in directory.iterdir() if path.is_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def connected_variant(task: str) -> str:
+    """The variant a ``connected<Variant>AndroidTest`` task runs, as the task spells it.
+
+    ``connectedProDebugAndroidTest`` -> ``ProDebug``. Compared without case.
+    """
+    return task.removeprefix("connected").removesuffix("AndroidTest")
+
+
+def _instrumented_candidates(result_root: Path, task: str) -> list[Path]:
+    """The variant's directory below ``build/outputs/androidTest-results/connected``.
+
+    Two layouts, both recorded with AGP 8.13.2 on one emulator; nothing else
+    is assumed:
+
+    * an unflavored variant writes ``connected/<variant>/`` -- ``debug/``
+      (instrumented_results_tree);
+    * a flavored one writes ``connected/<buildType>/flavors/<flavor>/`` --
+      ``proDebug`` into ``debug/flavors/pro/``
+      (instrumented_flavored_results_tree).
+
+    The variant is matched against what is on disk rather than split into
+    flavor and build type, which would need the project's build types:
+    ``<flavor><BuildType>`` is AGP's variant name, so ``<buildType>/flavors/
+    <flavor>/`` is the variant's directory when the two read back as it,
+    without case. A variant AGP writes anywhere else is not found, so its run
+    is refused as one with no results -- reports are never read from a place
+    that was not cleaned first.
+    """
+    wanted = connected_variant(task).casefold()
+    matches = []
+    for build_type in _subdirectories(result_root):
+        if build_type.name.casefold() == wanted:
+            matches.append(build_type)
+        capitalized = f"{build_type.name[:1].upper()}{build_type.name[1:]}"
+        matches.extend(
+            flavor
+            for flavor in _subdirectories(build_type / "flavors")
+            if f"{flavor.name}{capitalized}".casefold() == wanted
+        )
+    return sorted(matches)
+
+
+def _flavor_directories(directory: Path) -> list[Path]:
+    """``<variant dir>/flavors/<flavor>/``: where AGP writes a flavored variant below it.
+
+    For ``connected/debug/`` these are ``debug/flavors/free/`` and
+    ``debug/flavors/pro/`` (instrumented_flavored_results_tree's layout): a
+    ``debug`` run in a flavored project leaves its reports there, none of its
+    own. They are cleared before the run and checked like the variant
+    directory, so whatever is in them afterwards is this run's -- but they are
+    the flavored variants' reports, never read as this one's verdict.
+    """
+    return _subdirectories(directory / "flavors")
+
+
+def _flavor_containers(directory: Path) -> list[Path]:
+    """``<variant dir>/flavors`` itself, whenever it is there -- even with no flavor in it.
+
+    Its children are checked as flavor directories, but an empty one (or a
+    symlink to an empty directory) has none, and would leave the link itself
+    unchecked while Gradle starts. Listed so its own components go through
+    the symlink and containment checks; it holds no report of its own.
+    """
+    container = directory / "flavors"
+    return [container] if container.exists() or container.is_symlink() else []
+
+
+def flavored_report_variants(reports: list[Path], variant: str) -> list[str]:
+    """The flavored variants a run's reports below its variant directory belong to.
+
+    ``connected/debug/flavors/<flavor>/TEST-*.xml`` written by a ``debug`` run
+    means the project has product flavors and ``debug`` is their build type,
+    not a variant of its own. Returned as the variants to pass instead --
+    ``<flavor><Variant>`` in the requested variant's capitalisation
+    (``freeDebug``, ``proDebug``). These reports are this run's (cleared
+    before it), but they word a refusal; they never pass one.
+    """
+    capitalized = f"{variant[:1].upper()}{variant[1:]}"
+    return sorted({f"{report.parent.name}{capitalized}" for report in reports})
+
+
+@dataclass(frozen=True)
+class ResultsRoot:
+    """Where one kind of test run writes its JUnit XML, below a module directory.
+
+    Every report the builder deletes or reads is a ``TEST-*.xml`` directly in
+    a task directory ``<module>/<base...>/<task directory...>/`` -- nothing
+    deeper (AGP's per-device UTP directory sits beside its report) -- or
+    directly in one of that directory's ``nested`` directories, which are
+    cleared, checked and counted as written but not read as the verdict.
+    Discovery,
+    the lexical symlink checks, the resolved-path containment checks, the
+    stale-report deletion and the no-results diagnostic all go through this
+    one description, so the two kinds cannot drift apart in any one of them.
+
+    Attributes:
+        kind: ``"unit"`` or ``"instrumented"``.
+        base: Path components from a module to the directory holding its task
+            directories.
+        candidates: The task's directories in ``<module>/<base...>``, given
+            that directory and the unqualified task name. More than one is
+            ambiguous, and refused.
+        placeholder: Path components below ``<module>/<base...>`` naming where
+            a module-scoped search looks before Gradle has created the task's
+            directory. Kept for the containment checks and the no-results
+            diagnostic; nothing in it is read.
+        label: How a refusal names this root's task directory, from the module.
+        noun: The same directory, named without its path.
+        nested: Report directories below a found task directory that belong to
+            other tasks or variants the run may write -- cleared before it and
+            checked like the task directory, never read as its result.
+        containers: Directories below a found task directory that hold
+            ``nested`` ones: checked like them, even when empty, never read
+            and never cleared (no report is written directly in them).
+    """
+
+    kind: str
+    base: tuple[str, ...]
+    candidates: Callable[[Path, str], list[Path]]
+    placeholder: Callable[[str], tuple[str, ...]]
+    label: str
+    noun: str
+    nested: Callable[[Path], list[Path]] = lambda _directory: []
+    containers: Callable[[Path], list[Path]] = lambda _directory: []
+
+    def pattern(self, search_root: Path, task: str) -> Path:
+        """Where a project-wide search looked, for the no-results diagnostic."""
+        return search_root.joinpath("**", *self.base, *self.placeholder(task))
+
+
+UNIT_RESULTS = ResultsRoot(
+    kind="unit",
+    base=("build", "test-results"),
+    candidates=_unit_candidates,
+    placeholder=lambda task: (task,),
+    label="build/test-results task directory",
+    noun="test result task directory",
+)
+
+INSTRUMENTED_RESULTS = ResultsRoot(
+    kind="instrumented",
+    base=("build", "outputs", "androidTest-results", "connected"),
+    candidates=_instrumented_candidates,
+    # Which of the two layouts a variant has is not known until AGP writes it,
+    # so the diagnostic names the directory both live under.
+    placeholder=lambda _task: (),
+    label="build/outputs/androidTest-results/connected variant directory",
+    noun="connected test result variant directory",
+    nested=_flavor_directories,
+    containers=_flavor_containers,
+)
+
+
+@dataclass(frozen=True)
+class ResultDirectory:
+    """A task directory a search resolved, and the module its root hangs from.
+
+    Attributes:
+        module: The module directory (lexical).
+        path: The task directory (lexical, unresolved).
+        found: False for a directory that is only checked, never searched for
+            reports: a module-scoped search's placeholder (nothing matched),
+            or a root's ``containers`` entry.
+        read: False for a root's ``nested`` directory -- cleared and checked,
+            its reports counted as written, not read as the task's result.
+    """
+
+    module: Path
+    path: Path
+    found: bool = True
+    read: bool = True
+
+    @property
+    def components(self) -> tuple[Path, ...]:
+        """Every lexical component from ``<module>/build`` down to the task directory."""
+        parts = self.path.relative_to(self.module).parts
+        return tuple(self.module.joinpath(*parts[: index + 1]) for index in range(len(parts)))
+
+
+def find_result_directories(
+    search_root: Path,
+    *,
+    task: str,
+    recursive: bool = True,
+    root: ResultsRoot = UNIT_RESULTS,
+) -> list[ResultDirectory]:
     """Resolve the one case-insensitive task directory below each eligible module.
 
     Gradle accepts a miscased task selector and writes reports under the task's
@@ -33,46 +241,78 @@ def find_test_result_directories(
     the caller did not uniquely identify.
     """
     if recursive:
-        result_roots = sorted(set(search_root.glob("**/build/test-results")))
+        result_roots = sorted(set(search_root.glob("/".join(("**", *root.base)))))
     else:
-        result_roots = [search_root / "build" / "test-results"]
+        result_roots = [search_root.joinpath(*root.base)]
 
-    directories: list[Path] = []
-    wanted = task.casefold()
+    directories: list[ResultDirectory] = []
     for result_root in result_roots:
-        try:
-            matches = sorted(
-                path
-                for path in result_root.iterdir()
-                if path.is_dir() and path.name.casefold() == wanted
-            )
-        except FileNotFoundError:
-            matches = []
+        module = result_root.parents[len(root.base) - 1]
+        matches = root.candidates(result_root, task)
         if len(matches) > 1:
+            listed = ", ".join(str(path) for path in matches)
+            if root is UNIT_RESULTS:
+                cli.fail(
+                    f"ambiguous Gradle test result directories for {task}: {listed}",
+                    "Remove or rename the case-colliding task result directories, then retry.",
+                )
+            variant = connected_variant(task)
+            variant = f"{variant[:1].lower()}{variant[1:]}"  # AGP's spelling: proDebug
             cli.fail(
-                f"ambiguous Gradle test result directories for {task}: "
-                + ", ".join(str(path) for path in matches),
-                "Remove or rename the case-colliding task result directories, then retry.",
+                f"ambiguous Gradle test result directories for {task}: {len(matches)} result "
+                f"directories read back as variant {variant}: {listed}",
+                "Remove the one that is not this variant's (AGP writes connected/<variant>/ "
+                "for an unflavored variant, connected/<buildType>/flavors/<flavor>/ for a "
+                "flavored one), then retry.",
             )
         if matches:
-            directories.extend(matches)
+            for path in matches:
+                directories.append(ResultDirectory(module, path))
+                directories.extend(
+                    ResultDirectory(module, container, found=False, read=False)
+                    for container in root.containers(path)
+                )
+                directories.extend(
+                    ResultDirectory(module, nested, read=False) for nested in root.nested(path)
+                )
         elif not recursive:
             # Keep the intended location available for containment checks and
             # for the no-results diagnostic even before Gradle creates it.
-            directories.append(result_root / task)
+            placeholder = result_root.joinpath(*root.placeholder(task))
+            directories.append(ResultDirectory(module, placeholder, found=False))
     return directories
 
 
+def find_test_result_directories(
+    search_root: Path,
+    *,
+    task: str,
+    recursive: bool = True,
+    root: ResultsRoot = UNIT_RESULTS,
+) -> list[Path]:
+    """The task directories :func:`find_result_directories` resolves, a placeholder included."""
+    found = find_result_directories(search_root, task=task, recursive=recursive, root=root)
+    return [directory.path for directory in found if directory.read]
+
+
 def find_test_result_files(
-    search_root: Path, *, task: str | None = None, recursive: bool = True
+    search_root: Path,
+    *,
+    task: str | None = None,
+    recursive: bool = True,
+    root: ResultsRoot = UNIT_RESULTS,
 ) -> list[Path]:
     """
     Find Gradle's JUnit XML reports under a project or module directory.
 
     Gradle writes one ``TEST-<class>.xml`` per test class into
-    ``<module>/build/test-results/<task>/``. Only files named that way are
-    returned: a bare ``*.xml`` glob also returned every other XML file at the
-    top of ``search_root`` (D9).
+    ``<module>/build/test-results/<task>/`` (the unit root, the default). AGP
+    writes one ``TEST-<device>-<module>-<flavor>.xml`` per device into the
+    variant's directory under ``<module>/build/outputs/androidTest-results/
+    connected/`` (``root=INSTRUMENTED_RESULTS``), beside a per-device
+    directory of UTP output that holds no report. Only files named that way,
+    directly in the task's directory, are returned: a bare ``*.xml`` glob
+    also returned every other XML file at the top of ``search_root`` (D9).
 
     This only finds reports; it cannot tell whose they are. The directory
     outlives the run -- measured on Gradle 8.13, an UP-TO-DATE test task exits
@@ -81,13 +321,15 @@ def find_test_result_files(
 
     Args:
         search_root: Directory to search under (a project or a module).
-        task: The test task, unqualified (``testDebugUnitTest``). Only reports
-            directly in a ``build/test-results/<task>/`` directory are
-            returned, the name compared without case: Gradle resolves a
-            miscased task name (recorded: gradle_miscased_variant_resolves) and
-            writes the directory under the task's real spelling.
+        task: The test task, unqualified (``testDebugUnitTest``,
+            ``connectedDebugAndroidTest``). Only reports directly in that
+            task's directory are returned, the name compared without case:
+            Gradle resolves a miscased task name (recorded:
+            gradle_miscased_variant_resolves) and writes the directory under
+            the task's real spelling.
         recursive: Search nested modules. A module-scoped build passes false so
             cleanup cannot cross into one of that module's children.
+        root: The results root the task writes to.
 
     Returns:
         Sorted list of report paths (empty if none match or the path is missing).
@@ -97,12 +339,17 @@ def find_test_result_files(
 
     candidates: set[Path] = set()
     if task is not None:
-        for directory in find_test_result_directories(search_root, task=task, recursive=recursive):
-            candidates.update(directory.glob("TEST-*.xml"))
-    else:
+        for directory in find_result_directories(
+            search_root, task=task, recursive=recursive, root=root
+        ):
+            if directory.found and directory.read:
+                candidates.update(directory.path.glob("TEST-*.xml"))
+    elif root is UNIT_RESULTS:
         candidates.update(search_root.glob("**/test-results/**/TEST-*.xml"))
         # search_root may itself be a task's results directory.
         candidates.update(search_root.glob("TEST-*.xml"))
+    else:
+        candidates.update(search_root.glob("/".join(("**", *root.base, "**", "TEST-*.xml"))))
 
     return sorted(path for path in candidates if path.is_file())
 

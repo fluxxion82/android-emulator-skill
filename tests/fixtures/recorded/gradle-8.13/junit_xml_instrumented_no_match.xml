@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuite name="com.example.composefixture.NoSuchTest" tests="1" failures="1" errors="0" skipped="0" time="0.0" timestamp="2020-01-01T00:00:00Z" hostname="build-host">
+  <properties>
+    <property name="device" value="aes_api33(AVD) - 13" />
+    <property name="flavor" value="" />
+    <property name="project" value=":app" />
+  </properties>
+  <testcase name="initializationError" classname="com.example.composefixture.NoSuchTest" time="0.0">
+    <failure>java.lang.RuntimeException: Failed loading specified test class 'com.example.composefixture.NoSuchTest'
+at androidx.test.internal.runner.DirectTestLoader.doCreateRunner(DirectTestLoader.java:50)
+at androidx.test.internal.runner.TestLoader.getRunnersFor(TestLoader.java:64)
+at androidx.test.internal.runner.TestRequestBuilder.build(TestRequestBuilder.java:842)
+at androidx.test.runner.AndroidJUnitRunner.buildRequest(AndroidJUnitRunner.java:672)
+at androidx.test.runner.AndroidJUnitRunner.onStart(AndroidJUnitRunner.java:453)
+at android.app.Instrumentation$InstrumentationThread.run(Instrumentation.java:2361)
+Caused by: java.lang.ClassNotFoundException: com.example.composefixture.NoSuchTest
+at java.lang.Class.classForName(Native Method)
+at java.lang.Class.forName(Class.java:454)
+at androidx.test.internal.runner.DirectTestLoader.doCreateRunner(DirectTestLoader.java:44)
+... 5 more
+Caused by: java.lang.ClassNotFoundException: Didn't find class "com.example.composefixture.NoSuchTest" on path: DexPathList[[zip file "/system/framework/android.test.runner.jar", zip file "/system/framework/android.test.mock.jar", zip file "/system/framework/android.test.base.jar", zip file "/data/app/~~ngy6TBWswMNYvlEB6ofNZw==/com.example.composefixture.test-pDAR5bGltwoLGwoHcFyUJw==/base.apk", zip file "/data/app/~~-3mR6hqhXEKgG_rLNCr56w==/com.example.composefixture-NJnUnt_V_JBDzZV3hXOcsQ==/base.apk"],nativeLibraryDirectories=[/data/app/~~ngy6TBWswMNYvlEB6ofNZw==/com.example.composefixture.test-pDAR5bGltwoLGwoHcFyUJw==/lib/arm64, /data/app/~~-3mR6hqhXEKgG_rLNCr56w==/com.example.composefixture-NJnUnt_V_JBDzZV3hXOcsQ==/lib/arm64, /data/app/~~ngy6TBWswMNYvlEB6ofNZw==/com.example.composefixture.test-pDAR5bGltwoLGwoHcFyUJw==/base.apk!/lib/arm64-v8a, /data/app/~~-3mR6hqhXEKgG_rLNCr56w==/com.example.composefixture-NJnUnt_V_JBDzZV3hXOcsQ==/base.apk!/lib/arm64-v8a, /system/lib64, /system_ext/lib64]]
+at dalvik.system.BaseDexClassLoader.findClass(BaseDexClassLoader.java:259)
+at java.lang.ClassLoader.loadClass(ClassLoader.java:379)
+at java.lang.ClassLoader.loadClass(ClassLoader.java:312)
+... 8 more
+</failure>
+  </testcase>
+</testsuite>

@@ -1,0 +1,110 @@
+Starting a Gradle Daemon (subsequent builds will be faster)
+
+> Configure project :app
+w: ⚠️ Deprecated Gradle Version
+The used Gradle version (Gradle 8.13) is deprecated and will not be supported in future Kotlin Gradle Plugin releases.
+The minimum supported Gradle version will become Gradle 8.14.4 in Kotlin 2.5.0.
+
+This warning can be suppressed in 'gradle.properties':
+    kotlin.suppressGradlePluginWarnings=DeprecatedGradleVersionWarning
+Solution: Please update the Gradle version to at least Gradle 8.14.4.
+
+
+> Task :app:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preProDebugBuild UP-TO-DATE
+> Task :app:checkProDebugAarMetadata
+> Task :app:processProDebugNavigationResources
+> Task :app:generateProDebugResValues
+> Task :app:compileProDebugNavigationResources
+> Task :app:mapProDebugSourceSetPaths
+> Task :app:generateProDebugResources
+> Task :app:packageProDebugResources
+> Task :app:mergeProDebugResources
+> Task :app:createProDebugCompatibleScreenManifests
+> Task :app:extractDeepLinksProDebug
+> Task :app:parseProDebugLocalResources
+> Task :app:processProDebugMainManifest
+> Task :app:processProDebugManifest
+> Task :app:preProDebugAndroidTestBuild SKIPPED
+> Task :app:javaPreCompileProDebug
+> Task :app:checkProDebugAndroidTestAarMetadata
+> Task :app:processProDebugManifestForPackage
+> Task :app:processProDebugAndroidTestNavigationResources
+> Task :app:compileProDebugAndroidTestNavigationResources
+> Task :app:generateProDebugAndroidTestResValues
+> Task :app:mapProDebugAndroidTestSourceSetPaths
+> Task :app:generateProDebugAndroidTestResources
+> Task :app:mergeProDebugAndroidTestResources
+> Task :app:processProDebugAndroidTestManifest
+> Task :app:javaPreCompileProDebugAndroidTest
+> Task :app:mergeProDebugShaders
+> Task :app:compileProDebugShaders NO-SOURCE
+> Task :app:generateProDebugAssets UP-TO-DATE
+> Task :app:mergeProDebugAssets
+> Task :app:compressProDebugAssets
+> Task :app:processProDebugAndroidTestResources
+> Task :app:processProDebugResources
+> Task :app:checkProDebugDuplicateClasses
+> Task :app:desugarProDebugFileDependencies
+> Task :app:mergeProDebugJniLibFolders
+> Task :app:mergeLibDexProDebug
+> Task :app:mergeProDebugNativeLibs
+> Task :app:validateSigningProDebug
+> Task :app:writeProDebugAppMetadata
+
+> Task :app:stripProDebugDebugSymbols
+Unable to strip the following libraries, packaging them as they are: libandroidx.graphics.path.so. Run with --info option to learn more.
+
+> Task :app:writeProDebugSigningConfigVersions
+> Task :app:mergeProDebugAndroidTestShaders
+> Task :app:compileProDebugAndroidTestShaders NO-SOURCE
+> Task :app:generateProDebugAndroidTestAssets UP-TO-DATE
+> Task :app:mergeProDebugAndroidTestAssets
+> Task :app:compressProDebugAndroidTestAssets
+> Task :app:checkProDebugAndroidTestDuplicateClasses
+> Task :app:desugarProDebugAndroidTestFileDependencies
+> Task :app:mergeProDebugAndroidTestJniLibFolders
+> Task :app:mergeLibDexProDebugAndroidTest
+> Task :app:mergeProDebugAndroidTestNativeLibs NO-SOURCE
+> Task :app:stripProDebugAndroidTestDebugSymbols NO-SOURCE
+> Task :app:validateSigningProDebugAndroidTest
+> Task :app:writeProDebugAndroidTestSigningConfigVersions
+> Task :app:mergeExtDexProDebugAndroidTest
+> Task :app:mergeExtDexProDebug
+> Task :app:compileProDebugKotlin
+> Task :app:compileProDebugJavaWithJavac NO-SOURCE
+> Task :app:bundleProDebugClassesToCompileJar
+> Task :app:dexBuilderProDebug
+> Task :app:mergeProDebugGlobalSynthetics
+> Task :app:processProDebugJavaRes
+> Task :app:mergeProjectDexProDebug
+> Task :app:compileProDebugAndroidTestKotlin
+> Task :app:compileProDebugAndroidTestJavaWithJavac NO-SOURCE
+> Task :app:dexBuilderProDebugAndroidTest
+> Task :app:mergeProDebugAndroidTestGlobalSynthetics
+> Task :app:processProDebugAndroidTestJavaRes
+> Task :app:mergeProjectDexProDebugAndroidTest
+> Task :app:mergeProDebugAndroidTestJavaResource
+> Task :app:mergeProDebugJavaResource
+> Task :app:packageProDebugAndroidTest
+> Task :app:createProDebugAndroidTestApkListingFileRedirect
+> Task :app:packageProDebug
+> Task :app:createProDebugApkListingFileRedirect
+
+> Task :app:connectedProDebugAndroidTest
+Starting 1 tests on aes_api33(AVD) - 13
+
+Finished 1 tests on aes_api33(AVD) - 13
+
+[Incubating] Problems report is available at: file:///scaffold/build/reports/problems/problems-report.html
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/8.13/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+
+BUILD SUCCESSFUL in 0s
+1 actionable tasks: 67 executed
+Warning: SDK processing. This version only understands SDK XML versions up to 3 but an SDK XML file of version 4 was encountered. This can happen if you use versions of Android Studio and the command-line tools that were released at different times.

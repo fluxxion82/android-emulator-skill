@@ -37,6 +37,7 @@ class OutputFormatter:
         test_info: dict | None = None,
         errors: list[dict] | None = None,
         failed_tests: list[dict] | None = None,
+        device: str | None = None,
     ) -> str:
         """
         Format the ultra-minimal default output: one summary line + a result ID.
@@ -53,15 +54,19 @@ class OutputFormatter:
             test_info: Optional aggregated test result dict
             errors: Optional error list to surface on failure
             failed_tests: Optional failed-test list to surface on failure
+            device: The serial an instrumented run was pinned to
 
         Returns:
             Minimal formatted string.
         """
         lines: list[str] = []
         dur = OutputFormatter._duration(duration)
+        on_device = f" on {device}" if device else ""
 
         if test_info:
-            lines.append(f"{OutputFormatter.test_summary(status, test_info)} [{build_id}]")
+            lines.append(
+                f"{OutputFormatter.test_summary(status, test_info)}{on_device} [{build_id}]"
+            )
         else:
             lines.append(
                 f"Build: {status} ({error_count} errors, {warning_count} warnings) "
@@ -206,6 +211,7 @@ class OutputFormatter:
         warnings: list[dict] | None = None,
         test_info: dict | None = None,
         failed_tests: list[dict] | None = None,
+        device: str | None = None,
     ) -> str:
         """Format verbose output with full error/warning/test detail."""
         lines: list[str] = []
@@ -217,6 +223,8 @@ class OutputFormatter:
         else:
             lines.append(f"Build: {status}")
 
+        if device:
+            lines.append(f"Device: {device}")
         lines.append(f"Duration: {OutputFormatter._duration(duration)}")
         lines.append(f"Result ID: {build_id}")
         lines.append("")

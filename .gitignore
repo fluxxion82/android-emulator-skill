@@ -33,6 +33,11 @@ build/
 .AppleDouble
 .LSOverride
 
+# A local run of the emulator lane script
+emulator-lane-outcomes/
+emulator-lane-diagnostics/
+emulator-lane.summary
+
 # Gradle scaffold build output (the scaffold sources are committed,
 # its build artifacts are not)
 tests/fixtures/scaffold/**/build/

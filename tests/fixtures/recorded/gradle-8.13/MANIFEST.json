@@ -364,6 +364,144 @@
       "description": "The same task with ANDROID_SERIAL naming a device that does not exist: what an agent sees when the emulator it asked for is gone. Needs no emulator.",
       "catches": [],
       "bytes": 4845
+    },
+    {
+      "name": "connected_android_test_no_match",
+      "file": "connected_android_test_no_match.txt",
+      "recorded_at": "2026-11-09T07:05:41Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.NoSuchTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 11.2,
+      "exit_code": 1,
+      "produced_artifact": null,
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/TEST-aes_api33(AVD) - 13-_app-.xml",
+      "description": "connectedDebugAndroidTest with the runner's class filter naming a class that does not exist: what AGP prints, exits with and leaves under androidTest-results when the filter matches no test -- the instrumented shape of 'no test results'. Measured: not an empty suite and not a missing report. The runner reports ONE failing test, '<class>.initializationError', whose failure is \"Failed loading specified test class '<class>'\", Gradle exits 1, and the XML holds that one testcase.",
+      "catches": [],
+      "bytes": 5333
+    },
+    {
+      "name": "junit_xml_instrumented_no_match",
+      "file": "junit_xml_instrumented_no_match.xml",
+      "recorded_at": "2026-11-09T07:05:41Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.NoSuchTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 11.2,
+      "produced_by": "connected_android_test_no_match",
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/TEST-aes_api33(AVD) - 13-_app-.xml",
+      "description": "The JUnit XML connected_android_test_no_match wrote. Found by searching 'app/build/**/TEST-*.xml' after the run, not by assuming a path: results_path is where AGP put it.",
+      "catches": [],
+      "bytes": 2626
+    },
+    {
+      "name": "instrumented_no_match_tree",
+      "file": "instrumented_no_match_tree.txt",
+      "recorded_at": "2026-11-09T07:05:41Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.NoSuchTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 11.2,
+      "produced_by": "connected_android_test_no_match",
+      "tree_root": "app/build/outputs/androidTest-results",
+      "description": "Every path under app/build/outputs/androidTest-results/ after connected_android_test_no_match, so the layout AGP writes is ground truth rather than an assumption.",
+      "catches": [],
+      "bytes": 1681
+    },
+    {
+      "name": "connected_android_test_repeat",
+      "file": "connected_android_test_repeat.txt",
+      "recorded_at": "2026-11-09T07:04:25Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold; the same command was run once first in the same copy, and this is the second run",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 9.4,
+      "exit_code": 0,
+      "produced_artifact": null,
+      "description": "The passing run, run twice in one copy with nothing changed and no --rerun; this is the second run. Whether its task line says UP-TO-DATE is the measurement build_and_test's --rerun rests on.",
+      "catches": [],
+      "bytes": 5084
+    },
+    {
+      "name": "connected_android_test_rerun",
+      "file": "connected_android_test_rerun.txt",
+      "recorded_at": "2026-11-09T07:04:44Z",
+      "command": "gradle --console=plain :app:connectedDebugAndroidTest --rerun -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold; the same command was run once first in the same copy, and this is the second run",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 7.9,
+      "exit_code": 0,
+      "produced_artifact": null,
+      "description": "The argv build_and_test --instrumented sends -- the task, --rerun bound to it, then the runner's class filter -- run twice in one copy; this is the second run. Gradle accepts --rerun on the connected task and the tests run again.",
+      "catches": [],
+      "bytes": 5084
+    },
+    {
+      "name": "connected_android_test_flavored",
+      "file": "connected_android_test_flavored.txt",
+      "recorded_at": "2026-11-09T07:02:05Z",
+      "command": "gradle --console=plain :app:connectedProDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold; appended to app/build.gradle: \"\\nandroid {\\n    flavorDimensions 'tier'\\n    productFlavors {\\n        free { dimension 'tier' }\\n        pro { dimension 'tier' }\\n    }\\n}\\n\"",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 36.0,
+      "exit_code": 0,
+      "produced_artifact": null,
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/flavors/pro/TEST-aes_api33(AVD) - 13-_app-pro.xml",
+      "description": "The passing class through a FLAVORED variant's connected task (proDebug: product flavor 'pro' of dimension 'tier', build type debug), in a copy of the compose scaffold with two flavors appended to app/build.gradle. Where AGP writes a flavored variant's JUnit XML is the second half of the instrumented results root's directory rule.",
+      "catches": [],
+      "bytes": 5024
+    },
+    {
+      "name": "junit_xml_instrumented_flavored",
+      "file": "junit_xml_instrumented_flavored.xml",
+      "recorded_at": "2026-11-09T07:02:05Z",
+      "command": "gradle --console=plain :app:connectedProDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold; appended to app/build.gradle: \"\\nandroid {\\n    flavorDimensions 'tier'\\n    productFlavors {\\n        free { dimension 'tier' }\\n        pro { dimension 'tier' }\\n    }\\n}\\n\"",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 36.0,
+      "produced_by": "connected_android_test_flavored",
+      "results_path": "app/build/outputs/androidTest-results/connected/debug/flavors/pro/TEST-aes_api33(AVD) - 13-_app-pro.xml",
+      "description": "The JUnit XML connected_android_test_flavored wrote. Found by searching 'app/build/**/TEST-*.xml' after the run, not by assuming a path: results_path is where AGP put it.",
+      "catches": [],
+      "bytes": 537
+    },
+    {
+      "name": "instrumented_flavored_results_tree",
+      "file": "instrumented_flavored_results_tree.txt",
+      "recorded_at": "2026-11-09T07:02:05Z",
+      "command": "gradle --console=plain :app:connectedProDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.composefixture.PassingInstrumentedTest",
+      "scaffold": "tests/fixtures/scaffold/compose",
+      "setup": "run in a temporary copy of the scaffold; appended to app/build.gradle: \"\\nandroid {\\n    flavorDimensions 'tier'\\n    productFlavors {\\n        free { dimension 'tier' }\\n        pro { dimension 'tier' }\\n    }\\n}\\n\"",
+      "environment": {
+        "ANDROID_SERIAL": "emulator-5556"
+      },
+      "wall_seconds": 36.0,
+      "produced_by": "connected_android_test_flavored",
+      "tree_root": "app/build/outputs/androidTest-results",
+      "description": "Every path under app/build/outputs/androidTest-results/ after connected_android_test_flavored, so the layout AGP writes is ground truth rather than an assumption.",
+      "catches": [],
+      "bytes": 2040
     }
   ]
 }
