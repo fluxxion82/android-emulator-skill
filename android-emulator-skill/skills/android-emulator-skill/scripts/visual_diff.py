@@ -48,6 +48,10 @@ except ImportError:
 # A pixel is painted red in diff.png when its R, G and B differences sum past this.
 OVERLAY_THRESHOLD = 30
 
+# The verdict counts a pixel as different when the greyscale (L) of its
+# difference is above this: a noise floor, separate from OVERLAY_THRESHOLD.
+COUNT_THRESHOLD = 10
+
 # Where a run's artifacts go when --output is not given, under the skill's cache
 # root. The default was ".", so an agent standing in a repository root left
 # diff.png, side-by-side.png and diff-report.json in it (L12) -- the same
@@ -147,13 +151,16 @@ class VisualDiffer:
         }
 
     def _count_different_pixels(self, diff_image: Image.Image) -> int:
-        """Count number of pixels that are different."""
-        # Convert to grayscale for easier processing
-        diff_gray = diff_image.convert("L")
+        """Count the pixels whose greyscale difference exceeds COUNT_THRESHOLD.
 
-        # Count non-zero pixels (different)
-        pixels = diff_gray.getdata()
-        return sum(1 for pixel in pixels if pixel > 10)  # Threshold for noise
+        The histogram of the L image, summed above the cut-off: bin ``n`` holds
+        the pixels at level ``n``, so bins 11..255 are exactly the pixels with
+        a level over 10 -- the same number as the Python loop over ``getdata``
+        this replaces gave (2.6 M comparisons for a 1080x2400 screenshot, and
+        ``getdata`` is deprecated in Pillow 13, removed in 14).
+        """
+        histogram = diff_image.convert("L").histogram()
+        return sum(histogram[COUNT_THRESHOLD + 1 :])
 
     def generate_diff_image(self, baseline_path: str, current_path: str, output_path: str) -> None:
         """Write ``current`` with every pixel whose R+G+B difference exceeds 30 painted red.
