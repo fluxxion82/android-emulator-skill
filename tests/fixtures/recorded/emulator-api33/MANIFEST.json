@@ -29,16 +29,32 @@
       "name": "adb_devices_offline",
       "file": "adb_devices_offline.txt",
       "command": "adb -s <emulator> reboot; poll adb devices -l (host-wide, no serial) every 0.1 s until the emulator's row reads offline; adb -s <emulator> wait-for-device; poll getprop sys.boot_completed until 1",
-      "description": "`adb devices -l` while a device is in the `offline` state: ground truth for what device_list's parse_adb_devices and serial resolution see for a device that is attached but not usable. Produced by rebooting the recording emulator and keeping the first host listing whose row for it reads `offline`; the emulator is waited for until sys.boot_completed is 1 before the capture is accepted. Every serial that is not `emulator-NNNN` (a phone attached to the same host) is replaced by SERIALREDACTED; its row and state are kept. Manifest: `target_serial`, and `states_seen`, the target's states in the order they were polled. `unauthorized` is NOT recorded: it needs a new adb host key and an authorization prompt on a real phone.",
+      "description": "`adb devices -l` while a device is in the `offline` state: ground truth for what device_list's parse_adb_devices and serial resolution see for a device that is attached but not usable. Produced by rebooting the recording emulator and keeping the first host listing whose row for it reads `offline`; the emulator is waited for until sys.boot_completed is 1 before the capture is accepted. Every serial that is not `emulator-NNNN` (a phone attached to the same host) is replaced by SERIALREDACTED; its row and state are kept. Manifest: `target_serial`, and `states_seen`, the target's states in the order they were polled. `unauthorized` is adb_devices_unauthorized: a second, throwaway emulator whose key the adb server does not hold, never a phone.",
       "catches": [],
-      "bytes": 254,
+      "bytes": 191,
       "exit_status": 0,
       "stream": "stdout",
       "target_serial": "emulator-5556",
       "states_seen": [
         "offline"
       ],
-      "recorded_at": "2026-10-24T18:17:35Z"
+      "recorded_at": "2026-11-09T06:33:45Z"
+    },
+    {
+      "name": "adb_devices_unauthorized",
+      "file": "adb_devices_unauthorized.txt",
+      "command": "adb devices -l (host-wide, no serial) while a second emulator reads `unauthorized`: start a second, throwaway emulator whose adbd requires authorization and whose key the adb server does not hold: an AVD from an image with ro.adb.secure=1 (google_apis_playstore), launched with HOME, ANDROID_USER_HOME and ANDROID_EMULATOR_HOME all pointing at an empty directory (the emulator then generates a fresh adbkey and passes it to the guest as ro.boot.qemu.adb.pubkey, while the adb server keeps ~/.android/adbkey) and -no-window, so nobody accepts the prompt; its row reads `unauthorized` until it is killed",
+      "description": "`adb devices -l` while a device is in the `unauthorized` state: ground truth for what device_list's parse_adb_devices sees for a device whose adbd has not accepted the host's key. The row carries only the serial, the state and `transport_id:N` -- no product/model/device fields, which adb cannot ask for before authorization -- so a parser that requires them drops the device. The recording emulator (whose props stamp the profile) is present and reads `device`; the unauthorized device is a second, throwaway emulator (see the command), never a phone. Every serial that is not `emulator-NNNN` (a phone attached to the same host) is replaced by SERIALREDACTED; its row and state are kept. Manifest: `recording_serial`, `target_serial`, and `target_fields`, the unauthorized row's fields after its state.",
+      "catches": [],
+      "bytes": 190,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recording_serial": "emulator-5556",
+      "target_serial": "emulator-5558",
+      "target_fields": [
+        "transport_id:10"
+      ],
+      "recorded_at": "2026-11-09T06:33:45Z"
     },
     {
       "name": "adb_install_missing_apk_echo",
@@ -79,6 +95,18 @@
       "exit_status": 1,
       "stream": "stderr",
       "recorded_at": "2026-10-24T18:30:17Z"
+    },
+    {
+      "name": "adb_unauthorized_get_state",
+      "file": "adb_unauthorized_get_state.txt",
+      "command": "adb -s <the unauthorized emulator> get-state",
+      "description": "What adb prints, and exits, for a command against an unauthorized device: `error: device unauthorized.` on stderr followed by three lines of advice ($ADB_VENDOR_KEYS, `adb kill-server`, the confirmation dialog), exit 1, nothing on stdout. adb_exec's classifier reads only lines starting `adb: ` or `error: `, so the first line is what types it DeviceUnauthorizedError. The target is the one emulator reading `unauthorized` in the host listing, as for adb_devices_unauthorized. Manifest: `target_serial`.",
+      "catches": [],
+      "bytes": 175,
+      "exit_status": 1,
+      "stream": "stderr",
+      "target_serial": "emulator-5558",
+      "recorded_at": "2026-11-09T06:33:45Z"
     },
     {
       "name": "adb_uninstall_echo",

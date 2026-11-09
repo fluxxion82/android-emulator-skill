@@ -1,0 +1,4 @@
+List of devices attached
+emulator-5556          device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64 device:emu64a transport_id:12
+emulator-5558          unauthorized transport_id:10
+

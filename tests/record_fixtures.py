@@ -3717,6 +3717,83 @@ def _offline_window(_scratch: Path, serial: str, extra: dict) -> Capture:
     return capture
 
 
+# --- the `unauthorized` state --------------------------------------------------
+#
+# adbd on an image built with ro.adb.secure=1 (every google_apis_playstore
+# image) challenges the host, and until the host's key is accepted the row in
+# `adb devices -l` reads `unauthorized` and carries NO product/model/device
+# fields: adb cannot ask for them. A phone with the prompt pending shows the
+# same row, but no lane may drive a phone, so the state is produced on a
+# second, throwaway emulator. The emulator passes the host's public key to the
+# guest as `ro.boot.qemu.adb.pubkey`, taking it from $HOME/.android/adbkey --
+# and copying it into ANDROID_USER_HOME when only that is redirected (measured:
+# the first attempt came up authorized) -- so HOME must be redirected too.
+_UNAUTHORIZED_HOWTO = (
+    "start a second, throwaway emulator whose adbd requires authorization and whose key the "
+    "adb server does not hold: an AVD from an image with ro.adb.secure=1 "
+    "(google_apis_playstore), launched with HOME, ANDROID_USER_HOME and ANDROID_EMULATOR_HOME "
+    "all pointing at an empty directory (the emulator then generates a fresh adbkey and passes "
+    "it to the guest as ro.boot.qemu.adb.pubkey, while the adb server keeps ~/.android/adbkey) "
+    "and -no-window, so nobody accepts the prompt; its row reads `unauthorized` until it is "
+    "killed"
+)
+
+
+def _unauthorized_target(listing: Capture, serial: str) -> tuple[str, list[str]]:
+    """The one emulator row reading ``unauthorized``, and its fields after the state.
+
+    Refuses a listing where the recording device is not itself usable (its
+    props stamp the profile, so it must be present and read ``device``), where
+    no emulator reads ``unauthorized`` (the setup above was not done), or where
+    more than one does (which row the fixture is about would be a guess). A
+    handset in any state is not a candidate: its row is kept and redacted, but
+    the state under test must be an emulator's.
+    """
+    rows = _device_rows(listing.stdout)
+    mine = next((r for r in rows if r[0] == serial), None)
+    if mine is None or len(mine) < 2 or mine[1] != "device":
+        raise CaptureError(
+            f"the recording device {serial} must read `device` in the listing; its row is {mine!r}"
+        )
+    candidates = [
+        r
+        for r in rows
+        if len(r) > 1 and r[1] == "unauthorized" and _EMULATOR_SERIAL_RE.fullmatch(r[0])
+    ]
+    if len(candidates) != 1:
+        raise CaptureError(
+            f"need exactly one emulator reading `unauthorized`, found {len(candidates)}: "
+            f"{[r[0] for r in candidates]}; {_UNAUTHORIZED_HOWTO}"
+        )
+    return candidates[0][0], candidates[0][2:]
+
+
+def _unauthorized_listing(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """``adb devices -l`` (host-wide, no serial) while a second emulator reads ``unauthorized``."""
+    listing = _run_host_adb(["devices", "-l"], timeout=15)
+    target, fields = _unauthorized_target(listing, serial)
+    extra["recording_serial"] = serial
+    extra["target_serial"] = target
+    extra["target_fields"] = fields
+    return listing
+
+
+def _unauthorized_get_state(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """``adb -s <the unauthorized emulator> get-state``: adb's own words for the state."""
+    target, _fields = _unauthorized_target(_run_host_adb(["devices", "-l"], timeout=15), serial)
+    answer = _run(["get-state"], target, timeout=15)
+    if answer.returncode == 0 or answer.stdout.strip():
+        raise CaptureError(
+            f"adb -s {target} get-state exited {answer.returncode} with stdout "
+            f"{answer.stdout.strip()!r}; the device no longer reads unauthorized"
+        )
+    first = answer.stderr.splitlines()[0] if answer.stderr.strip() else ""
+    if "unauthorized" not in first:
+        raise CaptureError(f"stderr's first line is {first!r}, not the unauthorized error")
+    extra["target_serial"] = target
+    return answer
+
+
 # --- agent text in a failing command's streams ---------------------------------
 #
 # run_adb types a device error from any stderr line that starts with `adb: ` or
@@ -3818,12 +3895,51 @@ FIXTURES: list[Fixture] = [
             "serial that is not `emulator-NNNN` (a phone attached to the same host) is "
             "replaced by SERIALREDACTED; its row and state are kept. Manifest: "
             "`target_serial`, and `states_seen`, the target's states in the order they were "
-            "polled. `unauthorized` is NOT recorded: it needs a new adb host key and an "
-            "authorization prompt on a real phone."
+            "polled. `unauthorized` is adb_devices_unauthorized: a second, throwaway emulator "
+            "whose key the adb server does not hold, never a phone."
         ),
         capture_with=_offline_window,
         teardown_verify=_rebooted_back,
         post=_redact_serials,
+    ),
+    Fixture(
+        name="adb_devices_unauthorized",
+        emulator_only=True,
+        args=["devices", "-l"],
+        command=(
+            "adb devices -l (host-wide, no serial) while a second emulator reads `unauthorized`: "
+            + _UNAUTHORIZED_HOWTO
+        ),
+        description=(
+            "`adb devices -l` while a device is in the `unauthorized` state: ground truth for "
+            "what device_list's parse_adb_devices sees for a device whose adbd has not accepted "
+            "the host's key. The row carries only the serial, the state and `transport_id:N` -- "
+            "no product/model/device fields, which adb cannot ask for before authorization -- "
+            "so a parser that requires them drops the device. The recording emulator (whose "
+            "props stamp the profile) is present and reads `device`; the unauthorized device is "
+            "a second, throwaway emulator (see the command), never a phone. Every serial that is "
+            "not `emulator-NNNN` (a phone attached to the same host) is replaced by "
+            "SERIALREDACTED; its row and state are kept. Manifest: `recording_serial`, "
+            "`target_serial`, and `target_fields`, the unauthorized row's fields after its state."
+        ),
+        capture_with=_unauthorized_listing,
+        post=_redact_serials,
+    ),
+    Fixture(
+        name="adb_unauthorized_get_state",
+        emulator_only=True,
+        args=["get-state"],
+        command="adb -s <the unauthorized emulator> get-state",
+        description=(
+            "What adb prints, and exits, for a command against an unauthorized device: `error: "
+            "device unauthorized.` on stderr followed by three lines of advice ($ADB_VENDOR_KEYS, "
+            "`adb kill-server`, the confirmation dialog), exit 1, nothing on stdout. adb_exec's "
+            "classifier reads only lines starting `adb: ` or `error: `, so the first line is "
+            "what types it DeviceUnauthorizedError. The target is the one emulator reading "
+            "`unauthorized` in the host listing, as for adb_devices_unauthorized. Manifest: "
+            "`target_serial`."
+        ),
+        capture_with=_unauthorized_get_state,
     ),
     Fixture(
         name="adb_device_not_found",
