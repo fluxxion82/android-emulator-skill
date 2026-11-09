@@ -24,9 +24,11 @@ from common.env_config import env_int
 
 from .config import Config
 from .results import (
+    UNIT_RESULTS,
+    ResultsRoot,
     aggregate_test_results,
     extract_failure_reasons,
-    find_test_result_directories,
+    find_result_directories,
     find_test_result_files,
     parse_build_output,
 )
@@ -336,41 +338,49 @@ class BuildRunner:
         # project rather than this process's cwd, then held to the same containment.
         return self.project_dir / answers[0]
 
-    def _report_files(self, root: Path, task: str) -> tuple[list[Path], list[Path]]:
-        """Find reports and prove every resolved path stays in its permitted directory."""
+    def _report_files(
+        self, root: Path, task: str, results: ResultsRoot = UNIT_RESULTS
+    ) -> tuple[list[Path], list[Path]]:
+        """Find reports and prove every resolved path stays in its permitted directory.
+
+        ``results`` says which tree: the unit root's ``build/test-results/<task>``
+        or the instrumented root's variant directory under
+        ``build/outputs/androidTest-results/connected``. The checks are the same
+        for both, component by component of that tree.
+        """
         recursive = self.module is None
-        directories = find_test_result_directories(root, task=task, recursive=recursive)
-        paths = find_test_result_files(root, task=task, recursive=recursive)
+        found = find_result_directories(root, task=task, recursive=recursive, root=results)
+        directories = [directory.path for directory in found]
+        paths = find_test_result_files(root, task=task, recursive=recursive, root=results)
         project = self.project_dir.resolve()
         resolved_directories: list[Path] = []
+        base = "/".join(results.base)
 
-        for directory in directories:
+        for directory in found:
             # Check the lexical path before resolving it. Otherwise an in-project
-            # build/test-results/task symlink can redefine the very boundary used
-            # to decide which reports cleanup is permitted to unlink.
-            module = directory.parents[2]
-            components = (
-                module / "build",
-                module / "build" / "test-results",
-                directory,
+            # symlink anywhere from <module>/build down to the task directory can
+            # redefine the very boundary used to decide which reports cleanup is
+            # permitted to unlink.
+            symlink = next(
+                (component for component in directory.components if component.is_symlink()),
+                None,
             )
-            symlink = next((component for component in components if component.is_symlink()), None)
             if symlink is not None:
-                affected = next((path for path in paths if path.parent == directory), None)
+                affected = next((path for path in paths if path.parent == directory.path), None)
                 report_detail = f"; refusing report {affected}" if affected is not None else ""
                 cli.fail(
                     f"refusing symlinked JUnit report path component: {symlink}{report_detail}",
-                    "Replace symlinks between the module and its test result task directory "
+                    f"Replace symlinks between the module and its {results.noun} "
                     "with real directories, then rerun the Gradle test task.",
                 )
 
-            resolved_module = module.resolve()
-            resolved = directory.resolve()
-            expected = resolved_module / "build" / "test-results" / directory.name
+            resolved_module = directory.module.resolve()
+            resolved = directory.path.resolve()
+            expected = resolved_module.joinpath(*directory.path.relative_to(directory.module).parts)
             if resolved != expected:
                 cli.fail(
-                    f"refusing redirected JUnit report directory: {directory}",
-                    "Restore the module's lexical build/test-results task directory, "
+                    f"refusing redirected JUnit report directory: {directory.path}",
+                    f"Restore the module's lexical {results.label}, "
                     "then rerun the Gradle test task.",
                 )
             resolved_directories.append(resolved)
@@ -386,19 +396,19 @@ class BuildRunner:
             if not resolved.is_relative_to(project) or not permitted:
                 cli.fail(
                     f"refusing to use JUnit report outside its project task directory: {path}",
-                    "Replace build/test-results symlinks with directories inside the project, "
+                    f"Replace {base} symlinks with directories inside the project, "
                     "then rerun the Gradle test task.",
                 )
         for directory in resolved_directories:
             if not directory.is_relative_to(project):
                 cli.fail(
                     f"refusing JUnit report directory outside the project: {directory}",
-                    "Replace build/test-results symlinks with directories inside the project, "
+                    f"Replace {base} symlinks with directories inside the project, "
                     "then rerun the Gradle test task.",
                 )
         return directories, paths
 
-    def _clear_reports(self, root: Path, task: str) -> None:
+    def _clear_reports(self, root: Path, task: str, results: ResultsRoot = UNIT_RESULTS) -> None:
         """Delete the task's ``TEST-*.xml`` reports under ``root`` before Gradle runs.
 
         After the run, everything in the task's results directory is then this
@@ -412,15 +422,19 @@ class BuildRunner:
         These are build outputs, and Gradle regenerates them: the test task
         runs with ``--rerun``, and Gradle itself removes them when the task
         has no source (measured: NO-SOURCE left no ``test-results`` behind).
-        Only ``TEST-*.xml`` directly in ``build/test-results/<task>/`` is
-        touched -- not the task's ``binary/`` results, not another task's
-        reports, not another module's when ``--module`` scopes ``root``.
+        Only ``TEST-*.xml`` directly in the task's directory is touched --
+        ``build/test-results/<task>/`` for unit tests, the variant's directory
+        under ``build/outputs/androidTest-results/connected/`` for instrumented
+        ones -- not the task's ``binary/`` results, not AGP's per-device UTP
+        directory or ``.pb`` files beside the report, not another task's or
+        variant's reports, not another module's when ``--module`` scopes
+        ``root``.
 
         Raises:
             OSError: A report could not be deleted -- reading results then
                 would be guessing again, so the run does not start.
         """
-        _, paths = self._report_files(root, task)
+        _, paths = self._report_files(root, task, results)
         for path in paths:
             path.unlink(missing_ok=True)
 
@@ -431,6 +445,7 @@ class BuildRunner:
         clean: bool,
         timeout: int,
         test_task: str | None = None,
+        results: ResultsRoot = UNIT_RESULTS,
     ) -> BuildResult:
         """
         Execute a gradlew command and assemble a BuildResult.
@@ -446,6 +461,7 @@ class BuildRunner:
             clean: Run a clean task first
             timeout: subprocess timeout in seconds
             test_task: For a test run, the task whose JUnit XML this run wrote
+            results: The results root ``test_task`` writes its JUnit XML to
 
         Returns:
             BuildResult.
@@ -458,7 +474,7 @@ class BuildRunner:
         # Only a test run reads reports, so only it pays for asking Gradle where they are.
         root = self._results_root() if name is not None else self.project_dir
         if name is not None:
-            self._clear_reports(root, name)
+            self._clear_reports(root, name, results)
         start = time.time()
 
         try:
@@ -505,11 +521,9 @@ class BuildRunner:
         if name is not None:
             # The task's reports were cleared before the run, so whatever is
             # in its directory now, this run wrote (N6).
-            directories, xml_files = self._report_files(root, name)
+            directories, xml_files = self._report_files(root, name, results)
             results_dir = str(
-                directories[0]
-                if len(directories) == 1
-                else root / "**" / "build" / "test-results" / name
+                directories[0] if len(directories) == 1 else results.pattern(root, name)
             )
             aggregate = aggregate_test_results(xml_files)
             # A report with no test case in it (a truncated write parses to

@@ -88,6 +88,19 @@ SERIAL_FROM_ARGS = "<--serial>"
 
 _INSTRUMENTED_CLASS_ARG = "-Pandroid.testInstrumentationRunnerArguments.class="
 _INSTRUMENTED_PACKAGE = "com.example.composefixture"
+# Two product flavors in one dimension, appended to a copy of the compose
+# scaffold's app/build.gradle. The flavored/ scaffold applies no Android plugin
+# (its task names only mimic AGP's), so it cannot host androidTest; this is
+# real AGP declaring a real flavored variant.
+_FLAVORS = """
+android {
+    flavorDimensions 'tier'
+    productFlavors {
+        free { dimension 'tier' }
+        pro { dimension 'tier' }
+    }
+}
+"""
 
 # What a fixture's ``args`` may contain, enumerated rather than screened.
 # Gradle expands camelCase abbreviations (``cDAT`` is connectedDebugAndroidTest)
@@ -116,11 +129,12 @@ KNOWN_TASKS = frozenset(
         ":app:properties",
         ":nope:properties",
         ":app:connectedDebugAndroidTest",
+        ":app:connectedProDebugAndroidTest",
     }
 )
 # The known tasks that install on or run against a device: a fixture running
 # one MUST pin ANDROID_SERIAL.
-DEVICE_TASKS = frozenset({":app:connectedDebugAndroidTest"})
+DEVICE_TASKS = frozenset({":app:connectedDebugAndroidTest", ":app:connectedProDebugAndroidTest"})
 # Flags taking no value, and flags whose NEXT element is their value. The
 # recorder's own --console=plain and --rerun-tasks are added by _run(), not
 # taken from args.
@@ -166,6 +180,13 @@ class GradleFixture:
             of the scaffold -- the checked-in scaffold is never edited -- and
             the copy's path is scrubbed to ``/scaffold`` like the scaffold's.
         make_dirs: Directories, relative to the copy, created before the run.
+        app_build_append: Text appended to the copy's ``app/build.gradle``
+            before the run (a fresh copy is implied) -- for a variant layout,
+            such as product flavors, that only a build script can declare.
+        prime: Run the same invocation once first, in the same copy, and
+            record the SECOND run: what an identical rerun prints (is the
+            task UP-TO-DATE?). The first run must exit as ``expect_success``
+            says, so a primed recording cannot hide a broken first build.
         fresh_copy: Run in a throwaway copy even with no settings edit, so
             nothing a previous build left in the scaffold (a results file, an
             up-to-date task) can stand in for this run's output.
@@ -200,6 +221,8 @@ class GradleFixture:
     gradle_below: str | None = None
     settings_append: str | None = None
     make_dirs: tuple[str, ...] = ()
+    app_build_append: str | None = None
+    prime: bool = False
     fresh_copy: bool = False
     android_serial: str | None = None
     timeout: int = GRADLE_TIMEOUT
@@ -605,6 +628,96 @@ FIXTURES: list[GradleFixture] = [
             "Needs no emulator."
         ),
     ),
+    GradleFixture(
+        name="connected_android_test_no_match",
+        args=[
+            ":app:connectedDebugAndroidTest",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.NoSuchTest",
+        ],
+        scaffold=COMPOSE,
+        fresh_copy=True,
+        android_serial=SERIAL_FROM_ARGS,
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=False,
+        requires_in_log="> Task :app:connectedDebugAndroidTest",
+        results_glob="app/build/**/TEST-*.xml",
+        results_fixture="junit_xml_instrumented_no_match",
+        tree_root="app/build/outputs/androidTest-results",
+        tree_fixture="instrumented_no_match_tree",
+        description=(
+            "connectedDebugAndroidTest with the runner's class filter naming a "
+            "class that does not exist: what AGP prints, exits with and leaves "
+            "under androidTest-results when the filter matches no test -- the "
+            "instrumented shape of 'no test results'. Measured: not an empty "
+            "suite and not a missing report. The runner reports ONE failing "
+            "test, '<class>.initializationError', whose failure is "
+            "\"Failed loading specified test class '<class>'\", Gradle exits 1, "
+            "and the XML holds that one testcase."
+        ),
+    ),
+    GradleFixture(
+        name="connected_android_test_repeat",
+        args=[
+            ":app:connectedDebugAndroidTest",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.PassingInstrumentedTest",
+        ],
+        scaffold=COMPOSE,
+        prime=True,
+        android_serial=SERIAL_FROM_ARGS,
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=True,
+        requires_in_log="> Task :app:connectedDebugAndroidTest",
+        description=(
+            "The passing run, run twice in one copy with nothing changed and "
+            "no --rerun; this is the second run. Whether its task line says "
+            "UP-TO-DATE is the measurement build_and_test's --rerun rests on."
+        ),
+    ),
+    GradleFixture(
+        name="connected_android_test_rerun",
+        args=[
+            ":app:connectedDebugAndroidTest",
+            "--rerun",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.PassingInstrumentedTest",
+        ],
+        scaffold=COMPOSE,
+        prime=True,
+        android_serial=SERIAL_FROM_ARGS,
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=True,
+        requires_in_log="> Task :app:connectedDebugAndroidTest",
+        description=(
+            "The argv build_and_test --instrumented sends -- the task, --rerun "
+            "bound to it, then the runner's class filter -- run twice in one "
+            "copy; this is the second run. Gradle accepts --rerun on the "
+            "connected task and the tests run again."
+        ),
+    ),
+    GradleFixture(
+        name="connected_android_test_flavored",
+        args=[
+            ":app:connectedProDebugAndroidTest",
+            f"{_INSTRUMENTED_CLASS_ARG}{_INSTRUMENTED_PACKAGE}.PassingInstrumentedTest",
+        ],
+        scaffold=COMPOSE,
+        app_build_append=_FLAVORS,
+        android_serial=SERIAL_FROM_ARGS,
+        timeout=CONNECTED_TIMEOUT,
+        expect_success=True,
+        requires_in_log="> Task :app:connectedProDebugAndroidTest",
+        results_glob="app/build/**/TEST-*.xml",
+        results_fixture="junit_xml_instrumented_flavored",
+        tree_root="app/build/outputs/androidTest-results",
+        tree_fixture="instrumented_flavored_results_tree",
+        description=(
+            "The passing class through a FLAVORED variant's connected task "
+            "(proDebug: product flavor 'pro' of dimension 'tier', build type "
+            "debug), in a copy of the compose scaffold with two flavors "
+            "appended to app/build.gradle. Where AGP writes a flavored "
+            "variant's JUnit XML is the second half of the instrumented "
+            "results root's directory rule."
+        ),
+    ),
 ]
 
 
@@ -639,6 +752,11 @@ def _prepare_copy(fixture: GradleFixture, workdir: Path) -> Path:
         settings = copy / "settings.gradle"
         settings.write_text(
             settings.read_text(encoding="utf-8") + fixture.settings_append, encoding="utf-8"
+        )
+    if fixture.app_build_append is not None:
+        build = copy / "app" / "build.gradle"
+        build.write_text(
+            build.read_text(encoding="utf-8") + fixture.app_build_append, encoding="utf-8"
         )
     for directory in fixture.make_dirs:
         (copy / directory).mkdir(parents=True, exist_ok=True)
@@ -905,10 +1023,28 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
         copies: tuple[Path, ...] = ()
         outputs: dict[str, tuple[str, str]] = {}
         collect_error: str | None = None
-        if fixture.settings_append is not None or fixture.make_dirs or fixture.fresh_copy:
+        if (
+            fixture.settings_append is not None
+            or fixture.make_dirs
+            or fixture.fresh_copy
+            or fixture.app_build_append is not None
+            or fixture.prime
+        ):
             with tempfile.TemporaryDirectory(prefix="gradle-fixture-") as workdir:
                 copy = _prepare_copy(fixture, Path(workdir))
                 copies = (copy,)
+                if fixture.prime:
+                    primed, primed_exit = _run(gradle, fixture, cwd=copy, env=env)
+                    if (
+                        fixture.expect_success is not None
+                        and (primed_exit == 0) != fixture.expect_success
+                    ):
+                        return _fail(
+                            fixture.name,
+                            f"the priming run exited {primed_exit}",
+                            _scrub(primed, copies),
+                        )
+                    started_at = time.time()
                 raw, exit_code = _run(gradle, fixture, cwd=copy, env=env)
                 wall_seconds = round(time.time() - started_at, 1)
                 log = _scrub(raw, copies)
@@ -974,6 +1110,17 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
                         + (
                             f"; created: {', '.join(fixture.make_dirs)}"
                             if fixture.make_dirs
+                            else ""
+                        )
+                        + (
+                            f"; appended to app/build.gradle: {fixture.app_build_append!r}"
+                            if fixture.app_build_append is not None
+                            else ""
+                        )
+                        + (
+                            "; the same command was run once first in the same copy, "
+                            "and this is the second run"
+                            if fixture.prime
                             else ""
                         )
                     )
