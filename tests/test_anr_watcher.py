@@ -7548,3 +7548,133 @@ def test_a_package_session_says_when_the_packages_uid_changed(recorded, store, t
     assert "Uid changed:" in buster.get_details(changed)
     assert (result["drift"], result["stable_count"]) == ([], 0), result
     assert "uid changed" in result["verdict"], result["verdict"]
+
+
+# ---------------------------------------------------------------------------
+# Codex, after slice 2 (F2): a host with no fcntl -- Windows -- is refused
+# ---------------------------------------------------------------------------
+
+# Loaded by site before the script: an `import fcntl` after it raises
+# ImportError, as it does on Windows, whose Python has no such module.
+_NO_FCNTL = 'import sys\nsys.modules["fcntl"] = None\n'
+
+# Every kind of invocation the script has: legacy, session, worker.
+_UNIX_ONLY_MODES = {
+    "--since": ("--since", "1m"),
+    "--watch": ("--watch", "--duration", "1"),
+    "--start": ("--start",),
+    "--stop": ("--stop", "anr-20260101-000000-abcd"),
+    "--list-sessions": ("--list-sessions",),
+    "--worker-session-id": (
+        "--worker-session-id",
+        "anr-20260101-000000-abcd",
+        anr_watcher.WORKER_TOKEN_FLAG,
+        "t",
+    ),
+}
+
+
+def _without_fcntl(tmp_path) -> dict[str, str]:
+    hook = tmp_path / "no-fcntl"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_NO_FCNTL, encoding="utf-8")
+    return {"PYTHONPATH": str(hook)}
+
+
+@pytest.mark.parametrize("mode", sorted(_UNIX_ONLY_MODES))
+def test_a_host_without_fcntl_gets_the_refusal_object_not_a_traceback(mode, toolchain, tmp_path):
+    """Codex's probe: fcntl unimportable, `--since 1m --json`, no device.
+
+    On main ``common/anr_sessions.py`` imported fcntl unconditionally, so
+    every mode died importing it: a traceback, nothing on stdout. The script
+    is Unix-only as a whole (its session storage locks with ``flock``); on a
+    host without fcntl every mode is the one refusal object, exit 1, before
+    adb is asked anything -- and no adb is installed here.
+    """
+    result = toolchain.run(
+        "anr_watcher.py", *_UNIX_ONLY_MODES[mode], "--json", **_without_fcntl(tmp_path)
+    )
+
+    assert "Traceback" not in result.stderr, result.stderr
+    (line,) = result.stdout.splitlines()
+    refusal = json.loads(line)
+    assert list(refusal) == ["success", "error", "remedy"], refusal
+    assert refusal["success"] is False, refusal
+    assert "fcntl" in refusal["error"] and "macOS or Linux" in refusal["remedy"], refusal
+    assert result.returncode == cli.EXIT_FAILURE, result.stdout + result.stderr
+    assert toolchain.calls("adb") == []
+
+
+def test_a_host_without_fcntl_is_refused_in_text_too(toolchain, tmp_path):
+    result = toolchain.run("anr_watcher.py", "--since", "1m", **_without_fcntl(tmp_path))
+
+    assert "Traceback" not in result.stderr, result.stderr
+    assert result.stdout == "", result.stdout
+    error, remedy = result.stderr.splitlines()
+    assert error.startswith("Error: ") and "fcntl" in error, result.stderr
+    assert remedy.startswith("Remedy: "), result.stderr
+    assert result.returncode == cli.EXIT_FAILURE, result.stderr
+
+
+def test_help_still_answers_on_a_host_without_fcntl(toolchain, tmp_path):
+    result = toolchain.run("anr_watcher.py", "--help", **_without_fcntl(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert "--since" in result.stdout
+
+
+# A macOS or Linux Python whose fcntl extension exists but fails to load: not
+# Windows, and the loader's own words are the diagnosis (Codex, closure review).
+_BROKEN_FCNTL = (
+    "import sys\n"
+    "from importlib.abc import MetaPathFinder\n"
+    "\n"
+    "\n"
+    "class _BrokenFcntl(MetaPathFinder):\n"
+    "    def find_spec(self, name, path, target=None):\n"
+    "        if name == 'fcntl':\n"
+    "            raise ImportError('dlopen fcntl: symbol not found: _flock', name='fcntl')\n"
+    "        return None\n"
+    "\n"
+    "\n"
+    "sys.meta_path.insert(0, _BrokenFcntl())\n"
+)
+
+
+def _with_broken_fcntl(tmp_path) -> dict[str, str]:
+    hook = tmp_path / "broken-fcntl"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_BROKEN_FCNTL, encoding="utf-8")
+    return {"PYTHONPATH": str(hook)}
+
+
+def test_a_broken_fcntl_keeps_the_loaders_diagnosis(toolchain, tmp_path):
+    """An absent module and a broken installation are told apart; the cause survives.
+
+    ``sys.modules["fcntl"] = None`` is Windows: ModuleNotFoundError, and the
+    refusal says to run on macOS or Linux. A Unix host whose fcntl extension
+    fails to load raises a plain ImportError; the same words there would send
+    the user to the host they are already on and drop the loader's message.
+    """
+    result = toolchain.run(
+        "anr_watcher.py", "--since", "1m", "--json", **_with_broken_fcntl(tmp_path)
+    )
+
+    assert "Traceback" not in result.stderr, result.stderr
+    (line,) = result.stdout.splitlines()
+    refusal = json.loads(line)
+    assert refusal["success"] is False, refusal
+    assert "dlopen fcntl: symbol not found: _flock" in refusal["error"], refusal
+    assert "has no fcntl module" not in refusal["error"], refusal
+    assert "Python" in refusal["remedy"], refusal
+    assert result.returncode == cli.EXIT_FAILURE, result.stdout + result.stderr
+    assert toolchain.calls("adb") == []
+
+
+def test_an_absent_fcntl_is_still_called_absent(toolchain, tmp_path):
+    result = toolchain.run("anr_watcher.py", "--since", "1m", "--json", **_without_fcntl(tmp_path))
+
+    (line,) = result.stdout.splitlines()
+    refusal = json.loads(line)
+    assert "has no fcntl module" in refusal["error"], refusal
+    assert "dlopen" not in refusal["error"], refusal

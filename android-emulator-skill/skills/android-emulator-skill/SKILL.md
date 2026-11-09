@@ -1458,13 +1458,15 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       named, since that version's worker never said how a session ended
     - **Compatibility boundary.** Upgrade quiescently: stop every ANR session
       with the old version before installing this one. A worker of v0.8.0
-      main still recording is fenced only by waiting for it (above), and a
+      main before the lifecycle landed (fb5de9c and earlier: its session has
+      no `lifecycle` key, which is all the fence keys on) still recording is
+      fenced only by waiting for it (above), and a
       `--start` of that version still in flight can claim a session this
       version cancelled — that version's claim checks nothing. Sessions this
       version writes are not for older binaries (no forward compatibility),
-      and two versions writing one session is unsupported. That includes the
-      version just before this one: its worker carries `lifecycle` in its
-      meta, so the fence above cannot see it, and it locks `<session>/lock`
+      and two versions writing one session is unsupported. That includes
+      v0.8.0 as released: its worker writes `lifecycle` 2 into its meta, so
+      the fence above cannot see it, and it locks `<session>/lock`
       inside the session's directory where this version locks
       `locks/<session>.lock`, so nothing excludes the two — stop its sessions
       before upgrading too. An older version's prune also takes `locks/` for a
@@ -1632,7 +1634,7 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py" --output audit-reports/ --ve
 
 ## Requirements
 
-- macOS, Linux, or Windows -- except `anr_watcher.py`'s live reads (`--watch`, and the session worker `--start` runs), which wait on adb's pipe with `select()`, and Python's `select()` takes only sockets on Windows: those two are Unix-only (macOS, Linux)
+- macOS, Linux, or Windows -- except `anr_watcher.py`, which is Unix-only (macOS, Linux) as a whole: its session storage locks with `fcntl.flock`, and on a host whose Python has no `fcntl` (Windows) every mode, `--since` included, refuses at once (exit 1, the one refusal object under `--json`). Its live readers differ by level: on API 33 they read by dumps through temporary files, with no `select()`; on every other level they stream, waiting on adb's pipe with `select()`, which on Windows takes only sockets
 - Android SDK with platform-tools and emulator
 - Python 3.12+
 - ADB (Android Debug Bridge)
@@ -1757,7 +1759,7 @@ planned rather than an invented percentage.
 
 **Structured Data**: Scripts output JSON or formatted text, not raw logs. Easy to parse and integrate.
 
-**Cross-Platform**: Works on macOS, Linux, and Windows (`anr_watcher.py`'s live reads are Unix-only: see Requirements).
+**Cross-Platform**: Works on macOS, Linux, and Windows, except `anr_watcher.py`, which is Unix-only as a whole: its session storage locks with `fcntl`, and on Windows every mode refuses (see Requirements).
 
 **Real Devices**: Unlike iOS, works with both emulators and real devices.
 
@@ -1791,8 +1793,9 @@ recorded fixture, and was red before the fix.
   `{"success": false, "error", "remedy"}` object under `--json` (or
   `Error:`/`Remedy:` on stderr), and exits 1, or 3 when the device is
   unavailable. An AST guard enumerates all 32 scripts, and the exit-code sweep
-  asserts the payload of 39 documented modes twice: once with every tool
-  failing and once with none installed.
+  asserts the payload of 40 documented modes twice (39 at this release;
+  v0.9.0 added the health check's): once with every tool failing and once
+  with none installed.
 - **"Could not look" is no longer "nothing there."** `emulator_create`,
   `emulator_erase`, `device_list` and `android_health_check.sh` refuse a
   missing or failing SDK tool or AVD home instead of returning an empty list.
@@ -1827,11 +1830,16 @@ recorded fixture, and was red before the fix.
   after another package). Jank is keyed by process, and a pid is named only
   from system_server's own `Start proc` record for it, seen in the same
   stream; `--package` matches that identity whole (since v0.9.0, jank and
-  StrictMode are the package's by each record's uid instead). A session's capture
-  losses — a record cut by the stop, a stream restart's gap — mark it
-  incomplete, and the one record `-T 1` replays when it starts is shown,
-  never counted. `--diff` calls nothing resolved, new or stable on the
-  strength of a side that may lack it — saved incomplete, or holding
+  StrictMode are the package's by each record's uid instead). On the stream
+  path (every level but API 33), a session's capture losses — a record cut by
+  the stop, a stream restart's gap — mark it incomplete, and the one record
+  `-T 1` replays when it starts is shown, never counted. On API 33 (since
+  v0.9.0) the session reads by dumps from a cursor that excludes its opening
+  record, so nothing is replayed (`ambiguous_tail` stays empty), a failed dump
+  retried from the checkpoint within the same worker is counted in
+  `dump_restarts` without marking the summary incomplete, and a lost cursor or
+  another boot ends the session incomplete. `--diff` calls nothing resolved,
+  new or stable on the strength of a side that may lack it — saved incomplete, or holding
   evidence it did not count (for jank and StrictMode, what `--package`
   dropped for want of a name, or did not record) — and says so in its
   verdict: "inconclusive" when nothing else changed, the change with its
@@ -1848,8 +1856,9 @@ recorded fixture, and was red before the fix.
   `--stop` answers with a summary only once the session has ended
   (otherwise it refuses, exit 1, and `--stop --abandon` saves what was
   read, marked incomplete, its events frozen at the abandonment), and
-  `--start` succeeds only on a worker that is recording. A worker of the
-  previous version, which takes no lock, is waited for until it is gone
+  `--start` succeeds only on a worker that is recording. A worker of v0.8.0
+  main before this lifecycle (fb5de9c and earlier: a session with no
+  `lifecycle` key), which takes no lock, is waited for until it is gone
   before its session is answered.
 - **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
   the error text as content (measured), so `container` and `model_inspector`
