@@ -267,10 +267,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       connected task without it runs on every attached device. No device attached exits **3**, several
       and no `--serial` exits **1**, and Gradle is not started for either. AGP's own "Connected device with
       serial '…' not found!" (the device left between the resolve and the run) is the same device error,
-      exit 3, with the log cached. The task always gets `--rerun`; measured on AGP 8.13.2 an identical
+      exit 3, with the log cached -- read only from a failed run that wrote no report: AGP raises it
+      while choosing the device, before any test runs, so a run with a report of its own had its device
+      and is judged by that report whatever its log says. The task always gets `--rerun`; measured on AGP 8.13.2 an identical
       second run was not UP-TO-DATE anyway. AGP uninstalls the app and test APKs when the run ends.
-      Timeout: `ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT` (default 3600s; a warm run measured 15–25 s, a cold
-      one builds two APKs first)
+      Timeout: `ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT` (default 3600s; recorded runs took 8–36 s on a warm
+      local arm64 daemon, and a cold one builds two APKs first)
     - `--suite` is Gradle's `--tests` filter for `--test`, and for `--instrumented` a fully qualified test
       class passed as the runner's argument (`-Pandroid.testInstrumentationRunnerArguments.class=<suite>`),
       never `--tests`
@@ -285,6 +287,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       exists, the device attached). That includes a `--suite` naming a class the test APK does not have:
       AGP reports it as one failing `initializationError` and exits 1, and it is refused as no test
       results, not reported as a failing test. A red run names the failing test in every mode;
+      `--variant` naming a build type of a flavored project (`debug` where the variants are `freeDebug`
+      and `proDebug`) leaves reports only under `connected/debug/flavors/<flavor>/`, none of its own: it
+      is refused as no test results with a remedy naming the variants to pass instead (`--variant
+      freeDebug` or `--variant proDebug`), one per invocation;
       `--json` adds `serial` and `device_task` to a unit run's keys
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--instrumented`, `--suite`, `--serial`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
@@ -2096,8 +2102,10 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     `keyboard` / `navigator` `input text`; and `push_notification --post`. The probe cannot tell such an echo from a real loss followed
     by a recovery before it, so a caller whose stderr is adb's alone does not
     ask.
-- `build_and_test --instrumented` runs one device, one module, one variant
-  per invocation: no orchestrator, no sharding, no `am instrument -r -w`
+- `build_and_test --instrumented` runs one device and one variant per
+  invocation, and one module when `--module` is given (without it the task
+  runs in every module, and every module's connected reports for the
+  variant are read): no orchestrator, no sharding, no `am instrument -r -w`
   protocol -- Gradle's JUnit XML is the one source. Its results layout is
   recorded for an unflavored and a one-dimension flavored variant on AGP
   8.13.2; any other layout is not guessed at, so its run is refused as no

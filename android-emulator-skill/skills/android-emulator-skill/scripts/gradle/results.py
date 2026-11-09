@@ -89,6 +89,26 @@ def _instrumented_candidates(result_root: Path, task: str) -> list[Path]:
     return sorted(matches)
 
 
+def flavored_report_variants(directory: Path, variant: str) -> list[str]:
+    """The flavored variants with reports below an unflavored variant directory.
+
+    ``connected/debug/flavors/<flavor>/TEST-*.xml`` under the directory a
+    ``debug`` run resolved means the project has product flavors and ``debug``
+    is their build type, not a variant of its own: AGP's per-variant reports
+    are the flavors'. Returned as the variants to pass instead --
+    ``<flavor><Variant>`` in the requested variant's capitalisation
+    (``freeDebug``, ``proDebug``) -- or ``[]``. Names only; nothing is read.
+    These reports were not cleared before the run, so they may be a previous
+    run's: this words a refusal, it never passes one.
+    """
+    capitalized = f"{variant[:1].upper()}{variant[1:]}"
+    return [
+        f"{flavor.name}{capitalized}"
+        for flavor in _subdirectories(directory / "flavors")
+        if any(path.is_file() for path in flavor.glob("TEST-*.xml"))
+    ]
+
+
 @dataclass(frozen=True)
 class ResultsRoot:
     """Where one kind of test run writes its JUnit XML, below a module directory.
@@ -194,10 +214,20 @@ def find_result_directories(
         module = result_root.parents[len(root.base) - 1]
         matches = root.candidates(result_root, task)
         if len(matches) > 1:
+            listed = ", ".join(str(path) for path in matches)
+            if root is UNIT_RESULTS:
+                cli.fail(
+                    f"ambiguous Gradle test result directories for {task}: {listed}",
+                    "Remove or rename the case-colliding task result directories, then retry.",
+                )
+            variant = connected_variant(task)
+            variant = f"{variant[:1].lower()}{variant[1:]}"  # AGP's spelling: proDebug
             cli.fail(
-                f"ambiguous Gradle test result directories for {task}: "
-                + ", ".join(str(path) for path in matches),
-                "Remove or rename the case-colliding task result directories, then retry.",
+                f"ambiguous Gradle test result directories for {task}: {len(matches)} result "
+                f"directories read back as variant {variant}: {listed}",
+                "Remove the one that is not this variant's (AGP writes connected/<variant>/ "
+                "for an unflavored variant, connected/<buildType>/flavors/<flavor>/ for a "
+                "flavored one), then retry.",
             )
         if matches:
             directories.extend(ResultDirectory(module, path) for path in matches)

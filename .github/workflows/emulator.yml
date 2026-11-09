@@ -48,8 +48,9 @@ jobs:
       # `build_and_test.py --instrumented` in a temporary COPY of the compose
       # scaffold, so the outputs the pre-boot build leaves in the scaffold do
       # not reach it; the cache does, because AGP's and Kotlin's tasks are
-      # relocatable. Measured locally (AGP 8.13.2): a second copy built its two
-      # APKs with 36 of 66 tasks FROM-CACHE, the Kotlin compiles among them.
+      # relocatable. A local, unrecorded measurement (AGP 8.13.2): a second
+      # copy built its two APKs with most tasks FROM-CACHE, the Kotlin
+      # compiles among them.
       GRADLE_OPTS: -Dorg.gradle.caching=true
 
     steps:

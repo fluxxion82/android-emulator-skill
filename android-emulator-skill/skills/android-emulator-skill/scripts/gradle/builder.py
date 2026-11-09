@@ -34,6 +34,7 @@ from .results import (
     extract_failures,
     find_result_directories,
     find_test_result_files,
+    flavored_report_variants,
     parse_build_output,
 )
 
@@ -44,8 +45,9 @@ RERUN_UNSUPPORTED = "Unknown command-line option '--rerun'"
 
 BUILD_TIMEOUT = env_int("ANDROID_EMU_BUILD_TIMEOUT", 1800)
 TEST_TIMEOUT = env_int("ANDROID_EMU_TEST_TIMEOUT", 2700)
-# A connected run builds and installs two APKs before a test starts: measured
-# 15-25 s warm on the compose scaffold, minutes cold.
+# A connected run builds and installs two APKs before a test starts: recorded
+# 8-36 s per run on a warm local arm64 daemon (gradle-8.13 MANIFEST.json,
+# wall_seconds), minutes cold.
 INSTRUMENTED_TEST_TIMEOUT = env_int("ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT", 3600)
 
 # The runner argument that filters a connected run to a class (AGP's way;
@@ -110,6 +112,7 @@ class BuildResult:
         results_dir: str | None = None,
         timeout_seconds: int | None = None,
         serial: str | None = None,
+        aggregate_variants: list[str] | None = None,
     ):
         self.success = success
         self.stdout = stdout
@@ -128,6 +131,10 @@ class BuildResult:
         self.timeout_seconds = timeout_seconds
         # The device an instrumented run was pinned to (ANDROID_SERIAL); None otherwise.
         self.serial = serial
+        # For an instrumented run that wrote no report of its own: the flavored
+        # variants whose reports sit below its directory -- it named a build
+        # type of a flavored project (results.flavored_report_variants).
+        self.aggregate_variants = aggregate_variants or []
 
     @property
     def timed_out(self) -> bool:
@@ -176,11 +183,17 @@ class BuildResult:
     def missing_device(self) -> str | None:
         """The serial AGP said is not attached, for a connected run that failed so.
 
-        Read from Gradle's own ``* What went wrong:`` block, not from anywhere
-        in the log: a test's output cannot forge it. The device was resolved
+        AGP raises its ``DeviceException`` while choosing the device, before
+        any test runs (recorded: connected_android_test_no_device, no report
+        written). So a run that wrote a test report -- the task's reports are
+        deleted before the run, so any here are this run's -- had its device,
+        and is judged by its report whatever its log says: the sentence is
+        matched in a ``* What went wrong:`` block, and nothing authenticates
+        that block's provenance, so a test could print one. Only a failed
+        run with no report of its own is read for it. The device was resolved
         before Gradle started, so this is one that went away in between.
         """
-        if self.serial is None or self.returncode in (None, 0):
+        if self.serial is None or self.returncode in (None, 0) or self.test_results:
             return None
         for failure in extract_failures(f"{self.stdout}\n{self.stderr}"):
             match = _DEVICE_NOT_FOUND.search(failure["message"])
@@ -633,6 +646,7 @@ class BuildRunner:
 
         test_results = None
         results_dir = None
+        aggregate_variants: list[str] = []
         if name is not None:
             # The task's reports were cleared before the run, so whatever is
             # in its directory now, this run wrote (N6).
@@ -644,6 +658,13 @@ class BuildRunner:
             # A report with no test case in it (a truncated write parses to
             # zero) is no more a result than no report at all.
             test_results = aggregate if aggregate["total"] else None
+            if results is INSTRUMENTED_RESULTS and test_results is None:
+                aggregate_variants = [
+                    flavored
+                    for directory in directories
+                    if directory.name.casefold() == self.variant.casefold()
+                    for flavored in flavored_report_variants(directory, self.variant)
+                ]
             success = (
                 success
                 and test_results is not None
@@ -675,4 +696,5 @@ class BuildRunner:
             returncode=returncode,
             results_dir=results_dir,
             serial=serial,
+            aggregate_variants=aggregate_variants,
         )

@@ -221,6 +221,16 @@ def _refuse_no_results(args: argparse.Namespace, result, build_id: str) -> None:
             "Pass --suite the fully qualified name of a test class under src/androidTest "
             f"(or leave it out to run them all); {log}",
         )
+    if result.aggregate_variants:
+        # A build type of a flavored project: its reports are the flavors'.
+        passes = " or ".join(f"--variant {variant}" for variant in result.aggregate_variants)
+        cli.fail(
+            f"the build produced no test results: {result.tasks[0]} wrote no report of its "
+            f"own under {result.results_dir}; {args.variant!r} is a build type of a flavored "
+            f"project, and the reports below it are the flavored variants' "
+            f"({', '.join(result.aggregate_variants)})",
+            f"Run one flavored variant at a time: pass {passes}; {log}",
+        )
     cli.fail(
         f"the build produced no test results: {result.tasks[0]} exited 0 on "
         f"{result.serial} and wrote no JUnit XML with a test case under "

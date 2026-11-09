@@ -335,9 +335,8 @@ def resolve_one_device(identifier: str | None) -> str:
         MultipleDevicesError: No ``identifier`` and several attached (exit 1).
     """
     if identifier is not None:
-        serial = resolve_device_identifier(identifier)
-        if serial is not None:
-            return serial
+        # A serial, or DeviceNotFoundError: never None for a given identifier.
+        return resolve_device_identifier(identifier)
     available = [d["serial"] for d in get_connected_devices() if d["state"] == "device"]
     if not available:
         remedy = (

@@ -8,14 +8,20 @@ JSON ``success``, the counts, the failing test's name, the refusal.
 
 Three live invocations, one per outcome: the passing class, the mixed class
 whose ``failsOnPurpose`` fails, and a class that does not exist (refused as
-no test results). Recorded wall-clock on a warm daemon is 15-25 s each, so
-all three fit the lane's budget live; the first pays the APK build, which the
-workflow's pre-boot step has already put in Gradle's build cache.
+no test results). The corpus records 8-36 s per connected run on a warm local
+arm64 daemon (tests/fixtures/recorded/gradle-8.13/MANIFEST.json,
+``wall_seconds``), so all three fit the lane's budget live; the first pays the
+APK build, which the workflow's pre-boot step has already put in Gradle's
+build cache.
 
 ``emulator_only_device`` and never ``live_device``: a connected task installs
 two APKs, runs instrumentation, then uninstalls them. AGP also uninstalls the
 app under test when it finishes, so a fixture app the lane installed for
-other tests is put back afterwards.
+other tests is put back afterwards -- best effort. A failed reinstall is
+reported in the step summary, not raised: raised in teardown it would be an
+ERROR against the last test, failing the lane on a reinstall rather than on an
+instrumented verdict. A later test that needs the app reports its own missing
+app.
 
 When ``EMULATOR_LANE_INSTRUMENTED_REPORT`` names a file (the lane script sets
 it), each outcome observed is appended there for the lane's step summary.
@@ -66,7 +72,8 @@ def compose_copy(tmp_path_factory, adb: str, emulator_only_device: str):
     """A throwaway copy of the compose scaffold, as the Gradle recorder makes one.
 
     Yields the copy; afterwards reinstalls the fixture app if it was installed
-    before and AGP's end-of-run uninstall took it away.
+    before and AGP's end-of-run uninstall took it away -- best effort, the
+    outcome observed either way (see the module docstring).
     """
     if not (os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")):
         pytest.skip("the compose scaffold builds with AGP: set ANDROID_HOME")
@@ -76,14 +83,25 @@ def compose_copy(tmp_path_factory, adb: str, emulator_only_device: str):
     yield copy
     if was_installed and not _installed(adb, emulator_only_device):
         apk = copy / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
-        subprocess.run(
-            [adb, "-s", emulator_only_device, "install", "-r", str(apk)],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=True,
-        )
-        _observe("fixture app: uninstalled by AGP after the connected runs; reinstalled")
+        try:
+            installed = subprocess.run(
+                [adb, "-s", emulator_only_device, "install", "-r", str(apk)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            said = (installed.stderr or installed.stdout).strip().splitlines()
+            failure = None if installed.returncode == 0 else (said[-1] if said else "no output")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failure = str(error)
+        if failure is None:
+            _observe("fixture app: uninstalled by AGP after the connected runs; reinstalled")
+        else:
+            _observe(
+                "fixture app: uninstalled by AGP after the connected runs; "
+                f"reinstall FAILED: {failure}"
+            )
 
 
 def _observe(line: str) -> None:

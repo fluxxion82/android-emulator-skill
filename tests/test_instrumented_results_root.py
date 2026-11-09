@@ -489,3 +489,24 @@ def test_the_connected_task_runs_pinned_rerun_and_filtered(
     assert "--tests" not in cmd
     assert kwargs["env"]["ANDROID_SERIAL"] == SERIAL
     assert kwargs["timeout"] == builder_mod.INSTRUMENTED_TEST_TIMEOUT > builder_mod.TEST_TIMEOUT
+
+
+def test_two_layouts_reading_back_as_one_variant_are_refused_in_their_own_words(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """connected/proDebug/ beside connected/debug/flavors/pro/: not a case collision."""
+    project = _project(tmp_path)
+    flavored = _materialize(project, "connected_android_test_flavored", recorded_gradle)
+    unflavored = project / CONNECTED / "proDebug" / flavored.name
+    unflavored.parent.mkdir(parents=True)
+    unflavored.write_text(flavored.read_text(), encoding="utf-8")
+    started = _gradle(monkeypatch, 0, recorded_gradle("connected_android_test_flavored"))
+
+    with pytest.raises(cli.Failure) as refused:
+        _run(project, variant="proDebug")
+
+    message = f"{refused.value} {refused.value.remedy}"
+    assert "read back as variant proDebug" in message, message
+    assert "case-colliding" not in message, message
+    assert flavored.exists() and unflavored.exists()
+    assert started == []

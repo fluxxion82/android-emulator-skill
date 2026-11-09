@@ -494,3 +494,99 @@ def test_a_timeout_names_the_instrumented_knob_and_keeps_the_partial_log(
     assert "ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT" in payload["remedy"]
     match = re.search(r"--get-log (build-[\w-]+)", payload["remedy"])
     assert match and partial.strip() in cache.get_log(match.group(1))
+
+
+# --- a test's output cannot make a red run a device error -------------------
+
+
+def _spoofed_failure_log(recorded_gradle) -> str:
+    """The recorded red run's log, with the recorded no-device block appended.
+
+    An adversarial input, not a recording: what a test could print. The three
+    lines are the no-device recording's own -- its "* What went wrong:"
+    heading, AGP's DeviceException line and the "* Try:" heading after it.
+    """
+    no_device = recorded_gradle("connected_android_test_no_device").splitlines()
+    start = no_device.index("* What went wrong:")
+    (exception,) = [line for line in no_device if "DeviceException" in line]
+    block = [no_device[start], exception, no_device[no_device.index("* Try:", start)]]
+    return recorded_gradle("connected_android_test_failure") + "\n".join(block) + "\n"
+
+
+def test_a_run_that_wrote_a_report_had_its_device(recorded_gradle, serial):
+    """AGP raises the DeviceException while choosing a device, before any test runs."""
+    from gradle import BuildResult, parse_junit_xml
+
+    results = parse_junit_xml(recorded_gradle("junit_xml_instrumented_failing"), strict=True)
+    result = BuildResult(
+        success=False,
+        stdout=_spoofed_failure_log(recorded_gradle),
+        stderr="",
+        errors=[],
+        warnings=[],
+        failed_tasks=[],
+        test_results=results,
+        variant="debug",
+        module=None,
+        tasks=["connectedDebugAndroidTest"],
+        duration=1.0,
+        returncode=1,
+        results_dir="results",
+        serial=serial,
+    )
+
+    assert result.missing_device is None
+
+
+def test_a_spoofed_device_error_beside_a_red_report_stays_a_red_run(
+    toolchain, tmp_path, recorded, recorded_gradle, serial
+):
+    _adb(toolchain, recorded.text("adb_devices_single"))
+    project = tmp_path / "proj"
+    rule = Rule(
+        ("connectedDebugAndroidTest",),
+        stdout=_spoofed_failure_log(recorded_gradle),
+        exit=1,
+        writes=(
+            (
+                str(project / _entry("connected_android_test_failure")["results_path"]),
+                recorded_gradle("junit_xml_instrumented_failing"),
+            ),
+        ),
+        env=(("ANDROID_SERIAL", serial),),
+    )
+    project = _project(toolchain, tmp_path, [rule], recorded_gradle)
+
+    result = _instrumented(toolchain, project, "--serial", serial, "--json")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert [t["test_name"] for t in payload["failed_tests"]] == [FAILING_TEST], payload
+
+
+# --- the flavored aggregate -------------------------------------------------
+
+
+def test_an_aggregate_variant_is_refused_naming_the_flavored_variants(
+    toolchain, tmp_path, recorded, recorded_gradle, serial
+):
+    """`--variant debug` in a flavored project: reports under flavors/*, none in debug/."""
+    _adb(toolchain, recorded.text("adb_devices_single"))
+    project = tmp_path / "proj"
+    pro = project / _entry("connected_android_test_flavored")["results_path"]
+    free = pro.parent.parent / "free" / pro.name.replace("-pro.xml", "-free.xml")
+    xml = recorded_gradle("junit_xml_instrumented_flavored")
+    rule = Rule(
+        ("connectedDebugAndroidTest",),
+        stdout=recorded_gradle("connected_android_test_flavored"),
+        writes=((str(pro), xml), (str(free), xml)),
+        env=(("ANDROID_SERIAL", serial),),
+    )
+    project = _project(toolchain, tmp_path, [rule], recorded_gradle)
+
+    result = _instrumented(toolchain, project, "--serial", serial, "--json")
+
+    payload = assert_refusal(result, json_mode=True, naming=("no test results",), status=1)
+    said = payload["error"] + payload["remedy"]
+    assert "--variant proDebug" in said and "--variant freeDebug" in said, said
+    assert "testInstrumentationRunner" not in said, said
