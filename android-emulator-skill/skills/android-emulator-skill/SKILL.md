@@ -243,6 +243,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       the existing no-results rule refuses the run. A run that wrote no test results is a failure, not "0 tests
       passed". If Gradle times out, its partial log is cached and the command refuses with a remedy to raise
       `ANDROID_EMU_BUILD_TIMEOUT` or `ANDROID_EMU_TEST_TIMEOUT` for the active mode, or inspect the stuck task
+    - Build ids look like `build-20251028-143052-1a2b3c4d` (time plus a random suffix, so two builds in one
+      second never share one); pass the whole id back. `--get-errors`/`--get-warnings`/`--get-log` on an
+      entry whose cache file cannot be read refuse with one error naming the file as corrupt, not expired
+      (exit 1); the file is kept for inspection, not deleted. `--list-builds` skips such a file
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring

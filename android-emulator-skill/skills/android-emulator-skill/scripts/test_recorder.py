@@ -21,8 +21,9 @@ command rather than a method call:
 Session storage follows ``common/anr_sessions.py``: a directory per session
 under ``~/.android-emulator-skill/test-sessions/<id>/`` holding ``meta.json``
 (atomic tmp+replace writes), an append-only ``steps.jsonl``, and the per-step
-artifacts. ``common/cache_utils.py`` is deliberately *not* reused — its writes
-are not atomic and its ids are unsanitised. User state never goes next to the
+artifacts. ``common/cache_utils.py`` is deliberately *not* reused — it stores
+one flat file per entry and expires it, where a session is a directory that
+grows step by step and must outlive the cache's TTL. User state never goes next to the
 script: the skill ships as a plugin, and writing into the installed package was
 a real bug (see ``emulator_selector``'s config path).
 

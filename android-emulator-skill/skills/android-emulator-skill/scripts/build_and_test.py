@@ -12,7 +12,7 @@ mechanics (gradlew tasks, JUnit XML, console parsing). See ``scripts/gradle/``.
 Usage Examples:
     # Build (minimal output)
     python scripts/build_and_test.py --project /path/to/project
-    # Output: Build: SUCCESS (0 errors, 3 warnings) [1:32] [build-20251028-143052]
+    # Output: Build: SUCCESS (0 errors, 3 warnings) [1:32] [build-20251028-143052-1a2b3c4d]
 
     # Build a specific module + variant, clean first
     python scripts/build_and_test.py --project . --module :app --variant release --clean
@@ -24,9 +24,9 @@ Usage Examples:
     python scripts/build_and_test.py --project . --test --suite "com.example.MyTest"
 
     # Drill into a previous build's details
-    python scripts/build_and_test.py --get-errors build-20251028-143052
-    python scripts/build_and_test.py --get-warnings build-20251028-143052
-    python scripts/build_and_test.py --get-log build-20251028-143052
+    python scripts/build_and_test.py --get-errors build-20251028-143052-1a2b3c4d
+    python scripts/build_and_test.py --get-warnings build-20251028-143052-1a2b3c4d
+    python scripts/build_and_test.py --get-log build-20251028-143052-1a2b3c4d
 
     # List recent builds
     python scripts/build_and_test.py --list-builds
@@ -199,8 +199,8 @@ Examples:
   python scripts/build_and_test.py --project . --test --suite com.example.MyTest
 
   # Drill into a previous build
-  python scripts/build_and_test.py --get-errors build-20251028-143052
-  python scripts/build_and_test.py --get-log build-20251028-143052
+  python scripts/build_and_test.py --get-errors build-20251028-143052-1a2b3c4d
+  python scripts/build_and_test.py --get-log build-20251028-143052-1a2b3c4d
 
   # List recent builds
   python scripts/build_and_test.py --list-builds
