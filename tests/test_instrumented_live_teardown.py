@@ -125,3 +125,33 @@ def test_a_report_that_cannot_be_written_falls_back_to_the_print(monkeypatch, tm
     out = capsys.readouterr().out
     assert "passing run: observed" in out
     assert "not written to" in out
+
+
+def test_a_reinstall_with_stdout_gone_does_not_raise(monkeypatch, tmp_path, observed):
+    """A broken stdout pipe while reporting a successful reinstall: nothing escapes."""
+    import builtins
+
+    def broken_print(*_args, **_kwargs):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(live, "_installed", lambda _adb, _device: False)
+    monkeypatch.setattr(
+        live.subprocess, "run", lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    monkeypatch.setattr(builtins, "print", broken_print)
+
+    live._restore_fixture_app(ADB, DEVICE, tmp_path, was_installed=True)
+
+    assert "reinstalled" in observed.read_text()
+
+
+def test_an_unwritable_report_with_stdout_gone_does_not_raise(monkeypatch, tmp_path):
+    import builtins
+
+    def broken_print(*_args, **_kwargs):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(live, "REPORT", str(tmp_path))
+    monkeypatch.setattr(builtins, "print", broken_print)
+
+    live._observe("passing run: observed")

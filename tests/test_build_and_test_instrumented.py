@@ -681,3 +681,30 @@ def test_a_zero_testcase_report_and_a_spoofed_device_error_are_not_exit_3(
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert "DeviceException" not in json.loads(result.stdout).get("error", ""), result.stdout
+
+
+@pytest.mark.parametrize("outside", [True, False], ids=["outside", "in-project"])
+def test_a_symlinked_empty_flavors_directory_is_refused_before_gradle(
+    outside, toolchain, tmp_path, recorded, recorded_gradle, serial
+):
+    """debug/flavors -> an empty directory: no flavor below it, the link itself still refused."""
+    _adb(toolchain, recorded.text("adb_devices_single"))
+    project = _connected(
+        toolchain,
+        tmp_path,
+        recorded_gradle,
+        serial,
+        "connected_android_test_no_device",
+        None,
+        "connectedDebugAndroidTest",
+    )
+    debug = (project / _entry("connected_android_test_success")["results_path"]).parent
+    debug.mkdir(parents=True)
+    target = (tmp_path / "elsewhere" if outside else project / "app" / "decoy") / "flavors"
+    target.mkdir(parents=True)
+    (debug / "flavors").symlink_to(target, target_is_directory=True)
+
+    result = _instrumented(toolchain, project, "--serial", serial, "--json")
+
+    assert toolchain.calls("gradlew") == [], "Gradle started past a symlinked flavors directory"
+    assert_refusal(result, json_mode=True, naming=("symlinked",), status=1)

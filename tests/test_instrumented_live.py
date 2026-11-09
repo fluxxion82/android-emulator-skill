@@ -31,6 +31,7 @@ it), each outcome observed is appended there for the lane's step summary.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -126,17 +127,24 @@ def _restore_fixture_app(adb: str, device: str, copy: Path, was_installed: bool)
 def _observe(line: str) -> None:
     """Print ``line``, and append it to the lane's report when one is named.
 
-    A report that cannot be written leaves the print alone: an outcome is
-    never turned into a test error by the file that was to carry it.
+    Never raises: a report that cannot be written leaves the print, and a
+    stdout that is gone (``BrokenPipeError``) leaves nothing more to say. An
+    outcome is never turned into a test error by what was to carry it.
     """
-    print(line)
+    _print(line)
     if not REPORT:
         return
     try:
         with open(REPORT, "a", encoding="utf-8") as handle:
             handle.write(f"- {line}\n")
     except OSError as error:
-        print(f"(not written to {REPORT}: {error})")
+        _print(f"(not written to {REPORT}: {error})")
+
+
+def _print(line: str) -> None:
+    # A stdout that is gone (OSError) leaves nothing more to be said.
+    with contextlib.suppress(OSError):
+        print(line)
 
 
 def _instrumented(copy: Path, device: str, suite: str) -> subprocess.CompletedProcess:

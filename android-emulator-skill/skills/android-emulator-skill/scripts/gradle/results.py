@@ -102,6 +102,18 @@ def _flavor_directories(directory: Path) -> list[Path]:
     return _subdirectories(directory / "flavors")
 
 
+def _flavor_containers(directory: Path) -> list[Path]:
+    """``<variant dir>/flavors`` itself, whenever it is there -- even with no flavor in it.
+
+    Its children are checked as flavor directories, but an empty one (or a
+    symlink to an empty directory) has none, and would leave the link itself
+    unchecked while Gradle starts. Listed so its own components go through
+    the symlink and containment checks; it holds no report of its own.
+    """
+    container = directory / "flavors"
+    return [container] if container.exists() or container.is_symlink() else []
+
+
 def flavored_report_variants(reports: list[Path], variant: str) -> list[str]:
     """The flavored variants a run's reports below its variant directory belong to.
 
@@ -146,6 +158,9 @@ class ResultsRoot:
         nested: Report directories below a found task directory that belong to
             other tasks or variants the run may write -- cleared before it and
             checked like the task directory, never read as its result.
+        containers: Directories below a found task directory that hold
+            ``nested`` ones: checked like them, even when empty, never read
+            and never cleared (no report is written directly in them).
     """
 
     kind: str
@@ -155,6 +170,7 @@ class ResultsRoot:
     label: str
     noun: str
     nested: Callable[[Path], list[Path]] = lambda _directory: []
+    containers: Callable[[Path], list[Path]] = lambda _directory: []
 
     def pattern(self, search_root: Path, task: str) -> Path:
         """Where a project-wide search looked, for the no-results diagnostic."""
@@ -180,6 +196,7 @@ INSTRUMENTED_RESULTS = ResultsRoot(
     label="build/outputs/androidTest-results/connected variant directory",
     noun="connected test result variant directory",
     nested=_flavor_directories,
+    containers=_flavor_containers,
 )
 
 
@@ -190,8 +207,9 @@ class ResultDirectory:
     Attributes:
         module: The module directory (lexical).
         path: The task directory (lexical, unresolved).
-        found: False for a module-scoped search's placeholder -- nothing
-            matched, and nothing in it is read.
+        found: False for a directory that is only checked, never searched for
+            reports: a module-scoped search's placeholder (nothing matched),
+            or a root's ``containers`` entry.
         read: False for a root's ``nested`` directory -- cleared and checked,
             its reports counted as written, not read as the task's result.
     """
@@ -250,6 +268,10 @@ def find_result_directories(
         if matches:
             for path in matches:
                 directories.append(ResultDirectory(module, path))
+                directories.extend(
+                    ResultDirectory(module, container, found=False, read=False)
+                    for container in root.containers(path)
+                )
                 directories.extend(
                     ResultDirectory(module, nested, read=False) for nested in root.nested(path)
                 )
