@@ -1535,8 +1535,17 @@ def _lint_roots(tool: str) -> list[str]:
     workflow = yaml.safe_load(
         (REPO_ROOT / ".github" / "workflows" / "lint.yml").read_text(encoding="utf-8")
     )
+    return _lint_roots_in(workflow, tool)
+
+
+def _lint_roots_in(workflow: dict, tool: str) -> list[str]:
+    """The paths a parsed workflow hands `tool` on the one `run:` line that starts with it.
+
+    The line is split as a shell would (`comments=True`), so an inline
+    `# comment` is not mistaken for two more roots.
+    """
     commands = [
-        shlex.split(line)
+        shlex.split(line, comments=True)
         for job in workflow["jobs"].values()
         for step in job["steps"]
         for line in str(step.get("run", "")).splitlines()
@@ -1577,6 +1586,25 @@ def test_pre_commit_lints_the_same_roots_as_ci():
             assert files.search(path), f"{hook_id}: {files.pattern} does not match {path}"
         for path in ("tests/fixtures/recorded/x.txt", "x.py", "site/x.py"):
             assert not files.search(path), f"{hook_id}: {files.pattern} matches {path}"
+
+
+@pytest.mark.parametrize(
+    ("run", "roots"),
+    [
+        ("black --check --diff a/ tests/", ["a/", "tests/"]),
+        ("black --check --diff a/ tests/  # coverage", ["a/", "tests/"]),
+        ("echo black --check a/ tests/", None),
+        ("# black --check a/ tests/", None),
+    ],
+)
+def test_lint_roots_reads_the_command_not_its_comment_or_an_echo(run, roots):
+    """The root extractor's own floor: a comment adds no root, an echo or a comment is no run."""
+    workflow = {"jobs": {"lint": {"steps": [{"run": f"set -e\n{run}\n"}]}}}
+    if roots is None:
+        with pytest.raises(AssertionError, match="exactly once"):
+            _lint_roots_in(workflow, "black")
+    else:
+        assert _lint_roots_in(workflow, "black") == roots
 
 
 def test_rewriting_hooks_leave_byte_exact_fixtures_alone():

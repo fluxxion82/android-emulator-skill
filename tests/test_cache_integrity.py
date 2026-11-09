@@ -131,6 +131,20 @@ CORRUPT_BODIES = {
     "no_created_at": json.dumps({"cache_id": CORRUPT_ID, "data": {"x": 1}}),
     "bad_created_at": json.dumps({"cache_id": CORRUPT_ID, "created_at": "soon", "data": {}}),
     "not_an_object": json.dumps(["build", "result"]),
+    # Typed but undated: a typed clear must not take the readable type as leave
+    # to delete an entry every other operation treats as corrupt.
+    "typed_no_created_at": json.dumps({"cache_type": "build-result", "data": {}}),
+    "typed_bad_created_at": json.dumps(
+        {"cache_type": "build-result", "created_at": "yesterday", "data": {}}
+    ),
+    # Well-formed JSON Python's decoder still refuses: an integer longer than
+    # sys.get_int_max_str_digits() (4300) raises a plain ValueError, not a
+    # JSONDecodeError. Written as text, because json.dump of such an int would
+    # hit the same limit.
+    "oversized_int": (
+        '{"cache_id": "build-20260101-000000-abcd1234", "cache_type": "build-result", '
+        '"created_at": "2026-01-01T00:00:00", "data": {"n": ' + "9" * 4301 + "}}"
+    ),
 }
 
 
@@ -173,6 +187,16 @@ def test_listing_skips_a_corrupt_entry_without_deleting_it(cache, corrupt_entry)
     assert corrupt_entry.exists(), "list_entries() deleted a corrupt entry"
 
 
+def test_a_typed_clear_keeps_a_corrupt_entry_and_an_untyped_clear_removes_it(cache, corrupt_entry):
+    """A corrupt entry has no readable type, so no typed clear may claim it."""
+    cleared = cache.clear("build-result")
+
+    assert corrupt_entry.exists(), "clear('build-result') deleted a corrupt entry"
+    assert cleared == 0, f"clear('build-result') counted a corrupt entry ({cleared})"
+    assert cache.clear() == 1
+    assert not corrupt_entry.exists()
+
+
 def test_an_expired_entry_beside_a_corrupt_one_is_still_swept(cache, cache_dir, corrupt_entry):
     """Setting corrupt entries aside must not stop the sweep for genuine old ones."""
     cache_id = cache.save({"x": 1}, "simulator-list")
@@ -205,6 +229,7 @@ def test_build_and_test_refuses_a_corrupt_build_as_corrupt(
         cli.run(build_script.main, argv)
     captured = capsys.readouterr()
 
+    assert "Traceback" not in captured.err, captured.err
     assert stopped.value.code == 1
     if json_mode:
         payload = json.loads(captured.out)
@@ -219,4 +244,30 @@ def test_build_and_test_refuses_a_corrupt_build_as_corrupt(
     assert "corrupt" in error and "not expired" in error, error
     assert str(corrupt_entry) in error, error
     assert str(corrupt_entry) in remedy, remedy
+    assert corrupt_entry.exists()
+
+
+@pytest.mark.parametrize("json_mode", [True, False])
+def test_list_builds_skips_a_corrupt_build_and_still_answers(
+    json_mode, cache_dir, corrupt_entry, monkeypatch, capsys
+):
+    """`--list-builds` is a scan: a corrupt file is skipped and kept, never a traceback."""
+    import build_and_test as build_script
+
+    from common import cli
+    from gradle import BuildResultCache
+
+    build_cache = BuildResultCache(cache_dir=str(cache_dir))
+    monkeypatch.setattr(build_script, "BuildResultCache", lambda: build_cache)
+
+    with pytest.raises(SystemExit) as stopped:
+        cli.run(build_script.main, ["--list-builds", *(["--json"] if json_mode else [])])
+    captured = capsys.readouterr()
+
+    assert "Traceback" not in captured.err, captured.err
+    assert stopped.value.code == 0, captured.err
+    if json_mode:
+        assert json.loads(captured.out) == []
+    else:
+        assert captured.out.strip() == "No cached builds found"
     assert corrupt_entry.exists()

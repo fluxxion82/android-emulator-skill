@@ -11,7 +11,8 @@ Cache directory: ~/.android-emulator-skill/cache/
 Cache expiration: Configurable per cache type (default 1 hour)
 
 Entries are written atomically (temp file + ``os.replace``), ids carry a random
-suffix so two saves in one second cannot collide, and an entry that cannot be
+8-hex-digit suffix so two saves in one second cannot practically collide (it
+makes a clash improbable, not impossible), and an entry that cannot be
 read is reported as corrupt (:class:`CacheCorruptionError`) and kept -- never
 deleted as though it had expired.
 
@@ -109,7 +110,8 @@ class ProgressiveCache:
         Returns:
             Cache ID like 'simulator-20251028-143052-1a2b3c4d' for use in
             progressive disclosure: the type's first word, the time, and a
-            random suffix so two saves in one second never share an id.
+            random 8-hex-digit suffix, so two saves in one second cannot
+            practically share an id.
 
         The entry is written to a temp file in the cache directory and moved
         into place with ``os.replace``, so a reader sees either no entry or the
@@ -285,7 +287,10 @@ class ProgressiveCache:
             cache_type: Type to clear (e.g., 'simulator-list'), or None to clear all
 
         Returns:
-            Number of entries deleted
+            Number of entries deleted. A typed clear skips and keeps a corrupt
+            entry, as every other operation does -- even one whose
+            ``cache_type`` happens to be readable. ``clear()`` with no type
+            removes every entry file, corrupt ones included.
 
         Example:
             cleared = cache.clear('simulator-list')
@@ -299,14 +304,11 @@ class ProgressiveCache:
                 cache_file.unlink()
                 deleted += 1
             else:
-                # Clear by type. A corrupt entry has no readable type, so no
-                # typed clear removes it; clear() with no type does.
                 try:
-                    with open(cache_file, encoding="utf-8") as f:
-                        entry = json.load(f)
-                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    entry, _created_at = self._read_entry(cache_file)
+                except (OSError, CacheCorruptionError):
                     continue
-                if isinstance(entry, dict) and entry.get("cache_type") == cache_type:
+                if entry.get("cache_type") == cache_type:
                     cache_file.unlink(missing_ok=True)
                     deleted += 1
 
@@ -365,8 +367,14 @@ class ProgressiveCache:
         with open(cache_file, encoding="utf-8") as f:
             try:
                 entry = json.load(f)
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                raise CacheCorruptionError(cache_file, f"not valid JSON ({error})") from error
+            except ValueError as error:
+                # ValueError, not just JSONDecodeError: bad UTF-8 raises
+                # UnicodeDecodeError, and well-formed JSON holding an integer
+                # longer than sys.get_int_max_str_digits() raises a plain
+                # ValueError. All three are a file that cannot be read back.
+                raise CacheCorruptionError(
+                    cache_file, f"it does not decode as JSON ({error})"
+                ) from error
 
         if not isinstance(entry, dict):
             raise CacheCorruptionError(
