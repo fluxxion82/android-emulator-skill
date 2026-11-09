@@ -1528,6 +1528,86 @@ def test_the_trailer_check_actually_rejects_a_trailer(tmp_path):
     assert accepted.returncode == 0, f"a clean message was rejected: {accepted.stderr}"
 
 
+def _lint_roots(tool: str) -> list[str]:
+    """The paths `lint.yml` hands `tool`, read from the workflow's `run:` steps."""
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "lint.yml").read_text(encoding="utf-8")
+    )
+    commands = [
+        shlex.split(line)
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        for line in str(step.get("run", "")).splitlines()
+        if line.strip().startswith(f"{tool} ")
+    ]
+    assert len(commands) == 1, f"lint.yml should run {tool} exactly once: {commands}"
+    # `black --check --diff A B` / `ruff check A B`: the operands that are paths.
+    return [arg for arg in commands[0][1:] if not arg.startswith("-") and arg != "check"]
+
+
+def test_pre_commit_lints_the_same_roots_as_ci():
+    """T12: Black and Ruff in pre-commit covered `scripts/` only; CI lints `tests/` too.
+
+    So a test file that CI would fail passed every local hook, and the first
+    anyone heard of it was a red required check. Both hooks' `files` regexes
+    are compiled and asked about real paths, and the roots they must cover are
+    read from `lint.yml`'s own command lines rather than typed here.
+    """
+    import yaml
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    hooks = {hook["id"]: hook for repo in config["repos"] for hook in repo.get("hooks", [])}
+
+    black_roots, ruff_roots = _lint_roots("black"), _lint_roots("ruff")
+    assert black_roots == ruff_roots, f"lint.yml: black {black_roots} vs ruff {ruff_roots}"
+    assert len(black_roots) == 2, f"lint.yml lints {black_roots}"
+
+    for hook_id in ("black", "ruff"):
+        assert hook_id in hooks, f"pre-commit has no {hook_id} hook"
+        files = re.compile(hooks[hook_id].get("files", ""))
+        for root in black_roots:
+            for path in (f"{root.rstrip('/')}/x.py", f"{root.rstrip('/')}/deeper/x.py"):
+                assert files.search(path), (
+                    f"pre-commit's {hook_id} hook skips {path}, which lint.yml lints: "
+                    f"files: {files.pattern}"
+                )
+        for path in ("tests/test_x.py", f"{SKILL_ROOT.relative_to(REPO_ROOT)}/scripts/x.py"):
+            assert files.search(path), f"{hook_id}: {files.pattern} does not match {path}"
+        for path in ("tests/fixtures/recorded/x.txt", "x.py", "site/x.py"):
+            assert not files.search(path), f"{hook_id}: {files.pattern} matches {path}"
+
+
+def test_rewriting_hooks_leave_byte_exact_fixtures_alone():
+    """`pre-commit run --all-files` must be runnable over the repo without rewriting fixtures.
+
+    Three hooks REWRITE files. Over the committed tree they "fixed" the legacy
+    ANR session fixtures (a previous version's store, compared byte for byte)
+    and the scaffold's `gradlew.bat` (CRLF is that file's format), so the run
+    failed on main for files nobody had touched. Each hook's `exclude` is
+    compiled and asked about those paths, and must still leave code alone.
+    """
+    import yaml
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    hooks = {hook["id"]: hook for repo in config["repos"] for hook in repo.get("hooks", [])}
+
+    for hook_id in ("trailing-whitespace", "end-of-file-fixer", "mixed-line-ending"):
+        assert hook_id in hooks, f"pre-commit has no {hook_id} hook"
+        exclude = re.compile(hooks[hook_id].get("exclude", "(?!)"))
+        for path in (
+            "tests/fixtures/anr_legacy_sessions/x/meta.json",
+            "tests/fixtures/scaffold/compose/gradlew.bat",
+            "tests/fixtures/recorded/x.txt",
+        ):
+            assert exclude.search(
+                path
+            ), f"pre-commit's {hook_id} hook rewrites {path}: exclude: {exclude.pattern}"
+        for path in ("tests/test_x.py", f"{SKILL_ROOT.relative_to(REPO_ROOT)}/scripts/x.py"):
+            assert not exclude.search(path), f"{hook_id}: {exclude.pattern} excludes {path}"
+
+
 def _option_tokens(help_text: str) -> set[str]:
     """The flags argparse actually registered, from its own --help output.
 
