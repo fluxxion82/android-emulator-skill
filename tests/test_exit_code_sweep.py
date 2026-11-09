@@ -714,6 +714,14 @@ SUBCOMMAND_USAGE_ERRORS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("logs.py", ("tail", "--severity", "loud")),
 )
 
+# A usage error a script raises itself, after argparse has parsed: still the
+# object. container.py checks --package after parsing, because --get-cached
+# reads the local cache and needs none; the other modes still require it.
+POST_PARSE_USAGE_ERRORS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("container.py", ("--ls",)),
+    ("container.py", ("--get-cached", "container-20200101-000000-deadbeef", "--ls")),
+)
+
 
 def _python_scripts() -> list[str]:
     """Every Python script, from the boundary guard's positive enumeration."""
@@ -731,6 +739,7 @@ def _usage_cases() -> list:
         _param(script, argv, " ".join(argv)) for script, argv in sorted(TYPED_USAGE_ERRORS.items())
     ]
     cases += [_param(script, argv, " ".join(argv)) for script, argv in SUBCOMMAND_USAGE_ERRORS]
+    cases += [_param(script, argv, " ".join(argv)) for script, argv in POST_PARSE_USAGE_ERRORS]
     return cases
 
 

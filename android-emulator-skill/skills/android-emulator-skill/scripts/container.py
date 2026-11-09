@@ -213,7 +213,10 @@ class ContainerInspector:
                 f"(file is at least {size_bytes:,}). Use --export for the full file."
             )
 
-        if len(content) > CAT_CACHE_BYTES:
+        # The threshold is bytes, as its name says: the text's UTF-8 length, not
+        # its character count (the recorded cap probe is 43,699 characters in
+        # 65,534 bytes; counting characters printed it inline).
+        if len(content.encode("utf-8")) > CAT_CACHE_BYTES:
             cache_id = self._cache.save({**base, "content": content}, "container-cat")
             return True, {
                 **base,
@@ -1050,6 +1053,27 @@ CONTAINER_REMEDY = (
 )
 
 
+def _read_cached_cat(cache_id: str) -> dict:
+    """The content a large ``--cat`` cached as ``cache_id``, whole.
+
+    Raises:
+        cli.Failure: nothing readable is cached as ``cache_id`` -- never cached,
+            expired, or an entry another script cached. The entry's recorded
+            type decides the last, not its keys: a ``build-result`` whose data
+            happens to carry a string ``content`` is still not --cat content.
+        CacheCorruptionError: the entry exists but is corrupt; common.cli
+            reports it as such and the file is kept.
+    """
+    data = ProgressiveCache().get(cache_id, cache_type="container-cat")
+    if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+        cli.fail(
+            f"no --cat content is cached as '{cache_id}'",
+            "Entries expire after an hour. Re-run the --cat that printed the id and pass "
+            "the id it prints now.",
+        )
+    return {"cache_id": cache_id, **data}
+
+
 def _emit(action: str, result: dict, args: argparse.Namespace) -> None:
     """Print a successful result in the requested mode."""
     if args.json:
@@ -1167,6 +1191,10 @@ def _format_text(action: str, result: dict, args: argparse.Namespace) -> None:
             if result.get("truncated") and result.get("note"):
                 print(f"# {result['note']}", file=sys.stderr)
             print(result["content"])
+    elif action == "get-cached":
+        if result.get("truncated") and result.get("note"):
+            print(f"# {result['note']}", file=sys.stderr)
+        sys.stdout.write(result["content"])  # exactly what was cached: no newline added
     elif action == "shared-prefs":
         if "preferences" in result:
             prefs = result["preferences"]
@@ -1239,10 +1267,13 @@ Examples:
   python container.py --package com.example.app --databases
   python container.py --package com.example.app --databases app.db --verbose
   python container.py --package com.example.app --export ./snapshot/
+  python container.py --get-cached container-20251028-143052-1a2b3c4d
         """,
     )
 
-    parser.add_argument("--package", required=True, help="App package name (required)")
+    # Required by every operation but --get-cached, which reads the local cache:
+    # checked after parsing, as a usage error, so --get-cached can omit it.
+    parser.add_argument("--package", help="App package name (required except for --get-cached)")
     parser.add_argument("--serial", help="Device serial (auto-detects if omitted)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Show extended detail")
@@ -1281,8 +1312,19 @@ Examples:
         metavar="DIR",
         help="Write a snapshot (shared_prefs, db listing, file tree) to DIR.",
     )
+    ops.add_argument(
+        "--get-cached",
+        metavar="ID",
+        help="Print, whole, the content a large --cat cached as ID (no device, no --package).",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.get_cached is not None:
+        _emit("get-cached", _read_cached_cat(args.get_cached), args)
+        sys.exit(0)
+    if args.package is None:
+        parser.error("the following arguments are required: --package")
 
     serial = resolve_device_identifier(args.serial)
 

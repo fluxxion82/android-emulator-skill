@@ -87,9 +87,11 @@ class BuildResultCache:
             build_id: Build ID from :meth:`save`
 
         Returns:
-            Stored payload dict, or None if missing/expired.
+            Stored payload dict, or None if missing, expired, or not a build
+            result: an id another script cached (``container --cat``) is not
+            a build with no errors.
         """
-        return self._cache.get(build_id)
+        return self._cache.get(build_id, cache_type=self.CACHE_TYPE)
 
     def list(self) -> list[dict]:
         """List recent cached build results (most recent first)."""

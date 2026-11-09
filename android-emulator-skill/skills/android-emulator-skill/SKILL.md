@@ -256,7 +256,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `ANDROID_EMU_BUILD_TIMEOUT`, `ANDROID_EMU_TEST_TIMEOUT` or `ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT` for the
       active mode, or inspect the stuck task
     - Build ids look like `build-20251028-143052-1a2b3c4d` (time plus a random 8-hex-digit suffix, so two
-      builds in one second cannot practically share one); pass the whole id back.
+      builds in one second cannot practically share one); pass the whole id back. An id another script
+      cached (a `container --cat` id) is not a build: refused as not found (exit 1), never an empty list.
       `--get-errors`/`--get-warnings`/`--get-log` on an
       entry whose cache file cannot be read refuse with one error naming the file as corrupt, not expired
       (exit 1); the file is kept for inspection, not deleted. `--list-builds` skips such a file
@@ -887,7 +888,16 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       find's failure, not the directory's: its remedy says the device's find
       cannot list this way. An older toybox is not measured. An older
       release's refusal wording is not recorded, and reads as the failure
-    - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`, `--verbose`
+    - A `--cat` whose output is longer than `ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES`
+      (8 KiB) is not printed: it is cached for an hour and the answer names
+      the id (`Full content cached as '<id>'`, `cache_id` under `--json`).
+      `--get-cached ID` prints that content whole — no further cap, no
+      device, no `--package` — exactly as cached in text mode, and with the
+      `--cat` fields (`path`, `size_bytes`, `truncated`, `content`) under
+      `--json`. An unknown or expired id, or one another script cached (a
+      build id), is refused (exit 1); a corrupt
+      entry is refused as corrupt, naming the file, which is kept
+    - Options: `--package` (all but `--get-cached`), `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--get-cached ID`, `--serial`, `--json`, `--verbose`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
     - LIVE reads the database with `adb shell -T` (common/run_as.py), after the

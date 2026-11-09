@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2206,3 +2207,177 @@ def test_databases_listing_does_not_offer_the_journal_as_a_database(recorded):
     names = {entry["name"] for entry in parse_listing(listing).entries}
     assert names == {"fixture.db", "fixture.db-journal"}
     assert [db for db in sorted(names) if not container._is_sqlite_sidecar(db)] == ["fixture.db"]
+
+
+# --- --get-cached: the --cat cache entry is read back ------------------------
+#
+# A --cat above CAT_CACHE_BYTES saves the content to the progressive-disclosure
+# cache and prints `Full content cached as '<id>'`. Until --get-cached, no mode
+# read a `container-cat` entry back: the content was cached and unreachable.
+# The loop below feeds the id --cat printed, in its own output, to --get-cached.
+
+
+def _cat_then_get_cached(tmp_path, monkeypatch, capsys, payload: bytes, flags: list[str]):
+    """--cat of a file read as ``payload`` (fake adb), then --get-cached of the id it printed."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    log = _bytes_adb(tmp_path, monkeypatch, payload)
+    cat = _run_main(
+        monkeypatch,
+        capsys,
+        *("--serial", "emulator-5554", "--package", FIXTURE_PKG),
+        *("--cat", "files/aes_utf8_cap.txt", *flags),
+    )
+    assert cat.returncode == 0, cat.stderr
+    if "--json" in flags:
+        printed = json.loads(cat.stdout)
+        assert "content" not in printed, "a cached --cat also printed the content"
+        cache_id = printed["cache_id"]
+        assert f"'{cache_id}'" in printed["note"], printed["note"]
+    else:
+        named = re.findall(r"Full content cached as '([^']+)'", cat.stdout)
+        assert len(named) == 1, cat.stdout
+        cache_id = named[0]
+    reads = log.read_text(encoding="utf-8").count("\n")
+
+    got = _run_main(monkeypatch, capsys, "--get-cached", cache_id, *flags)
+    assert log.read_text(encoding="utf-8").count("\n") == reads, "--get-cached reached adb"
+    return cache_id, got
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize("capped", [False, True], ids=["whole", "capped"])
+def test_a_cat_above_the_cache_threshold_reads_back_whole_through_get_cached(
+    tmp_path, monkeypatch, capsys, json_mode, capped
+):
+    """The recorded 70,161-byte read, cached by --cat, comes back byte-equal and uncut."""
+    entry = _manifest_entry("run_as_cat_utf8_cap")
+    payload = API33.data(entry["file"])
+    assert len(payload) > container.CAT_CACHE_BYTES, "the recording no longer reaches the cache"
+    if capped:
+        expected = payload[: entry["split_character_starts_at"]].decode("utf-8")
+    else:
+        monkeypatch.setattr(container, "CAT_MAX_BYTES", 2 * len(payload))
+        expected = payload.decode("utf-8")
+
+    flags = ["--json"] if json_mode else []
+    cache_id, got = _cat_then_get_cached(tmp_path, monkeypatch, capsys, payload, flags)
+
+    assert got.returncode == 0, got.stderr
+    if json_mode:
+        result = json.loads(got.stdout)
+        assert (result["action"], result["success"]) == ("get-cached", True)
+        assert result["cache_id"] == cache_id
+        assert (result["package"], result["path"]) == (FIXTURE_PKG, "files/aes_utf8_cap.txt")
+        assert result["truncated"] is capped
+        assert result["content"].encode("utf-8") == expected.encode("utf-8")
+    else:
+        assert got.stdout.encode("utf-8") == expected.encode("utf-8")
+        assert ("capped" in got.stderr) is capped, got.stderr
+
+
+def test_the_cache_threshold_counts_bytes_not_characters(tmp_path, monkeypatch, capsys):
+    """ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES is a byte count, as its name says.
+
+    The recorded UTF-8 read, cut at the cap, is 43,699 characters in 65,534
+    bytes; a threshold between the two must route it through the cache.
+    Counting characters printed it inline.
+    """
+    entry = _manifest_entry("run_as_cat_utf8_cap")
+    payload = API33.data(entry["file"])
+    expected = payload[: entry["split_character_starts_at"]].decode("utf-8")
+    characters, utf8_bytes = len(expected), len(expected.encode("utf-8"))
+    assert characters < utf8_bytes, "the recording is no longer multibyte"
+    monkeypatch.setattr(container, "CAT_CACHE_BYTES", (characters + utf8_bytes) // 2)
+
+    cache_id, got = _cat_then_get_cached(tmp_path, monkeypatch, capsys, payload, ["--json"])
+
+    assert got.returncode == 0, got.stderr
+    result = json.loads(got.stdout)
+    assert result["cache_id"] == cache_id
+    assert result["content"].encode("utf-8") == expected.encode("utf-8")
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_get_cached_refuses_an_unknown_id_with_a_remedy(tmp_path, monkeypatch, capsys, json_mode):
+    """An id nothing cached (or one that expired): one refusal, exit 1, no device."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    flags = ["--json"] if json_mode else []
+    got = _run_main(
+        monkeypatch, capsys, "--get-cached", "container-20200101-000000-deadbeef", *flags
+    )
+    assert got.returncode == 1, got
+    error, remedy = _refusal_lines(got, json_mode)
+    assert "container-20200101-000000-deadbeef" in error, error
+    assert "--cat" in remedy, remedy
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize(
+    "data",
+    [{"errors": [], "warnings": []}, {"content": "another script's text"}],
+    ids=["no-content", "content"],
+)
+def test_get_cached_refuses_an_entry_another_script_cached(
+    tmp_path, monkeypatch, capsys, json_mode, data
+):
+    """A real entry of another type is not --cat content, whatever its keys hold.
+
+    The entry's recorded type decides, not the presence of a string `content`:
+    refused, with nothing of the other script's data printed.
+    """
+    from common.cache_utils import ProgressiveCache
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    other = ProgressiveCache().save(data, "build-result")
+    flags = ["--json"] if json_mode else []
+    got = _run_main(monkeypatch, capsys, "--get-cached", other, *flags)
+    assert got.returncode == 1, got
+    error, remedy = _refusal_lines(got, json_mode)
+    assert other in error, error
+    assert "--cat" in remedy, remedy
+    assert "another script's text" not in got.stdout + got.stderr, got
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_get_cached_refuses_a_corrupt_entry_as_corrupt_and_keeps_it(
+    tmp_path, monkeypatch, capsys, json_mode
+):
+    """#62's contract at this boundary: corrupt, not expired, the file named and kept."""
+    from test_cache_integrity import CORRUPT_BODIES, CORRUPT_ID
+
+    from common.cache_utils import default_cache_dir
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    corrupt = default_cache_dir() / f"{CORRUPT_ID}.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text(CORRUPT_BODIES["truncated"], encoding="utf-8")
+
+    flags = ["--json"] if json_mode else []
+    got = _run_main(monkeypatch, capsys, "--get-cached", CORRUPT_ID, *flags)
+    assert got.returncode == 1, got
+    error, remedy = _refusal_lines(got, json_mode)
+    assert "corrupt" in error and "not expired" in error, error
+    assert str(corrupt) in error and str(corrupt) in remedy, (error, remedy)
+    assert corrupt.exists()
+
+
+def test_get_cached_needs_no_package_and_every_other_mode_still_does(monkeypatch, capsys):
+    """--package left argparse's required list for --get-cached; the others still ask for it."""
+    got = _run_main(monkeypatch, capsys, "--ls", "--json")
+    assert got.returncode == 2, got
+    assert "--package" in json.loads(got.stdout)["error"], got.stdout
+
+
+def _refusal_lines(got: subprocess.CompletedProcess, json_mode: bool) -> tuple[str, str]:
+    """A refusal's error and remedy: one JSON object, or `Error:`/`Remedy:` on stderr."""
+    assert "Traceback" not in got.stdout + got.stderr, got.stderr
+    if json_mode:
+        assert got.stdout.count("\n") == 1, got.stdout
+        payload = json.loads(got.stdout)
+        assert payload["success"] is False, payload
+        return payload["error"], payload["remedy"]
+    lines = got.stderr.splitlines()
+    assert len(lines) == 2 and lines[0].startswith("Error: "), got.stderr
+    assert lines[1].startswith("Remedy: "), got.stderr
+    assert got.stdout == "", got.stdout
+    return lines[0], lines[1]
