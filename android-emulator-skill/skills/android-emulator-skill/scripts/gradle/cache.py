@@ -53,6 +53,7 @@ class BuildResultCache:
         module: str | None,
         tasks: list[str],
         duration: float,
+        serial: str | None = None,
     ) -> str:
         """
         Save a build/test result and return its short build ID.
@@ -73,6 +74,9 @@ class BuildResultCache:
             "tasks": tasks,
             "duration": duration,
         }
+        if serial is not None:
+            # The device an instrumented run was pinned to.
+            payload["serial"] = serial
         return self._cache.save(payload, self.CACHE_TYPE)
 
     def get(self, build_id: str) -> dict | None:

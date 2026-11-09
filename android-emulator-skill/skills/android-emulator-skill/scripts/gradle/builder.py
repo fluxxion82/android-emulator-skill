@@ -11,9 +11,11 @@ xcodebuild.
 Timeouts are tunable via the ANDROID_EMU_ prefix:
 - ANDROID_EMU_BUILD_TIMEOUT (default 1800s; also bounds a --module test run's projectDir query)
 - ANDROID_EMU_TEST_TIMEOUT  (default 2700s)
+- ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT (default 3600s)
 """
 
 import contextlib
+import os
 import re
 import shlex
 import subprocess
@@ -24,10 +26,12 @@ from common.env_config import env_int
 
 from .config import Config
 from .results import (
+    INSTRUMENTED_RESULTS,
     UNIT_RESULTS,
     ResultsRoot,
     aggregate_test_results,
     extract_failure_reasons,
+    extract_failures,
     find_result_directories,
     find_test_result_files,
     parse_build_output,
@@ -40,6 +44,30 @@ RERUN_UNSUPPORTED = "Unknown command-line option '--rerun'"
 
 BUILD_TIMEOUT = env_int("ANDROID_EMU_BUILD_TIMEOUT", 1800)
 TEST_TIMEOUT = env_int("ANDROID_EMU_TEST_TIMEOUT", 2700)
+# A connected run builds and installs two APKs before a test starts: measured
+# 15-25 s warm on the compose scaffold, minutes cold.
+INSTRUMENTED_TEST_TIMEOUT = env_int("ANDROID_EMU_INSTRUMENTED_TEST_TIMEOUT", 3600)
+
+# The runner argument that filters a connected run to a class (AGP's way;
+# Gradle's --tests is the unit task's option, not the connected task's).
+INSTRUMENTATION_CLASS_ARG = "-Pandroid.testInstrumentationRunnerArguments.class="
+
+# AGP's sentence when ANDROID_SERIAL names no attached device, in Gradle's
+# "* What went wrong:" block (recorded: connected_android_test_no_device):
+# "> com.android.builder.testing.api.DeviceException: Connected device with
+# serial 'no-such-serial-xyz' not found!"
+_DEVICE_NOT_FOUND = re.compile(
+    r"com\.android\.builder\.testing\.api\.DeviceException: "
+    r"Connected device with serial '(?P<serial>[^']*)' not found!"
+)
+
+# What AndroidJUnitRunner reports when the class filter names a class the test
+# APK does not have (recorded: junit_xml_instrumented_no_match): one failing
+# testcase `<class>.initializationError` whose failure's first line is this.
+_INITIALIZATION_ERROR = ".initializationError"
+_CLASS_NOT_LOADED = re.compile(
+    r"^java\.lang\.RuntimeException: Failed loading specified test class '(?P<cls>[^']+)'$"
+)
 
 # What ``<module>:properties --property projectDir`` prints for the module's
 # directory (recorded: gradle-8.13 and gradle-7.5.1 gradle_properties_project_dir):
@@ -81,6 +109,7 @@ class BuildResult:
         returncode: int | None,
         results_dir: str | None = None,
         timeout_seconds: int | None = None,
+        serial: str | None = None,
     ):
         self.success = success
         self.stdout = stdout
@@ -97,6 +126,8 @@ class BuildResult:
         # Where a test run's JUnit XML was looked for; None for a build.
         self.results_dir = results_dir
         self.timeout_seconds = timeout_seconds
+        # The device an instrumented run was pinned to (ANDROID_SERIAL); None otherwise.
+        self.serial = serial
 
     @property
     def timed_out(self) -> bool:
@@ -120,6 +151,42 @@ class BuildResult:
         A run Gradle failed is not this case -- its own failure is the verdict.
         """
         return self.results_dir is not None and self.returncode == 0 and not self.test_results
+
+    @property
+    def unloaded_test_classes(self) -> list[str]:
+        """The classes an instrumented run's filter named that the runner could not load.
+
+        Non-empty only when that is ALL the run reported: every testcase an
+        ``initializationError`` failing with "Failed loading specified test
+        class" (recorded: a ``--suite`` naming no class in the test APK, exit
+        1). No test ran, so it is no test results, not a red test. A run where
+        one named class loaded and another did not is a red run like any other.
+        """
+        if self.serial is None or not self.test_results:
+            return []
+        classes = []
+        for test in self.test_results["failed_tests"]:
+            match = _CLASS_NOT_LOADED.match(test.get("failure_message", ""))
+            if not (match and test.get("test_name", "").endswith(_INITIALIZATION_ERROR)):
+                return []
+            classes.append(match.group("cls"))
+        return classes if len(classes) == self.test_results["total"] else []
+
+    @property
+    def missing_device(self) -> str | None:
+        """The serial AGP said is not attached, for a connected run that failed so.
+
+        Read from Gradle's own ``* What went wrong:`` block, not from anywhere
+        in the log: a test's output cannot forge it. The device was resolved
+        before Gradle started, so this is one that went away in between.
+        """
+        if self.serial is None or self.returncode in (None, 0):
+            return None
+        for failure in extract_failures(f"{self.stdout}\n{self.stderr}"):
+            match = _DEVICE_NOT_FOUND.search(failure["message"])
+            if match:
+                return match.group("serial")
+        return None
 
 
 class BuildRunner:
@@ -238,6 +305,48 @@ class BuildRunner:
         # Task options bind to the task named before them, so this stays next to it.
         extra = ["--rerun", *(["--tests", suite] if suite else [])]
         return self._run([task, *extra], clean=clean, timeout=TEST_TIMEOUT, test_task=task)
+
+    def instrumented_test(
+        self, serial: str, clean: bool = False, suite: str | None = None
+    ) -> BuildResult:
+        """Run ``connected<Variant>AndroidTest`` on ONE device and judge its JUnit XML.
+
+        The device is pinned with ``ANDROID_SERIAL=<serial>`` in Gradle's
+        environment: with several devices attached, a connected task without
+        it runs on every one of them (a plugged-in phone included) and
+        uninstalls its APKs from each afterwards. ``serial`` must already be
+        resolved to an attached device; the CLI does that before calling.
+
+        The verdict is the unit tests' (Gradle exit 0, results this run wrote,
+        no ``<failure>``/``<error>``), read from the instrumented results root
+        (:data:`INSTRUMENTED_RESULTS`) after its stale reports are deleted.
+
+        ``--rerun`` is passed for the same reason the unit task gets it, though
+        it was not needed here: measured on AGP 8.13.2, an identical second run
+        without it was NOT up to date -- the task executed and the tests ran
+        again (connected_android_test_repeat) -- and Gradle accepts it bound to
+        the connected task (connected_android_test_rerun).
+
+        Args:
+            serial: The resolved device serial.
+            clean: Run a clean task first.
+            suite: A test class, passed as the runner's ``class`` argument
+                (``-Pandroid.testInstrumentationRunnerArguments.class=``).
+
+        Returns:
+            BuildResult with ``serial`` set.
+        """
+        task = self._task_name("connected") + "AndroidTest"
+        extra = ["--rerun", *([f"{INSTRUMENTATION_CLASS_ARG}{suite}"] if suite else [])]
+        return self._run(
+            [task, *extra],
+            clean=clean,
+            timeout=INSTRUMENTED_TEST_TIMEOUT,
+            test_task=task,
+            results=INSTRUMENTED_RESULTS,
+            env={**os.environ, "ANDROID_SERIAL": serial},
+            serial=serial,
+        )
 
     def _module_path(self) -> str | None:
         """The selected module as a normalised ``:a:b`` Gradle path, or None."""
@@ -446,6 +555,8 @@ class BuildRunner:
         timeout: int,
         test_task: str | None = None,
         results: ResultsRoot = UNIT_RESULTS,
+        env: dict[str, str] | None = None,
+        serial: str | None = None,
     ) -> BuildResult:
         """
         Execute a gradlew command and assemble a BuildResult.
@@ -462,6 +573,8 @@ class BuildRunner:
             timeout: subprocess timeout in seconds
             test_task: For a test run, the task whose JUnit XML this run wrote
             results: The results root ``test_task`` writes its JUnit XML to
+            env: Gradle's environment, when it is not this process's own
+            serial: The device an instrumented run is pinned to
 
         Returns:
             BuildResult.
@@ -485,6 +598,7 @@ class BuildRunner:
                 text=True,
                 check=False,
                 timeout=timeout,
+                **({"env": env} if env is not None else {}),
             )
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -510,6 +624,7 @@ class BuildRunner:
                 duration=round(duration, 2),
                 returncode=None,
                 timeout_seconds=timeout,
+                serial=serial,
             )
 
         duration = time.time() - start
@@ -559,4 +674,5 @@ class BuildRunner:
             duration=round(duration, 2),
             returncode=returncode,
             results_dir=results_dir,
+            serial=serial,
         )

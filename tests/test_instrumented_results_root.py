@@ -35,6 +35,8 @@ from gradle.results import (
 
 RECORDED = Path(__file__).resolve().parent / "fixtures" / "recorded" / "gradle-8.13"
 CONNECTED = Path("app", "build", "outputs", "androidTest-results", "connected")
+# Any serial: Gradle is mocked here, and the device is the CLI's concern.
+SERIAL = "emulator-5554"
 
 # run -> (its tree listing, its recorded report)
 RUNS = {
@@ -147,10 +149,7 @@ def _gradle(monkeypatch, returncode: int, log: str, writes=(), seen=None) -> lis
 def _run(project: Path, variant: str = "debug", module: str | None = ":app"):
     """One instrumented run through the builder's verdict path."""
     runner = BuildRunner(str(project), module=module, variant=variant)
-    task = runner._task_name("connected") + "AndroidTest"
-    return runner._run(
-        [task], clean=False, timeout=60, test_task=task, results=INSTRUMENTED_RESULTS
-    )
+    return runner.instrumented_test(SERIAL)
 
 
 # --- discovery --------------------------------------------------------------
@@ -467,3 +466,26 @@ def test_case_colliding_variant_directories_are_refused(
     assert report.exists()
     assert "ambiguous" in str(refused.value).lower()
     assert started == []
+
+
+def test_the_connected_task_runs_pinned_rerun_and_filtered(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """ANDROID_SERIAL in Gradle's environment, --rerun bound to the task, the runner's filter."""
+    project = _project(tmp_path)
+    started = _gradle(monkeypatch, 0, recorded_gradle("connected_android_test_success"))
+
+    BuildRunner(str(project), module=":app", variant="proDebug").instrumented_test(
+        SERIAL, suite="com.example.composefixture.PassingInstrumentedTest"
+    )
+
+    ((cmd, kwargs),) = started
+    task = cmd.index(":app:connectedProDebugAndroidTest")
+    assert cmd[task + 1 :] == [
+        "--rerun",
+        "-Pandroid.testInstrumentationRunnerArguments.class="
+        "com.example.composefixture.PassingInstrumentedTest",
+    ]
+    assert "--tests" not in cmd
+    assert kwargs["env"]["ANDROID_SERIAL"] == SERIAL
+    assert kwargs["timeout"] == builder_mod.INSTRUMENTED_TEST_TIMEOUT > builder_mod.TEST_TIMEOUT
