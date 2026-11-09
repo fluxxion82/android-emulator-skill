@@ -472,11 +472,16 @@ def test_case_colliding_variant_directories_are_refused(
     report = _materialize(project, "connected_android_test_success", recorded_gradle)
     connected = project / CONNECTED
     exact, colliding = connected / "debug", connected / "DEBUG"
+    # On a case-sensitive filesystem (Linux CI) this is a second, real
+    # directory; on a case-insensitive one (macOS's temp volume) it is the same
+    # directory as `debug`, so exist_ok. Discovery drops a name that is not a
+    # directory, so the colliding one has to exist wherever it can.
+    colliding.mkdir(exist_ok=True)
     original = Path.iterdir
 
     def listing(path):
-        # macOS's temp volume is case-insensitive: one directory, two names,
-        # as a case-sensitive filesystem would list them.
+        # A case-insensitive volume lists one name; this is what a
+        # case-sensitive filesystem lists.
         if path == connected:
             return iter((exact, colliding))
         return original(path)
