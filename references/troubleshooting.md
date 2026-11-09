@@ -55,7 +55,8 @@ of that type wins). Lifecycle scripts use `--serial` the same way:
 ```bash
 python emulator_shutdown.py --serial emulator-5554
 ```
-(`build_and_test.py` is host-side and has no `--serial`; it targets a project, not a device.)
+(`build_and_test.py` targets a project, not a device; only `--instrumented` takes `--serial`,
+and it resolves it the same way before pinning Gradle to that one device.)
 
 ---
 
