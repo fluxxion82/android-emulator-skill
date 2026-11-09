@@ -178,10 +178,17 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - List available AVDs
    - Every mode reports a missing or failing `avdmanager` the same way: exit 1
      with the `cmdline-tools` remedy, never "No AVDs deleted" at exit 0
-   - `--old N` ranks by the mtime of `<name>.avd`; an AVD whose directory
-     cannot be found fails the whole ranking (exit 1) rather than sorting
-     oldest and being deleted. The AVD home is `$ANDROID_AVD_HOME`, else
-     `$ANDROID_SDK_HOME/.android/avd`, else `~/.android/avd`
+   - `--old N` keeps the newest N by config modification time -- the mtime of
+     `<name>.avd/config.ini`, which the emulator rewrites when the AVD's
+     configuration changes (it was the `.avd` directory's, which moves with
+     any snapshot or lock file). That is a proxy for last use, not a record
+     of it: an AVD booted without a configuration change keeps its old mtime.
+     The prompt and the text summary say "by config modification time";
+     `--json` carries `ranked_by: "config modification time"`
+   - An AVD whose `config.ini` cannot be found fails the whole ranking
+     (exit 1) rather than sorting oldest and being deleted. The AVD home is
+     `$ANDROID_AVD_HOME`, else `$ANDROID_SDK_HOME/.android/avd`, else
+     `~/.android/avd`
    - `N` must be at least 1: `--old 0` keeps nothing, so it is rejected as a
      usage error (exit 2) pointing at `--all --yes`
    - Without `--yes` the question goes to stderr and the answer is read from
@@ -192,8 +199,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `--json` — including a `--name` that is not listed, and a delete
      avdmanager refused or did not finish. `--all` / `--old` are batches (see
      **Failures**): the summary (`action`, `succeeded`, `failed`, `total`,
-     `keep_count`) and `items`, one per AVD with `name`, `message`, `success`,
-     `error`, `remedy` -- always, not only with `--verbose`, where they were
+     and for `--old` `keep_count` and `ranked_by`) and `items`, one per AVD
+     with `name`, `message`, `success`, `error`, `remedy` -- always, not only with `--verbose`, where they were
      `results`. **Breaking in v0.9.0.** Exit 1 with `error` / `remedy` on top
      when any AVD failed
    - Options: `--name`, `--all`, `--old`, `--yes`, `--list`, `--json`, `--verbose`
@@ -535,10 +542,26 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Save reports (JSON + Markdown)
     - Options: `--serial`, `--output`, `--verbose`, `--json`
 
-17. **visual_diff.py** - Compare screenshots for visual changes
-    - Pixel-perfect comparison
-    - Highlight differences
-    - Generate diff images
+17. **visual_diff.py** - Compare two Android screenshots (emulator or device) for visual changes
+    - `diff.png` is the current screenshot with every pixel whose R+G+B
+      difference sums past 30 painted red: a thresholded per-pixel overlay,
+      not a bounding box. `side-by-side.png` puts the two next to each other;
+      `diff-report.json` holds the metrics and the artifacts' paths
+    - The verdict counts a pixel as different when the greyscale of its
+      difference exceeds 10, and passes (exit 0) when that count is at most
+      `--threshold` of all pixels (0.01 = 1%); FAIL is exit 1. Different
+      sizes are refused (exit 1)
+    - Without `--output` the artifacts go to a new
+      `~/.android-emulator-skill/cache/visual-diff/<YYYYmmdd-HHMMSS>/`, never
+      the working directory (the default was `.`). `--output DIR` is used as
+      given, created if missing
+    - Every path printed is absolute, including the inputs (`--json`'s
+      `summary.baseline` / `summary.current`, and `diff-report.json`'s
+      `baseline` / `current`, which were bare file names). Artifact paths
+      name files that were written -- the `Diff overlay:` line, `--json`'s
+      `artifacts` (`diff_image`, `comparison_image`, `report`; null for an
+      image that could not be written) and `diff-report.json`'s `artifacts`
+      -- and `Artifacts saved to:` names their directory
     - Usage: `visual_diff.py BASELINE CURRENT [--output DIR] [--threshold N] [--json]`
     - Note: the two images are **positional**. `--json` now emits the full
       report, so this script keeps the same contract as every other one;

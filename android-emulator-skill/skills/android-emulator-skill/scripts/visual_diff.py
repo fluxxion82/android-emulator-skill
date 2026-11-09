@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 """
-Visual Diff Tool for iOS Simulator Screenshots
+Visual diff for Android screenshots (emulator or device).
 
-Compares two screenshots pixel-by-pixel to detect visual changes.
-Optimized for minimal token output.
+Compares two screenshots of the same size pixel by pixel and writes three
+artifacts:
+
+* ``diff.png`` -- the current screenshot with every changed pixel painted
+  red. "Changed" here means the per-channel difference summed over R, G and B
+  exceeds 30 (so ``(100,100,100)`` against ``(110,110,110)`` is not painted,
+  ``(110,110,111)`` is). It is a thresholded per-pixel overlay, not a
+  bounding box.
+* ``side-by-side.png`` -- baseline and current next to each other.
+* ``diff-report.json`` -- the metrics below and the artifacts' paths.
+
+The verdict counts a pixel as different when the greyscale of its difference
+exceeds 10 (a noise floor), and passes when that count is at most
+``--threshold`` of all pixels (0.01 = 1%). The two cut-offs are separate:
+the overlay can paint fewer pixels than the count reports.
+
+Without ``--output`` the artifacts go to a new
+``~/.android-emulator-skill/cache/visual-diff/<YYYYmmdd-HHMMSS>/`` directory,
+never into the caller's working directory. Every path printed is absolute --
+the inputs too, in ``--json``'s ``summary`` and in ``diff-report.json`` --
+artifact paths name files that were written, and ``Artifacts saved to:``
+names their directory.
 
 Usage: python scripts/visual_diff.py baseline.png current.png [options]
 """
@@ -11,11 +31,12 @@ Usage: python scripts/visual_diff.py baseline.png current.png [options]
 from __future__ import annotations
 
 import json
-import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from common import cli
+from common.cache_utils import default_cache_dir
 
 try:
     from PIL import Image, ImageChops
@@ -24,16 +45,51 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
+# A pixel is painted red in diff.png when its R, G and B differences sum past this.
+OVERLAY_THRESHOLD = 30
+
+# Where a run's artifacts go when --output is not given, under the skill's cache
+# root. The default was ".", so an agent standing in a repository root left
+# diff.png, side-by-side.png and diff-report.json in it (L12) -- the same
+# litter app_state_capture's snapshots used to leave (N12).
+ARTIFACTS_DIRNAME = "visual-diff"
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def default_output_dir() -> Path:
+    """A new ``~/.android-emulator-skill/cache/visual-diff/<YYYYmmdd-HHMMSS>/``, created.
+
+    Two runs inside the same second get ``-1``, ``-2``... rather than one
+    overwriting the other's artifacts.
+    """
+    base = default_cache_dir() / ARTIFACTS_DIRNAME
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = _timestamp()
+    candidate = base / stamp
+    suffix = 0
+    while True:
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            suffix += 1
+            candidate = base / f"{stamp}-{suffix}"
+
 
 class VisualDiffer:
-    """Performs visual comparison between screenshots."""
+    """Compares two screenshots and draws the thresholded overlay of what changed."""
 
     def __init__(self, threshold: float = 0.01):
         """
         Initialize differ with threshold.
 
         Args:
-            threshold: Maximum acceptable difference ratio (0.01 = 1%)
+            threshold: Largest fraction of differing pixels that still passes
+                (0.01 = 1%); a pixel differs when the greyscale of its
+                difference exceeds 10
         """
         self.threshold = threshold
 
@@ -100,26 +156,31 @@ class VisualDiffer:
         return sum(1 for pixel in pixels if pixel > 10)  # Threshold for noise
 
     def generate_diff_image(self, baseline_path: str, current_path: str, output_path: str) -> None:
-        """Generate highlighted difference image."""
+        """Write ``current`` with every pixel whose R+G+B difference exceeds 30 painted red.
+
+        PIL operations over whole images, not a ``getpixel``/``putpixel`` loop
+        (a 1080x2400 screenshot is 2.6 M pixels, 5-8 M method calls), and the
+        same picture pixel for pixel. ``ImageChops.add`` clips at 255, which
+        cannot change a ``> 30`` decision.
+
+        Raises:
+            ValueError: The images differ in size. The loop this replaced
+                crashed when the baseline was the larger and drew a top-left
+                crop when it was the smaller; neither is a diff.
+        """
         baseline = Image.open(baseline_path).convert("RGB")
         current = Image.open(current_path).convert("RGB")
+        if baseline.size != current.size:
+            raise ValueError(
+                f"Image dimensions do not match: baseline {baseline.size}, "
+                f"current {current.size}"
+            )
 
-        # Create difference image
-        diff = ImageChops.difference(baseline, current)
-
-        # Enhance differences with red overlay
-        diff_enhanced = Image.new("RGB", baseline.size)
-        for x in range(baseline.size[0]):
-            for y in range(baseline.size[1]):
-                diff_pixel = diff.getpixel((x, y))
-                if sum(diff_pixel) > 30:  # Threshold for visibility
-                    # Highlight in red
-                    diff_enhanced.putpixel((x, y), (255, 0, 0))
-                else:
-                    # Keep original
-                    diff_enhanced.putpixel((x, y), current.getpixel((x, y)))
-
-        diff_enhanced.save(output_path)
+        red, green, blue = ImageChops.difference(baseline, current).split()
+        channel_sum = ImageChops.add(ImageChops.add(red, green), blue)
+        mask = channel_sum.point(lambda level: 255 if level > OVERLAY_THRESHOLD else 0)
+        painted = Image.new("RGB", current.size, (255, 0, 0))
+        Image.composite(painted, current, mask).save(output_path)
 
     def generate_side_by_side(
         self, baseline_path: str, current_path: str, output_path: str
@@ -143,21 +204,32 @@ class VisualDiffer:
 def main(argv: list[str] | None = None):
     """Main entry point."""
     parser = cli.parser(
-        description="Compare screenshots for visual differences",
+        description=(
+            "Compare two Android screenshots (emulator or device) of the same size. "
+            "diff.png is the current screenshot with every pixel whose R+G+B "
+            "difference exceeds 30 painted red."
+        ),
         json_flags=("--json", "--details"),
     )
     parser.add_argument("baseline", help="Path to baseline screenshot")
     parser.add_argument("current", help="Path to current screenshot")
     parser.add_argument(
         "--output",
-        default=".",
-        help="Output directory for diff artifacts (default: current directory)",
+        default=None,
+        help=(
+            "Output directory for diff artifacts (default: a new "
+            f"~/.android-emulator-skill/cache/{ARTIFACTS_DIRNAME}/<YYYYmmdd-HHMMSS>/)"
+        ),
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=0.01,
-        help="Acceptable difference threshold (0.01 = 1%%, default: 0.01)",
+        help=(
+            "Largest fraction of pixels that may differ and still PASS "
+            "(0.01 = 1%%, default: 0.01). A pixel differs when the greyscale of "
+            "its difference exceeds 10"
+        ),
     )
     # `--json` is the repo-wide contract for machine-readable output (CLAUDE.md:
     # "--help and --json on every script"), and this was the one script without
@@ -186,10 +258,6 @@ def main(argv: list[str] | None = None):
     if not _PIL_AVAILABLE:
         cli.fail("Pillow is not installed", "Run: pip3 install pillow")
 
-    # Create output directory if needed
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     # Initialize differ
     differ = VisualDiffer(threshold=args.threshold)
 
@@ -206,13 +274,32 @@ def main(argv: list[str] | None = None):
             "(same device, same --size preset).",
         )
 
+    # The inputs exist -- compare() opened them -- so they resolve. Reported
+    # absolute like the artifacts: a relative path is relative to a cwd the
+    # reader may not share.
+    baseline_path = str(Path(args.baseline).resolve())
+    current_path = str(Path(args.current).resolve())
+
+    # Only now, so a refused comparison leaves no empty run directory behind.
+    # Absolute, because every path printed below is one an agent should be able
+    # to open from wherever it stands; a bare `diff.png` was relative to a cwd
+    # the reader may not share.
+    if args.output is None:
+        output_dir = default_output_dir()
+    else:
+        output_dir = Path(args.output).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     # Generate artifacts
     diff_image_path = output_dir / "diff.png"
     comparison_image_path = output_dir / "side-by-side.png"
+    written: set[Path] = set()
 
     try:
         differ.generate_diff_image(args.baseline, args.current, str(diff_image_path))
+        written.add(diff_image_path)
         differ.generate_side_by_side(args.baseline, args.current, str(comparison_image_path))
+        written.add(comparison_image_path)
     except Exception as e:
         # The comparison stands without the pictures. To stderr under --json,
         # where stdout is the report.
@@ -221,6 +308,10 @@ def main(argv: list[str] | None = None):
             file=sys.stderr if args.json_output else sys.stdout,
         )
 
+    def _written(path: Path) -> str | None:
+        """The absolute path, or None for an artifact that was not written."""
+        return str(path) if path in written else None
+
     # Save JSON report -- BEFORE printing the result. Written after it, a
     # report file that could not be saved appended a refusal to a success
     # already on stdout: under --json, two objects.
@@ -228,10 +319,13 @@ def main(argv: list[str] | None = None):
     with open(report_path, "w") as f:
         json.dump(
             {
-                "baseline": os.path.basename(args.baseline),
-                "current": os.path.basename(args.current),
+                "baseline": baseline_path,
+                "current": current_path,
                 "results": result,
-                "artifacts": {"diff": "diff.png", "comparison": "side-by-side.png"},
+                "artifacts": {
+                    "diff": _written(diff_image_path),
+                    "comparison": _written(comparison_image_path),
+                },
             },
             f,
             indent=2,
@@ -242,15 +336,16 @@ def main(argv: list[str] | None = None):
         # Detailed output
         report = {
             "summary": {
-                "baseline": args.baseline,
-                "current": args.current,
+                "baseline": baseline_path,
+                "current": current_path,
                 "threshold": args.threshold,
                 "passed": result["passed"],
             },
             "results": result,
             "artifacts": {
-                "diff_image": str(diff_image_path),
-                "comparison_image": str(comparison_image_path),
+                "diff_image": _written(diff_image_path),
+                "comparison_image": _written(comparison_image_path),
+                "report": str(report_path),
             },
         }
         print(json.dumps(report, indent=2))
@@ -259,6 +354,8 @@ def main(argv: list[str] | None = None):
         print(f"Difference: {result['difference_percentage']}% ({result['verdict']})")
         if result["different_pixels"] > 0:
             print(f"Changed pixels: {result['different_pixels']:,}")
+        if diff_image_path in written:
+            print(f"Diff overlay: {diff_image_path}")
         print(f"Artifacts saved to: {output_dir}/")
 
     # Exit with error if test failed

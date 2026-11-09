@@ -1039,7 +1039,10 @@ def _delete(*missing: str, old: bool = False):
             avd = home / f"{name}{suffix}.avd"
             avd.mkdir(parents=True)
             stamp = 1_700_000_000 - age * 3600
-            os.utime(avd, (stamp, stamp))
+            # --old ranks by config.ini's mtime, not the directory's (L5-b).
+            config = avd / "config.ini"
+            config.write_text("hw.lcd.density=420\n")
+            os.utime(config, (stamp, stamp))
         return {"ANDROID_AVD_HOME": str(home)}
 
     return setup
