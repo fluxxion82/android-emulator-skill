@@ -322,9 +322,11 @@ def test_the_pre_run_delete_touches_only_the_variants_reports(
 ):
     """Gone when Gradle starts: the variant's TEST-*.xml. Kept: everything else.
 
-    The per-device UTP directory and every .pb beside the report, another
-    variant's report, the same variant in another module, and a report from
-    a device this run is not on is deleted too -- it is the variant's.
+    Deleted: the variant's report, one from a device this run is not on, and
+    those under its flavors/<f>/ (a ``debug`` run in a flavored project writes
+    there, so whatever is there afterwards must be this run's). Kept: the
+    per-device UTP directory and every .pb beside a report, another variant's
+    report, and the same variant in another module.
     """
     project = _project(tmp_path)
     (project / "lib").mkdir()
@@ -333,21 +335,43 @@ def test_the_pre_run_delete_touches_only_the_variants_reports(
         project, "connected_android_test_success", recorded_gradle, device="Other(AVD) - 14"
     )
     flavored = _materialize(project, "connected_android_test_flavored", recorded_gradle)
+    release = project / CONNECTED / "release" / previous.name
+    release.parent.mkdir(parents=True)
+    release.write_text(previous.read_text(), encoding="utf-8")
     lib = project / "lib" / previous.relative_to(project / "app")
     lib.parent.mkdir(parents=True)
     lib.write_text(previous.read_text(), encoding="utf-8")
-    kept_before = {
-        p for p in project.rglob("*") if p.is_file() and p not in (previous, other_device)
-    }
+    deleted = (previous, other_device, flavored)
+    kept_before = {p for p in project.rglob("*") if p.is_file() and p not in deleted}
     seen: set[Path] = set()
     _gradle(monkeypatch, 1, recorded_gradle("connected_android_test_failure"), seen=seen)
 
     _run(project)
 
-    assert previous not in seen and other_device not in seen, "a stale report reached the run"
+    assert not set(deleted) & seen, "a stale report reached the run"
     assert kept_before <= seen, sorted(map(str, kept_before - seen))
-    assert flavored in seen and lib in seen
+    assert release in seen and lib in seen
     assert any(p.suffix == ".pb" for p in seen) and any(p.name == "test-result.pb" for p in seen)
+
+
+def test_a_flavored_run_leaves_its_sibling_flavor_and_its_build_type_alone(
+    tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """proDebug clears debug/flavors/pro/ only: not free's, not debug/'s own."""
+    project = _project(tmp_path)
+    pro = _materialize(project, "connected_android_test_flavored", recorded_gradle)
+    free = pro.parent.parent / "free" / pro.name.replace("-pro.xml", "-free.xml")
+    free.parent.mkdir()
+    free.write_text(pro.read_text(), encoding="utf-8")
+    unflavored = project / CONNECTED / "debug" / pro.name
+    unflavored.write_text(pro.read_text(), encoding="utf-8")
+    seen: set[Path] = set()
+    _gradle(monkeypatch, 0, recorded_gradle("connected_android_test_flavored"), seen=seen)
+
+    _run(project, variant="proDebug")
+
+    assert pro not in seen
+    assert free in seen and unflavored in seen
 
 
 @pytest.mark.parametrize("module", [":app", None], ids=["module", "project"])
@@ -509,4 +533,24 @@ def test_two_layouts_reading_back_as_one_variant_are_refused_in_their_own_words(
     assert "read back as variant proDebug" in message, message
     assert "case-colliding" not in message, message
     assert flavored.exists() and unflavored.exists()
+    assert started == []
+
+
+@pytest.mark.parametrize("outside", [True, False], ids=["outside", "in-project"])
+@pytest.mark.parametrize("component", FLAVORED_COMPONENTS)
+def test_a_symlinked_flavor_directory_is_refused_for_its_build_type_too(
+    component, outside, tmp_path: Path, monkeypatch, recorded_gradle
+):
+    """A `debug` run clears debug/flavors/<f>/, so a symlink there is refused like any other."""
+    project = _project(tmp_path)
+    sentinel = _redirect(
+        project, "connected_android_test_flavored", component, recorded_gradle, outside
+    )
+    started = _gradle(monkeypatch, 0, recorded_gradle("connected_android_test_flavored"))
+
+    with pytest.raises(cli.Failure) as refused:
+        _run(project, variant="debug")
+
+    assert sentinel.exists(), "cleanup deleted a report it reached through a symlink"
+    assert "symlinked JUnit report path component" in str(refused.value)
     assert started == []

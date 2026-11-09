@@ -17,11 +17,13 @@ build cache.
 ``emulator_only_device`` and never ``live_device``: a connected task installs
 two APKs, runs instrumentation, then uninstalls them. AGP also uninstalls the
 app under test when it finishes, so a fixture app the lane installed for
-other tests is put back afterwards -- best effort. A failed reinstall is
-reported in the step summary, not raised: raised in teardown it would be an
-ERROR against the last test, failing the lane on a reinstall rather than on an
-instrumented verdict. A later test that needs the app reports its own missing
-app.
+other tests is put back afterwards -- best effort. A failed reinstall, a
+failed "is it installed?" query, and a report file that cannot be written are
+reported (the step summary, or the print), never raised: raised in teardown
+any of them would be an ERROR against the last test, failing the lane on
+housekeeping rather than on an instrumented verdict. A later test that needs
+the app reports its own missing app. tests/test_instrumented_live_teardown.py
+drives each of those paths without a device.
 
 When ``EMULATOR_LANE_INSTRUMENTED_REPORT`` names a file (the lane script sets
 it), each outcome observed is appended there for the lane's step summary.
@@ -81,34 +83,60 @@ def compose_copy(tmp_path_factory, adb: str, emulator_only_device: str):
     shutil.copytree(COMPOSE, copy, ignore=shutil.ignore_patterns(".gradle", "build", ".kotlin"))
     was_installed = _installed(adb, emulator_only_device)
     yield copy
-    if was_installed and not _installed(adb, emulator_only_device):
-        apk = copy / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
-        try:
-            installed = subprocess.run(
-                [adb, "-s", emulator_only_device, "install", "-r", str(apk)],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
-            )
-            said = (installed.stderr or installed.stdout).strip().splitlines()
-            failure = None if installed.returncode == 0 else (said[-1] if said else "no output")
-        except (OSError, subprocess.TimeoutExpired) as error:
-            failure = str(error)
-        if failure is None:
-            _observe("fixture app: uninstalled by AGP after the connected runs; reinstalled")
-        else:
-            _observe(
-                "fixture app: uninstalled by AGP after the connected runs; "
-                f"reinstall FAILED: {failure}"
-            )
+    _restore_fixture_app(adb, emulator_only_device, copy, was_installed)
+
+
+def _restore_fixture_app(adb: str, device: str, copy: Path, was_installed: bool) -> None:
+    """Reinstall the fixture app AGP uninstalled; never raise (see the module docstring).
+
+    Every outcome is observed: a query that fails (the app is left as it is),
+    a reinstall that fails (with adb's last line), a reinstall that worked.
+    """
+    if not was_installed:
+        return
+    try:
+        still_installed = _installed(adb, device)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        _observe(f"fixture app: could not check whether it is installed: {error}")
+        return
+    if still_installed:
+        return
+    apk = copy / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+    try:
+        installed = subprocess.run(
+            [adb, "-s", device, "install", "-r", str(apk)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        said = (installed.stderr or installed.stdout).strip().splitlines()
+        failure = None if installed.returncode == 0 else (said[-1] if said else "no output")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        failure = str(error)
+    if failure is None:
+        _observe("fixture app: uninstalled by AGP after the connected runs; reinstalled")
+    else:
+        _observe(
+            "fixture app: uninstalled by AGP after the connected runs; "
+            f"reinstall FAILED: {failure}"
+        )
 
 
 def _observe(line: str) -> None:
+    """Print ``line``, and append it to the lane's report when one is named.
+
+    A report that cannot be written leaves the print alone: an outcome is
+    never turned into a test error by the file that was to carry it.
+    """
     print(line)
-    if REPORT:
+    if not REPORT:
+        return
+    try:
         with open(REPORT, "a", encoding="utf-8") as handle:
             handle.write(f"- {line}\n")
+    except OSError as error:
+        print(f"(not written to {REPORT}: {error})")
 
 
 def _instrumented(copy: Path, device: str, suite: str) -> subprocess.CompletedProcess:

@@ -222,7 +222,8 @@ def _refuse_no_results(args: argparse.Namespace, result, build_id: str) -> None:
             f"(or leave it out to run them all); {log}",
         )
     if result.aggregate_variants:
-        # A build type of a flavored project: its reports are the flavors'.
+        # A build type of a flavored project: its reports are the flavors',
+        # whether Gradle exited 0 or failed on one of them.
         passes = " or ".join(f"--variant {variant}" for variant in result.aggregate_variants)
         cli.fail(
             f"the build produced no test results: {result.tasks[0]} wrote no report of its "
@@ -403,7 +404,7 @@ Examples:
             remedy=remedy,
         )
 
-    if result.no_test_results or result.unloaded_test_classes:
+    if result.no_test_results or result.unloaded_test_classes or result.aggregate_variants:
         _refuse_no_results(args, result, build_id)
 
     _emit_result(args, result, build_id)

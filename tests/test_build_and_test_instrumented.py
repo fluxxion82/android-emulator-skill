@@ -533,6 +533,7 @@ def test_a_run_that_wrote_a_report_had_its_device(recorded_gradle, serial):
         returncode=1,
         results_dir="results",
         serial=serial,
+        report_written=True,
     )
 
     assert result.missing_device is None
@@ -590,3 +591,93 @@ def test_an_aggregate_variant_is_refused_naming_the_flavored_variants(
     said = payload["error"] + payload["remedy"]
     assert "--variant proDebug" in said and "--variant freeDebug" in said, said
     assert "testInstrumentationRunner" not in said, said
+
+
+# --- "a run that wrote a report had its device", literally -------------------
+
+
+def _flavored_reports(project: Path) -> tuple[Path, Path]:
+    """Where AGP writes proDebug's report (recorded), and freeDebug's beside it."""
+    pro = project / _entry("connected_android_test_flavored")["results_path"]
+    return pro, pro.parent.parent / "free" / pro.name.replace("-pro.xml", "-free.xml")
+
+
+def test_flavored_red_reports_and_a_spoofed_device_error_are_the_aggregate_refusal(
+    toolchain, tmp_path, recorded, recorded_gradle, serial
+):
+    """`--variant debug` in a flavored project, fresh failing reports under flavors/*.
+
+    The run wrote reports, so it had its device: never exit 3 whatever it printed.
+    """
+    _adb(toolchain, recorded.text("adb_devices_single"))
+    project = tmp_path / "proj"
+    failing = recorded_gradle("junit_xml_instrumented_failing")
+    rule = Rule(
+        ("connectedDebugAndroidTest",),
+        stdout=_spoofed_failure_log(recorded_gradle),
+        exit=1,
+        writes=tuple((str(path), failing) for path in _flavored_reports(project)),
+        env=(("ANDROID_SERIAL", serial),),
+    )
+    project = _project(toolchain, tmp_path, [rule], recorded_gradle)
+
+    result = _instrumented(toolchain, project, "--serial", serial, "--json")
+
+    payload = assert_refusal(result, json_mode=True, naming=("no test results",), status=1)
+    said = payload["error"] + payload["remedy"]
+    assert "--variant freeDebug or --variant proDebug" in said, said
+
+
+def test_a_stale_flavored_report_is_cleared_and_a_device_gone_is_still_exit_3(
+    toolchain, tmp_path, recorded, recorded_gradle, serial
+):
+    """A previous run's flavored report is not this run's: cleared, so the no-device run is 3."""
+    _adb(toolchain, recorded.text("adb_devices_single"))
+    project = _connected(
+        toolchain,
+        tmp_path,
+        recorded_gradle,
+        serial,
+        "connected_android_test_no_device",
+        None,
+        "connectedDebugAndroidTest",
+    )
+    stale, _ = _flavored_reports(project)
+    stale.parent.mkdir(parents=True)
+    stale.write_text(recorded_gradle("junit_xml_instrumented_flavored"), encoding="utf-8")
+
+    result = _instrumented(toolchain, project, "--serial", serial, "--json")
+
+    assert not stale.exists(), "a previous run's flavored report survived the pre-run delete"
+    assert_refusal(result, json_mode=True, naming=("not found",), status=3)
+
+
+def test_a_zero_testcase_report_and_a_spoofed_device_error_are_not_exit_3(
+    toolchain, tmp_path, recorded, recorded_gradle, serial
+):
+    """A report with no testcase is still a report this run wrote: it had its device."""
+    from xml.etree import ElementTree
+
+    suite = ElementTree.fromstring(recorded_gradle("junit_xml_instrumented_passing"))
+    for case in suite.findall("testcase"):
+        suite.remove(case)
+    _adb(toolchain, recorded.text("adb_devices_single"))
+    project = tmp_path / "proj"
+    rule = Rule(
+        ("connectedDebugAndroidTest",),
+        stdout=_spoofed_failure_log(recorded_gradle),
+        exit=1,
+        writes=(
+            (
+                str(project / _entry("connected_android_test_success")["results_path"]),
+                ElementTree.tostring(suite, encoding="unicode"),
+            ),
+        ),
+        env=(("ANDROID_SERIAL", serial),),
+    )
+    project = _project(toolchain, tmp_path, [rule], recorded_gradle)
+
+    result = _instrumented(toolchain, project, "--serial", serial, "--json")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "DeviceException" not in json.loads(result.stdout).get("error", ""), result.stdout

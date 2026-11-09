@@ -267,7 +267,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       connected task without it runs on every attached device. No device attached exits **3**, several
       and no `--serial` exits **1**, and Gradle is not started for either. AGP's own "Connected device with
       serial '…' not found!" (the device left between the resolve and the run) is the same device error,
-      exit 3, with the log cached -- read only from a failed run that wrote no report: AGP raises it
+      exit 3, with the log cached -- read only from a failed run that wrote no report at all (a
+      zero-testcase or flavored one counts as written): AGP raises it
       while choosing the device, before any test runs, so a run with a report of its own had its device
       and is judged by that report whatever its log says. The task always gets `--rerun`; measured on AGP 8.13.2 an identical
       second run was not UP-TO-DATE anyway. AGP uninstalls the app and test APKs when the run ends.
@@ -281,7 +282,9 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       or `connected/<buildType>/flavors/<flavor>/` for a flavored variant (both layouts recorded with AGP
       8.13.2). Only the `TEST-*.xml` directly in that directory is deleted before the run and read after
       it — not the per-device UTP directory or `.pb` files beside it — with the same symlink and
-      containment refusals as the unit root
+      containment refusals as the unit root. The `TEST-*.xml` in that directory's own `flavors/<flavor>/`
+      directories are deleted and checked the same way, so any there afterwards are this run's, but they
+      are never read as its verdict (a flavored `proDebug` run leaves its sibling `flavors/free/` alone)
     - An instrumented run that produced no test result is refused, never "0 passed", with an
       instrumented remedy (tests under `src/androidTest`, a `testInstrumentationRunner`, a `--suite` that
       exists, the device attached). That includes a `--suite` naming a class the test APK does not have:
@@ -289,8 +292,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       results, not reported as a failing test. A red run names the failing test in every mode;
       `--variant` naming a build type of a flavored project (`debug` where the variants are `freeDebug`
       and `proDebug`) leaves reports only under `connected/debug/flavors/<flavor>/`, none of its own: it
-      is refused as no test results with a remedy naming the variants to pass instead (`--variant
-      freeDebug` or `--variant proDebug`), one per invocation;
+      is refused as no test results, whether Gradle exited 0 or failed, with a remedy naming the
+      variants to pass instead (`--variant freeDebug` or `--variant proDebug`), one per invocation;
       `--json` adds `serial` and `device_task` to a unit run's keys
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--instrumented`, `--suite`, `--serial`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 

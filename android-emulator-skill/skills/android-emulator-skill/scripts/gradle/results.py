@@ -89,24 +89,31 @@ def _instrumented_candidates(result_root: Path, task: str) -> list[Path]:
     return sorted(matches)
 
 
-def flavored_report_variants(directory: Path, variant: str) -> list[str]:
-    """The flavored variants with reports below an unflavored variant directory.
+def _flavor_directories(directory: Path) -> list[Path]:
+    """``<variant dir>/flavors/<flavor>/``: where AGP writes a flavored variant below it.
 
-    ``connected/debug/flavors/<flavor>/TEST-*.xml`` under the directory a
-    ``debug`` run resolved means the project has product flavors and ``debug``
-    is their build type, not a variant of its own: AGP's per-variant reports
-    are the flavors'. Returned as the variants to pass instead --
+    For ``connected/debug/`` these are ``debug/flavors/free/`` and
+    ``debug/flavors/pro/`` (instrumented_flavored_results_tree's layout): a
+    ``debug`` run in a flavored project leaves its reports there, none of its
+    own. They are cleared before the run and checked like the variant
+    directory, so whatever is in them afterwards is this run's -- but they are
+    the flavored variants' reports, never read as this one's verdict.
+    """
+    return _subdirectories(directory / "flavors")
+
+
+def flavored_report_variants(reports: list[Path], variant: str) -> list[str]:
+    """The flavored variants a run's reports below its variant directory belong to.
+
+    ``connected/debug/flavors/<flavor>/TEST-*.xml`` written by a ``debug`` run
+    means the project has product flavors and ``debug`` is their build type,
+    not a variant of its own. Returned as the variants to pass instead --
     ``<flavor><Variant>`` in the requested variant's capitalisation
-    (``freeDebug``, ``proDebug``) -- or ``[]``. Names only; nothing is read.
-    These reports were not cleared before the run, so they may be a previous
-    run's: this words a refusal, it never passes one.
+    (``freeDebug``, ``proDebug``). These reports are this run's (cleared
+    before it), but they word a refusal; they never pass one.
     """
     capitalized = f"{variant[:1].upper()}{variant[1:]}"
-    return [
-        f"{flavor.name}{capitalized}"
-        for flavor in _subdirectories(directory / "flavors")
-        if any(path.is_file() for path in flavor.glob("TEST-*.xml"))
-    ]
+    return sorted({f"{report.parent.name}{capitalized}" for report in reports})
 
 
 @dataclass(frozen=True)
@@ -115,7 +122,10 @@ class ResultsRoot:
 
     Every report the builder deletes or reads is a ``TEST-*.xml`` directly in
     a task directory ``<module>/<base...>/<task directory...>/`` -- nothing
-    deeper (AGP's per-device UTP directory sits beside its report). Discovery,
+    deeper (AGP's per-device UTP directory sits beside its report) -- or
+    directly in one of that directory's ``nested`` directories, which are
+    cleared, checked and counted as written but not read as the verdict.
+    Discovery,
     the lexical symlink checks, the resolved-path containment checks, the
     stale-report deletion and the no-results diagnostic all go through this
     one description, so the two kinds cannot drift apart in any one of them.
@@ -133,6 +143,9 @@ class ResultsRoot:
             diagnostic; nothing in it is read.
         label: How a refusal names this root's task directory, from the module.
         noun: The same directory, named without its path.
+        nested: Report directories below a found task directory that belong to
+            other tasks or variants the run may write -- cleared before it and
+            checked like the task directory, never read as its result.
     """
 
     kind: str
@@ -141,6 +154,7 @@ class ResultsRoot:
     placeholder: Callable[[str], tuple[str, ...]]
     label: str
     noun: str
+    nested: Callable[[Path], list[Path]] = lambda _directory: []
 
     def pattern(self, search_root: Path, task: str) -> Path:
         """Where a project-wide search looked, for the no-results diagnostic."""
@@ -165,6 +179,7 @@ INSTRUMENTED_RESULTS = ResultsRoot(
     placeholder=lambda _task: (),
     label="build/outputs/androidTest-results/connected variant directory",
     noun="connected test result variant directory",
+    nested=_flavor_directories,
 )
 
 
@@ -177,11 +192,14 @@ class ResultDirectory:
         path: The task directory (lexical, unresolved).
         found: False for a module-scoped search's placeholder -- nothing
             matched, and nothing in it is read.
+        read: False for a root's ``nested`` directory -- cleared and checked,
+            its reports counted as written, not read as the task's result.
     """
 
     module: Path
     path: Path
     found: bool = True
+    read: bool = True
 
     @property
     def components(self) -> tuple[Path, ...]:
@@ -230,7 +248,11 @@ def find_result_directories(
                 "flavored one), then retry.",
             )
         if matches:
-            directories.extend(ResultDirectory(module, path) for path in matches)
+            for path in matches:
+                directories.append(ResultDirectory(module, path))
+                directories.extend(
+                    ResultDirectory(module, nested, read=False) for nested in root.nested(path)
+                )
         elif not recursive:
             # Keep the intended location available for containment checks and
             # for the no-results diagnostic even before Gradle creates it.
@@ -246,9 +268,9 @@ def find_test_result_directories(
     recursive: bool = True,
     root: ResultsRoot = UNIT_RESULTS,
 ) -> list[Path]:
-    """The paths :func:`find_result_directories` resolves, a placeholder included."""
+    """The task directories :func:`find_result_directories` resolves, a placeholder included."""
     found = find_result_directories(search_root, task=task, recursive=recursive, root=root)
-    return [directory.path for directory in found]
+    return [directory.path for directory in found if directory.read]
 
 
 def find_test_result_files(
@@ -298,7 +320,7 @@ def find_test_result_files(
         for directory in find_result_directories(
             search_root, task=task, recursive=recursive, root=root
         ):
-            if directory.found:
+            if directory.found and directory.read:
                 candidates.update(directory.path.glob("TEST-*.xml"))
     elif root is UNIT_RESULTS:
         candidates.update(search_root.glob("**/test-results/**/TEST-*.xml"))

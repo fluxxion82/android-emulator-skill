@@ -28,12 +28,12 @@ from .config import Config
 from .results import (
     INSTRUMENTED_RESULTS,
     UNIT_RESULTS,
+    ResultDirectory,
     ResultsRoot,
     aggregate_test_results,
     extract_failure_reasons,
     extract_failures,
     find_result_directories,
-    find_test_result_files,
     flavored_report_variants,
     parse_build_output,
 )
@@ -113,6 +113,7 @@ class BuildResult:
         timeout_seconds: int | None = None,
         serial: str | None = None,
         aggregate_variants: list[str] | None = None,
+        report_written: bool = False,
     ):
         self.success = success
         self.stdout = stdout
@@ -135,6 +136,10 @@ class BuildResult:
         # variants whose reports sit below its directory -- it named a build
         # type of a flavored project (results.flavored_report_variants).
         self.aggregate_variants = aggregate_variants or []
+        # Whether this run wrote any JUnit report under its task directory --
+        # direct or flavored, a zero-testcase one included. All were deleted
+        # before the run, so any there now are this run's.
+        self.report_written = report_written
 
     @property
     def timed_out(self) -> bool:
@@ -185,15 +190,17 @@ class BuildResult:
 
         AGP raises its ``DeviceException`` while choosing the device, before
         any test runs (recorded: connected_android_test_no_device, no report
-        written). So a run that wrote a test report -- the task's reports are
-        deleted before the run, so any here are this run's -- had its device,
-        and is judged by its report whatever its log says: the sentence is
-        matched in a ``* What went wrong:`` block, and nothing authenticates
-        that block's provenance, so a test could print one. Only a failed
-        run with no report of its own is read for it. The device was resolved
-        before Gradle started, so this is one that went away in between.
+        written). So a run that wrote a test report had its device:
+        :attr:`report_written` -- any ``TEST-*.xml`` under the task's
+        directory or its ``flavors/<f>/`` directories, a zero-testcase one
+        included, all of which were deleted before the run. Such a run is
+        judged by its reports whatever its log says: the sentence is matched in
+        a ``* What went wrong:`` block, and nothing authenticates that block's
+        provenance, so a test could print one. Only a failed run that wrote no
+        report is read for it. The device was resolved before Gradle started,
+        so this is one that went away in between.
         """
-        if self.serial is None or self.returncode in (None, 0) or self.test_results:
+        if self.serial is None or self.returncode in (None, 0) or self.report_written:
             return None
         for failure in extract_failures(f"{self.stdout}\n{self.stderr}"):
             match = _DEVICE_NOT_FOUND.search(failure["message"])
@@ -462,18 +469,28 @@ class BuildRunner:
 
     def _report_files(
         self, root: Path, task: str, results: ResultsRoot = UNIT_RESULTS
-    ) -> tuple[list[Path], list[Path]]:
+    ) -> tuple[list[ResultDirectory], list[Path]]:
         """Find reports and prove every resolved path stays in its permitted directory.
 
         ``results`` says which tree: the unit root's ``build/test-results/<task>``
         or the instrumented root's variant directory under
-        ``build/outputs/androidTest-results/connected``. The checks are the same
-        for both, component by component of that tree.
+        ``build/outputs/androidTest-results/connected``, with its ``flavors/<f>/``
+        directories. The checks are the same for all, component by component.
+
+        Returns:
+            Every directory resolved (task directories, a placeholder, nested
+            directories) and every report in them -- the reports to clear
+            before a run; :meth:`_run` reads only those in ``read`` ones.
         """
         recursive = self.module is None
         found = find_result_directories(root, task=task, recursive=recursive, root=results)
-        directories = [directory.path for directory in found]
-        paths = find_test_result_files(root, task=task, recursive=recursive, root=results)
+        paths = sorted(
+            path
+            for directory in found
+            if directory.found
+            for path in directory.path.glob("TEST-*.xml")
+            if path.is_file()
+        )
         project = self.project_dir.resolve()
         resolved_directories: list[Path] = []
         base = "/".join(results.base)
@@ -528,7 +545,7 @@ class BuildRunner:
                     f"Replace {base} symlinks with directories inside the project, "
                     "then rerun the Gradle test task.",
                 )
-        return directories, paths
+        return found, paths
 
     def _clear_reports(self, root: Path, task: str, results: ResultsRoot = UNIT_RESULTS) -> None:
         """Delete the task's ``TEST-*.xml`` reports under ``root`` before Gradle runs.
@@ -546,11 +563,12 @@ class BuildRunner:
         has no source (measured: NO-SOURCE left no ``test-results`` behind).
         Only ``TEST-*.xml`` directly in the task's directory is touched --
         ``build/test-results/<task>/`` for unit tests, the variant's directory
-        under ``build/outputs/androidTest-results/connected/`` for instrumented
-        ones -- not the task's ``binary/`` results, not AGP's per-device UTP
-        directory or ``.pb`` files beside the report, not another task's or
-        variant's reports, not another module's when ``--module`` scopes
-        ``root``.
+        under ``build/outputs/androidTest-results/connected/`` and its
+        ``flavors/<flavor>/`` directories for instrumented ones -- not the
+        task's ``binary/`` results, not AGP's per-device UTP directory or
+        ``.pb`` files beside the report, not another task's or variant's
+        reports (a flavored ``proDebug`` run leaves ``debug/flavors/free/``
+        alone), not another module's when ``--module`` scopes ``root``.
 
         Raises:
             OSError: A report could not be deleted -- reading results then
@@ -647,10 +665,16 @@ class BuildRunner:
         test_results = None
         results_dir = None
         aggregate_variants: list[str] = []
+        report_written = False
         if name is not None:
             # The task's reports were cleared before the run, so whatever is
-            # in its directory now, this run wrote (N6).
-            directories, xml_files = self._report_files(root, name, results)
+            # in its directories now, this run wrote (N6).
+            found, reports = self._report_files(root, name, results)
+            report_written = bool(reports)
+            directories = [directory.path for directory in found if directory.read]
+            read = {directory.path for directory in found if directory.read}
+            xml_files = [path for path in reports if path.parent in read]
+            nested = [path for path in reports if path.parent not in read]
             results_dir = str(
                 directories[0] if len(directories) == 1 else results.pattern(root, name)
             )
@@ -658,13 +682,8 @@ class BuildRunner:
             # A report with no test case in it (a truncated write parses to
             # zero) is no more a result than no report at all.
             test_results = aggregate if aggregate["total"] else None
-            if results is INSTRUMENTED_RESULTS and test_results is None:
-                aggregate_variants = [
-                    flavored
-                    for directory in directories
-                    if directory.name.casefold() == self.variant.casefold()
-                    for flavored in flavored_report_variants(directory, self.variant)
-                ]
+            if test_results is None and nested:
+                aggregate_variants = flavored_report_variants(nested, self.variant)
             success = (
                 success
                 and test_results is not None
@@ -697,4 +716,5 @@ class BuildRunner:
             results_dir=results_dir,
             serial=serial,
             aggregate_variants=aggregate_variants,
+            report_written=report_written,
         )
