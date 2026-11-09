@@ -91,9 +91,12 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
    - Deep link navigation. `--open-url` waits the same way `--launch` does and
      fails when the intent resolves to nothing, rather than reporting a URL it
      merely handed to the system.
-   - List installed packages
+   - `--restart PKG` terminates then launches; `--activity NAME` picks the activity for
+     `--launch`/`--restart`; `--args KEY=VALUE` (repeatable) passes an intent string extra
+     (`am start --es KEY VALUE`)
+   - List installed packages (`--filter TEXT` narrows `--list`)
    - Check app state
-   - Options: `--launch`, `--terminate`, `--install`, `--uninstall`, `--open-url`, `--list`, `--state`, `--json`
+   - Options: `--launch`, `--restart`, `--activity`, `--args KEY=VALUE`, `--terminate`, `--install`, `--uninstall`, `--open-url`, `--list`, `--filter`, `--state`, `--serial`/`-s`, `--json`
 
 #### Device Lifecycle (5 scripts) ✓ COMPLETE
 5. **emulator_boot.py** - Boot emulators with optional readiness verification
@@ -124,7 +127,8 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `Error:` / `Remedy:` on stderr otherwise, exit 1. A successful boot under
      `--json` answers `{"success": true, ...}` (it reported a defect, exit 1,
      before v0.8.0)
-   - Options: `--avd`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
+   - `--all` boots every defined AVD in the background, without the readiness wait
+   - Options: `--avd`, `--all`, `--wait-ready`, `--timeout`, `--headless`, `--list-avds`, `--json`
 
 6. **emulator_shutdown.py** - Gracefully shutdown emulators
    - Shutdown by serial number. Emulators only: a serial that is not an
@@ -144,7 +148,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
      `error`, `remedy` (it reported counts only); one that vanished before its
      kill is that item's failure and the rest still stop. Exit 1 when any
      failed
-   - Options: `--serial`, `--name`, `--verify`, `--timeout`, `--all`, `--json`
+   - Options: `--serial`, `--name`, `--verify`/`--no-verify`, `--timeout`, `--all`, `--json`
 
 7. **emulator_create.py** ⭐ NEW - Create AVDs dynamically
    - Create by device type and API level
@@ -243,6 +247,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       the existing no-results rule refuses the run. A run that wrote no test results is a failure, not "0 tests
       passed". If Gradle times out, its partial log is cached and the command refuses with a remedy to raise
       `ANDROID_EMU_BUILD_TIMEOUT` or `ANDROID_EMU_TEST_TIMEOUT` for the active mode, or inspect the stuck task
+    - Build ids look like `build-20251028-143052-1a2b3c4d` (time plus a random 8-hex-digit suffix, so two
+      builds in one second cannot practically share one); pass the whole id back.
+      `--get-errors`/`--get-warnings`/`--get-log` on an
+      entry whose cache file cannot be read refuse with one error naming the file as corrupt, not expired
+      (exit 1); the file is kept for inspection, not deleted. `--list-builds` skips such a file
     - Options: `--project`, `--module`/`-p`, `--variant`, `--clean`, `--test`, `--suite`, `--get-errors`/`--get-warnings`/`--get-log <ID>`, `--list-builds`, `--verbose`, `--json`
 
 11. **log_monitor.py** ⭐ NEW - Real-time logcat monitoring
@@ -421,7 +430,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Duration-based or follow mode. `--duration` / `--last` need a unit
       (`30s`, `5m`, `1h`); a bare number is rejected as a usage error (exit 2)
     - Save logs to file
-    - Options: `--app`, `--serial`, `--severity`, `--follow`, `--duration`, `--output`, `--clear`, `--verbose`, `--json`
+    - Options: `--app`, `--serial`, `--severity`, `--follow`, `--duration`, `--last`, `--output`, `--clear`, `--verbose`, `--json`
 
 #### Navigation & Interaction (4 scripts)
 12. **screen_mapper.py** - Analyze current screen and list interactive elements
@@ -478,8 +487,11 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       --scroll-to-find)`. Scrolling is opt-in on purpose -- a swipe is not a read, so a lookup
       that scrolled silently would let `--find-text "Save is visible"` pass for a button three
       screens away.
-    - Options: `--find-text`, `--find-type`, `--find-id`, `--tap`, `--enter-text`, `--list`,
-      `--scroll-to-find`, `--scroll-direction {down,up}`, `--max-scrolls N`, `--serial`,
+    - `--find-exact TEXT` (or `--find-text TEXT --exact`) matches the whole text, not fuzzily;
+      `--index N` picks the Nth match (0-based); `--tap-at x,y` taps coordinates, the fallback
+      when no element can be named
+    - Options: `--find-text`, `--find-exact`, `--exact`, `--find-type`, `--find-id`, `--index`,
+      `--tap`, `--enter-text`, `--tap-at x,y`, `--list`, `--scroll-to-find`, `--scroll-direction {down,up}`, `--max-scrolls N`, `--serial`,
       `--json`, `--verbose`
 
 14. **gesture.py** - Perform swipes, scrolls, long press
@@ -487,9 +499,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       **finger** does. They are opposites. (Conflating them was a real defect: `--scroll down`
       dragged lists back toward the top and reported success.)
     - Directional swipes
-    - Custom swipe coordinates
-    - Scroll and long press
-    - Options: `--swipe`, `--from-edge`, `--duration`, `--long-press`, `--scroll`, `--serial`, `--json`
+    - Custom swipe coordinates: `--swipe-path x1,y1,x2,y2`; drag and drop: `--drag x1,y1,x2,y2`
+    - Scroll (`--count N` repeats it) and long press
+    - `--refresh` pulls to refresh (a swipe down from the top; `--duration` defaults to 600 ms for it)
+    - Options: `--swipe`, `--from-edge`, `--swipe-path`, `--drag`, `--refresh`, `--duration`, `--long-press`, `--scroll`, `--count`, `--serial`, `--json`
 
 15. **keyboard.py** - Text input and hardware buttons
     - Type text with **`--type`**. There is no `--text` — that flag belongs to
@@ -582,7 +595,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - A device that becomes unavailable during the capture is exit 3, as
       everywhere else, with what did arrive under `partial`
     - All-in-one debugging artifact
-    - Options: `--package`, `--output`, `--serial`, `--logs`, `--no-logs`, `--log-lines`, `--screenshot-size`, `--json`
+    - Options: `--package`, `--output`, `--serial`, `--logs`, `--no-logs`, `--log-lines`, `--screenshot-size`, `--json`, `--verbose`
 
 #### Advanced Testing & Permissions (3 scripts) ✓ COMPLETE
 20. **privacy_manager.py** ⭐ NEW - App permission management
@@ -605,16 +618,19 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       for fails with the `pm install-existing --user <id>` remedy, and a
       read-back with no section for the user fails rather than reading
       another user's state.
-    - Options: `--grant`, `--revoke`, `--reset`, `--list`, `--package`, `--user`, `--serial`, `--list-permissions`, `--json`
+    - Options: `--grant`, `--revoke`, `--reset`, `--list`, `--package`, `--user`, `--serial`, `--list-permissions`, `--json`, `--verbose`
 
 21. **status_bar.py** ⭐ NEW - Status bar control
     - Set battery level and charging state
     - Set WiFi/mobile signal strength, or hide either icon: `--wifi hide`,
-      `--mobile hide` (bare `--wifi` / `--mobile` shows it)
+      `--mobile hide` (bare `--wifi` / `--mobile` shows it). `--wifi-level N` and
+      `--mobile-level N` are signal bars, 0-4 (anything else is refused); `--mobile-type TYPE`
+      is the network label SystemUI shows, passed through as given (e.g. `lte`, `4g`, `5g`,
+      `hspa`; it is not checked against a list)
     - Set time display (for consistent screenshots): `--time` takes `H:MM` or
       `HH:MM` (`9:41` reaches SystemUI as `0941`); anything else is refused
     - Demo mode support
-    - Options: `--preset`, `--battery`, `--charging`, `--wifi`, `--mobile`, `--time`, `--reset`, `--serial`, `--json`
+    - Options: `--preset`, `--battery`, `--charging`, `--wifi`, `--wifi-level N`, `--mobile`, `--mobile-level N`, `--mobile-type TYPE`, `--time`, `--reset`, `--serial`, `--json`, `--verbose`
     - One item per operation asked for (see **Failures**): `{"success",
       "items"}`, each with `operation`, `message`, `success`, `error`,
       `remedy`. **Breaking in v0.9.0:** it was `{"results": [...]}`
@@ -727,13 +743,13 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--res DIR`, `--source DIR`, `--locale CODE`, `--strict`, `--json`, `--verbose`
 
 27. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
-    - Options: `--theme {light,dark}`, `--text-size {small,default,large,xl}`, `--font-scale`, `--locale`, `--reset`, `--serial`, `--json`
+    - Options: `--theme {light,dark}`, `--text-size {small,default,large,xl}`, `--font-scale`, `--locale`, `--reset`, `--serial`, `--json`, `--verbose`
     - One item per change asked for (see **Failures**): `{"success",
       "items"}`, each with `operation`, `message`, `success`, `error`,
       `remedy`. **Breaking in v0.9.0:** it was `{"results": [...]}`
 
 28. **location.py** - Simulate GPS on an emulator via `adb emu geo fix` (fixed coords, city presets, GPX route replay). Emulator-only.
-    - Options: `--lat`/`--lng`, `--city`, `--gpx FILE`, `--interval`/`--speed`, `--clear`, `--list-cities`, `--serial`, `--json`
+    - Options: `--lat`/`--lng`, `--city`, `--gpx FILE`, `--interval`/`--speed`, `--clear`, `--list-cities`, `--serial`, `--json`, `--verbose`
 
 29. **container.py** ⭐ NEW - Inspect a **debuggable** app's sandbox via `adb shell run-as` (fails clearly on release apps).
     - List/read files, dump `shared_prefs` XML, list databases and dump SQLite schema (Room == SQLite), export a snapshot
@@ -812,7 +828,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       find's failure, not the directory's: its remedy says the device's find
       cannot list this way. An older toybox is not measured. An older
       release's refusal wording is not recorded, and reads as the failure
-    - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`
+    - Options: `--package`, `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--serial`, `--json`, `--verbose`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
     - LIVE reads the database with `adb shell -T` (common/run_as.py), after the

@@ -58,7 +58,7 @@ class BuildResultCache:
         Save a build/test result and return its short build ID.
 
         Returns:
-            Build ID like ``build-20251028-143052``.
+            Build ID like ``build-20251028-143052-1a2b3c4d``.
         """
         payload = {
             "success": success,
