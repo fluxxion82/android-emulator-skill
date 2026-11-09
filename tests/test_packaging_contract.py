@@ -1531,6 +1531,18 @@ def test_the_trailer_check_actually_rejects_a_trailer(tmp_path):
 def _option_tokens(help_text: str) -> set[str]:
     """The flags argparse actually registered, from its own --help output.
 
+    Every spelling of every option, flattened; see :func:`_option_entries`.
+    """
+    return {flag for entry in _option_entries(help_text) for flag in entry}
+
+
+def _option_entries(help_text: str) -> list[frozenset[str]]:
+    """The options argparse registered, one set of spellings per option.
+
+    ``-s SERIAL, --serial SERIAL`` is one entry, ``{"-s", "--serial"}``: the
+    spellings an option's help line names are aliases of one another, so a doc
+    naming any of them documents the option.
+
     Only tokens in the leading option column of a line count; anything in a
     help *description* is prose, not a flag.
 
@@ -1551,20 +1563,23 @@ def _option_tokens(help_text: str) -> set[str]:
             continue
         candidates.append((len(line) - len(line.lstrip()), stripped))
     if not candidates:
-        return set()
+        return []
 
     option_column = min(indent for indent, _ in candidates)
-    tokens: set[str] = set()
+    entries: list[frozenset[str]] = []
     for indent, stripped in candidates:
         if indent != option_column:
             continue
         # "  --json, -j METAVAR   description..." -> the part before 2+ spaces.
         column = re.split(r"\s{2,}", stripped)[0]
+        spellings = set()
         for piece in column.split(","):
             flag = piece.strip().split("=")[0].split(" ")[0]
             if flag.startswith("-"):
-                tokens.add(flag)
-    return tokens
+                spellings.add(flag)
+        if spellings:
+            entries.append(frozenset(spellings))
+    return entries
 
 
 @functools.cache
@@ -1726,6 +1741,145 @@ def test_every_flag_documented_in_skill_md_exists():
     assert not wrong, (
         "SKILL.md documents flags that argparse does not accept; an agent "
         f"following it gets 'unrecognized arguments': {wrong}"
+    )
+
+
+# Flags a script accepts that its SKILL.md `- Options:` bullet deliberately
+# leaves out, script -> flags (any one spelling of an option names it). Debt or
+# a reason, never a place to hide an interface: NEVER_UNDOCUMENTED below may not
+# appear here, and an entry naming a script or flag that no longer exists fails,
+# so the set can only be paid down, not left stale.
+UNDOCUMENTED_OK: dict[str, frozenset[str]] = {
+    # Audit labels carried over from the iOS skill: echoed into the operation's
+    # output as a test trail, they change nothing on the device or in the verdict.
+    "privacy_manager.py": frozenset({"--scenario", "--step"}),
+}
+
+# The ceiling: a script's main verbs. An agent that cannot find these in
+# SKILL.md cannot use the script at all, so they are documented, never excused.
+NEVER_UNDOCUMENTED: frozenset[str] = frozenset(
+    {
+        # Named by the release plan (T3).
+        "--tap-at",
+        "--drag",
+        "--find-exact",
+        "--index",
+        "--restart",
+        "--args",
+        "--all",
+        "--old",
+        "--yes",
+        # The verbs the scripts are named for.
+        "--launch",
+        "--terminate",
+        "--install",
+        "--uninstall",
+        "--open-url",
+        "--swipe",
+        "--swipe-path",
+        "--scroll",
+        "--long-press",
+        "--refresh",
+        "--find-text",
+        "--find-id",
+        "--find-type",
+        "--tap",
+        "--enter-text",
+        "--list",
+    }
+)
+
+
+def _global_flags() -> frozenset[str]:
+    """Flags documented once for every script rather than per entry.
+
+    Two sources, both read rather than typed: what ``common.cli.parser``
+    registers by itself (its own ``--help``), and the backticked flags of
+    SKILL.md's "All scripts support ..." sentence, the one place the doc
+    promises a flag to every script.
+    """
+    from common import cli
+
+    flags = set(_option_tokens(cli.parser(prog="any").format_help()))
+    promise = [
+        line
+        for line in SKILL_MD.read_text(encoding="utf-8").splitlines()
+        if line.startswith("All scripts support")
+    ]
+    assert len(promise) == 1, f"SKILL.md's 'All scripts support' sentence: {promise}"
+    flags |= {flag for chunk in _BACKTICKED.findall(promise[0]) for flag in _FLAG.findall(chunk)}
+    return frozenset(flags)
+
+
+def _accepted_but_undocumented() -> dict[str, list[str]]:
+    """{script: options} argparse accepts that neither SKILL.md nor the globals name.
+
+    One spelling per option (the longest), so `-s/--serial` is one finding.
+    """
+    documented = _documented_options(SKILL_MD.read_text(encoding="utf-8"))
+    global_flags = _global_flags()
+    missing: dict[str, list[str]] = {}
+    for script in sorted((SKILL_ROOT / "scripts").glob("*.py")):
+        named = documented.get(script.name, set()) | global_flags
+        gaps = sorted(
+            max(sorted(entry), key=len)
+            for entry in _option_entries(_help_text(str(script)))
+            if not entry & named
+        )
+        if gaps:
+            missing[script.name] = gaps
+    return missing
+
+
+def test_every_flag_a_script_accepts_is_documented_or_excused():
+    """The reverse of the guard above: accepted minus documented, per script.
+
+    The forward guard catches a flag SKILL.md invents; nothing caught a flag
+    SKILL.md never mentions, and an agent reads SKILL.md, not `--help`. So a
+    script's interface that is missing from its `- Options:` bullet is, to the
+    agent, an interface that does not exist. Each such flag is either
+    documented or listed in UNDOCUMENTED_OK with the reason; the core verbs in
+    NEVER_UNDOCUMENTED may only be documented.
+
+    The count is computed here, never written down: a number in a plan or a
+    doc ("29 undocumented flags") is stale the day after it is counted.
+    """
+    missing = _accepted_but_undocumented()
+    unexcused = {
+        script: sorted(set(flags) - UNDOCUMENTED_OK.get(script, frozenset()))
+        for script, flags in missing.items()
+    }
+    unexcused = {script: flags for script, flags in unexcused.items() if flags}
+    count = sum(len(flags) for flags in unexcused.values())
+    assert not unexcused, (
+        f"{count} flag(s) are accepted by argparse but named neither in the script's "
+        "SKILL.md `- Options:` bullet nor in UNDOCUMENTED_OK; document them (or, if "
+        f"they are not a core verb, excuse them with a reason): {unexcused}"
+    )
+
+
+def test_undocumented_ok_holds_no_core_verb_and_nothing_stale():
+    """The ceiling, and the ratchet that keeps the excuse list honest."""
+    core = {
+        script: sorted(flags & NEVER_UNDOCUMENTED)
+        for script, flags in UNDOCUMENTED_OK.items()
+        if flags & NEVER_UNDOCUMENTED
+    }
+    assert not core, f"core action flags may be documented, never excused: {core}"
+
+    scripts = {s.name: s for s in (SKILL_ROOT / "scripts").glob("*.py")}
+    gone = sorted(set(UNDOCUMENTED_OK) - set(scripts))
+    assert not gone, f"UNDOCUMENTED_OK names scripts that no longer exist: {gone}"
+
+    missing = _accepted_but_undocumented()
+    stale = {
+        script: sorted(flags - set(missing.get(script, [])))
+        for script, flags in UNDOCUMENTED_OK.items()
+        if flags - set(missing.get(script, []))
+    }
+    assert not stale, (
+        "UNDOCUMENTED_OK excuses flags that are now documented or no longer accepted; "
+        f"delete them: {stale}"
     )
 
 
