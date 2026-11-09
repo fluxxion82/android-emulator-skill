@@ -17,7 +17,7 @@ android-emulator-skill/                      # repo root
 │       └── android-emulator-skill/
 │           ├── SKILL.md                     # entry point / script reference
 │           └── scripts/                     # production scripts + common/ utilities
-├── .github/workflows/                       # lint, test, release, validate-version, pages
+├── .github/workflows/                       # lint, test, emulator, release, validate-version, pages
 ├── tests/                                   # pytest suite (adb/subprocess mocked, no device)
 ├── pyproject.toml                           # Black / Ruff / pytest config (Python 3.12+)
 └── .pre-commit-config.yaml
@@ -35,9 +35,9 @@ android-emulator-skill/                      # repo root
 ```bash
 # From the repo root
 uv venv --python 3.12
-uv pip install black==26.5.1 ruff==0.15.14 pytest pillow pre-commit
+uv pip install black==26.5.1 ruff==0.15.14 pytest pillow pyyaml pre-commit
 source .venv/bin/activate
-pre-commit install
+pre-commit install && pre-commit install --hook-type commit-msg
 ```
 
 ## Linting and tests
@@ -46,8 +46,8 @@ pre-commit install
 SCRIPTS=android-emulator-skill/skills/android-emulator-skill/scripts
 
 # Format + lint (must be clean)
-black --check "$SCRIPTS"
-ruff check "$SCRIPTS"
+black --check "$SCRIPTS" tests/
+ruff check "$SCRIPTS" tests/
 
 # Unit tests — fully mocked, no device/emulator required
 pytest tests/
@@ -57,20 +57,26 @@ pytest tests/
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `lint.yml` | PR / push (scripts) | Black + Ruff |
-| `test.yml` | PR / push (scripts, tests) | `pytest tests/` |
-| `release.yml` | release published | Validate structure, zip the `android-emulator-skill/` package, attach to release |
-| `validate-version.yml` | release published | `pyproject.toml` version == tag; SKILL.md mentions the version |
-| `pages.yml` | push to `site/**` | Deploy the docs site to GitHub Pages |
+| `lint.yml` | PR / push to `main` | Black + Ruff over `scripts/` and `tests/` |
+| `test.yml` | PR / push to `main` | `pytest tests/` |
+| `emulator.yml` | PR, nightly, manual, called by `release.yml` | `pytest -m emulator` against a booted emulator |
+| `release.yml` | release published | Lint + unit tests, the emulator lane, and the four manifests == tag; only then zip the `android-emulator-skill/` package and attach it |
+| `validate-version.yml` | release published, manual | `pyproject.toml`, SKILL.md frontmatter, `plugin.json` and `marketplace.json` versions == tag |
+| `pages.yml` | push to `main` touching `site/**` or the workflow itself, manual | Deploy the docs site to GitHub Pages |
 
 ## Release process
 
 ```bash
-# 1. Bump version in pyproject.toml AND SKILL.md frontmatter (keep them in sync)
+# 1. Bump the version in pyproject.toml, SKILL.md (frontmatter and `## Scripts (vX.Y.Z)`),
+#    android-emulator-skill/.claude-plugin/plugin.json, .claude-plugin/marketplace.json
+#    and the hero tag in site/index.html; tests/test_packaging_contract.py fails until all agree
 # 2. Commit, tag, push
 git commit -am "chore: bump version to X.Y.Z"
 git tag vX.Y.Z && git push origin main --tags
-# 3. Create a GitHub release for the tag — release.yml packages the plugin zip
+# 3. Create the GitHub release on tag vX.Y.Z — release.yml and validate-version.yml strip only
+#    a leading `v`, so a release on the plugin tag fails its version gate. The plugin tag
+#    (`cd android-emulator-skill && claude plugin tag`, giving android-emulator-skill--vX.Y.Z)
+#    goes on the same commit, as v0.8.0's did; release.yml packages the plugin zip
 ```
 
 ## Code style
@@ -83,7 +89,10 @@ git tag vX.Y.Z && git push origin main --tags
 
 ## Testing strategy
 
-- **Unit tests** mock `adb`/`subprocess` so they run in CI without a device — see `tests/conftest.py`
-  and `tests/fixtures/` (e.g. `SAMPLE_UI_HIERARCHY`).
+- **Unit tests** mock `adb`/`subprocess` so they run in CI without a device. Parsers read output
+  recorded from real devices in `tests/fixtures/recorded/<profile>/` (`tests/record_fixtures.py`
+  records it), never inline tool output; CLAUDE.md states the rule and `tests/test_fixture_policy.py`
+  enforces it.
+- **Emulator tests** (`@pytest.mark.emulator`, deselected by default) run with `pytest -m emulator`.
 - **Manual smoke** (per change touching device behavior): boot an emulator, run
   `bash .../scripts/android_health_check.sh`, then exercise a launch → map → navigate flow.

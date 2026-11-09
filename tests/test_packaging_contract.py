@@ -22,6 +22,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -90,14 +91,14 @@ def test_skill_md_lists_every_script_and_counts_them_correctly():
     decide what this skill can do.
 
     Counted from disk rather than from the heading, so adding a script without
-    documenting it fails here.
+    documenting it fails here. The shell health check is a script too: SKILL.md
+    numbers it among the others, and counting only `*.py` left the heading one
+    short of the categories under it (32 against 33).
     """
     text = SKILL_MD.read_text(encoding="utf-8")
 
-    scripts = sorted(p.name for p in (SKILL_ROOT / "scripts").glob("*.py"))
-    common = sorted(
-        p.name for p in (SKILL_ROOT / "scripts" / "common").glob("*.py") if p.name != "__init__.py"
-    )
+    scripts = _scripts_on_disk()
+    common = _common_modules_on_disk()
 
     undocumented = [name for name in scripts if f"**{name}**" not in text]
     assert not undocumented, f"scripts missing from SKILL.md: {undocumented}"
@@ -113,6 +114,186 @@ def test_skill_md_lists_every_script_and_counts_them_correctly():
     assert int(claimed_common.group(1)) == len(
         common
     ), f"SKILL.md claims {claimed_common.group(1)} common modules; {len(common)} exist"
+
+
+def _scripts_on_disk() -> list[str]:
+    """Every script an agent can run: the Python scripts and the shell health check."""
+    return sorted(p.name for p in (SKILL_ROOT / "scripts").iterdir() if p.suffix in (".py", ".sh"))
+
+
+def _common_modules_on_disk() -> list[str]:
+    return sorted(
+        p.name for p in (SKILL_ROOT / "scripts" / "common").glob("*.py") if p.name != "__init__.py"
+    )
+
+
+_CATEGORY_HEADING = re.compile(r"^#### (.+?) \((\d+) scripts?\)")
+_ANY_HEADING = re.compile(r"^#{1,4} ")
+_NUMBERED_SCRIPT = re.compile(r"^\d+\.\s+\*\*([\w.]+\.(?:py|sh))\*\*")
+
+
+def _skill_md_categories() -> dict[str, tuple[int, list[str]]]:
+    """{category: (count its heading claims, scripts numbered under it)}.
+
+    A category runs from its `#### Name (N scripts)` heading to the next
+    heading of level four or above; the scripts in it are its numbered
+    `N. **name**` entries, the shape the inventory guard above reads.
+    """
+    categories: dict[str, tuple[int, list[str]]] = {}
+    current: str | None = None
+    for line in SKILL_MD.read_text(encoding="utf-8").splitlines():
+        if heading := _CATEGORY_HEADING.match(line):
+            current = heading.group(1)
+            categories[current] = (int(heading.group(2)), [])
+        elif _ANY_HEADING.match(line):
+            current = None
+        elif current and (entry := _NUMBERED_SCRIPT.match(line)):
+            categories[current][1].append(entry.group(1))
+    return categories
+
+
+def test_skill_md_category_counts_add_up_to_the_scripts_heading():
+    """Each `#### Category (N scripts)` holds N entries, and the Ns sum to the total.
+
+    The heading said 32 while the categories under it held 33: the shell health
+    check was numbered in a category and left out of the total.
+    """
+    categories = _skill_md_categories()
+    assert categories, "SKILL.md has no `#### Category (N scripts)` headings"
+    wrong = {
+        name: (claimed, len(entries))
+        for name, (claimed, entries) in categories.items()
+        if claimed != len(entries)
+    }
+    assert (
+        not wrong
+    ), f"category headings whose count is not their entries' (claimed, held): {wrong}"
+
+    listed = sorted(name for _, entries in categories.values() for name in entries)
+    assert listed == _scripts_on_disk(), (
+        "the categories do not list each script on disk exactly once: "
+        f"{sorted(set(listed) ^ set(_scripts_on_disk()))} differ, "
+        f"{sorted({n for n in listed if listed.count(n) > 1})} repeat"
+    )
+    total = re.search(r"### Implemented \((\d+) scripts\)", SKILL_MD.read_text(encoding="utf-8"))
+    assert total, "SKILL.md no longer announces a script count"
+    assert int(total.group(1)) == sum(
+        claimed for claimed, _ in categories.values()
+    ), f"`Implemented ({total.group(1)} scripts)` != the categories' sum"
+
+
+# ---------------------------------------------------------------------------
+# The docs site says what the package holds.
+# ---------------------------------------------------------------------------
+
+SITE_HTML = REPO_ROOT / "site" / "index.html"
+
+
+class _SiteReading(HTMLParser):
+    """The site as a reader meets it: its text, its meta descriptions, its catalog.
+
+    ``text``: every text node and every ``<meta>`` description, in order.
+    ``catalog``: per catalog ``<li>``, the script its first ``<code>`` names and
+    the flags its ``<em>`` lists. ``groups``: the number of catalog groups.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.text: list[str] = []
+        self.catalog: dict[str, set[str]] = {}
+        self.groups = 0
+        self._li: str | None = None
+        self._in_li = self._in_code = self._in_em = False
+
+    def handle_starttag(self, tag, attrs):
+        named = dict(attrs)
+        classes = (named.get("class") or "").split()
+        if tag == "meta" and "description" in (named.get("name") or named.get("property") or ""):
+            self.text.append(named.get("content") or "")
+        elif tag == "div" and "catalog-group" in classes:
+            self.groups += 1
+        elif tag == "li":
+            self._in_li, self._li = True, None
+        elif tag == "code":
+            self._in_code = True
+        elif tag == "em":
+            self._in_em = True
+
+    def handle_endtag(self, tag):
+        if tag == "li":
+            self._in_li, self._li = False, None
+        elif tag == "code":
+            self._in_code = False
+        elif tag == "em":
+            self._in_em = False
+
+    def handle_data(self, data):
+        self.text.append(data)
+        if not self._in_li:
+            return
+        if self._li is None and self._in_code and data.strip().endswith((".py", ".sh")):
+            self._li = data.strip()
+            self.catalog.setdefault(self._li, set())
+        elif self._li and self._in_em:
+            self.catalog[self._li] |= set(_FLAG.findall(data))
+
+
+@functools.cache
+def _site() -> _SiteReading:
+    reading = _SiteReading()
+    reading.feed(SITE_HTML.read_text(encoding="utf-8"))
+    reading.close()
+    return reading
+
+
+def _site_numbers(pattern: str) -> list[int]:
+    """Every number the site's text states in ``pattern`` (one group), whitespace folded."""
+    folded = " ".join(" ".join(_site().text).split())
+    return [int(n) for n in re.findall(pattern, folded, re.IGNORECASE)]
+
+
+def test_the_site_states_the_number_of_scripts_on_disk():
+    """The site said "29 scripts" in five places while 33 existed (32 Python, one shell)."""
+    stated = _site_numbers(r"\b(\d+) (?:production )?scripts\b")
+    assert stated, "site/index.html no longer states how many scripts there are"
+    on_disk = len(_scripts_on_disk())
+    assert set(stated) == {on_disk}, f"the site says {stated} scripts; {on_disk} exist on disk"
+
+
+def test_the_site_states_its_category_and_shared_module_counts():
+    """`N categories` is the catalog's group count; `N shared modules` is common/'s."""
+    categories = _site_numbers(r"\b(\d+) categories\b")
+    assert categories, "the site no longer states its category count"
+    assert set(categories) == {
+        _site().groups
+    }, f"the site says {categories} categories; its catalog has {_site().groups} groups"
+
+    modules = _site_numbers(r"\b(\d+) shared modules\b")
+    assert modules, "the site no longer states how many shared modules back the scripts"
+    common = len(_common_modules_on_disk())
+    assert set(modules) == {common}, f"the site says {modules} shared modules; common/ has {common}"
+
+
+def test_the_site_catalog_lists_every_script_with_flags_it_accepts():
+    """The catalog's flags are argparse's, as SKILL.md's are (see the guard below).
+
+    Five catalog entries still described scripts as they were before a rescope
+    -- `keyboard --text`, `screen_mapper --list`, `visual_diff --image1`,
+    `test_recorder --test-name`, `push_notification --title` -- and five
+    scripts were not in the catalog at all.
+    """
+    catalog = _site().catalog
+    assert sorted(catalog) == _scripts_on_disk(), (
+        "the site catalog and the scripts on disk differ: "
+        f"{sorted(set(catalog) ^ set(_scripts_on_disk()))}"
+    )
+    wrong = {
+        name: sorted(flags - _option_tokens(_help_text(str(SKILL_ROOT / "scripts" / name))))
+        for name, flags in catalog.items()
+        if name.endswith(".py") and flags
+    }
+    wrong = {name: bogus for name, bogus in wrong.items() if bogus}
+    assert not wrong, f"the site catalog names flags argparse does not accept: {wrong}"
 
 
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
@@ -1575,6 +1756,17 @@ def _pyproject_version() -> str:
     return match.group(1)
 
 
+def _site_version() -> str:
+    """The version in the docs site's hero tag (`vX.Y.Z · Plugin`).
+
+    Hand-written like the `## Scripts` heading, and it had been left at v0.4.0
+    through four releases.
+    """
+    match = re.search(r"\bv(\d+\.\d+\.\d+) · Plugin\b", " ".join(_site().text))
+    assert match, "site/index.html has no `vX.Y.Z · Plugin` tag"
+    return match.group(1)
+
+
 @pytest.mark.parametrize(
     ("label", "getter"),
     [
@@ -1592,6 +1784,7 @@ def _pyproject_version() -> str:
         ),
         ("SKILL.md", _skill_md_version),
         ("SKILL.md `## Scripts` heading", _skill_md_scripts_heading_version),
+        ("site/index.html hero tag", _site_version),
     ],
 )
 def test_every_manifest_declares_the_same_version_as_pyproject(label, getter):

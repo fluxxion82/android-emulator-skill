@@ -1,6 +1,6 @@
 ---
 name: android-emulator-skill
-version: 0.8.0
+version: 0.9.0
 description: Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output. Android equivalent of ios-simulator-skill.
 ---
 
@@ -45,9 +45,9 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 
 All scripts support `--help` for detailed options and `--json` for machine-readable output.
 
-## Scripts (v0.8.0)
+## Scripts (v0.9.0)
 
-### Implemented (32 scripts)
+### Implemented (33 scripts)
 
 #### Core Utilities (16 modules in `common/`)
 1. **common/device_utils.py** - ADB command building and device detection
@@ -888,9 +888,10 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       find's failure, not the directory's: its remedy says the device's find
       cannot list this way. An older toybox is not measured. An older
       release's refusal wording is not recorded, and reads as the failure
-    - A `--cat` whose output is longer than `ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES`
-      (8 KiB) is not printed: it is cached for an hour and the answer names
-      the id (`Full content cached as '<id>'`, `cache_id` under `--json`).
+    - A `--cat` whose text is more than `ANDROID_EMU_CONTAINER_CAT_CACHE_BYTES`
+      (8,192 bytes of UTF-8; a byte count, not a character count) is not
+      printed: it is cached for an hour and the answer names the id
+      (`Full content cached as '<id>'`, `cache_id` under `--json`).
       `--get-cached ID` prints that content whole — no further cap, no
       device, no `--package` — exactly as cached in text mode, and with the
       `--cat` fields (`path`, `size_bytes`, `truncated`, `content`) under
@@ -1869,6 +1870,54 @@ handler is not reachable from adb — see `push_notification.py` above.
 
 ## Status & Roadmap
 
+**v0.9.0 — the gaps v0.8.0 named.** v0.8.0 closed with a Known-gaps list.
+This release removes the gaps a test can pin and states the ones it keeps. Each
+removed gap is pinned by a named test that is red on v0.8.0's status commit
+(f69c236) and green here; see the v0.9.0 release notes for the list.
+
+- **Fixture-policy debt is zero.** `KNOWN_VIOLATIONS` in
+  `tests/test_fixture_policy.py` is empty (v0.8.0 left two entries): no test
+  feeds a long inline string of tool output to a parser, and the ratchet fails
+  the next one that does.
+- **Three recorded profiles carry most of the suite.** `emulator-api35` (157
+  fixtures, an Android 15 emulator) is the primary profile; `emulator-api33`
+  (67, an Android 13 userdebug emulator) and `gradle-8.13` (35, Gradle 8.13 /
+  AGP 8.13.2 scaffolds) were recorded for this release. Three smaller profiles
+  from earlier releases still feed tests: `pixel4xl-api33` (15, a phone),
+  `gradle-7.5.1` (5) and `gpxpy-1.6.2` (2). `emulator-api33`
+  recorded what API 33 does differently and what v0.8.0 had not recorded:
+  logcat holding `-B` records back from a live stream (so `log_monitor` and
+  `anr_watcher` read live by dumps there), the uid and process tables behind
+  `anr_watcher --package`'s attribution by uid, two-user `dumpsys package` and
+  `pm grant --user` output for `privacy_manager --user`, a `--cat` read past its
+  cap, adb echoing agent-supplied text on stderr, and the offline and
+  unauthorized device states.
+- **Instrumented tests are a feature (#64).** `build_and_test --instrumented`
+  runs the connected test task on one device and one variant per invocation.
+  The device is resolved before Gradle starts (none attached: exit 3; several
+  and no `--serial`: exit 1) and handed to Gradle as `ANDROID_SERIAL`; the
+  verdict is read from that run's connected JUnit XML. Verified live in the
+  emulator lane.
+- **A per-item batch is one object (#57).** `status_bar`, `appearance`,
+  `privacy_manager` grant/revoke/reset and the `emulator_*` `--all` / `--old`
+  modes answer one object whose `items` each carry `success`, `error` and
+  `remedy`; exit 0 only when every item succeeded. Breaking: they printed
+  `results` (`emulator_shutdown`, counts only). Usage errors joined the
+  schema in #56 (exit 2, one object under
+  `--json`). The Failures entry's "Not in the schema yet" paragraph is gone.
+- **`anr_watcher` is Unix-only (#61).** Its session storage locks with
+  `fcntl.flock`; on a host whose Python has no `fcntl` (Windows) every mode
+  refuses at once (exit 1) rather than run unlocked, and `logs anr`, which
+  runs it, refuses the same way. The other Python scripts keep macOS, Linux
+  and Windows; `android_health_check.sh` needs Bash.
+- **`container --get-cached ID`** prints the content a `--cat` above 8 KiB
+  cached. The id that `--cat` printed had no reader before.
+
+Tests: 3,110 → 4,430 passed at the release commit, 0 xfailed; 13 skipped
+(a per-profile check for a fixture `emulator-api33` did not record, and one
+keyboard case the primary profile cannot exercise) and 28 deselected (the
+emulator lane's `-m emulator` tests).
+
 **v0.8.0 — the diagnostics stop lying.** v0.7.0 proved the agent loop closes
 from the skill's own output. This release goes after the numbers an agent
 reads: a verdict, a count or "nothing found" that the device did not actually
@@ -1878,7 +1927,7 @@ recorded fixture, and was red before the fix.
 - **One error boundary for every script** (`common/cli.py`). A refusal is one
   `{"success": false, "error", "remedy"}` object under `--json` (or
   `Error:`/`Remedy:` on stderr), and exits 1, or 3 when the device is
-  unavailable. An AST guard enumerates all 32 scripts, and the exit-code sweep
+  unavailable. An AST guard enumerates all 32 Python scripts, and the exit-code sweep
   asserts the payload of 40 documented modes twice (39 at this release;
   v0.9.0 added the health check's): once with every tool failing and once
   with none installed.
