@@ -20,7 +20,10 @@ the overlay can paint fewer pixels than the count reports.
 
 Without ``--output`` the artifacts go to a new
 ``~/.android-emulator-skill/cache/visual-diff/<YYYYmmdd-HHMMSS>/`` directory,
-never into the caller's working directory. Every path printed is absolute.
+never into the caller's working directory. Every path printed is absolute --
+the inputs too, in ``--json``'s ``summary`` and in ``diff-report.json`` --
+artifact paths name files that were written, and ``Artifacts saved to:``
+names their directory.
 
 Usage: python scripts/visual_diff.py baseline.png current.png [options]
 """
@@ -28,7 +31,6 @@ Usage: python scripts/visual_diff.py baseline.png current.png [options]
 from __future__ import annotations
 
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -157,9 +159,9 @@ class VisualDiffer:
         """Write ``current`` with every pixel whose R+G+B difference exceeds 30 painted red.
 
         PIL operations over whole images, not a ``getpixel``/``putpixel`` loop
-        (2.6 M Python calls for a 1080x2400 screenshot), and the same picture
-        pixel for pixel. ``ImageChops.add`` clips at 255, which cannot change a
-        ``> 30`` decision.
+        (a 1080x2400 screenshot is 2.6 M pixels, 5-8 M method calls), and the
+        same picture pixel for pixel. ``ImageChops.add`` clips at 255, which
+        cannot change a ``> 30`` decision.
 
         Raises:
             ValueError: The images differ in size. The loop this replaced
@@ -272,6 +274,12 @@ def main(argv: list[str] | None = None):
             "(same device, same --size preset).",
         )
 
+    # The inputs exist -- compare() opened them -- so they resolve. Reported
+    # absolute like the artifacts: a relative path is relative to a cwd the
+    # reader may not share.
+    baseline_path = str(Path(args.baseline).resolve())
+    current_path = str(Path(args.current).resolve())
+
     # Only now, so a refused comparison leaves no empty run directory behind.
     # Absolute, because every path printed below is one an agent should be able
     # to open from wherever it stands; a bare `diff.png` was relative to a cwd
@@ -311,8 +319,8 @@ def main(argv: list[str] | None = None):
     with open(report_path, "w") as f:
         json.dump(
             {
-                "baseline": os.path.basename(args.baseline),
-                "current": os.path.basename(args.current),
+                "baseline": baseline_path,
+                "current": current_path,
                 "results": result,
                 "artifacts": {
                     "diff": _written(diff_image_path),
@@ -328,8 +336,8 @@ def main(argv: list[str] | None = None):
         # Detailed output
         report = {
             "summary": {
-                "baseline": args.baseline,
-                "current": args.current,
+                "baseline": baseline_path,
+                "current": current_path,
                 "threshold": args.threshold,
                 "passed": result["passed"],
             },

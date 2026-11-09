@@ -5,10 +5,11 @@ output. Two contracts:
 
 * ``generate_diff_image`` paints every pixel whose per-channel difference sum
   exceeds 30 red over the current image. It did so with a nested
-  ``getpixel``/``putpixel`` loop (2.6 M Python calls for a 1080x2400
-  screenshot). The vectorised version must give the same picture pixel for
-  pixel: ``_reference_overlay`` below is the original loop, kept verbatim as
-  the reference, and the guard test forbids the per-pixel calls outright.
+  ``getpixel``/``putpixel`` loop (a 1080x2400 screenshot is 2.6 M pixels,
+  5-8 M method calls). The vectorised version must give the same picture
+  pixel for pixel: ``_reference_overlay`` below is the original loop, kept
+  verbatim as the reference, and the guard test forbids the per-pixel calls
+  outright.
 * Without ``--output``, nothing is written into the caller's working
   directory, and every path the script reports is absolute and exists.
 """
@@ -16,6 +17,7 @@ output. Two contracts:
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 
@@ -272,3 +274,21 @@ def test_two_runs_in_one_second_do_not_share_a_directory(
     first_dir = Path(json.loads(first)["artifacts"]["report"]).parent
     second_dir = Path(json.loads(second)["artifacts"]["report"]).parent
     assert first_dir != second_dir
+
+
+def test_relative_inputs_are_reported_as_absolute_paths(screenshots, isolated, capsys):
+    """The summary and the saved report name the inputs absolutely, as given or not."""
+    cwd, _home = isolated
+    base, cur = (Path(p) for p in screenshots)
+    relative = [os.path.relpath(base, cwd), os.path.relpath(cur, cwd)]
+
+    _status, out, _err = _run([*relative, "--json"], capsys)
+
+    report = json.loads(out)
+    for key, expected in (("baseline", base), ("current", cur)):
+        value = Path(report["summary"][key])
+        assert value.is_absolute(), f"summary.{key} is not absolute: {value}"
+        assert value == expected.resolve(), value
+    saved = json.loads(Path(report["artifacts"]["report"]).read_text())
+    assert Path(saved["baseline"]) == base.resolve(), saved["baseline"]
+    assert Path(saved["current"]) == cur.resolve(), saved["current"]
