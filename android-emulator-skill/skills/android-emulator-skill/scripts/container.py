@@ -29,6 +29,7 @@ documented, safe mechanism and is what real debugging workflows rely on.
 
 import argparse
 import codecs
+import contextlib
 import json
 import subprocess
 import sys
@@ -217,6 +218,11 @@ class ContainerInspector:
         # its character count (the recorded cap probe is 43,699 characters in
         # 65,534 bytes; counting characters printed it inline).
         if len(content.encode("utf-8")) > CAT_CACHE_BYTES:
+            # Typed reads keep another type's entries, so no other script sweeps
+            # these: drop the ones past their hour here. Housekeeping only -- a
+            # file that will not go must not fail the read.
+            with contextlib.suppress(OSError):
+                self._cache.cleanup(cache_type="container-cat")
             cache_id = self._cache.save({**base, "content": content}, "container-cat")
             return True, {
                 **base,

@@ -164,7 +164,9 @@ class ProgressiveCache:
 
         Returns:
             Cached data dictionary, or None if not found/expired (or, with
-            ``cache_type``, of another type). An expired entry is deleted.
+            ``cache_type``, of another type). An expired entry is deleted,
+            unless it is another type's: this cache's max age is not that
+            type's, so it is kept whatever its age.
 
         Raises:
             CacheCorruptionError: The entry exists but cannot be read as one.
@@ -184,10 +186,13 @@ class ProgressiveCache:
         except FileNotFoundError:
             return None
 
+        # Type before age. Readers share this directory and keep their entries
+        # for different lengths of time, so this reader's max age says nothing
+        # about another type's entry: it is refused and left for its own reader.
+        if cache_type is not None and entry.get("cache_type") != cache_type:
+            return None
         if self._is_expired(created_at):
             cache_file.unlink(missing_ok=True)
-            return None
-        if cache_type is not None and entry.get("cache_type") != cache_type:
             return None
         return entry.get("data")
 
@@ -199,7 +204,8 @@ class ProgressiveCache:
 
         Returns:
             List of cache entries with id, type, created_at, age_seconds.
-            Expired entries are deleted on the way. A corrupt entry is skipped
+            Expired entries are deleted on the way (with ``cache_type``, only
+            that type's: another type's entry is kept). A corrupt entry is skipped
             and kept -- its type cannot be read, so it belongs to no listing;
             :meth:`corrupt_entries` names them.
 
@@ -216,12 +222,13 @@ class ProgressiveCache:
             except (OSError, CacheCorruptionError):
                 continue
 
-            if self._is_expired(created_at):
-                cache_file.unlink(missing_ok=True)
+            # Filter by type if specified -- before the age check, as in get():
+            # a typed listing never expires another type's entry.
+            if cache_type and entry.get("cache_type") != cache_type:
                 continue
 
-            # Filter by type if specified
-            if cache_type and entry.get("cache_type") != cache_type:
+            if self._is_expired(created_at):
+                cache_file.unlink(missing_ok=True)
                 continue
 
             age_seconds = (datetime.now() - created_at).total_seconds()
@@ -236,11 +243,14 @@ class ProgressiveCache:
 
         return entries
 
-    def cleanup(self, max_age_hours: int | None = None) -> int:
+    def cleanup(self, max_age_hours: int | None = None, cache_type: str | None = None) -> int:
         """Remove expired cache entries.
 
         Args:
             max_age_hours: Age threshold (default: uses instance max_age_hours)
+            cache_type: When given, only entries of this type are considered;
+                a reader sweeping its own type passes it, because its max age
+                is not another type's.
 
         Returns:
             Number of expired entries deleted. A corrupt entry is neither
@@ -256,8 +266,10 @@ class ProgressiveCache:
 
         for cache_file in self.cache_dir.glob("*.json"):
             try:
-                _entry, created_at = self._read_entry(cache_file)
+                entry, created_at = self._read_entry(cache_file)
             except (OSError, CacheCorruptionError):
+                continue
+            if cache_type is not None and entry.get("cache_type") != cache_type:
                 continue
             if self._is_expired(created_at, max_age_hours):
                 cache_file.unlink(missing_ok=True)

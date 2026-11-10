@@ -556,7 +556,7 @@ def test_crash_buffer_triage_on_a_live_device(live_device, scripts_dir):
 
 
 @pytest.mark.emulator
-def test_a_forced_crash_shows_up_in_triage(live_device, scripts_dir, adb):
+def test_a_forced_crash_shows_up_in_triage(emulator_only_device, scripts_dir, adb):
     """`am crash` produces a real trace; triage must find and attribute it.
 
     Keyed on the PID of the process that was crashed, not merely on "some crash
@@ -564,13 +564,14 @@ def test_a_forced_crash_shows_up_in_triage(live_device, scripts_dir, adb):
     earlier run would satisfy a count-based assertion without this run working.
 
     Uses the repo's own fixture app when it is installed, and skips otherwise
-    rather than crashing an unrelated app on someone's device.
+    rather than crashing an unrelated app on someone's device. Emulator only:
+    it force-stops, launches and crashes that app, and a phone can have it.
     """
     package = "com.example.composefixture"
 
     def device(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [adb, "-s", live_device, "shell", *args],
+            [adb, "-s", emulator_only_device, "shell", *args],
             capture_output=True,
             text=True,
             timeout=60,
@@ -578,7 +579,7 @@ def test_a_forced_crash_shows_up_in_triage(live_device, scripts_dir, adb):
         )
 
     if package not in device("pm", "list", "packages", package).stdout:
-        pytest.skip(f"{package} is not installed on {live_device}")
+        pytest.skip(f"{package} is not installed on {emulator_only_device}")
 
     # Force-stop before launching so the PID below is guaranteed fresh. Without
     # it, a process left alive by an earlier forced crash keeps its PID, and its
@@ -597,7 +598,7 @@ def test_a_forced_crash_shows_up_in_triage(live_device, scripts_dir, adb):
         if not pid:
             time.sleep(1)
     if not pid:
-        pytest.skip(f"{package} would not stay running on {live_device}")
+        pytest.skip(f"{package} would not stay running on {emulator_only_device}")
 
     def triage() -> dict:
         result = subprocess.run(
@@ -605,7 +606,7 @@ def test_a_forced_crash_shows_up_in_triage(live_device, scripts_dir, adb):
                 sys.executable,
                 str(scripts_dir / "crash_triage.py"),
                 "--serial",
-                live_device,
+                emulator_only_device,
                 "--package",
                 package,
                 "--json",

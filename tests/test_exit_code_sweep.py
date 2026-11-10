@@ -730,11 +730,32 @@ def _python_scripts() -> list[str]:
     return list(SCRIPT_NAMES)
 
 
+def _shell_scripts() -> list[str]:
+    """Every shell script, read off the directory so a new one joins the sweep."""
+    return sorted(path.name for path in SCRIPTS.glob("*.sh"))
+
+
+# A shell script has no argparse; it must still refuse what it does not take,
+# in argparse's words, so the same assertions hold for it. The empty argument
+# is one too (`script "$UNSET_VARIABLE"`): a refusal built by joining the
+# unknown arguments saw nothing to refuse in it, and went on to the checks.
+SHELL_USAGE_ERRORS: tuple[tuple[str, ...], ...] = ((UNKNOWN_FLAG,), ("stray",), ("",))
+
+# The health check's --json answers all carry `ok` beside `success` (its report
+# and its refusals alike), so a caller reading `ok` gets an answer here too.
+USAGE_EXTRA_KEYS: dict[str, frozenset[str]] = {"android_health_check.sh": frozenset({"ok"})}
+
+
 def _usage_cases() -> list:
     def _param(script: str, argv: tuple[str, ...], what: str):
         return pytest.param(script, argv, id=f"{script.removesuffix('.py')} {what}")
 
     cases = [_param(script, (UNKNOWN_FLAG,), "unknown flag") for script in _python_scripts()]
+    cases += [
+        _param(script, argv, " ".join(arg or "''" for arg in argv))
+        for script in _shell_scripts()
+        for argv in SHELL_USAGE_ERRORS
+    ]
     cases += [
         _param(script, argv, " ".join(argv)) for script, argv in sorted(TYPED_USAGE_ERRORS.items())
     ]
@@ -761,8 +782,14 @@ def _argparse_message(stderr: str) -> str:
     return _fold(stderr.split(": error: ", 1)[1])
 
 
-def _assert_one_usage_object(outcome: Outcome, label: str) -> dict:
-    """Exit 2, and stdout is one line holding exactly the three contract keys."""
+def _assert_one_usage_object(
+    outcome: Outcome, label: str, extra_keys: frozenset[str] = frozenset()
+) -> dict:
+    """Exit 2, and stdout is one line holding exactly the three contract keys.
+
+    ``extra_keys`` are the ones a script puts in every object it prints (the
+    health check's ``ok``); they are required too, and false.
+    """
     shown = f"\n{label}\nstdout: {outcome.stdout[-600:]!r}\nstderr: {outcome.stderr[-600:]!r}"
     assert "Traceback" not in outcome.stdout + outcome.stderr, f"crashed:{shown}"
     assert outcome.returncode == USAGE, f"exit {outcome.returncode}, not {USAGE}:{shown}"
@@ -770,8 +797,10 @@ def _assert_one_usage_object(outcome: Outcome, label: str) -> dict:
     assert len(lines) == 1, f"stdout is {len(lines)} lines, not one JSON object:{shown}"
     payload = json.loads(lines[0])
     assert isinstance(payload, dict), f"not an object:{shown}"
-    assert set(payload) == {"success", "error", "remedy"}, f"keys {sorted(payload)}:{shown}"
+    expected_keys = {"success", "error", "remedy"} | extra_keys
+    assert set(payload) == expected_keys, f"keys {sorted(payload)}:{shown}"
     assert payload["success"] is False, shown
+    assert all(payload[key] is False for key in extra_keys), shown
     assert isinstance(payload["error"], str) and payload["error"].strip(), shown
     assert isinstance(payload["remedy"], str) and payload["remedy"].strip(), shown
     assert outcome.tools == (), f"a rejected command line reached {outcome.tools}:{shown}"
@@ -799,12 +828,67 @@ def test_a_usage_error_under_json_is_one_refusal_object_at_exit_2(
     message = _argparse_message(text.stderr)
 
     payload = _assert_one_usage_object(
-        _run_usage(script, (*argv, "--json"), toolchains, tmp_path), f"{label} --json"
+        _run_usage(script, (*argv, "--json"), toolchains, tmp_path),
+        f"{label} --json",
+        USAGE_EXTRA_KEYS.get(script, frozenset()),
     )
     assert (
         payload["error"] == message
     ), f"{label}: --json says {payload['error']!r}, the prose says {message!r}"
     assert "usage:" in payload["remedy"], f"{label}: the remedy has no usage line: {payload}"
+
+
+def test_the_usage_sweep_reaches_every_script_on_disk():
+    """Exit criterion 2 is about every script, so the sweep is counted against the directory.
+
+    The Python half comes from the boundary guard's list and the shell half
+    from a glob; this compares their union with what is actually shipped, so a
+    script of either kind cannot sit outside the usage sweep.
+    """
+    swept = {case.values[0] for case in _usage_cases() if case.values[1] == (UNKNOWN_FLAG,)}
+    shipped = {
+        path.name
+        for path in SCRIPTS.iterdir()
+        if path.suffix in {".py", ".sh"} and path.name != "__init__.py"
+    }
+    assert shipped, "no scripts found; the comparison below would be vacuous"
+    assert (
+        swept == shipped
+    ), f"not swept: {sorted(shipped - swept)}; swept but not shipped: {sorted(swept - shipped)}"
+
+
+@pytest.mark.parametrize("script", _shell_scripts())
+@pytest.mark.parametrize("unknown", [argv[0] for argv in SHELL_USAGE_ERRORS], ids=repr)
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_a_shell_script_refuses_usage_before_it_needs_any_tool(
+    script: str, unknown: str, json_mode: bool, tmp_path
+):
+    """With nothing on PATH at all, the refusal is still the usage error.
+
+    The health check answered a temp-directory error at exit 1 here: it had
+    ignored the unknown flag and gone on to ``mktemp``. A rejected command line
+    must not depend on the environment the script was about to inspect.
+    """
+    argv = (unknown, "--json") if json_mode else (unknown,)
+    completed = subprocess.run(
+        ["/bin/bash", str(SCRIPTS / script), *argv],
+        env={"PATH": "", "HOME": str(tmp_path), "TMPDIR": str(tmp_path / "absent")},
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=MODE_TIMEOUT_SECONDS,
+        check=False,
+    )
+    shown = f"stdout: {completed.stdout[-600:]!r}\nstderr: {completed.stderr[-600:]!r}"
+    assert completed.returncode == USAGE, f"exit {completed.returncode}, not {USAGE}\n{shown}"
+    said = completed.stdout if json_mode else completed.stderr
+    assert (unknown or "''") in said, f"the refusal does not name the argument\n{shown}"
+    if json_mode:
+        assert completed.stderr == "", shown
+        assert json.loads(completed.stdout)["success"] is False
+    else:
+        assert completed.stdout == "", shown
 
 
 def test_a_scripts_alias_for_json_gets_the_object_too(toolchains, tmp_path):

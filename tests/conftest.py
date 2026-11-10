@@ -258,6 +258,39 @@ def adb() -> str:
     return path
 
 
+def booted_serials(listing: str) -> list[str]:
+    """Serials `adb devices` reports in the `device` state, in its order."""
+    # The state is the second column in both shapes: `adb devices` stops
+    # there, `adb devices -l` goes on to product, model and transport id.
+    rows = [line.split() for line in listing.splitlines()[1:]]
+    return [row[0] for row in rows if len(row) >= 2 and row[1] == "device"]
+
+
+def emulator_serials(serials: list[str]) -> list[str]:
+    """The serials that are provably emulators: the ones adb names `emulator-<port>`."""
+    return [serial for serial in serials if serial.startswith("emulator-")]
+
+
+def emulator_with_package(adb: str, listing: str, package: str, run=subprocess.run) -> str | None:
+    """The first booted EMULATOR that has ``package`` installed, or None.
+
+    For a live test that needs an app and will then drive it. Only emulators
+    are asked: a phone listed first, with the same package on it, is neither
+    queried nor returned, so its serial never reaches an adb command line.
+    """
+    for serial in emulator_serials(booted_serials(listing)):
+        packages = run(
+            [adb, "-s", serial, "shell", "pm", "list", "packages", package],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if package in packages.stdout:
+            return serial
+    return None
+
+
 @pytest.fixture(scope="session")
 def live_device(adb: str) -> str:
     """Serial of a booted device, or skip.
@@ -273,11 +306,7 @@ def live_device(adb: str) -> str:
     except subprocess.TimeoutExpired:
         pytest.skip("adb devices timed out")
 
-    serials = [
-        line.split()[0]
-        for line in result.stdout.splitlines()[1:]
-        if line.strip() and line.split()[-1] == "device"
-    ]
+    serials = booted_serials(result.stdout)
     if not serials:
         pytest.skip("no booted device; start one and re-run with -m emulator")
 
@@ -289,7 +318,7 @@ def live_device(adb: str) -> str:
     #
     # A physical device is used only when it is the ONLY thing attached, which
     # is a deliberate choice by whoever attached it.
-    emulators = [serial for serial in serials if serial.startswith("emulator-")]
+    emulators = emulator_serials(serials)
     if emulators:
         return emulators[0]
 

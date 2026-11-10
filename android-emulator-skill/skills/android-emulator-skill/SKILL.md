@@ -729,7 +729,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
 #### Discovery & Device State (14 scripts) ⭐ NEW
 
-23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing or the JDK is below 17. Quick Start step 0.
+23. **android_health_check.sh** - Verify the environment (ANDROID_HOME, adb, emulator, avdmanager, sdkmanager, java, Python 3.12+, Pillow); lists connected devices and AVDs. Exits non-zero if adb is missing or the JDK is below 17; an argument it does not take is a usage error (exit 2, the one refusal object under `--json`), refused before anything is checked. Quick Start step 0.
     - The JDK floor is 17 (AGP 8 runs Gradle on nothing older). The major is
       read from the first line of `java -version` (both streams) that STARTS
       `java version "` or `openjdk version "` -- not from its first line,
@@ -1721,7 +1721,7 @@ python3 "$SKILL_DIR/scripts/accessibility_audit.py" --output audit-reports/ --ve
 
 ## Requirements
 
-- macOS, Linux, or Windows -- except `anr_watcher.py`, which is Unix-only (macOS, Linux) as a whole: its session storage locks with `fcntl.flock`, and on a host whose Python has no `fcntl` (Windows) every mode, `--since` included, refuses at once (exit 1, the one refusal object under `--json`). Its live readers differ by level: on API 33 they read by dumps through temporary files, with no `select()`; on every other level they stream, waiting on adb's pipe with `select()`, which on Windows takes only sockets
+- macOS or Linux. Windows is untested: no CI job runs there, `build_and_test.py` always runs the Unix `gradlew` wrapper (never `gradlew.bat`), `android_health_check.sh` needs Bash, and `anr_watcher.py` is Unix-only (macOS, Linux) as a whole: its session storage locks with `fcntl.flock`, and on a host whose Python has no `fcntl` (Windows) every mode, `--since` included, refuses at once (exit 1, the one refusal object under `--json`). Its live readers differ by level: on API 33 they read by dumps through temporary files, with no `select()`; on every other level they stream, waiting on adb's pipe with `select()`, which on Windows takes only sockets
 - Android SDK with platform-tools and emulator
 - Python 3.12+
 - ADB (Android Debug Bridge)
@@ -1846,7 +1846,7 @@ planned rather than an invented percentage.
 
 **Structured Data**: Scripts output JSON or formatted text, not raw logs. Easy to parse and integrate.
 
-**Cross-Platform**: Works on macOS, Linux, and Windows, except `anr_watcher.py`, which is Unix-only as a whole: its session storage locks with `fcntl`, and on Windows every mode refuses (see Requirements).
+**Cross-Platform**: Works on macOS and Linux. Windows is untested, and `build_and_test.py`, `android_health_check.sh` and `anr_watcher.py` are known not to run there (see Requirements).
 
 **Real Devices**: Unlike iOS, works with both emulators and real devices.
 
@@ -1908,12 +1908,22 @@ removed gap is pinned by a named test that is red on v0.8.0's status commit
 - **`anr_watcher` is Unix-only (#61).** Its session storage locks with
   `fcntl.flock`; on a host whose Python has no `fcntl` (Windows) every mode
   refuses at once (exit 1) rather than run unlocked, and `logs anr`, which
-  runs it, refuses the same way. The other Python scripts keep macOS, Linux
-  and Windows; `android_health_check.sh` needs Bash.
+  runs it, refuses the same way. `android_health_check.sh` needs Bash, and
+  `build_and_test.py` always runs the Unix `gradlew` wrapper, never
+  `gradlew.bat`. Nothing is run on Windows in CI, so Windows is untested, not
+  supported (Known gaps).
 - **`container --get-cached ID`** prints the content a `--cat` above 8 KiB
-  cached. The id that `--cat` printed had no reader before.
+  cached. The id that `--cat` printed had no reader before. A reader is
+  refused an entry of another script's type before that entry's age is
+  looked at, so `container`'s one-hour reader cannot expire and delete a
+  build `build_and_test` still keeps for a day; `container` clears only its
+  own expired entries.
+- **`android_health_check.sh` refuses an argument it does not take** (exit
+  2, the one object under `--json`) before it needs any tool; it ignored
+  one. The usage sweep now covers every script on disk, the shell script
+  included.
 
-Tests: 3,110 → 4,430 passed at the release commit, 0 xfailed; 13 skipped
+Tests: 3,110 → 4,455 passed at the release commit, 0 xfailed; 13 skipped
 (a per-profile check for a fixture `emulator-api33` did not record, and one
 keyboard case the primary profile cannot exercise) and 28 deselected (the
 emulator lane's `-m emulator` tests).
@@ -2019,6 +2029,18 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
 
 **Known gaps, for the next release:**
 
+- Windows is untested. No CI job runs there; `build_and_test.py` never
+  selects `gradlew.bat`, `android_health_check.sh` needs Bash and
+  `anr_watcher.py` refuses. Whether the remaining scripts work there has not
+  been observed.
+- `test_recorder` skips a line of a session's `steps.jsonl` it cannot parse
+  and does not say so. After a damaged step file (a write cut short),
+  `--stop` reports on the lines that still parse: fewer steps, or none, in a
+  report that can still say PASSED and exit 0.
+- `model_inspector`'s Room schema reading is tested against a schema
+  document written by hand, not one Room's exporter produced: no exported
+  schema is recorded, so a difference in the real format would not be
+  caught.
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
 - `anr_watcher --package` cannot attribute jank or StrictMode written by an
@@ -2103,9 +2125,15 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     **last line** of stdout, and parses on its own. `anr_watcher --since
     --json` is JSON Lines as well, like `--watch --json`: one object per
     event, no enclosing document, so read it line by line (a single-document
-    parse fails at the second event). Every other mode keeps stdout to the one
-    object under `--json` (`emulator_delete`'s confirmation prompt goes to
-    stderr).
+    parse fails at the second event). `anr_watcher --get-details ID --raw`
+    prints the session's stored event lines (`events.jsonl`, an abandoned
+    session's up to its fence), with or without `--json`: JSON Lines too.
+    Every other mode keeps stdout to one
+    JSON document under `--json` (`emulator_delete`'s confirmation prompt
+    goes to stderr). A refusal is always the object; a successful listing is
+    an array instead in five modes: `build_and_test --get-errors`,
+    `--get-warnings` and `--list-builds`, `test_recorder --list`, and
+    `anr_watcher --list-sessions`.
   - Some places catch a device error on purpose, so it does not reach the
     boundary. This list is not exhaustive; among them: boot-completion
     polling (`emulator_boot`), the snapshot
@@ -2124,7 +2152,9 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
     tools present and failing, and with none on PATH at all — and
     asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
     naming the tool; the exact status), not just a non-zero exit. It runs a
-    usage error through every script in both modes too.
+    usage error through every script in both modes too, and fails if a
+    script on disk is missing from that run (`android_health_check.sh`
+    included; its object carries `ok` as well, like its other answers).
   - A **batch** that reports per item — per operation in `status_bar` and
     `appearance`, per permission in `privacy_manager`'s grant/revoke/reset,
     per AVD or emulator in `emulator_boot` / `emulator_shutdown` /

@@ -25,7 +25,7 @@ android-emulator-skill/                      # repo root
 
 ## Prerequisites
 
-- macOS, Linux, or Windows
+- macOS or Linux (Windows is untested; see SKILL.md, Known gaps)
 - Android SDK with `platform-tools`, `emulator`, `avdmanager` on `PATH`; `ANDROID_HOME` set
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended for environment + tooling)

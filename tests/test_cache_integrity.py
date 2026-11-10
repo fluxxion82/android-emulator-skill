@@ -19,7 +19,7 @@ The files written below are constructed cache state, not tool output.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -332,3 +332,99 @@ def test_build_and_test_refuses_an_entry_another_script_cached(
     said = json.loads(captured.out)["error"] if json_mode else captured.err
     assert foreign in said, said
     assert (cache_dir / f"{foreign}.json").exists(), "the other script's entry was removed"
+
+
+# ---------------------------------------------------------------------------
+# A reader's max age is its own type's. Readers share one directory and differ
+# in how long they keep an entry (a build 24 hours, a --cat one hour), so the
+# type is checked before the age: a short-lived reader handed a long-lived
+# type's id refuses it and leaves it for the reader it belongs to.
+
+
+def _aged(cache_dir, cache_id: str, hours: float):
+    path = cache_dir / f"{cache_id}.json"
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    entry["created_at"] = (datetime.now() - timedelta(hours=hours)).isoformat()
+    path.write_text(json.dumps(entry), encoding="utf-8")
+    return path
+
+
+def test_a_typed_get_never_expires_another_types_entry(cache_dir):
+    builds = ProgressiveCache(cache_dir=str(cache_dir), max_age_hours=24)
+    cats = ProgressiveCache(cache_dir=str(cache_dir), max_age_hours=1)
+    build = builds.save({"stdout": "valid build log"}, "build-result")
+    path = _aged(cache_dir, build, hours=2)
+
+    assert cats.get(build, cache_type="container-cat") is None
+    assert path.exists(), "a one-hour reader deleted a two-hour-old build"
+    assert builds.get(build, cache_type="build-result") == {"stdout": "valid build log"}
+
+
+def test_a_typed_listing_never_expires_another_types_entry(cache_dir):
+    builds = ProgressiveCache(cache_dir=str(cache_dir), max_age_hours=24)
+    cats = ProgressiveCache(cache_dir=str(cache_dir), max_age_hours=1)
+    build = builds.save({"stdout": "valid build log"}, "build-result")
+    path = _aged(cache_dir, build, hours=2)
+
+    assert cats.list_entries("container-cat") == []
+    assert path.exists(), "a one-hour reader's listing deleted a two-hour-old build"
+    assert [entry["id"] for entry in builds.list_entries("build-result")] == [build]
+
+
+@pytest.mark.parametrize("read", ["typed-get", "typed-listing", "untyped-get", "untyped-listing"])
+def test_a_reader_still_expires_what_is_its_own(cache_dir, read):
+    """The other half: an old entry of the reader's own type, or any old entry
+    under an untyped read, is still refused and deleted."""
+    cats = ProgressiveCache(cache_dir=str(cache_dir), max_age_hours=1)
+    cat = cats.save({"content": "old text"}, "container-cat")
+    path = _aged(cache_dir, cat, hours=2)
+
+    if read == "typed-get":
+        assert cats.get(cat, cache_type="container-cat") is None
+    elif read == "typed-listing":
+        assert cats.list_entries("container-cat") == []
+    elif read == "untyped-get":
+        assert cats.get(cat) is None
+    else:
+        assert cats.list_entries() == []
+    assert not path.exists(), "an expired entry was kept"
+
+
+@pytest.mark.parametrize("json_mode", [True, False])
+def test_a_build_outlives_a_container_read_of_its_id(tmp_path, json_mode, monkeypatch, capsys):
+    """The two real readers over one cache: build_and_test's own build id, two
+    hours old, is passed to ``container --get-cached`` and then read back."""
+    import build_and_test as build_script
+    import container
+
+    from common import cli
+    from gradle import BuildResultCache
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    build = BuildResultCache().save(
+        success=True,
+        stdout="valid build log",
+        stderr="",
+        errors=[],
+        warnings=[],
+        failed_tasks=[],
+        test_results=None,
+        variant="debug",
+        module="app",
+        tasks=["assembleDebug"],
+        duration=1.0,
+    )
+    path = _aged(cache_utils.default_cache_dir(), build, hours=2)
+    flags = ["--json"] if json_mode else []
+
+    with pytest.raises(SystemExit) as refused:
+        cli.run(container.main, ["--get-cached", build, *flags])
+    capsys.readouterr()
+    assert refused.value.code == 1
+    assert path.exists(), "container --get-cached deleted a build that had not expired"
+
+    with pytest.raises(SystemExit) as read_back:
+        cli.run(build_script.main, ["--get-log", build, *flags])
+    captured = capsys.readouterr()
+    assert read_back.value.code == 0, (captured.out, captured.err)
+    assert "valid build log" in captured.out
