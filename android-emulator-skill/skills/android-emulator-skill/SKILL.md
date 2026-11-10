@@ -1915,7 +1915,8 @@ handler is not reachable from adb — see `push_notification.py` above.
 
 ## Status & Roadmap
 
-**v0.9.0 — the gaps v0.8.0 named.** v0.8.0 closed with a Known-gaps list.
+**v0.9.0 — most known gaps closed, instrumented tests added.** v0.8.0 closed
+with a Known-gaps list.
 This release removes the gaps a test can pin and states the ones it keeps. Each
 removed gap is pinned by a named test that is red on v0.8.0's status commit
 (f69c236) and green here; see the v0.9.0 release notes for the list.
@@ -1967,8 +1968,18 @@ removed gap is pinned by a named test that is red on v0.8.0's status commit
   2, the one object under `--json`) before it needs any tool; it ignored
   one. The usage sweep now covers every script on disk, the shell script
   included.
+- **`test_recorder` discloses a damaged `steps.jsonl` (#67).** `--stop`,
+  `--get-details` and `--list` say the recording is incomplete and count
+  what was lost, and `--stop` exits 1; damaged lines were skipped silently.
+- **`model_inspector --schema` is tested on a schema Room exported (#69).**
+  It reports views and FTS tables, and `--raw` takes a table or view name.
+  Breaking: `entity_name` is gone from `--json`; Room's export never names
+  the class.
+- **The test toolchain is pinned (#68).** `dev-constraints.txt` states each
+  version once; every workflow install and the documented commands take
+  theirs from it, and a test fails one written any other way.
 
-Tests: 3,110 → 4,455 passed at the release commit, 0 xfailed; 13 skipped
+Tests: 3,110 → 4,905 passed at the release commit, 0 xfailed; 13 skipped
 (a per-profile check for a fixture `emulator-api33` did not record, and one
 keyboard case the primary profile cannot exercise) and 28 deselected (the
 emulator lane's `-m emulator` tests).
