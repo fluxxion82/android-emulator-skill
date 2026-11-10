@@ -75,6 +75,8 @@ import signal
 import struct
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,6 +90,8 @@ RUN_TIMEOUT_SECONDS = 60
 # How long a killed run's pipes may take to close. Only a process outside its
 # group (a detached worker, which writes to neither) could hold them open.
 REAP_TIMEOUT_SECONDS = 10
+# How often ``interrupt_when`` is asked while a run goes on.
+INTERRUPT_CHECK_SECONDS = 0.05
 
 # Directories that must stay reachable for the interpreter and coreutils, and
 # that hold no Android tool on the machines this suite runs on (asserted by
@@ -460,6 +464,7 @@ class FakeToolchain:
         stdin: str | None = None,
         timeout: float = RUN_TIMEOUT_SECONDS,
         interrupt_after: float | None = None,
+        interrupt_when: Callable[[], bool] | None = None,
         **extra_env: str,
     ) -> subprocess.CompletedProcess:
         """Run one skill script with this toolchain and nothing else on PATH.
@@ -468,6 +473,10 @@ class FakeToolchain:
         ``interrupt_after`` sends the script SIGINT (Ctrl-C) once that many
         seconds have passed, for a mode that runs until it is interrupted
         (``log_monitor --follow`` over a device that ``follows``).
+        ``interrupt_when`` sends it once that condition holds instead, asked
+        every ``INTERRUPT_CHECK_SECONDS`` -- for a spec that must not interrupt
+        before the script reached a step (the stub calls it made), however
+        slowly it got there.
 
         The script runs in a process group of its own. Past ``timeout`` the
         whole group is killed -- the script and every stub it started -- and
@@ -489,7 +498,11 @@ class FakeToolchain:
             start_new_session=True,
         ) as process:
             try:
-                if interrupt_after is None:
+                if interrupt_when is not None:
+                    stdout, stderr = self._communicate_until(
+                        process, stdin if stdin is not None else "", interrupt_when, timeout
+                    )
+                elif interrupt_after is None:
                     stdout, stderr = process.communicate(
                         stdin if stdin is not None else "", timeout=timeout
                     )
@@ -509,6 +522,32 @@ class FakeToolchain:
                     process.communicate(timeout=REAP_TIMEOUT_SECONDS)
                 raise
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    @staticmethod
+    def _communicate_until(
+        process: subprocess.Popen,
+        stdin: str,
+        interrupt_when: Callable[[], bool],
+        timeout: float,
+    ) -> tuple[str, str]:
+        """``communicate``, sending SIGINT once ``interrupt_when()`` holds; all within ``timeout``.
+
+        Raises:
+            subprocess.TimeoutExpired: ``timeout`` passed (the caller kills the group).
+        """
+        ends = time.monotonic() + timeout
+        given: str | None = stdin
+        while True:
+            try:
+                left = max(0.0, ends - time.monotonic())
+                return process.communicate(given, timeout=min(INTERRUPT_CHECK_SECONDS, left))
+            except subprocess.TimeoutExpired:
+                given = None  # handed over by the first call; a retry must not resend it
+                if interrupt_when():
+                    process.send_signal(signal.SIGINT)
+                    return process.communicate(timeout=max(0.0, ends - time.monotonic()))
+                if time.monotonic() >= ends:
+                    raise
 
     # --- reading back -------------------------------------------------------
 
