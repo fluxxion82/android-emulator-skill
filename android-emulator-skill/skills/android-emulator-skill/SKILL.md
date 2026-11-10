@@ -1987,8 +1987,12 @@ removed gap is pinned by a named test that is red on v0.8.0's status commit
 - **The test toolchain is pinned (#68).** `dev-constraints.txt` states each
   version once; every workflow install and the documented commands take
   theirs from it, and a test fails one written any other way.
+- **`localization_audit` compares `<plurals>` placeholders item by item
+  (#71).** A language with more plural categories than English (Serbian,
+  Arabic) is no longer a mismatch; an item that drops or adds an argument
+  still is, and the finding names its `quantity`.
 
-Tests: 3,110 → 4,905 passed at the release commit, 0 xfailed; 13 skipped
+Tests: 3,110 → 4,916 passed at the release commit, 0 xfailed; 13 skipped
 (a per-profile check for a fixture `emulator-api33` did not record, and one
 keyboard case the primary profile cannot exercise) and 28 deselected (the
 emulator lane's `-m emulator` tests).
