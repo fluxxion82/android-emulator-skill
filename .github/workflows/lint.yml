@@ -26,11 +26,15 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
+          cache-dependency-path: dev-constraints.txt
 
       - name: Install linting tools
+        # Versions come from dev-constraints.txt and nowhere else: packages are
+        # named bare here. Guarded by tests/test_packaging_contract.py::
+        # test_every_workflow_install_takes_its_version_from_the_shared_pins.
         run: |
-          python -m pip install --upgrade pip
-          pip install 'black==26.5.1' 'ruff==0.15.14'
+          python -m pip install -c dev-constraints.txt pip
+          pip install -c dev-constraints.txt black ruff
 
       - name: Run Black (formatter check)
         run: |

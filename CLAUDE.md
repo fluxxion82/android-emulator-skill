@@ -20,6 +20,7 @@ android-emulator-skill/                      # repo root
 │       └── scripts/                         # production scripts + common/ utilities
 ├── .github/workflows/                        # lint, test, release, validate-version, pages
 ├── tests/                                    # pytest suite (adb/subprocess mocked)
+├── dev-constraints.txt                       # exact pins for the dev toolchain; CI and local read it
 └── pyproject.toml / .pre-commit-config.yaml
 ```
 
@@ -130,8 +131,16 @@ Therefore:
 Run the suite with:
 
 ```bash
-uvx --python 3.12 --with pytest --with pillow --with pyyaml pytest tests/
+uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest tests/
 ```
+
+`dev-constraints.txt` is the one place the toolchain's versions are stated (exact
+pins: pip, pytest, Pillow, PyYAML, Black, Ruff). Every install step in a workflow
+is written one way, `pip install -c dev-constraints.txt <pinned names>` and nothing
+else in the step; a guard in `tests/test_packaging_contract.py` fails a workflow
+that names an installer any other way. It checks how the workflows are written,
+not what a job does at run time. Third-party actions are pinned to commits by the
+same module.
 
 `pyyaml` is required, not optional: the guards in `tests/test_packaging_contract.py`
 parse `.github/workflows/` to assert a release cannot be cut without running the

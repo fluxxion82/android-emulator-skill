@@ -305,10 +305,31 @@ def _yaml(name: str):
     Deliberately NOT `pytest.importorskip("yaml")`: these guards protect the
     release gate, and a guard that skips when a dependency is missing is worth
     nothing. CI installs pyyaml precisely so these run.
+
+    A mapping with two keys the loader reads as one is refused. PyYAML keeps
+    the last and drops the other without a word, and it reads YAML 1.1, where
+    `yes`, `on` and `true` are one key; GitHub reads 1.2, where they are
+    three. What it dropped would be a string no guard here ever saw. (A merge
+    key that an own key overrides is refused the same way; no workflow has
+    one.)
     """
     import yaml
 
-    return yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+    class RefusingEqualKeys(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            mapping = super().construct_mapping(node, deep=deep)
+            assert len(mapping) == len(node.value), (
+                f"{name}:{node.start_mark.line + 1}: this mapping has {len(node.value)} keys "
+                f"and PyYAML reads as one key what the file writes as several, leaving "
+                f"{len(mapping)}"
+            )
+            return mapping
+
+    loader = RefusingEqualKeys((WORKFLOWS / name).read_text(encoding="utf-8"))
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def test_a_release_cannot_be_cut_without_running_the_tests():
@@ -2451,3 +2472,1263 @@ def test_the_path_filter_detector_actually_detects():
     # always-on -- which would fail the guard above for the wrong reason.
     unfiltered = {"on": {"pull_request": {"branches": ["main"]}, "push": {"branches": ["main"]}}}
     assert _path_filter_offenders("emulator.yml", unfiltered) == []
+
+
+# ---------------------------------------------------------------------------
+# Toolchain pins (S5): one file states the versions, every install reads it.
+# ---------------------------------------------------------------------------
+
+CONSTRAINTS = REPO_ROOT / "dev-constraints.txt"
+
+# What each workflow installs with pip, by hand: the mirror that keeps the scan
+# below from passing over nothing, and from passing a test workflow that quietly
+# stopped installing Pillow (the image tests would skip, not fail). A workflow
+# not named here installs nothing.
+WORKFLOW_INSTALLS = {
+    "test.yml": {"pip", "pytest", "pillow", "pyyaml"},
+    "emulator.yml": {"pip", "pytest", "pillow", "pyyaml"},
+    "lint.yml": {"pip", "black", "ruff"},
+    "release.yml": {"pip", "pytest", "pillow", "pyyaml", "black", "ruff"},
+}
+
+# The one way a workflow installs: a line that is this text and nothing else,
+# matched whole. An earlier reader understood shell (words, quotes, `;`,
+# comments, continuations, `$(...)`), and four reviews each found a spelling it
+# read one way and bash another. A line with nothing in it to interpret has no
+# second reading, so the form is one spelling and everything else is refused.
+PINNED_NAME = r"[a-z0-9][a-z0-9-]*"
+INSTALL_LINE = re.compile(
+    rf"(?:python -m )?pip install -c dev-constraints\.txt(?P<names>(?: {PINNED_NAME})+)"
+)
+INSTALL_FORM = "pip install -c dev-constraints.txt <names pinned there>"
+# A step that installs has these keys and no others: `shell:`,
+# `working-directory:` and `env:` each change what the same line does.
+INSTALL_STEP_KEYS = frozenset({"name", "run"})
+# The one action that may be handed the word `pip` and the file's name: it
+# reads them as a cache key.
+SETUP_PYTHON = re.compile(r"actions/setup-python@[0-9A-Za-z.]+")
+SETUP_PYTHON_INPUTS = frozenset(
+    {(("with", "cache"), "pip"), (("with", "cache-dependency-path"), "dev-constraints.txt")}
+)
+
+# What a code block of CLAUDE.md or DEV.md may show that names an installer.
+# Whole lines again; the words after `uvx`'s tool are the tool's own, so the
+# tool is not an installer (`uvx -c dev-constraints.txt pip install requests`
+# pins pip and nothing pip installs): `tool` names none.
+DOCUMENTED_FORMS = (
+    INSTALL_LINE,
+    re.compile(r"uv venv --python 3\.12"),
+    re.compile(rf"uv pip install -c dev-constraints\.txt(?P<names>(?: {PINNED_NAME})+)"),
+    re.compile(
+        r"uvx --python 3\.12 -c dev-constraints\.txt"
+        rf"(?P<tool>(?P<names>(?: --with {PINNED_NAME})* {PINNED_NAME})(?: [A-Za-z0-9._/=:-]+)*)"
+    ),
+)
+
+# A line of CLAUDE.md or DEV.md that fences a block: three backticks, and a
+# language to open one. Spaces before it are a list's indentation.
+DOCUMENT_FENCE = "`" * 3
+DOCUMENT_FENCE_LINE = re.compile(rf"(?P<indent> *){DOCUMENT_FENCE}(?P<language>[a-z]*)")
+
+# The letters of a tool that installs packages. `pipx` and `uvx` stand before
+# `pip` and `uv` only so that a message names the longer one.
+INSTALLER_NAMES = ("pipx", "pip", "uvx", "uv", "poetry", "pdm", "conda", "easy_install")
+# The one word CI spells with those letters that is not an installer.
+NOT_AN_INSTALLER = "pipefail"
+
+THIRD_PARTY_ACTIONS = frozenset(
+    {
+        "gradle/actions/setup-gradle",
+        "reactivecircus/android-emulator-runner",
+        "softprops/action-gh-release",
+    }
+)
+COMMIT_PINNED_ACTION = re.compile(r"[\w.-]+/[\w.-]+(?:/[\w./-]+)?@[0-9a-f]{40}")
+
+
+def _shared_pins(text: str | None = None) -> dict[str, str]:
+    """``{canonical name: version}`` from dev-constraints.txt, which must hold exact pins only.
+
+    Read with `packaging` (pytest depends on it), so a specifier is a parsed
+    operator and version rather than a substring: `pytest>=9`, `pillow==13.*`
+    and `pytest==9.2.0; python_version < "3.13"` are each refused.
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    text = CONSTRAINTS.read_text(encoding="utf-8") if text is None else text
+    pins: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        requirement = Requirement(line)
+        specifiers = list(requirement.specifier)
+        exact = (
+            len(specifiers) == 1
+            and specifiers[0].operator == "=="
+            and "*" not in specifiers[0].version
+            and requirement.url is None
+            and requirement.marker is None
+            and not requirement.extras
+        )
+        assert exact, f"dev-constraints.txt: `{line}` is not an exact `name==version` pin"
+        name = canonicalize_name(requirement.name)
+        assert name not in pins, f"dev-constraints.txt pins {name} twice"
+        pins[name] = specifiers[0].version
+    return pins
+
+
+def _installer_named(text: str) -> str | None:
+    """The installer whose letters stand anywhere in a string, whatever the case.
+
+    A substring, with no word boundary to be on the right side of: `-mpip`,
+    `PIP`, `"pip"` and `pip3.12` all name pip. So do `pipeline` and `--pipe`;
+    that is the price, and the message says which letters were found.
+    `pipefail` is taken out by name first, replaced by a space so that what
+    stood on either side of it cannot join into a name or hide one.
+    """
+    text = text.casefold().replace(NOT_AN_INSTALLER, " ")
+    return next((name for name in INSTALLER_NAMES if name in text), None)
+
+
+def _named(text: str) -> str | None:
+    """What a string names that only an install may: an installer, or the constraints file.
+
+    The file by its letters too, so that a step writing to it
+    (`printf ... > dev-constraints.txt`) is read as an install step and refused.
+    """
+    return _installer_named(text) or (
+        CONSTRAINTS.stem if CONSTRAINTS.stem in text.casefold() else None
+    )
+
+
+def _install_lines(script: str, pins: dict[str, str]) -> tuple[set[str], list[str]]:
+    """``(names installed, offenders)`` for a script that must be install lines only.
+
+    Split at `\n` and nowhere else: a carriage return or a form feed is not a
+    line end to bash, so it stays in its line and the line does not match. One
+    empty piece at the end is the newline a YAML block ends in.
+    """
+    lines = script.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    names: set[str] = set()
+    offenders: list[str] = []
+    for line in lines:
+        match = INSTALL_LINE.fullmatch(line)
+        if match is None:
+            offenders.append(
+                f"{line!r} is not `{INSTALL_FORM}` (or `python -m pip ...`). A step that names "
+                "an installer or the constraints file holds such lines and nothing else: no "
+                "comment, quote, option or other command. Put those in a step of their own."
+            )
+            continue
+        for name in match["names"].split():
+            if name in pins:
+                names.add(name)
+            else:
+                offenders.append(f"{line!r}: {name} has no pin in dev-constraints.txt")
+    return names, offenders
+
+
+def _strings(node: object, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str, bool]]:
+    """``(path, string, is a key)`` for every string in the mappings and lists of parsed YAML.
+
+    A mapping's keys are strings of it too (`env: PIP_INDEX_URL:`), found at
+    the mapping's own path and marked: `run: {"pip install ...": null}` has a
+    key at the path a `run:` script has, and it is not one. What YAML holds
+    besides mappings, lists and plain scalars is `_unwalked`'s to name, and
+    what PyYAML would drop for an equal key is `_yaml`'s to refuse.
+    """
+    if isinstance(node, dict):
+        keys = [(path, key, True) for key in node if isinstance(key, str)]
+        return keys + [
+            found for key, value in node.items() for found in _strings(value, (*path, str(key)))
+        ]
+    if isinstance(node, list):
+        return [
+            found
+            for index, value in enumerate(node)
+            for found in _strings(value, (*path, str(index)))
+        ]
+    return [(path, node, False)] if isinstance(node, str) else []
+
+
+PLAIN_SCALARS = (str, int, float, bool, type(None))
+
+
+def _unwalked(node: object, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str]]:
+    """``(path, type)`` for every key and value of parsed YAML that `_strings` does not walk.
+
+    `!!set`, `!!pairs`, `!!binary` (a value or a key) and a date reach
+    Python as a set, tuples, bytes and a `date`, and the first three can hold
+    an installer's name where no string of `_strings` shows it. No workflow
+    needs one, so each is refused by its type, whatever it holds.
+    """
+    if isinstance(node, dict):
+        keys = [(path, type(key).__name__) for key in node if not isinstance(key, PLAIN_SCALARS)]
+        return keys + [
+            found for key, value in node.items() for found in _unwalked(value, (*path, str(key)))
+        ]
+    if isinstance(node, list):
+        return [
+            found
+            for index, value in enumerate(node)
+            for found in _unwalked(value, (*path, str(index)))
+        ]
+    return [] if isinstance(node, PLAIN_SCALARS) else [(path, type(node).__name__)]
+
+
+def _script_file_offenders(root: Path) -> list[str]:
+    """Every line under a directory of CI scripts that names an installer.
+
+    These files are not parsed: shell, Python, YAML, at any depth, comments
+    included, and no directory is passed over by its name. An install belongs
+    in a workflow step, where `_workflow_installs` reads it; so does every
+    mention of the constraints file.
+    """
+    offenders = []
+    for path in sorted(root.rglob("*")):
+        name = path.relative_to(root).as_posix()
+        if path.is_dir() and not path.is_symlink():
+            continue
+        if path.is_symlink() or not path.is_file():
+            offenders.append(f"{name}: not a regular file")
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            offenders.append(f"{name}: not text this guard can read")
+            continue
+        for number, line in enumerate(lines, 1):
+            named = _named(line)
+            if named:
+                offenders.append(
+                    f"{name}:{number}: names `{named}`; installs belong in a workflow step"
+                )
+    return offenders
+
+
+def _unparsed_ci_file_offenders() -> list[str]:
+    """The same, for the two places under `.github/` that hold code a workflow runs.
+
+    `scripts/` by path from a `run:`, `actions/` through `uses: ./...`.
+    """
+    return [
+        f".github/{directory}/{reason}"
+        for directory in ("actions", "scripts")
+        for reason in _script_file_offenders(REPO_ROOT / ".github" / directory)
+    ]
+
+
+def _workflow_installs(workflow: dict, pins: dict[str, str]) -> tuple[set[str], list[str]]:
+    """``(names installed, offenders)`` for a parsed workflow.
+
+    Every string of the workflow that names an installer or the constraints
+    file is one of three things, and a mapping key that names one is always
+    the third:
+
+    - the `run:` of an install step: a step with `name` and `run` only, in a
+      job and a workflow that set no `defaults`, whose every line is
+      `INSTALL_LINE` naming pinned packages;
+    - `cache: pip` or `cache-dependency-path: dev-constraints.txt` handed to
+      `actions/setup-python`, and to that action only;
+    - an offender.
+
+    Nothing is parsed as shell, so there is no spelling to read differently
+    from bash: `sudo pip`, `bash -c "pip ..."`, `$(...)`, a comment, a
+    continuation and `cd tests &&` are all simply not the line.
+
+    The strings are those of the mappings and lists `_yaml` returns.
+    Anything else YAML can hold (`_unwalked`) is an offender by its type, and
+    a mapping in which the loader would drop a value for a key it reads as
+    equal to another never gets here: `_yaml` refuses it.
+    """
+    steps = {
+        ("jobs", str(name), "steps", str(index)): (job, step)
+        for name, job in (workflow.get("jobs") or {}).items()
+        if isinstance(job, dict)
+        for index, step in enumerate(job.get("steps") or [])
+        if isinstance(step, dict)
+    }
+    names: set[str] = set()
+    offenders = [
+        f"{'.'.join(path)}: holds a `{kind}`; this guard reads mappings, lists and plain "
+        "scalars only"
+        for path, kind in _unwalked(workflow)
+    ]
+    for path, value, is_key in _strings(workflow):
+        named = _named(value)
+        if named is None:
+            continue
+        where = ".".join(path)
+        job, step = (None, None) if is_key else steps.get(path[:4], (None, None))
+        if step is not None and path[4:] == ("run",):
+            others = sorted(str(key) for key in step if key not in INSTALL_STEP_KEYS)
+            if others:
+                offenders.append(
+                    f"{where}: a step that installs has `name` and `run` only, not {others}"
+                )
+            offenders += [
+                f"{where}: {owner} sets `defaults`, which can change the shell or the "
+                "directory an install runs in"
+                for owner, scope in (("the workflow", workflow), (f"job {path[1]}", job))
+                if "defaults" in scope
+            ]
+            installed, wrong = _install_lines(value, pins)
+            names |= installed
+            offenders += [f"{where}: {reason}" for reason in wrong]
+        elif (
+            step is not None
+            and SETUP_PYTHON.fullmatch(str(step.get("uses", "")))
+            and (path[4:], value) in SETUP_PYTHON_INPUTS
+        ):
+            continue
+        else:
+            offenders.append(f"{where}: names `{named}` outside an install step")
+    return names, offenders
+
+
+def test_the_shared_pins_are_exact_and_cover_the_toolchain():
+    """S5: `pip install pytest pillow pyyaml` took whatever was newest that morning.
+
+    Black, Ruff, Gradle, AGP and Kotlin were pinned; the three packages the
+    suite itself runs on were not, and neither was pip. Pillow 14 (2027-10-15)
+    removes `Image.getdata`, which has already forced one rework here, so an
+    unpinned install is a red main on a date nobody chose.
+    """
+    pins = _shared_pins()
+    for name in sorted(set().union(*WORKFLOW_INSTALLS.values())):
+        assert name in pins, f"dev-constraints.txt has no pin for {name}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["pytest", "pytest>=9.2.0", "pillow==13.*", "pytest~=9.2", "pytest==9.2.0,<10"],
+)
+def test_the_shared_pins_refuse_anything_but_an_exact_version(line):
+    with pytest.raises(AssertionError, match="not an exact"):
+        _shared_pins(f"pyyaml==6.0.3\n{line}\n")
+
+
+def test_every_workflow_install_takes_its_version_from_the_shared_pins():
+    """Every install a workflow writes is `pip install -c dev-constraints.txt <pinned names>`.
+
+    What is read: every string in `.github/workflows/` (parsed with pyyaml),
+    and every line of every file under `.github/scripts/` and
+    `.github/actions/`. A workflow names an installer or the constraints file
+    in an install step, written the one way `_workflow_installs` describes,
+    or not at all.
+
+    The limit: this is a check of how the workflows are written, not of what
+    a job does when it runs. A step that rewrites the constraints file under
+    a name it builds, puts another `pip` first on PATH, or runs an installer
+    this module has no name for (`$TOOL install`, a download piped to a
+    shell) is past it. So are the job's own `env:`, `container:` and runner,
+    and whatever the suite, the skill's scripts or an action from another
+    repository does.
+    """
+    pins = _shared_pins()
+    offenders: list[str] = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        names, wrong = _workflow_installs(_yaml(path.name), pins)
+        offenders += [f"{path.name}: {reason}" for reason in wrong]
+        expected = WORKFLOW_INSTALLS.get(path.name, set())
+        assert names == expected, (
+            f"{path.name} installs {sorted(names)} with pip; WORKFLOW_INSTALLS says "
+            f"{sorted(expected)}. Change the mirror only with the workflow."
+        )
+    offenders += _unparsed_ci_file_offenders()
+    assert not offenders, "installs that do not take their version from dev-constraints.txt:\n" + (
+        "\n".join(offenders)
+    )
+
+
+CONSTRAINED = "pip install -c dev-constraints.txt"
+NOT_THE_LINE = f"is not `{INSTALL_FORM}`"
+
+
+def _one_step(script: str, **keys: object) -> dict:
+    return {"jobs": {"test": {"steps": [{"run": script, **keys}]}}}
+
+
+def _offenders(workflow: dict) -> list[str]:
+    return _workflow_installs(workflow, _shared_pins())[1]
+
+
+@pytest.mark.parametrize(
+    ("script", "names"),
+    [
+        (f"{CONSTRAINED} pytest pillow pyyaml", {"pytest", "pillow", "pyyaml"}),
+        # As the workflows write it: a YAML block, which ends in one newline.
+        (f"python -m {CONSTRAINED} pip\n{CONSTRAINED} black ruff\n", {"pip", "black", "ruff"}),
+        # A step that names neither an installer nor the file is not read.
+        ("pytest tests/ -q", set()),
+        ("set -euo pipefail\npytest tests/  # the whole suite", set()),
+        ("cd tests && ls", set()),
+    ],
+)
+def test_the_pin_guard_passes_the_install_line_and_steps_that_install_nothing(script, names):
+    """...and is not simply always red, which would fail the workflows for the wrong reason."""
+    assert _workflow_installs(_one_step(script), _shared_pins()) == (names, [])
+    named = _one_step(script, name="Install test dependencies")
+    assert _workflow_installs(named, _shared_pins()) == (names, [])
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # The four lines S5 named, as they stood on main.
+        "pip install pytest pillow pyyaml",
+        "python -m pip install --upgrade pip",
+        "pip install pytest 'black==26.5.1'",
+        f"{CONSTRAINED} 'black==26.5.1'",
+        # A package that states its own version, an option, a variable.
+        f"{CONSTRAINED} 'pillow>=13'",
+        f"{CONSTRAINED} black==26.5.1",
+        f"{CONSTRAINED} -r requirements.txt",
+        f"{CONSTRAINED} --pre pytest",
+        f"{CONSTRAINED} $PACKAGES",
+        f"""{CONSTRAINED} 'pytest; python_version < "3.0"'""",
+        f"{CONSTRAINED} 'pytest[dev]'",
+        f"{CONSTRAINED} pytest[dev]",
+        f"{CONSTRAINED}",
+        # Another constraints file, or the same name read another way.
+        "pip install -c other.txt pytest",
+        "pip install --constraint=other.txt pytest",
+        "pip install -c ../dev-constraints.txt pytest",
+        "pip install -c tests/dev-constraints.txt pytest",
+        "pip install -c dev-constraintsxtxt pytest",
+        # pip 26.3 reads the file name here as `=dev-constraints.txt`.
+        "pip install -c=dev-constraints.txt pytest",
+        # Something before pip, or another pip.
+        "sudo pip3 install pytest",
+        "/usr/bin/pip3.12 install pytest",
+        f"sudo {CONSTRAINED} pytest",
+        f"uv {CONSTRAINED} pytest",
+        f"env -C tests {CONSTRAINED} pytest",
+        f"PIP_INDEX_URL=https://example.invalid/simple {CONSTRAINED} pytest",
+        f"then {CONSTRAINED} pytest",
+        f"echo {CONSTRAINED} pytest",
+        f"python3 -m {CONSTRAINED} pytest",
+        f"/usr/bin/{CONSTRAINED} pytest",
+        # Two commands on a line, a continuation, a comment.
+        "true && pip install pytest",
+        f"{CONSTRAINED} pytest; pip install pillow",
+        f"{CONSTRAINED} pytest && pip install pillow",
+        "pip install \\\n  pytest",
+        f"{CONSTRAINED} \\\n  pytest",
+        "true x#; pip install requests",
+        "echo a#b && pip install requests",
+        "# pip install pytest",
+        f"# why\n{CONSTRAINED} pytest",
+        f"{CONSTRAINED} ruff  # lint",
+        "pytest tests/  # pip install pytest",
+        f"{CONSTRAINED} pytest \\\n# requests",
+        # A comment that ends in a backslash: an earlier reader joined the next
+        # line onto it and never saw the `cd`; bash runs it.
+        f"# prepare \\\ncd tests\n{CONSTRAINED} pytest",
+        # A step that installs does nothing else, before or after.
+        f"cd tests && {CONSTRAINED} pytest",
+        f"cd tests\n{CONSTRAINED} pytest",
+        f"{CONSTRAINED} pytest\ncd tests",
+        f"pushd tests\n{CONSTRAINED} pytest",
+        f"export CONSTRAINTS=other.txt\n{CONSTRAINED} pytest",
+        f"source ci/setup.sh\n{CONSTRAINED} pytest",
+        f"{CONSTRAINED} pytest\npytest tests/",
+        f"set -euo pipefail\n{CONSTRAINED} pytest",
+        # White space that is not one space, and line ends that are not `\n`.
+        f"{CONSTRAINED}  pytest",
+        f"{CONSTRAINED}\tpytest",
+        f" {CONSTRAINED} pytest",
+        f"{CONSTRAINED} pytest ",
+        f"\n{CONSTRAINED} pytest",
+        f"{CONSTRAINED} pytest\n\n",
+        f"{CONSTRAINED} pytest\n\n{CONSTRAINED} pillow",
+        f"{CONSTRAINED} pytest\rrequests",
+        f"{CONSTRAINED} pytest\r{CONSTRAINED} pillow",
+        f"{CONSTRAINED} pytest\r\n",
+        f"{CONSTRAINED} pytest\x0c{CONSTRAINED} pillow",
+        "true\x0c# x; pip install requests",
+        "\x0c# x || pip install requests",
+        f"\x0c# x; cd tests\n{CONSTRAINED} pytest",
+        f"{CONSTRAINED} pytest requests",
+        f"{CONSTRAINED} pytest {CONSTRAINED} pillow",
+        # A word the shell runs or expands is not the word that was read.
+        'pip install -c "$(pip install requests >&2; echo x)/../dev-constraints.txt" pytest',
+        'pip install -c "`pip install requests >&2`x/../dev-constraints.txt" pytest',
+        '"$(pip install requests >&2; echo /usr/bin)/pip" install -c dev-constraints.txt pytest',
+        f'"$(pip install requests >&2; echo /usr/bin)/python" -m {CONSTRAINED} pytest',
+        'pip install -c "$d/../dev-constraints.txt" pytest',
+        'pip install -c "`pwd`/../dev-constraints.txt" pytest',
+        'pip install -c "é/../dev-constraints.txt" pytest',
+        f"{CONSTRAINED} pytest${{EXTRA}}",
+        f"{CONSTRAINED} pytest ';'",
+        f"{CONSTRAINED} 'pytest'",
+        # Another installer, or pip not as `pip install`.
+        "uvx --with pillow pytest tests/",
+        "true; pipx install black",
+        "sudo pipx install black",
+        "python3 -m pipx install black",
+        "if true; then uvx black; fi",
+        "python3 -m pip --disable-pip-version-check install pytest",
+        "pip download pytest",
+        # No word boundary to slip past, and no case: `-mpip` is `-m pip` to
+        # Python, and `PIP` is pip wherever the file system folds case.
+        "python -mpip install pytest",
+        "python3 -mpipx run black",
+        "PIP install pytest",
+        "Python -m Pip install pytest",
+        f"PIP{CONSTRAINED[3:]} pytest",
+        "pip.exe install pytest",
+        # pip's environment is pip's configuration.
+        "export PIP_CONSTRAINT=other.txt",
+        # An install inside a quoted word, and prose: nothing tells `echo` from `bash -c`.
+        'bash -c "pip install pytest"',
+        'value="$(pip install pytest)"',
+        "eval 'pip install pytest'",
+        'python -c \'import subprocess; subprocess.run(["pip", "install", "pytest"])\'',
+        'echo "pip install pytest"',
+        # The constraints file is named to be read by an install, and not to be written.
+        "printf 'pytest==9.1.1\\n' > dev-constraints.txt",
+        "printf 'pytest==9.1.1\\n' > =dev-constraints.txt",
+        "cp other.txt DEV-CONSTRAINTS.txt",
+    ],
+)
+def test_the_pin_guard_refuses_every_line_that_is_not_the_install_line(script):
+    """Guard the guard: one form is let through, so each of these is refused for not being it.
+
+    Among them every spelling the earlier, shell-reading guard was shown to
+    misread, and every one it refused.
+    """
+    offenders = _offenders(_one_step(script))
+    assert any(NOT_THE_LINE in offender for offender in offenders), offenders
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Each was let through by the reader that understood pip's options and
+        # the shell's words. All still install from the pins; none is the line.
+        f"python -m {CONSTRAINED} --upgrade pip",
+        "pip install --constraint dev-constraints.txt pillow pyyaml",
+        "pip install --constraint=dev-constraints.txt -q ruff",
+        f"{CONSTRAINED} Pillow PyYAML",
+        f"python3.12 -m {CONSTRAINED} pytest",
+        "/usr/bin/pip3.12 install -c dev-constraints.txt pytest",
+        f"  # why\n{CONSTRAINED} pytest",
+    ],
+)
+def test_the_install_line_has_one_spelling(script):
+    """The price of reading no shell, paid on purpose: a harmless variant is refused too."""
+    offenders = _offenders(_one_step(script))
+    assert any(NOT_THE_LINE in offender for offender in offenders), offenders
+    assert any("Put those in a step of their own" in offender for offender in offenders)
+
+
+def test_the_pin_guard_refuses_a_package_the_shared_pins_do_not_name():
+    assert _workflow_installs(_one_step(f"{CONSTRAINED} pytest requests"), _shared_pins()) == (
+        {"pytest"},
+        [
+            f"jobs.test.steps.0.run: '{CONSTRAINED} pytest requests': "
+            "requests has no pin in dev-constraints.txt"
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        {"working-directory": "tests"},
+        # Normalising this path cancels the expression; the runner does not.
+        {"working-directory": "${{ runner.temp }}/.."},
+        {"shell": 'bash -c "cd tests; exec bash {0}"'},
+        {"shell": "bash"},
+        {"env": {"HOME": "/tmp/elsewhere"}},
+        {"if": "always()"},
+        {"continue-on-error": True},
+        {"uses": "actions/setup-python@v5"},
+    ],
+)
+def test_a_step_that_installs_has_a_name_and_a_run_and_nothing_else(keys):
+    """`shell:` and `working-directory:` each make the same line read another file.
+
+    `-c dev-constraints.txt` from `tests/` names a file that is not the pins,
+    and a custom shell can change directory before the script starts. Rather
+    than read each key for what it changes, an install step has none.
+    """
+    offenders = _offenders(_one_step(f"{CONSTRAINED} pytest", **keys))
+    assert any("has `name` and `run` only" in offender for offender in offenders), offenders
+
+
+@pytest.mark.parametrize(
+    "defaults",
+    [
+        {"run": {"shell": 'bash -c "cd tests; exec bash {0}"'}},
+        {"run": {"working-directory": "tests"}},
+        {},
+    ],
+)
+def test_no_defaults_stand_over_a_step_that_installs(defaults):
+    """`defaults.run` sets the shell and directory of every step that names neither."""
+    workflow = _one_step(f"{CONSTRAINED} pytest")
+    assert _offenders({**workflow, "defaults": defaults}) == [
+        "jobs.test.steps.0.run: the workflow sets `defaults`, which can change the shell or "
+        "the directory an install runs in"
+    ]
+    workflow["jobs"]["test"]["defaults"] = defaults
+    assert _offenders(workflow) == [
+        "jobs.test.steps.0.run: job test sets `defaults`, which can change the shell or "
+        "the directory an install runs in"
+    ]
+
+    # A job that installs nothing may set its own.
+    workflow = _one_step(f"{CONSTRAINED} pytest")
+    workflow["jobs"]["other"] = {"defaults": defaults, "steps": [{"run": "pytest tests/"}]}
+    assert _offenders(workflow) == []
+
+
+def test_an_installer_named_outside_an_install_step_is_refused():
+    """The emulator runner's `with: script:` is a shell script, and not a `run:`."""
+    pins = _shared_pins()
+    runner = {"uses": "reactivecircus/android-emulator-runner@v2"}
+    workflow = {"jobs": {"lane": {"steps": [{**runner, "with": {"script": "pip install pytest"}}]}}}
+    assert _workflow_installs(workflow, pins) == (
+        set(),
+        ["jobs.lane.steps.0.with.script: names `pip` outside an install step"],
+    )
+
+    workflow = {"env": {"RUNNER": "uvx"}, "jobs": {"lane": {"steps": [{"run": "$RUNNER pytest"}]}}}
+    assert _workflow_installs(workflow, pins) == (
+        set(),
+        ["env.RUNNER: names `uvx` outside an install step"],
+    )
+
+    workflow = {"env": {"SETUP": "python -mpip install requests"}, "jobs": {}}
+    assert _workflow_installs(workflow, pins) == (
+        set(),
+        ["env.SETUP: names `pip` outside an install step"],
+    )
+
+    # A key is a string too: pip reads its configuration from the environment.
+    workflow = {"jobs": {"test": {"env": {"PIP_INDEX_URL": "https://example.invalid/simple"}}}}
+    assert _workflow_installs(workflow, pins) == (
+        set(),
+        ["jobs.test.env: names `pip` outside an install step"],
+    )
+
+    # A `run:` that is not text is not a script this guard reads.
+    workflow = {"jobs": {"test": {"steps": [{"run": [f"{CONSTRAINED} pytest"]}]}}}
+    assert _workflow_installs(workflow, pins) == (
+        set(),
+        ["jobs.test.steps.0.run.0: names `pip` outside an install step"],
+    )
+
+    # The constraints file is not handed to anything but an install.
+    upload = {"uses": "actions/upload-artifact@v4", "with": {"path": "dev-constraints.txt"}}
+    assert _workflow_installs({"jobs": {"test": {"steps": [upload]}}}, pins) == (
+        set(),
+        ["jobs.test.steps.0.with.path: names `dev-constraints` outside an install step"],
+    )
+
+
+def test_setup_python_is_handed_the_pip_cache_and_the_file_it_is_keyed_on():
+    """The two mentions that install nothing, as the four workflows make them."""
+    setup = {
+        "uses": "actions/setup-python@v5",
+        "with": {
+            "python-version": "3.12",
+            "cache": "pip",
+            "cache-dependency-path": "dev-constraints.txt",
+        },
+    }
+    assert _workflow_installs({"jobs": {"test": {"steps": [setup]}}}, _shared_pins()) == (set(), [])
+
+    for key, value in (
+        ("cache", "pipx"),
+        ("cache-dependency-path", "tests/dev-constraints.txt"),
+        ("cache-dependency-path", "${{ hashFiles('dev-constraints.txt') }}"),
+        ("python-version", "pip"),
+    ):
+        changed = {**setup, "with": {**setup["with"], key: value}}
+        assert _offenders({"jobs": {"test": {"steps": [changed]}}}) == [
+            f"jobs.test.steps.0.with.{key}: names `{_named(value)}` outside an install step"
+        ]
+
+
+@pytest.mark.parametrize(
+    "uses",
+    [
+        "./.github/actions/install",
+        "someone/setup-python@v5",
+        "actions/setup-python-and-more@v5",
+        "actions/setup-python/sub@v5",
+        "actions/setup-python",
+        "actions/setup-python@",
+        "actions/setup-python@v5@extra",
+        "actions/setup-python@v5\n",
+        None,
+    ],
+)
+@pytest.mark.parametrize(
+    ("key", "value", "named"),
+    [("cache", "pip", "pip"), ("cache-dependency-path", "dev-constraints.txt", "dev-constraints")],
+)
+def test_the_cache_inputs_are_let_through_for_setup_python_and_no_other_action(
+    uses, key, value, named
+):
+    """`with: cache: pip` is a word an action receives; what it does with it is the action's.
+
+    A local action whose step is `${{ inputs.cache }} install requests` gets
+    its installer from this input, so the exception names the one action known
+    to treat it as a cache key, by its whole reference.
+    """
+    step = {"with": {key: value}} if uses is None else {"uses": uses, "with": {key: value}}
+    assert _workflow_installs({"jobs": {"test": {"steps": [step]}}}, _shared_pins()) == (
+        set(),
+        [f"jobs.test.steps.0.with.{key}: names `{named}` outside an install step"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "name"),
+    [
+        ("pip", "pip"),
+        ("/usr/bin/pip3.12", "pip"),
+        ("-mpip", "pip"),
+        ("PIP", "pip"),
+        ("pipx", "pipx"),
+        ("$(uvx black)", "uvx"),
+        ("uv", "uv"),
+        ("micromamba-conda", "conda"),
+        ("pipefailpip", "pip"),
+        ("pipefail pipefail", None),
+        ("pipipefailp", None),
+        ("set -euo pipefail", None),
+        ("pytest tests/", None),
+        # The price of having no boundary, paid on purpose: a word that merely
+        # holds the letters is refused, and the message says which letters.
+        ("pipeline", "pip"),
+        ("maneuver", "uv"),
+    ],
+)
+def test_an_installer_is_named_by_its_letters_wherever_they_stand(text, name):
+    """A substring, whatever the case: a boundary is a thing to be on the right side of.
+
+    A whole-word pattern read `-mpip` as some other word. The one word let
+    through is `pipefail`, by name, and taking it out cannot hide what stands
+    beside it.
+    """
+    assert _installer_named(text) == name
+
+
+def test_no_file_under_github_scripts_names_an_installer(tmp_path):
+    """Installs belong in a workflow step, where they are read; these files are not parsed.
+
+    Any file, at any depth: `setup/install.sh` and `install.py` run as readily
+    as a `*.sh` beside the lane script.
+    """
+    assert _script_file_offenders(REPO_ROOT / ".github" / "scripts") == []
+
+    (tmp_path / "setup").mkdir()
+    (tmp_path / "setup" / "install.sh").write_text("#!/bin/bash\npip install pytest\n")
+    (tmp_path / "install.py").write_text('import subprocess\nsubprocess.run(["uvx", "black"])\n')
+    (tmp_path / "lane.sh").write_text("set -euo pipefail\npytest -m emulator tests/\n")
+    (tmp_path / "pins.sh").write_text("echo ok\nsed -i s/9.2.0/9.1.1/ dev-constraints.txt\n")
+    (tmp_path / "blob").write_bytes(b"\xff\xfe pip")
+    # No directory is passed over by name: `bash .github/scripts/__pycache__/install.sh` runs.
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "install.sh").write_text("python -mpip install requests\n")
+    (tmp_path / "__pycache__" / "lane.cpython-312.pyc").write_bytes(b"\xcb\r\r\n\x00\xff")
+    assert _script_file_offenders(tmp_path) == [
+        "__pycache__/install.sh:1: names `pip`; installs belong in a workflow step",
+        "__pycache__/lane.cpython-312.pyc: not text this guard can read",
+        "blob: not text this guard can read",
+        "install.py:2: names `uvx`; installs belong in a workflow step",
+        "pins.sh:2: names `dev-constraints`; installs belong in a workflow step",
+        "setup/install.sh:2: names `pip`; installs belong in a workflow step",
+    ]
+    assert _script_file_offenders(tmp_path / "no-such-directory") == []
+
+
+def test_a_local_action_is_read_like_a_script(monkeypatch, tmp_path):
+    """`.github/actions/` holds steps a workflow runs through `uses: ./...`, and no `run:` reader."""
+    action = tmp_path / ".github" / "actions" / "install" / "action.yml"
+    action.parent.mkdir(parents=True)
+    action.write_text("runs:\n  using: composite\n  steps:\n    - run: pip install requests\n")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    assert _unparsed_ci_file_offenders() == [
+        ".github/actions/install/action.yml:4: names `pip`; installs belong in a workflow step"
+    ]
+
+
+def test_pre_commit_runs_the_black_and_ruff_the_shared_pins_name():
+    """pre-commit cannot read a constraints file, so its two `rev:`s are compared instead."""
+    import yaml
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    revs = {
+        hook["id"]: repo.get("rev") for repo in config["repos"] for hook in repo.get("hooks", [])
+    }
+    pins = _shared_pins()
+    assert revs["black"] == pins["black"], "pre-commit and dev-constraints.txt disagree on Black"
+    assert revs["ruff"] == f"v{pins['ruff']}", "pre-commit and dev-constraints.txt disagree on Ruff"
+
+
+def _fenced_lines(markdown: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """``(lines inside backtick fences, fence lines this reader cannot pair)``.
+
+    Markdown is not parsed. A line with three backticks in a row is a fence
+    line, and it is `DOCUMENT_FENCE_LINE` whole: with or without a language it
+    opens a block, and alone, as far in as the fence that opened it, it closes
+    one. Every other place the backticks stand is refused, since each is a way
+    for a block to go on, or to exist, where this reader sees none: a fence
+    with a language inside a block (it does not close one), four backticks
+    (three do not close them), a closing fence at another indentation or a
+    line left of its block's fence (in a list either ends the block early), a
+    fence in a quote or behind a tab, words after it, a block left open. So
+    is a line with `~~~` anywhere in it, which fences a block in a quote or
+    a list item as it does at the margin. A refused line changes nothing:
+    what follows is read as it was being read.
+
+    The limit: fences are paired by counting, which is what Markdown does
+    for a document whose three-backtick lines are all fences. A line of
+    three backticks that Markdown takes for something else (inside an HTML
+    block or a comment, or indented as code outside a list) is counted like
+    any other, so a document built around such lines can show a block this
+    reader pairs wrongly. That is past it: this checks that the commands a
+    plainly written document shows are the pinned ones.
+
+    Lines end at a newline only, as bash ends them; `splitlines()` would cut
+    a command in two at a form feed.
+    """
+    lines: list[str] = []
+    refused: list[tuple[str, list[str]]] = []
+    opened: re.Match[str] | None = None
+    for line in markdown.split("\n"):
+        if "~~~" in line:
+            refused.append(
+                (line, ["has `~~~`, which fences a block this guard does not read; use backticks"])
+            )
+        elif DOCUMENT_FENCE in line:
+            fence = DOCUMENT_FENCE_LINE.fullmatch(line)
+            if fence is None or (
+                opened is not None and (fence["language"] or fence["indent"] != opened["indent"])
+            ):
+                refused.append(
+                    (
+                        line,
+                        [
+                            "is a fence this guard cannot pair. Three backticks and a language "
+                            "open a block, three alone at the same indentation close it, and "
+                            "they stand nowhere else"
+                        ],
+                    )
+                )
+            else:
+                opened = fence if opened is None else None
+        elif opened is not None:
+            if line.strip(" ") and not line.startswith(opened["indent"]):
+                refused.append(
+                    (
+                        line,
+                        [
+                            "stands left of the fence of the block it is in; in a list that "
+                            "ends the block"
+                        ],
+                    )
+                )
+            lines.append(line)
+    if opened is not None:
+        refused.append((opened.string, ["opens a block that nothing closes"]))
+    return lines, refused
+
+
+def _documented_installs(markdown: str) -> list[tuple[str, list[str]]]:
+    """``(line, offenders)`` for each line of a document's code blocks that names an installer.
+
+    Such a line is one of `DOCUMENTED_FORMS`, whole, and every package it
+    names has a pin. Named by its letters, as in a workflow: a line of a tree
+    or of sample output that has them is refused too, and is reworded.
+    Indentation is the document's (a block inside a list), so spaces at
+    either end are not the command's.
+
+    The limit: a block is what `_fenced_lines` pairs, with the limit stated
+    there. A command in running prose (`inline code`), in an HTML element or
+    in a block made by indentation alone is not read.
+    """
+    pins = _shared_pins()
+    fenced, found = _fenced_lines(markdown)
+    for raw in fenced:
+        line = raw.strip(" ")
+        if _installer_named(line) is None:
+            continue
+        match = next((match for form in DOCUMENTED_FORMS if (match := form.fullmatch(line))), None)
+        if match is None:
+            shown = "; ".join(f"`{form.pattern}`" for form in DOCUMENTED_FORMS)
+            found.append(
+                (
+                    line,
+                    [
+                        f"is not a command this guard reads. It reads, whole: {shown}. "
+                        "Reword a line that is not a command."
+                    ],
+                )
+            )
+            continue
+        second = _installer_named(match.groupdict().get("tool") or "")
+        if second is not None:
+            found.append(
+                (
+                    line,
+                    [
+                        f"names `{second}` after the constraints file; `uvx` runs a tool "
+                        "there, and what an installer run that way installs has no pin"
+                    ],
+                )
+            )
+            continue
+        names = [word for word in match.groupdict().get("names", "").split() if word != "--with"]
+        found.append((line, [f"{name} has no pin" for name in names if name not in pins]))
+    return found
+
+
+@pytest.mark.parametrize("doc", ["CLAUDE.md", "DEV.md"])
+def test_the_documented_install_commands_use_the_shared_pins(doc):
+    """The command a contributor copies must take the versions CI tests with."""
+    found = _documented_installs((REPO_ROOT / doc).read_text(encoding="utf-8"))
+    assert found, f"{doc} documents no install command; this test is reading nothing"
+    wrong = [(line, offenders) for line, offenders in found if offenders]
+    assert not wrong, f"{doc} documents installs that ignore dev-constraints.txt: {wrong}"
+
+
+def _documented(command: str) -> list[tuple[str, list[str]]]:
+    fence = "```"
+    return _documented_installs(f"Run:\n\n{fence}bash\n{command}\n{fence}\n")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # No constraints file, another one, or the name read another way.
+        "uvx --python 3.12 --with pillow --with pyyaml pytest tests/",
+        "env uvx pytest tests/",
+        "uvx --constraints=other.txt pytest tests/",
+        "uvx --python 3.12 -c other.txt pytest tests/",
+        "uvx --python 3.12 -c=dev-constraints.txt pytest tests/",
+        "uvx --python 3.12 -c dev-constraintsxtxt pytest tests/",
+        "uvx --python 3x12 -c dev-constraints.txt pytest tests/",
+        "uv pip install -c dev-constraintsxtxt pytest",
+        "uv venv --python 3x12",
+        # A package from somewhere the pins do not name.
+        "uvx --python 3.12 -c dev-constraints.txt --from pytest==9.0 pytest tests/",
+        "uvx --python 3.12 -c dev-constraints.txt --from=pytest==9.0 pytest tests/",
+        "uvx --python 3.12 -c dev-constraints.txt --with-requirements r.txt pytest",
+        "uvx --python 3.12 -c dev-constraints.txt --index https://example.invalid pytest",
+        "uvx --python 3.12 -c dev-constraints.txt --with 'pillow>=13' pytest tests/",
+        "uvx --python 3.12 -c dev-constraints.txt --with pillow>=13 pytest tests/",
+        "uvx --python 3.12 -c dev-constraints.txt --with=requests pytest",
+        "uvx --python 3.12 -c dev-constraints.txt pytest@9.0 tests/",
+        "uvx --python 3.12 -c dev-constraints.txt 'pytest==9.0' tests/",
+        # `--with` and no name it can be: the tool would be read as `--with`.
+        "uvx --python 3.12 -c dev-constraints.txt --with Pillow pytest tests/",
+        "uvx --python 3.12 -c dev-constraints.txt --with pillow",
+        "uvx --python 3.12 -c dev-constraints.txt",
+        # Two commands, a comment, a substitution.
+        "uvx --python 3.12 -c dev-constraints.txt pytest tests/ && uvx black",
+        "uvx --python 3.12 -c dev-constraints.txt pytest tests/ # the suite",
+        "uvx --python 3.12 -c dev-constraints.txt pytest $(uvx black)",
+        "uvx --python 3.12 -c dev-constraints.txt pytest\ttests/",
+        'pip install -c "$(pip install requests >&2; echo x)/../dev-constraints.txt" pytest',
+        "uv pip install black==26.5.1 pytest pillow",
+        "uv pip install pytest pillow",
+        "uv venv --python 3.12 && uv pip install requests",
+        "uv tool install black",
+        "pipx install black",
+        # The spelling counts here too.
+        "uvx -p 3.12 --constraints=dev-constraints.txt -w pillow pytest tests/",
+        "UVX --python 3.12 -c dev-constraints.txt pytest tests/",
+    ],
+)
+def test_a_documented_command_that_names_an_installer_is_one_this_guard_reads(command):
+    """`--from pytest==9.0`, an unpinned tool and `$(...)` each ran what the pins do not name."""
+    ((line, offenders),) = _documented(command)
+    assert line == command
+    assert len(offenders) == 1 and "is not a command this guard reads" in offenders[0], offenders
+
+
+@pytest.mark.parametrize(
+    ("command", "unpinned"),
+    [
+        ("uvx --python 3.12 -c dev-constraints.txt requests", "requests"),
+        ("uvx --python 3.12 -c dev-constraints.txt --with requests pytest tests/", "requests"),
+        ("uvx --python 3.12 -c dev-constraints.txt --with pillow tox", "tox"),
+        ("uv pip install -c dev-constraints.txt pytest requests", "requests"),
+        (f"{CONSTRAINED} requests", "requests"),
+    ],
+)
+def test_a_documented_command_names_only_pinned_packages(command, unpinned):
+    assert _documented(command) == [(command, [f"{unpinned} has no pin"])]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest tests/",
+        "uvx --python 3.12 -c dev-constraints.txt black --check --diff tests/",
+        # Words after the tool are the tool's own arguments, not uvx's.
+        "uvx --python 3.12 -c dev-constraints.txt pytest --with anything -x -k name=value",
+        "uv venv --python 3.12",
+        "uv pip install -c dev-constraints.txt black ruff pytest pillow pyyaml pre-commit",
+        f"python -m {CONSTRAINED} pip",
+        # Inside a list, a block is indented with the list.
+        "   uvx --python 3.12 -c dev-constraints.txt pytest tests/",
+    ],
+)
+def test_the_documented_reader_passes_a_pinned_command(command):
+    assert _documented(command) == [(command.strip(" "), [])]
+
+
+TILDE_REFUSAL = "has `~~~`, which fences a block this guard does not read; use backticks"
+
+
+def test_a_block_fenced_with_tildes_is_refused_and_not_passed_over():
+    assert _documented_installs("Run:\n\n~~~bash\npip install requests\n~~~\n") == [
+        ("~~~bash", [TILDE_REFUSAL]),
+        ("~~~", [TILDE_REFUSAL]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    [
+        "> ~~~bash\n> pip install requests\n> ~~~\n",
+        "- ~~~bash\n  pip install requests\n  ~~~\n",
+        "1. ~~~\n   pip install requests\n   ~~~\n",
+    ],
+)
+def test_a_tilde_fence_is_refused_wherever_in_its_line_it_stands(markdown):
+    """Only a line that began with one was refused: in a quote or a list item it opened unseen."""
+    found = _documented_installs(markdown)
+    assert [reasons for _, reasons in found] == [[TILDE_REFUSAL], [TILDE_REFUSAL]], found
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "env: !!set {pip: null}\njobs: {}\n",
+        "env: !!pairs [{X: pip}]\njobs: {}\n",
+        "env: {X: !!binary cGlw}\njobs: {}\n",
+        "? !!binary cGlw\n: x\njobs: {}\n",
+        "env: {X: 2026-11-09}\njobs: {}\n",
+        "jobs: {a: {steps: [{env: !!set {pip: null}}]}}\n",
+    ],
+)
+def test_a_workflow_holding_what_the_guard_does_not_walk_is_refused(document):
+    """YAML's set, pairs, binary (as a value or a key) and date are types `_strings` passes."""
+    import yaml
+
+    names, offenders = _workflow_installs(yaml.safe_load(document), _shared_pins())
+    assert names == set()
+    assert (
+        len(offenders) == 1 and "mappings, lists and plain scalars only" in offenders[0]
+    ), offenders
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "env: {yes: pip, on: ok}\njobs: {}\n",
+        "env:\n  true: pip\n  on: ok\njobs: {}\n",
+        "env: {X: pip, X: ok}\njobs: {}\n",
+        "jobs: {a: {steps: [{run: pip install requests, run: echo ok}]}}\n",
+        # A merged key the mapping writes again: counted after the merge is laid out.
+        "env: {<<: {X: pip, Y: ok}, X: ok}\njobs: {}\n",
+    ],
+)
+def test_a_workflow_with_two_keys_the_loader_reads_as_one_is_refused(
+    document, monkeypatch, tmp_path
+):
+    """PyYAML kept the last and dropped the other: `yes` and `on` are both `True` to it."""
+    (tmp_path / "test.yml").write_text(document, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOWS", tmp_path)
+    with pytest.raises(AssertionError, match="reads as one key"):
+        _yaml("test.yml")
+
+
+def test_the_documented_reader_passes_over_what_names_no_installer():
+    assert _documented("source .venv/bin/activate\npre-commit install\npytest tests/ -q") == []
+    # Prose is not a command a reader copies.
+    assert _documented_installs("Never run `pip install pytest` by hand.\n") == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uvx --python 3.12 -c dev-constraints.txt pip install requests",
+        "uvx --python 3.12 -c dev-constraints.txt pip install -c other.txt pytest",
+        "uvx --python 3.12 -c dev-constraints.txt --with pillow uv pip install requests",
+        "uvx --python 3.12 -c dev-constraints.txt pytest tests/ -p pipx",
+    ],
+)
+def test_a_documented_uvx_command_runs_a_tool_and_not_a_second_installer(command):
+    """`uvx -c dev-constraints.txt pip install requests` pinned pip and nothing pip installed."""
+    ((line, offenders),) = _documented(command)
+    assert line == command
+    assert len(offenders) == 1 and "after the constraints file" in offenders[0], offenders
+
+
+@pytest.mark.parametrize("end", ["\x0b", "\x0c", "\r", "\x1c", "\x85", "\u2028"])
+def test_a_documented_line_ends_at_a_newline_and_at_nothing_else(end):
+    """bash reads a form feed as part of a word; `splitlines()` read two good commands."""
+    ((line, offenders),) = _documented(f"{CONSTRAINED} pytest{end}{CONSTRAINED} pillow")
+    assert end in line
+    assert len(offenders) == 1 and "is not a command this guard reads" in offenders[0], offenders
+
+
+FENCE = "`" * 3
+
+
+@pytest.mark.parametrize(
+    ("markdown", "refused"),
+    [
+        # A fence with a language does not close a block: the second command is inside it.
+        (
+            f"{FENCE}bash\n{CONSTRAINED} pytest\n{FENCE}bash\npip install requests\n{FENCE}\n",
+            f"{FENCE}bash",
+        ),
+        # Four backticks are closed by four, so three would not end the block.
+        (f"{FENCE}`bash\npip install requests\n{FENCE}\n", f"{FENCE}`bash"),
+        (f"{FENCE}bash\npip install requests\n{FENCE}`\n", f"{FENCE}`"),
+        # A block in a quote, behind a tab, or with words after the fence.
+        (f"> {FENCE}bash\n> pip install requests\n> {FENCE}\n", f"> {FENCE}bash"),
+        (f"\t{FENCE}bash\n\tpip install requests\n\t{FENCE}\n", f"\t{FENCE}bash"),
+        (f"{FENCE}bash title=x\npip install requests\n{FENCE}\n", f"{FENCE}bash title=x"),
+        (f"{FENCE}bash\npip install requests\n{FENCE} \n", f"{FENCE} "),
+        # In a list, a fence at the margin ends the item and opens a block of its own.
+        (
+            f"1. Step:\n\n   {FENCE}bash\n   {CONSTRAINED} pytest\n{FENCE}\npip install requests\n",
+            FENCE,
+        ),
+        (
+            f"Run {FENCE}pip install requests{FENCE} now.\n",
+            f"Run {FENCE}pip install requests{FENCE} now.",
+        ),
+    ],
+)
+def test_a_fence_this_reader_cannot_pair_is_refused(markdown, refused):
+    """Reading a block as closed while Markdown still shows it passes over its commands."""
+    found = dict(_documented_installs(markdown))
+    assert refused in found, found
+    assert any("is a fence this guard cannot pair" in reason for reason in found[refused])
+
+
+def test_a_line_left_of_the_fence_of_its_block_is_refused():
+    """In a list such a line ends the item, and the block with it: the next fence opens one."""
+    found = _documented_installs(
+        f"1. Step:\n\n   {FENCE}bash\n{CONSTRAINED} pytest\n\n   \n   {FENCE}\n"
+    )
+    left = "stands left of the fence of the block it is in; in a list that ends the block"
+    assert found == [(f"{CONSTRAINED} pytest", [left]), (f"{CONSTRAINED} pytest", [])]
+
+
+def test_a_block_left_open_is_refused():
+    found = _documented_installs(f"Run:\n\n{FENCE}bash\n{CONSTRAINED} pytest\n")
+    assert (f"{FENCE}bash", ["opens a block that nothing closes"]) in found
+
+
+def test_the_documented_reader_pairs_a_plain_fence_and_one_inside_a_list():
+    markdown = (
+        f"{FENCE}\n{CONSTRAINED} pytest\n{FENCE}\n\n"
+        f"1. Then:\n\n   {FENCE}bash\n   {CONSTRAINED} pillow\n   {FENCE}\n\npip install requests\n"
+    )
+    assert _documented_installs(markdown) == [
+        (f"{CONSTRAINED} pytest", []),
+        (f"{CONSTRAINED} pillow", []),
+    ]
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        {"run": {f"{CONSTRAINED} pytest": None}},
+        {"name": "Install", "run": {f"{CONSTRAINED} pytest": "x"}},
+        {"uses": "actions/setup-python@v6", "with": {"cache": {"pip": None}}},
+        {
+            "uses": "actions/setup-python@v6",
+            "with": {"cache-dependency-path": {"dev-constraints.txt": None}},
+        },
+    ],
+)
+def test_a_mapping_key_is_never_the_install_line_or_a_cache_input(step):
+    """A key was read at its mapping's path, where `run: {"pip install ...": null}` is `run`."""
+    names, offenders = _workflow_installs({"jobs": {"test": {"steps": [step]}}}, _shared_pins())
+    assert names == set()
+    assert len(offenders) == 1 and "outside an install step" in offenders[0], offenders
+
+
+def test_the_workflow_guard_counts_what_the_script_files_name(monkeypatch):
+    refusal = ".github/scripts/x.sh:1: names `pip`; installs belong in a workflow step"
+    monkeypatch.setattr(sys.modules[__name__], "_unparsed_ci_file_offenders", lambda: [refusal])
+    with pytest.raises(AssertionError, match=r"scripts/x\.sh:1"):
+        test_every_workflow_install_takes_its_version_from_the_shared_pins()
+
+
+def test_the_workflow_guard_holds_each_workflow_to_its_mirror(monkeypatch, tmp_path):
+    (tmp_path / "test.yml").write_text("jobs: {}\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOWS", tmp_path)
+    with pytest.raises(AssertionError, match="WORKFLOW_INSTALLS says"):
+        test_every_workflow_install_takes_its_version_from_the_shared_pins()
+
+
+def _action_offenders(workflow: dict) -> tuple[set[str], list[str]]:
+    """``(third-party actions used, the ones not pinned to a commit)``.
+
+    `actions/*` is GitHub's own and stays on its major tags; a local `./` path
+    is this repository. Everything else runs someone else's code with this
+    repository's token, and a tag there can be moved.
+    """
+    used: set[str] = set()
+    offenders: list[str] = []
+    for job in workflow["jobs"].values():
+        for item in [job, *(job.get("steps") or [])]:
+            uses = str(item.get("uses", ""))
+            if not uses or uses.startswith(("./", "actions/")):
+                continue
+            used.add(uses.split("@", 1)[0])
+            if not COMMIT_PINNED_ACTION.fullmatch(uses):
+                offenders.append(uses)
+    return used, offenders
+
+
+def test_third_party_actions_are_pinned_to_a_commit():
+    used: set[str] = set()
+    offenders: list[str] = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        seen, wrong = _action_offenders(_yaml(path.name))
+        used |= seen
+        offenders += [f"{path.name}: {uses}" for uses in wrong]
+    assert (
+        used == THIRD_PARTY_ACTIONS
+    ), f"third-party actions in use changed: {sorted(used ^ THIRD_PARTY_ACTIONS)}"
+    assert not offenders, f"third-party actions on a tag that can be moved: {offenders}"
+
+
+def test_the_action_pin_reader_tells_a_tag_from_a_commit():
+    sha = "a" * 40
+    steps = [
+        {"uses": "actions/checkout@v4"},
+        {"uses": "gradle/actions/setup-gradle@v4"},
+        {"uses": f"gradle/actions/setup-gradle@{sha}"},
+        {"uses": f"owner/action@{sha[:7]}"},
+        {"run": "echo owner/action@v1"},
+    ]
+    workflow = {"jobs": {"a": {"steps": steps}, "b": {"uses": "owner/repo/.github/w.yml@main"}}}
+    used, offenders = _action_offenders(workflow)
+    assert used == {"gradle/actions/setup-gradle", "owner/action", "owner/repo/.github/w.yml"}
+    assert offenders == [
+        "gradle/actions/setup-gradle@v4",
+        f"owner/action@{sha[:7]}",
+        "owner/repo/.github/w.yml@main",
+    ]

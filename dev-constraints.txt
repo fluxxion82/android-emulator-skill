@@ -1,0 +1,35 @@
+# The one place the development toolchain's versions are stated.
+#
+# A pip constraints file: it installs nothing by itself, it fixes the version of
+# each package named below whenever an install brings that package in. Every
+# install step in .github/workflows/ is written one way,
+# `pip install -c dev-constraints.txt <names pinned here>`, and
+# tests/test_packaging_contract.py::test_every_workflow_install_takes_its_version_from_the_shared_pins
+# fails a workflow that names an installer any other way. It checks how the
+# workflows are written, not what a job does when it runs. Locally:
+#
+#   uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest tests/
+#
+# Exact pins only. To move one, change it here and run the suite.
+# Black and Ruff are also named in .pre-commit-config.yaml (pre-commit cannot
+# read this file); the same test module fails when the two disagree.
+#
+# A package named below is held to its pin whether a command names it or
+# another package pulls it in (pre-commit depends on PyYAML). A dependency
+# not named below (pytest: iniconfig, packaging, pluggy, pygments; black:
+# click, pathspec, ...) still floats.
+
+pip==26.3
+
+# Tests. Pillow is the one with a date on it: 14 (2027-10-15) removes
+# `Image.getdata`.
+pytest==9.2.0
+pillow==13.0.0
+pyyaml==6.0.3
+
+# Lint.
+black==26.5.1
+ruff==0.15.14
+
+# Local hooks only; no workflow installs it.
+pre-commit==4.7.0

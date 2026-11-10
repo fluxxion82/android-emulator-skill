@@ -25,11 +25,15 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
+          cache-dependency-path: dev-constraints.txt
 
       - name: Install dependencies
+        # Versions come from dev-constraints.txt and nowhere else: packages are
+        # named bare here. Guarded by tests/test_packaging_contract.py::
+        # test_every_workflow_install_takes_its_version_from_the_shared_pins.
         run: |
-          python -m pip install --upgrade pip
-          pip install pytest pillow pyyaml 'black==26.5.1' 'ruff==0.15.14'
+          python -m pip install -c dev-constraints.txt pip
+          pip install -c dev-constraints.txt pytest pillow pyyaml black ruff
 
       - name: Ruff
         run: ruff check android-emulator-skill/skills/android-emulator-skill/scripts/ tests/
@@ -113,7 +117,7 @@ jobs:
           ls -lh android-emulator-skill-${{ github.ref_name }}.zip
 
       - name: Upload package to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: android-emulator-skill-${{ github.ref_name }}.zip
           generate_release_notes: true
