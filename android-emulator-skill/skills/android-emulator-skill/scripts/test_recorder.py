@@ -56,7 +56,18 @@ before:
 Exit status: ``--step`` fails only when a step captured *nothing* (both the
 screenshot and the hierarchy failed), so a partial capture is still recorded
 rather than silently lost. ``--stop --failed`` exits 1 so a CI wrapper can key
-off it.
+off it, and so does ``--stop`` on an incomplete recording.
+
+A damaged ``steps.jsonl`` is disclosed, not refused. ``common/cache_utils.py``
+refuses a corrupt entry because its remedy is cheap: delete the file and re-run
+the command. A recording has no re-run -- the device has moved on -- and the
+readable steps, with every step's screenshot and UI dump, are still worth
+having; a refusal would also leave the session unstoppable until someone
+hand-edited the file. So what reads is kept and what does not is counted
+(:class:`StepLog`, :func:`_integrity`) and said by ``--stop``, ``--get-details``
+and ``--list`` in text and JSON, in ``report.md`` and ``manifest.json``, and by
+``--stop``'s exit status. Exit 0 from ``--stop`` means "passed, and every
+recorded step is in the report".
 """
 
 from __future__ import annotations
@@ -92,6 +103,11 @@ STEP_NAME_MAXLEN = env_int("ANDROID_EMU_STEP_NAME_MAXLEN", 30)
 # Labels kept on the step record for the report. The full hierarchy is on disk
 # in the step's ui-dump, so this is a preview, not the data.
 MAX_STEP_LABELS = 8
+
+# The most steps one session holds. A step number is read back from a file
+# anyone can edit and becomes the next number and its artifact names, so it has
+# a ceiling: past it, a line is not a step and `--step` is refused.
+MAX_STEP_NUMBER = 999_999
 
 STATUS_RECORDING = "recording"
 STATUS_STOPPED = "stopped"
@@ -199,6 +215,187 @@ class SessionMeta:
         return max(0.0, (end_ms - self.started_at_ms) / 1000.0)
 
 
+@dataclass(frozen=True)
+class StepLog:
+    """What ``steps.jsonl`` holds, including what could not be read from it.
+
+    Attributes:
+        path: The steps file.
+        steps: The step records that read, in file order.
+        unreadable_lines: Non-blank lines that gave no step: damaged ones
+            (cut short, not UTF-8, not JSON, or not a record the recorder
+            could have written -- see :func:`_parse_step_line`) and repeats.
+        repeated_lines: The part of ``unreadable_lines`` that is a readable
+            record whose step number an earlier line already holds.
+    """
+
+    path: Path
+    steps: list[dict]
+    unreadable_lines: int
+    repeated_lines: int
+
+    def recorded(self, meta: SessionMeta) -> int:
+        """How many steps this session has recorded: its highest step number.
+
+        The file and meta each know part of it. Meta is written after the
+        append, so it lags a step that landed and then lost its process; the
+        file loses lines, or all of them. Meta and the highest number that
+        reads can only undercount, so the largest claim wins.
+
+        A damaged line counts as a step that was recorded, because a record
+        cut short or corrupted is what one usually is; a line of junk that
+        never was a step is counted the same way and cannot be told apart. A
+        repeat is different: the step it names is already counted, so it adds
+        nothing -- two readable rows that are both step 1 are one step, and a
+        row pasted in twice must not raise the count ``--stop`` keeps.
+        """
+        highest = max((step["number"] for step in self.steps), default=0)
+        damaged = self.unreadable_lines - self.repeated_lines
+        return max(meta.step_count, highest, len(self.steps) + damaged)
+
+
+def _integrity(meta: SessionMeta, log: StepLog) -> dict:
+    """The disclosure every reading command carries, text and JSON alike.
+
+    ``lost_steps`` is steps recorded but not readable; ``unreadable_lines`` is
+    how many non-blank lines of the file gave no step. They differ when lines
+    are gone altogether (a file emptied after two steps: 2 lost, 0 unreadable)
+    and when a line repeats a step that is still there (0 lost, 1 unreadable).
+    Either one makes the recording incomplete: a file holding a line the
+    recorder did not write is not one whose step list can be vouched for.
+    """
+    lost = log.recorded(meta) - len(log.steps)
+    return {
+        "incomplete": lost > 0 or log.unreadable_lines > 0,
+        "unreadable_lines": log.unreadable_lines,
+        "lost_steps": lost,
+        "steps_file": str(log.path),
+    }
+
+
+def _incomplete_note(integrity: dict, steps: int) -> str:
+    """One line saying what is missing and which file to look at."""
+    return (
+        f"{integrity['lost_steps']} of {steps + integrity['lost_steps']} recorded step(s) lost; "
+        f"{integrity['unreadable_lines']} unreadable line(s) in {integrity['steps_file']}"
+    )
+
+
+def _is_text(value: object) -> bool:
+    """A string that can be written out: a lone surrogate parses and cannot."""
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _is_text_or_none(value: object) -> bool:
+    return value is None or _is_text(value)
+
+
+def _is_texts(value: object) -> bool:
+    return isinstance(value, list) and all(_is_text(item) for item in value)
+
+
+def _is_flag(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_step_number(value: object) -> bool:
+    return _is_count(value) and 1 <= value <= MAX_STEP_NUMBER
+
+
+def _is_seconds(value: object) -> bool:
+    """A length of time a float holds: not NaN, not infinite, not negative."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return 0 <= float(value) < float("inf")
+    except OverflowError:  # an integer of hundreds of digits
+        return False
+
+
+# What `summarize_hierarchy` writes under a step's `screen`.
+_SCREEN_FIELDS = {
+    "elements": _is_count,
+    "clickable": _is_count,
+    "with_text": _is_count,
+    "labels": _is_texts,
+    "label_total": _is_count,
+    "package": _is_text_or_none,
+}
+
+
+def _is_screen(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        key in _SCREEN_FIELDS and _SCREEN_FIELDS[key](item) for key, item in value.items()
+    )
+
+
+# Every field `TestRecorder.step` writes, and what it writes there. The table
+# is closed: a field that is not in it, or a value its check refuses, makes the
+# line unreadable. None is accepted only where the recorder writes None.
+_STEP_FIELDS = {
+    "number": _is_step_number,
+    "description": _is_text,
+    "recorded_at": _is_text,
+    "elapsed_seconds": _is_seconds,
+    "screenshot": _is_text_or_none,
+    "ui_dump": _is_text_or_none,
+    "screen": _is_screen,
+    "activity": _is_text_or_none,
+    "marker_logged": _is_flag,
+    "errors": _is_texts,
+    "captured": _is_flag,
+    "screen_name": _is_text,
+    "state": _is_text,
+    "assertion": _is_text,
+    "assertion_passed": _is_flag,
+}
+_REQUIRED_STEP_FIELDS = ("number", "description")
+
+
+def _bad_field(record: dict) -> str | None:
+    """The first field that keeps a dict from being a step record, or None."""
+    for key, value in record.items():
+        if key not in _STEP_FIELDS or not _STEP_FIELDS[key](value):
+            return key
+    return next((key for key in _REQUIRED_STEP_FIELDS if key not in record), None)
+
+
+def _parse_step_line(raw: bytes) -> dict | None:
+    """A step record, or None for a line that is not one.
+
+    A line is read as bytes so that one that is not UTF-8 is one unreadable
+    line rather than a decode error for the whole file. JSON that is not a
+    step is unreadable too: ``null``, a list, an object without a step number
+    and a description, or one holding anything :data:`_STEP_FIELDS` does not
+    describe.
+
+    The renderers are not what decides. Checking the fields the report
+    happened to index left the next one unchecked each time -- a string no
+    file can hold, a number no float can -- and ``--stop`` ended in a
+    traceback. A record that passes here is one the recorder could have
+    written, and those it can render.
+    """
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        # ValueError: not UTF-8, not JSON, or an integer too long to convert.
+        # RecursionError: nested deeper than the parser goes.
+        return None
+    if not isinstance(record, dict) or _bad_field(record) is not None:
+        return None
+    return record
+
+
 # === SESSION STORE ===
 
 
@@ -217,12 +414,33 @@ class RecorderSessionStore:
 
     def __init__(self, base_dir: Path | str | None = None):
         self.base_dir = Path(base_dir).expanduser() if base_dir else _default_sessions_dir()
+        # Every artifact path a step records starts here, and a record holds
+        # only text that encodes (`_STEP_FIELDS`). Refused where the root is
+        # read, so no command gets as far as a path it cannot write down.
+        if not _is_text(str(self.base_dir)):
+            raise RecorderError(
+                f"The recorder's storage root {str(self.base_dir)!a} is not a path "
+                "that encodes as UTF-8, so no step could record where its files are. "
+                "Point ANDROID_EMU_RECORDER_HOME at a directory whose path does."
+            )
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     # === PUBLIC API ===
 
     def create(self, meta_fields: dict) -> SessionMeta:
-        """Allocate an id, build the session tree, and write the initial meta."""
+        """Allocate an id, build the session tree, and write the initial meta.
+
+        Raises:
+            RecorderError: a field is text the report could not hold. meta.json
+                would take it, as an escape; report.md is UTF-8 and would not,
+                and that is found out at ``--stop``, with the steps taken.
+        """
+        for key, value in meta_fields.items():
+            if isinstance(value, str) and not _is_text(value):
+                raise RecorderError(
+                    f"The session's {key.replace('_', ' ')} is not text that can be "
+                    "stored: it does not encode as UTF-8."
+                )
         session_id = _generate_session_id()
         session_dir = self.base_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=False)
@@ -259,28 +477,69 @@ class RecorderSessionStore:
         Durability matters more than throughput here: the next invocation is a
         different process, and a step that is only in a buffer is a step that
         never happened.
+
+        A file that does not end in a newline ends in a record cut short. The
+        new record starts on a line of its own, so the fragment stays one
+        unreadable line instead of swallowing this step as well.
+
+        This is the one place a step is written, so it is where the writer is
+        held to the reader's table: a record `_parse_step_line` would not read
+        back is refused, not appended as a line that is lost on arrival.
+
+        Raises:
+            RecorderError: the record holds a field the reader refuses.
         """
-        with open(self.steps_path(session_id), "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(step, ensure_ascii=False) + "\n")
+        bad = _bad_field(step)
+        if bad is not None:
+            raise RecorderError(
+                f"Step {step.get('number')} was not recorded: its {bad.replace('_', ' ')} "
+                f"is {ascii(step.get(bad))[:120]}, which the recorder could not read back."
+            )
+        line = json.dumps(step, ensure_ascii=False) + "\n"
+        with open(self.steps_path(session_id), "a+b") as handle:
+            if handle.seek(0, os.SEEK_END) > 0:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    line = "\n" + line
+            handle.write(line.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
 
-    def read_steps(self, session_id: str) -> list[dict]:
-        """Every recorded step, in order. Unparseable lines are skipped."""
+    def read_steps(self, session_id: str) -> StepLog:
+        """The steps file as it is: the records that read, and a count of the rest.
+
+        Returns a :class:`StepLog`, never a bare list: a list of what parsed
+        cannot say that anything did not, which is how a damaged file used to
+        stop as a clean, shorter recording. A missing file reads as no lines;
+        whether that is a loss is :func:`_integrity`'s call, against meta.
+        """
         path = self.steps_path(session_id)
-        if not path.exists():
-            return []
         steps: list[dict] = []
-        with open(path, encoding="utf-8") as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line:
+        numbers: set[int] = set()
+        line_count = 0
+        repeated = 0
+        if path.exists():
+            for raw in path.read_bytes().split(b"\n"):
+                if not raw.strip():
                     continue
-                try:
-                    steps.append(json.loads(line))
-                except json.JSONDecodeError:
+                line_count += 1
+                record = _parse_step_line(raw)
+                if record is None:
                     continue
-        return steps
+                # A step number is handed out once, so a second line carrying
+                # one is not a second step. The first is kept: an append never
+                # lands before the line it copies.
+                if record["number"] in numbers:
+                    repeated += 1
+                    continue
+                numbers.add(record["number"])
+                steps.append(record)
+        return StepLog(
+            path=path,
+            steps=steps,
+            unreadable_lines=line_count - len(steps),
+            repeated_lines=repeated,
+        )
 
     def list_sessions(self) -> list[SessionMeta]:
         """All sessions, newest first.
@@ -428,9 +687,29 @@ class TestRecorder:
                 f"Session {session_id} is {meta.status}; start a new one to record more steps."
             )
 
-        # Numbering comes from what is on disk, not from meta, so a step is
-        # numbered correctly even if a previous invocation died after appending.
-        number = len(self.store.read_steps(session_id)) + 1
+        # One past the highest number this session has handed out, by whichever
+        # of the file and meta knows more: a step that landed before its
+        # invocation died is counted (meta lags), and so is a line that no
+        # longer reads or is gone (the file lost it). Counting only the lines
+        # that parsed gave a lost step's number, and its artifact names, away
+        # again.
+        number = self.store.read_steps(session_id).recorded(meta) + 1
+        # Refused before anything is captured, for what is known before it:
+        # the step's own text and its number. What the capture brings back is
+        # held to the same table where it is written (`append_step`).
+        asked = {"screen_name": screen_name, "state": state, "assertion": assertion}
+        said = {key: value for key, value in asked.items() if value}
+        bad = _bad_field({"number": number, "description": description, **said})
+        if bad == "number":
+            raise RecorderError(
+                f"Session {session_id} is at step {number - 1}; a session holds at most "
+                f"{MAX_STEP_NUMBER}. Stop it and start a new one."
+            )
+        if bad:
+            raise RecorderError(
+                f"The step's {bad.replace('_', ' ')} is not text that can be stored: "
+                "it does not encode as UTF-8."
+            )
         slug = self._slugify(description)
         target_serial = serial or meta.serial
         errors: list[str] = []
@@ -484,17 +763,24 @@ class TestRecorder:
         meta.stopped_at = now.isoformat()
         meta.stopped_at_ms = int(now.timestamp() * 1000)
         meta.passed = passed
-        steps = self.store.read_steps(session_id)
-        meta.step_count = len(steps)
-        self.store.write_meta(meta)
+        log = self.store.read_steps(session_id)
+        steps = log.steps
+        integrity = _integrity(meta, log)
+        # Steps recorded, not steps readable: a stopped session read back by
+        # --list / --get-details must still be able to tell that some are gone.
+        meta.step_count = log.recorded(meta)
 
+        # Meta is written last. A stop that dies writing its report must leave
+        # the session recording, so that --stop can be run again: a session
+        # already marked stopped is refused, and would never get a report.
         report_path = self.store.report_path(session_id)
         manifest_path = self.store.manifest_path(session_id)
-        report_path.write_text(self.render_report(meta, steps), encoding="utf-8")
+        report_path.write_text(self.render_report(meta, steps, integrity), encoding="utf-8")
         _atomic_write_json(
             manifest_path,
             {
                 "session": meta.to_json(),
+                **integrity,
                 "steps": steps,
                 "artifacts": {
                     "report": str(report_path),
@@ -504,11 +790,13 @@ class TestRecorder:
                 },
             },
         )
+        self.store.write_meta(meta)
         return {
             "session_id": session_id,
             "name": meta.name,
             "passed": passed,
             "steps": len(steps),
+            **integrity,
             "capture_failures": meta.capture_failures,
             "duration_seconds": round(meta.duration_seconds, 2),
             "report": str(report_path),
@@ -516,25 +804,42 @@ class TestRecorder:
         }
 
     def list_sessions(self) -> list[dict]:
-        """Session summaries, newest first."""
-        return [
-            {
-                "session_id": meta.session_id,
-                "name": meta.name,
-                "status": meta.status,
-                "steps": meta.step_count,
-                "passed": meta.passed,
-                "started_at": meta.started_at,
-                "duration_seconds": round(meta.duration_seconds, 2),
-            }
-            for meta in self.store.list_sessions()
-        ]
+        """Session summaries, newest first.
+
+        ``steps`` is counted from each session's steps file, not taken from
+        meta, so it is the number ``--get-details`` would show and it sits
+        beside the count of what could not be read.
+        """
+        summaries = []
+        for meta in self.store.list_sessions():
+            log = self.store.read_steps(meta.session_id)
+            integrity = _integrity(meta, log)
+            summaries.append(
+                {
+                    "session_id": meta.session_id,
+                    "name": meta.name,
+                    "status": meta.status,
+                    "steps": len(log.steps),
+                    "incomplete": integrity["incomplete"],
+                    "unreadable_lines": integrity["unreadable_lines"],
+                    "lost_steps": integrity["lost_steps"],
+                    "passed": meta.passed,
+                    "started_at": meta.started_at,
+                    "duration_seconds": round(meta.duration_seconds, 2),
+                }
+            )
+        return summaries
+
+    def integrity(self, session_id: str) -> dict:
+        """Whether every step a session recorded can still be read back."""
+        meta = self.store.load_meta(_validate_session_id(session_id))
+        return _integrity(meta, self.store.read_steps(meta.session_id))
 
     def get_details(self, session_id: str) -> dict:
         """Full stored state for one session."""
         meta = self.store.load_meta(_validate_session_id(session_id))
-        steps = self.store.read_steps(meta.session_id)
-        details = {"session": meta.to_json(), "steps": steps}
+        log = self.store.read_steps(meta.session_id)
+        details = {"session": meta.to_json(), **_integrity(meta, log), "steps": log.steps}
         report = self.store.report_path(meta.session_id)
         if report.exists():
             details["report"] = str(report)
@@ -687,14 +992,27 @@ class TestRecorder:
         return "✓" if step.get("assertion_passed") else "✗"
 
     @classmethod
-    def render_report(cls, meta: SessionMeta, steps: list[dict]) -> str:
-        """Markdown report: the human-readable half of a finished session."""
+    def render_report(
+        cls, meta: SessionMeta, steps: list[dict], integrity: dict | None = None
+    ) -> str:
+        """Markdown report: the human-readable half of a finished session.
+
+        ``integrity`` is :func:`_integrity`'s answer for the session; when it
+        says steps were lost the report says so under its status, and never
+        "no steps were recorded" for steps that were recorded and are gone.
+        """
+        incomplete = bool(integrity and integrity["incomplete"])
         status = "✓ PASSED" if meta.passed else "✗ FAILED"
         lines = [
             f"# Test Report: {meta.name}",
             "",
             f"- **Session:** `{meta.session_id}`",
             f"- **Status:** {status}",
+            *(
+                [f"- **Recording:** INCOMPLETE — {_incomplete_note(integrity, len(steps))}"]
+                if incomplete
+                else []
+            ),
             f"- **Steps:** {len(steps)}",
             f"- **Duration:** {meta.duration_seconds:.1f}s",
             f"- **Device:** {meta.serial or 'default'}",
@@ -707,7 +1025,10 @@ class TestRecorder:
         lines += ["", "## Steps", ""]
 
         if not steps:
-            lines += ["_No steps were recorded._", ""]
+            lines += [
+                "_No recorded step could be read._" if incomplete else "_No steps were recorded._",
+                "",
+            ]
 
         for step in steps:
             lines.append(f"### {step['number']}. {step['description']}")
@@ -878,9 +1199,10 @@ def _run_start(recorder: TestRecorder, args: argparse.Namespace) -> int:
 
 
 def _run_step(recorder: TestRecorder, args: argparse.Namespace) -> int:
+    session_id = recorder.store.resolve_session_id(args.session)
     step = recorder.step(
         args.step,
-        session_id=args.session,
+        session_id=session_id,
         screen_name=args.screen,
         state=args.state,
         assertion=args.assertion,
@@ -908,6 +1230,10 @@ def _run_step(recorder: TestRecorder, args: argparse.Namespace) -> int:
                 print(f"  labels:     {' · '.join(screen['labels'])}")
     for error in step.get("errors") or []:
         print(f"Warning: {error}", file=sys.stderr)
+    integrity = recorder.integrity(session_id)
+    if integrity["incomplete"]:
+        note = _incomplete_note(integrity, step["number"] - integrity["lost_steps"])
+        print(f"Warning: recording is incomplete: {note}", file=sys.stderr)
     # Only a step that captured nothing at all is a failure.
     return 0 if step["captured"] else 1
 
@@ -918,15 +1244,21 @@ def _run_stop(recorder: TestRecorder, args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
     else:
         status = "✓ PASSED" if result["passed"] else "✗ FAILED"
+        if result["incomplete"]:
+            status += ", INCOMPLETE RECORDING"
         print(
             f"{status}: {result['name']} — {result['steps']} steps in {result['duration_seconds']}s"
         )
+        if result["incomplete"]:
+            print(f"Incomplete: {_incomplete_note(result, result['steps'])}")
         print(f"Report:   {result['report']}")
         print(f"Manifest: {result['manifest']}")
         if result["capture_failures"]:
             print(f"Capture failures: {result['capture_failures']}", file=sys.stderr)
-    # Non-zero on a failed run so a CI wrapper can key off it.
-    return 0 if result["passed"] else 1
+    # Non-zero on a failed run so a CI wrapper can key off it -- and on an
+    # incomplete recording, so a caller reading only the status is not told a
+    # run passed on a report that is missing steps.
+    return 0 if result["passed"] and not result["incomplete"] else 1
 
 
 def _run_list(recorder: TestRecorder, args: argparse.Namespace) -> int:
@@ -938,10 +1270,16 @@ def _run_list(recorder: TestRecorder, args: argparse.Namespace) -> int:
         print("No recorded sessions.")
         return 0
     for entry in sessions:
-        print(
+        line = (
             f"{entry['session_id']}  {entry['status']:<9}  "
             f"{entry['steps']:>3} steps  {entry['name']}"
         )
+        if entry["incomplete"]:
+            line += (
+                f"  INCOMPLETE: {entry['lost_steps']} lost, "
+                f"{entry['unreadable_lines']} unreadable line(s)"
+            )
+        print(line)
     return 0
 
 
@@ -953,6 +1291,8 @@ def _run_get_details(recorder: TestRecorder, args: argparse.Namespace) -> int:
     session = details["session"]
     print(f"{session['session_id']}  {session['status']}  {session['name']}")
     print(f"Steps: {len(details['steps'])}  Device: {session['serial'] or 'default'}")
+    if details["incomplete"]:
+        print(f"Incomplete: {_incomplete_note(details, len(details['steps']))}")
     for step in details["steps"]:
         screen = step.get("screen") or {}
         symbol = TestRecorder._assertion_symbol(step)
