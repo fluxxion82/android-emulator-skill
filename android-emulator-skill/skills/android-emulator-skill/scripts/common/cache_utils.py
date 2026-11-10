@@ -152,15 +152,19 @@ class ProgressiveCache:
 
         return cache_id
 
-    def get(self, cache_id: str) -> dict | None:
+    def get(self, cache_id: str, cache_type: str | None = None) -> dict | None:
         """Retrieve data from cache by cache_id.
 
         Args:
             cache_id: Cache ID from save() or list_entries()
+            cache_type: When given, only an entry saved under this type is
+                answered; another type's entry reads as None and is kept. A
+                reader that knows what it cached passes it, so another
+                script's data with the same keys is never taken for its own.
 
         Returns:
-            Cached data dictionary, or None if not found/expired. An expired
-            entry is deleted.
+            Cached data dictionary, or None if not found/expired (or, with
+            ``cache_type``, of another type). An expired entry is deleted.
 
         Raises:
             CacheCorruptionError: The entry exists but cannot be read as one.
@@ -182,6 +186,8 @@ class ProgressiveCache:
 
         if self._is_expired(created_at):
             cache_file.unlink(missing_ok=True)
+            return None
+        if cache_type is not None and entry.get("cache_type") != cache_type:
             return None
         return entry.get("data")
 

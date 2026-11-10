@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Android Emulator Skill — Build, test, and automate Android apps with Claude Code</title>
-<meta name="description" content="A production-ready Claude Code skill of 29 scripts wrapping adb, uiautomator, avdmanager, and the Gradle wrapper. Semantic UI navigation, emulator lifecycle, accessibility audits, and ANR/jank watching — optimized for AI agents.">
+<meta name="description" content="A production-ready Claude Code skill of 33 scripts wrapping adb, uiautomator, avdmanager, and the Gradle wrapper. Semantic UI navigation, emulator lifecycle, accessibility audits, and ANR/jank watching — optimized for AI agents.">
 <meta property="og:title" content="Android Emulator Skill for Claude Code">
-<meta property="og:description" content="29 scripts for Android app building, testing, and automation. Semantic, token-efficient, built on adb and uiautomator.">
+<meta property="og:description" content="33 scripts for Android app building, testing, and automation. Semantic, token-efficient, built on adb and uiautomator.">
 <meta property="og:type" content="website">
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="stylesheet" href="styles.css">
@@ -32,11 +32,11 @@
 <section class="hero">
   <div class="container">
     <div class="hero-meta">
-      <span class="tag">v0.4.0 · Plugin</span>
+      <span class="tag">v0.9.0 · Plugin</span>
       <span class="tag tag-muted">macOS · Linux · Windows</span>
     </div>
     <h1>Build, test, and automate Android apps&nbsp;with <em>Claude Code</em>.</h1>
-    <p class="lede">A production-ready skill of 29 scripts wrapping <code>adb</code>, <code>uiautomator</code>, <code>avdmanager</code>, and the Gradle wrapper with semantic interfaces designed for AI agents and developers.</p>
+    <p class="lede">A production-ready skill of 33 scripts wrapping <code>adb</code>, <code>uiautomator</code>, <code>avdmanager</code>, and the Gradle wrapper with semantic interfaces designed for AI agents and developers.</p>
 
     <div class="cta-row">
       <a class="btn btn-primary" href="#install">Install</a>
@@ -46,13 +46,13 @@
     <div class="stats">
       <div class="stat">
         <div class="stat-num">/01</div>
-        <div class="stat-value">29</div>
+        <div class="stat-value">33</div>
         <div class="stat-label">Production scripts</div>
       </div>
       <div class="stat">
         <div class="stat-num">/02</div>
-        <div class="stat-value">96<span class="stat-unit">%</span></div>
-        <div class="stat-label">Token reduction vs raw tools</div>
+        <div class="stat-value">16</div>
+        <div class="stat-label">Shared modules in common/</div>
       </div>
       <div class="stat">
         <div class="stat-num">/03</div>
@@ -75,7 +75,7 @@
       <article class="feature-card">
         <span class="feature-num">A</span>
         <h3>Token-efficient by default</h3>
-        <p>Default output is a few lines. Drill into errors, warnings, or full logs only when you need them with <code>--verbose</code> and <code>--json</code>. About 96% less output than raw tools.</p>
+        <p>Default output is a few lines. Drill into errors, warnings, or full logs only when you need them with <code>--verbose</code> and <code>--json</code>.</p>
       </article>
       <article class="feature-card">
         <span class="feature-num">B</span>
@@ -90,7 +90,7 @@
       <article class="feature-card">
         <span class="feature-num">D</span>
         <h3>Production-ready</h3>
-        <p>Class-based scripts, modern type hints, Black + Ruff CI, and a mocked pytest suite. Auto device detection. Idempotent emulator lifecycle (create / boot / shutdown / erase / delete).</p>
+        <p>Class-based scripts, modern type hints, Black + Ruff CI, and a device-free pytest suite whose parsers read output recorded from real emulators. Auto device detection. Idempotent emulator lifecycle (create / boot / shutdown / erase / delete).</p>
       </article>
     </div>
   </div>
@@ -100,8 +100,8 @@
   <div class="container">
     <div class="section-head">
       <span class="section-num">02 / CATALOG</span>
-      <h2 class="section-title">29 scripts. 8 categories.</h2>
-      <p class="section-sub">Every script supports <code>--help</code> and <code>--json</code>, and auto-detects the connected device unless you pass <code>--serial</code>.</p>
+      <h2 class="section-title">33 scripts. 8 categories.</h2>
+      <p class="section-sub">Every script supports <code>--help</code> and <code>--json</code>; those that drive a device auto-detect it unless you pass <code>--serial</code>.</p>
     </div>
 
     <div class="catalog">
@@ -127,6 +127,8 @@
           <li><code>emulator_create.py</code><span>Create AVDs by device type and API level. <em>--device · --api · --name · --abi · --variant · --list-devices · --list-images</em></span></li>
           <li><code>emulator_delete.py</code><span>Delete AVDs permanently. <em>--name · --list</em></span></li>
           <li><code>emulator_erase.py</code><span>Factory-reset an AVD, wiping user data without deleting it. <em>--name · --force · --list</em></span></li>
+          <li><code>snapshot.py</code><span>Save, load and delete emulator snapshots; a failed load is a failure, not an <code>adb emu</code> exit 0. Emulator only. <em>--list · --save · --load · --delete · --no-verify · --timeout</em></span></li>
+          <li><code>avd.py</code><span>One entry point for the lifecycle: <code>list</code>, <code>pick</code>, <code>create</code>, <code>start</code>, <code>stop</code>, <code>reset</code>, <code>delete</code>, each routed to the script above that does it.</span></li>
         </ul>
       </div>
 
@@ -137,7 +139,9 @@
         </div>
         <ul>
           <li><code>build_and_test.py</code><span>Gradle build, unit and instrumented tests with progressive disclosure; parses JUnit XML and Gradle/Kotlin/Java errors. <em>--project · --module/-p · --variant · --clean · --test · --instrumented · --suite · --serial · --get-errors · --get-warnings · --get-log · --list-builds</em></span></li>
-          <li><code>log_monitor.py</code><span>Real-time logcat with package and severity filtering, dedup, and save-to-file. <em>--app · --serial · --severity · --follow · --duration · --output · --clear</em></span></li>
+          <li><code>log_monitor.py</code><span>Real-time logcat with package and severity filtering, dedup, and save-to-file. <em>--app · --serial · --severity · --follow · --duration · --last · --output · --clear</em></span></li>
+          <li><code>crash_triage.py</code><span>Parse the crash buffer (<code>logcat -b crash</code>) into crashes grouped by fault, naming the frame most useful for triage and why. <em>--package · --clear · --fail-on-crash</em></span></li>
+          <li><code>logs.py</code><span>One entry point for reading logs: <code>tail</code>, <code>crashes</code>, <code>anr</code>, routed to <code>log_monitor.py</code>, <code>crash_triage.py</code> and <code>anr_watcher.py</code>.</span></li>
         </ul>
       </div>
 
@@ -147,10 +151,10 @@
           <h3>Navigation &amp; Interaction</h3>
         </div>
         <ul>
-          <li><code>screen_mapper.py</code><span>Analyze the current screen and list interactive elements by type. <em>--serial · --list · --verbose</em></span></li>
+          <li><code>screen_mapper.py</code><span>Analyze the current screen and name every interactive control, by kind; listing is the default. <em>--serial · --verbose · --hints</em></span></li>
           <li><code>navigator.py</code><span>Find and interact with elements semantically (text, type, resource ID). <em>--find-text · --find-type · --find-id · --tap · --enter-text · --list</em></span></li>
           <li><code>gesture.py</code><span>Swipes, scrolls, and long press, including edge swipes. <em>--swipe · --from-edge · --duration · --long-press · --scroll</em></span></li>
-          <li><code>keyboard.py</code><span>Type text, press hardware keys/buttons, clear input. <em>--text · --key · --button · --clear</em></span></li>
+          <li><code>keyboard.py</code><span>Type text, press hardware keys/buttons, clear input, hide the soft keyboard. <em>--type · --delay · --key · --keys · --button · --clear · --hide-keyboard</em></span></li>
         </ul>
       </div>
 
@@ -161,8 +165,8 @@
         </div>
         <ul>
           <li><code>accessibility_audit.py</code><span>WCAG checks: content descriptions, touch-target size, EditText hints, image accessibility. <em>--serial · --output · --verbose</em></span></li>
-          <li><code>visual_diff.py</code><span>Compare two screenshots and generate a diff image. <em>--image1 · --image2 · --output · --threshold</em></span></li>
-          <li><code>test_recorder.py</code><span>Document test execution with screenshots and UI hierarchy per step. <em>--test-name · --output · --serial · --inline · --size · --app-name</em></span></li>
+          <li><code>visual_diff.py</code><span>Compare two screenshots (positional: baseline, current) and write a per-pixel diff overlay. <em>--output · --threshold</em></span></li>
+          <li><code>test_recorder.py</code><span>Document a test run as a session: a screenshot and the UI hierarchy per step, then a report. <em>--start · --step · --stop · --list · --get-details · --serial · --size · --app-name</em></span></li>
           <li><code>app_state_capture.py</code><span>All-in-one debugging snapshot: screenshot, UI hierarchy, logs, app info. <em>--package · --output · --serial · --logs/--no-logs · --screenshot-size</em></span></li>
         </ul>
       </div>
@@ -175,9 +179,10 @@
         <ul>
           <li><code>privacy_manager.py</code><span>Grant/revoke runtime permissions (20+ types), with batch support. <em>--grant · --revoke · --list · --package · --list-permissions</em></span></li>
           <li><code>status_bar.py</code><span>Demo-mode status bar: battery, charging, WiFi/mobile signal, time. <em>--battery · --charging · --wifi · --mobile · --time · --reset</em></span></li>
-          <li><code>push_notification.py</code><span>Send test notifications and list channels. <em>--package · --title · --message · --id · --data · --list-channels · --method</em></span></li>
+          <li><code>push_notification.py</code><span>Post into the shade (as <code>com.android.shell</code>, not the app) and read back what is posted. <em>--post · --tag · --text · --list · --expect-package · --grant-permission · --revoke-permission · --package</em></span></li>
           <li><code>appearance.py</code><span>Dark/light mode and font scale, best-effort locale. <em>--theme · --text-size · --font-scale · --locale · --reset</em></span></li>
           <li><code>location.py</code><span>Simulate GPS via <code>adb emu geo fix</code>: fixed coords, city presets, GPX route replay (emulator only). <em>--lat/--lng · --city · --gpx · --interval/--speed · --clear · --list-cities</em></span></li>
+          <li><code>sms.py</code><span>Deliver an inbound SMS to an emulator and read the inbox back to prove it arrived; extract a one-time code. Sending is emulator-only; <code>--list</code> and <code>--otp</code> work on any device. <em>--send · --to · --body · --list · --otp</em></span></li>
         </ul>
       </div>
 
@@ -200,15 +205,15 @@
           <h3>Inspection &amp; Stability</h3>
         </div>
         <ul>
-          <li><code>container.py</code><span>Inspect a debuggable app's sandbox via <code>adb shell run-as</code>: files, <code>shared_prefs</code>, SQLite schema, snapshot export. <em>--package · --ls · --cat · --shared-prefs · --databases · --export</em></span></li>
+          <li><code>container.py</code><span>Inspect a debuggable app's sandbox via <code>adb shell run-as</code>: files, <code>shared_prefs</code>, SQLite schema, snapshot export. <em>--package · --ls · --cat · --shared-prefs · --databases · --export · --get-cached</em></span></li>
           <li><code>model_inspector.py</code><span>Inspect Room annotations, exported-schema JSON, and live SQLite schema (Room == SQLite). <em>--source · --schema · --show-versions · --raw · --package · --db</em></span></li>
-          <li><code>anr_watcher.py</code><span>Record &amp; summarise ANRs/jank from logcat with session-based progressive disclosure. <em>--start · --stop · --get-details · --list-sessions · --diff · --watch · --since · --terse</em></span></li>
+          <li><code>anr_watcher.py</code><span>Record &amp; summarise ANRs/jank from logcat with session-based progressive disclosure. Unix only (macOS, Linux). <em>--start · --stop · --get-details · --list-sessions · --diff · --watch · --since · --terse</em></span></li>
         </ul>
       </div>
 
     </div>
 
-    <p class="catalog-note">Three shared modules back the scripts above — <code>common/device_utils.py</code> (ADB command building &amp; device detection), <code>common/screenshot_utils.py</code> (capture &amp; resize), and <code>common/cache_utils.py</code> (progressive-disclosure cache). The Gradle build system lives in the <code>gradle/</code> subpackage.</p>
+    <p class="catalog-note">16 shared modules in <code>common/</code> back the scripts above, among them <code>common/device_utils.py</code> (ADB command building &amp; device detection), <code>common/screenshot_utils.py</code> (capture &amp; resize), and <code>common/cache_utils.py</code> (progressive-disclosure cache). The Gradle build system lives in the <code>gradle/</code> subpackage.</p>
   </div>
 </section>
 
@@ -227,7 +232,7 @@
 <pre><code>/plugin marketplace add fluxxion82/android-emulator-skill
 /plugin install android-emulator-skill@fluxxion82</code></pre>
     </div>
-    <p class="install-prereqs">Prerequisites: Android SDK with platform-tools &amp; emulator · Python 3.8+ · ADB · Gradle (optional) · Pillow for screenshot resizing (optional).</p>
+    <p class="install-prereqs">Prerequisites: Android SDK with platform-tools &amp; emulator · Python 3.12+ · ADB · Gradle (optional) · Pillow for screenshot resizing (optional).</p>
   </div>
 </section>
 
@@ -243,11 +248,12 @@
       <div class="codeblock-head">
         <span>manual testing flow</span>
       </div>
-<pre><code>python scripts/app_launcher.py --launch com.example.app
-python scripts/screen_mapper.py
-python scripts/navigator.py --find-text "Login" --tap
-python scripts/navigator.py --find-type EditText --enter-text "user@example.com"
-python scripts/accessibility_audit.py</code></pre>
+<pre><code>SCRIPTS=/path/to/skills/android-emulator-skill/scripts   # by path, not relative to the cwd
+python3 "$SCRIPTS/app_launcher.py" --launch com.example.app
+python3 "$SCRIPTS/screen_mapper.py"
+python3 "$SCRIPTS/navigator.py" --find-text "Login" --tap
+python3 "$SCRIPTS/navigator.py" --find-type EditText --enter-text "user@example.com"
+python3 "$SCRIPTS/accessibility_audit.py"</code></pre>
     </div>
   </div>
 </section>

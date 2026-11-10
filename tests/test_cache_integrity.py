@@ -271,3 +271,64 @@ def test_list_builds_skips_a_corrupt_build_and_still_answers(
     else:
         assert captured.out.strip() == "No cached builds found"
     assert corrupt_entry.exists()
+
+
+# ---------------------------------------------------------------------------
+# Typed reads
+# ---------------------------------------------------------------------------
+
+
+def test_a_typed_get_answers_only_an_entry_of_that_type(cache):
+    """``get(id, cache_type=...)`` is None for another type's entry, and keeps it.
+
+    A reader that knows what it cached (``container --get-cached`` reads
+    ``container-cat`` entries) must not be handed another script's data because
+    that data happens to carry the same keys.
+    """
+    foreign = cache.save({"content": "another script's text"}, "build-result")
+    own = cache.save({"content": "cat text"}, "container-cat")
+
+    assert cache.get(foreign, cache_type="container-cat") is None
+    assert cache.get(own, cache_type="container-cat") == {"content": "cat text"}
+    assert cache.get(foreign) == {"content": "another script's text"}, "the entry was removed"
+
+
+def test_a_typed_get_still_reports_a_corrupt_entry(cache, corrupt_entry):
+    """Asking for a type does not turn corruption into not-found, nor delete the file."""
+    with pytest.raises(cache_utils.CacheCorruptionError):
+        cache.get(CORRUPT_ID, cache_type="container-cat")
+    assert corrupt_entry.exists()
+
+
+@pytest.mark.parametrize("flag", ["--get-errors", "--get-warnings", "--get-log"])
+@pytest.mark.parametrize("json_mode", [True, False])
+def test_build_and_test_refuses_an_entry_another_script_cached(
+    flag, json_mode, cache_dir, monkeypatch, capsys
+):
+    """A ``container-cat`` id is not a build: refused, not an empty list at exit 0.
+
+    The entry carries ``stdout`` so that an untyped read has something to
+    print for ``--get-log`` too.
+    """
+    import build_and_test as build_script
+
+    from common import cli
+    from gradle import BuildResultCache
+
+    foreign_text = "another script's text"
+    build_cache = BuildResultCache(cache_dir=str(cache_dir))
+    monkeypatch.setattr(build_script, "BuildResultCache", lambda: build_cache)
+    foreign = ProgressiveCache(cache_dir=str(cache_dir)).save(
+        {"content": foreign_text, "stdout": foreign_text}, "container-cat"
+    )
+
+    argv = [flag, foreign, *(["--json"] if json_mode else [])]
+    with pytest.raises(SystemExit) as stopped:
+        cli.run(build_script.main, argv)
+    captured = capsys.readouterr()
+
+    assert stopped.value.code == 1, (stopped.value.code, captured.out, captured.err)
+    assert foreign_text not in captured.out + captured.err
+    said = json.loads(captured.out)["error"] if json_mode else captured.err
+    assert foreign in said, said
+    assert (cache_dir / f"{foreign}.json").exists(), "the other script's entry was removed"
