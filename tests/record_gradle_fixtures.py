@@ -10,8 +10,8 @@ does not — ``gradle/results.py`` defines ``_BUILD_FAILED_RE`` and never uses i
 so a configuration or task-lookup failure is reported as
 ``Build: FAILED (0 errors, 0 warnings)`` with no diagnostic at all.
 
-Fixtures come from two checked-in scaffolds, neither of which needs AGP or an
-Android SDK:
+Most fixtures come from two checked-in scaffolds, neither of which needs AGP or
+an Android SDK:
 
 * ``tests/fixtures/scaffold/flavored`` — task names that mimic AGP's
   ``buildType x productFlavor`` camelCase (``assembleProStagingDebug``). The
@@ -31,6 +31,18 @@ Usage
     python tests/record_gradle_fixtures.py --gradle /path/to/gradle
     python tests/record_gradle_fixtures.py --gradle /path/to/gradle-7.5.1 \
         --only gradle_rerun_unknown_option
+
+Room schema fixtures
+--------------------
+The ``room_schema_*`` fixtures are the JSON Room's compiler EXPORTS
+(``model_inspector.py --schema`` reads it), from
+``tests/fixtures/scaffold/room``: an Android library with the Room Gradle
+plugin's ``schemaDirectory`` set, built as far as ``:db:kspDebugKotlin`` -- AGP,
+so ANDROID_HOME must be set, but nothing is installed or run and no device is
+involved::
+
+    ANDROID_HOME=~/Library/Android/sdk python tests/record_gradle_fixtures.py \
+        --only room_schema_export_v1 --only room_schema_export_v2
 
 ``--only`` records the named fixtures and merges them into that Gradle
 version's existing manifest instead of replacing it. A fixture with
@@ -74,7 +86,10 @@ FLAVORED = SCAFFOLDS / "flavored"
 COMPILE = SCAFFOLDS / "compile"
 WHERE_BLOCK = SCAFFOLDS / "where-block"
 COMPOSE = SCAFFOLDS / "compose"
-ALL_SCAFFOLDS = (FLAVORED, COMPILE, WHERE_BLOCK, COMPOSE)
+ROOM = SCAFFOLDS / "room"
+ALL_SCAFFOLDS = (FLAVORED, COMPILE, WHERE_BLOCK, COMPOSE, ROOM)
+# The scaffolds that apply an Android Gradle plugin, which needs the SDK.
+AGP_SCAFFOLDS = (COMPOSE, ROOM)
 RECORDED_ROOT = Path(__file__).resolve().parent / "fixtures" / "recorded"
 
 GRADLE_TIMEOUT = 300
@@ -88,6 +103,11 @@ SERIAL_FROM_ARGS = "<--serial>"
 
 _INSTRUMENTED_CLASS_ARG = "-Pandroid.testInstrumentationRunnerArguments.class="
 _INSTRUMENTED_PACKAGE = "com.example.composefixture"
+# Which of the room scaffold's two database sources is compiled (db/build.gradle).
+_ROOM_SCHEMA_VERSION_ARG = "-ProomSchemaVersion="
+# Runs Room's compiler, and with it the Room Gradle plugin's copyRoomSchemas.
+# It stops at generated sources: nothing is packaged, installed or run.
+_ROOM_EXPORT_TASK = ":db:kspDebugKotlin"
 # Two product flavors in one dimension, appended to a copy of the compose
 # scaffold's app/build.gradle. The flavored/ scaffold applies no Android plugin
 # (its task names only mimic AGP's), so it cannot host androidTest; this is
@@ -130,6 +150,7 @@ KNOWN_TASKS = frozenset(
         ":nope:properties",
         ":app:connectedDebugAndroidTest",
         ":app:connectedProDebugAndroidTest",
+        _ROOM_EXPORT_TASK,
     }
 )
 # The known tasks that install on or run against a device: a fixture running
@@ -143,7 +164,7 @@ KNOWN_VALUE_FLAGS = frozenset({"--property"})
 # -P project properties, by the text up to and including '='. A property cannot
 # select a task, but "-P..." would also admit AGP's injected options, some of
 # which change what a device run does, so these are enumerated too.
-KNOWN_PROPERTY_PREFIXES = (_INSTRUMENTED_CLASS_ARG,)
+KNOWN_PROPERTY_PREFIXES = (_INSTRUMENTED_CLASS_ARG, _ROOM_SCHEMA_VERSION_ARG)
 assert DEVICE_TASKS <= KNOWN_TASKS
 
 
@@ -187,6 +208,12 @@ class GradleFixture:
             record the SECOND run: what an identical rerun prints (is the
             task UP-TO-DATE?). The first run must exit as ``expect_success``
             says, so a primed recording cannot hide a broken first build.
+        earlier_runs: Invocations (each the arguments after ``gradle
+            --console=plain``) run first, in order, in the same throwaway copy
+            (one is implied); each must exit 0. For a file a project only
+            holds because of its history: Room writes one schema per database
+            version, each by the build of its day, so version 2 beside
+            version 1 takes two builds. The log recorded is the last run's.
         fresh_copy: Run in a throwaway copy even with no settings edit, so
             nothing a previous build left in the scaffold (a results file, an
             up-to-date task) can stand in for this run's output.
@@ -198,15 +225,20 @@ class GradleFixture:
         expect_success: When not None, the exit status the run must have for
             the capture to count -- a "passing" run that failed because the
             emulator went away is not a recording of a passing run.
-        results_glob: Glob, relative to the copy, for the JUnit XML the run
-            wrote. Deliberately a search, not a path: where AGP writes it is
-            part of what is being recorded. Exactly one match is required; it
-            is recorded as ``results_fixture`` and its relative path goes into
-            the manifest as ``results_path``.
+        results_glob: Glob, relative to the copy, for the file the run wrote
+            (the JUnit XML, an exported schema). Deliberately a search, not a
+            path: where the build writes it is part of what is being recorded.
+            Exactly one match is required; it is recorded as
+            ``results_fixture``, under its own extension, and its relative
+            path goes into the manifest as ``results_path``.
         results_fixture: Name the ``results_glob`` match is recorded under.
+        results_description: The manifest's description of that file. Defaults
+            to the JUnit XML's.
         tree_root: Directory, relative to the copy, whose listing is recorded
             as ``tree_fixture`` so the output layout is ground truth too.
         tree_fixture: Name the ``tree_root`` listing is recorded under.
+        tree_description: The manifest's description of that listing. Defaults
+            to one naming AGP as what laid the directory out.
     """
 
     name: str
@@ -223,14 +255,17 @@ class GradleFixture:
     make_dirs: tuple[str, ...] = ()
     app_build_append: str | None = None
     prime: bool = False
+    earlier_runs: tuple[tuple[str, ...], ...] = ()
     fresh_copy: bool = False
     android_serial: str | None = None
     timeout: int = GRADLE_TIMEOUT
     expect_success: bool | None = None
     results_glob: str | None = None
     results_fixture: str | None = None
+    results_description: str | None = None
     tree_root: str | None = None
     tree_fixture: str | None = None
+    tree_description: str | None = None
 
 
 # build_and_test asks Gradle where a --module lives instead of reading the
@@ -718,6 +753,68 @@ FIXTURES: list[GradleFixture] = [
             "results root's directory rule."
         ),
     ),
+    GradleFixture(
+        name="room_schema_export_v1",
+        args=[f"{_ROOM_SCHEMA_VERSION_ARG}1", _ROOM_EXPORT_TASK],
+        scaffold=ROOM,
+        fresh_copy=True,
+        expect_success=True,
+        requires_in_log="> Task :db:copyRoomSchemas",
+        results_glob="db/schemas/**/*.json",
+        results_fixture="room_schema_v1",
+        results_description=(
+            "The schema Room's compiler exported for version 1 of the room "
+            "scaffold's database (two entities, a unique index, a foreign key), "
+            "byte for byte; the Room version is the one pinned in the "
+            "scaffold's build.gradle. The glob matched one file, so this build "
+            "wrote nothing else under the schema directory. What Room omits is "
+            "as much the recording as what it writes: a nullable field carries "
+            "no `notNull` key, an entity without foreign keys no `foreignKeys` "
+            "key, and no entity names its Kotlin class anywhere -- `entityName`, "
+            "which model_inspector read and its hand-written test document "
+            "supplied, is not a key Room writes."
+        ),
+        description=(
+            "Building the room scaffold's version 1 database as far as KSP, "
+            "from a fresh copy: the log shows which task exports the schema "
+            "(copyRoomSchemas, the Room Gradle plugin's, after kspDebugKotlin). "
+            "No device is involved."
+        ),
+        catches=("S4",),
+    ),
+    GradleFixture(
+        name="room_schema_export_v2",
+        args=[f"{_ROOM_SCHEMA_VERSION_ARG}2", _ROOM_EXPORT_TASK],
+        earlier_runs=((f"{_ROOM_SCHEMA_VERSION_ARG}1", _ROOM_EXPORT_TASK),),
+        scaffold=ROOM,
+        expect_success=True,
+        requires_in_log="> Task :db:copyRoomSchemas",
+        results_glob="db/schemas/**/2.json",
+        results_fixture="room_schema_v2",
+        results_description=(
+            "The schema Room's compiler exported for version 2, built in the "
+            "project that had already exported version 1. Adds what version 1 "
+            "has none of: a `views` array (a @DatabaseView is not an entity), a "
+            "field with `defaultValue`, an @Embedded object's dotted "
+            "`fieldPath`, a composite primary key and a named composite index, "
+            "and an FTS4 entity -- `ftsVersion`/`ftsOptions`, no `indices` key, "
+            "and a primary key column (`rowid`) that is not among its fields."
+        ),
+        tree_root="db/schemas",
+        tree_fixture="room_schema_tree",
+        tree_description=(
+            "Every path under db/schemas/ after both builds: the Room Gradle "
+            "plugin's schemaDirectory holds one directory per database, named "
+            "by the database class's qualified name, and in it one "
+            "<version>.json per version built. Version 1's file is still there "
+            "after version 2 was exported."
+        ),
+        description=(
+            "The same project one database version later: version 1 is built "
+            "first, then version 2, in one copy. The log of the second build."
+        ),
+        catches=("S4",),
+    ),
 ]
 
 
@@ -745,8 +842,12 @@ def _artifact_path(fixture: GradleFixture) -> pathlib.Path | None:
 def _prepare_copy(fixture: GradleFixture, workdir: Path) -> Path:
     """Copy the scaffold into ``workdir`` and apply the fixture's settings edit."""
     copy = workdir / fixture.scaffold.name
+    # "schemas" is Room's export directory: one left by a build run by hand
+    # would be an earlier version's file this recording never produced.
     shutil.copytree(
-        fixture.scaffold, copy, ignore=shutil.ignore_patterns(".gradle", "build", ".kotlin")
+        fixture.scaffold,
+        copy,
+        ignore=shutil.ignore_patterns(".gradle", "build", ".kotlin", "schemas"),
     )
     if fixture.settings_append is not None:
         settings = copy / "settings.gradle"
@@ -770,10 +871,20 @@ def _args_refusal(fixture: GradleFixture) -> str | None:
     a known ``-P`` property, or a task in ``KNOWN_TASKS``; a task in
     ``DEVICE_TASKS`` additionally needs ``android_serial``. Anything else is
     refused with its text quoted -- an abbreviation of a known task included,
-    which Gradle would otherwise expand and run.
+    which Gradle would otherwise expand and run. ``earlier_runs`` reach Gradle
+    too, so each is held to the same list.
     """
+    for run in (*fixture.earlier_runs, fixture.args):
+        why = _run_refusal(fixture, list(run))
+        if why is not None:
+            return why
+    return None
+
+
+def _run_refusal(fixture: GradleFixture, args: list[str]) -> str | None:
+    """``_args_refusal`` for one invocation of the fixture's."""
     awaiting_value_of: str | None = None
-    for arg in fixture.args:
+    for arg in args:
         if awaiting_value_of is not None:
             awaiting_value_of = None
         elif arg in KNOWN_VALUE_FLAGS:
@@ -837,8 +948,11 @@ def _run(
     fixture: GradleFixture,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    args: list[str] | None = None,
 ) -> tuple[str, int]:
     """Run one fixture's Gradle invocation; return combined output and exit code.
+
+    ``args`` replaces ``fixture.args``, for one of its ``earlier_runs``.
 
     Failure output is the point of most of these fixtures, so a non-zero exit is
     expected and not an error. ``--console=plain`` matches what the skill itself
@@ -848,7 +962,7 @@ def _run(
     if fixture.rerun:
         flags.append("--rerun-tasks")
     result = subprocess.run(
-        [gradle, *flags, *fixture.args],
+        [gradle, *flags, *(fixture.args if args is None else args)],
         cwd=cwd or fixture.scaffold,
         env=env,
         capture_output=True,
@@ -1002,10 +1116,12 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
     if refusal:
         print(refusal, file=sys.stderr)
         return 2
-    if any(f.scaffold == COMPOSE for f in selected) and not (
-        os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
-    ):
-        print("The compose scaffold builds with AGP: set ANDROID_HOME.", file=sys.stderr)
+    needs_sdk = sorted({f.scaffold.name for f in selected if f.scaffold in AGP_SCAFFOLDS})
+    if needs_sdk and not (os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")):
+        print(
+            f"The {' and '.join(needs_sdk)} scaffold(s) build with AGP: set ANDROID_HOME.",
+            file=sys.stderr,
+        )
         return 1
 
     entries = []
@@ -1029,10 +1145,22 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
             or fixture.fresh_copy
             or fixture.app_build_append is not None
             or fixture.prime
+            or fixture.earlier_runs
         ):
             with tempfile.TemporaryDirectory(prefix="gradle-fixture-") as workdir:
                 copy = _prepare_copy(fixture, Path(workdir))
                 copies = (copy,)
+                for earlier in fixture.earlier_runs:
+                    before, before_exit = _run(
+                        gradle, fixture, cwd=copy, env=env, args=list(earlier)
+                    )
+                    if before_exit != 0:
+                        return _fail(
+                            fixture.name,
+                            f"the earlier run {' '.join(earlier)!r} exited {before_exit}",
+                            _scrub(before, copies),
+                        )
+                started_at = time.time()
                 if fixture.prime:
                     primed, primed_exit = _run(gradle, fixture, cwd=copy, env=env)
                     if (
@@ -1117,6 +1245,11 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
                             if fixture.app_build_append is not None
                             else ""
                         )
+                        + "".join(
+                            f"; run first in the same copy: gradle --console=plain "
+                            f"{' '.join(earlier)}"
+                            for earlier in fixture.earlier_runs
+                        )
                         + (
                             "; the same command was run once first in the same copy, "
                             "and this is the second run"
@@ -1156,14 +1289,15 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
 
         sidecars = []
         if "results" in outputs:
-            results_path, xml = outputs["results"]
+            results_path, written = outputs["results"]
             sidecars.append(
                 (
                     fixture.results_fixture,
-                    "xml",
-                    _scrub(xml, copies),
+                    Path(results_path).suffix.lstrip(".") or "txt",
+                    _scrub(written, copies),
                     {"results_path": results_path},
-                    f"The JUnit XML {fixture.name} wrote. Found by searching "
+                    fixture.results_description
+                    or f"The JUnit XML {fixture.name} wrote. Found by searching "
                     f"{fixture.results_glob!r} after the run, not by assuming a "
                     f"path: results_path is where AGP put it.",
                 )
@@ -1176,7 +1310,8 @@ def record(gradle: str, only: set[str] | None = None, serial: str | None = None)
                     "txt",
                     listing,
                     {"tree_root": tree_root},
-                    f"Every path under {tree_root}/ after {fixture.name}, so the "
+                    fixture.tree_description
+                    or f"Every path under {tree_root}/ after {fixture.name}, so the "
                     f"layout AGP writes is ground truth rather than an assumption.",
                 )
             )

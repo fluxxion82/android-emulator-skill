@@ -1956,11 +1956,18 @@ def test_rewriting_hooks_leave_byte_exact_fixtures_alone():
             "tests/fixtures/anr_legacy_sessions/x/meta.json",
             "tests/fixtures/scaffold/compose/gradlew.bat",
             "tests/fixtures/recorded/x.txt",
+            # Room ends an exported schema without a newline.
+            "tests/fixtures/recorded/gradle-8.13/room_schema_v1.json",
         ):
             assert exclude.search(
                 path
             ), f"pre-commit's {hook_id} hook rewrites {path}: exclude: {exclude.pattern}"
-        for path in ("tests/test_x.py", f"{SKILL_ROOT.relative_to(REPO_ROOT)}/scripts/x.py"):
+        for path in (
+            "tests/test_x.py",
+            f"{SKILL_ROOT.relative_to(REPO_ROOT)}/scripts/x.py",
+            # Written by the recorders, not recorded: it stays under every hook.
+            "tests/fixtures/recorded/gradle-8.13/MANIFEST.json",
+        ):
             assert not exclude.search(path), f"{hook_id}: {exclude.pattern} excludes {path}"
 
 

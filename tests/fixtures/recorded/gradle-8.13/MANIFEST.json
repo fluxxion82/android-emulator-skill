@@ -6,7 +6,8 @@
     "tests/fixtures/scaffold/flavored",
     "tests/fixtures/scaffold/compile",
     "tests/fixtures/scaffold/where-block",
-    "tests/fixtures/scaffold/compose"
+    "tests/fixtures/scaffold/compose",
+    "tests/fixtures/scaffold/room"
   ],
   "note": "Durations and absolute paths are normalised so a re-record diffs only on real format changes. The JUnit XML additionally has its hostname, timestamp and per-test time normalised: Gradle writes the recording machine's hostname into every testsuite element.",
   "fixtures": [
@@ -502,6 +503,77 @@
       "description": "Every path under app/build/outputs/androidTest-results/ after connected_android_test_flavored, so the layout AGP writes is ground truth rather than an assumption.",
       "catches": [],
       "bytes": 2040
+    },
+    {
+      "name": "room_schema_export_v1",
+      "file": "room_schema_export_v1.txt",
+      "recorded_at": "2026-11-10T00:37:37Z",
+      "command": "gradle --console=plain -ProomSchemaVersion=1 :db:kspDebugKotlin",
+      "scaffold": "tests/fixtures/scaffold/room",
+      "setup": "run in a temporary copy of the scaffold",
+      "exit_code": 0,
+      "produced_artifact": null,
+      "results_path": "db/schemas/com.example.roomfixture.AppDatabase/1.json",
+      "description": "Building the room scaffold's version 1 database as far as KSP, from a fresh copy: the log shows which task exports the schema (copyRoomSchemas, the Room Gradle plugin's, after kspDebugKotlin). No device is involved.",
+      "catches": [
+        "S4"
+      ],
+      "bytes": 1341
+    },
+    {
+      "name": "room_schema_v1",
+      "file": "room_schema_v1.json",
+      "recorded_at": "2026-11-10T00:37:37Z",
+      "command": "gradle --console=plain -ProomSchemaVersion=1 :db:kspDebugKotlin",
+      "scaffold": "tests/fixtures/scaffold/room",
+      "setup": "run in a temporary copy of the scaffold",
+      "produced_by": "room_schema_export_v1",
+      "results_path": "db/schemas/com.example.roomfixture.AppDatabase/1.json",
+      "description": "The schema Room's compiler exported for version 1 of the room scaffold's database (two entities, a unique index, a foreign key), byte for byte; the Room version is the one pinned in the scaffold's build.gradle. The glob matched one file, so this build wrote nothing else under the schema directory. What Room omits is as much the recording as what it writes: a nullable field carries no `notNull` key, an entity without foreign keys no `foreignKeys` key, and no entity names its Kotlin class anywhere -- `entityName`, which model_inspector read and its hand-written test document supplied, is not a key Room writes.",
+      "catches": [],
+      "bytes": 3055
+    },
+    {
+      "name": "room_schema_export_v2",
+      "file": "room_schema_export_v2.txt",
+      "recorded_at": "2026-11-10T00:37:41Z",
+      "command": "gradle --console=plain -ProomSchemaVersion=2 :db:kspDebugKotlin",
+      "scaffold": "tests/fixtures/scaffold/room",
+      "setup": "run in a temporary copy of the scaffold; run first in the same copy: gradle --console=plain -ProomSchemaVersion=1 :db:kspDebugKotlin",
+      "exit_code": 0,
+      "produced_artifact": null,
+      "results_path": "db/schemas/com.example.roomfixture.AppDatabase/2.json",
+      "description": "The same project one database version later: version 1 is built first, then version 2, in one copy. The log of the second build.",
+      "catches": [
+        "S4"
+      ],
+      "bytes": 1421
+    },
+    {
+      "name": "room_schema_v2",
+      "file": "room_schema_v2.json",
+      "recorded_at": "2026-11-10T00:37:41Z",
+      "command": "gradle --console=plain -ProomSchemaVersion=2 :db:kspDebugKotlin",
+      "scaffold": "tests/fixtures/scaffold/room",
+      "setup": "run in a temporary copy of the scaffold; run first in the same copy: gradle --console=plain -ProomSchemaVersion=1 :db:kspDebugKotlin",
+      "produced_by": "room_schema_export_v2",
+      "results_path": "db/schemas/com.example.roomfixture.AppDatabase/2.json",
+      "description": "The schema Room's compiler exported for version 2, built in the project that had already exported version 1. Adds what version 1 has none of: a `views` array (a @DatabaseView is not an entity), a field with `defaultValue`, an @Embedded object's dotted `fieldPath`, a composite primary key and a named composite index, and an FTS4 entity -- `ftsVersion`/`ftsOptions`, no `indices` key, and a primary key column (`rowid`) that is not among its fields.",
+      "catches": [],
+      "bytes": 6144
+    },
+    {
+      "name": "room_schema_tree",
+      "file": "room_schema_tree.txt",
+      "recorded_at": "2026-11-10T00:37:41Z",
+      "command": "gradle --console=plain -ProomSchemaVersion=2 :db:kspDebugKotlin",
+      "scaffold": "tests/fixtures/scaffold/room",
+      "setup": "run in a temporary copy of the scaffold; run first in the same copy: gradle --console=plain -ProomSchemaVersion=1 :db:kspDebugKotlin",
+      "produced_by": "room_schema_export_v2",
+      "tree_root": "db/schemas",
+      "description": "Every path under db/schemas/ after both builds: the Room Gradle plugin's schemaDirectory holds one directory per database, named by the database class's qualified name, and in it one <version>.json per version built. Version 1's file is still there after version 2 was exported.",
+      "catches": [],
+      "bytes": 168
     }
   ]
 }

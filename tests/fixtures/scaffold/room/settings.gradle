@@ -1,0 +1,23 @@
+// Android library whose only job is to make Room's annotation processor EXPORT
+// its schema, so the JSON `model_inspector.py --schema` reads can be RECORDED
+// instead of imagined. See tests/record_gradle_fixtures.py (room_schema_*).
+//
+// Why Android and not a plain JVM module: the exported file and where it lands
+// are what is being recorded, and an Android project gets both from AGP + KSP +
+// the Room Gradle plugin. Nothing is installed or run: the recorder stops at
+// :db:kspDebugKotlin, so no device or emulator is involved.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = 'room-scaffold'
+include ':db'

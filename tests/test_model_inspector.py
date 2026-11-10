@@ -3,8 +3,8 @@
 Three modes, all adb/subprocess-free unless explicitly monkeypatched:
 
 1. SOURCE: a Kotlin @Entity/@Database fixture -> parsed tables/columns/version.
-2. SCHEMA: a Room exported-schema JSON fixture (tmp_path) -> entities/fields/
-   version, plus --show-versions and --raw behavior.
+2. SCHEMA: the schema JSON Room's compiler exported (recorded_gradle) ->
+   entities/fields/views/version, plus --show-versions and --raw behavior.
 3. LIVE: a "sqlite .schema" fixture -> parsed tables; run-as command
    construction asserted with subprocess.run monkeypatched. No real device.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import model_inspector
 import pytest
@@ -27,6 +28,7 @@ from model_inspector import (
     LiveInspector,
     SchemaInspector,
     SourceInspector,
+    format_schema,
     parse_sqlite_schema,
     strip_comments,
 )
@@ -175,148 +177,255 @@ def test_strip_comments_removes_line_and_block():
 # === SCHEMA MODE ===========================================================
 
 
-SCHEMA_DOC = {
-    "formatVersion": 1,
-    "database": {
-        "version": 3,
-        "entities": [
-            {
-                "tableName": "users",
-                "entityName": "com.example.app.data.User",
-                "createSql": "CREATE TABLE ...",
-                "fields": [
-                    {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": True},
-                    {
-                        "fieldPath": "name",
-                        "columnName": "full_name",
-                        "affinity": "TEXT",
-                        "notNull": True,
-                    },
-                    {
-                        "fieldPath": "email",
-                        "columnName": "email",
-                        "affinity": "TEXT",
-                        "notNull": False,
-                    },
-                ],
-                "primaryKey": {"columnNames": ["id"], "autoGenerate": True},
-                "indices": [
-                    {"name": "index_users_email", "unique": True, "columnNames": ["email"]}
-                ],
-                "foreignKeys": [],
-            },
-            {
-                "tableName": "notes",
-                "entityName": "com.example.app.data.Note",
-                "fields": [
-                    {
-                        "fieldPath": "noteId",
-                        "columnName": "noteId",
-                        "affinity": "INTEGER",
-                        "notNull": True,
-                    },
-                    {
-                        "fieldPath": "userId",
-                        "columnName": "user_id",
-                        "affinity": "INTEGER",
-                        "notNull": True,
-                    },
-                ],
-                "primaryKey": {"columnNames": ["noteId"]},
-                "indices": [],
-                "foreignKeys": [
-                    {
-                        "table": "users",
-                        "onDelete": "CASCADE",
-                        "onUpdate": "NO ACTION",
-                        "columns": ["user_id"],
-                        "referencedColumns": ["id"],
-                    }
-                ],
-            },
-        ],
-    },
-}
+# Every schema below is one Room's compiler EXPORTED (recorded_gradle:
+# room_schema_v1 / room_schema_v2, built from tests/fixtures/scaffold/room), in
+# the directory the Room Gradle plugin laid out (room_schema_tree). Until the
+# recording these tests read a document written by hand, which gave every
+# entity an `entityName`. Room writes no such key, so `--raw <ClassName>` and
+# the `entity_name` field were tested and had never worked on a real export.
 
 
-def _write_schema(tmp_path, version: int, doc: dict):
-    db_dir = tmp_path / "schemas" / "com.example.app.data.AppDatabase"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    path = db_dir / f"{version}.json"
-    path.write_text(json.dumps(doc), encoding="utf-8")
+@pytest.fixture
+def room_schemas(tmp_path, recorded_gradle) -> Path:
+    """Room's schemaDirectory, rebuilt from the recording: the tree, and each file's bytes."""
+    listing = recorded_gradle("room_schema_tree").splitlines()
+    for line in listing:
+        if line.endswith(".json"):
+            path = tmp_path / line
+            path.parent.mkdir(parents=True, exist_ok=True)
+            exported = recorded_gradle(f"room_schema_v{path.stem}.json")
+            path.write_text(exported, encoding="utf-8", newline="")
+    return tmp_path / listing[0]
+
+
+def _version_file(root: Path, version: int) -> Path:
+    (path,) = root.glob(f"*/{version}.json")
     return path
 
 
-def test_schema_parses_entities_fields_and_version(tmp_path):
-    path = _write_schema(tmp_path, 3, SCHEMA_DOC)
-    ok, result = SchemaInspector(str(path)).execute()
-    assert ok is True
-    assert result["version"] == 3
+def _exported(recorded_gradle, version: int) -> dict:
+    return json.loads(recorded_gradle(f"room_schema_v{version}.json"))["database"]
 
-    by_table = {e["table"]: e for e in result["entities"]}
+
+def _by_table(result: dict) -> dict[str, dict]:
+    return {entity["table"]: entity for entity in result["entities"]}
+
+
+def test_schema_parses_entities_fields_and_version(room_schemas):
+    ok, result = SchemaInspector(str(_version_file(room_schemas, 1))).execute()
+    assert ok is True
+    assert result["version"] == 1
+
+    by_table = _by_table(result)
     assert set(by_table) == {"users", "notes"}
 
     users = by_table["users"]
-    assert users["entity_name"] == "User"
     assert users["primary_key"] == ["id"]
     fields = {f["column_name"]: f for f in users["fields"]}
     assert fields["full_name"]["field_path"] == "name"
     assert fields["full_name"]["affinity"] == "TEXT"
     assert fields["id"]["not_null"] is True
+    # Room writes no `notNull` key at all for a nullable column ...
     assert fields["email"]["not_null"] is False
-    assert users["indices"][0]["name"] == "index_users_email"
-    assert users["indices"][0]["unique"] is True
+    assert users["indices"] == [{"name": "index_users_email", "unique": True, "columns": ["email"]}]
+    # ... and no `foreignKeys` key for an entity that has none.
+    assert users["foreign_keys"] == []
 
-    notes = by_table["notes"]
-    fk = notes["foreign_keys"][0]
-    assert fk["table"] == "users"
-    assert fk["columns"] == ["user_id"]
-    assert fk["referenced_columns"] == ["id"]
-    assert fk["on_delete"] == "CASCADE"
+    assert by_table["notes"]["foreign_keys"] == [
+        {
+            "table": "users",
+            "columns": ["user_id"],
+            "referenced_columns": ["id"],
+            "on_delete": "CASCADE",
+            "on_update": "NO ACTION",
+        }
+    ]
 
 
-def test_schema_show_versions_lists_files(tmp_path):
-    _write_schema(tmp_path, 1, SCHEMA_DOC)
-    _write_schema(tmp_path, 2, SCHEMA_DOC)
-    path = _write_schema(tmp_path, 3, SCHEMA_DOC)
+def test_schema_reads_embedded_fields_and_composite_keys(room_schemas):
+    ok, result = SchemaInspector(str(room_schemas)).execute()
+    assert ok is True
+    by_table = _by_table(result)
+
+    paths = {f["column_name"]: f["field_path"] for f in by_table["users"]["fields"]}
+    assert paths["addr_city"] == "address.city"
+    assert paths["addr_postal_code"] == "address.postalCode"
+
+    tags = by_table["note_tags"]
+    assert tags["primary_key"] == ["note_id", "tag"]
+    assert tags["indices"] == [
+        {"name": "idx_note_tags_by_tag", "unique": False, "columns": ["tag", "note_id"]}
+    ]
+    (fk,) = tags["foreign_keys"]
+    assert (fk["table"], fk["on_delete"], fk["on_update"]) == ("notes", "CASCADE", "RESTRICT")
+
+
+def test_room_exports_no_class_name_for_an_entity(recorded_gradle):
+    """The premise of every test below that names a table and never a class."""
+    for version in (1, 2):
+        for entity in _exported(recorded_gradle, version)["entities"]:
+            assert not {"entityName", "entity"} & entity.keys(), entity["tableName"]
+            # Not as a value either: the package appears nowhere in the block.
+            assert "roomfixture" not in json.dumps(entity), entity["tableName"]
+
+
+def test_schema_reports_no_class_name_room_never_exported(room_schemas):
+    """`entity_name` was "" for every entity of a real export, printed as `users (?)`."""
+    ok, result = SchemaInspector(str(room_schemas)).execute()
+    assert ok is True
+
+    for entity in result["entities"]:
+        assert "entity_name" not in entity, entity["table"]
+    text = format_schema(result, verbose=True)
+    assert "?" not in text
+    assert "users, 6 fields, PK: id" in text.splitlines()
+
+
+def test_schema_reports_a_view(room_schemas):
+    """A @DatabaseView is under `views`, not `entities`: it was not reported at all."""
+    ok, result = SchemaInspector(str(room_schemas)).execute()
+    assert ok is True
+
+    (view,) = result["views"]
+    assert view["name"] == "note_summaries"
+    # Room exports the statement with a placeholder for the name; filled in here.
+    assert view["create_sql"].startswith(
+        "CREATE VIEW `note_summaries` AS SELECT notes.noteId AS noteId, "
+    )
+    assert "${" not in view["create_sql"]
+
+    brief = format_schema(result, verbose=False).splitlines()
+    assert brief[0] == "Room schema v2: 4 entities, 1 view [2.json]"
+    assert "  note_summaries: view" in brief
+    assert f"  {view['create_sql']}" in format_schema(result, verbose=True).splitlines()
+
+
+def test_a_schema_without_views_reports_none(room_schemas):
+    """Version 1 has no `views` key at all."""
+    ok, result = SchemaInspector(str(_version_file(room_schemas, 1))).execute()
+    assert ok is True
+
+    assert result["views"] == []
+    assert format_schema(result, verbose=False).splitlines()[0] == (
+        "Room schema v1: 2 entities, 0 views [1.json]"
+    )
+
+
+def test_schema_marks_an_fts_table(room_schemas):
+    """An @Fts4 entity is a virtual table; it was reported as an ordinary one."""
+    ok, result = SchemaInspector(str(room_schemas)).execute()
+    assert ok is True
+    by_table = _by_table(result)
+
+    search = by_table["note_search"]
+    assert search["fts_version"] == "FTS4"
+    # Its primary key is SQLite's rowid, which is not a field of the entity.
+    assert search["primary_key"] == ["rowid"]
+    assert [f["column_name"] for f in search["fields"]] == ["body"]
+    for table in ("users", "notes", "note_tags"):
+        assert by_table[table]["fts_version"] is None, table
+
+    assert "  note_search: 1 fields (FTS4)" in format_schema(result, verbose=False).splitlines()
+    assert "note_search, 1 fields, PK: rowid, FTS4" in (
+        format_schema(result, verbose=True).splitlines()
+    )
+
+
+def test_schema_show_versions_lists_files(room_schemas):
+    path = _version_file(room_schemas, 2)
     ok, result = SchemaInspector(str(path)).execute(show_versions=True)
     assert ok is True
-    versions = {v["version"]: v for v in result["versions"]}
-    assert set(versions) == {"1", "2", "3"}
-    assert versions["3"]["is_current"] is True
-    assert versions["1"]["is_current"] is False
+    assert result["versions"] == [
+        {"version": "1", "file": "1.json", "is_current": False},
+        {"version": "2", "file": "2.json", "is_current": True},
+    ]
 
 
-def test_schema_dir_resolves_to_highest_version(tmp_path):
-    _write_schema(tmp_path, 1, {"database": {"version": 1, "entities": []}})
-    _write_schema(tmp_path, 10, SCHEMA_DOC)
-    db_dir = tmp_path / "schemas" / "com.example.app.data.AppDatabase"
-    ok, result = SchemaInspector(str(db_dir)).execute()
+def test_schema_directory_resolves_to_the_highest_version(room_schemas):
+    """Given the schemaDirectory itself, one level above the database's own."""
+    ok, result = SchemaInspector(str(room_schemas)).execute()
     assert ok is True
-    # Highest numeric version wins (10 > 1, not lexical where "1" precedes).
-    assert result["version"] == 3
+    assert result["version"] == 2
+    assert result["schema_file"] == str(_version_file(room_schemas, 2).resolve())
 
 
-def test_schema_raw_by_table_name(tmp_path):
-    path = _write_schema(tmp_path, 3, SCHEMA_DOC)
-    ok, raw = SchemaInspector(str(path)).get_raw_entity("users")
+def test_schema_dir_orders_versions_as_numbers(room_schemas):
+    """10 follows 9. The two NAMES are this test's -- Room exported 1 and 2 -- the bytes are Room's."""
+    db_dir = _version_file(room_schemas, 2).parent
+    (db_dir / "1.json").rename(db_dir / "9.json")
+    (db_dir / "2.json").rename(db_dir / "10.json")
+
+    ok, result = SchemaInspector(str(db_dir)).execute(show_versions=True)
+
     assert ok is True
-    parsed = json.loads(raw)
-    assert parsed["tableName"] == "users"
+    assert Path(result["schema_file"]).name == "10.json"
+    assert [v["version"] for v in result["versions"]] == ["9", "10"]
 
 
-def test_schema_raw_by_class_name(tmp_path):
-    path = _write_schema(tmp_path, 3, SCHEMA_DOC)
-    ok, raw = SchemaInspector(str(path)).get_raw_entity("Note")
+def test_schema_raw_by_table_name(room_schemas, recorded_gradle):
+    ok, raw = SchemaInspector(str(room_schemas)).get_raw_entity("users")
     assert ok is True
-    assert json.loads(raw)["tableName"] == "notes"
+    (exported,) = [
+        e for e in _exported(recorded_gradle, 2)["entities"] if e["tableName"] == "users"
+    ]
+    assert json.loads(raw) == exported
 
 
-def test_schema_raw_missing_entity(tmp_path):
-    path = _write_schema(tmp_path, 3, SCHEMA_DOC)
-    ok, msg = SchemaInspector(str(path)).get_raw_entity("ghosts")
+def test_schema_raw_by_view_name(room_schemas, recorded_gradle):
+    ok, raw = SchemaInspector(str(room_schemas)).get_raw_entity("note_summaries")
+    assert ok is True
+    assert json.loads(raw) == _exported(recorded_gradle, 2)["views"][0]
+
+
+def test_schema_raw_refusal_names_what_the_schema_holds(room_schemas):
+    """A class name is the likely wrong guess: Room exported tables and views, not classes."""
+    ok, msg = SchemaInspector(str(room_schemas)).get_raw_entity("User")
     assert ok is False
-    assert "not found" in msg
+    assert "'User' not found in 2.json" in msg
+    for name in ("users", "notes", "note_tags", "note_search", "note_summaries"):
+        assert name in msg, name
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_every_name_the_schema_listing_prints_is_one_raw_accepts(
+    tmp_path, room_schemas, recorded_gradle, version
+):
+    """The loop an agent runs: list the schema, then ask for what it listed."""
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    schema = str(_version_file(room_schemas, version))
+    exported = _exported(recorded_gradle, version)
+
+    listing = chain.run("model_inspector.py", "--schema", schema)
+    assert listing.returncode == 0, listing.stderr
+    names = [line.split(":")[0].strip() for line in listing.stdout.splitlines()[1:]]
+    assert names == [
+        *(entity["tableName"] for entity in exported["entities"]),
+        *(view["viewName"] for view in exported.get("views", [])),
+    ]
+    assert len(names) >= 2, names
+
+    for name in names:
+        raw = chain.run("model_inspector.py", "--schema", schema, "--raw", name)
+        assert raw.returncode == 0, f"--raw {name}: {raw.stderr}"
+        block = json.loads(raw.stdout)
+        assert name in (block.get("tableName"), block.get("viewName"))
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_raw_given_a_class_name_is_refused_with_the_names_to_pass(
+    tmp_path, room_schemas, json_mode
+):
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    argv = ["--schema", str(room_schemas), "--raw", "User", *(["--json"] if json_mode else [])]
+
+    result = chain.run("model_inspector.py", *argv)
+
+    refusal = assert_refusal(result, json_mode=json_mode, naming=("'User' not found",), status=1)
+    remedy = refusal["remedy"] if json_mode else result.stderr
+    assert "table or view name" in remedy
+    assert "class name" not in remedy
 
 
 def test_schema_missing_path_fails(tmp_path):
@@ -331,6 +440,346 @@ def test_schema_invalid_json_fails(tmp_path):
     ok, result = SchemaInspector(str(path)).execute()
     assert ok is False
     assert "Invalid schema JSON" in result["error"]
+
+
+@pytest.mark.parametrize(
+    "content", ["[" * 200_000, "9" * 5000], ids=["nested-too-deep", "number-too-long"]
+)
+def test_json_the_parser_gives_up_on_is_invalid_json(tmp_path, content):
+    """json raises more than JSONDecodeError: RecursionError, and int()'s ValueError."""
+    path = tmp_path / "1.json"
+    path.write_text(content, encoding="utf-8")
+    inspector = SchemaInspector(str(path))
+
+    ok, result = inspector.execute()
+    assert ok is False
+    assert "Invalid schema JSON" in result["error"]
+
+    ok, message = inspector.get_raw_entity("users")
+    assert ok is False
+    assert "Invalid schema JSON" in message
+
+
+_ABSENT = object()
+_ENTITIES = ("database", "entities")
+_VIEWS = ("database", "views")
+
+
+def _recorded_document(recorded_gradle, version: int = 2) -> dict:
+    return json.loads(recorded_gradle(f"room_schema_v{version}.json"))
+
+
+def _schema_file(tmp_path, document: object) -> Path:
+    path = tmp_path / "written" / "1.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def _damage(document: dict, path: tuple, value: object) -> None:
+    """Replace, or with ``_ABSENT`` remove, what stands at ``path`` in an exported document."""
+    holder = document
+    for step in path[:-1]:
+        holder = holder[step]
+    assert path[-1] in holder if isinstance(holder, dict) else path[-1] < len(holder), path
+    if value is _ABSENT:
+        del holder[path[-1]]
+    else:
+        holder[path[-1]] = value
+
+
+# (id, path into the recorded v2 document, what is put there, how the refusal names the place)
+SHAPE_DAMAGE = [
+    ("version-absent", ("database", "version"), _ABSENT, "database.version"),
+    ("version-text", ("database", "version"), "2", "database.version"),
+    ("version-flag", ("database", "version"), True, "database.version"),
+    ("entities-absent", _ENTITIES, _ABSENT, "database.entities"),
+    ("entities-object", _ENTITIES, {}, "database.entities"),
+    ("entity-text", (*_ENTITIES, 0), "users", "database.entities[0]"),
+    ("table-name-absent", (*_ENTITIES, 0, "tableName"), _ABSENT, "entities[0].tableName"),
+    ("table-name-number", (*_ENTITIES, 0, "tableName"), 7, "entities[0].tableName"),
+    ("table-name-not-utf8", (*_ENTITIES, 0, "tableName"), "\ud83d", "entities[0].tableName"),
+    ("fields-absent", (*_ENTITIES, 0, "fields"), _ABSENT, "entities[0].fields"),
+    ("fields-null", (*_ENTITIES, 0, "fields"), None, "entities[0].fields"),
+    ("field-list", (*_ENTITIES, 0, "fields", 1), [], "entities[0].fields[1]"),
+    (
+        "field-path-absent",
+        (*_ENTITIES, 0, "fields", 0, "fieldPath"),
+        _ABSENT,
+        "fields[0].fieldPath",
+    ),
+    ("column-name-number", (*_ENTITIES, 0, "fields", 0, "columnName"), 5, "fields[0].columnName"),
+    ("affinity-null", (*_ENTITIES, 0, "fields", 0, "affinity"), None, "fields[0].affinity"),
+    ("not-null-text", (*_ENTITIES, 0, "fields", 0, "notNull"), "yes", "fields[0].notNull"),
+    ("primary-key-list", (*_ENTITIES, 0, "primaryKey"), ["id"], "entities[0].primaryKey"),
+    (
+        "primary-key-columns-text",
+        (*_ENTITIES, 0, "primaryKey", "columnNames"),
+        "id",
+        "entities[0].primaryKey.columnNames",
+    ),
+    ("indices-object", (*_ENTITIES, 0, "indices"), {}, "entities[0].indices"),
+    ("index-name-absent", (*_ENTITIES, 0, "indices", 0, "name"), _ABSENT, "indices[0].name"),
+    ("index-unique-text", (*_ENTITIES, 0, "indices", 0, "unique"), "true", "indices[0].unique"),
+    (
+        "index-columns-numbers",
+        (*_ENTITIES, 0, "indices", 0, "columnNames"),
+        [1],
+        "indices[0].columnNames[0]",
+    ),
+    ("foreign-keys-text", (*_ENTITIES, 1, "foreignKeys"), "users", "entities[1].foreignKeys"),
+    (
+        "foreign-key-table-null",
+        (*_ENTITIES, 1, "foreignKeys", 0, "table"),
+        None,
+        "foreignKeys[0].table",
+    ),
+    (
+        "foreign-key-columns-text",
+        (*_ENTITIES, 1, "foreignKeys", 0, "columns"),
+        "user_id",
+        "foreignKeys[0].columns",
+    ),
+    (
+        "foreign-key-referenced-object",
+        (*_ENTITIES, 1, "foreignKeys", 0, "referencedColumns"),
+        {},
+        "foreignKeys[0].referencedColumns",
+    ),
+    (
+        "foreign-key-on-delete-number",
+        (*_ENTITIES, 1, "foreignKeys", 0, "onDelete"),
+        0,
+        "foreignKeys[0].onDelete",
+    ),
+    ("fts-version-number", (*_ENTITIES, 3, "ftsVersion"), 4, "entities[3].ftsVersion"),
+    ("views-object", _VIEWS, {}, "database.views"),
+    ("view-number", (*_VIEWS, 0), 3, "database.views[0]"),
+    ("view-name-absent", (*_VIEWS, 0, "viewName"), _ABSENT, "views[0].viewName"),
+    ("view-sql-null", (*_VIEWS, 0, "createSql"), None, "views[0].createSql"),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "where"),
+    [damage[1:] for damage in SHAPE_DAMAGE],
+    ids=[damage[0] for damage in SHAPE_DAMAGE],
+)
+def test_a_document_not_shaped_as_room_exports_is_refused_naming_the_place(
+    tmp_path, recorded_gradle, path, value, where
+):
+    """What the parser reads is held to the type Room exported it with (recorded: room_schema_v2).
+
+    These were read with `.get`: a missing `tableName` was a table called
+    None at exit 0, and a value of another type an AttributeError.
+    """
+    document = _recorded_document(recorded_gradle)
+    _damage(document, path, value)
+    inspector = SchemaInspector(str(_schema_file(tmp_path, document)))
+
+    ok, result = inspector.execute()
+    assert ok is False, result
+    assert result["error"].startswith("Not a Room exported schema (1.json): "), result["error"]
+    assert where in result["error"]
+    result["error"].encode("utf-8")
+
+    # --raw reads the same document, so it is refused for the same reason,
+    # wherever in the document the damage is.
+    ok, message = inspector.get_raw_entity("users")
+    assert ok is False, message
+    assert message == result["error"]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_what_room_exported_fits_the_shape_whole(room_schemas, version):
+    """The other direction: neither recording is refused, extra keys and absent ones included."""
+    inspector = SchemaInspector(str(_version_file(room_schemas, version)))
+    ok, result = inspector.execute()
+    assert ok is True, result
+    assert result["version"] == version
+    for entity in result["entities"]:
+        ok, raw = inspector.get_raw_entity(entity["table"])
+        assert ok is True, raw
+
+
+@pytest.mark.parametrize(
+    "document",
+    [{}, {"hello": "world"}, [], {"database": None}],
+    ids=["empty-object", "other-json", "a-list", "database-null"],
+)
+@pytest.mark.parametrize("raw", [False, True], ids=["listing", "raw"])
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_json_that_is_not_a_room_schema_is_refused_not_listed(tmp_path, document, raw, json_mode):
+    """`{}` listed as "Room schema v?: 0 entities" at exit 0; `[]` was a traceback."""
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    argv = ["--schema", str(_schema_file(tmp_path, document))]
+    argv += ["--raw", "users"] if raw else []
+    argv += ["--json"] if json_mode else []
+
+    result = chain.run("model_inspector.py", *argv)
+
+    assert "Traceback" not in result.stderr, result.stderr
+    refusal = assert_refusal(
+        result, json_mode=json_mode, naming=("Not a Room exported schema (1.json)",), status=1
+    )
+    # Where to point --schema, with or without --raw; not advice about --raw's argument.
+    remedy = refusal["remedy"] if json_mode else result.stderr
+    assert "exported-schema JSON file" in remedy
+    assert "Pass --raw" not in remedy
+
+
+def test_a_view_query_that_holds_the_placeholder_itself_keeps_it(tmp_path, recorded_gradle):
+    """Only the name is filled in. Every `${VIEW_NAME}` was, the query's own text included."""
+    document = _recorded_document(recorded_gradle)
+    (view,) = document["database"]["views"]
+    head = "CREATE VIEW `${VIEW_NAME}` AS "
+    assert view["createSql"].startswith(head)  # the recording's premise
+    query = view["createSql"][len(head) :] + " WHERE notes.body != '${VIEW_NAME}'"
+    view["createSql"] = head + query
+
+    ok, result = SchemaInspector(str(_schema_file(tmp_path, document))).execute()
+    assert ok is True, result
+
+    assert result["views"][0]["create_sql"] == f"CREATE VIEW `{view['viewName']}` AS {query}"
+
+
+def test_a_view_statement_that_does_not_open_as_room_writes_it_is_reported_as_written(
+    tmp_path, recorded_gradle
+):
+    document = _recorded_document(recorded_gradle)
+    (view,) = document["database"]["views"]
+    view["createSql"] = "SELECT '${VIEW_NAME}' AS marker"
+
+    ok, result = SchemaInspector(str(_schema_file(tmp_path, document))).execute()
+    assert ok is True, result
+
+    assert result["views"][0]["create_sql"] == "SELECT '${VIEW_NAME}' AS marker"
+
+
+def _schema_text_file(tmp_path, text: str) -> Path:
+    path = tmp_path / "written" / "1.json"
+    path.parent.mkdir()
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _with_an_unread_key(recorded_gradle, value_text: str) -> str:
+    """The recorded export with one key more on its first entity, holding JSON text as given.
+
+    A key the shape does not name: the listing never reads it, --raw prints it.
+    """
+    text = json.dumps(_recorded_document(recorded_gradle))
+    head = '"entities": [{'
+    assert text.count(head) == 1
+    return text.replace(head, head + f'"unread": {value_text}, ')
+
+
+def _lists_deep(count: int) -> str:
+    return "[" * count + "0" + "]" * count
+
+
+# The unread value stands four levels down: document, database, entities, entity.
+_UNREAD_LEVEL = 4
+
+
+@pytest.mark.parametrize(
+    "value_text",
+    [_lists_deep(991), "NaN", "Infinity", "-Infinity", "1e999", '0, "unread": 1'],
+    ids=["991-lists-deep", "nan", "infinity", "minus-infinity", "float-overflow", "key-twice"],
+)
+@pytest.mark.parametrize("raw", [False, True], ids=["listing", "raw"])
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_json_that_could_not_be_printed_back_is_refused_where_it_is_read(
+    tmp_path, recorded_gradle, value_text, raw, json_mode
+):
+    """What --raw prints is the whole entity, the keys the listing never reads included.
+
+    991 lists deep in such a key listed at exit 0 and ended --raw in the JSON
+    writer's RecursionError; NaN and Infinity were printed back as tokens that
+    are not JSON; of a key named twice one value was silently dropped
+    (verification of #69). Each is refused by the one reader, so the listing
+    and --raw agree.
+    """
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    path = _schema_text_file(tmp_path, _with_an_unread_key(recorded_gradle, value_text))
+    argv = ["--schema", str(path)]
+    argv += ["--raw", "users"] if raw else []
+    argv += ["--json"] if json_mode else []
+
+    result = chain.run("model_inspector.py", *argv)
+
+    assert "Traceback" not in result.stderr, result.stderr[-400:]
+    assert_refusal(result, json_mode=json_mode, naming=("Invalid schema JSON",), status=1)
+
+
+def test_nesting_past_the_depth_named_is_refused_and_nesting_at_it_is_printed_back(
+    tmp_path, recorded_gradle
+):
+    """The limit is one number, held on both sides, and it is the last depth that is read.
+
+    "nested more than 64 deep" has to mean that: 64 lists and objects inside
+    one another are printed back by --raw, and one more is refused.
+    """
+    limit = model_inspector.MAX_JSON_DEPTH
+    assert limit < 100  # far under where the JSON writer's recursion ends
+
+    held = _lists_deep(limit - _UNREAD_LEVEL)
+    path = _schema_text_file(tmp_path, _with_an_unread_key(recorded_gradle, held))
+    inspector = SchemaInspector(str(path))
+    ok, result = inspector.execute()
+    assert ok is True, result
+    ok, raw = inspector.get_raw_entity(result["entities"][0]["table"])
+    assert ok is True, raw
+    assert json.loads(raw)["unread"] == json.loads(held)
+
+    past = _lists_deep(limit - _UNREAD_LEVEL + 1)
+    (path.parent / "2.json").write_text(
+        _with_an_unread_key(recorded_gradle, past), encoding="utf-8"
+    )
+    inspector = SchemaInspector(str(path.parent / "2.json"))
+    ok, result = inspector.execute()
+    assert ok is False
+    assert f"Invalid schema JSON: nested more than {limit} deep" in result["error"]
+    ok, message = inspector.get_raw_entity("users")
+    assert ok is False
+    assert f"nested more than {limit} deep" in message
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_a_table_named_with_no_characters_is_still_a_name_raw_accepts(
+    tmp_path, recorded_gradle, json_mode
+):
+    """`--raw ""` printed the whole listing at exit 0: the argument was tested for truth."""
+    document = _recorded_document(recorded_gradle)
+    document["database"]["entities"][0]["tableName"] = ""
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    argv = ["--schema", str(_schema_file(tmp_path, document)), "--raw", ""]
+
+    result = chain.run("model_inspector.py", *argv, *(["--json"] if json_mode else []))
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == document["database"]["entities"][0]
+
+
+def test_a_view_name_is_written_between_backticks_as_room_writes_it(tmp_path, recorded_gradle):
+    """Not escaped. Room's DatabaseView.createViewQuery is "CREATE VIEW `$viewName` AS ...",
+
+    the name as the annotation spelled it, and the statement reported here is
+    that one. Doubling a backtick would report a statement Room does not run.
+    """
+    document = _recorded_document(recorded_gradle)
+    (view,) = document["database"]["views"]
+    head = "CREATE VIEW `${VIEW_NAME}` AS "
+    query = view["createSql"][len(head) :]
+    view["viewName"] = "a``b"
+
+    ok, result = SchemaInspector(str(_schema_file(tmp_path, document))).execute()
+    assert ok is True, result
+
+    assert result["views"][0]["create_sql"] == f"CREATE VIEW `a``b` AS {query}"
 
 
 # === LIVE MODE (sqlite parsing + run-as command construction) ==============

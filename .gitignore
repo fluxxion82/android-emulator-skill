@@ -42,6 +42,8 @@ emulator-lane.summary
 # its build artifacts are not)
 tests/fixtures/scaffold/**/build/
 tests/fixtures/scaffold/**/.gradle/
+# Room's export directory, when the room scaffold is built by hand
+tests/fixtures/scaffold/room/db/schemas/
 
 # Android (for testing)
 *.apk

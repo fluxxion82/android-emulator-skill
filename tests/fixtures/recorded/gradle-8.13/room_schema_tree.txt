@@ -1,0 +1,4 @@
+db/schemas/
+db/schemas/com.example.roomfixture.AppDatabase/
+db/schemas/com.example.roomfixture.AppDatabase/1.json
+db/schemas/com.example.roomfixture.AppDatabase/2.json

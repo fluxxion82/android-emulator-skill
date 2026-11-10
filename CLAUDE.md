@@ -100,6 +100,13 @@ Therefore:
    `run_as_not_an_application`, `shared_prefs_settings_xml`,
    `sqlite_schema_host`.
 
+   `model_inspector --schema` followed: its tests read a Room schema written
+   by hand (a dict, which the ratchet cannot see) until one Room's compiler
+   exported was recorded -- `room_schema_v1`, `room_schema_v2`,
+   `room_schema_tree`, in the Gradle profile, from
+   `tests/fixtures/scaffold/room`. The hand-written one named each entity's
+   class; Room does not.
+
    Read the current debt off `KNOWN_VIOLATIONS`, not off this paragraph. The
    frozen set is the copy that fails when it is wrong; a prose list of what is
    outstanding goes stale silently, which this one did.
