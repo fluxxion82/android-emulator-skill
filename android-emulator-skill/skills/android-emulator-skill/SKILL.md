@@ -825,6 +825,15 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       `default` for an override of the default language); `qualifiers`, the
       directory's other qualifiers (`land`, `night`) or null; and `label`, the
       display string text output uses (`de (land)`, `default (night)`)
+    - A `<plurals>` is compared item by item, never joined: a language uses its
+      own plural categories (Serbian `one/few/other`, Arabic all six), so a
+      translation with more items than `values/` is no finding. Each item is
+      read as the arguments it formats (`%d` reads argument 1 as `%1$d` does;
+      `%d %d` reads two). It may read only arguments some default item reads,
+      must read every argument all default items read, and its `other` item
+      (a missing one reads as empty) every argument the default's `other`
+      reads. A plural finding names its item in `quantity` (`few`; null for a
+      string) and shows placeholders by argument (`%1$d`)
     - Options: `--res DIR`, `--source DIR`, `--locale CODE`, `--strict`, `--json`, `--verbose`
 
 27. **appearance.py** - Control dark/light mode (`cmd uimode night`) and font scale (`settings put system font_scale`); best-effort locale.
@@ -1978,8 +1987,12 @@ removed gap is pinned by a named test that is red on v0.8.0's status commit
 - **The test toolchain is pinned (#68).** `dev-constraints.txt` states each
   version once; every workflow install and the documented commands take
   theirs from it, and a test fails one written any other way.
+- **`localization_audit` compares `<plurals>` placeholders item by item
+  (#71).** A language with more plural categories than English (Serbian,
+  Arabic) is no longer a mismatch; an item that drops or adds an argument
+  still is, and the finding names its `quantity`.
 
-Tests: 3,110 → 4,905 passed at the release commit, 0 xfailed; 13 skipped
+Tests: 3,110 → 4,916 passed at the release commit, 0 xfailed; 13 skipped
 (a per-profile check for a fixture `emulator-api33` did not record, and one
 keyboard case the primary profile cannot exercise) and 28 deselected (the
 emulator lane's `-m emulator` tests).

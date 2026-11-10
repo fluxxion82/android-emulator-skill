@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Arabic has all six plural categories against English's one/other: each
+     item carries the %d the format call supplies, so none is a finding. -->
+<resources>
+    <string name="greeting">مرحبا، %1$s!</string>
+    <string name="theme_label">سمة فاتحة</string>
+    <plurals name="items">
+        <item quantity="zero">%d عناصر</item>
+        <item quantity="one">%d عنصر</item>
+        <item quantity="two">%d عنصران</item>
+        <item quantity="few">%d عناصر</item>
+        <item quantity="many">%d عنصرًا</item>
+        <item quantity="other">%d عنصر</item>
+    </plurals>
+    <string-array name="sizes">
+        <item>صغير</item>
+        <item>كبير</item>
+    </string-array>
+</resources>

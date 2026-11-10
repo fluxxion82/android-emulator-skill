@@ -123,7 +123,7 @@ def test_a_partial_override_by_a_non_locale_qualifier_is_not_a_translation():
     """L6: values-night, -sw600dp, -v31 and -land override a key or two; none is a locale."""
     report = LocalizationAuditor(LOCALIZATION_RES).audit()
 
-    assert _labels(report) == ["b+sr+Latn", "fr", "fr-rCA"]
+    assert _labels(report) == ["ar", "b+sr+Latn", "fr", "fr-rCA"]
     assert report.missing_keys == [], [f"{m.locale}:{m.key}" for m in report.missing_keys]
     assert report.placeholder_mismatches == []
     assert not report.has_findings()
@@ -142,7 +142,7 @@ def test_strict_on_a_tree_with_qualified_overrides_finds_nothing(capsys):
     """The CLI: --strict exited 2 on four fake locales; --json lists what it skipped."""
     localization_audit.main(["--res", str(LOCALIZATION_RES), "--strict", "--json"])
     report = json.loads(capsys.readouterr().out)
-    assert [entry["label"] for entry in report["locales"]] == ["b+sr+Latn", "fr", "fr-rCA"]
+    assert [entry["label"] for entry in report["locales"]] == ["ar", "b+sr+Latn", "fr", "fr-rCA"]
     assert report["missing_keys"] == []
     assert {e["directory"] for e in report["skipped"]} >= set(NOT_LOCALES)
 
@@ -374,6 +374,158 @@ def test_positional_placeholder_match_is_ok(tmp_path: Path):
     )
     report = LocalizationAuditor(res_dir=res).audit()
     assert report.placeholder_mismatches == []
+
+
+# A <plurals> is read through getQuantityString(id, count, args...): the
+# language picks ONE item by its own categories (Serbian one/few/other, Arabic
+# zero/one/two/few/many/other) and that item is formatted with the args the
+# call supplies. So items are compared one by one, never joined.
+
+
+def test_a_language_with_more_plural_categories_is_not_a_mismatch():
+    """values-b+sr+Latn has a few item and values-ar all six; English has one/other.
+
+    Joined, Serbian read ['%d','%d','%d'] against ['%d','%d'] -- a finding that
+    is no defect. Each item carries the %d the call supplies.
+    """
+    report = LocalizationAuditor(LOCALIZATION_RES).audit()
+    assert report.placeholder_mismatches == [], [
+        (m.label, m.key, m.locale_placeholders) for m in report.placeholder_mismatches
+    ]
+
+
+ITEMS_EN = (
+    '<plurals name="items"><item quantity="one">%d item</item>'
+    '<item quantity="other">%d items</item></plurals>'
+)
+
+
+def _plural(*items: tuple[str, str]) -> str:
+    body = "".join(f'<item quantity="{quantity}">{text}</item>' for quantity, text in items)
+    return f'<plurals name="items">{body}</plurals>'
+
+
+def test_a_plural_item_that_drops_a_placeholder_every_default_item_carries_is_reported(
+    tmp_path: Path,
+):
+    """Serbian few without %d prints no number for 2-4 items: still a finding."""
+    sr = _plural(("one", "%d stavka"), ("few", "nekoliko stavki"), ("other", "%d stavki"))
+    res = _make_res(tmp_path, {"values": ITEMS_EN, "values-b+sr+Latn": sr})
+    report = LocalizationAuditor(res).audit()
+    found = [
+        (m.label, m.key, m.quantity, m.default_placeholders, m.locale_placeholders)
+        for m in report.placeholder_mismatches
+    ]
+    assert found == [("b+sr+Latn", "items", "few", ["%1$d"], [])]
+
+
+def test_a_plural_item_with_a_placeholder_the_call_does_not_supply_is_reported(tmp_path: Path):
+    """%3$s in one item: the default's items take two arguments, so it has nothing to format."""
+    default = _plural(("one", "%1$d file in %2$s"), ("other", "%1$d files in %2$s"))
+    ar = _plural(
+        ("zero", "%1$d in %2$s"),
+        ("one", "%1$d in %2$s"),
+        ("two", "%1$d in %2$s"),
+        ("few", "%1$d in %2$s %3$s"),
+        ("many", "%1$d in %2$s"),
+        ("other", "%1$d in %2$s"),
+    )
+    res = _make_res(tmp_path, {"values": default, "values-ar": ar})
+    report = LocalizationAuditor(res).audit()
+    found = [(m.quantity, m.locale_placeholders) for m in report.placeholder_mismatches]
+    assert found == [("few", ["%1$d", "%2$s", "%3$s"])]
+
+
+def test_an_other_item_is_held_to_the_default_other_item(tmp_path: Path):
+    """English one may say "One item" (it is only ever 1); every language's other must count.
+
+    The default's one carries no %d, so no item is held to it by every default
+    item -- but other is the category every language has, for the numbers no
+    other category takes, and a translation's other without %d prints none.
+    """
+    default = _plural(("one", "One item"), ("other", "%d items"))
+    fr_ok = _plural(("one", "Un élément"), ("many", "%d éléments"), ("other", "%d éléments"))
+    de_bad = _plural(("one", "Ein Element"), ("other", "Elemente"))
+    res = _make_res(tmp_path, {"values": default, "values-fr": fr_ok, "values-de": de_bad})
+    report = LocalizationAuditor(res).audit()
+    found = [(m.label, m.quantity, m.locale_placeholders) for m in report.placeholder_mismatches]
+    assert found == [("de", "other", [])]
+
+
+def test_a_plural_item_that_reads_more_arguments_than_the_call_supplies_is_reported(
+    tmp_path: Path,
+):
+    """%d %d reads two arguments; the default's items read one. The format call throws."""
+    de = _plural(("one", "%d Element"), ("other", "%d %d Elemente"))
+    res = _make_res(tmp_path, {"values": ITEMS_EN, "values-de": de})
+    found = [
+        (m.quantity, m.default_placeholders, m.locale_placeholders)
+        for m in LocalizationAuditor(res).audit().placeholder_mismatches
+    ]
+    assert found == [("other", ["%1$d"], ["%1$d", "%2$d"])]
+
+
+def test_d_and_1_d_read_the_same_argument(tmp_path: Path):
+    """%d is the first argument, as %1$d is: swapping the two forms is no mismatch."""
+    default = _plural(("one", "%d item"), ("other", "%1$d items"))
+    de = _plural(("one", "%1$d Element"), ("other", "%d Elemente"))
+    res = _make_res(tmp_path, {"values": default, "values-de": de})
+    assert LocalizationAuditor(res).audit().placeholder_mismatches == []
+
+
+def test_a_percent_with_a_width_reads_no_argument(tmp_path: Path):
+    """%5% prints a padded percent sign: it does not shift %d off argument 1."""
+    default = _plural(("one", "%5% %d item"), ("other", "%5% %d items"))
+    de = _plural(("one", "%d Element %5%"), ("other", "%d Elemente %5%"))
+    res = _make_res(tmp_path, {"values": default, "values-de": de})
+    assert LocalizationAuditor(res).audit().placeholder_mismatches == []
+
+
+def test_a_plural_with_no_other_item_is_held_to_the_default_other(tmp_path: Path):
+    """Android falls back to other when a category has no item; none there is a finding."""
+    res = _make_res(
+        tmp_path,
+        {
+            "values": ITEMS_EN,
+            "values-de": _plural(("one", "%d Element")),
+            "values-fr": '<plurals name="items"></plurals>',
+        },
+    )
+    found = [
+        (m.label, m.quantity, m.locale_placeholders)
+        for m in LocalizationAuditor(res).audit().placeholder_mismatches
+    ]
+    assert found == [("de", "other", []), ("fr", "other", [])]
+
+
+def test_every_item_of_a_repeated_quantity_is_checked(tmp_path: Path):
+    """Two one items: the first's %s must not be lost behind the second's %d."""
+    de = _plural(("one", "%s Element"), ("one", "%d Element"), ("other", "%d Elemente"))
+    res = _make_res(tmp_path, {"values": ITEMS_EN, "values-de": de})
+    found = [
+        (m.quantity, m.locale_placeholders)
+        for m in LocalizationAuditor(res).audit().placeholder_mismatches
+    ]
+    assert found == [("one", ["%1$s"])]
+
+
+def test_a_plural_mismatch_names_its_item_in_text_and_json(tmp_path: Path, capsys):
+    sr = _plural(("one", "%d stavka"), ("few", "stavke"), ("other", "%d stavki"))
+    res = _make_res(tmp_path, {"values": ITEMS_EN, "values-b+sr+Latn": sr})
+    localization_audit.main(["--res", str(res), "--verbose"])
+    assert "[b+sr+Latn] items (few)" in capsys.readouterr().out
+    localization_audit.main(["--res", str(res), "--json"])
+    (mismatch,) = json.loads(capsys.readouterr().out)["placeholder_mismatches"]
+    assert mismatch["quantity"] == "few"
+
+
+def test_a_string_mismatch_has_no_quantity(tmp_path: Path):
+    res = _make_res(
+        tmp_path,
+        {"values": '<string name="c">%d new</string>', "values-es": '<string name="c">x</string>'},
+    )
+    (mismatch,) = LocalizationAuditor(res).audit().placeholder_mismatches
+    assert mismatch.quantity is None
 
 
 def test_missing_key_not_double_reported_as_mismatch(tmp_path: Path):
