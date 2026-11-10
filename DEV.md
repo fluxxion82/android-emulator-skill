@@ -20,6 +20,7 @@ android-emulator-skill/                      # repo root
 ├── .github/workflows/                       # lint, test, emulator, release, validate-version, pages
 ├── tests/                                   # pytest suite (adb/subprocess mocked, no device)
 ├── pyproject.toml                           # Black / Ruff / pytest config (Python 3.12+)
+├── dev-constraints.txt                      # exact pins for the dev toolchain; CI and local read it
 └── .pre-commit-config.yaml
 ```
 
@@ -35,9 +36,22 @@ android-emulator-skill/                      # repo root
 ```bash
 # From the repo root
 uv venv --python 3.12
-uv pip install black==26.5.1 ruff==0.15.14 pytest pillow pyyaml pre-commit
+uv pip install -c dev-constraints.txt black ruff pytest pillow pyyaml pre-commit
 source .venv/bin/activate
 pre-commit install && pre-commit install --hook-type commit-msg
+```
+
+Versions are stated once, in [dev-constraints.txt](dev-constraints.txt) (exact pins: pip, pytest,
+Pillow, PyYAML, Black, Ruff, pre-commit). Every install step in `.github/workflows/` is written
+one way, `pip install -c dev-constraints.txt <pinned names>`, so CI and the commands here get the
+same versions of those packages (a dependency the file does not name still floats);
+`tests/test_packaging_contract.py` fails a workflow that names an installer any other way (it
+checks how the workflows are written, not what a job does at run time). To move a
+version, change it there (and the matching `rev:` in `.pre-commit-config.yaml` for Black or Ruff),
+run the suite, and commit both. Without a venv:
+
+```bash
+uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest tests/
 ```
 
 ## Linting and tests
