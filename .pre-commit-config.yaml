@@ -38,6 +38,8 @@ repos:
   # rewrite bytes inside its binary record stream. Only the payloads are
   # excluded: MANIFEST.json, and anything else in that tree, stays under every
   # hook, and the checking hooks still see the payloads too.
+  # A Room schema is the one payload that is JSON (room_schema_*.json): Room
+  # ends the file without a newline, which end-of-file-fixer would add.
   #
   # Two more trees are skipped by the same three hooks, and nothing else.
   # tests/fixtures/anr_legacy_sessions/ holds the committed bytes of a previous
@@ -51,10 +53,10 @@ repos:
     hooks:
       - id: trailing-whitespace
         name: Trim trailing whitespace
-        exclude: ^tests/fixtures/(recorded/.*\.(txt|xml|trace|png|gpx)|anr_legacy_sessions/.*|scaffold/.*\.bat)$
+        exclude: ^tests/fixtures/(recorded/.*\.(txt|xml|trace|png|gpx)|recorded/.*/room_schema_[^/]*\.json|anr_legacy_sessions/.*|scaffold/.*\.bat)$
       - id: end-of-file-fixer
         name: Fix end of files
-        exclude: ^tests/fixtures/(recorded/.*\.(txt|xml|trace|png|gpx)|anr_legacy_sessions/.*|scaffold/.*\.bat)$
+        exclude: ^tests/fixtures/(recorded/.*\.(txt|xml|trace|png|gpx)|recorded/.*/room_schema_[^/]*\.json|anr_legacy_sessions/.*|scaffold/.*\.bat)$
       - id: check-yaml
         name: Check YAML syntax
       - id: check-added-large-files
@@ -63,7 +65,7 @@ repos:
       - id: mixed-line-ending
         name: Fix mixed line endings
         args: ['--fix=lf']
-        exclude: ^tests/fixtures/(recorded/.*\.(txt|xml|trace|png|gpx)|anr_legacy_sessions/.*|scaffold/.*\.bat)$
+        exclude: ^tests/fixtures/(recorded/.*\.(txt|xml|trace|png|gpx)|recorded/.*/room_schema_[^/]*\.json|anr_legacy_sessions/.*|scaffold/.*\.bat)$
 
   # Commit messages end at their last content line: no Co-Authored-By, no
   # Signed-off-by, no generated-with footer. A hook rather than a note in the

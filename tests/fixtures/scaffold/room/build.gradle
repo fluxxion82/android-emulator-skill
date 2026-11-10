@@ -1,0 +1,10 @@
+// Versions are PINNED: the exported schema's shape belongs to Room's compiler
+// (it switched JSON writers between 2.6 and 2.7), so a floating version would
+// silently change the recorded shape under whoever re-records next. AGP and
+// Kotlin match the compose/ scaffold next door.
+plugins {
+    id 'com.android.library' version '8.13.2' apply false
+    id 'org.jetbrains.kotlin.android' version '2.4.0' apply false
+    id 'com.google.devtools.ksp' version '2.3.12' apply false
+    id 'androidx.room' version '2.8.5' apply false
+}

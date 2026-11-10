@@ -926,6 +926,26 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
     - Options: `--package` (all but `--get-cached`), `--ls [SUBPATH]`, `--cat FILE`, `--shared-prefs [NAME]`, `--databases [NAME]`, `--export DIR`, `--get-cached ID`, `--serial`, `--json`, `--verbose`
 
 30. **model_inspector.py** ⭐ NEW - Inspect Android persistence: Room annotations from source, Room exported-schema JSON, and live SQLite schema via `run-as` (Room == SQLite).
+    - SCHEMA reads the JSON Room's compiler exports (`room.schemaLocation`, or
+      the Room Gradle plugin's `schemaDirectory`; a file, the database's
+      directory, or the schema directory itself, where the highest version is
+      read): each table's fields, primary key, indices and foreign keys,
+      `fts_version` for an `@Fts4` table, and the database's `views`. The
+      export names tables and views, never the Kotlin classes behind them, so
+      `--raw NAME` takes a table or view name — every name the listing prints
+      — and a refusal lists the names the file holds. A column's default
+      value, `autoGenerate`, an index's order and an FTS table's `ftsOptions`
+      and `contentSyncTriggers` are in the `--raw` block only. JSON that is
+      not shaped as Room exports it (`{}`, a list, a `tableName` that is
+      missing or not text) is refused, exit 1, naming the place
+      (`database.entities[0].tableName is missing`), with or without `--raw`.
+      So is JSON that `--raw` could not print back as JSON: `NaN` or
+      `Infinity`, a key named twice in one object, nesting far deeper than
+      Room writes.
+      (Tested on a schema Room 2.8.5 exported, recorded with the Gradle
+      fixtures. Before that it read a class name Room never wrote: every table
+      printed as `users (?)`, `--raw <ClassName>` found nothing, and a
+      `@DatabaseView` was not reported at all.)
     - LIVE reads the database with `adb shell -T` (common/run_as.py), after the
       same adb 1.0.36 check as container.py. It used `adb exec-out`, which
       exits 0 on a missing file and hands back the error text as the bytes, so
@@ -2058,10 +2078,6 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
   selects `gradlew.bat`, `android_health_check.sh` needs Bash and
   `anr_watcher.py` refuses. Whether the remaining scripts work there has not
   been observed.
-- `model_inspector`'s Room schema reading is tested against a schema
-  document written by hand, not one Room's exporter produced: no exported
-  schema is recorded, so a difference in the real format would not be
-  caught.
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
 - `anr_watcher --package` cannot attribute jank or StrictMode written by an

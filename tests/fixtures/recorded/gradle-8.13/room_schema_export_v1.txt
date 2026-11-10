@@ -1,0 +1,32 @@
+
+> Configure project :db
+w: ⚠️ Deprecated Gradle Version
+The used Gradle version (Gradle 8.13) is deprecated and will not be supported in future Kotlin Gradle Plugin releases.
+The minimum supported Gradle version will become Gradle 8.14.4 in Kotlin 2.5.0.
+
+This warning can be suppressed in 'gradle.properties':
+    kotlin.suppressGradlePluginWarnings=DeprecatedGradleVersionWarning
+Solution: Please update the Gradle version to at least Gradle 8.14.4.
+
+
+> Task :db:preBuild UP-TO-DATE
+> Task :db:preDebugBuild UP-TO-DATE
+> Task :db:generateDebugResValues
+> Task :db:generateDebugResources
+> Task :db:packageDebugResources
+> Task :db:processDebugNavigationResources
+> Task :db:parseDebugLocalResources
+> Task :db:generateDebugRFile
+> Task :db:kspDebugKotlin
+> Task :db:copyRoomSchemas
+
+[Incubating] Problems report is available at: file:///scaffold/build/reports/problems/problems-report.html
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/8.13/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+
+BUILD SUCCESSFUL in 0s
+1 actionable tasks: 8 executed

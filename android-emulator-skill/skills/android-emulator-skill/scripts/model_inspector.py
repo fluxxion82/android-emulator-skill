@@ -20,10 +20,14 @@ Three modes (exactly one per run):
    best-effort: comments are stripped, results deduped, formatting tolerated.
 
 2. SCHEMA (--schema PATH): parse Room's EXPORTED schema JSON. When
-   ``room.schemaLocation`` is set, Room writes ``schemas/<db-class>/<version>.json``.
-   Parses ``database.entities[]`` -> tableName, fields (fieldPath, columnName,
-   affinity, notNull), primaryKey, indices, foreignKeys. ``--show-versions``
-   lists all exported version files; ``--raw NAME`` dumps one entity's raw JSON.
+   ``room.schemaLocation`` (or the Room Gradle plugin's ``schemaDirectory``) is
+   set, Room writes ``schemas/<db-class>/<version>.json``. Parses
+   ``database.entities[]`` -> tableName, fields (fieldPath, columnName,
+   affinity, notNull), primaryKey, indices, foreignKeys, ftsVersion -- and
+   ``database.views[]``. ``--show-versions`` lists all exported version files;
+   ``--raw NAME`` dumps one table's or view's raw JSON. The export names
+   tables and views, never the Kotlin classes behind them (SOURCE mode maps
+   one to the other).
 
 3. LIVE (--package PKG [--db NAME]): dump the SQLite schema of a DEBUGGABLE app's
    database via ``adb shell run-as PKG``. Tries on-device ``sqlite3 <db> .schema``
@@ -36,6 +40,7 @@ Three modes (exactly one per run):
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -481,12 +486,9 @@ class SchemaInspector:
             return False, {"error": f"Schema path not found: {self.schema_path}"}
 
         try:
-            raw = target.read_text(encoding="utf-8")
-            doc = json.loads(raw)
-        except (OSError, UnicodeDecodeError) as exc:
-            return False, {"error": f"Could not read schema: {exc}"}
-        except json.JSONDecodeError as exc:
-            return False, {"error": f"Invalid schema JSON: {exc}"}
+            doc = _read_schema_file(target)
+        except SchemaFileError as exc:
+            return False, {"error": str(exc)}
 
         result = parse_schema_doc(doc)
         result["schema_file"] = str(target)
@@ -495,22 +497,35 @@ class SchemaInspector:
         return True, result
 
     def get_raw_entity(self, name: str) -> tuple[bool, str]:
-        """Dump one entity's raw JSON block by tableName or entity class name."""
+        """Dump one entity's or view's raw JSON block, by tableName or viewName.
+
+        Not by class name: Room exports none (recorded: room_schema_v1 /
+        room_schema_v2 hold no ``entityName``, which this looked for). A name
+        that is neither is refused with the names the file does hold, which
+        is the next call's argument.
+        """
         target = self._resolve_target()
         if target is None:
             return False, f"Schema path not found: {self.schema_path}"
         try:
-            doc = json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            return False, f"Could not read schema: {exc}"
+            doc = _read_schema_file(target)
+        except SchemaFileError as exc:
+            return False, str(exc)
 
-        for entity in doc.get("database", {}).get("entities", []):
-            table = entity.get("tableName")
-            class_path = entity.get("entityName") or entity.get("entity")
-            class_name = class_path.split(".")[-1] if class_path else None
-            if name in (table, class_name):
-                return True, json.dumps(entity, indent=2)
-        return False, f"Entity '{name}' not found in {target.name}"
+        database = doc["database"]
+        held: list[str] = []
+        for name_key, blocks in (
+            ("tableName", database["entities"]),
+            ("viewName", database.get("views", [])),
+        ):
+            for block in blocks:
+                if block[name_key] == name:
+                    return True, json.dumps(block, indent=2)
+                held.append(block[name_key])
+        return False, (
+            f"Entity or view '{name}' not found in {target.name}, "
+            f"which holds: {', '.join(held) or 'none'}"
+        )
 
     def _resolve_target(self) -> Path | None:
         """Resolve to a concrete JSON file.
@@ -542,34 +557,264 @@ class SchemaInspector:
         return versions
 
 
+class SchemaFileError(ValueError):
+    """A --schema file that could not be read as a Room exported schema."""
+
+
+# What `parse_schema_doc` reads, typed as Room exported it (recorded:
+# room_schema_v1 / room_schema_v2). A mapping is an object, `{key: (shape,
+# required)}`; a one-item list is a list of that shape; a type is a value of
+# that type. Required is what every recorded block carries and a listing
+# cannot be printed without. A key this does not name is not looked at: Room
+# exports more than is read here (createSql, autoGenerate, ftsOptions,
+# setupQueries) and a later Room may export more still.
+_TEXTS = [str]
+_SCHEMA_SHAPE = {
+    "database": (
+        {
+            "version": (int, True),
+            "entities": (
+                [
+                    {
+                        "tableName": (str, True),
+                        "fields": (
+                            [
+                                {
+                                    "fieldPath": (str, True),
+                                    "columnName": (str, True),
+                                    "affinity": (str, True),
+                                    "notNull": (bool, False),
+                                }
+                            ],
+                            True,
+                        ),
+                        "primaryKey": ({"columnNames": (_TEXTS, False)}, False),
+                        "indices": (
+                            [
+                                {
+                                    "name": (str, True),
+                                    "unique": (bool, False),
+                                    "columnNames": (_TEXTS, False),
+                                }
+                            ],
+                            False,
+                        ),
+                        "foreignKeys": (
+                            [
+                                {
+                                    "table": (str, True),
+                                    "columns": (_TEXTS, False),
+                                    "referencedColumns": (_TEXTS, False),
+                                    "onDelete": (str, False),
+                                    "onUpdate": (str, False),
+                                }
+                            ],
+                            False,
+                        ),
+                        "ftsVersion": (str, False),
+                    }
+                ],
+                True,
+            ),
+            "views": ([{"viewName": (str, True), "createSql": (str, True)}], False),
+        },
+        True,
+    )
+}
+
+_JSON_KINDS = {
+    dict: "an object",
+    list: "a list",
+    str: "text",
+    bool: "true or false",
+    int: "a number",
+    float: "a number",
+    type(None): "null",
+}
+
+
+def _shape_fault(value: object, shape: object, where: str) -> str | None:
+    """Where a parsed JSON value first departs from a shape, or None when it fits.
+
+    The place is named, never the value: the value is whatever the file held.
+    """
+    kind = _JSON_KINDS[type(value)]
+    if isinstance(shape, dict):
+        if not isinstance(value, dict):
+            return f"{where or 'the document'} is {kind}, not an object"
+        for key, (member, required) in shape.items():
+            place = f"{where}.{key}" if where else key
+            if key not in value:
+                if required:
+                    return f"{place} is missing"
+                continue
+            fault = _shape_fault(value[key], member, place)
+            if fault is not None:
+                return fault
+        return None
+    if isinstance(shape, list):
+        if not isinstance(value, list):
+            return f"{where} is {kind}, not a list"
+        for index, item in enumerate(value):
+            fault = _shape_fault(item, shape[0], f"{where}[{index}]")
+            if fault is not None:
+                return fault
+        return None
+    # The exact type: `true` is an int to isinstance, and is not a version.
+    if type(value) is not shape:
+        return f"{where} is {kind}, not {_JSON_KINDS[shape]}"
+    if shape is str:
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate, which JSON can spell and nothing can print.
+            return f"{where} is text that does not encode as UTF-8"
+    return None
+
+
+# Room's export nests six deep. The limit is what --raw can print back: json's
+# writer recurses once a level, and 991 lists deep in a key the listing never
+# reads ended --raw in a RecursionError (verification of #69).
+MAX_JSON_DEPTH = 64
+
+
+def _refuse_constant(token: str) -> float:
+    raise ValueError(f"{token} is not a JSON number")
+
+
+def _finite(token: str) -> float:
+    number = float(token)
+    if not math.isfinite(number):
+        raise ValueError(f"{token} is a number too large to hold")
+    return number
+
+
+def _no_key_twice(pairs: list[tuple[str, object]]) -> dict:
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("an object names one key twice")
+    return members
+
+
+def _nested_past(value: object, limit: int) -> bool:
+    """Whether `value` holds more than `limit` lists and objects, one inside another.
+
+    `[[0]]` is two. Does not recurse.
+    """
+    level = [value]
+    for _ in range(limit):
+        level = [
+            child
+            for item in level
+            if isinstance(item, (dict, list))
+            for child in (item.values() if isinstance(item, dict) else item)
+        ]
+        if not level:
+            return False
+    return any(isinstance(item, (dict, list)) for item in level)
+
+
+def _parse_json(text: str) -> object:
+    """JSON that `json.dumps` writes back as JSON, every value of it.
+
+    --raw prints an entity whole, the keys the shape does not name included,
+    so what is wrong in those has to be refused here or not at all. Python's
+    reader takes NaN and Infinity, which are not JSON and are written back as
+    the same tokens; it keeps the last of a key named twice and drops the rest;
+    and it reads nesting its own writer cannot print.
+
+    Raises:
+        ValueError: any of those, or text that is not JSON.
+    """
+    document = json.loads(
+        text,
+        parse_constant=_refuse_constant,
+        parse_float=_finite,
+        object_pairs_hook=_no_key_twice,
+    )
+    if _nested_past(document, MAX_JSON_DEPTH):
+        raise ValueError(f"nested more than {MAX_JSON_DEPTH} deep")
+    return document
+
+
+def _read_schema_file(target: Path) -> dict:
+    """A Room exported schema file, parsed and held to `_SCHEMA_SHAPE`.
+
+    The one reader the listing and --raw share, so neither answers from a
+    document the other would refuse. `{}` listed as a schema with no version
+    and no entities at exit 0, and `[]` was an AttributeError (review of #69).
+
+    Raises:
+        SchemaFileError: unreadable, not JSON, or JSON of another shape.
+    """
+    try:
+        doc = _parse_json(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SchemaFileError(f"Could not read schema: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        # JSONDecodeError, what `_parse_json` refuses, and what json raises
+        # that is not one: a number of more digits than int() converts,
+        # nesting deeper than the stack.
+        raise SchemaFileError(f"Invalid schema JSON: {exc}") from exc
+    fault = _shape_fault(doc, _SCHEMA_SHAPE, "")
+    if fault is not None:
+        raise SchemaFileError(f"Not a Room exported schema ({target.name}): {fault}")
+    return doc
+
+
+# How Room opens a view's createSql (recorded: room_schema_v2).
+VIEW_NAME_HEAD = "CREATE VIEW `${VIEW_NAME}` AS "
+
+
+def _view_statement(name: str, create_sql: str) -> str:
+    """A view's createSql with its name where Room left a placeholder for it.
+
+    Only the placeholder Room wrote, in the statement's opening. The query
+    after it is the app's own text; every `${VIEW_NAME}` in it was replaced
+    too (review of #69). A statement that opens any other way is reported as
+    written.
+
+    The name goes between the backticks as it is, a backtick in it included:
+    Room's DatabaseView.createViewQuery writes "CREATE VIEW `$viewName` AS ..."
+    and escapes nothing, so this is the statement Room runs.
+    """
+    if create_sql.startswith(VIEW_NAME_HEAD):
+        return f"CREATE VIEW `{name}` AS {create_sql[len(VIEW_NAME_HEAD) :]}"
+    return create_sql
+
+
 def parse_schema_doc(doc: dict) -> dict:
     """Parse a Room exported-schema document into structured data.
 
-    Pulls ``database.version`` and each entity's tableName, fields
-    (fieldPath, columnName, affinity, notNull), primaryKey, indices, and
-    foreignKeys.
+    Pulls ``database.version``, each entity's tableName, fields (fieldPath,
+    columnName, affinity, notNull), primaryKey, indices, foreignKeys and
+    ftsVersion, and each view's viewName and createSql.
+
+    ``doc`` is one `_read_schema_file` returned, so what is required is
+    indexed and what is optional has its type. In what Room exports
+    (recorded: room_schema_v1 / room_schema_v2) an absent key is the common
+    case: a nullable field has no ``notNull``, an entity without them no
+    ``indices`` or ``foreignKeys``, a database without them no ``views``. No
+    key names an entity's class.
     """
-    database = doc.get("database", {})
-    version = database.get("version")
+    database = doc["database"]
     entities_out: list[dict] = []
 
-    for entity in database.get("entities", []):
+    for entity in database["entities"]:
         fields = [
             {
-                "field_path": f.get("fieldPath"),
-                "column_name": f.get("columnName"),
-                "affinity": f.get("affinity"),
-                "not_null": bool(f.get("notNull", False)),
+                "field_path": f["fieldPath"],
+                "column_name": f["columnName"],
+                "affinity": f["affinity"],
+                "not_null": f.get("notNull", False),
             }
-            for f in entity.get("fields", [])
+            for f in entity["fields"]
         ]
-        primary_key = entity.get("primaryKey", {})
-        pk_columns = primary_key.get("columnNames", []) if isinstance(primary_key, dict) else []
 
         indices = [
             {
-                "name": idx.get("name"),
-                "unique": bool(idx.get("unique", False)),
+                "name": idx["name"],
+                "unique": idx.get("unique", False),
                 "columns": idx.get("columnNames", []),
             }
             for idx in entity.get("indices", [])
@@ -577,7 +822,7 @@ def parse_schema_doc(doc: dict) -> dict:
 
         foreign_keys = [
             {
-                "table": fk.get("table"),
+                "table": fk["table"],
                 "columns": fk.get("columns", []),
                 "referenced_columns": fk.get("referencedColumns", []),
                 "on_delete": fk.get("onDelete"),
@@ -588,20 +833,29 @@ def parse_schema_doc(doc: dict) -> dict:
 
         entities_out.append(
             {
-                "table": entity.get("tableName"),
-                "entity_name": (entity.get("entityName") or entity.get("entity") or "").split(".")[
-                    -1
-                ],
+                "table": entity["tableName"],
                 "fields": fields,
-                "primary_key": pk_columns,
+                "primary_key": entity.get("primaryKey", {}).get("columnNames", []),
                 "indices": indices,
                 "foreign_keys": foreign_keys,
+                # "FTS3" / "FTS4" for a virtual table, whose primary key is
+                # SQLite's rowid rather than one of its fields.
+                "fts_version": entity.get("ftsVersion"),
             }
         )
 
+    views_out = [
+        {
+            "name": view["viewName"],
+            "create_sql": _view_statement(view["viewName"], view["createSql"]),
+        }
+        for view in database.get("views", [])
+    ]
+
     return {
-        "version": version,
+        "version": database["version"],
         "entities": entities_out,
+        "views": views_out,
     }
 
 
@@ -1047,8 +1301,11 @@ def format_schema(result: dict, *, verbose: bool) -> str:
     lines: list[str] = []
     version = result.get("version")
     entities = result["entities"]
+    views = result["views"]
     lines.append(
-        f"Room schema v{version}: {len(entities)} entities " f"[{Path(result['schema_file']).name}]"
+        f"Room schema v{version}: {len(entities)} entities, "
+        f"{len(views)} view{'' if len(views) == 1 else 's'} "
+        f"[{Path(result['schema_file']).name}]"
     )
 
     if result.get("versions"):
@@ -1062,10 +1319,8 @@ def format_schema(result: dict, *, verbose: bool) -> str:
         for entity in entities:
             lines.append("")
             pk = ", ".join(entity["primary_key"]) or "—"
-            lines.append(
-                f"{entity['table']} ({entity['entity_name'] or '?'}), "
-                f"{len(entity['fields'])} fields, PK: {pk}"
-            )
+            fts = f", {entity['fts_version']}" if entity["fts_version"] else ""
+            lines.append(f"{entity['table']}, {len(entity['fields'])} fields, PK: {pk}{fts}")
             for field in entity["fields"]:
                 nn = " NOT NULL" if field["not_null"] else ""
                 lines.append(
@@ -1080,9 +1335,16 @@ def format_schema(result: dict, *, verbose: bool) -> str:
                     f"  FK {', '.join(fk['columns'])} -> "
                     f"{fk['table']}({', '.join(fk['referenced_columns'])})"
                 )
+        for view in views:
+            lines.append("")
+            lines.append(f"{view['name']}, view")
+            lines.append(f"  {view['create_sql']}")
     else:
         for entity in entities:
-            lines.append(f"  {entity['table']}: {len(entity['fields'])} fields")
+            fts = f" ({entity['fts_version']})" if entity["fts_version"] else ""
+            lines.append(f"  {entity['table']}: {len(entity['fields'])} fields{fts}")
+        for view in views:
+            lines.append(f"  {view['name']}: view")
 
     return "\n".join(lines)
 
@@ -1165,7 +1427,7 @@ Examples:
     parser.add_argument(
         "--raw",
         metavar="NAME",
-        help="SCHEMA: dump one entity's raw JSON (by tableName or class name)",
+        help="SCHEMA: dump one table's or view's raw JSON (by tableName or viewName)",
     )
     parser.add_argument(
         "--db",
@@ -1232,20 +1494,22 @@ def _run_source(args: argparse.Namespace) -> None:
 def _run_schema(args: argparse.Namespace) -> None:
     """Dispatch SCHEMA mode."""
     inspector = SchemaInspector(args.schema)
-    if args.raw:
+    # Read first, with or without --raw: a file that is not a schema is refused
+    # with where to point --schema, not with advice about --raw's argument.
+    success, result = inspector.execute(show_versions=args.show_versions)
+    if not success:
+        _refuse(result, OFFLINE_REMEDY)
+    if args.raw is not None:
         ok, raw = inspector.get_raw_entity(args.raw)
         if not ok:
             cli.fail(
                 str(raw),
-                "Pass --raw one of the entities the schema lists (run without --raw to see "
-                "them), by tableName or class name.",
+                "Pass --raw a table or view name the schema lists (run without --raw to "
+                "see them). Room's export names tables and views, not classes.",
             )
         print(raw)
         sys.exit(0)
 
-    success, result = inspector.execute(show_versions=args.show_versions)
-    if not success:
-        _refuse(result, OFFLINE_REMEDY)
     if args.json:
         print(json.dumps(result, indent=2))
     else:

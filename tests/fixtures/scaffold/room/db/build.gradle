@@ -1,0 +1,58 @@
+// Export one version of the database's schema (ANDROID_HOME is not exported on
+// the recording machine, so pass it explicitly):
+//
+//   ANDROID_HOME=~/Library/Android/sdk \
+//   gradle -p tests/fixtures/scaffold/room -ProomSchemaVersion=1 :db:kspDebugKotlin
+//
+// The database exists twice, src/v1 and src/v2, the way a project's history
+// holds it twice: -ProomSchemaVersion picks which one is compiled, and Room
+// writes schemas/<database class>/<version>.json beside whatever an earlier
+// build exported. tests/record_gradle_fixtures.py runs both, in order, in a
+// throwaway copy, so db/schemas/ is never created here (and is ignored if a
+// build by hand creates it).
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.google.devtools.ksp'
+    id 'androidx.room'
+}
+
+def schemaVersion = providers.gradleProperty('roomSchemaVersion').getOrElse('2')
+if (!(schemaVersion in ['1', '2'])) {
+    throw new GradleException("roomSchemaVersion must be 1 or 2, not '${schemaVersion}'")
+}
+
+android {
+    namespace 'com.example.roomfixture'
+    compileSdk 36
+
+    defaultConfig {
+        minSdk 24
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ["src/v${schemaVersion}/kotlin"]
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+room {
+    schemaDirectory "$projectDir/schemas"
+}
+
+dependencies {
+    implementation 'androidx.room:room-runtime:2.8.5'
+    ksp 'androidx.room:room-compiler:2.8.5'
+}
