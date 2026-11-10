@@ -17,6 +17,8 @@
 #   1 - A hard requirement is missing (adb not on PATH, a JDK below 17, a tool
 #       that cannot run), or --json could not emit its report (one
 #       {"success": false, "error", "remedy"} line instead)
+#   2 - Usage error: an argument this script does not take. Nothing is checked;
+#       under --json it is the same one-line refusal.
 
 set -u
 
@@ -41,8 +43,17 @@ else
     NC=''
 fi
 
+USAGE_LINE="usage: android_health_check.sh [--help] [--json]"
+
 SHOW_HELP=false
 JSON_MODE=false
+# Every argument this script does not take, in the order given. An unknown
+# flag used to be skipped, so a mistyped `--jsno` ran the whole check in prose
+# and an agent parsing stdout got a report it had not asked for.
+# Counted, not inferred from the joined text: an empty argument is one too,
+# and joins to nothing.
+UNRECOGNIZED_COUNT=0
+UNRECOGNIZED=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -51,6 +62,10 @@ for arg in "$@"; do
             ;;
         --json)
             JSON_MODE=true
+            ;;
+        *)
+            UNRECOGNIZED_COUNT=$((UNRECOGNIZED_COUNT + 1))
+            UNRECOGNIZED="${UNRECOGNIZED:+$UNRECOGNIZED }${arg:-''}"
             ;;
     esac
 done
@@ -82,6 +97,8 @@ Exit codes:
   1 - A hard requirement is missing (adb not on PATH, a JDK below ${JAVA_FLOOR}, a
       tool that cannot run), or --json could not emit its report (one
       {"success": false, "error", "remedy"} line instead)
+  2 - Usage error: an argument this script does not take. Nothing is checked;
+      under --json it is the same one-line refusal.
 EOF
     exit 0
 fi
@@ -524,6 +541,20 @@ run_combined_captured() {
     rm -f "$combined_file"
     [ "$CAPTURED_STATUS" -eq 0 ]
 }
+
+# A command line this script does not take is refused here, before anything is
+# probed and with shell builtins only, so the answer is the same whatever the
+# environment turns out to be. The wording is argparse's, which is what the
+# Python scripts answer: the error on one line, the usage line as the remedy.
+if [ "$UNRECOGNIZED_COUNT" -gt 0 ]; then
+    if [ "$JSON_MODE" = true ]; then
+        emit_json_unavailable "unrecognized arguments: $UNRECOGNIZED" "$USAGE_LINE"
+    else
+        printf '%s\n' "$USAGE_LINE" >&2
+        printf 'android_health_check.sh: error: unrecognized arguments: %s\n' "$UNRECOGNIZED" >&2
+    fi
+    exit 2
+fi
 
 if [ "$JSON_MODE" = true ]; then
     exec 3>&1

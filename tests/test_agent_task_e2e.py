@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pytest
 from app_launcher import parse_am_start
+from conftest import booted_serials, emulator_serials, emulator_with_package
 
 # The independent resolver from the fixture-driven loop spec, imported rather
 # than re-implemented: the rectangle a tap must land in is computed from the
@@ -82,40 +83,31 @@ _QUOTED = re.compile(r'"([^"]*)"')
 
 @pytest.fixture(scope="session")
 def compose_device(adb: str) -> str:
-    """The attached device that has the fixture app.
+    """The booted emulator that has the fixture app.
 
-    Deliberately searches rather than taking the first device: a developer
-    machine often has both an emulator and a physical phone attached, and the
-    app is only on one of them. Taking `live_device` here made this test skip
-    while the app sat installed on the emulator.
+    Deliberately searches rather than taking `live_device`: with two emulators
+    up the app is often on the second, and taking the first made this test skip
+    while the app sat installed next door.
+
+    Emulators only. This test force-stops, launches, taps and types, and
+    `adb devices` lists a phone before `emulator-5554`: searching every
+    attached device returned a handset that happened to have the app.
     """
     listing = subprocess.run(
         [adb, "devices"], capture_output=True, text=True, timeout=20, check=False
     )
-    serials = [
-        line.split()[0]
-        for line in listing.stdout.splitlines()[1:]
-        if line.strip() and line.split()[-1] == "device"
-    ]
-    if not serials:
-        pytest.skip("no booted device; start one and re-run with -m emulator")
+    emulators = emulator_serials(booted_serials(listing.stdout))
+    if not emulators:
+        pytest.skip("no booted emulator; start one and re-run with -m emulator")
 
-    for serial in serials:
-        packages = subprocess.run(
-            [adb, "-s", serial, "shell", "pm", "list", "packages", APP],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+    serial = emulator_with_package(adb, listing.stdout, APP)
+    if serial is None:
+        pytest.skip(
+            f"{APP} is not installed on any booted emulator ({', '.join(emulators)}). "
+            f"Build and install it with:\n"
+            f"  cd tests/fixtures/scaffold/compose && gradle :app:installDebug"
         )
-        if APP in packages.stdout:
-            return serial
-
-    pytest.skip(
-        f"{APP} is not installed on any attached device ({', '.join(serials)}). "
-        f"Build and install it with:\n"
-        f"  cd tests/fixtures/scaffold/compose && gradle :app:installDebug"
-    )
+    return serial
 
 
 @pytest.fixture

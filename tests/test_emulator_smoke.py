@@ -17,10 +17,12 @@ device happens to be attached.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 
 import pytest
+from conftest import booted_serials
 
 pytestmark = pytest.mark.emulator
 
@@ -120,16 +122,20 @@ def test_omitting_serial_fails_loudly_when_multiple_devices_attached(adb: str):
     listing = subprocess.run(
         [adb, "devices"], capture_output=True, text=True, timeout=20, check=False
     )
-    serials = [
-        line.split()[0]
-        for line in listing.stdout.splitlines()[1:]
-        if line.strip() and line.split()[-1] == "device"
-    ]
+    serials = booted_serials(listing.stdout)
     if len(serials) < 2:
         pytest.skip("needs two attached devices")
 
+    # ANDROID_SERIAL would address the command for adb, and there would be
+    # nothing to refuse: the question is what adb does with no serial at all.
+    unaddressed = {k: v for k, v in os.environ.items() if k != "ANDROID_SERIAL"}
     result = subprocess.run(
-        [adb, "shell", "echo", "hi"], capture_output=True, text=True, timeout=20, check=False
+        [adb, "shell", "echo", "hi"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env=unaddressed,
     )
     assert result.returncode != 0, "adb silently picked a device instead of refusing"
     assert "more than one device" in (result.stderr + result.stdout).lower()

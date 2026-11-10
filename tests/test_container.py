@@ -2297,6 +2297,36 @@ def test_the_cache_threshold_counts_bytes_not_characters(tmp_path, monkeypatch, 
     assert result["content"].encode("utf-8") == expected.encode("utf-8")
 
 
+def test_a_cached_cat_sweeps_old_cat_entries_and_no_other_scripts(tmp_path, monkeypatch, capsys):
+    """Typed reads keep another type's entries, so nothing else sweeps --cat's.
+
+    Saving one deletes the --cat entries past their hour; a build of the same
+    age, which its own reader keeps for a day, is not this script's to delete.
+    """
+    from datetime import datetime, timedelta
+
+    from common.cache_utils import ProgressiveCache, default_cache_dir
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    cache = ProgressiveCache()
+    old = {
+        "cat": cache.save({"content": "old text"}, "container-cat"),
+        "build": cache.save({"stdout": "valid build log"}, "build-result"),
+    }
+    for cache_id in old.values():
+        path = default_cache_dir() / f"{cache_id}.json"
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        entry["created_at"] = (datetime.now() - timedelta(hours=2)).isoformat()
+        path.write_text(json.dumps(entry), encoding="utf-8")
+
+    payload = API33.data(_manifest_entry("run_as_cat_utf8_cap")["file"])
+    cache_id, got = _cat_then_get_cached(tmp_path, monkeypatch, capsys, payload, [])
+    assert got.returncode == 0, got
+
+    kept = {path.stem for path in default_cache_dir().glob("*.json")}
+    assert kept == {cache_id, old["build"]}, kept
+
+
 @pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
 def test_get_cached_refuses_an_unknown_id_with_a_remedy(tmp_path, monkeypatch, capsys, json_mode):
     """An id nothing cached (or one that expired): one refusal, exit 1, no device."""
