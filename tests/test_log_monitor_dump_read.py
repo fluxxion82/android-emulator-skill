@@ -42,7 +42,7 @@ import signal
 import struct
 import subprocess
 import sys
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import log_monitor
@@ -72,6 +72,13 @@ API33 = RecordedFixtures(RECORDED_ROOT / "emulator-api33")
 API35 = RecordedFixtures(RECORDED_ROOT / "emulator-api35")
 SERIAL = "emulator-5556"
 LIVE = ("--serial", SERIAL, "--duration", "1s")
+# For a spec about the opening: each opening dump is bounded by the duration or
+# NEWEST_TIMEOUT, whichever is less (log_monitor), and LIVE's 1 s is less than a
+# stub adb's interpreter takes to start on a loaded machine ("did not finish
+# within 1s and was killed"). A read refused in its opening ends before its
+# first poll; one that opens is ended by Ctrl-C once it has polled
+# (``_once_polled``), so the longer duration costs no time either way.
+OPENING_ONLY = ("--serial", SERIAL, "--duration", f"{dump_read.NEWEST_TIMEOUT}s")
 MARK_TAG = "aes-recorder"
 
 
@@ -990,6 +997,11 @@ def test_follow_s_last_read_at_ctrl_c_prints_what_only_it_could(toolchain, recor
 # ``get-state``); that the child is gone or the refusal says it could not be
 # stopped; and that both files are closed. The child is a stand-in for Popen,
 # scripted per outcome; the real-child specs above cover a real process.
+#
+# Time is a fake clock (``_Clock``), patched in as ``dump_read.time``: it moves
+# only when the child waits. On real time, a run under load reached the dump's
+# deadline before its first wait (no Ctrl-C raised, no exit seen) or polled the
+# child after its scripted exit (no kill), and the steps differed run to run.
 
 _CAP = 4096
 _BUDGET = 0.2
@@ -1050,12 +1062,38 @@ class _CountedFile:
         self.closed = True
 
 
-class _ScriptedDump:
-    """A dump child that ends as ``outcome`` says."""
+class _Clock:
+    """``dump_read``'s ``time`` in the matrix: monotonic, and still unless the child waits."""
 
-    def __init__(self, outcome: str, out, said, said_bytes: bytes, events: list[str]):
-        self.outcome, self.events = outcome, events
-        now = time.monotonic()
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, seconds)
+
+    def until(self, moment: float) -> None:
+        self.now = max(self.now, moment)
+
+
+@pytest.fixture
+def clock(monkeypatch) -> _Clock:
+    """A ``_Clock`` installed as ``dump_read.time``, for a ``_ScriptedDump`` to wait on."""
+    fake = _Clock()
+    monkeypatch.setattr(dump_read, "time", fake)
+    return fake
+
+
+class _ScriptedDump:
+    """A dump child that ends as ``outcome`` says, its exit and every wait on ``clock``."""
+
+    def __init__(
+        self, outcome: str, out, said, said_bytes: bytes, events: list[str], clock: _Clock
+    ):
+        self.outcome, self.events, self.clock = outcome, events, clock
+        now = clock.monotonic()
         self.exit_at = {
             "exit0": now,
             "nonzero": now,
@@ -1078,7 +1116,7 @@ class _ScriptedDump:
             return self.outcome == "reap_hangs"
         if self.outcome == "exit0_seen_late":
             return not self.reported
-        return self.exit_at is None or time.monotonic() < self.exit_at
+        return self.exit_at is None or self.clock.monotonic() < self.exit_at
 
     def _status(self) -> int | None:
         if self.killed:
@@ -1096,18 +1134,17 @@ class _ScriptedDump:
         if self.waits == 1 and self.outcome.startswith("interrupted"):
             raise KeyboardInterrupt
         if self.outcome == "exit0_seen_late" and not self.killed:
-            time.sleep(max(0.0, self.seen_at - time.monotonic()))
+            self.clock.until(self.seen_at)
             self.reported = True
             return 0
         status = self._status()
         if status is not None:
             return status
         if self.exit_at is not None and timeout is not None:
-            left = self.exit_at - time.monotonic()
-            if left <= timeout:
-                time.sleep(max(0.0, left))
+            if self.exit_at - self.clock.monotonic() <= timeout:
+                self.clock.until(self.exit_at)
                 return self.code
-        time.sleep(timeout or 0)
+        self.clock.sleep(timeout or 0)
         raise subprocess.TimeoutExpired("adb logcat", timeout)
 
     def kill(self) -> None:
@@ -1183,7 +1220,7 @@ def _expected(outcome: str, recheck: str, said: str, reads: str) -> tuple[int | 
 @pytest.mark.parametrize("recheck", _RECHECKS)
 @pytest.mark.parametrize("outcome", _OUTCOMES)
 def test_every_dump_ending_passes_the_same_steps(
-    outcome, recheck, said, reads, monkeypatch, recorded, capsys
+    outcome, recheck, said, reads, monkeypatch, recorded, capsys, clock
 ):
     events: list[str] = []
     files: list[_CountedFile] = []
@@ -1198,7 +1235,7 @@ def test_every_dump_ending_passes_the_same_steps(
     def popen(_command, **kwargs):
         children.append(
             _ScriptedDump(
-                outcome, kwargs["stdout"], kwargs["stderr"], _said(recorded, said), events
+                outcome, kwargs["stdout"], kwargs["stderr"], _said(recorded, said), events, clock
             )
         )
         return children[-1]
@@ -1441,7 +1478,7 @@ def test_a_tail_that_would_pass_the_byte_cap_is_refused_before_it_is_asked(toolc
     not hasattr(signal, "pthread_sigmask"), reason="no signal masks on this platform"
 )
 def test_a_second_ctrl_c_during_the_cleanup_does_not_swallow_the_diagnostic(
-    monkeypatch, recorded, capsys
+    monkeypatch, recorded, capsys, clock
 ):
     """Ctrl-C, the kill fails, and a second Ctrl-C is pending: the diagnostic is still printed.
 
@@ -1453,7 +1490,7 @@ def test_a_second_ctrl_c_during_the_cleanup_does_not_swallow_the_diagnostic(
 
     def popen(_command, **kwargs):
         child = _ScriptedDump(
-            "interrupted_unkillable", kwargs["stdout"], kwargs["stderr"], b"", events
+            "interrupted_unkillable", kwargs["stdout"], kwargs["stderr"], b"", events, clock
         )
         real_kill = child.kill
 
@@ -1718,6 +1755,22 @@ def _marker(scenario: Scenario) -> Frame:
     return shell.replace(tag="aes-log-monitor", message=PLACEHOLDER)
 
 
+def _once_polled(toolchain: FakeToolchain, opening: int) -> Callable[[], bool]:
+    """Whether the read asked a dump past its opening's ``opening`` -- so it is open and polling.
+
+    For ``FakeToolchain.run(interrupt_when=...)``: Ctrl-C then ends the read
+    with its last read, by the stub calls it made rather than a time.
+    """
+
+    def polled() -> bool:
+        try:
+            return len(_all_tails(toolchain)) > opening
+        except (OSError, ValueError):  # no stub has run yet, or one is writing its line
+            return False
+
+    return polled
+
+
 def _anchor_calls(toolchain: FakeToolchain) -> list[list[str]]:
     """Every `adb shell log` the read made, its argv after ``adb``."""
     return [call for call in toolchain.calls("adb") if "shell" in call and "log" in call]
@@ -1748,7 +1801,13 @@ def test_copies_of_one_app_datagram_cannot_pass_for_records_already_read(
         dump=Rule(("logcat", "-d", "-T"), buffered=framed(after_turnover), logged=PLACEHOLDER),
     )
 
-    result = toolchain.run("log_monitor.py", *LIVE, "--clear", "--json")
+    result = toolchain.run(
+        "log_monitor.py",
+        *OPENING_ONLY,
+        "--clear",
+        "--json",
+        interrupt_when=_once_polled(toolchain, 5) if marker_kept else None,
+    )
 
     if marker_kept:
         assert result.returncode == 0, result.stderr
@@ -1776,7 +1835,7 @@ def test_an_anchor_that_never_appears_is_refused(toolchain, recorded):
         window=framed(copies),
     )
 
-    result = toolchain.run("log_monitor.py", *LIVE, "--json")
+    result = toolchain.run("log_monitor.py", *OPENING_ONLY, "--json")
 
     payload = assert_refusal(result, json_mode=True, naming=("marker",), status=1)
     assert payload["partial"]["statistics"]["total_lines"] == 0
@@ -1823,7 +1882,7 @@ def test_the_anchor_is_said_in_the_text_summary_and_only_api_33_has_the_key(tool
     assert "anchor_written" not in _capture(toolchain)
 
 
-def test_a_dump_outside_the_api_33_read_adds_no_anchor_key(monkeypatch, recorded):
+def test_a_dump_outside_the_api_33_read_adds_no_anchor_key(monkeypatch, recorded, clock):
     """``anchor_written`` belongs to API 33's dump-made read alone (PR #55's ruling).
 
     A dump made on its own -- through ``LogMonitor._dump``, outside that read --
@@ -1833,7 +1892,7 @@ def test_a_dump_outside_the_api_33_read_adds_no_anchor_key(monkeypatch, recorded
     events: list[str] = []
 
     def popen(_command, **kwargs):
-        return _ScriptedDump("nonzero", kwargs["stdout"], kwargs["stderr"], b"", events)
+        return _ScriptedDump("nonzero", kwargs["stdout"], kwargs["stderr"], b"", events, clock)
 
     monkeypatch.setattr(dump_read.subprocess, "Popen", popen)
     monkeypatch.setattr(dump_read, "run_adb", _recheck(recorded, "answers", events))
