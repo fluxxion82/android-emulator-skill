@@ -616,9 +616,34 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       after its capture, so a `--stop` landing in between can be lost.
     - Each step records a screenshot and the UI hierarchy, plus optional
       `--screen`, `--state` and `--assert` (`--assert-failed` marks it failed).
+      A step the recorder could not read back is refused (exit 1) and not
+      recorded: before anything is captured when it is the step's own text
+      (it does not encode as UTF-8) or a step past number 999,999, and
+      where it would be written when it is something the capture brought
+      back. `--start` refuses a name, `--app-name` or `--serial` that does
+      not encode as UTF-8, and every command a storage root whose path does
+      not.
     - Sessions live under `~/.android-emulator-skill`, not in an output
       directory you pass: retrieve with `--list` / `--get-details ID`, remove
       with `--clear [--older-than 24h]`.
+    - A damaged `steps.jsonl` (a write cut short, a corrupt line, a file
+      emptied) is disclosed, not refused and never skipped silently: a
+      recording cannot be re-run, so the steps that still read are kept and
+      the rest are counted. `--stop`, `--get-details` and `--list` carry
+      `incomplete`, `unreadable_lines` (non-blank lines of the file that gave
+      no step: not a record the recorder writes — a field it does not
+      write, a value of the wrong type, text that is not UTF-8, a step
+      number outside 1–999,999 — or a repeat of a step number already
+      read) and `lost_steps`
+      (steps recorded but not readable, which also counts lines that are
+      gone; a repeat is not a lost step) under `--json` — `--stop` and
+      `--get-details` name the file as `steps_file` — and say `INCOMPLETE` /
+      `Incomplete:` with the same counts in text; `report.md` and
+      `manifest.json` say it too. `--stop` on an incomplete recording still
+      writes both and keeps the verdict it was given, but exits 1: exit 0
+      means passed *and* every recorded step is in the report. `--step` keeps
+      recording after a loss, warns on stderr, and never reuses a lost step's
+      number. In `--list`, `steps` is the count readable from the file.
     - Options: `--start`, `--step`, `--stop`, `--list`, `--get-details`,
       `--clear`, `--session`, `--serial`, `--app-name`, `--size`, `--screen`,
       `--state`, `--assert`, `--assert-failed`, `--failed`, `--older-than`,
@@ -2033,10 +2058,6 @@ fixing it forces the marker's removal. None is pinned in v0.8.0. See
   selects `gradlew.bat`, `android_health_check.sh` needs Bash and
   `anr_watcher.py` refuses. Whether the remaining scripts work there has not
   been observed.
-- `test_recorder` skips a line of a session's `steps.jsonl` it cannot parse
-  and does not say so. After a damaged step file (a write cut short),
-  `--stop` reports on the lines that still parse: fewer steps, or none, in a
-  report that can still say PASSED and exit 0.
 - `model_inspector`'s Room schema reading is tested against a schema
   document written by hand, not one Room's exporter produced: no exported
   schema is recorded, so a difference in the real format would not be
