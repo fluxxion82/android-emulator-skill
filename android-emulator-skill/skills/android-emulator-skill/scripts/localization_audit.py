@@ -23,7 +23,13 @@ Android-native (NOT an iOS .xcstrings port):
 Reports:
   - Per-locale missing keys vs. the default ``values/strings.xml``.
   - Placeholder mismatches (``%s``, ``%d``, positional ``%1$s``) between the
-    default value and each translation.
+    default value and each translation. A ``<plurals>`` is compared item by
+    item, never joined: the language picks one item by its own categories
+    (Serbian ``one/few/other``, Arabic six) and formats it with the arguments
+    the call supplies. Each item may read only arguments some default item
+    reads, must read every argument all default items read, and its ``other``
+    item (missing reads as empty) every argument the default's ``other``
+    reads. Plural placeholders are shown by argument: ``%d`` as ``%1$d``.
   - With ``--source DIR``: keys referenced in code (``R.string.NAME``,
     ``getString(R.string.NAME)``, ``stringResource(R.string.NAME)``) that are
     undefined, and defined keys that are never referenced (unused).
@@ -95,6 +101,7 @@ class PlaceholderMismatch:
     label: str
     default_placeholders: list[str]
     locale_placeholders: list[str]
+    quantity: str | None = None  # the <plurals> item (``few``); None for a string
 
 
 @dataclass
@@ -150,6 +157,81 @@ def _extract_placeholders(value: str) -> list[str]:
     """Extract all printf-style format specifiers from a string value."""
     # A bare "%%" is a literal percent, not a placeholder — drop it.
     return [p for p in _PLACEHOLDER_RE.findall(value) if p != "%%"]
+
+
+def _arguments_read(value: str) -> set[str]:
+    """The arguments a format string reads, each as ``%<index>$<conversion>``.
+
+    ``java.util.Formatter`` gives each specifier without an explicit index the
+    next ordinary index, counted apart from explicit ones: ``%d`` reads
+    argument 1 as ``%1$d`` does, and ``%d %d`` reads arguments 1 and 2. A
+    ``%`` or ``n`` conversion (``%%``, ``%5%``, ``%n``) reads none.
+    """
+    read: set[str] = set()
+    ordinary = 0
+    for spec in _PLACEHOLDER_RE.findall(value):
+        if spec[-1] in "%n":
+            continue
+        explicit = re.match(r"%(\d+)\$(.*)", spec)
+        if explicit:
+            read.add(f"%{explicit.group(1)}${explicit.group(2)}")
+        else:
+            ordinary += 1
+            read.add(f"%{ordinary}${spec[1:]}")
+    return read
+
+
+def _plural_mismatches(
+    key: str,
+    default: dict[str, Any],
+    translated: dict[str, Any],
+    resource: "ResourceSet",
+) -> list[PlaceholderMismatch]:
+    """Compare a translated ``<plurals>`` with the default's, item by item.
+
+    ``getQuantityString(id, count, args...)`` picks ONE item by the language's
+    own plural categories -- Serbian has ``few``, Arabic ``zero/two/few/many``,
+    English neither -- and formats it with the arguments the call supplies.
+    Items are therefore never matched by category, and never joined. Each is
+    read as the arguments it formats (:func:`_arguments_read`), so ``%d`` and
+    ``%1$d`` agree and ``%d %d`` reads two:
+
+    - an item may read only arguments some default item reads (the call
+      supplies no other);
+    - it must read every argument every default item reads;
+    - its ``other`` -- the category every language has, and Android's fallback
+      for a category with no item -- must read what the default's ``other``
+      reads. A missing ``other`` reads as an empty one.
+
+    Every item is checked, a repeated quantity too.
+    """
+    default_sets = [_arguments_read(text) for _, text in default["items"]]
+    supplied: set[str] = set().union(*default_sets)
+    always: set[str] = set.intersection(*default_sets) if default_sets else set()
+    default_other = [text for quantity, text in default["items"] if quantity == "other"]
+    other_needs = always.union(*(_arguments_read(text) for text in default_other))
+
+    items = list(translated["items"])
+    if not any(quantity == "other" for quantity, _ in items):
+        items.append(("other", ""))
+
+    found: list[PlaceholderMismatch] = []
+    for quantity, text in items:
+        used = _arguments_read(text)
+        needed = other_needs if quantity == "other" else always
+        if used - supplied or needed - used:
+            found.append(
+                PlaceholderMismatch(
+                    key=key,
+                    locale=resource.locale,
+                    qualifiers=resource.qualifiers,
+                    label=resource.label,
+                    default_placeholders=sorted(supplied),
+                    locale_placeholders=sorted(used),
+                    quantity=quantity,
+                )
+            )
+    return found
 
 
 # === RESOURCE PARSING ===
@@ -230,7 +312,9 @@ def parse_strings_xml(path: Path) -> dict[str, dict[str, Any]]:
     Each entry is ``{"kind": str, "value": str}`` where ``value`` is the
     concatenation of all translatable text used for placeholder comparison:
       - ``<string>``  -> the element text
-      - ``<plurals>`` -> all ``<item>`` texts joined
+      - ``<plurals>`` -> all ``<item>`` texts joined, and under ``items`` each
+        ``(quantity, text)`` in document order, repeats kept (placeholders are
+        compared per item)
       - ``<string-array>`` -> all ``<item>`` texts joined
 
     Entries marked ``translatable="false"`` are skipped (they are not localized).
@@ -257,6 +341,10 @@ def parse_strings_xml(path: Path) -> dict[str, dict[str, Any]]:
             value = " ".join(_node_text(item) for item in elem.findall("item"))
 
         entries[name] = {"kind": elem.tag, "value": value}
+        if elem.tag == "plurals":
+            entries[name]["items"] = [
+                (item.get("quantity") or "", _node_text(item)) for item in elem.findall("item")
+            ]
 
     return entries
 
@@ -432,8 +520,12 @@ class LocalizationAuditor:
             for key, entry in default.items():
                 if key not in resource.entries:
                     continue  # a translation's gap is reported as missing
+                translated = resource.entries[key]
+                if entry["kind"] == "plurals" and translated["kind"] == "plurals":
+                    mismatches.extend(_plural_mismatches(key, entry, translated, resource))
+                    continue
                 default_ph = sorted(_extract_placeholders(entry["value"]))
-                locale_ph = sorted(_extract_placeholders(resource.entries[key]["value"]))
+                locale_ph = sorted(_extract_placeholders(translated["value"]))
                 if default_ph != locale_ph:
                     mismatches.append(
                         PlaceholderMismatch(
@@ -445,7 +537,7 @@ class LocalizationAuditor:
                             locale_placeholders=locale_ph,
                         )
                     )
-        return sorted(mismatches, key=lambda m: (m.label, m.key))
+        return sorted(mismatches, key=lambda m: (m.label, m.key, m.quantity or ""))
 
     def audit(self) -> AuditReport:
         """Run the full audit and return a structured report.
@@ -569,7 +661,7 @@ def _format_verbose(report: AuditReport) -> str:
         sections.append("\n=== Placeholder Mismatches ===")
         for m in report.placeholder_mismatches:
             sections.append(
-                f"  [{m.label}] {m.key}\n"
+                f"  [{m.label}] {m.key}{f' ({m.quantity})' if m.quantity else ''}\n"
                 f"    values: {m.default_placeholders}\n"
                 f"    {m.label}: {m.locale_placeholders}"
             )
