@@ -226,4 +226,4 @@ adb shell input keyevent KEYCODE_ENTER
 ## See also
 
 - `SKILL.md` — the script reference; each script wraps the commands above.
-- `references/` — deeper topic docs.
+- `docs/` (this directory) — the other topic docs.

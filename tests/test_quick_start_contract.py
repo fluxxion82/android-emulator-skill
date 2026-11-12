@@ -44,6 +44,7 @@ test never running the script. Both now take `SCRIPT_SUFFIXES`.
 from __future__ import annotations
 
 import ast
+import re
 import shlex
 from pathlib import Path
 
@@ -96,6 +97,149 @@ E2E_BASELINE = (
 # ---------------------------------------------------------------------------
 
 
+PROSE, FENCE, CODE = "prose", "fence", "code"
+_FENCE_RUN = re.compile(r"([ ]*)(`{3,}|~{3,})(.*)$")
+_QUOTED_FENCE_RUN = re.compile(r"[ ]*>[ >]*(`{3,}|~{3,})(.*)$")
+_MARKER_FENCE_RUN = re.compile(r"[ ]*(?:(?:[-*+]|\d+[.)])[ ]+)+(`{3,}|~{3,})(.*)$")
+# Whitespace a renderer and `str` methods do not agree about: a tab is columns,
+# not a character, to a renderer; a no-break space is not a space to one.
+_OTHER_WHITESPACE = re.compile(r"[^\S \n]")
+# HTML whose content a renderer shows as code, or does not show.
+_HTML_BLOCK = re.compile(r"<(?:pre|script|style|textarea)\b|<!--", re.IGNORECASE)
+
+
+def _opens_a_block(run: str, rest: str) -> bool:
+    """A run of backticks followed by more backticks on its line is inline code."""
+    return bool(run) and not (run[0] == "`" and "`" in rest)
+
+
+def _read_fences(markdown: str) -> tuple[list[tuple[str, str]], list[str]]:
+    lines: list[tuple[str, str]] = []
+    problems: list[str] = []
+    opened: tuple[str, str, int] | None = None
+    # Lines end at a newline and nowhere else. `str.splitlines` also breaks at
+    # U+2028, a form feed and others, where a renderer does not: a fence
+    # followed by one of those would close here and stay open there. So the
+    # text is split on "\n" alone (a CRLF pair counted as one), and any other
+    # whitespace than U+0020 is refused below, those characters included.
+    text = markdown.replace("\r\n", "\n")
+    for number, line in enumerate(text.removesuffix("\n").split("\n") if text else [], 1):
+        if _OTHER_WHITESPACE.search(line):
+            problems.append(
+                f"line {number}: a tab, or whitespace other than U+0020 and a newline "
+                "(write spaces; show a tab as \\t)"
+            )
+        match = _FENCE_RUN.match(line)
+        indent, run, rest = match.groups() if match else ("", "", "")
+        if opened is None:
+            quoted = _QUOTED_FENCE_RUN.match(line)
+            if quoted and _opens_a_block(*quoted.groups()):
+                problems.append(f"line {number}: a fenced block inside a blockquote")
+            marked = _MARKER_FENCE_RUN.match(line)
+            if marked and _opens_a_block(*marked.groups()):
+                problems.append(
+                    f"line {number}: a fence on a list marker's line "
+                    "(write it on a line of its own, under the item)"
+                )
+            if _opens_a_block(run, rest):
+                opened = (indent, run, number)
+                lines.append((line, FENCE))
+                continue
+            if _HTML_BLOCK.search(line):
+                problems.append(
+                    f"line {number}: <pre>, <script>, <style>, <textarea> or an HTML comment "
+                    "outside a fenced block (remove it, or show it inside one)"
+                )
+            lines.append((line, PROSE))
+            continue
+        open_indent, open_run, open_number = opened
+        if run and run[0] == open_run[0] and len(run) >= len(open_run) and not rest.strip(" "):
+            if indent != open_indent:
+                problems.append(
+                    f"line {number}: closes the block opened on line {open_number} "
+                    "at another indentation"
+                )
+            opened = None
+            lines.append((line, FENCE))
+            continue
+        if line.strip() and not line.startswith(open_indent):
+            problems.append(
+                f"line {number}: indented less than the block opened on line {open_number}, "
+                "which is not closed before it"
+            )
+        lines.append((line, CODE))
+    if opened is not None:
+        problems.append(f"line {opened[2]}: opens a block that is never closed")
+    return lines, problems
+
+
+def fence_problems(markdown: str) -> list[str]:
+    """What in a document `markdown_lines` will not read. Empty when nothing."""
+    return _read_fences(markdown)[1]
+
+
+def markdown_lines(markdown: str) -> list[tuple[str, str]]:
+    """Each line of a document with what it is: PROSE, a FENCE line, or CODE.
+
+    The one reader of fenced blocks; every Markdown guard in the suite takes its
+    lines from here. A block opens on a line that is a run of three or more
+    backticks or tildes (after spaces) and closes on a run of the same
+    character at least as long with nothing after it, so a tilde fence is a
+    fence, and three backticks inside a four-backtick block are code. A line
+    that opens with backticks and holds more of them later (three backticks
+    around a word) is inline code.
+
+    This is not a Markdown parser, and it does not guess at what it cannot
+    read. The fence, whitespace and HTML forms below are refused
+    (``AssertionError``); every other line outside a fenced block is PROSE:
+
+    * a fenced block inside a blockquote -- its fence lines begin with ``>``,
+      and here they would be prose;
+    * a block whose closing fence is indented differently from its opening
+      one, or that holds a line indented less than it -- a renderer ends a
+      block fenced inside a list item where the item ends, and here it would
+      run on;
+    * a block that is never closed, and a fence that shares its line with a
+      list marker (``1. ```bash``), which is not read as a fence at all: write
+      the fence on a line of its own, under the item;
+    * a tab, or any whitespace other than U+0020 and a newline, anywhere -- a
+      fence followed by a no-break space does not close its block, a tab is
+      not one column, and a line separator ends a line for `str.splitlines`
+      and for no renderer;
+    * outside fenced blocks, ``<pre>``, ``<script>``, ``<style>``,
+      ``<textarea>`` or an HTML comment -- what they hold is shown as code, or
+      not shown.
+
+    What "prose" means here is "outside a fenced block", and no more. A block
+    made by indentation alone, inline code, and what a renderer shows inside
+    other HTML are all PROSE: telling them apart is parsing Markdown.
+    `flush_prose_lines` leaves out the first of those where it can.
+    """
+    lines, problems = _read_fences(markdown)
+    assert not problems, f"this document is not one the fence reader reads: {problems}"
+    return lines
+
+
+def prose_lines(markdown: str) -> list[str]:
+    """Lines outside fenced blocks: what a document claims."""
+    return [line for line, kind in markdown_lines(markdown) if kind == PROSE]
+
+
+def flush_prose_lines(markdown: str) -> list[str]:
+    """Prose lines indented fewer than four columns.
+
+    Keeps the lines outside fenced blocks that begin with fewer than four
+    U+0020 spaces, which leaves out an ordinary block made by indentation.
+    Indentation after a container's marker (``>``, ``1.``) is not interpreted.
+    """
+    return [line for line in prose_lines(markdown) if len(line) - len(line.lstrip(" ")) < 4]
+
+
+def code_lines(markdown: str) -> list[str]:
+    """Lines inside fenced blocks: what a reader copies and runs."""
+    return [line for line, kind in markdown_lines(markdown) if kind == CODE]
+
+
 def _quick_start_block(markdown: str) -> list[str]:
     """Lines inside the fenced blocks under `## Quick Start`, and nowhere else.
 
@@ -104,24 +248,31 @@ def _quick_start_block(markdown: str) -> list[str]:
     reason `test_packaging_contract._code_block_lines` gives: a sentence
     describing a command is not a command.
     """
-    lines: list[str] = []
-    in_section = False
-    in_fence = False
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            if in_section:
-                break
-            in_section = stripped == QUICK_START_HEADING
+    return code_lines(section(markdown, QUICK_START_HEADING.removeprefix("## ")))
+
+
+def section(markdown: str, title: str) -> str:
+    """Everything under the one ``## title`` heading, up to the next ``## ``.
+
+    A line inside a fenced block is never a heading, so a ``## `` in an example
+    does not end a section. Refuses a title that is missing or that two sections
+    carry: a guard reading "the Failures section" must not be reading the first
+    of two.
+    """
+    heading = f"## {title}"
+    found: list[list[str]] = []
+    current: list[str] | None = None
+    for line, kind in markdown_lines(markdown):
+        if kind == PROSE and line.startswith("## "):
+            current = None
+            if line.strip() == heading:
+                current = []
+                found.append(current)
             continue
-        if not in_section:
-            continue
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            lines.append(line)
-    return lines
+        if current is not None:
+            current.append(line)
+    assert len(found) == 1, f"expected one {heading!r} section, found {len(found)}"
+    return "\n".join(found[0])
 
 
 def _command(line: str) -> tuple[str, frozenset[str]] | None:

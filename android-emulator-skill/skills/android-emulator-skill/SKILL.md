@@ -56,7 +56,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
 
    Also in `common/`: **cli.py** (the error boundary every script ends in,
    `cli.run(main)`; its contract, and what it does not cover yet, is the
-   **Failures** entry under Known gaps below), **batch.py** (the one shape of a
+   **Failures** section below), **batch.py** (the one shape of a
    batch that reports per item -- `items`, each with `success` / `error` /
    `remedy` -- and when a device error stops one), **adb_exec.py** (the one bounded
    entry point for every adb call, with typed errors that name a remedy),
@@ -524,7 +524,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
       under `--json`, `Error:` / `Remedy:` on stderr otherwise (it was the
       message alone on stdout), exit 1 — and a lookup's refusal carries its
       `search` detail in the object. A usage error is the same object at exit
-      2 (see Failures under Known gaps).
+      2 (see **Failures**).
     - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible
       screen, and `Not found` is indistinguishable from "the item is two rows down". The default
       path now says which it was: `(searched 1 screen; this screen scrolls -- retry with
@@ -1438,7 +1438,7 @@ All scripts support `--help` for detailed options and `--json` for machine-reada
         stream's drain asks nothing; `--stop` waits up to 5.5 s for the worker to
         publish its end, that read included, and refuses "had not finished"
         past it -- run `--stop` again. The capture contract is log_monitor's
-        on that level (Known gaps): what logd delivered, never a certificate
+        on that level (`references/known-gaps.md`): what logd delivered, never a certificate
         that the window is complete
     - A stream that is not logd's records to its end is never read as if it
       were. A record still arriving when our own stop — `--duration`, Ctrl-C,
@@ -1823,12 +1823,14 @@ ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulato
 - **SKILL.md** (this file) - the script reference; the accurate inventory
 - **README.md** - short orientation for humans
 - **examples/** - complete automation workflows (ships with the package)
+- **references/** - `known-gaps.md`, what the skill does not do yet (ships
+  with the package)
 
-In the source repository only:
+In the source repository only (not included in the released package):
 
 - **CLAUDE.md** - architecture, conventions, and the recorded-fixture policy
-- **references/** - deep dives on adb, test patterns, accessibility
-  (not included in the released package)
+- **CHANGELOG.md** - release history
+- **docs/** - deep dives on adb, test patterns, accessibility
 
 ## Platform limitations worth knowing
 
@@ -1922,351 +1924,123 @@ planned rather than an invented percentage.
 read back what a package has actually posted. Delivering into an app's own FCM
 handler is not reachable from adb — see `push_notification.py` above.
 
-## Status & Roadmap
+## Failures
 
-**v0.9.0 — most known gaps closed, instrumented tests added.** v0.8.0 closed
-with a Known-gaps list.
-This release removes the gaps a test can pin and states the ones it keeps. Each
-removed gap is pinned by a named test that is red on v0.8.0's status commit
-(f69c236) and green here; see the v0.9.0 release notes for the list.
+Every script ends in `cli.run(main)` (`common/cli.py`), so a failure has one
+shape whichever script met it. What is promised, and what is not yet:
 
-- **Fixture-policy debt is zero.** `KNOWN_VIOLATIONS` in
-  `tests/test_fixture_policy.py` is empty (v0.8.0 left two entries): no test
-  feeds a long inline string of tool output to a parser, and the ratchet fails
-  the next one that does.
-- **Three recorded profiles carry most of the suite.** `emulator-api35` (157
-  fixtures, an Android 15 emulator) is the primary profile; `emulator-api33`
-  (67, an Android 13 userdebug emulator) and `gradle-8.13` (35, Gradle 8.13 /
-  AGP 8.13.2 scaffolds) were recorded for this release. Three smaller profiles
-  from earlier releases still feed tests: `pixel4xl-api33` (15, a phone),
-  `gradle-7.5.1` (5) and `gpxpy-1.6.2` (2). `emulator-api33`
-  recorded what API 33 does differently and what v0.8.0 had not recorded:
-  logcat holding `-B` records back from a live stream (so `log_monitor` and
-  `anr_watcher` read live by dumps there), the uid and process tables behind
-  `anr_watcher --package`'s attribution by uid, two-user `dumpsys package` and
-  `pm grant --user` output for `privacy_manager --user`, a `--cat` read past its
-  cap, adb echoing agent-supplied text on stderr, and the offline and
-  unauthorized device states.
-- **Instrumented tests are a feature (#64).** `build_and_test --instrumented`
-  runs the connected test task on one device and one variant per invocation.
-  The device is resolved before Gradle starts (none attached: exit 3; several
-  and no `--serial`: exit 1) and handed to Gradle as `ANDROID_SERIAL`; the
-  verdict is read from that run's connected JUnit XML. Verified live in the
-  emulator lane.
-- **A per-item batch is one object (#57).** `status_bar`, `appearance`,
-  `privacy_manager` grant/revoke/reset and the `emulator_*` `--all` / `--old`
-  modes answer one object whose `items` each carry `success`, `error` and
-  `remedy`; exit 0 only when every item succeeded. Breaking: they printed
-  `results` (`emulator_shutdown`, counts only). Usage errors joined the
-  schema in #56 (exit 2, one object under
-  `--json`). The Failures entry's "Not in the schema yet" paragraph is gone.
-- **`anr_watcher` is Unix-only (#61).** Its session storage locks with
-  `fcntl.flock`; on a host whose Python has no `fcntl` (Windows) every mode
-  refuses at once (exit 1) rather than run unlocked, and `logs anr`, which
-  runs it, refuses the same way. `android_health_check.sh` needs Bash, and
-  `build_and_test.py` always runs the Unix `gradlew` wrapper, never
-  `gradlew.bat`. Nothing is run on Windows in CI, so Windows is untested, not
-  supported (Known gaps).
-- **`container --get-cached ID`** prints the content a `--cat` above 8 KiB
-  cached. The id that `--cat` printed had no reader before. A reader is
-  refused an entry of another script's type before that entry's age is
-  looked at, so `container`'s one-hour reader cannot expire and delete a
-  build `build_and_test` still keeps for a day; `container` clears only its
-  own expired entries.
-- **`android_health_check.sh` refuses an argument it does not take** (exit
-  2, the one object under `--json`) before it needs any tool; it ignored
-  one. The usage sweep now covers every script on disk, the shell script
-  included.
-- **`test_recorder` discloses a damaged `steps.jsonl` (#67).** `--stop`,
-  `--get-details` and `--list` say the recording is incomplete and count
-  what was lost, and `--stop` exits 1; damaged lines were skipped silently.
-- **`model_inspector --schema` is tested on a schema Room exported (#69).**
-  It reports views and FTS tables, and `--raw` takes a table or view name.
-  Breaking: `entity_name` is gone from `--json`; Room's export never names
-  the class.
-- **The test toolchain is pinned (#68).** `dev-constraints.txt` states each
-  version once; every workflow install and the documented commands take
-  theirs from it, and a test fails one written any other way.
-- **`localization_audit` compares `<plurals>` placeholders item by item
-  (#71).** A language with more plural categories than English (Serbian,
-  Arabic) is no longer a mismatch; an item that drops or adds an argument
-  still is, and the finding names its `quantity`.
+- A *typed* failure — a missing `adb` or SDK tool, an adb call that failed, a
+  screen that would not dump, a timeout, or a failure a script raises with
+  `cli.fail` — answers `{"success": false, "error": ..., "remedy": ...}` on
+  one line of stdout under `--json`, `Error:` / `Remedy:` on stderr
+  otherwise, and exits **1**. A refusal that found something on the way may
+  carry it as extra keys after those three (a lookup's `search`, a capture's
+  `partial`, the entries a listing could read); the three are always there.
+- A device that is **unavailable** (not found, offline, unauthorized) is the
+  same object and exits **3** — whether `--serial` resolution noticed or adb
+  did mid-run. Several devices and no `--serial` is 1.
+- A **usage error** — an unknown flag, a bad value for a typed flag, a
+  missing required argument, a flag combination the script rejects, an
+  unknown `avd.py` / `logs.py` verb — exits **2** and is the same object
+  under `--json`: one line on stdout, `error` argparse's message, `remedy`
+  the usage line (for an unknown verb, the verbs). Inside a router verb it
+  is the delegate's own (`avd.py list --bogus --json`). Without `--json` it
+  is argparse's prose on stderr (the route guide for an unknown verb).
+  `--json` after `--` is a positional value, not the flag.
+- A script's own exit statuses pass through unchanged, including the ones
+  that mean a *finding*: `crash_triage --fail-on-crash` and
+  `localization_audit --strict` exit 2 when they find something, and
+  `accessibility_audit` exits 1 when a critical issue is present.
+- A streaming mode (`log_monitor --follow`, `anr_watcher --watch`) cannot
+  take back the records it already printed: there the refusal object is the
+  **last line** of stdout, and parses on its own. `anr_watcher --since
+  --json` is JSON Lines as well, like `--watch --json`: one object per
+  event, no enclosing document, so read it line by line (a single-document
+  parse fails at the second event). `anr_watcher --get-details ID --raw`
+  prints the session's stored event lines (`events.jsonl`, an abandoned
+  session's up to its fence), with or without `--json`: JSON Lines too.
+  Every other mode keeps stdout to one
+  JSON document under `--json` (`emulator_delete`'s confirmation prompt
+  goes to stderr). A refusal is always the object; a successful listing is
+  an array instead in five modes: `build_and_test --get-errors`,
+  `--get-warnings` and `--list-builds`, `test_recorder --list`, and
+  `anr_watcher --list-sessions`.
+- Some places catch a device error on purpose, so it does not reach the
+  boundary. This list is not exhaustive; among them: boot-completion
+  polling (`emulator_boot`), the snapshot
+  save/delete verify poll (`snapshot`, which keeps asking until its deadline
+  and then reports the device as unavailable), the optional
+  foreground-activity lookup (`device_utils.get_current_activity`), the
+  emulator-console survey (`emu_console`), and the partial-capture policy of
+  `test_recorder` steps and `app_state_capture` (what arrived is kept and
+  handed over -- by `app_state_capture` in a refusal that is still exit 3
+  when the device was unavailable), and `anr_watcher`'s attribution lookups
+  (system_server's pid, the package's uids, a live pid's uid and the whole
+  uid table, each an unknown answer on failure, disclosed as unattributed or
+  unknown attribution rather than ending a read or a session).
+- Checked, not just promised: `tests/test_exit_code_sweep.py` runs every
+  Quick Start command and the modes its table lists twice — with the Android
+  tools present and failing, and with none on PATH at all — and
+  asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
+  naming the tool; the exact status), not just a non-zero exit. In all it
+  asserts the payload of 40 documented modes, each of them twice. It runs a
+  usage error through every script in both modes too, and fails if a
+  script on disk is missing from that run (`android_health_check.sh`
+  included; its object carries `ok` as well, like its other answers).
+- A **batch** that reports per item — per operation in `status_bar` and
+  `appearance`, per permission in `privacy_manager`'s grant/revoke/reset,
+  per AVD or emulator in `emulator_boot` / `emulator_shutdown` /
+  `emulator_erase` `--all` and `emulator_delete` `--all` / `--old`
+  (`common/batch.py`) — is one object: `success` false when ANY item failed,
+  then `error` and `remedy` as above, the batch's own keys, and `items`,
+  each item its own fields plus `success`, `error`, `remedy` (null when it
+  succeeded). Exit 0 only when every item succeeded, 1 when one failed; a
+  batch whose every item failed is still that one object. **Breaking in
+  v0.9.0:** each of these printed `results` (or, `emulator_shutdown`,
+  counts only); it is `items` now. In a one-device batch (`status_bar`,
+  `appearance`, `privacy_manager`) a device that goes away stops the batch
+  at the item that met it: that item carries the device error, every item
+  after it says `not attempted`, and the object exits 3 (1 for several
+  devices and no `--serial`). In the `emulator_*` batches each item is its
+  own emulator, so one that vanished is that item's failure and the rest
+  still run. (`anr_watcher --all` keeps every ANR cluster; it is not a
+  batch.)
+- Device-error confirmation applies to app-file reads (`container` and
+  `model_inspector` ask `run_argv` for it with `confirm_device_errors`): their
+  stderr is a device command's, and a file name can print an `adb: …` line.
+  logcat's readers do not ask: that stderr is adb's own, and a probe finding
+  the device a moment later turned a real device error into exit 1. Of the
+  `run_adb` callers whose arguments are agent-supplied, three print that
+  text back on stderr where a forged `adb: device ... not found` line would
+  read as adb's own, and ask `run_adb` for the same confirmation:
+  `privacy_manager`'s `pm grant` / `pm revoke` (an unknown permission's
+  name), `appearance --locale` (`setprop` names the value it refused) and
+  `app_launcher --install` (adb's own `adb: failed to stat <path>`). These
+  were recorded alongside them (`tests/record_fixtures.py`, the `*_echo`
+  fixtures), and their text comes back on stdout, or not at all, so it is
+  never classified: `privacy_manager`'s `dumpsys package`; `app_launcher`'s
+  launch, `--open-url`, `--terminate`, `--uninstall` and launcher lookup;
+  `device_utils`' `pm dump` and package-uid lookup; `pidof` (`log_monitor`'s
+  stream path, `app_state_capture`, `app_launcher --state`) and
+  `app_state_capture`'s version probe; `status_bar --mobile-type`;
+  `keyboard` / `navigator` `input text`; and `push_notification --post`. The probe cannot tell such an echo from a real loss followed
+  by a recovery before it, so a caller whose stderr is adb's alone does not
+  ask.
 
-Tests: 3,110 → 4,916 passed at the release commit, 0 xfailed; 13 skipped
-(a per-profile check for a fixture `emulator-api33` did not record, and one
-keyboard case the primary profile cannot exercise) and 28 deselected (the
-emulator lane's `-m emulator` tests).
+## Known gaps and release history
 
-**v0.8.0 — the diagnostics stop lying.** v0.7.0 proved the agent loop closes
-from the skill's own output. This release goes after the numbers an agent
-reads: a verdict, a count or "nothing found" that the device did not actually
-produce. Each fix below started as a strict-xfail spec written against a
-recorded fixture, and was red before the fix.
-
-- **One error boundary for every script** (`common/cli.py`). A refusal is one
-  `{"success": false, "error", "remedy"}` object under `--json` (or
-  `Error:`/`Remedy:` on stderr), and exits 1, or 3 when the device is
-  unavailable. An AST guard enumerates all 32 Python scripts, and the exit-code sweep
-  asserts the payload of 40 documented modes twice (39 at this release;
-  v0.9.0 added the health check's): once with every tool failing and once
-  with none installed.
-- **"Could not look" is no longer "nothing there."** `emulator_create`,
-  `emulator_erase`, `device_list` and `android_health_check.sh` refuse a
-  missing or failing SDK tool or AVD home instead of returning an empty list.
-  `emulator_create` defaults to the host's ABI, never skips its image check,
-  and reads both `sdkmanager` formats. The Java tool's pipe table had parsed to
-  nothing, which kept the lane's AVD lifecycle test skipped on every CI run.
-- **Build verdicts come from this run's tests.** `build_and_test` deletes the
-  test task's old JUnit reports, reruns the task, and passes only on Gradle
-  exit 0 with no `<failure>`/`<error>`. A run that wrote no results is refused,
-  never reported as "0 passed". A Gradle older than 7.6 is refused by name.
-- **Log windows belong to the app.** `log_monitor --app` and
-  `app_state_capture` keep only lines from processes shown to be the app's,
-  including a crashed one that has since restarted. A pid counts only on
-  evidence that system_server wrote and whose uid matches the package; both
-  read logd's records (`-B`), so no tag or message an app writes can forge
-  attribution. The price is coverage: a process the window saw no such
-  evidence for -- one started before the read, a private `pkg:name` process
-  -- is left out, and the window says so (`attribution.complete: false`,
-  `unresolved_pids`) rather than guessing. `--severity` validates its names,
-  and counts are line counts. Snapshots no longer land in the caller's working
-  directory.
-- **One ANR is one event.** `anr_watcher` reads logd's records too, so the
-  `Reason:`/`PID:` lines arrive inside their report, and a WindowManager-only
-  ANR still counts, but only as system_server wrote it — the record's pid,
-  which no tag can forge — and as an ANR of a window: the window's title is
-  the app's text, so it names, classifies and settles nothing. A window's
-  report that ActivityManager's report of the same broadcast ANR may already
-  account for is counted and marked `possible_duplicate`, never merged on
-  the strength of a title. An ANR is
-  filed under a package only when its process is shown to run as that
-  package's uid (ActivityManager names the process, which an app may name
-  after another package). Jank is keyed by process, and a pid is named only
-  from system_server's own `Start proc` record for it, seen in the same
-  stream; `--package` matches that identity whole (since v0.9.0, jank and
-  StrictMode are the package's by each record's uid instead). On the stream
-  path (every level but API 33), a session's capture losses — a record cut by
-  the stop, a stream restart's gap — mark it incomplete, and the one record
-  `-T 1` replays when it starts is shown, never counted. On API 33 (since
-  v0.9.0) the session reads by dumps from a cursor that excludes its opening
-  record, so nothing is replayed (`ambiguous_tail` stays empty), a failed dump
-  retried from the checkpoint within the same worker is counted in
-  `dump_restarts` without marking the summary incomplete, and a lost cursor or
-  another boot ends the session incomplete. `--diff` calls nothing resolved,
-  new or stable on the strength of a side that may lack it — saved incomplete, or holding
-  evidence it did not count (for jank and StrictMode, what `--package`
-  dropped for want of a name, or did not record) — and says so in its
-  verdict: "inconclusive" when nothing else changed, the change with its
-  caveats otherwise. It never emits `Infinity`. The live readers no longer
-  swallow adb's exit status: losses are disclosed; a `--watch` stream that
-  ends by itself is a refusal, and a session's is restarted, while a restart
-  is left, unless adb or `adb get-state` names a device error, then refused
-  at `--stop` — adb's own words typed first (a device error is exit 3), in
-  `--watch`, `--since` and the session worker alike. A session's lifecycle
-  is serialised under a per-session lock (meta and summary; events are
-  appended unlocked), each transition owned by the worker or the CLI and
-  applied only from the state it expects: the worker publishes how it ended
-  before it exits (unless it cannot have the lock in 5 minutes),
-  `--stop` answers with a summary only once the session has ended
-  (otherwise it refuses, exit 1, and `--stop --abandon` saves what was
-  read, marked incomplete, its events frozen at the abandonment), and
-  `--start` succeeds only on a worker that is recording. A worker of v0.8.0
-  main before this lifecycle (fb5de9c and earlier: a session with no
-  `lifecycle` key), which takes no lock, is waited for until it is gone
-  before its session is answered.
-- **App files are read honestly.** `adb exec-out run-as … cat` exits 0 with
-  the error text as content (measured), so `container` and `model_inspector`
-  now read through `adb shell -T` and refuse an adb client too old to honour
-  it. Device file names are treated as untrusted input: directories are
-  listed as NUL-terminated records (toybox find), so a name holding a newline
-  cannot forge or hide an entry; unsafe, undecodable or CR/LF-carrying names
-  are refused and reported, and exports stay inside their directory.
-- **The required emulator lane can no longer pass without testing.** It fails
-  on any skip, exits 3 with diagnostics when the device is lost, retries only
-  that case once, and counts the retry in the step summary.
-
-Tests: 1,653 → 3,110, and 0 xfailed. Fourteen fix PRs landed between the
-version bump and publication, each from an independent review of the merged
-code; the entries above describe what shipped. Fixture-policy debt is down to
-two entries, and the boundary guard's debt list is empty.
-
-The correction remains fixture-driven: `tests/fixtures/recorded/` holds verbatim
-output captured from real devices on two API levels, parser tests consume it,
-and a known defect, when one exists, is pinned with `xfail(strict=True)` so
-fixing it forces the marker's removal. None is pinned in v0.8.0. See
-`CLAUDE.md` in the source repository.
-
-**Known gaps, for the next release:**
-
-- Windows is untested. No CI job runs there; `build_and_test.py` never
-  selects `gradlew.bat`, `android_health_check.sh` needs Bash and
-  `anr_watcher.py` refuses. Whether the remaining scripts work there has not
-  been observed.
-- `accessibility_audit` has no contrast check. Contrast needs pixel sampling
-  from a screenshot, which is not implemented.
-- `anr_watcher --package` cannot attribute jank or StrictMode written by an
-  isolated process (`android:isolatedProcess`), one an app zygote spawned,
-  or the package's SDK sandbox: each runs under a uid of its own that no
-  package's listing names, so its records are listed under
-  `isolated_unattributed` / `sdk_sandbox_unattributed`, never counted for the
-  package, and `--diff` concludes nothing about jank beside them. A coverage
-  limit, said rather than closed. Unrecorded end to end: no recorded process
-  table holds such a process, so the classifier is tested on uids derived
-  from the package's recorded uid and AOSP's app-id ranges.
-- `anr_watcher --package` asks the package's uids (and the whole uid table)
-  once per watch or session and never refreshes them: install, reinstall or
-  add a user for the package during a read and its records under the new
-  uid go uncounted. A `Start proc` naming the package under such a uid is
-  said (`package_uid_changed`), but one the read never sees — lost in a
-  restarted stream's gap — is not; start a new read after changing the
-  install.
-- A capture by `log_monitor`, or by `anr_watcher`'s live readers on API 33,
-  is what logd delivered, never a certificate that the window is complete.
-  logd may drop records it prunes while a reader is
-  behind -- Android 13's buffer prunes while it flushes to a slow reader
-  and does not disconnect it -- on every level and for every reader, stream
-  or dump; nothing on our side can tell a pruned record from one never
-  logged. On API 33 the dump-made read (above) adds its own limits: the
-  records it continues from show only that logd still held them when the
-  next dump began, and only in their own buffers (main, system, crash and
-  kernel each turn over on their own, so another one turning over within a
-  poll interval loses records unseen -- on a busy device enlarge its rings
-  with `adb logcat -G`); a buffer that turns over past a record the read
-  already took after its system record is refused although nothing unread
-  may be lost; without a new system record, the remembered suffix and the
-  required dump grow until turnover or the byte cap refuses continuation;
-  and a buffer with no system record at the open gets a marker line written
-  into it (above), so `--clear` on API 33 leaves one `aes-log-monitor` line
-  in the device's log. Android 13's `SerializedLogBuffer::Log` numbers a
-  record before it takes `logd_lock`, so a record from logd's own kernel
-  (LogKlog) or audit (LogAudit) thread can be stored behind records a read
-  already took -- the window is the time between numbering and storing:
-  inside the remembered suffix that is a loud lost refusal; just before the
-  cursor that one record is not captured. Listener writers -- every app and
-  system process -- keep their order among themselves, but under the same
-  race one of their records can also land before a kernel or audit cursor
-  and be missed; the default buffer selection is kept, as the stream path
-  reads it. The read is placed by a
-  system-written record, so an app resending a record
-  -- byte-identical, with or without pruning -- can no longer make it
-  resume from the copy: the earlier limit for a resend is gone. It follows
-  logd's order, not timestamps, so a writer whose clock is far behind (or
-  ahead), or a device clock that steps, no longer opens a gap either.
-- Without `--package`, an ANR session names only a process started while it
-  runs (system_server's `Start proc` is the only evidence it takes); an app
-  already running when `--start` is called is keyed by pid, listed under
-  `unnamed_pids`, and `--diff` does not compare its jank. Under `--package`
-  its jank and StrictMode are the package's by uid.
-- **Failures** (`common/cli.py`; every script ends `cli.run(main)`). What is
-  promised, and what is not yet:
-  - A *typed* failure — a missing `adb` or SDK tool, an adb call that failed, a
-    screen that would not dump, a timeout, or a failure a script raises with
-    `cli.fail` — answers `{"success": false, "error": ..., "remedy": ...}` on
-    one line of stdout under `--json`, `Error:` / `Remedy:` on stderr
-    otherwise, and exits **1**. A refusal that found something on the way may
-    carry it as extra keys after those three (a lookup's `search`, a capture's
-    `partial`, the entries a listing could read); the three are always there.
-  - A device that is **unavailable** (not found, offline, unauthorized) is the
-    same object and exits **3** — whether `--serial` resolution noticed or adb
-    did mid-run. Several devices and no `--serial` is 1.
-  - A **usage error** — an unknown flag, a bad value for a typed flag, a
-    missing required argument, a flag combination the script rejects, an
-    unknown `avd.py` / `logs.py` verb — exits **2** and is the same object
-    under `--json`: one line on stdout, `error` argparse's message, `remedy`
-    the usage line (for an unknown verb, the verbs). Inside a router verb it
-    is the delegate's own (`avd.py list --bogus --json`). Without `--json` it
-    is argparse's prose on stderr (the route guide for an unknown verb).
-    `--json` after `--` is a positional value, not the flag.
-  - A script's own exit statuses pass through unchanged, including the ones
-    that mean a *finding*: `crash_triage --fail-on-crash` and
-    `localization_audit --strict` exit 2 when they find something, and
-    `accessibility_audit` exits 1 when a critical issue is present.
-  - A streaming mode (`log_monitor --follow`, `anr_watcher --watch`) cannot
-    take back the records it already printed: there the refusal object is the
-    **last line** of stdout, and parses on its own. `anr_watcher --since
-    --json` is JSON Lines as well, like `--watch --json`: one object per
-    event, no enclosing document, so read it line by line (a single-document
-    parse fails at the second event). `anr_watcher --get-details ID --raw`
-    prints the session's stored event lines (`events.jsonl`, an abandoned
-    session's up to its fence), with or without `--json`: JSON Lines too.
-    Every other mode keeps stdout to one
-    JSON document under `--json` (`emulator_delete`'s confirmation prompt
-    goes to stderr). A refusal is always the object; a successful listing is
-    an array instead in five modes: `build_and_test --get-errors`,
-    `--get-warnings` and `--list-builds`, `test_recorder --list`, and
-    `anr_watcher --list-sessions`.
-  - Some places catch a device error on purpose, so it does not reach the
-    boundary. This list is not exhaustive; among them: boot-completion
-    polling (`emulator_boot`), the snapshot
-    save/delete verify poll (`snapshot`, which keeps asking until its deadline
-    and then reports the device as unavailable), the optional
-    foreground-activity lookup (`device_utils.get_current_activity`), the
-    emulator-console survey (`emu_console`), and the partial-capture policy of
-    `test_recorder` steps and `app_state_capture` (what arrived is kept and
-    handed over -- by `app_state_capture` in a refusal that is still exit 3
-    when the device was unavailable), and `anr_watcher`'s attribution lookups
-    (system_server's pid, the package's uids, a live pid's uid and the whole
-    uid table, each an unknown answer on failure, disclosed as unattributed or
-    unknown attribution rather than ending a read or a session).
-  - Checked, not just promised: `tests/test_exit_code_sweep.py` runs every
-    Quick Start command and the modes its table lists twice — with the Android
-    tools present and failing, and with none on PATH at all — and
-    asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
-    naming the tool; the exact status), not just a non-zero exit. It runs a
-    usage error through every script in both modes too, and fails if a
-    script on disk is missing from that run (`android_health_check.sh`
-    included; its object carries `ok` as well, like its other answers).
-  - A **batch** that reports per item — per operation in `status_bar` and
-    `appearance`, per permission in `privacy_manager`'s grant/revoke/reset,
-    per AVD or emulator in `emulator_boot` / `emulator_shutdown` /
-    `emulator_erase` `--all` and `emulator_delete` `--all` / `--old`
-    (`common/batch.py`) — is one object: `success` false when ANY item failed,
-    then `error` and `remedy` as above, the batch's own keys, and `items`,
-    each item its own fields plus `success`, `error`, `remedy` (null when it
-    succeeded). Exit 0 only when every item succeeded, 1 when one failed; a
-    batch whose every item failed is still that one object. **Breaking in
-    v0.9.0:** each of these printed `results` (or, `emulator_shutdown`,
-    counts only); it is `items` now. In a one-device batch (`status_bar`,
-    `appearance`, `privacy_manager`) a device that goes away stops the batch
-    at the item that met it: that item carries the device error, every item
-    after it says `not attempted`, and the object exits 3 (1 for several
-    devices and no `--serial`). In the `emulator_*` batches each item is its
-    own emulator, so one that vanished is that item's failure and the rest
-    still run. (`anr_watcher --all` keeps every ANR cluster; it is not a
-    batch.)
-  - Device-error confirmation applies to app-file reads (`container` and
-    `model_inspector` ask `run_argv` for it with `confirm_device_errors`): their
-    stderr is a device command's, and a file name can print an `adb: …` line.
-    logcat's readers do not ask: that stderr is adb's own, and a probe finding
-    the device a moment later turned a real device error into exit 1. Of the
-    `run_adb` callers whose arguments are agent-supplied, three print that
-    text back on stderr where a forged `adb: device ... not found` line would
-    read as adb's own, and ask `run_adb` for the same confirmation:
-    `privacy_manager`'s `pm grant` / `pm revoke` (an unknown permission's
-    name), `appearance --locale` (`setprop` names the value it refused) and
-    `app_launcher --install` (adb's own `adb: failed to stat <path>`). These
-    were recorded alongside them (`tests/record_fixtures.py`, the `*_echo`
-    fixtures), and their text comes back on stdout, or not at all, so it is
-    never classified: `privacy_manager`'s `dumpsys package`; `app_launcher`'s
-    launch, `--open-url`, `--terminate`, `--uninstall` and launcher lookup;
-    `device_utils`' `pm dump` and package-uid lookup; `pidof` (`log_monitor`'s
-    stream path, `app_state_capture`, `app_launcher --state`) and
-    `app_state_capture`'s version probe; `status_bar --mobile-type`;
-    `keyboard` / `navigator` `input text`; and `push_notification --post`. The probe cannot tell such an echo from a real loss followed
-    by a recovery before it, so a caller whose stderr is adb's alone does not
-    ask.
-- `build_and_test --instrumented` runs one device and one variant per
-  invocation, and one module when `--module` is given (without it the task
-  runs in every module, and every module's connected reports for the
-  variant are read): no orchestrator, no sharding, no `am instrument -r -w`
-  protocol -- Gradle's JUnit XML is the one source. Its results layout is
-  recorded for an unflavored and a one-dimension flavored variant on AGP
-  8.13.2; any other layout is not guessed at, so its run is refused as no
-  test results rather than read from somewhere it did not clean.
-
-Removed rather than repaired: `clipboard.py` — see "Platform limitations"
-above; writing the clipboard is not reachable from adb on any modern Android,
-so the script could not be made to do what it advertised.
+- **Known gaps:** [references/known-gaps.md](references/known-gaps.md), which
+  ships with the skill. Read it before relying on: Windows; a contrast check
+  in `accessibility_audit`; `anr_watcher --package` attribution for isolated,
+  app-zygote and SDK-sandbox processes, or for a package installed,
+  reinstalled or given another user during the read; an ANR session without
+  `--package` naming an app that was already running; a log capture as proof
+  that a window is complete; `build_and_test --instrumented` beyond one
+  device and one variant, or on a results layout other than the two recorded;
+  writing the clipboard.
+- **Release history:** `CHANGELOG.md` at the root of the source repository
+  (https://github.com/fluxxion82/android-emulator-skill). It does not ship
+  with the skill.
 
 ## Contributing
 
@@ -2299,6 +2073,6 @@ New scripts should:
 
 ---
 
-**Status**: Under active modernization toward parity with [`ios-simulator-skill`](https://github.com/conorluddy/ios-simulator-skill). See the "Status & Roadmap" section above.
+**Status**: Under active modernization toward parity with [`ios-simulator-skill`](https://github.com/conorluddy/ios-simulator-skill). See "Known gaps and release history" above.
 
 Use these scripts directly or let Claude Code invoke them automatically when your request matches the skill description.
