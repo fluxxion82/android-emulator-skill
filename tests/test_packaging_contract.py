@@ -1,7 +1,7 @@
 """What the released package actually contains, and what the docs claim.
 
 `release.yml` zips only `android-emulator-skill/`, so anything outside that
-directory — the repo README, CLAUDE.md, `references/` — does not reach a
+directory — the repo README, CLAUDE.md, CHANGELOG.md, `docs/` — does not reach a
 consumer. Docs that point at those from inside the package are broken links for
 everyone who installs it.
 
@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import ast
 import functools
+import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -28,11 +30,41 @@ from pathlib import Path
 import pytest
 import test_instrumented_live
 from fake_toolchain import FakeToolchain, Rule
+from test_quick_start_contract import (
+    code_lines,
+    fence_problems,
+    flush_prose_lines,
+    markdown_lines,
+    prose_lines,
+    section,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "android-emulator-skill"
 SKILL_ROOT = PACKAGE_ROOT / "skills" / "android-emulator-skill"
 SKILL_MD = SKILL_ROOT / "SKILL.md"
+REFERENCES = SKILL_ROOT / "references"
+README = REPO_ROOT / "README.md"
+PACKAGED_README = SKILL_ROOT / "README.md"
+
+
+def _shipped_docs() -> list[Path]:
+    """SKILL.md and each reference file: what an installed agent can open.
+
+    A guard on "the documentation" reads all of these. A rule that held for
+    SKILL.md alone would stop holding the day a paragraph moved next door.
+    """
+    return [SKILL_MD, *sorted(REFERENCES.glob("*.md"))]
+
+
+def _packaged_markdown() -> list[Path]:
+    """Every Markdown file the release zips, at any depth: the README too."""
+    return sorted(PACKAGE_ROOT.rglob("*.md"))
+
+
+def _doc_id(doc: Path) -> str:
+    root = SKILL_ROOT if SKILL_ROOT in doc.parents else PACKAGE_ROOT
+    return doc.relative_to(root).as_posix()
 
 
 # ---------------------------------------------------------------------------
@@ -47,27 +79,34 @@ def _code_block_lines(markdown: str) -> list[str]:
     explaining this very rule) is not a defect, and a whole-file scan cannot
     tell the two apart.
     """
-    lines, inside = [], False
-    for line in markdown.splitlines():
-        if line.lstrip().startswith("```"):
-            inside = not inside
-            continue
-        if inside:
-            lines.append(line)
-    return lines
+    return code_lines(markdown)
 
 
-def test_no_bare_relative_script_invocations_in_skill_md():
-    """`python scripts/foo.py` only works if cwd is the skill root."""
-    offenders = [
+def _bare_invocations(markdown: str) -> list[str]:
+    return [
         line.strip()
-        for line in _code_block_lines(SKILL_MD.read_text(encoding="utf-8"))
+        for line in _code_block_lines(markdown)
         if re.search(r"python3?\s+scripts/", line)
     ]
+
+
+@pytest.mark.parametrize("doc", _shipped_docs(), ids=_doc_id)
+def test_no_bare_relative_script_invocations_in_a_shipped_doc(doc):
+    """`python scripts/foo.py` only works if cwd is the skill root."""
+    offenders = _bare_invocations(doc.read_text(encoding="utf-8"))
     assert not offenders, (
-        "SKILL.md documents bare relative invocations, which fail for an "
+        f"{_doc_id(doc)} documents bare relative invocations, which fail for an "
         f"installed plugin: {offenders[:5]}"
     )
+
+
+def test_the_bare_invocation_guard_reads_a_reference_file_as_it_reads_skill_md():
+    """The rule moved with the text: an example is an example in either file."""
+    example = "```bash\npython scripts/screen_mapper.py --json\n```\n"
+    reference = REFERENCES / "known-gaps.md"
+
+    assert _bare_invocations(reference.read_text(encoding="utf-8") + example)
+    assert not _bare_invocations("Never write `python scripts/foo.py`.\n")
 
 
 def test_skill_md_shows_how_to_root_the_path():
@@ -1515,19 +1554,680 @@ def test_no_instrumented_outcome_is_said_not_left_out(tmp_path):
     assert "None observed in attempt 1: the instrumented test did not run" in summary
 
 
-def test_skill_md_does_not_link_nonexistent_docs():
+@pytest.mark.parametrize("doc", _shipped_docs(), ids=_doc_id)
+def test_no_shipped_doc_names_docs_that_never_existed(doc):
     """STATUS.md and TESTING.md have never existed in this repo."""
-    text = SKILL_MD.read_text(encoding="utf-8")
+    text = doc.read_text(encoding="utf-8")
     for missing in ("STATUS.md", "TESTING.md"):
-        assert missing not in text, f"SKILL.md still references {missing}, which does not exist"
+        assert missing not in text, f"{_doc_id(doc)} names {missing}, which does not exist"
+
+
+# ---------------------------------------------------------------------------
+# What ships beside SKILL.md, and what stays in the repository.
+#
+# v0.10.0 took the release history and the known gaps out of SKILL.md. The
+# gaps went to `references/known-gaps.md`, inside the package, because an
+# installed agent has to be able to open them; the history went to the
+# repository's CHANGELOG.md, because it does not. The four topic documents that
+# used to be the repository's `references/` are `docs/` now, so "references"
+# names one directory and it is the one that ships.
+# ---------------------------------------------------------------------------
+
+# Links in a packaged document: an allowlist, not a parser.
+#
+# Markdown has more ways to write a link than a guard can follow -- a title
+# after the target, a target in angle brackets or on the next line, a reference
+# defined elsewhere, an HTML anchor, escapes -- and a guard that tries to
+# recognise them is one construct behind for ever (three review rounds each
+# found more). So a packaged document may write a link ONE way, and what else
+# could make one is refused by rules of the form "this appears nowhere":
+#
+# * the form is `[text](target)` (or `![text](target)`), the text holding no
+#   `]` and the target following its bracket directly;
+# * a target is an http(s) URL, an in-page `#anchor`, or a relative path:
+#   optional leading `../` steps, then names made of letters, digits and
+#   `_ . -` (not starting with a dot) joined by single `/`, then an optional
+#   `#anchor`. So no spaces, titles, angle brackets, parentheses, backslashes,
+#   drive letters, query strings, percent-escapes, absolute paths, `.` or
+#   empty steps, trailing `/`, or `..` after a name;
+# * every `](` in the file belongs to such a link;
+# * `]:` appears nowhere (it is how a reference is defined, on however many
+#   lines and inside whatever container);
+# * `href=`, `src=` and `srcset=` appear nowhere, in any case, with or without
+#   whitespace or a line break before the `=`.
+#
+# The whole file is read, fenced blocks and inline code included: nothing has
+# to be decided about where prose ends, and the price is that a packaged
+# document cannot illustrate link syntax or show a JSON key that ends `]:`.
+# None does. Not covered, and said here: HTML that names a file by some other
+# attribute. An agent reads these files as text, where that is not a link.
+_URL = r"https?://[^()\s<>\"'\\]+"
+_ANCHOR = r"#[A-Za-z0-9_-]+"
+_NAME = r"[A-Za-z0-9_-][A-Za-z0-9_.-]*"
+_FILE = rf"(?:\.\./)*{_NAME}(?:/{_NAME})*(?:{_ANCHOR})?"
+_PLAIN_LINK = re.compile(rf"!?\[[^\]]*\]\(({_URL}|{_ANCHOR}|{_FILE})\)")
+_HTML_LINK = re.compile(r"\b(?:href|src|srcset)\s*=", re.IGNORECASE)
+
+
+def _unreadable_links(markdown: str) -> list[str]:
+    """Everything in a document that could be a link and is not in the one form.
+
+    Each finding says which rule it broke and what to do, because two of the
+    rules refuse text that is not a link at all (`items[0]:` in an example).
+    """
+
+    def around(at: int) -> str:
+        return repr(markdown[max(0, at - 30) : at + 40])
+
+    read = [match.span() for match in _PLAIN_LINK.finditer(markdown)]
+    unreadable = [
+        f"`](` that is not `[text](relative/path)` or `[text](https://...)`: {around(at.start())}"
+        for at in re.finditer(r"\]\(", markdown)
+        if not any(start <= at.start() < end for start, end in read)
+    ]
+    unreadable += [
+        "`]:`, which is how Markdown defines a link by reference; not allowed anywhere, "
+        f"code examples included, so reword the example: {around(at.start())}"
+        for at in re.finditer(r"\]:", markdown)
+    ]
+    unreadable += [
+        f"an HTML `href`, `src` or `srcset`; not allowed anywhere: {around(at.start())}"
+        for at in _HTML_LINK.finditer(markdown)
+    ]
+    return unreadable
+
+
+def _relative_links(markdown: str) -> list[str]:
+    """Targets of a document's links that name a file, anywhere in it.
+
+    A URL or an in-page anchor names no file and is left out. Complete only for
+    a document `_unreadable_links` finds nothing in.
+    """
+    return [
+        target
+        for target in _PLAIN_LINK.findall(markdown)
+        if not target.startswith(("http://", "https://", "#"))
+    ]
+
+
+def _symlinks_under(root: Path) -> list[Path]:
+    found = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        found += [
+            Path(directory, name)
+            for name in (*dirnames, *filenames)
+            if Path(directory, name).is_symlink()
+        ]
+    return sorted(found)
+
+
+def _installed_root(doc: Path) -> Path:
+    """The directory that arrives together with ``doc`` however it is installed.
+
+    A plugin install places the plugin directory; a clone install links the
+    skill directory alone (SKILL.md, "As Claude Code Skill"). So a document
+    inside the skill can count on the skill directory and nothing above it.
+    """
+    return SKILL_ROOT if SKILL_ROOT in doc.parents else PACKAGE_ROOT
+
+
+def _links_that_do_not_ship(doc: Path, markdown: str) -> list[str]:
+    """Relative links in ``doc`` that an installed copy could not follow.
+
+    Followed one step at a time from the document's own directory, as an
+    installed copy on any filesystem would have to: `..` may not climb above
+    the installed root (a path that leaves and comes back does so by the
+    checkout's directory names, which an install does not keep); every name
+    must be an entry of the directory it is looked up in, spelled exactly as
+    the entry is (this checkout may sit on a filesystem that ignores case; an
+    install need not); and the last name must be a file. The package holds no
+    symlinks (`test_the_package_holds_no_symlinks`), so following the text of a
+    path is following the path.
+    """
+    root = _installed_root(doc)
+    broken = []
+    for target in _relative_links(markdown):
+        at = doc.parent
+        for step in target.partition("#")[0].split("/"):
+            if step == ".." and at != root:
+                at = at.parent
+            elif step != ".." and at.is_dir() and step in {entry.name for entry in at.iterdir()}:
+                at = at / step
+            else:
+                broken.append(target)
+                break
+        else:
+            if not at.is_file():
+                broken.append(target)
+    return broken
 
 
 def test_package_contains_what_the_docs_promise():
-    """`examples/` is promised and ships; `references/` does not ship."""
+    """`examples/` and `references/` are promised, and both ship."""
     assert (SKILL_ROOT / "examples").is_dir(), "examples/ is documented but missing"
-    assert not (
-        SKILL_ROOT / "references"
-    ).exists(), "references/ now ships; SKILL.md says it is repo-only and should be updated"
+    assert REFERENCES.is_dir(), "references/ is documented but missing"
+
+
+def test_references_holds_the_known_gaps_file_and_nothing_else():
+    """One file until the per-script references arrive (v0.10.0, PR 4).
+
+    Stated exactly so that PR 4 has to change this test to add a file, and say
+    then what the rule becomes: one file per index entry, plus this one.
+    """
+    assert sorted(path.name for path in REFERENCES.iterdir()) == ["known-gaps.md"]
+
+
+def test_skill_md_links_the_known_gaps_file():
+    """Moved out is not dropped: the main file says where the gaps went, as a link."""
+    links = _relative_links(SKILL_MD.read_text(encoding="utf-8"))
+    assert "references/known-gaps.md" in links, links
+
+
+def test_the_package_holds_no_symlinks():
+    """What the guards walk is what ships, file for file.
+
+    The release's `zip -r` follows a symlink and packs what it points at; a
+    directory walk does not descend into one, and a path through one does not
+    lead where its text says. With none in the package, the inventory below is
+    complete and a link can be followed by reading it.
+    """
+    assert _symlinks_under(PACKAGE_ROOT) == []
+
+
+def test_a_symlink_in_a_package_is_found(tmp_path):
+    (tmp_path / "skill" / "examples").mkdir(parents=True)
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "notes.md").write_text("[x](missing.md)\n", encoding="utf-8")
+    (tmp_path / "skill" / "examples" / "more").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "skill" / "notes.md").symlink_to(tmp_path / "elsewhere" / "notes.md")
+
+    assert [path.name for path in _symlinks_under(tmp_path / "skill")] == ["more", "notes.md"]
+
+
+def test_the_link_guard_reads_every_markdown_file_the_package_holds():
+    """SKILL.md, each reference, and the README beside them: none is left out."""
+    packaged = _packaged_markdown()
+    assert set(_shipped_docs()) < set(packaged)
+    assert PACKAGED_README in packaged
+    assert [doc.name for doc in packaged if doc.parent == REFERENCES] == ["known-gaps.md"]
+
+
+@pytest.mark.parametrize("doc", _packaged_markdown(), ids=_doc_id)
+def test_every_link_in_a_packaged_doc_is_written_the_one_way(doc):
+    unreadable = _unreadable_links(doc.read_text(encoding="utf-8"))
+    assert not unreadable, (
+        f"{_doc_id(doc)} breaks the link rules for packaged documents "
+        f"(see the comment above `_URL`): {unreadable}"
+    )
+
+
+@pytest.mark.parametrize("doc", _packaged_markdown(), ids=_doc_id)
+def test_every_relative_link_in_a_packaged_doc_lands_inside_the_package(doc):
+    broken = _links_that_do_not_ship(doc, doc.read_text(encoding="utf-8"))
+    assert not broken, f"{_doc_id(doc)} links files an installed agent does not have: {broken}"
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [README, REPO_ROOT / "DEV.md", REPO_ROOT / "CHANGELOG.md", *_packaged_markdown()],
+    ids=lambda doc: doc.relative_to(REPO_ROOT).as_posix(),
+)
+def test_every_fenced_block_in_a_document_is_one_the_reader_reads(doc):
+    """Otherwise every guard that reads this document's prose or code refuses it."""
+    assert fence_problems(doc.read_text(encoding="utf-8")) == []
+
+
+def _link_to_a_file_that_is_not_there(skill_md: str) -> str:
+    return skill_md.replace("(references/known-gaps.md)", "(references/known-gap.md)")
+
+
+def _link_to_the_repository_changelog(skill_md: str) -> str:
+    return skill_md.replace("(references/known-gaps.md)", "(../../../CHANGELOG.md)")
+
+
+def _link_to_the_repository_docs(skill_md: str) -> str:
+    return skill_md.replace("(references/known-gaps.md)", "(../../../docs/adb_quick.md#see-also)")
+
+
+def _link_out_of_the_skill_and_back_by_the_checkout_names(skill_md: str) -> str:
+    back = "../../../android-emulator-skill/skills/android-emulator-skill/references/known-gaps.md"
+    return skill_md.replace("(references/known-gaps.md)", f"({back})")
+
+
+def _link_to_a_directory(skill_md: str) -> str:
+    return skill_md.replace("(references/known-gaps.md)", "(references)")
+
+
+def _link_through_a_file_as_if_it_were_a_directory(skill_md: str) -> str:
+    return skill_md.replace("(references/known-gaps.md)", "(README.md/known-gaps.md)")
+
+
+def _link_spelled_in_another_case(skill_md: str) -> str:
+    """Followed happily by the filesystem this was written on, and by no other."""
+    return skill_md.replace("(references/known-gaps.md)", "(references/Known-Gaps.md)")
+
+
+def _link_through_a_directory_spelled_in_another_case(skill_md: str) -> str:
+    return skill_md.replace("(references/known-gaps.md)", "(References/known-gaps.md)")
+
+
+def _link_in_inline_code_to_a_file_that_is_not_there(skill_md: str) -> str:
+    return skill_md.replace(
+        "[references/known-gaps.md](references/known-gaps.md)",
+        "`[references/known-gaps.md](references/missing.md)`",
+    )
+
+
+def _link_in_a_fenced_block_to_a_file_that_is_not_there(skill_md: str) -> str:
+    return skill_md + "\n```markdown\n[the gaps](references/missing.md)\n```\n"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        _link_to_a_file_that_is_not_there,
+        _link_to_the_repository_changelog,
+        _link_to_the_repository_docs,
+        _link_out_of_the_skill_and_back_by_the_checkout_names,
+        _link_to_a_directory,
+        _link_through_a_file_as_if_it_were_a_directory,
+        _link_spelled_in_another_case,
+        _link_through_a_directory_spelled_in_another_case,
+        _link_in_inline_code_to_a_file_that_is_not_there,
+        _link_in_a_fenced_block_to_a_file_that_is_not_there,
+    ],
+    ids=lambda m: m.__name__,
+)
+def test_the_link_guard_fails_a_link_an_installed_agent_cannot_follow(mutation):
+    """Each is written the one way, so it is read; none leads to a packaged file."""
+    skill_md = SKILL_MD.read_text(encoding="utf-8")
+    mutated = mutation(skill_md)
+    assert mutated != skill_md
+    assert not _unreadable_links(mutated), "the mutation must be a link the guard reads"
+
+    assert _links_that_do_not_ship(SKILL_MD, mutated)
+
+
+def test_a_link_may_climb_out_of_its_own_directory_while_it_stays_inside_the_skill():
+    reference = REFERENCES / "known-gaps.md"
+
+    assert not _links_that_do_not_ship(reference, "See [the reference](../SKILL.md#failures).\n")
+    assert not _links_that_do_not_ship(reference, "See [itself](known-gaps.md).\n")
+    assert not _links_that_do_not_ship(reference, "See [itself](../references/known-gaps.md).\n")
+    assert not _links_that_do_not_ship(
+        SKILL_MD, "See [an example](examples/login_flow_example.sh).\n"
+    )
+    assert _links_that_do_not_ship(reference, "See [the repository](../../README.md).\n")
+    assert _links_that_do_not_ship(SKILL_MD, "See [the plugin](../README.md).\n")
+
+
+def test_the_packaged_readme_is_read_like_any_other_packaged_document():
+    """It sits in the skill directory, so it is held to the skill directory."""
+    readme = PACKAGED_README.read_text(encoding="utf-8")
+
+    assert _links_that_do_not_ship(PACKAGED_README, readme + "\nSee [this](missing.md).\n")
+    assert _links_that_do_not_ship(PACKAGED_README, readme + "\nSee [this](../../../README.md).\n")
+    assert not _links_that_do_not_ship(PACKAGED_README, readme + "\nSee [this](SKILL.md).\n")
+
+
+_THE_LINK = "[references/known-gaps.md](references/known-gaps.md)"
+
+# Ways to write a link to a file that is not there which are NOT the one form.
+# Each value replaces the real link; `\n` + text is appended where a second
+# line is needed. Collected from two review rounds: every one of these was, at
+# some point, a broken link the guard passed without reading.
+OTHER_LINK_FORMS = {
+    "titled": '[gaps](references/missing.md "the gaps")',
+    "in angle brackets": "[gaps](<references/missing.md>)",
+    "target on the next line": "[gaps](\n  references/missing.md)",
+    "space in the target": "[gaps](references/missing file.md)",
+    "escaped parenthesis": "[gaps](references/missing\\).md)",
+    "label with an escaped bracket": "[the \\] gaps](references/missing.md)",
+    "query string": "[gaps](references/missing.md?raw=1)",
+    "percent-escape": "[gaps](references/%6dissing.md)",
+    "drive letter, backslashes": "[gaps](c:\\outside\\missing.md)",
+    "drive letter, slashes": "[gaps](c:/outside/missing.md)",
+    "upper-case drive letter": "[gaps](C:/outside/missing.md)",
+    "network path, backslashes": "[gaps](\\\\host\\share\\missing.md)",
+    "another scheme": "[gaps](file:///outside/missing.md)",
+    "absolute path": "[gaps](/references/missing.md)",
+    "network path, slashes": "[gaps](//host/share/missing.md)",
+    "trailing slash": "[gaps](references/)",
+    "file with a trailing slash": "[gaps](SKILL.md/)",
+    "file with a trailing dot step": "[gaps](SKILL.md/.)",
+    "leading dot step": "[gaps](./references/missing.md)",
+    "empty step": "[gaps](references//missing.md)",
+    "climbing after a name": "[gaps](examples/../references/missing.md)",
+    "climbing through a file": "[gaps](README.md/../references/missing.md)",
+    "hidden file": "[gaps](.missing.md)",
+    "by reference": "[gaps][g]\n\n[g]: references/missing.md",
+    "by reference, target on the next line": "[gaps][g]\n\n[g]:\n  references/missing.md",
+    "by reference, in a blockquote": "> [gaps][g]\n>\n> [g]: references/missing.md",
+    "by reference, in a list item": "- [gaps][g]\n\n  [g]: references/missing.md",
+    "by reference, label with an escaped bracket": "[gaps][a\\]b]\n\n[a\\]b]: references/missing.md",
+    "by reference, label on two lines": "[gaps][a b]\n\n[a\nb]: references/missing.md",
+    "by reference, after a tab": "[gaps][g]\n\n\t[g]: references/missing.md",
+    "by reference, in a fenced block": "```markdown\n[g]: references/missing.md\n```",
+    "html anchor": '<a href="references/missing.md">gaps</a>',
+    "html anchor, upper case": '<A HREF="references/missing.md">gaps</A>',
+    "html anchor, spaced": "<a href = 'references/missing.md'>gaps</a>",
+    "html image": '<img SRC="references/missing.png">',
+    "html anchor, attribute on two lines": '<a href\n="references/missing.md">gaps</a>',
+    "html image, attribute on two lines": '<img src\n  = "references/missing.png">',
+    "html image, srcset": '<img srcset="references/missing.png 1x">',
+}
+
+
+@pytest.mark.parametrize("form", OTHER_LINK_FORMS.values(), ids=OTHER_LINK_FORMS.keys())
+def test_a_link_written_any_other_way_is_refused_rather_than_skipped(form):
+    """Skipping what it cannot read is how a link guard passes a broken link."""
+    skill_md = SKILL_MD.read_text(encoding="utf-8")
+    assert skill_md.count(_THE_LINK) == 1
+    rewritten = skill_md.replace(_THE_LINK, form)
+
+    assert _unreadable_links(rewritten)
+
+
+def test_the_one_link_form_is_read_wherever_it_is_written():
+    """Prose, a wrapped label, a list item, a table cell, a blockquote, a fenced block."""
+    markdown = (
+        "See [the site](https://example.com/a_(b).md), [below](#failures), [a](one.md) and\n"
+        "[b](two/three.md#part); ![a picture](four.png).\n"
+        "- Then [the\n  gaps](five.md).\n"
+        "| cell | [six](six.md) |\n"
+        "> quoted: [seven](seven.md)\n"
+        "```\n[eight](eight.md)\n```\n"
+        "Inline `[nine](nine.md)`.\n"
+    )
+    wanted = [f"{name}.md" for name in ("one", "five", "six", "seven", "eight", "nine")]
+    wanted[1:1] = ["two/three.md#part", "four.png"]
+
+    # The URL holds parentheses, which the one form does not allow.
+    assert len(_unreadable_links(markdown)) == 1
+    markdown = markdown.replace("a_(b).md", "a_b.md")
+    assert _unreadable_links(markdown) == []
+    assert _relative_links(markdown) == wanted
+
+
+# The reader of fenced blocks itself (`test_quick_start_contract.markdown_lines`).
+
+
+def test_a_heading_inside_any_fenced_block_is_not_a_heading():
+    """Tildes fence a block too, and a longer fence holds a shorter one."""
+    for opening, inner, closing in (
+        ("```", "~~~", "```"),
+        ("~~~", "```", "~~~"),
+        ("````", "```", "````"),
+        ("~~~~", "~~~", "~~~~~"),
+    ):
+        markdown = (
+            f"## One\n\nfirst\n\n{opening}text\n## Not a heading\n{inner}\n{closing}\n"
+            "\nlast\n\n## Two\n\nsecond\n"
+        )
+        assert code_lines(markdown) == ["## Not a heading", inner], opening
+        assert prose_lines(section(markdown, "One")) == ["", "first", "", "", "last"], opening
+        assert section(markdown, "Two").strip() == "second", opening
+        assert fence_problems(markdown) == [], opening
+
+
+def test_the_reader_agrees_with_itself_about_every_document_it_guards():
+    """Prose, fence and code lines are the document, in order, nothing dropped."""
+    for doc in (README, REPO_ROOT / "DEV.md", CHANGELOG, *_packaged_markdown()):
+        text = doc.read_text(encoding="utf-8")
+        assert [line for line, _ in markdown_lines(text)] == text.splitlines(), doc.name
+
+
+def test_lines_end_at_a_newline_or_a_crlf_pair_and_nowhere_else():
+    assert [line for line, _ in markdown_lines("a\r\nb\n\nc")] == ["a", "b", "", "c"]
+    assert [line for line, _ in markdown_lines("a\n")] == ["a"]
+    assert markdown_lines("") == []
+
+
+def test_a_block_fenced_inside_a_list_item_is_read():
+    markdown = "1. Step:\n\n   ```bash\n   echo hi\n\n     indented more\n   ```\n\n2. Next\n"
+
+    assert code_lines(markdown) == ["   echo hi", "", "     indented more"]
+    assert prose_lines(markdown) == ["1. Step:", "", "", "2. Next"]
+
+
+def test_three_backticks_around_a_word_do_not_open_a_block():
+    markdown = "```not a fence``` is inline code\n> ```nor this``` in a quote\n## Real\n\nbody\n"
+
+    assert [kind for _, kind in markdown_lines(markdown)] == ["prose"] * 5
+    assert section(markdown, "Real").strip() == "body"
+
+
+def test_a_block_made_by_indentation_is_left_out_of_flush_prose():
+    """`prose_lines` cannot tell it from a list's continuation; `flush_prose_lines` need not."""
+    markdown = "Said:\n\n    not said, shown\n\n- item\n  continued\n    - nested item\n"
+
+    assert "    not said, shown" in prose_lines(markdown)
+    assert flush_prose_lines(markdown) == ["Said:", "", "", "- item", "  continued"]
+
+
+# Documents the fence reader refuses, each for a reason its docstring gives.
+UNREAD_FENCES = {
+    "never closed": "## One\n\n```bash\necho hi\n\n## Two\n\nprose\n",
+    "inside a blockquote": "> ```text\n> quoted\n> ```\n",
+    "inside a nested blockquote": "> > ~~~\n> > quoted\n> > ~~~\n",
+    "closed at another indentation": "- item\n\n  ```\n  code\n```\n",
+    "left by a line indented less": "- item\n\n  ```\n  code\nprose again\n\n```\nmore\n```\n",
+    "opened on a list marker's line": "1. ```bash\n   echo hi\n   ```\n",
+    "opened on a list marker's line, never closed": "1. ```bash\n   echo hi\n",
+    "opened on a nested list marker's line": "- 2) ~~~\n     echo hi\n",
+    "closing fence followed by a line separator": "```text\ncode\n```\u2028prose\n",
+    "closing fence followed by a paragraph separator": "```text\ncode\n```\u2029prose\n",
+    "closing fence followed by a form feed": "```text\ncode\n```\x0cprose\n",
+    "closing fence followed by a vertical tab": "```text\ncode\n```\x0bprose\n",
+    "closing fence followed by a next-line character": "```text\ncode\n```\x85prose\n",
+    "closing fence followed by a bare carriage return": "```text\ncode\n```\rprose\n",
+    "closing fence followed by a file separator": "```text\ncode\n```\x1cprose\n",
+    "closing fence followed by a no-break space": "```text\ncode\n``` \nprose\n",
+    "closing fence followed by a tab": "```text\ncode\n```\t\nprose\n",
+    "fence indented by a tab": "\t```text\n\tcode\n\t```\n",
+    "a tab in prose": "one\ttwo\n",
+    "an html pre block": "<pre>\nshown as code\n</pre>\n",
+    "an html pre block, upper case": "text <PRE class='x'>\nshown as code\n</PRE>\n",
+    "an html comment": "<!--\nnot shown\n-->\n",
+    "an html script block": "<script>\nnot shown\n</script>\n",
+}
+
+
+@pytest.mark.parametrize("markdown", UNREAD_FENCES.values(), ids=UNREAD_FENCES.keys())
+def test_a_fenced_block_the_reader_cannot_place_is_refused_not_guessed_at(markdown):
+    assert fence_problems(markdown)
+    for read in (markdown_lines, prose_lines, code_lines):
+        with pytest.raises(AssertionError):
+            read(markdown)
+    with pytest.raises(AssertionError):
+        section(markdown, "One")
+
+
+def test_a_section_is_found_once_or_not_at_all():
+    markdown = "## One\n\na\n\n### Under one\n\nb\n\n## Two\r\n\r\nc\r\n\n## One more\n"
+
+    assert section(markdown, "One").split() == ["a", "###", "Under", "one", "b"]
+    assert section(markdown, "Two").strip() == "c"
+    for title in ("Three", "One mor", "Under one"):
+        with pytest.raises(AssertionError):
+            section(markdown, title)
+    with pytest.raises(AssertionError):
+        section(markdown + "\n## One\n", "One")
+
+
+def _documentation_names(skill_md: str) -> tuple[list[str], list[str]]:
+    """The bold names in SKILL.md's Documentation section: shipped, repository-only.
+
+    The section is two bullet lists with one sentence between them, which says
+    the second list is in the source repository only.
+    """
+    shipped: list[str] = []
+    repository: list[str] = []
+    into = shipped
+    for line in _prose_lines(section(skill_md, "Documentation")):
+        if line.startswith("In the source repository only"):
+            into = repository
+        elif match := re.match(r"- \*\*([^*]+)\*\*", line):
+            into.append(match.group(1))
+    return shipped, repository
+
+
+def test_the_documentation_section_says_where_each_document_is():
+    """Each name it lists as shipped is in the package; each repository-only one is not.
+
+    The section said `references/` was repository-only while a guard asserted
+    the directory was absent from the package. Both moved in v0.10.0; this
+    reads the section instead of restating it.
+    """
+    shipped, repository = _documentation_names(SKILL_MD.read_text(encoding="utf-8"))
+
+    assert shipped == ["SKILL.md", "README.md", "examples/", "references/"]
+    assert repository == ["CLAUDE.md", "CHANGELOG.md", "docs/"]
+    for name in shipped:
+        assert (SKILL_ROOT / name).exists(), f"{name} is listed as shipped and is not there"
+    for name in repository:
+        assert (REPO_ROOT / name).exists(), f"{name} is listed and is not in the repository"
+        assert not (SKILL_ROOT / name).exists(), f"{name} is listed as repository-only and ships"
+        assert not (PACKAGE_ROOT / name).exists(), f"{name} is listed as repository-only and ships"
+
+
+def test_a_documentation_list_inside_a_fenced_block_is_not_the_claim():
+    skill_md = SKILL_MD.read_text(encoding="utf-8")
+    start = skill_md.index("## Documentation\n") + len("## Documentation\n")
+    end = skill_md.index("## Platform limitations worth knowing")
+    fenced = skill_md[:start] + "\n```text" + skill_md[start:end] + "```\n\n" + skill_md[end:]
+
+    assert _documentation_names(fenced) == ([], [])
+
+
+def test_references_means_one_directory():
+    """The repository's four topic documents are `docs/`; `references/` is the skill's."""
+    assert not (REPO_ROOT / "references").exists()
+    assert sorted(path.name for path in (REPO_ROOT / "docs").glob("*.md")) == [
+        "accessibility_checklist.md",
+        "adb_quick.md",
+        "test_patterns.md",
+        "troubleshooting.md",
+    ]
+
+
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
+
+# The two entries as SKILL.md held them at v0.9.0 (f9ab727), each without its
+# surrounding blank lines and with one final newline: byte count and SHA-256.
+# A released entry is not edited afterwards; correcting one means changing its
+# line here, on purpose.
+MOVED_RELEASE_NOTES = {
+    "v0.9.0": (4687, "5e7ec0714850bf7ec4bb6e5e4bfc20dd068f72569a7c8f4300cfefaffb78b6ed"),
+    "v0.8.0": (6843, "e2894fb8c7e20f839cc223e0ad753253ee4ff6ccbac7a2e3e31268d5fbe721a4"),
+}
+V0_9_0_COMMIT = "f9ab727"
+
+
+def _release_body(changelog: str, release: str) -> bytes:
+    return (section(changelog, release).strip("\n") + "\n").encode("utf-8")
+
+
+def test_the_changelog_holds_the_releases_that_left_skill_md():
+    """History moved; it was not deleted, shortened or retyped on the way."""
+    changelog = CHANGELOG.read_text(encoding="utf-8")
+    headings = [line for line in prose_lines(changelog) if line.startswith("## ")]
+    assert headings == [f"## {release}" for release in MOVED_RELEASE_NOTES]
+
+    for release, (size, digest) in MOVED_RELEASE_NOTES.items():
+        body = _release_body(changelog, release)
+        assert len(body) == size, release
+        assert hashlib.sha256(body).hexdigest() == digest, release
+
+
+def test_the_moved_release_notes_are_the_ones_skill_md_held_at_v0_9_0():
+    """The digests above, checked against the file they were taken from.
+
+    Where the repository's history holds the v0.9.0 commit. A shallow CI clone
+    does not, and there the pinned digests stand alone.
+    """
+    blob = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "show", f"{V0_9_0_COMMIT}:{SKILL_MD.relative_to(REPO_ROOT)}"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if blob.returncode != 0:
+        pytest.skip(f"{V0_9_0_COMMIT} is not in this clone's history")
+    released = blob.stdout.decode("utf-8")
+
+    changelog = CHANGELOG.read_text(encoding="utf-8")
+    for release in MOVED_RELEASE_NOTES:
+        assert _release_body(changelog, release).decode("utf-8") in released, release
+
+
+_LIST_MARKER = re.compile(r"(?:[-*+]|\d+[.)])\s+")
+
+
+def _release_note_units(changelog: str) -> list[str]:
+    """Each paragraph and each list item of the moved entries: its words, folded.
+
+    A unit is a whole thought as the release notes put it. One of its lines is
+    not: current documentation may say again, in the same words, something a
+    release note said, and a guard on single lines failed exactly that. The
+    item's own marker is left off, so the same item under `*` or `1.`, or as
+    a paragraph, is the same unit.
+    """
+    units = []
+    for release in MOVED_RELEASE_NOTES:
+        for block in re.split(r"\n\s*\n", section(changelog, release)):
+            for item in re.split(r"\n(?=- )", block):
+                folded = _LIST_MARKER.sub("", " ".join(item.split()), count=1)
+                if len(folded) >= 80:
+                    units.append(folded)
+    return units
+
+
+def _release_notes_still_in(skill_md: str) -> list[str]:
+    """The moved entries' paragraphs and list items that a SKILL.md holds whole.
+
+    Compared with whitespace folded, so re-wrapping, re-indenting or
+    re-bulleting a copied item does not hide it.
+    """
+    folded = " ".join(skill_md.split())
+    units = _release_note_units(CHANGELOG.read_text(encoding="utf-8"))
+    return [unit[:70] for unit in units if unit in folded]
+
+
+def test_skill_md_keeps_none_of_the_release_notes_it_handed_over():
+    """Moved, not copied: the file an agent loads does not carry the history as well."""
+    skill_md = SKILL_MD.read_text(encoding="utf-8")
+    assert len(_release_note_units(CHANGELOG.read_text(encoding="utf-8"))) > 20
+    assert _release_notes_still_in(skill_md) == []
+
+    sections = [line for line in prose_lines(skill_md) if line.startswith("## ")]
+    assert "## Failures" in sections
+    assert "## Known gaps and release history" in sections
+    assert "## Status & Roadmap" not in sections
+    assert not [line for line in sections if re.match(r"## v\d", line)]
+
+
+def test_a_release_note_copied_back_into_skill_md_is_found_however_it_is_wrapped():
+    skill_md = SKILL_MD.read_text(encoding="utf-8")
+    entry = section(CHANGELOG.read_text(encoding="utf-8"), "v0.9.0")
+    item = next(item for item in re.split(r"\n(?=- )", entry) if item.startswith("- **A per-item"))
+    rewrapped = "\n".join("    " + line.strip() for line in item.splitlines())
+
+    assert _release_notes_still_in(skill_md + "\n## Status\n\n" + item + "\n")
+    assert _release_notes_still_in(skill_md + "\n## Status\n\n" + rewrapped + "\n")
+    for marker in ("* ", "1. ", "7) ", ""):
+        again = marker + item.removeprefix("- ")
+        assert _release_notes_still_in(skill_md + "\n## Status\n\n" + again + "\n"), marker
+
+
+def test_one_line_a_release_note_also_used_is_not_a_release_note():
+    """Current documentation restating a contract in the release note's words."""
+    skill_md = SKILL_MD.read_text(encoding="utf-8")
+    entry = section(CHANGELOG.read_text(encoding="utf-8"), "v0.8.0")
+    line = next(line for line in entry.splitlines() if "answers with a summary only once" in line)
+    summary = f"- ANR session contract:\n{line}\n  (otherwise the command refuses).\n"
+
+    assert _release_notes_still_in(skill_md + "\n" + summary) == []
 
 
 def test_shipped_readme_is_not_stale():
@@ -1553,9 +2253,6 @@ def test_shipped_readme_is_not_stale():
 # is not. Neither guard reads the whole file, and no guard reads this one.
 # ---------------------------------------------------------------------------
 
-README = REPO_ROOT / "README.md"
-PACKAGED_README = SKILL_ROOT / "README.md"
-
 
 def _prose_lines(markdown: str) -> list[str]:
     """Lines OUTSIDE fenced code blocks -- what the document claims.
@@ -1565,14 +2262,7 @@ def _prose_lines(markdown: str) -> list[str]:
     is read the whole file, or a documented `# will be finalized` comment
     inside an example would satisfy it.
     """
-    lines, inside = [], False
-    for line in markdown.splitlines():
-        if line.lstrip().startswith("```"):
-            inside = not inside
-            continue
-        if not inside:
-            lines.append(line)
-    return lines
+    return prose_lines(markdown)
 
 
 # A metavar a reader is meant to substitute is legitimate in a command; a
@@ -1583,7 +2273,9 @@ SUBSTITUTABLE = frozenset({"<name>", "<serial>", "<id>", "<package>"})
 
 
 @pytest.mark.parametrize(
-    "doc", [README, PACKAGED_README, SKILL_MD], ids=["repo", "packaged", "skill"]
+    "doc",
+    [README, PACKAGED_README, *_shipped_docs()],
+    ids=["repo", "packaged", *(_doc_id(doc) for doc in _shipped_docs())],
 )
 def test_no_documented_command_still_carries_a_placeholder(doc):
     """`git clone <repository-url>` is not a command; it is a TODO (P8).
@@ -2173,8 +2865,8 @@ def test_every_flag_documented_in_skill_md_exists():
     * `visual_diff` -- documented as having no `--json` after it gained one.
 
     The last two show the failure mode: the rescoping was deliberate and the
-    Status section even describes it, so nobody reading the file top to bottom
-    sees a contradiction. Only argparse knows.
+    Status section even described it (SKILL.md had one until v0.10.0), so nobody
+    reading the file top to bottom saw a contradiction. Only argparse knows.
 
     Both sides are extracted structurally -- see `_documented_options` for why
     matching prose instead would fail on the sentences that are *correct*.

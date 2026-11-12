@@ -108,7 +108,10 @@ Use `cp -R` in place of `ln -s` if you would rather not have a symlink; a
 
 ## Documentation
 
-- `android-emulator-skill/skills/android-emulator-skill/SKILL.md` — script reference + roadmap.
+- `android-emulator-skill/skills/android-emulator-skill/SKILL.md` — script reference and the failure contract.
+- `android-emulator-skill/skills/android-emulator-skill/references/known-gaps.md` — what the skill does not do yet.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history.
+- [`docs/`](docs/) — topic notes on adb, test patterns, accessibility and troubleshooting.
 - [`DEV.md`](DEV.md) — development environment, linting, tests, CI, release process.
 - [`CLAUDE.md`](CLAUDE.md) — architecture and conventions for contributors and Claude Code.
 

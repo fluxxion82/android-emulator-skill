@@ -16,10 +16,13 @@ android-emulator-skill/                      # repo root
 ├── android-emulator-skill/                   # distributable plugin package
 │   ├── .claude-plugin/plugin.json
 │   └── skills/android-emulator-skill/
-│       ├── SKILL.md                         # entry point / script reference + roadmap
+│       ├── SKILL.md                         # entry point / script reference
+│       ├── references/                      # ships: known-gaps.md
 │       └── scripts/                         # production scripts + common/ utilities
 ├── .github/workflows/                        # lint, test, release, validate-version, pages
 ├── tests/                                    # pytest suite (adb/subprocess mocked)
+├── docs/                                     # repo-only topic docs (adb, test patterns, a11y)
+├── CHANGELOG.md                              # release history (repo-only; not in the package)
 ├── dev-constraints.txt                       # exact pins for the dev toolchain; CI and local read it
 └── pyproject.toml / .pre-commit-config.yaml
 ```

@@ -5,8 +5,8 @@ Three findings, all the same shape -- an answer the tools did not give:
 * **L11** (``emulator_create.py:476,678``, remedy at ``:737-740``): the default
   ABI is ``x86_64`` and ``platform.machine()`` is never consulted. On an arm64
   Mac -- the machine this skill is developed on, and the first command of the
-  documented CI flow (SKILL.md:503) -- every create without ``--abi`` asks for
-  an image the host cannot run, and both remedies recommend installing one.
+  documented CI flow (SKILL.md, "CI/CD Flow", step 1, as of fed0857) -- every
+  create without ``--abi`` asks for an image the host cannot run, and both remedies recommend installing one.
 
 * **N3** (``:511-512``): the "is this image installed?" check runs only
   ``if installed``, so when ``sdkmanager`` is missing the list is empty and

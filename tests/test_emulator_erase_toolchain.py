@@ -8,8 +8,9 @@
 
 so on a host whose AVD home is not where the script looked -- or a host with
 no SDK at all -- ``--list --json`` answers ``{"avds": []}`` and ``--all``
-answers "No AVDs found", both at exit 0. SKILL.md:716-719 claims the opposite:
-that emulator_erase routes through ``common/sdk_tools.py`` and "gives the
+answers "No AVDs found", both at exit 0. SKILL.md claimed the opposite (as of
+fed0857, under "Status & Roadmap": "A missing SDK tool says so in the lifecycle
+scripts"): that emulator_erase routes through ``common/sdk_tools.py`` and "gives the
 remedy instead of returning an empty list". It does not consult any SDK tool;
 it reads one directory and treats that directory's absence as an answer.
 

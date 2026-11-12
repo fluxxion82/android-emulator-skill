@@ -625,17 +625,178 @@ def test_skill_md_states_the_number_of_modes_the_sweep_runs():
     Every statement must agree with the count; a second accurate one is fine
     (Codex, closure review: `[40, 40] != [40]` would have failed a true doc).
     """
-    import re
-
     from test_quick_start_contract import SKILL_MD
 
-    stated = re.findall(
-        r"asserts the payload of (\d+) documented modes", SKILL_MD.read_text("utf-8")
+    _check_the_stated_mode_count(SKILL_MD.read_text("utf-8"), len(MODES))
+
+
+def _mode_counts(text: str) -> list[int]:
+    """Each count of swept modes a text states. Whitespace is folded: prose wraps."""
+    import re
+
+    folded = " ".join(text.split())
+    return [int(n) for n in re.findall(r"asserts the payload of (\d+) documented modes", folded)]
+
+
+def _check_the_stated_mode_count(skill_md: str, swept: int) -> None:
+    """The count is stated in SKILL.md's Failures section and is the table's length.
+
+    The sentence lived in the v0.8.0 release notes, which v0.10.0 moved out of
+    SKILL.md into CHANGELOG.md. It is the Failures contract's claim, so that is
+    where it has to be: said only in some other section, it would be the next
+    paragraph to leave the file and take this guard's subject with it.
+
+    The section's statement is read from its lines outside fenced blocks and
+    fewer than four columns in, which keeps out the two ordinary ways a
+    sentence becomes an example of a sentence: a fenced block and an indented
+    one. Agreement is asked of the whole file, code and all: a wrong count is
+    wrong wherever it is written.
+
+    This is a check of where the sentence is written, not of how it renders.
+    Wrapped in backticks, put in ``<code>``, or indented inside a blockquote it
+    is still counted as said. Telling those apart takes a Markdown parser, the
+    suite has none, and each rule added to imitate one left another case open
+    (four review rounds). The limit is stated instead.
+    """
+    from test_quick_start_contract import flush_prose_lines, section
+
+    said = "\n".join(flush_prose_lines(section(skill_md, "Failures")))
+    assert _mode_counts(
+        said
+    ), "SKILL.md's Failures section no longer states how many modes the sweep runs"
+    stated = _mode_counts(skill_md)
+    assert set(stated) == {swept}, f"SKILL.md says {stated}; the sweep runs {swept} modes"
+
+
+def _the_count_sentence(skill_md: str) -> str:
+    import re
+
+    found = re.findall(r"In all it\s+asserts the payload of \d+ documented modes[^.]*\.", skill_md)
+    assert len(found) == 1, found
+    return found[0]
+
+
+def _count_moved_to_another_section(skill_md: str) -> str:
+    sentence = _the_count_sentence(skill_md)
+    return skill_md.replace(sentence, "").replace(
+        "## Contributing\n", f"## Contributing\n\n{sentence}\n"
     )
-    assert stated, "SKILL.md no longer states how many modes the sweep runs"
-    assert {int(n) for n in stated} == {
-        len(MODES)
-    }, f"SKILL.md says {stated}; the sweep runs {len(MODES)} modes"
+
+
+def _count_off_by_one(skill_md: str) -> str:
+    sentence = _the_count_sentence(skill_md)
+    return skill_md.replace(sentence, sentence.replace(str(len(MODES)), str(len(MODES) - 1)))
+
+
+def _count_restated_wrongly_elsewhere(skill_md: str) -> str:
+    wrong = f"The sweep asserts the payload of {len(MODES) + 1} documented modes."
+    return skill_md.replace("## Contributing\n", f"## Contributing\n\n{wrong}\n")
+
+
+def _count_removed(skill_md: str) -> str:
+    return skill_md.replace(_the_count_sentence(skill_md), "")
+
+
+def _count_only_in_a_fenced_example(skill_md: str) -> str:
+    sentence = _the_count_sentence(skill_md)
+    return skill_md.replace(sentence, "").replace(
+        "## Known gaps and release history\n",
+        f"```text\n{sentence}\n```\n\n## Known gaps and release history\n",
+    )
+
+
+def _count_only_in_a_blockquoted_fenced_example(skill_md: str) -> str:
+    """Not read as prose by mistake: the fence reader refuses the document."""
+    sentence = " ".join(_the_count_sentence(skill_md).split())
+    return skill_md.replace(_the_count_sentence(skill_md), "").replace(
+        "## Known gaps and release history\n",
+        f"> ```text\n> {sentence}\n> ```\n\n## Known gaps and release history\n",
+    )
+
+
+def _count_displaced(skill_md: str, before: str, after: str, indent: str = "") -> str:
+    """The count sentence, on one line, moved to the end of Failures between two strings."""
+    sentence = indent + " ".join(_the_count_sentence(skill_md).split())
+    return skill_md.replace(_the_count_sentence(skill_md), "").replace(
+        "## Known gaps and release history\n",
+        f"{before}{sentence}\n{after}\n## Known gaps and release history\n",
+    )
+
+
+def _count_only_in_an_indented_code_block(skill_md: str) -> str:
+    return _count_displaced(skill_md, "An example:\n\n", "", indent="    ")
+
+
+def _count_only_in_an_html_pre_block(skill_md: str) -> str:
+    return _count_displaced(skill_md, "<pre>\n", "</pre>\n")
+
+
+def _count_only_in_an_html_comment(skill_md: str) -> str:
+    return _count_displaced(skill_md, "<!--\n", "-->\n")
+
+
+def _count_after_a_fence_that_a_no_break_space_keeps_open(skill_md: str) -> str:
+    return _count_displaced(skill_md, "```text\nexample\n```\u00a0\n", "")
+
+
+def _count_after_a_fence_that_a_tab_indents(skill_md: str) -> str:
+    return _count_displaced(skill_md, "\t```text\n", "\t```\n")
+
+
+def _count_after_a_fence_that_a_line_separator_seems_to_close(skill_md: str) -> str:
+    """U+2028 ends a line for `str.splitlines` and for no renderer."""
+    mutated = _count_displaced(skill_md, "```text\nexample\n```\n", "")
+    return once_in(mutated, "```text\nexample\n```\n", "```text\nexample\n```\u2028")
+
+
+def _count_in_a_fence_opened_on_a_list_marker_line(skill_md: str) -> str:
+    return _count_displaced(skill_md, "1. ```text\n", "", indent="   ")
+
+
+def once_in(text: str, old: str, new: str) -> str:
+    assert text.count(old) == 1
+    return text.replace(old, new)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        _count_moved_to_another_section,
+        _count_off_by_one,
+        _count_restated_wrongly_elsewhere,
+        _count_removed,
+        _count_only_in_a_fenced_example,
+        _count_only_in_a_blockquoted_fenced_example,
+        _count_only_in_an_indented_code_block,
+        _count_only_in_an_html_pre_block,
+        _count_only_in_an_html_comment,
+        _count_after_a_fence_that_a_no_break_space_keeps_open,
+        _count_after_a_fence_that_a_tab_indents,
+        _count_after_a_fence_that_a_line_separator_seems_to_close,
+        _count_in_a_fence_opened_on_a_list_marker_line,
+    ],
+    ids=lambda m: m.__name__,
+)
+def test_the_mode_count_guard_fails_a_skill_md_that_misstates_it(mutation):
+    from test_quick_start_contract import SKILL_MD
+
+    skill_md = SKILL_MD.read_text("utf-8")
+    mutated = mutation(skill_md)
+    assert mutated != skill_md
+
+    with pytest.raises(AssertionError):
+        _check_the_stated_mode_count(mutated, len(MODES))
+
+
+def test_a_wrapped_count_sentence_is_still_read():
+    """Prose wraps; the guard must not depend on where."""
+    from test_quick_start_contract import SKILL_MD
+
+    skill_md = SKILL_MD.read_text("utf-8")
+    wrapped = skill_md.replace("asserts the payload of", "asserts the\n  payload of")
+    assert wrapped != skill_md
+
+    _check_the_stated_mode_count(wrapped, len(MODES))
 
 
 def test_the_sweep_covers_the_scripts_n5_named():

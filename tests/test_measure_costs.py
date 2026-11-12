@@ -376,7 +376,7 @@ def test_the_frozen_v0_9_0_size_is_the_pinned_one(measured):
 
 
 def test_reference_files_are_counted_when_there_are_some(tmp_path, monkeypatch):
-    """Today there are none; the row has to be right the day they arrive."""
+    """Counted from the files, on a tree that is not this one."""
     skill_dir = tmp_path / "skill"
     (skill_dir / "references").mkdir(parents=True)
     (skill_dir / "SKILL.md").write_bytes(b"x" * 1000)
@@ -449,11 +449,42 @@ def test_the_printed_table_carries_every_measured_figure(measured):
     for figure in ("framing_bytes", "stream_bytes", "document_bytes"):
         assert f"{measured['stream'][figure]:,}" in table, figure
     assert f"{measured['skill']['bytes']:,}" in table
-    assert mc.NOT_PRESENT in table
+    plus = measured["skill"]["skill_md_plus_largest_reference"]
+    assert f"{plus['bytes']:,} | ~{plus['tokens_est']:,}" in table
+    assert mc.NOT_PRESENT not in table
     assert "estimate" in table
     for shot in measured["screenshots"]:
         for cell in shot["presets"].values():
             assert f"{cell['width']}x{cell['height']}, {cell['bytes']:,}" in table
+
+
+def test_the_printed_table_says_so_when_no_reference_file_ships(measured):
+    """The v0.9.0 shape: the row is there and reads "not present", not a zero."""
+    skill = {
+        **measured["skill"],
+        "references": mc.NOT_PRESENT,
+        "skill_md_plus_largest_reference": mc.NOT_PRESENT,
+    }
+
+    table = mc.render({**measured, "skill": skill})
+
+    assert f"| `SKILL.md` plus one reference file | {mc.NOT_PRESENT} | {mc.NOT_PRESENT} |" in table
+
+
+def test_the_skill_ships_a_reference_file_and_it_is_counted(measured):
+    """Since v0.10.0 the gaps are a file beside SKILL.md; the live row counts it."""
+    skill = measured["skill"]
+    sizes = sorted(path.stat().st_size for path in (mc.SKILL_DIR / "references").glob("*.md"))
+
+    assert sizes, "no reference file ships"
+    assert skill["references"] == {
+        "files": len(sizes),
+        "total_bytes": sum(sizes),
+        "smallest_bytes": sizes[0],
+        "largest_bytes": sizes[-1],
+    }
+    assert skill["skill_md_plus_largest_reference"]["bytes"] == skill["bytes"] + sizes[-1]
+    assert skill["bytes"] < V0_9_0_BYTES, "SKILL.md is no smaller than it was at v0.9.0"
 
 
 def test_the_printed_table_says_what_it_does_not_compare(measured):

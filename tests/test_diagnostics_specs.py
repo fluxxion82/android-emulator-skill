@@ -1069,7 +1069,7 @@ def test_the_snapshot_device_supports_a_complete_capture(toolchain, tmp_path, re
 
 
 def test_n12_a_default_snapshot_succeeds_outside_the_callers_cwd(toolchain, tmp_path, recorded):
-    """N12: ``app_state_capture.py:534`` (and SKILL.md:525).
+    """N12: ``app_state_capture.py:534`` (and SKILL.md's "Debugging Flow", as of fed0857).
 
     ``--output`` defaults to the relative ``app-state-snapshots``, so every run
     without it writes into whatever directory the agent happens to be in --
