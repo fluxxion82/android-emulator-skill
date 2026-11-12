@@ -1,0 +1,452 @@
+{
+  "estimate": "tokens are bytes / 4, rounded: an estimate, no tokenizer is run",
+  "profile": "emulator-api35",
+  "screens": [
+    {
+      "id": "walk_1_catalog",
+      "walk": 1,
+      "fixture": "uiautomator_walk_1_catalog",
+      "focus": "dumpsys_window_focus_walk_1_catalog",
+      "find_text": "Open cart",
+      "rows": {
+        "raw_dump": {
+          "bytes": 8586,
+          "tokens_est": 2147
+        },
+        "screen_mapper": {
+          "bytes": 250,
+          "tokens_est": 63
+        },
+        "screen_mapper_verbose": {
+          "bytes": 604,
+          "tokens_est": 151
+        },
+        "navigator_list": {
+          "bytes": 282,
+          "tokens_est": 71
+        },
+        "navigator_find_text": {
+          "bytes": 46,
+          "tokens_est": 12
+        }
+      }
+    },
+    {
+      "id": "walk_2_product",
+      "walk": 2,
+      "fixture": "uiautomator_walk_2_product",
+      "focus": "dumpsys_window_focus_walk_2_product",
+      "find_text": "Add to cart",
+      "rows": {
+        "raw_dump": {
+          "bytes": 5583,
+          "tokens_est": 1396
+        },
+        "screen_mapper": {
+          "bytes": 182,
+          "tokens_est": 46
+        },
+        "screen_mapper_verbose": {
+          "bytes": 445,
+          "tokens_est": 111
+        },
+        "navigator_list": {
+          "bytes": 120,
+          "tokens_est": 30
+        },
+        "navigator_find_text": {
+          "bytes": 47,
+          "tokens_est": 12
+        }
+      }
+    },
+    {
+      "id": "walk_3_cart",
+      "walk": 3,
+      "fixture": "uiautomator_walk_3_cart",
+      "focus": "dumpsys_window_focus_walk_3_cart",
+      "find_text": "Checkout",
+      "rows": {
+        "raw_dump": {
+          "bytes": 7915,
+          "tokens_est": 1979
+        },
+        "screen_mapper": {
+          "bytes": 216,
+          "tokens_est": 54
+        },
+        "screen_mapper_verbose": {
+          "bytes": 513,
+          "tokens_est": 128
+        },
+        "navigator_list": {
+          "bytes": 200,
+          "tokens_est": 50
+        },
+        "navigator_find_text": {
+          "bytes": 44,
+          "tokens_est": 11
+        }
+      }
+    },
+    {
+      "id": "walk_4_checkout",
+      "walk": 4,
+      "fixture": "uiautomator_walk_4_checkout",
+      "focus": "dumpsys_window_focus_walk_4_checkout",
+      "find_text": "Place order",
+      "rows": {
+        "raw_dump": {
+          "bytes": 7214,
+          "tokens_est": 1804
+        },
+        "screen_mapper": {
+          "bytes": 264,
+          "tokens_est": 66
+        },
+        "screen_mapper_verbose": {
+          "bytes": 548,
+          "tokens_est": 137
+        },
+        "navigator_list": {
+          "bytes": 244,
+          "tokens_est": 61
+        },
+        "navigator_find_text": {
+          "bytes": 47,
+          "tokens_est": 12
+        }
+      }
+    },
+    {
+      "id": "walk_5_confirmation",
+      "walk": 5,
+      "fixture": "uiautomator_walk_5_confirmation",
+      "focus": "dumpsys_window_focus_walk_5_confirmation",
+      "find_text": "Open settings",
+      "rows": {
+        "raw_dump": {
+          "bytes": 5583,
+          "tokens_est": 1396
+        },
+        "screen_mapper": {
+          "bytes": 184,
+          "tokens_est": 46
+        },
+        "screen_mapper_verbose": {
+          "bytes": 448,
+          "tokens_est": 112
+        },
+        "navigator_list": {
+          "bytes": 122,
+          "tokens_est": 31
+        },
+        "navigator_find_text": {
+          "bytes": 49,
+          "tokens_est": 12
+        }
+      }
+    },
+    {
+      "id": "walk_6_settings",
+      "walk": 6,
+      "fixture": "uiautomator_walk_6_settings",
+      "focus": "dumpsys_window_focus_walk_6_settings",
+      "find_text": "Back to catalog",
+      "rows": {
+        "raw_dump": {
+          "bytes": 7878,
+          "tokens_est": 1970
+        },
+        "screen_mapper": {
+          "bytes": 220,
+          "tokens_est": 55
+        },
+        "screen_mapper_verbose": {
+          "bytes": 489,
+          "tokens_est": 122
+        },
+        "navigator_list": {
+          "bytes": 204,
+          "tokens_est": 51
+        },
+        "navigator_find_text": {
+          "bytes": 51,
+          "tokens_est": 13
+        }
+      }
+    },
+    {
+      "id": "compose_single_screen",
+      "walk": null,
+      "fixture": "uiautomator_compose_default",
+      "focus": "dumpsys_window_focus_compose_default",
+      "find_text": "Submit Order",
+      "rows": {
+        "raw_dump": {
+          "bytes": 10895,
+          "tokens_est": 2724
+        },
+        "screen_mapper": {
+          "bytes": 334,
+          "tokens_est": 84
+        },
+        "screen_mapper_verbose": {
+          "bytes": 791,
+          "tokens_est": 198
+        },
+        "navigator_list": {
+          "bytes": 350,
+          "tokens_est": 88
+        },
+        "navigator_find_text": {
+          "bytes": 41,
+          "tokens_est": 10
+        }
+      }
+    },
+    {
+      "id": "settings_home",
+      "walk": null,
+      "fixture": "uiautomator_settings_top",
+      "focus": "dumpsys_window_focus_settings_top",
+      "find_text": "Notifications",
+      "rows": {
+        "raw_dump": {
+          "bytes": 23466,
+          "tokens_est": 5867
+        },
+        "screen_mapper": {
+          "bytes": 577,
+          "tokens_est": 144
+        },
+        "screen_mapper_verbose": {
+          "bytes": 1327,
+          "tokens_est": 332
+        },
+        "navigator_list": {
+          "bytes": 799,
+          "tokens_est": 200
+        },
+        "navigator_find_text": {
+          "bytes": 87,
+          "tokens_est": 22
+        }
+      }
+    },
+    {
+      "id": "dialer_keypad",
+      "walk": null,
+      "fixture": "uiautomator_dialer_keypad",
+      "focus": "dumpsys_window_focus_dialer_keypad",
+      "find_text": "Call",
+      "rows": {
+        "raw_dump": {
+          "bytes": 41034,
+          "tokens_est": 10259
+        },
+        "screen_mapper": {
+          "bytes": 430,
+          "tokens_est": 108
+        },
+        "screen_mapper_verbose": {
+          "bytes": 905,
+          "tokens_est": 226
+        },
+        "navigator_list": {
+          "bytes": 907,
+          "tokens_est": 227
+        },
+        "navigator_find_text": {
+          "bytes": 36,
+          "tokens_est": 9
+        }
+      }
+    }
+  ],
+  "walk": {
+    "screens": [
+      "walk_1_catalog",
+      "walk_2_product",
+      "walk_3_cart",
+      "walk_4_checkout",
+      "walk_5_confirmation",
+      "walk_6_settings"
+    ],
+    "totals": {
+      "raw_dump": {
+        "bytes": 42759,
+        "tokens_est": 10690
+      },
+      "screen_mapper": {
+        "bytes": 1316,
+        "tokens_est": 329
+      },
+      "screen_mapper_verbose": {
+        "bytes": 3047,
+        "tokens_est": 762
+      },
+      "navigator_list": {
+        "bytes": 1172,
+        "tokens_est": 293
+      },
+      "navigator_find_text": {
+        "bytes": 284,
+        "tokens_est": 71
+      }
+    },
+    "percent_of_raw_dump": {
+      "raw_dump": 100.0,
+      "screen_mapper": 3.1,
+      "screen_mapper_verbose": 7.1,
+      "navigator_list": 2.7,
+      "navigator_find_text": 0.7
+    }
+  },
+  "stream": {
+    "fixture": "uiautomator_dump_raw",
+    "stream_bytes": 10927,
+    "document_bytes": 10894,
+    "framing_bytes": 33
+  },
+  "screenshots": [
+    {
+      "id": "walk_1_catalog",
+      "fixture": "screencap_walk_1_catalog",
+      "presets": {
+        "full": {
+          "width": 1080,
+          "height": 2424,
+          "bytes": 61612
+        },
+        "half": {
+          "width": 540,
+          "height": 1212
+        },
+        "quarter": {
+          "width": 270,
+          "height": 606
+        },
+        "thumb": {
+          "width": 108,
+          "height": 242
+        }
+      }
+    },
+    {
+      "id": "walk_2_product",
+      "fixture": "screencap_walk_2_product",
+      "presets": {
+        "full": {
+          "width": 1080,
+          "height": 2424,
+          "bytes": 48482
+        },
+        "half": {
+          "width": 540,
+          "height": 1212
+        },
+        "quarter": {
+          "width": 270,
+          "height": 606
+        },
+        "thumb": {
+          "width": 108,
+          "height": 242
+        }
+      }
+    },
+    {
+      "id": "walk_3_cart",
+      "fixture": "screencap_walk_3_cart",
+      "presets": {
+        "full": {
+          "width": 1080,
+          "height": 2424,
+          "bytes": 51207
+        },
+        "half": {
+          "width": 540,
+          "height": 1212
+        },
+        "quarter": {
+          "width": 270,
+          "height": 606
+        },
+        "thumb": {
+          "width": 108,
+          "height": 242
+        }
+      }
+    },
+    {
+      "id": "walk_4_checkout",
+      "fixture": "screencap_walk_4_checkout",
+      "presets": {
+        "full": {
+          "width": 1080,
+          "height": 2424,
+          "bytes": 35893
+        },
+        "half": {
+          "width": 540,
+          "height": 1212
+        },
+        "quarter": {
+          "width": 270,
+          "height": 606
+        },
+        "thumb": {
+          "width": 108,
+          "height": 242
+        }
+      }
+    },
+    {
+      "id": "walk_5_confirmation",
+      "fixture": "screencap_walk_5_confirmation",
+      "presets": {
+        "full": {
+          "width": 1080,
+          "height": 2424,
+          "bytes": 48229
+        },
+        "half": {
+          "width": 540,
+          "height": 1212
+        },
+        "quarter": {
+          "width": 270,
+          "height": 606
+        },
+        "thumb": {
+          "width": 108,
+          "height": 242
+        }
+      }
+    },
+    {
+      "id": "walk_6_settings",
+      "fixture": "screencap_walk_6_settings",
+      "presets": {
+        "full": {
+          "width": 1080,
+          "height": 2424,
+          "bytes": 50895
+        },
+        "half": {
+          "width": 540,
+          "height": 1212
+        },
+        "quarter": {
+          "width": 270,
+          "height": 606
+        },
+        "thumb": {
+          "width": 108,
+          "height": 242
+        }
+      }
+    }
+  ]
+}

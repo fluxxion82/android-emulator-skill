@@ -1,0 +1,2 @@
+  mCurrentFocus=Window{8d38289 u0 com.example.composefixture/com.example.composefixture.WalkActivity}
+  mFocusedApp=ActivityRecord{3758945 u0 com.example.composefixture/.WalkActivity t909}
