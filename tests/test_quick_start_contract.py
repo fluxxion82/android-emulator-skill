@@ -275,6 +275,30 @@ def section(markdown: str, title: str) -> str:
     return "\n".join(found[0])
 
 
+# argparse's own test for "a negative number, not an option" (`--lng -.12`).
+_NUMBER = re.compile(r"-\d+|-\d*\.\d+")
+
+
+def is_option(token: str) -> bool:
+    """Whether a word of a command line is an option: `--tap`, `-s`, `--x=1`.
+
+    Anything dash-led that is not a number (`--lng -0.12`). Long options
+    alone were kept at first, so `screen_mapper.py -s emulator-5554` read as
+    the bare command, covered by any test that ran the script at all.
+    """
+    return token.startswith("-") and token != "-" and not _NUMBER.fullmatch(token)
+
+
+def options_in(tokens) -> frozenset[str]:
+    """The options among a command's words, each without a `=value` it carries.
+
+    One function for every side of a coverage comparison -- the documented
+    command, the e2e test's call, a loop test's call -- so `--find-text=Login`
+    in a document and in a test are the same option, not two spellings.
+    """
+    return frozenset(token.split("=", 1)[0] for token in tokens if is_option(token))
+
+
 def _command(line: str) -> tuple[str, frozenset[str]] | None:
     """A documented invocation as ``(script basename, flags)``.
 
@@ -293,7 +317,7 @@ def _command(line: str) -> tuple[str, frozenset[str]] | None:
     script = next((Path(token).name for token in tokens if token.endswith(SCRIPT_SUFFIXES)), None)
     if script is None:
         return None
-    return script, frozenset(token for token in tokens if token.startswith("--"))
+    return script, options_in(tokens)
 
 
 def quick_start_commands() -> list[tuple[str, frozenset[str]]]:
@@ -336,7 +360,7 @@ def e2e_invocations() -> list[tuple[str, frozenset[str]]]:
         script = next((value for value in literals if value.endswith(SCRIPT_SUFFIXES)), None)
         if script is None:
             continue
-        calls.append((script, frozenset(value for value in literals if value.startswith("--"))))
+        calls.append((script, options_in(literals)))
     return calls
 
 

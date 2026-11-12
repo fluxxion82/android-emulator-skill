@@ -18,6 +18,11 @@ This module drives the documented path instead:
       -> navigator --find-text <name> --tap
       -> the `input tap x y` argv that actually reached adb
 
+SKILL.md's loop section names a second handoff, and it is driven here too (the
+last section of this module): a build id `build_and_test` printed goes back in
+as `--get-errors <id>`. `test_skill_index.py` requires every command that
+section shows to be run from this module.
+
 and asserts the tap landed inside the control that name belongs to. The expected
 rectangle is a literal in the inventory below, checked against the recorded
 hierarchy by ``test_the_case_inventory_matches_the_recorded_screen``, and never
@@ -58,6 +63,7 @@ from types import SimpleNamespace
 import navigator
 import pytest
 import screen_mapper
+from fake_toolchain import FakeToolchain, Rule
 
 from common import adb_exec
 
@@ -613,3 +619,60 @@ def test_the_expectation_is_not_read_from_the_tool_under_test(recorded):
     assert _expected_rect(screen, "Remember me") == (33, 754, 159, 880)
     assert _expected_rect(screen, "Dark theme") == (32, 890, 169, 1016)
     assert _expected_rect(screen, "Submit Order") == (32, 217, 375, 343)
+
+
+# ---------------------------------------------------------------------------
+# The second handoff: a printed build id opens that build's errors.
+# ---------------------------------------------------------------------------
+
+# The shape SKILL.md shows for an id. Read off the build's printed summary line,
+# never off its --json: the loop section tells the agent to pass back what was
+# printed.
+_BUILD_ID = re.compile(r"build-\d{8}-\d{6}-[0-9a-f]{8}")
+
+# K2's own error line in the recording: `e: file:///...Broken.kt:5:13 <message>`.
+_KOTLIN_ERROR = re.compile(r"^e: \S+ (.+)$", re.MULTILINE)
+
+
+def test_a_printed_build_id_opens_that_builds_errors(tmp_path, recorded_gradle):
+    """SKILL.md's second handoff: build, then pass the printed id to --get-errors.
+
+    The build is a recorded Kotlin compile failure answered by a stub gradlew;
+    the skill script runs as a subprocess with nothing else on PATH. The id is
+    parsed from the text the build printed and fed to the second command, and
+    the compiler's message expected there is read from the recording, so
+    nothing comes from this test's own idea of the output.
+    """
+    recording = recorded_gradle("gradle_kotlin_compile_error")
+    (message,) = _KOTLIN_ERROR.findall(recording)
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+    project = tmp_path / "proj"
+    project.mkdir()
+    chain.install(
+        "gradlew", [Rule(("assembleDebug",), stdout=recording, exit=1)], directory=project
+    )
+
+    build = chain.run("build_and_test.py", "--project", str(project))
+
+    assert build.returncode == 1, build.stdout + build.stderr
+    summary = build.stdout.splitlines()[0]
+    assert summary.startswith("Build: FAILED"), build.stdout
+    (build_id,) = _BUILD_ID.findall(summary)
+
+    errors = chain.run("build_and_test.py", "--get-errors", build_id)
+
+    assert errors.returncode == 0, errors.stdout + errors.stderr
+    assert message in errors.stdout, errors.stdout
+    assert len(chain.calls("gradlew")) == 1, "reading a build's errors ran the build again"
+
+
+def test_an_id_no_build_printed_opens_nothing(tmp_path):
+    """The control for the test above: --get-errors answers for a real id only."""
+    chain = FakeToolchain(tmp_path / "toolchain")
+    chain.assert_isolated()
+
+    errors = chain.run("build_and_test.py", "--get-errors", "build-20251028-143052-1a2b3c4d")
+
+    assert errors.returncode == 1, errors.stdout + errors.stderr
+    assert "Errors (" not in errors.stdout
