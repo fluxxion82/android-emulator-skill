@@ -35,6 +35,32 @@
             android:exported="true" />
 
         <!--
+          Six screens of one flow, reachable by tapping or by `-ei screen N`
+          (1..6). Recorded as `uiautomator_walk_*`; see WalkActivity.kt. The two
+          activities above are untouched, so their recordings stay valid.
+        -->
+        <activity
+            android:name=".WalkActivity"
+            android:exported="true" />
+
+        <!--
+          Text that changes by itself `-ei delay_ms N` after launch, with no
+          input. Recorded as `uiautomator_delayed_before` / `_after`.
+        -->
+        <activity
+            android:name=".DelayedActivity"
+            android:exported="true" />
+
+        <!--
+          A screen that never settles:
+          `-es mode ticker|animation|progress|view_ticker`. Recorded as
+          `uiautomator_never_idle_*`, to learn which of them a dump cannot read.
+        -->
+        <activity
+            android:name=".NeverIdleActivity"
+            android:exported="true" />
+
+        <!--
           Commits a StrictMode violation and finishes. Recorded as
           `logcat_strictmode_violation`; see StrictModeActivity.kt.
         -->

@@ -1221,6 +1221,113 @@
         "stderr"
       ],
       "recorded_at": "2026-10-26T07:18:21Z"
+    },
+    {
+      "name": "uiautomator_delayed_after",
+      "file": "uiautomator_delayed_after.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty (same launch as uiautomator_delayed_before, after the delay; no input between)",
+      "description": "The second dump of the launch uiautomator_delayed_before records: the status node now reads 'Order confirmed' and a new node, 'Order #5107', exists that the first document does not have. The manifest entry carries the clock: the first dump finished within the delay counted from the launch request, and this one started more than the delay after the launch command returned.",
+      "catches": [],
+      "bytes": 3898,
+      "exit_status": 0,
+      "stream": "stdout",
+      "delay_ms": 12000,
+      "input_between_dumps": "none",
+      "launch_command_took_s": 1.9,
+      "first_dump_finished_s_after_launch_requested": 4.7,
+      "second_dump_started_s_after_launch_returned": 15.0,
+      "recorded_at": "2026-11-11T23:20:30Z"
+    },
+    {
+      "name": "uiautomator_delayed_before",
+      "file": "uiautomator_delayed_before.xml",
+      "command": "adb shell am start -W -n com.example.composefixture/.DelayedActivity --ei delay_ms 12000; adb exec-out uiautomator dump /dev/tty (at once)",
+      "description": "DelayedActivity as it opens: the status node reads 'Placing order'. The same node reads 'Order confirmed' in uiautomator_delayed_after, which is a second dump of THIS launch, taken after the activity's own timer fired. Nothing was sent to the device between the two: no tap, no swipe, no key. That is what the Settings top/scrolled pair cannot show -- its transition was caused by a swipe -- and it is the ground truth for waiting on text: a reader that polls sees this document first and the other one later, with no action of its own. The screen is static while it waits (no spinner), so the dump reaches idle and succeeds.",
+      "catches": [],
+      "bytes": 3555,
+      "exit_status": 0,
+      "stream": "stdout",
+      "delay_ms": 12000,
+      "input_between_dumps": "none",
+      "launch_command_took_s": 1.9,
+      "first_dump_finished_s_after_launch_requested": 4.7,
+      "second_dump_started_s_after_launch_returned": 15.0,
+      "recorded_at": "2026-11-11T23:20:30Z"
+    },
+    {
+      "name": "uiautomator_dump_screen_asleep",
+      "file": "uiautomator_dump_screen_asleep.txt",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "The other way a dump fails: with the display asleep there is no active window, and uiautomator answers 'ERROR: null root node returned by UiTestAutomationBridge.' -- again on STDOUT with exit status 0 and an empty stderr, this time within about two seconds rather than eleven. Recorded after KEYCODE_SLEEP; the teardown wakes the device and reads its wakefulness back.",
+      "catches": [],
+      "bytes": 58,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 58,
+      "stderr_bytes": 0,
+      "recorded_at": "2026-11-11T22:52:18Z"
+    },
+    {
+      "name": "uiautomator_never_idle_animations_off",
+      "file": "uiautomator_never_idle_animations_off.txt",
+      "command": "adb shell settings put global {window_animation_scale,transition_animation_scale,animator_duration_scale} 0; adb exec-out uiautomator dump /dev/tty",
+      "description": "The same View ticker as uiautomator_never_idle_view_ticker, dumped with all three animation scales set to 0 and read back as 0. The answer is unchanged: 'ERROR: could not get idle state.' on stdout at exit 0. Disabling animations is the remedy usually given for this error -- it is the one common/hierarchy.py prints -- and it does nothing here, because nothing is animating: the content is changing. An agent told to disable animations will do so, retry, and fail the same way.",
+      "catches": [
+        "V10-A"
+      ],
+      "bytes": 33,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 33,
+      "stderr_bytes": 0,
+      "animation_scales_during_capture": "0",
+      "recorded_at": "2026-11-11T23:20:30Z"
+    },
+    {
+      "name": "uiautomator_never_idle_compose_animation",
+      "file": "uiautomator_never_idle_compose_animation.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "A Compose screen that never stops -- a box whose alpha animates for ever -- dumped successfully. This is the control for uiautomator_never_idle_view_ticker and it came out the other way round from what was expected: none of the three Compose variants recorded (a Text changing every 100 ms, an endless alpha animation, an indeterminate CircularProgressIndicator) stopped the dump of this app on this API level. A successful dump does not say why; what it gives is a counterexample. 'The screen is animating' does not by itself predict a capture failure, and a spinner is not by itself a reason to expect one.",
+      "catches": [],
+      "bytes": 3883,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-11-11T23:20:30Z"
+    },
+    {
+      "name": "uiautomator_never_idle_compose_progress",
+      "file": "uiautomator_never_idle_compose_progress.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "A Compose screen that never stops -- an indeterminate CircularProgressIndicator -- dumped successfully. This is the control for uiautomator_never_idle_view_ticker and it came out the other way round from what was expected: none of the three Compose variants recorded (a Text changing every 100 ms, an endless alpha animation, an indeterminate CircularProgressIndicator) stopped the dump of this app on this API level. A successful dump does not say why; what it gives is a counterexample. 'The screen is animating' does not by itself predict a capture failure, and a spinner is not by itself a reason to expect one.",
+      "catches": [],
+      "bytes": 3894,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-11-11T23:20:30Z"
+    },
+    {
+      "name": "uiautomator_never_idle_compose_ticker",
+      "file": "uiautomator_never_idle_compose_ticker.xml",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "A Compose screen that never stops -- a Text whose content changes every 100 ms -- dumped successfully. This is the control for uiautomator_never_idle_view_ticker and it came out the other way round from what was expected: none of the three Compose variants recorded (a Text changing every 100 ms, an endless alpha animation, an indeterminate CircularProgressIndicator) stopped the dump of this app on this API level. A successful dump does not say why; what it gives is a counterexample. 'The screen is animating' does not by itself predict a capture failure, and a spinner is not by itself a reason to expect one.",
+      "catches": [],
+      "bytes": 3906,
+      "exit_status": 0,
+      "stream": "stdout",
+      "recorded_at": "2026-11-11T23:20:30Z"
+    },
+    {
+      "name": "uiautomator_never_idle_view_ticker",
+      "file": "uiautomator_never_idle_view_ticker.txt",
+      "command": "adb exec-out uiautomator dump /dev/tty",
+      "description": "What `uiautomator dump` answers on a screen it cannot read: the one line 'ERROR: could not get idle state.' -- on STDOUT, with exit status 0 and nothing on stderr, about eleven seconds after it was asked (it waits ten for a one-second gap in accessibility events). A caller that trusts the exit status, or looks for an error on stderr, takes this for a successful dump of an empty screen. The screen is an android.widget.TextView whose text changes every 100 ms: each change raises a content-changed accessibility event, so the gap never comes. Only this screen was recorded; a stopwatch or a download counter built the same way would be expected to behave the same. Compare the three uiautomator_never_idle_compose_* fixtures, where content that never stops did NOT block the dump.",
+      "catches": [],
+      "bytes": 33,
+      "exit_status": 0,
+      "stream": "stdout",
+      "stdout_bytes": 33,
+      "stderr_bytes": 0,
+      "recorded_at": "2026-11-11T23:20:30Z"
     }
   ]
 }

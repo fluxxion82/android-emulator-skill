@@ -4,8 +4,8 @@ These are the payoff of ``tests/record_fixtures.py``. Every assertion here runs
 against bytes a real device actually produced, never a hand-written literal.
 
 A known defect is pinned here with ``xfail(strict=True)`` against its defect ID
-until it is fixed; none is pinned today. That convention is deliberate and
-load-bearing:
+until it is fixed; one is pinned today (V10-A, at the end of this file). That
+convention is deliberate and load-bearing:
 
 - The suite stays honest — a known-broken parser is not reported as passing.
 - ``strict=True`` means the test *fails* if it unexpectedly passes, so whoever
@@ -980,3 +980,52 @@ def test_the_whole_package_table_names_the_fixture_app_and_a_shared_uid(recorded
         if parse_package_uids(table, name) == frozenset({1000})
     ]
     assert {"android", "com.android.localtransport"} <= set(on_system)
+
+
+# ---------------------------------------------------------------------------
+# V10-A: the remedy for a dump that cannot reach idle (v0.10.0 ground truth).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "V10-A: common/hierarchy.py says 'The screen is still animating; wait for it to "
+        "settle, or disable animations'. uiautomator_never_idle_animations_off is that "
+        "advice followed -- all three scales at 0 -- and the dump fails identically, "
+        "because the screen's content is changing, not animating. Fixed with the "
+        "unreadable-screen answer of navigator --wait-for; delete this marker there."
+    ),
+)
+def test_the_idle_failure_remedy_covers_content_that_keeps_changing(recorded, monkeypatch):
+    """The error must not send the reader after a fix the recording shows does nothing."""
+    import subprocess
+
+    from common import adb_exec, hierarchy
+
+    entry = next(
+        e
+        for e in recorded.manifest["fixtures"]
+        if e["name"] == "uiautomator_never_idle_animations_off"
+    )
+    assert entry["animation_scales_during_capture"] == "0"
+    payload = recorded.text("uiautomator_never_idle_animations_off")
+    monkeypatch.setattr(
+        adb_exec.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, entry["exit_status"], payload, ""),
+    )
+    monkeypatch.setattr(hierarchy.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(hierarchy.HierarchyError) as excinfo:
+        hierarchy.capture_hierarchy("emulator-5554", retries=2)
+
+    message = str(excinfo.value).lower()
+    # The changing has to be said OF the content: a noun, at most three words, then
+    # "changing" or "updating". Neither "change the animation scales to zero" nor "the
+    # content is still animating; change the scales" is that -- both are the same advice.
+    said_of_content = r"\b(content|text|counter|timer)(\s+\w+){0,3}\s+(chang|updat)ing\b"
+    assert re.search(said_of_content, message), (
+        "the remedy names animation only; a screen whose content keeps changing (a timer, a "
+        "counter) fails the same way with animations disabled"
+    )

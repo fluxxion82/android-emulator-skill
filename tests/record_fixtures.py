@@ -44,9 +44,13 @@ Five documented departures from verbatim, all visible in the code below:
    -- a phone attached to the recording host -- is replaced by
    ``SERIALREDACTED`` (``_redact_serials``). Its row and state are kept.
 
-Three fixtures are written through ``capture_bytes`` and so skip (1) and (2)
-entirely; each carries its own check instead.
+The fixtures written through ``capture_bytes`` skip (1) and (2) entirely; each
+carries its own check instead.
 
+- The six ``screencap_walk_*`` PNGs are whole screens with one edit: the rows
+  above the app's first element, which hold the status bar, are painted over
+  in the screen's background colour (``_walk_screenshot``). Everything else is
+  the device's pixels, re-encoded losslessly.
 - The status-bar PNGs and ``am_profile_hang.trace`` are binary: newline
   translation or aliasing would corrupt them -- the trace's record stream is
   little-endian integers, and a 0x0d byte in a clock value is not a line
@@ -900,6 +904,211 @@ def _status_bar_strip_showing(demo_clock_applied: bool) -> Callable[[str, dict],
         return _status_bar_strip(serial, extra)
 
     return capture
+
+
+# --- the six-screen walk, text that arrives late, screens that never settle ---
+# All three come from activities in tests/fixtures/scaffold/compose
+# (WalkActivity.kt). Build and install it first.
+
+# (screen number, slug, a text only that screen carries). The text is what a
+# capture is refused without: `--ei screen N` is clamped, so a typo would
+# otherwise record screen 1 six times under six names.
+WALK_SCREENS: tuple[tuple[int, str, str], ...] = (
+    (1, "catalog", "Open cart"),
+    (2, "product", "Add to cart"),
+    (3, "cart", "Keep shopping"),
+    (4, "checkout", "Place order"),
+    (5, "confirmation", "Arrives Thursday"),
+    (6, "settings", "Use cellular data"),
+)
+
+# A whole 1080x2424 screenshot of a flat Material screen is 35-65KB optimised
+# (measured on screens 1 and 4). The launcher's wallpaper makes one 1.4MB, which
+# is why these are taken over the fixture app and nothing else.
+MAX_WALK_PNG_BYTES = 100 * 1024
+
+# How long DelayedActivity waits before it changes its text. Long enough that a
+# dump -- which itself waits a second for idle and takes two or three in all --
+# finishes well inside it.
+DELAYED_MS = 12000
+
+_DUMP = ["exec-out", "uiautomator", "dump", "/dev/tty"]
+
+
+def _open_walk(screen: int) -> list[list[str]]:
+    """Setup steps that open WalkActivity directly on ``screen``."""
+    return [
+        ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+        [
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-n",
+            f"{COMPOSE_PACKAGE}/.WalkActivity",
+            "--ei",
+            "screen",
+            str(screen),
+        ],
+        ["shell", "sleep", "1"],
+    ]
+
+
+# --- global settings a recorder changes, and gets back ----------------------
+# `settings put` prints nothing whether it worked or not, and a recorder that
+# raises half way never reaches cleanup of its own. So a value is saved before
+# it is changed, and the fixture's `teardown_verify` -- which the recording loop
+# runs however the capture ended -- puts every saved value back, each one
+# independently of the others, and reads them all back.
+_SAVED_GLOBAL_SETTINGS: dict[tuple[str, str], str] = {}
+
+
+def _global_setting(serial: str, key: str) -> str:
+    """One global setting as `settings get` prints it: "null" when it is unset.
+
+    A read that failed is refused, never returned. Its text would otherwise be
+    saved as the setting's original value and written back into the setting at
+    restore time: `error: device offline`, restored faithfully, read back equal.
+    """
+    result = _run(["shell", "settings", "get", "global", key], serial, timeout=15)
+    value = result.stdout.strip()
+    if result.returncode != 0 or result.stderr.strip() or not value:
+        raise CaptureError(
+            f"could not read global setting {key} (exit {result.returncode}): "
+            f"{result.text.strip()[:200]!r}"
+        )
+    return value
+
+
+def _put_global_setting(serial: str, key: str, value: str) -> None:
+    """Change a global setting, remembering what it was, and read the change back."""
+    if (serial, key) not in _SAVED_GLOBAL_SETTINGS:
+        _SAVED_GLOBAL_SETTINGS[(serial, key)] = _global_setting(serial, key)
+    _run(["shell", "settings", "put", "global", key, value], serial, timeout=15)
+    now = _global_setting(serial, key)
+    if now != value:
+        raise CaptureError(f"`settings put global {key} {value}` read back as {now!r}")
+
+
+def _global_settings_restored(*keys: str) -> Callable[[str], None]:
+    """``teardown_verify``: put back every saved value of ``keys`` and read each one back."""
+
+    def verify(serial: str) -> None:
+        problems = []
+        for key in keys:
+            original = _SAVED_GLOBAL_SETTINGS.get((serial, key))
+            if original is None:
+                continue  # never changed: the run failed before reaching it
+            try:
+                if original == "null":
+                    _run(["shell", "settings", "delete", "global", key], serial, timeout=15)
+                else:
+                    _run(["shell", "settings", "put", "global", key, original], serial, timeout=15)
+                now = _global_setting(serial, key)
+            except CaptureError as exc:
+                problems.append(f"{key} could not be put back to {original!r} ({exc})")
+                continue
+            if now != original:
+                problems.append(f"{key} was {original!r} and is {now!r}")
+                continue
+            # Forgotten only once it is back: a restore that failed keeps the
+            # true original, so a retry -- or the next fixture to change this
+            # setting -- does not take the changed value for the baseline.
+            del _SAVED_GLOBAL_SETTINGS[(serial, key)]
+        if problems:
+            raise CaptureError("global settings not restored: " + "; ".join(problems))
+
+    return verify
+
+
+# Where the app's own content starts, read off the dump: the top of the node
+# every walk screen opens with.
+_WALK_TITLE_TOP = re.compile(r'resource-id="screen_title"[^>]*?bounds="\[\d+,(\d+)\]')
+
+
+def _walk_screenshot(marker: str) -> Callable[[str, dict], bytes]:
+    """Screencap the walk screen that carries ``marker`` as a PNG, less its status bar.
+
+    A screenshot cannot be asked what it shows, so the hierarchy is dumped
+    before it and again after it, and the capture refused unless the fixture
+    app is on top with the marker on screen both times.
+
+    The status bar is painted over on the host, in the screen's own background
+    colour: every row above the app's first element. Its clock and icons are
+    the recording machine's -- on a developer's emulator the icons belong to
+    whatever else is installed -- and nothing below them is. An earlier version
+    put the device in demo mode instead, and needed three review rounds without
+    ever proving it had left demo mode again. This one changes nothing on the
+    device. The dimensions stay the device's; both they and the number of rows
+    painted go in the manifest.
+    """
+
+    def capture(serial: str, extra: dict) -> bytes:
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover - depends on the host
+            raise CaptureError(
+                "Pillow is required to record the walk screenshots. Run the "
+                "recorder with it available, e.g.\n"
+                "  uv run --python 3.12 --with pillow python tests/record_fixtures.py ..."
+            ) from exc
+
+        import io
+
+        def dump_of_this_screen(when: str) -> str:
+            dump = _run(_DUMP, serial, timeout=60).text
+            if f'package="{COMPOSE_PACKAGE}"' not in dump or marker not in dump:
+                raise CaptureError(
+                    f"{when} the screenshot the screen is not the walk screen with "
+                    f"{marker!r}: {dump.strip()[:120]!r}"
+                )
+            return dump
+
+        # Dump and screencap are two commands; a display timeout or an overlay
+        # between them would put a different screen in the PNG than was checked.
+        dump = dump_of_this_screen("before")
+        raw = _run_bytes(["exec-out", "screencap", "-p"], serial, timeout=60)
+        dump_of_this_screen("after")
+        title = _WALK_TITLE_TOP.search(dump)
+        if title is None:
+            raise CaptureError("the dump names no screen_title node to measure the status bar by")
+        content_top = int(title.group(1))
+        try:
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+        except OSError as exc:  # Pillow's UnidentifiedImageError is one
+            raise CaptureError(f"screencap did not return an image: {exc}") from exc
+        if not 0 < content_top < image.height // 4:
+            raise CaptureError(
+                f"the app's content starts at row {content_top} of {image.height}: that is "
+                f"not a status bar's height, and painting it out would paint the app"
+            )
+        background = image.getpixel((0, content_top))
+        image.paste(background, (0, 0, image.width, content_top))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        payload = buffer.getvalue()
+        if len(payload) > MAX_WALK_PNG_BYTES:
+            raise CaptureError(
+                f"walk screenshot is {len(payload)} bytes, over the "
+                f"{MAX_WALK_PNG_BYTES}-byte budget; something other than the flat "
+                f"fixture screen is in it."
+            )
+        extra["width"], extra["height"] = image.size
+        extra["status_bar_rows_painted_out"] = content_top
+        return payload
+
+    return capture
+
+
+def _device_awake(serial: str) -> None:
+    """Read the wakefulness back after waking the device; a key event says nothing."""
+    for _ in range(10):
+        power = _run(["shell", "dumpsys", "power"], serial, timeout=30).text
+        if "mWakefulness=Awake" in power:
+            return
+        _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial, timeout=15)
+        time.sleep(1)
+    raise CaptureError("the device did not report mWakefulness=Awake after teardown")
 
 
 def _anr_for(package: str) -> Callable[[str], str]:
@@ -3364,6 +3573,106 @@ def _text_twin(name: str, first_half: str) -> Callable[[Path, str, dict], Captur
         return result
 
     return capture
+
+
+def _delayed_window(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """Two dumps of one launch of DelayedActivity, with no input between them.
+
+    The activity opens on "Placing order" and changes that text to "Order
+    confirmed" :data:`DELAYED_MS` later, by itself. The first dump is taken as
+    soon as the launch returns (this fixture); the second after the delay has
+    passed (uiautomator_delayed_after). Between them the recorder only sleeps.
+
+    Both are refused unless they carry what they exist to show: the first must
+    hold the early text and not the late one, the second the late one. And both
+    are refused unless the clock agrees, by bounds that do not depend on when
+    inside the launch the activity started its timer: the first dump must have
+    finished within the delay counted from the launch REQUEST, the second must
+    have started more than the delay after the launch RETURNED.
+    """
+    component = f"{COMPOSE_PACKAGE}/.DelayedActivity"
+    delay_s = DELAYED_MS / 1000
+    _run(["shell", "am", "force-stop", COMPOSE_PACKAGE], serial, timeout=30)
+    requested = time.monotonic()
+    started = _run(
+        ["shell", "am", "start", "-W", "-n", component, "--ei", "delay_ms", str(DELAYED_MS)],
+        serial,
+        timeout=60,
+    )
+    returned = time.monotonic()
+    if "Status: ok" not in started.text:
+        raise CaptureError(f"DelayedActivity did not launch: {started.text.strip()[:200]!r}")
+    before = _run(_DUMP, serial, timeout=60)
+    first_done = time.monotonic()
+    # The activity started its timer at some moment between `requested` and
+    # `returned`, so the text changes no earlier than requested + delay and
+    # no later than returned + delay. The second dump waits out the latter.
+    remaining = returned + delay_s + 3 - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+    second_started = time.monotonic()
+    after = _run(_DUMP, serial, timeout=60)
+
+    if first_done - requested >= delay_s:
+        raise CaptureError(
+            f"the first dump finished {first_done - requested:.1f}s after the launch was "
+            f"requested, not inside the {delay_s:.0f}s delay: it cannot be shown to precede "
+            f"the change, whatever it contains"
+        )
+    if second_started - returned <= delay_s:
+        raise CaptureError("the second dump started before the delay must have elapsed")
+    if "Placing order" not in before.text or "Order confirmed" in before.text:
+        raise CaptureError("the first dump does not show the early text alone")
+    if "Order confirmed" not in after.text or "Placing order" in after.text:
+        raise CaptureError("the second dump does not show the late text alone")
+    provenance = {
+        "delay_ms": DELAYED_MS,
+        "input_between_dumps": "none",
+        "launch_command_took_s": round(returned - requested, 1),
+        "first_dump_finished_s_after_launch_requested": round(first_done - requested, 1),
+        "second_dump_started_s_after_launch_returned": round(second_started - returned, 1),
+    }
+    _TEXT_TWINS["uiautomator_delayed_after"] = (after, provenance)
+    extra.update(provenance)
+    return before
+
+
+_ANIMATION_SCALES = (
+    "window_animation_scale",
+    "transition_animation_scale",
+    "animator_duration_scale",
+)
+
+
+def _view_ticker_with_animations_off(_scratch: Path, serial: str) -> None:
+    """``prepare``: all three animation scales at 0, read back, then open the View ticker.
+
+    "Disable animations" is the standard remedy for a dump that cannot reach
+    idle, and the one the skill's own error message gives. The scales are saved
+    as they are changed and restored by ``_global_settings_restored``, which the
+    recording loop runs whether or not the capture succeeded.
+    """
+    for key in _ANIMATION_SCALES:
+        _put_global_setting(serial, key, "0")
+    _run(["shell", "am", "force-stop", COMPOSE_PACKAGE], serial, timeout=30)
+    started = _run(
+        [
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-n",
+            f"{COMPOSE_PACKAGE}/.NeverIdleActivity",
+            "--es",
+            "mode",
+            "view_ticker",
+        ],
+        serial,
+        timeout=60,
+    )
+    if "Status: ok" not in started.text:
+        raise CaptureError(f"NeverIdleActivity did not launch: {started.text.strip()[:200]!r}")
+    time.sleep(1)
 
 
 def _users_listed(serial: str) -> str:
@@ -7594,6 +7903,242 @@ FIXTURES: list[Fixture] = [
         ],
         teardown=[["shell", "am", "broadcast", "-a", DEMO_ACTION, "-e", "command", "exit"]],
     ),
+    # --- text that arrives late, with no input ------------------------------
+    Fixture(
+        name="uiautomator_delayed_before",
+        emulator_only=True,
+        ext="xml",
+        args=_DUMP,
+        command=(
+            f"adb shell am start -W -n {COMPOSE_PACKAGE}/.DelayedActivity --ei delay_ms "
+            f"{DELAYED_MS}; adb exec-out uiautomator dump /dev/tty (at once)"
+        ),
+        description=(
+            "DelayedActivity as it opens: the status node reads 'Placing order'. "
+            "The same node reads 'Order confirmed' in uiautomator_delayed_after, "
+            "which is a second dump of THIS launch, taken after the activity's "
+            "own timer fired. Nothing was sent to the device between the two: no "
+            "tap, no swipe, no key. That is what the Settings top/scrolled pair "
+            "cannot show -- its transition was caused by a swipe -- and it is the "
+            "ground truth for waiting on text: a reader that polls sees this "
+            "document first and the other one later, with no action of its own. "
+            "The screen is static while it waits (no spinner), so the dump "
+            "reaches idle and succeeds."
+        ),
+        capture_with=_delayed_window,
+        # Stopped here, not inside the capture: the loop checks this command's
+        # exit status and reports it, which a `finally` of its own did not.
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        post=_screen_of(COMPOSE_PACKAGE, require=("Placing order",), forbid=("Order confirmed",)),
+    ),
+    Fixture(
+        name="uiautomator_delayed_after",
+        emulator_only=True,
+        ext="xml",
+        args=_DUMP,
+        command=(
+            "adb exec-out uiautomator dump /dev/tty (same launch as "
+            "uiautomator_delayed_before, after the delay; no input between)"
+        ),
+        description=(
+            "The second dump of the launch uiautomator_delayed_before records: "
+            "the status node now reads 'Order confirmed' and a new node, 'Order "
+            "#5107', exists that the first document does not have. The manifest "
+            "entry carries the clock: the first dump finished within the delay "
+            "counted from the launch request, and this one started more than "
+            "the delay after the launch command returned."
+        ),
+        capture_with=_text_twin("uiautomator_delayed_after", "uiautomator_delayed_before"),
+        post=_screen_of(
+            COMPOSE_PACKAGE, require=("Order confirmed", "Order #5107"), forbid=("Placing order",)
+        ),
+    ),
+    # --- screens that never settle: which of them can a dump not read? ------
+    Fixture(
+        name="uiautomator_never_idle_view_ticker",
+        emulator_only=True,
+        timeout=60,
+        args=_DUMP,
+        description=(
+            "What `uiautomator dump` answers on a screen it cannot read: the one "
+            "line 'ERROR: could not get idle state.' -- on STDOUT, with exit "
+            "status 0 and nothing on stderr, about eleven seconds after it was "
+            "asked (it waits ten for a one-second gap in accessibility events). "
+            "A caller that trusts the exit status, or looks for an error on "
+            "stderr, takes this for a successful dump of an empty screen. The "
+            "screen is an android.widget.TextView whose text changes every "
+            "100 ms: each change raises a content-changed accessibility event, "
+            "so the gap never comes. Only this screen was recorded; a stopwatch "
+            "or a download counter built the same way would be expected to "
+            "behave the same. Compare the three uiautomator_never_idle_compose_* "
+            "fixtures, where content that never stops did NOT block the dump."
+        ),
+        setup=[
+            ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+            [
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-n",
+                f"{COMPOSE_PACKAGE}/.NeverIdleActivity",
+                "--es",
+                "mode",
+                "view_ticker",
+            ],
+            ["shell", "sleep", "1"],
+        ],
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        record_both_streams=True,
+        post=_requires("could not get idle state", absent=("<hierarchy",)),
+    ),
+    Fixture(
+        name="uiautomator_never_idle_animations_off",
+        emulator_only=True,
+        timeout=60,
+        args=_DUMP,
+        command=(
+            "adb shell settings put global {window_animation_scale,"
+            "transition_animation_scale,animator_duration_scale} 0; "
+            "adb exec-out uiautomator dump /dev/tty"
+        ),
+        description=(
+            "The same View ticker as uiautomator_never_idle_view_ticker, dumped "
+            "with all three animation scales set to 0 and read back as 0. The "
+            "answer is unchanged: 'ERROR: could not get idle state.' on stdout "
+            "at exit 0. Disabling animations is the remedy usually given for "
+            "this error -- it is the one common/hierarchy.py prints -- and it "
+            "does nothing here, because nothing is animating: the content is "
+            "changing. An agent told to disable animations will do so, retry, "
+            "and fail the same way."
+        ),
+        catches=("V10-A",),
+        prepare=_view_ticker_with_animations_off,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        teardown_verify=_global_settings_restored(*_ANIMATION_SCALES),
+        # Not a guess: the prepare step refuses to go on unless each reads back 0.
+        metadata=lambda _serial: {"animation_scales_during_capture": "0"},
+        record_both_streams=True,
+        post=_requires("could not get idle state", absent=("<hierarchy",)),
+    ),
+    *[
+        Fixture(
+            name=f"uiautomator_never_idle_compose_{mode}",
+            emulator_only=True,
+            ext="xml",
+            timeout=60,
+            args=_DUMP,
+            description=(
+                f"A Compose screen that never stops -- {what} -- dumped "
+                "successfully. This is the control for uiautomator_never_idle_"
+                "view_ticker and it came out the other way round from what was "
+                "expected: none of the three Compose variants recorded (a Text "
+                "changing every 100 ms, an endless alpha animation, an "
+                "indeterminate CircularProgressIndicator) stopped the dump of "
+                "this app on this API level. A successful dump does not say "
+                "why; what it gives is a counterexample. 'The screen is "
+                "animating' does not by itself predict a capture failure, and "
+                "a spinner is not by itself a reason to expect one."
+            ),
+            setup=[
+                ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+                [
+                    "shell",
+                    "am",
+                    "start",
+                    "-W",
+                    "-n",
+                    f"{COMPOSE_PACKAGE}/.NeverIdleActivity",
+                    "--es",
+                    "mode",
+                    mode,
+                ],
+                ["shell", "sleep", "1"],
+            ],
+            teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+            post=_screen_of(COMPOSE_PACKAGE, require=("Syncing", marker)),
+        )
+        for mode, what, marker in (
+            ("ticker", "a Text whose content changes every 100 ms", "sync_counter"),
+            ("animation", "a box whose alpha animates for ever", "sync_pulse"),
+            ("progress", "an indeterminate CircularProgressIndicator", "sync_spinner"),
+        )
+    ],
+    Fixture(
+        name="uiautomator_dump_screen_asleep",
+        emulator_only=True,
+        timeout=60,
+        args=_DUMP,
+        description=(
+            "The other way a dump fails: with the display asleep there is no "
+            "active window, and uiautomator answers 'ERROR: null root node "
+            "returned by UiTestAutomationBridge.' -- again on STDOUT with exit "
+            "status 0 and an empty stderr, this time within about two seconds "
+            "rather than eleven. Recorded after KEYCODE_SLEEP; the teardown "
+            "wakes the device and reads its wakefulness back."
+        ),
+        setup=[
+            ["shell", "input", "keyevent", "KEYCODE_SLEEP"],
+            ["shell", "sleep", "2"],
+        ],
+        teardown=[
+            ["shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+            ["shell", "wm", "dismiss-keyguard"],
+        ],
+        teardown_verify=_device_awake,
+        record_both_streams=True,
+        post=_requires("null root node", absent=("<hierarchy",)),
+    ),
+    # --- six screens of one flow: a walk that is a walk ---------------------
+    *[
+        Fixture(
+            name=f"uiautomator_walk_{number}_{slug}",
+            emulator_only=True,
+            ext="xml",
+            args=_DUMP,
+            description=(
+                f"Screen {number} of 6 ({slug}) of the fixture app's shopping flow "
+                "(WalkActivity): catalog, product, cart, checkout, confirmation, "
+                "settings. Six different screens of one app, each reachable from "
+                "the one before by a button, so a cost measured over them is the "
+                "cost of a walk. The older Compose fixtures are two variants of a "
+                "single screen. Opened directly with `--ei screen N` so the "
+                f"recording does not depend on taps; refused unless {marker!r}, "
+                "which only this screen carries, is on it. The root sets "
+                "testTagsAsResourceId, so tagged controls carry bare resource-ids."
+            ),
+            setup=_open_walk(number),
+            teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+            post=_screen_of(COMPOSE_PACKAGE, require=(marker,)),
+        )
+        for number, slug, marker in WALK_SCREENS
+    ],
+    *[
+        Fixture(
+            name=f"screencap_walk_{number}_{slug}",
+            emulator_only=True,
+            # What capture_bytes runs, after a dump that checks the screen.
+            args=["exec-out", "screencap", "-p"],
+            ext="png",
+            capture_bytes=_walk_screenshot(marker),
+            description=(
+                f"Walk screen {number} ({slug}) as a screenshot, re-encoded "
+                "losslessly, with ONE edit: the rows above the app's first "
+                "element -- the status bar -- are painted over in the screen's "
+                "own background colour, because its clock and icons are the "
+                "recording machine's. The image keeps the device's pixel "
+                "dimensions; the manifest entry gives them and the number of "
+                "rows painted. The hierarchy was checked before and after the "
+                "capture. This is the image a screenshot-reading agent would be "
+                f"sent for the screen uiautomator_walk_{number}_{slug} describes "
+                "as text, less its status bar."
+            ),
+            # Nothing on the device is changed: no demo mode, no setting.
+            setup=_open_walk(number),
+            teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        )
+        for number, slug, marker in WALK_SCREENS
+    ],
 ]
 
 
@@ -8006,7 +8551,13 @@ def record(serial: str | None, only: set[str] | None, profile: str) -> int:
             # somebody owns. Its exit status is checked, and `teardown_verify`
             # reads the state back rather than trusting the command's word.
             for cmd in fixture.teardown:
-                result = _run(cmd, serial)
+                # Each on its own: a timeout here used to leave the loop, and
+                # with it the remaining commands and the readback below.
+                try:
+                    result = _run(cmd, serial)
+                except CaptureError as exc:
+                    restore_failures.append(f"{fixture.name}: `adb {' '.join(cmd)}`: {exc}")
+                    continue
                 if result.returncode != 0:
                     restore_failures.append(
                         f"{fixture.name}: `adb {' '.join(cmd)}` exited "
