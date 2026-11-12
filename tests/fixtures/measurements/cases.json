@@ -1,0 +1,24 @@
+{
+  "profile": "emulator-api35",
+  "about": "What tests/measure_costs.py measures. Every input is a recording under tests/fixtures/recorded/<profile>/; nothing here is a number. `fixture` is the screen's uiautomator dump and `focus` the focused-window lines of `dumpsys window` recorded with that same screen on top: the two things a script asks the device for. `walk` orders the six screens of the fixture app's shopping flow (WalkActivity); a screen without it is a single recorded screen, replayed, not part of any walk. `find_text` is what an agent would look for on that screen to act next.",
+  "outputs": [
+    {"id": "raw_dump", "what": "the XML document `adb exec-out uiautomator dump /dev/tty` returns"},
+    {"id": "screen_mapper", "tool": "screen_mapper", "argv": []},
+    {"id": "screen_mapper_verbose", "tool": "screen_mapper", "argv": ["--verbose"]},
+    {"id": "navigator_list", "tool": "navigator", "argv": ["--list"]},
+    {"id": "navigator_find_text", "tool": "navigator", "argv": ["--find-text", "{find_text}"]}
+  ],
+  "screens": [
+    {"id": "walk_1_catalog", "walk": 1, "fixture": "uiautomator_walk_1_catalog", "find_text": "Open cart", "screenshot": "screencap_walk_1_catalog", "focus": "dumpsys_window_focus_walk_1_catalog"},
+    {"id": "walk_2_product", "walk": 2, "fixture": "uiautomator_walk_2_product", "find_text": "Add to cart", "screenshot": "screencap_walk_2_product", "focus": "dumpsys_window_focus_walk_2_product"},
+    {"id": "walk_3_cart", "walk": 3, "fixture": "uiautomator_walk_3_cart", "find_text": "Checkout", "screenshot": "screencap_walk_3_cart", "focus": "dumpsys_window_focus_walk_3_cart"},
+    {"id": "walk_4_checkout", "walk": 4, "fixture": "uiautomator_walk_4_checkout", "find_text": "Place order", "screenshot": "screencap_walk_4_checkout", "focus": "dumpsys_window_focus_walk_4_checkout"},
+    {"id": "walk_5_confirmation", "walk": 5, "fixture": "uiautomator_walk_5_confirmation", "find_text": "Open settings", "screenshot": "screencap_walk_5_confirmation", "focus": "dumpsys_window_focus_walk_5_confirmation"},
+    {"id": "walk_6_settings", "walk": 6, "fixture": "uiautomator_walk_6_settings", "find_text": "Back to catalog", "screenshot": "screencap_walk_6_settings", "focus": "dumpsys_window_focus_walk_6_settings"},
+    {"id": "compose_single_screen", "fixture": "uiautomator_compose_default", "find_text": "Submit Order", "focus": "dumpsys_window_focus_compose_default"},
+    {"id": "settings_home", "fixture": "uiautomator_settings_top", "find_text": "Notifications", "focus": "dumpsys_window_focus_settings_top"},
+    {"id": "dialer_keypad", "fixture": "uiautomator_dialer_keypad", "find_text": "Call", "focus": "dumpsys_window_focus_dialer_keypad"}
+  ],
+  "stream": {"fixture": "uiautomator_dump_raw", "what": "the same dump as exec-out delivers it, status line included"},
+  "screenshot_presets": ["full", "half", "quarter", "thumb"]
+}

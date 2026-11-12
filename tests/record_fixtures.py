@@ -934,6 +934,10 @@ DELAYED_MS = 12000
 
 _DUMP = ["exec-out", "uiautomator", "dump", "/dev/tty"]
 
+# The two focus lines of `dumpsys window`, filtered on the device: the whole
+# dump lists every window of every app installed on the recording machine.
+_FOCUS_LINES = ["shell", "dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp'"]
+
 
 def _open_walk(screen: int) -> list[list[str]]:
     """Setup steps that open WalkActivity directly on ``screen``."""
@@ -8138,6 +8142,81 @@ FIXTURES: list[Fixture] = [
             teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
         )
         for number, slug, marker in WALK_SCREENS
+    ],
+    # --- the focused activity behind each measured screen -------------------
+    # screen_mapper names the screen it maps by asking `dumpsys window` which
+    # activity has focus. tests/measure_costs.py replays these beside the dump
+    # of the same screen; without them its mapper rows said "Unknown Screen"
+    # and were short by the length of a component name.
+    *[
+        Fixture(
+            name=f"dumpsys_window_focus_{case}",
+            emulator_only=True,
+            args=_FOCUS_LINES,
+            description=(
+                f"The focused-window lines of `dumpsys window` with {what} on top: "
+                "what screen_mapper reads to name the screen in its header. "
+                "Filtered on the device to the two focus lines, as "
+                "dumpsys_window_focus is, because the whole dump lists every "
+                "window of every app on the recording machine. Opened by the "
+                f"same steps as the dump it is replayed beside ({dump})."
+            ),
+            setup=setup,
+            teardown=[["shell", "am", "force-stop", package]],
+            post=_requires("mCurrentFocus", component),
+        )
+        for case, what, dump, setup, package, component in (
+            *[
+                (
+                    f"walk_{number}_{slug}",
+                    f"walk screen {number} ({slug})",
+                    f"uiautomator_walk_{number}_{slug}",
+                    _open_walk(number),
+                    COMPOSE_PACKAGE,
+                    f"{COMPOSE_PACKAGE}/.WalkActivity",
+                )
+                for number, slug, _marker in WALK_SCREENS
+            ],
+            (
+                "compose_default",
+                "the fixture app's first Compose screen",
+                "uiautomator_compose_default",
+                [
+                    ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+                    ["shell", "am", "start", "-W", "-n", f"{COMPOSE_PACKAGE}/.DefaultActivity"],
+                    ["shell", "sleep", "1"],
+                ],
+                COMPOSE_PACKAGE,
+                f"{COMPOSE_PACKAGE}/.DefaultActivity",
+            ),
+            (
+                "settings_top",
+                "Settings home",
+                "uiautomator_settings_top",
+                _OPEN_SETTINGS,
+                SETTINGS_PACKAGE,
+                f"{SETTINGS_PACKAGE}/",
+            ),
+            (
+                "dialer_keypad",
+                "the dialer keypad",
+                "uiautomator_dialer_keypad",
+                [
+                    [
+                        "shell",
+                        "am",
+                        "start",
+                        "-a",
+                        "android.intent.action.DIAL",
+                        "-d",
+                        "tel:5551234",
+                    ],
+                    ["shell", "sleep", "3"],
+                ],
+                DIALER_PACKAGE,
+                f"{DIALER_PACKAGE}/",
+            ),
+        )
     ],
 ]
 

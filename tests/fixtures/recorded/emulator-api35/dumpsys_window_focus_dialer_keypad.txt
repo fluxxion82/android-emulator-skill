@@ -1,0 +1,2 @@
+  mCurrentFocus=Window{1717c57 u0 com.google.android.dialer/com.android.dialer.main.impl.MainActivityDialAlias}
+  mFocusedApp=ActivityRecord{c3539c0 u0 com.google.android.dialer/com.android.dialer.main.impl.MainActivityDialAlias t917}

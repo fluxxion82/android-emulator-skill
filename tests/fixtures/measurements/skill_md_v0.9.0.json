@@ -1,0 +1,11 @@
+{
+  "about": "SKILL.md as v0.9.0 shipped it: the 'before' of v0.10.0's diet. Written once by tests/measure_costs.py's measure_skill() and not regenerated. To check it: git show f9ab727:android-emulator-skill/skills/android-emulator-skill/SKILL.md | wc -c",
+  "release": "0.9.0",
+  "commit": "f9ab727",
+  "path": "android-emulator-skill/skills/android-emulator-skill/SKILL.md",
+  "bytes": 156541,
+  "tokens_est": 39135,
+  "sha256": "cf2eb70b618464bf5cafc2caa38254f1000b569662ee58d5e1d67b875fa90499",
+  "references": "not present",
+  "skill_md_plus_largest_reference": "not present"
+}

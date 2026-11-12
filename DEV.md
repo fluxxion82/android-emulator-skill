@@ -108,5 +108,11 @@ git tag vX.Y.Z && git push origin main --tags
   records it), never inline tool output; CLAUDE.md states the rule and `tests/test_fixture_policy.py`
   enforces it.
 - **Emulator tests** (`@pytest.mark.emulator`, deselected by default) run with `pytest -m emulator`.
+- **Measured costs.** `python tests/measure_costs.py` prints what one screen costs to read as a raw
+  dump and through `screen_mapper` / `navigator`, from the recordings; nothing in it is typed. The
+  screen rows are committed as `tests/fixtures/measurements/expected.json` and compared by
+  `tests/test_measure_costs.py`, so a script whose output grows fails a test. When that is
+  intended, `python tests/measure_costs.py --write` and commit the diff. SKILL.md's size is
+  measured live; `skill_md_v0.9.0.json` is the frozen size it had before v0.10.0.
 - **Manual smoke** (per change touching device behavior): boot an emulator, run
   `bash .../scripts/android_health_check.sh`, then exercise a launch → map → navigate flow.
