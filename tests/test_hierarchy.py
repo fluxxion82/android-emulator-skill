@@ -66,6 +66,16 @@ def _recorded(name: str) -> str:
     return (RECORDED / f"{name}.xml").read_text(encoding="utf-8")
 
 
+def _recorded_failure(name: str) -> str:
+    """What uiautomator printed, at exit 0, when it could not read the screen."""
+    return (RECORDED / f"{name}.txt").read_text(encoding="utf-8")
+
+
+# A TextView whose text never stops changing, and a display that is asleep.
+NOT_IDLE = "uiautomator_never_idle_view_ticker"
+NO_ROOT = "uiautomator_dump_screen_asleep"
+
+
 # ---------------------------------------------------------------------------
 # No temp files, on either side.
 # ---------------------------------------------------------------------------
@@ -182,7 +192,7 @@ def test_capture_retries_when_the_ui_is_not_idle(fake_dump):
     turns most of those into a success.
     """
     fake_dump(
-        "ERROR: could not get idle state.",
+        _recorded_failure(NOT_IDLE),
         _recorded("uiautomator_compose_default"),
     )
     root = hierarchy.capture_hierarchy("emulator-5554")
@@ -191,7 +201,7 @@ def test_capture_retries_when_the_ui_is_not_idle(fake_dump):
 
 
 def test_capture_gives_up_with_an_actionable_error(fake_dump):
-    fake_dump("ERROR: could not get idle state.")
+    fake_dump(_recorded_failure(NOT_IDLE))
     with pytest.raises(hierarchy.HierarchyError) as excinfo:
         hierarchy.capture_hierarchy("emulator-5554", retries=2)
 
@@ -278,7 +288,7 @@ def test_a_null_root_node_is_retried(fake_dump):
     Retried for the same reason as the idle error: waiting is the entire fix.
     """
     fake_dump(
-        "ERROR: null root node returned by UiTestAutomationBridge.",
+        _recorded_failure(NO_ROOT),
         _recorded("uiautomator_compose_default"),
     )
     assert hierarchy.capture_hierarchy("emulator-5554").tag == "hierarchy"
@@ -287,7 +297,7 @@ def test_a_null_root_node_is_retried(fake_dump):
 
 def test_a_persistent_null_root_node_says_what_to_check(fake_dump):
     """Giving up must still be actionable, and must not blame the wrong thing."""
-    fake_dump("ERROR: null root node returned by UiTestAutomationBridge.")
+    fake_dump(_recorded_failure(NO_ROOT))
 
     with pytest.raises(hierarchy.HierarchyError) as excinfo:
         hierarchy.capture_hierarchy("emulator-5554", retries=2)
