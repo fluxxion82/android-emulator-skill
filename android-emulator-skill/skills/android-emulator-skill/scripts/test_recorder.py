@@ -116,6 +116,11 @@ SESSION_ID_PREFIX = "rec"
 # rec-YYYYMMDD-HHMMSS-XXXX. Also the traversal guard: a session id arrives from
 # the command line and is joined onto the storage root.
 SESSION_ID_RE = re.compile(rf"^{SESSION_ID_PREFIX}-\d{{8}}-\d{{6}}-[0-9a-f]{{4}}$")
+# Two sessions started in one second share everything but the four hex digits,
+# so an id can be drawn whose directory already exists. Another is drawn, up to
+# this many draws in all, the first included; the bound is there so a start
+# always ends.
+SESSION_ID_ATTEMPTS = 8
 
 _DURATION_RE = re.compile(r"(\d+)([smhd])$")
 
@@ -441,9 +446,7 @@ class RecorderSessionStore:
                     f"The session's {key.replace('_', ' ')} is not text that can be "
                     "stored: it does not encode as UTF-8."
                 )
-        session_id = _generate_session_id()
-        session_dir = self.base_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=False)
+        session_id, session_dir = self._claim_session_dir()
         (session_dir / "screenshots").mkdir()
         (session_dir / "ui-dumps").mkdir()
         # Empty steps file so a later append (and a read before any step) is clean.
@@ -458,6 +461,36 @@ class RecorderSessionStore:
         )
         self.write_meta(meta)
         return meta
+
+    def _claim_session_dir(self) -> tuple[str, Path]:
+        """Draw an id whose directory does not exist and make that directory.
+
+        Making the directory is the claim: ``mkdir`` refuses a name that
+        exists, in one step, so two recorders started together cannot both
+        be handed it. A refused path is left as it is and another id is drawn.
+
+        The storage root is made first and on its own, so the only
+        ``FileExistsError`` the loop can meet is the session directory's;
+        anything wrong with the root is raised as it is, not drawn around.
+
+        Raises:
+            RecorderError: ``SESSION_ID_ATTEMPTS`` draws in a row named a
+                path that already existed.
+        """
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        for _ in range(SESSION_ID_ATTEMPTS):
+            session_id = _generate_session_id()
+            session_dir = self.base_dir / session_id
+            try:
+                session_dir.mkdir()
+            except FileExistsError:
+                continue
+            return session_id, session_dir
+        raise RecorderError(
+            f"No session could be started: {SESSION_ID_ATTEMPTS} session ids drawn "
+            f"in a row each named a path that already exists under {self.base_dir}. "
+            "Start the session again; if it repeats, look at what is in that directory."
+        )
 
     def load_meta(self, session_id: str) -> SessionMeta:
         path = self._meta_path(session_id)
@@ -1063,7 +1096,8 @@ class TestRecorder:
 
 
 def _generate_session_id() -> str:
-    """``rec-YYYYMMDD-HHMMSS-XXXX`` — the hex suffix avoids same-second collisions."""
+    """``rec-YYYYMMDD-HHMMSS-XXXX``. The hex suffix makes a same-second repeat rare,
+    not impossible; ``RecorderSessionStore._claim_session_dir`` is what settles it."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{SESSION_ID_PREFIX}-{timestamp}-{secrets.token_hex(2)}"
 

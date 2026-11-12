@@ -155,10 +155,95 @@ def test_explicit_base_dir_overrides_the_env_root(tmp_path, device, monkeypatch)
 
 
 def test_session_id_shape(home, device):
-    """rec-YYYYMMDD-HHMMSS-XXXX; the hex suffix avoids same-second collisions."""
+    """rec-YYYYMMDD-HHMMSS-XXXX."""
     session_id = _fresh().start("Login flow").session_id
     assert test_recorder.SESSION_ID_RE.match(session_id), session_id
     assert session_id.startswith("rec-")
+
+
+def _ids(monkeypatch, *session_ids: str) -> list[str]:
+    """Make the recorder draw these ids, in order; returns the ones not yet drawn.
+
+    Two sessions started in one second differ only in four hex digits, so the
+    same id being drawn twice is rare and real: CI met it once, as a `--start`
+    that exited 1 with "[Errno 17] File exists". Drawing is the only thing
+    replaced here; the directory is still made, and refused, by the filesystem.
+    """
+    remaining = list(session_ids)
+    monkeypatch.setattr(test_recorder, "_generate_session_id", lambda: remaining.pop(0))
+    return remaining
+
+
+def _session_files(session_id: str) -> dict[str, bytes]:
+    """Every file of a session and what it holds: meta, steps, screenshots, dumps."""
+    root = _fresh().store.session_dir(session_id)
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _a_session_with_a_step(monkeypatch, capsys, session_id: str) -> dict[str, bytes]:
+    assert _cli(monkeypatch, "--start", "Login flow") == 0
+    assert capsys.readouterr().out.strip() == session_id
+    assert _cli(monkeypatch, "--step", "Open the app") == 0
+    capsys.readouterr()
+    files = _session_files(session_id)
+    assert {"meta.json", "steps.jsonl"} < set(files), sorted(files)
+    assert any(name.startswith("screenshots/") for name in files), sorted(files)
+    return files
+
+
+def test_start_draws_again_when_the_id_is_already_a_session(home, device, monkeypatch, capsys):
+    taken, free = "rec-20261112-021449-ad6c", "rec-20261112-021449-ad6d"
+    remaining = _ids(monkeypatch, taken, taken, free)
+    before = _a_session_with_a_step(monkeypatch, capsys, taken)
+
+    assert _cli(monkeypatch, "--start", "Login flow") == 0
+    assert capsys.readouterr().out.strip() == free
+    assert remaining == []
+
+    assert _session_files(taken) == before, "the session whose id was drawn twice changed"
+    assert _fresh().store.read_steps(free).steps == []
+
+
+def test_start_gives_up_by_name_when_no_free_id_can_be_drawn(home, device, monkeypatch, capsys):
+    taken = "rec-20261112-021449-ad6c"
+    attempts = test_recorder.SESSION_ID_ATTEMPTS
+    remaining = _ids(monkeypatch, taken, *[taken] * attempts, "rec-20261112-021449-ad6d")
+    before = _a_session_with_a_step(monkeypatch, capsys, taken)
+
+    assert _cli(monkeypatch, "--start", "Login flow") == 1
+
+    err = capsys.readouterr().err
+    assert f"{attempts} session ids" in err, err
+    assert str(home / "test-sessions") in err, err
+    assert "Errno" not in err, err
+    assert remaining == ["rec-20261112-021449-ad6d"], "draws: exactly SESSION_ID_ATTEMPTS"
+    assert _session_files(taken) == before, "giving up changed the session that held the id"
+    assert [p.name for p in (home / "test-sessions").iterdir() if p.is_dir()] == [taken]
+
+
+def test_a_storage_root_that_is_a_file_is_said_once_and_not_drawn_around(
+    home, device, monkeypatch, capsys
+):
+    """Only the session directory existing is a reason to draw again.
+
+    Asked of the store's own claim: `start` reads the root before it gets
+    here, so through the CLI this root fails earlier and proves nothing.
+    """
+    store = _fresh().store
+    root = store.base_dir
+    root.rmdir()
+    root.write_bytes(b"")
+    remaining = _ids(monkeypatch, "rec-20261112-021449-ad6c", "rec-20261112-021449-ad6d")
+
+    with pytest.raises(FileExistsError) as refused:
+        store._claim_session_dir()
+
+    assert refused.value.filename == str(root)
+    assert len(remaining) == 2, "an id was drawn for a root that cannot hold a session"
 
 
 def test_start_builds_the_session_tree(home, device):
