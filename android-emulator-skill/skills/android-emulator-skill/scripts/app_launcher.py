@@ -654,34 +654,34 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Launch app
-  python app_launcher.py --launch com.example.app
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app
 
   # Launch specific activity
-  python app_launcher.py --launch com.example.app --activity .MainActivity
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app --activity .MainActivity
 
   # Launch with intent string extras (repeatable)
-  python app_launcher.py --launch com.example.app --args mode=test --args env=ci
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app --args mode=test --args env=ci
 
   # Restart app (terminate then launch)
-  python app_launcher.py --restart com.example.app
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --restart com.example.app
 
   # Terminate app
-  python app_launcher.py --terminate com.example.app
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --terminate com.example.app
 
   # Install APK
-  python app_launcher.py --install /path/to/app.apk
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --install /path/to/app.apk
 
   # Uninstall app
-  python app_launcher.py --uninstall com.example.app
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --uninstall com.example.app
 
   # Open deep link
-  python app_launcher.py --open-url "myapp://main"
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --open-url "myapp://main"
 
   # List installed packages
-  python app_launcher.py --list
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --list
 
   # Get app state
-  python app_launcher.py --state com.example.app
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --state com.example.app
         """,
     )
 

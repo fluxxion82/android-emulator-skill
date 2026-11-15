@@ -20,6 +20,7 @@ import os
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -376,6 +377,35 @@ def test_stop_builds_summary_over_seeded_events(recorded, tmp_path, monkeypatch)
     summary = store.load_summary(session_id)
     assert summary is not None
     assert summary.event_count == 3
+
+
+def test_the_drill_line_a_stop_prints_is_a_command_that_opens_that_session(
+    recorded, tmp_path, monkeypatch, capsys
+):
+    """Step N's printed output is step N+1's input: the Drill line, run as printed.
+
+    It printed `Drill: anr_watcher.py --get-details <id> [--cluster N]`: no
+    interpreter, no path, and an option in brackets that is not an argument.
+    The line after `Drill: ` is now split as a shell splits it, must start
+    with the rooted invocation SKILL.md writes, and its arguments -- nothing
+    typed here -- go to the script's own parser.
+    """
+    store, session_id = _seed_session(recorded, tmp_path, [35, 65, 150])
+    monkeypatch.setenv("ANDROID_EMU_ANR_HOME", str(tmp_path))
+
+    out = anr_watcher.AnrBuster(store=store).stop(session_id)
+    (drill,) = [line for line in out.splitlines() if line.startswith("Drill: ")]
+    words = shlex.split(drill.removeprefix("Drill: "))
+
+    assert words[:2] == ["python3", "$SKILL_DIR/scripts/anr_watcher.py"], drill
+    monkeypatch.setattr(anr_watcher.sys, "argv", ["anr_watcher.py", *words[2:]])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.run(anr_watcher.main)
+
+    details = capsys.readouterr()
+    assert exc.value.code == 0, details.err
+    assert session_id in details.out, details.out
 
 
 def test_stop_terse_is_one_line(recorded, tmp_path, monkeypatch):

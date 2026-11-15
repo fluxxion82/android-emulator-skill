@@ -1543,7 +1543,7 @@ def test_the_cluster_drill_says_the_session_is_incomplete(recorded):
 def test_format_l1_includes_drill_hint(recorded):
     summary = _summary([_norm(_jank_line(recorded, 120))])
     out = p.format_l1(summary)
-    assert "Drill: anr_watcher.py --get-details anr-test-0001" in out
+    assert 'Drill: python3 "$SKILL_DIR/scripts/anr_watcher.py" --get-details anr-test-0001\n' in out
 
 
 def test_format_l2_includes_severity_histogram(recorded):

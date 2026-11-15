@@ -12,17 +12,17 @@ This is the Android counterpart of the iOS ``sim_list.py``:
 
 Usage Examples:
     # Concise summary (default)
-    python scripts/device_list.py
+    python3 "$SKILL_DIR/scripts/device_list.py"
 
     # Full list of every target
-    python scripts/device_list.py --get-details
+    python3 "$SKILL_DIR/scripts/device_list.py" --get-details
 
     # Machine-readable
-    python scripts/device_list.py --json
+    python3 "$SKILL_DIR/scripts/device_list.py" --json
 
     # Filter by name/type substring (matches serial, model, or AVD name)
-    python scripts/device_list.py --device-type Pixel
-    python scripts/device_list.py --name emulator --get-details
+    python3 "$SKILL_DIR/scripts/device_list.py" --device-type Pixel
+    python3 "$SKILL_DIR/scripts/device_list.py" --name emulator --get-details
 
 Output (default):
     Android Targets
@@ -498,17 +498,17 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Concise summary (default)
-  python scripts/device_list.py
+  python3 "$SKILL_DIR/scripts/device_list.py"
 
   # Full list of every target
-  python scripts/device_list.py --get-details
+  python3 "$SKILL_DIR/scripts/device_list.py" --get-details
 
   # Machine-readable output
-  python scripts/device_list.py --json
+  python3 "$SKILL_DIR/scripts/device_list.py" --json
 
   # Filter by name/type substring (serial, model, or AVD name)
-  python scripts/device_list.py --device-type Pixel
-  python scripts/device_list.py --name emulator --get-details
+  python3 "$SKILL_DIR/scripts/device_list.py" --device-type Pixel
+  python3 "$SKILL_DIR/scripts/device_list.py" --name emulator --get-details
         """,
     )
     parser.add_argument(

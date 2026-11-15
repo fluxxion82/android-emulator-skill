@@ -14,20 +14,20 @@ Key Features:
 
 Usage Examples:
     # Type text
-    python scripts/keyboard.py --type "Hello World"
+    python3 "$SKILL_DIR/scripts/keyboard.py" --type "Hello World"
 
     # Press Enter key
-    python scripts/keyboard.py --key enter
+    python3 "$SKILL_DIR/scripts/keyboard.py" --key enter
 
     # Press Back button
-    python scripts/keyboard.py --button back
+    python3 "$SKILL_DIR/scripts/keyboard.py" --button back
 
     # Clear text (5 deletes)
-    python scripts/keyboard.py --clear 5
+    python3 "$SKILL_DIR/scripts/keyboard.py" --clear 5
 
     # Hide keyboard (checks `dumpsys input_method` first; BACK would otherwise
     # leave the screen when no keyboard is up)
-    python scripts/keyboard.py --hide-keyboard
+    python3 "$SKILL_DIR/scripts/keyboard.py" --hide-keyboard
 
 Output Format:
     Typed: "Hello World"
@@ -349,32 +349,32 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Type text
-  python keyboard.py --type "Hello World"
+  python3 "$SKILL_DIR/scripts/keyboard.py" --type "Hello World"
 
   # Type slowly (0.1s between characters)
-  python keyboard.py --type "slow typing" --delay 0.1
+  python3 "$SKILL_DIR/scripts/keyboard.py" --type "slow typing" --delay 0.1
 
   # Press special key
-  python keyboard.py --key enter
-  python keyboard.py --key delete
-  python keyboard.py --key tab
+  python3 "$SKILL_DIR/scripts/keyboard.py" --key enter
+  python3 "$SKILL_DIR/scripts/keyboard.py" --key delete
+  python3 "$SKILL_DIR/scripts/keyboard.py" --key tab
 
   # Press delete 5 times
-  python keyboard.py --key delete --count 5
+  python3 "$SKILL_DIR/scripts/keyboard.py" --key delete --count 5
 
   # Press hardware button
-  python keyboard.py --button back
-  python keyboard.py --button home
+  python3 "$SKILL_DIR/scripts/keyboard.py" --button back
+  python3 "$SKILL_DIR/scripts/keyboard.py" --button home
 
   # Clear text field
-  python keyboard.py --clear 10
+  python3 "$SKILL_DIR/scripts/keyboard.py" --clear 10
 
   # Hide / dismiss keyboard
-  python keyboard.py --hide-keyboard
-  python keyboard.py --dismiss
+  python3 "$SKILL_DIR/scripts/keyboard.py" --hide-keyboard
+  python3 "$SKILL_DIR/scripts/keyboard.py" --dismiss
 
   # Key combination
-  python keyboard.py --keys enter,back
+  python3 "$SKILL_DIR/scripts/keyboard.py" --keys enter,back
 
 Available Keys:
   Text: enter/return, delete/backspace, tab, space, escape/esc

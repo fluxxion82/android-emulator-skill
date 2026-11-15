@@ -1398,17 +1398,17 @@ Scoping:
 
 Examples:
   # SOURCE: scan Kotlin/Java source for Room annotations
-  python model_inspector.py --source app/src/main/java
-  python model_inspector.py --source app/src/main/java --verbose
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --source app/src/main/java
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --source app/src/main/java --verbose
 
   # SCHEMA: parse Room's exported schema JSON (room.schemaLocation)
-  python model_inspector.py --schema app/schemas/com.app.AppDb/3.json
-  python model_inspector.py --schema app/schemas --show-versions
-  python model_inspector.py --schema app/schemas/com.app.AppDb/3.json --raw users
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --schema app/schemas/com.app.AppDb/3.json
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --schema app/schemas --show-versions
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --schema app/schemas/com.app.AppDb/3.json --raw users
 
   # LIVE: dump a debuggable app's SQLite schema via run-as
-  python model_inspector.py --package com.example.app
-  python model_inspector.py --package com.example.app --db app.db --verbose
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --package com.example.app
+  python3 "$SKILL_DIR/scripts/model_inspector.py" --package com.example.app --db app.db --verbose
         """,
     )
 

@@ -7,16 +7,16 @@ Creates a debugging snapshot that can be analyzed later.
 
 Usage Examples:
     # Capture current state (into ~/.android-emulator-skill/cache/app-state-snapshots/)
-    python scripts/app_state_capture.py --package com.myapp
+    python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp
 
     # Capture into a directory of your choosing
-    python scripts/app_state_capture.py --package com.myapp --output snapshots/
+    python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --output snapshots/
 
     # Capture with logs from last 30 seconds
-    python scripts/app_state_capture.py --package com.myapp --logs 30s
+    python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --logs 30s
 
     # Limit how many log lines are kept in the snapshot
-    python scripts/app_state_capture.py --package com.myapp --log-lines 500
+    python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --log-lines 500
 """
 
 import argparse
@@ -781,19 +781,19 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Capture current state; the snapshot's path is printed
-  python scripts/app_state_capture.py --package com.myapp
+  python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp
 
   # Capture into a directory of your choosing
-  python scripts/app_state_capture.py --package com.myapp --output snapshots/
+  python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --output snapshots/
 
   # Capture with 1 minute of logs
-  python scripts/app_state_capture.py --package com.myapp --logs 1m
+  python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --logs 1m
 
   # Capture without logs
-  python scripts/app_state_capture.py --package com.myapp --no-logs
+  python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --no-logs
 
   # Keep up to 500 log lines in the snapshot
-  python scripts/app_state_capture.py --package com.myapp --log-lines 500
+  python3 "$SKILL_DIR/scripts/app_state_capture.py" --package com.myapp --log-lines 500
         """,
     )
 

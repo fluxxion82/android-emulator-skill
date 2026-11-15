@@ -4374,22 +4374,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Also reachable as `python scripts/logs.py anr ...` — the unified log entry
-point, which routes here unchanged. Both invocations are supported.
+Also reachable as the `anr` verb of logs.py, the unified log entry point,
+which routes here unchanged. Both invocations are supported.
 
 Examples:
-  # ANRBuster session mode (agent-friendly):
-  SID=$(python scripts/anr_watcher.py --start --package com.myapp)
+  # ANRBuster session mode (agent-friendly). --start prints the session id;
+  # pass it, as printed, where SESSION_ID stands below:
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --start --package com.myapp
   # ... interact with the app ...
-  python scripts/anr_watcher.py --stop $SID
-  python scripts/anr_watcher.py --get-details $SID --cluster 1
-  python scripts/anr_watcher.py --list-sessions
-  python scripts/anr_watcher.py --diff $SID_A $SID_B
-  python scripts/anr_watcher.py --clear-sessions --older-than 24h
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --stop SESSION_ID
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --get-details SESSION_ID --cluster 1
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --list-sessions
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --diff SESSION_A SESSION_B
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --clear-sessions --older-than 24h
 
   # Legacy:
-  python scripts/anr_watcher.py --watch --duration 60
-  python scripts/anr_watcher.py --since 5m --json
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --watch --duration 60
+  python3 "$SKILL_DIR/scripts/anr_watcher.py" --since 5m --json
 
 Environment variables:
   ANDROID_EMU_ANR_MIN_FRAMES         Min skipped frames kept (default 30)

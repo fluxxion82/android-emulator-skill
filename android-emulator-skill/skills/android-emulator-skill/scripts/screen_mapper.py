@@ -18,19 +18,19 @@ Key Features:
 
 Usage Examples:
     # Quick summary (default)
-    python scripts/screen_mapper.py
+    python3 "$SKILL_DIR/scripts/screen_mapper.py"
 
     # Specific device
-    python scripts/screen_mapper.py --serial emulator-5554
+    python3 "$SKILL_DIR/scripts/screen_mapper.py" --serial emulator-5554
 
     # Detailed element breakdown
-    python scripts/screen_mapper.py --verbose
+    python3 "$SKILL_DIR/scripts/screen_mapper.py" --verbose
 
     # Include navigation suggestions
-    python scripts/screen_mapper.py --hints
+    python3 "$SKILL_DIR/scripts/screen_mapper.py" --hints
 
     # Full JSON output for parsing
-    python scripts/screen_mapper.py --json
+    python3 "$SKILL_DIR/scripts/screen_mapper.py" --json
 
 Output Format (default):
     Screen: com.example.app/.MainActivity (45 elements, 7 interactive)
@@ -59,7 +59,9 @@ Configuration (env overrides, ANDROID_EMU_ prefix):
 
 import argparse
 import json as json_lib
+import shlex
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
@@ -69,11 +71,33 @@ from common.env_config import env_int
 from common.hierarchy import INTERACTIVE_ATTRIBUTES as _INTERACTIVE_ATTRIBUTES
 from common.hierarchy import bare_resource_id, capture_hierarchy, is_interactive, parse_bounds
 
-# Preview limits (env-configurable; see SKILL.md -> Configuration).
+# Preview limits (env-configurable; the module docstring lists the variables).
 # BUTTONS_PREVIEW caps how many button labels render on the summary line.
 # SECTION_ITEMS_PREVIEW caps how many items render per type in --verbose mode.
 BUTTONS_PREVIEW = env_int("ANDROID_EMU_SCREEN_BUTTONS_PREVIEW", 15)
 SECTION_ITEMS_PREVIEW = env_int("ANDROID_EMU_SCREEN_SECTION_ITEMS", 10)
+
+
+def _navigator_command(label: str, *action: str) -> str | None:
+    """A navigator invocation for one label, as SKILL.md writes one: a line to run as printed.
+
+    Rooted at ``$SKILL_DIR`` with its interpreter: `navigator.py --find-text ...`
+    alone is a file-not-found from a project directory, which is where an
+    installed skill is used. Each argument is quoted for the shell, so a label
+    holding a quote, a `$` or an `&` is still one word. A label that starts
+    with a dash is attached with `=`, or argparse would read it as an option.
+
+    None for a label no single line can carry: an empty one, or one holding a
+    control character or a line or paragraph separator (Unicode categories
+    Cc, Zl, Zp: line feed, tab, NEL, U+2028 among them). No hint is better
+    than a hint that is two lines, or that names nothing.
+    """
+    if not label or any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in label):
+        return None
+    quoted = shlex.quote(label)
+    find = f"--find-text={quoted}" if label.startswith("-") else f"--find-text {quoted}"
+    words = "".join(f" {shlex.quote(word)}" for word in action)
+    return f"{cli.invocation('navigator.py')} {find}{words}"
 
 
 class ScreenMapper:
@@ -425,14 +449,16 @@ class ScreenMapper:
         # a noun phrase the agent has to translate.
         if hints:
             lines.append("\n--- Navigation Hints ---")
-            for _bucket, names in self.interactive_names(analysis)[:3]:
-                lines.append(f'• navigator.py --find-text "{names[0]}" --tap')
+            commands = [
+                _navigator_command(names[0], "--tap")
+                for _bucket, names in self.interactive_names(analysis)[:3]
+            ]
             unfilled = [et for et in analysis["edit_texts"] if not et["filled"]]
             if unfilled:
-                lines.append(
-                    f'• navigator.py --find-text "{unfilled[0]["label"]}" '
-                    f'--enter-text "your text"'
+                commands.append(
+                    _navigator_command(unfilled[0]["label"], "--enter-text", "your text")
                 )
+            lines.extend(command for command in commands if command)
 
         return "\n".join(lines)
 
@@ -472,19 +498,19 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Quick summary (default)
-  python screen_mapper.py
+  python3 "$SKILL_DIR/scripts/screen_mapper.py"
 
   # Specific device
-  python screen_mapper.py --serial emulator-5554
+  python3 "$SKILL_DIR/scripts/screen_mapper.py" --serial emulator-5554
 
   # Detailed breakdown
-  python screen_mapper.py --verbose
+  python3 "$SKILL_DIR/scripts/screen_mapper.py" --verbose
 
   # With navigation hints
-  python screen_mapper.py --hints
+  python3 "$SKILL_DIR/scripts/screen_mapper.py" --hints
 
   # JSON output
-  python screen_mapper.py --json
+  python3 "$SKILL_DIR/scripts/screen_mapper.py" --json
         """,
     )
 

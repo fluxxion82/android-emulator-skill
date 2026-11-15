@@ -10,7 +10,7 @@ detail: what each mode does, what it prints, and how it fails.
 - Support for 20+ permission types
 - Batch operations: `--grant` / `--revoke` / `--reset` take a
   comma-separated list and answer one object, `{"success", "action",
-  "items"}` (plus `test_trail`), one item per permission with
+  "items"}` (plus `test_trail` when `--scenario` or `--step` was passed), one item per permission with
   `permission`, `message`, `success`, `error`, `remedy`; exit 1 with
   `error` / `remedy` on top when any failed, 3 when the device went (see
   **Failures** in SKILL.md). **Breaking in v0.9.0:** it was `{"action", "results"}`

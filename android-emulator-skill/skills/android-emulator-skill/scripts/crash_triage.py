@@ -31,10 +31,10 @@ output (``DEBUG`` tombstones, ``libc`` fatal-signal lines); those are counted by
 tag and reported rather than silently dropped.
 
 Usage:
-    python scripts/crash_triage.py
-    python scripts/crash_triage.py --package com.myapp --verbose
-    python scripts/crash_triage.py --json
-    python scripts/crash_triage.py --clear
+    python3 "$SKILL_DIR/scripts/crash_triage.py"
+    python3 "$SKILL_DIR/scripts/crash_triage.py" --package com.myapp --verbose
+    python3 "$SKILL_DIR/scripts/crash_triage.py" --json
+    python3 "$SKILL_DIR/scripts/crash_triage.py" --clear
 """
 
 from __future__ import annotations
@@ -641,15 +641,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Also reachable as `python scripts/logs.py crashes ...` — the unified log entry
-point, which routes here unchanged. Both invocations are supported.
+Also reachable as the `crashes` verb of logs.py, the unified log entry point,
+which routes here unchanged. Both invocations are supported.
 
 Examples:
-  python scripts/crash_triage.py
-  python scripts/crash_triage.py --package com.myapp
-  python scripts/crash_triage.py --verbose
-  python scripts/crash_triage.py --json
-  python scripts/crash_triage.py --clear          # reset before a repro run
+  python3 "$SKILL_DIR/scripts/crash_triage.py"
+  python3 "$SKILL_DIR/scripts/crash_triage.py" --package com.myapp
+  python3 "$SKILL_DIR/scripts/crash_triage.py" --verbose
+  python3 "$SKILL_DIR/scripts/crash_triage.py" --json
+  # Reset before a repro run:
+  python3 "$SKILL_DIR/scripts/crash_triage.py" --clear
 
 Exit status (deliberate contract):
   0  the triage ran. An empty crash buffer is a healthy answer, not an error,

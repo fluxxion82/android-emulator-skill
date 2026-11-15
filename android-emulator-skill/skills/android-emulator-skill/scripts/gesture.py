@@ -15,22 +15,22 @@ Key Features:
 
 Usage Examples:
     # Swipe up (scroll down content)
-    python scripts/gesture.py --swipe up
+    python3 "$SKILL_DIR/scripts/gesture.py" --swipe up
 
     # Swipe right from left edge (back gesture)
-    python scripts/gesture.py --swipe right --from-edge
+    python3 "$SKILL_DIR/scripts/gesture.py" --swipe right --from-edge
 
     # Scroll up 3 times
-    python scripts/gesture.py --scroll up --count 3
+    python3 "$SKILL_DIR/scripts/gesture.py" --scroll up --count 3
 
     # Long press at center
-    python scripts/gesture.py --long-press 540,960 --duration 2000
+    python3 "$SKILL_DIR/scripts/gesture.py" --long-press 540,960 --duration 2000
 
     # Custom swipe path
-    python scripts/gesture.py --swipe-path 100,500,900,500 --duration 300
+    python3 "$SKILL_DIR/scripts/gesture.py" --swipe-path 100,500,900,500 --duration 300
 
     # Pull to refresh
-    python scripts/gesture.py --refresh
+    python3 "$SKILL_DIR/scripts/gesture.py" --refresh
 
 Output Format:
     Swiped: up (540,1600) → (540,400) [300ms]
@@ -346,25 +346,25 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Swipe up (scroll down content)
-  python gesture.py --swipe up
+  python3 "$SKILL_DIR/scripts/gesture.py" --swipe up
 
   # Swipe from edge (back gesture)
-  python gesture.py --swipe right --from-edge
+  python3 "$SKILL_DIR/scripts/gesture.py" --swipe right --from-edge
 
   # Scroll up 3 times
-  python gesture.py --scroll up --count 3
+  python3 "$SKILL_DIR/scripts/gesture.py" --scroll up --count 3
 
   # Long press at coordinates
-  python gesture.py --long-press 540,960 --duration 2000
+  python3 "$SKILL_DIR/scripts/gesture.py" --long-press 540,960 --duration 2000
 
   # Custom swipe path
-  python gesture.py --swipe-path 100,500,900,500
+  python3 "$SKILL_DIR/scripts/gesture.py" --swipe-path 100,500,900,500
 
   # Drag and drop
-  python gesture.py --drag 100,500,900,500 --duration 1000
+  python3 "$SKILL_DIR/scripts/gesture.py" --drag 100,500,900,500 --duration 1000
 
   # Pull to refresh
-  python gesture.py --refresh
+  python3 "$SKILL_DIR/scripts/gesture.py" --refresh
         """,
     )
 

@@ -31,7 +31,7 @@ detail: what each mode does, what it prints, and how it fails.
   caller can check where the tap went without parsing prose. Every failure
   is the shared refusal — `{"success": false, "error": ..., "remedy": ...}`
   under `--json`, `Error:` / `Remedy:` on stderr otherwise (it was the
-  message alone on stdout), exit 1 — and a lookup's refusal carries its
+  message alone on stdout), exit 1 (3 when the device is unavailable) — and a lookup's refusal carries its
   `search` detail in the object. A usage error is the same object at exit
   2 (see **Failures** in SKILL.md).
 - **`--scroll-to-find`** searches below the fold. Without it a lookup sees only the visible

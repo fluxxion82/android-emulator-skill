@@ -7,26 +7,26 @@ Supports common Android permissions with audit trail tracking.
 
 Usage Examples:
     # Grant camera permission
-    python scripts/privacy_manager.py --grant camera --package com.myapp
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --grant camera --package com.myapp
 
     # Revoke location permission
-    python scripts/privacy_manager.py --revoke location --package com.myapp
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --revoke location --package com.myapp
 
     # Reset a permission (Android: alias for revoke; see note below)
-    python scripts/privacy_manager.py --reset camera --package com.myapp
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --reset camera --package com.myapp
 
     # List app permissions
-    python scripts/privacy_manager.py --list --package com.myapp
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --list --package com.myapp
 
     # Grant multiple permissions
-    python scripts/privacy_manager.py --grant camera,location,storage --package com.myapp
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --grant camera,location,storage --package com.myapp
 
     # Record a test-trail scenario/step alongside the operation
-    python scripts/privacy_manager.py --revoke camera --package com.myapp \
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --revoke camera --package com.myapp \
         --scenario onboarding --step 2
 
     # Act on (and read back) a secondary user's permissions
-    python scripts/privacy_manager.py --grant camera --package com.myapp --user 11
+    python3 "$SKILL_DIR/scripts/privacy_manager.py" --grant camera --package com.myapp --user 11
 
 Note on --user:
     Runtime permissions are per user. ``--user <id>`` goes into the ``pm``
@@ -586,29 +586,29 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Grant camera permission
-  python scripts/privacy_manager.py --grant camera --package com.myapp
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --grant camera --package com.myapp
 
   # Revoke location
-  python scripts/privacy_manager.py --revoke location --package com.myapp
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --revoke location --package com.myapp
 
   # Reset a permission (Android: alias for revoke; no prompt-state reset exists)
-  python scripts/privacy_manager.py --reset camera --package com.myapp
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --reset camera --package com.myapp
 
   # Grant multiple permissions
-  python scripts/privacy_manager.py --grant camera,location,storage --package com.myapp
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --grant camera,location,storage --package com.myapp
 
   # Record a test-trail scenario/step with the operation
-  python scripts/privacy_manager.py --revoke camera --package com.myapp \\
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --revoke camera --package com.myapp \\
       --scenario onboarding --step 2
 
   # List app permissions
-  python scripts/privacy_manager.py --list --package com.myapp
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --list --package com.myapp
 
   # List available permission names
-  python scripts/privacy_manager.py --list-permissions
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --list-permissions
 
   # Grant, verify and list for a secondary user (default: user 0)
-  python scripts/privacy_manager.py --grant camera --package com.myapp --user 11
+  python3 "$SKILL_DIR/scripts/privacy_manager.py" --grant camera --package com.myapp --user 11
         """,
     )
 

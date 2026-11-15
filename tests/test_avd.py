@@ -260,7 +260,7 @@ def test_bare_invocation_is_a_usage_error_that_still_explains_the_verbs(capsys):
 )
 def test_unknown_verb_suggests_the_nearest_one(typed, expected, capsys):
     assert avd.main([typed]) == 2
-    assert f"avd.py {expected}" in capsys.readouterr().err.rsplit("Did you mean", 1)[-1]
+    assert f"`{expected}`" in capsys.readouterr().err.rsplit("Did you mean", 1)[-1]
 
 
 @pytest.mark.parametrize("typed", ["erase", "wipe", "clean", "clear"])
@@ -273,7 +273,7 @@ def test_a_word_meaning_destroy_is_never_resolved_for_the_caller(typed, capsys):
     """
     assert avd.main([typed]) == 2
     hint = capsys.readouterr().err.rsplit("Did you mean", 1)[-1]
-    assert "avd.py reset" in hint and "avd.py delete" in hint
+    assert "`reset`" in hint and "`delete`" in hint
 
 
 @pytest.mark.parametrize(
@@ -289,7 +289,7 @@ def test_a_fuzzy_guess_never_names_one_destructive_verb_on_its_own(typed):
     destructive verb must present both of them, so the caller has to read.
     """
     hint = avd.suggest_verb(typed)
-    named = {name for name in avd.ROUTES_BY_NAME if f"avd.py {name}" in hint}
+    named = {name for name in avd.ROUTES_BY_NAME if f"`{name}`" in hint}
     destructive = {name for name in named if avd.ROUTES_BY_NAME[name].destructive}
     both_or_neither = destructive in ({"reset", "delete"}, set())
     assert both_or_neither, f"{typed!r} was answered with one destructive verb: {hint!r}"

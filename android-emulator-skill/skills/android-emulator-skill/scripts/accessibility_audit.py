@@ -13,13 +13,13 @@ written, which is worse than not offering it.
 
 Usage Examples:
     # Audit current screen
-    python scripts/accessibility_audit.py
+    python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 
     # Audit with detailed report
-    python scripts/accessibility_audit.py --verbose
+    python3 "$SKILL_DIR/scripts/accessibility_audit.py" --verbose
 
     # Save audit report
-    python scripts/accessibility_audit.py --output audit-reports/
+    python3 "$SKILL_DIR/scripts/accessibility_audit.py" --output audit-reports/
 
 Exit code:
     Returns 1 when any critical issue is found (CI gate), else 0.
@@ -516,16 +516,16 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Audit current screen
-  python scripts/accessibility_audit.py
+  python3 "$SKILL_DIR/scripts/accessibility_audit.py"
 
   # Audit with verbose output
-  python scripts/accessibility_audit.py --verbose
+  python3 "$SKILL_DIR/scripts/accessibility_audit.py" --verbose
 
   # Save report to file
-  python scripts/accessibility_audit.py --output audit-reports/
+  python3 "$SKILL_DIR/scripts/accessibility_audit.py" --output audit-reports/
 
   # JSON output
-  python scripts/accessibility_audit.py --json
+  python3 "$SKILL_DIR/scripts/accessibility_audit.py" --json
         """,
     )
 

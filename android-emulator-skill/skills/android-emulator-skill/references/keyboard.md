@@ -16,6 +16,7 @@ detail: what each mode does, what it prints, and how it fails.
   only when an IME is actually shown — BACK is not a "hide keyboard" key,
   and with no keyboard up it leaves the current screen. With none shown they
   report "No keyboard shown", send no key event and exit 0; if the IME state
-  cannot be read they exit 1 rather than guess. To press BACK regardless,
+  cannot be read they exit 1 rather than guess (3 when the device is
+  unavailable). To press BACK regardless,
   ask for it: `--button back`. (The state is read from `mInputShown`, with
   `mIsInputViewShown` as a backup — both measured on API 33 and API 35.)

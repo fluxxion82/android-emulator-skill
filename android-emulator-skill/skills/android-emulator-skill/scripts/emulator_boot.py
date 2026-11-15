@@ -360,19 +360,19 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # Boot AVD
-  python emulator_boot.py --avd Pixel_5_API_33
+  python3 "$SKILL_DIR/scripts/emulator_boot.py" --avd Pixel_5_API_33
 
   # Boot and wait for readiness
-  python emulator_boot.py --avd Pixel_5_API_33 --wait-ready
+  python3 "$SKILL_DIR/scripts/emulator_boot.py" --avd Pixel_5_API_33 --wait-ready
 
   # Boot in headless mode
-  python emulator_boot.py --avd Pixel_5_API_33 --headless
+  python3 "$SKILL_DIR/scripts/emulator_boot.py" --avd Pixel_5_API_33 --headless
 
   # Boot all defined AVDs
-  python emulator_boot.py --all
+  python3 "$SKILL_DIR/scripts/emulator_boot.py" --all
 
   # List available AVDs
-  python emulator_boot.py --list-avds
+  python3 "$SKILL_DIR/scripts/emulator_boot.py" --list-avds
         """,
     )
 

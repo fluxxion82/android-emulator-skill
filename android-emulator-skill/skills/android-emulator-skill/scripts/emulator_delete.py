@@ -7,19 +7,19 @@ and managing AVD storage.
 
 Usage Examples:
     # Delete single AVD (prompts for confirmation)
-    python scripts/emulator_delete.py --name MyTestDevice
+    python3 "$SKILL_DIR/scripts/emulator_delete.py" --name MyTestDevice
 
     # Delete without the confirmation prompt
-    python scripts/emulator_delete.py --name MyTestDevice --yes
+    python3 "$SKILL_DIR/scripts/emulator_delete.py" --name MyTestDevice --yes
 
     # List all AVDs first
-    python scripts/emulator_delete.py --list
+    python3 "$SKILL_DIR/scripts/emulator_delete.py" --list
 
     # Delete every AVD
-    python scripts/emulator_delete.py --all --yes
+    python3 "$SKILL_DIR/scripts/emulator_delete.py" --all --yes
 
     # Keep the 3 AVDs whose config.ini changed most recently, delete the rest
-    python scripts/emulator_delete.py --old 3 --yes
+    python3 "$SKILL_DIR/scripts/emulator_delete.py" --old 3 --yes
 
 ``--old`` ranks by config modification time: the mtime of
 ``<avd_home>/<name>.avd/config.ini``. That is a proxy for last use, not a
@@ -411,19 +411,19 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Delete AVD (prompts for confirmation)
-  python scripts/emulator_delete.py --name MyTestDevice
+  python3 "$SKILL_DIR/scripts/emulator_delete.py" --name MyTestDevice
 
   # Delete without the confirmation prompt
-  python scripts/emulator_delete.py --name MyTestDevice --yes
+  python3 "$SKILL_DIR/scripts/emulator_delete.py" --name MyTestDevice --yes
 
   # List all AVDs
-  python scripts/emulator_delete.py --list
+  python3 "$SKILL_DIR/scripts/emulator_delete.py" --list
 
   # Delete every AVD
-  python scripts/emulator_delete.py --all --yes
+  python3 "$SKILL_DIR/scripts/emulator_delete.py" --all --yes
 
   # Keep the newest N AVDs by config modification time, delete the rest
-  python scripts/emulator_delete.py --old 3 --yes
+  python3 "$SKILL_DIR/scripts/emulator_delete.py" --old 3 --yes
         """,
     )
 

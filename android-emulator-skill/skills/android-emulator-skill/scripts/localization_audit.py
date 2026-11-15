@@ -35,9 +35,9 @@ Reports:
     undefined, and defined keys that are never referenced (unused).
 
 Usage:
-    python scripts/localization_audit.py --res app/src/main/res
-    python scripts/localization_audit.py --res ./res --source ./src
-    python scripts/localization_audit.py --res ./res --locale es --strict --json
+    python3 "$SKILL_DIR/scripts/localization_audit.py" --res app/src/main/res
+    python3 "$SKILL_DIR/scripts/localization_audit.py" --res ./res --source ./src
+    python3 "$SKILL_DIR/scripts/localization_audit.py" --res ./res --locale es --strict --json
 """
 
 import argparse
@@ -690,10 +690,10 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python scripts/localization_audit.py --res app/src/main/res
-  python scripts/localization_audit.py --res ./res --source ./src
-  python scripts/localization_audit.py --res ./res --locale es --strict
-  python scripts/localization_audit.py --res ./res --json
+  python3 "$SKILL_DIR/scripts/localization_audit.py" --res app/src/main/res
+  python3 "$SKILL_DIR/scripts/localization_audit.py" --res ./res --source ./src
+  python3 "$SKILL_DIR/scripts/localization_audit.py" --res ./res --locale es --strict
+  python3 "$SKILL_DIR/scripts/localization_audit.py" --res ./res --json
         """,
     )
     parser.add_argument(

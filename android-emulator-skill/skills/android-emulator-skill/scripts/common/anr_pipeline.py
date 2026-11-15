@@ -35,6 +35,8 @@ from datetime import datetime, tzinfo
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from . import cli
+
 if TYPE_CHECKING:
     from common.logcat import LogRecord
 
@@ -1639,7 +1641,7 @@ def format_l1(summary: SessionSummary, top_n: int = 3) -> str:
                 f"{_nothing_found(summary, '≥')} "
                 f"(scanned {summary.matched_lines}/{summary.total_lines} lines).",
                 *note,
-                f"Drill: anr_watcher.py --get-details {summary.session_id}",
+                "Drill: " + cli.invocation("anr_watcher.py", "--get-details", summary.session_id),
             ]
         )
     lines = [
@@ -1660,7 +1662,8 @@ def format_l1(summary: SessionSummary, top_n: int = 3) -> str:
             f"{icon} {cluster.max_duration_ms:.0f}ms × {cluster.count} — "
             f"{cluster.symbol_or_prefix} at {at}"
         )
-    lines.append(f"Drill: anr_watcher.py --get-details {summary.session_id} [--cluster N]")
+    lines.append("Drill: " + cli.invocation("anr_watcher.py", "--get-details", summary.session_id))
+    lines.append("  (one cluster: add --cluster N)")
     return "\n".join(lines)
 
 

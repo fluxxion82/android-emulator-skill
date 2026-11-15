@@ -18,16 +18,16 @@ without a real emulator, adb, or filesystem.
 
 Usage Examples:
     # Ranked best AVDs for the current host
-    python scripts/emulator_selector.py --suggest
+    python3 "$SKILL_DIR/scripts/emulator_selector.py" --suggest
 
     # List every candidate AVD (unranked detail)
-    python scripts/emulator_selector.py --list
+    python3 "$SKILL_DIR/scripts/emulator_selector.py" --list
 
     # Boot a chosen AVD (delegates to emulator_boot.py / `emulator -avd`)
-    python scripts/emulator_selector.py --boot Pixel_9_Pro
+    python3 "$SKILL_DIR/scripts/emulator_selector.py" --boot Pixel_9_Pro
 
     # Machine-readable suggestions
-    python scripts/emulator_selector.py --suggest --json
+    python3 "$SKILL_DIR/scripts/emulator_selector.py" --suggest --json
 
 Tunables (env, ANDROID_EMU_ prefix):
     ANDROID_EMU_SELECTOR_COUNT        Default number of suggestions (default: 4)
@@ -695,16 +695,16 @@ def _run(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Ranked best AVDs
-  python scripts/emulator_selector.py --suggest
+  python3 "$SKILL_DIR/scripts/emulator_selector.py" --suggest
 
   # List every candidate AVD
-  python scripts/emulator_selector.py --list
+  python3 "$SKILL_DIR/scripts/emulator_selector.py" --list
 
   # Boot a chosen AVD (delegates to emulator_boot.py)
-  python scripts/emulator_selector.py --boot Pixel_9_Pro
+  python3 "$SKILL_DIR/scripts/emulator_selector.py" --boot Pixel_9_Pro
 
   # Suggestions as JSON
-  python scripts/emulator_selector.py --suggest --json
+  python3 "$SKILL_DIR/scripts/emulator_selector.py" --suggest --json
         """,
     )
 

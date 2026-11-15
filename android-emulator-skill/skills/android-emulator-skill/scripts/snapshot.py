@@ -38,9 +38,9 @@ Measured on emulator-5554 / API 35:
 - Names reach the console unquoted; see ``SNAPSHOT_NAME_RULE``.
 
 Usage Examples:
-    python snapshot.py --list
-    python snapshot.py --save before_upgrade
-    python snapshot.py --load before_upgrade
+    python3 "$SKILL_DIR/scripts/snapshot.py" --list
+    python3 "$SKILL_DIR/scripts/snapshot.py" --save before_upgrade
+    python3 "$SKILL_DIR/scripts/snapshot.py" --load before_upgrade
 """
 
 from __future__ import annotations
@@ -588,11 +588,11 @@ Emulators only. `adb emu` is the running emulator's console; a physical device
 does not have one.
 
 Examples:
-  python snapshot.py --list
-  python snapshot.py --list --json
-  python snapshot.py --save before_upgrade
-  python snapshot.py --load before_upgrade --serial emulator-5554
-  python snapshot.py --delete before_upgrade
+  python3 "$SKILL_DIR/scripts/snapshot.py" --list
+  python3 "$SKILL_DIR/scripts/snapshot.py" --list --json
+  python3 "$SKILL_DIR/scripts/snapshot.py" --save before_upgrade
+  python3 "$SKILL_DIR/scripts/snapshot.py" --load before_upgrade --serial emulator-5554
+  python3 "$SKILL_DIR/scripts/snapshot.py" --delete before_upgrade
 
 Exit status:
   0  the console accepted the command (and, for --save/--delete, the read-back
