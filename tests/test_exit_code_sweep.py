@@ -690,7 +690,7 @@ def _count_off_by_one(skill_md: str) -> str:
 
 def _count_restated_wrongly_elsewhere(skill_md: str) -> str:
     wrong = f"The sweep asserts the payload of {len(MODES) + 1} documented modes."
-    return skill_md.replace("## Contributing\n", f"## Contributing\n\n{wrong}\n")
+    return skill_md.replace("## Requirements\n", f"## Requirements\n\n{wrong}\n")
 
 
 def _count_removed(skill_md: str) -> str:

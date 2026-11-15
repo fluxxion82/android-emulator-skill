@@ -16,8 +16,8 @@ android-emulator-skill/                      # repo root
 ├── android-emulator-skill/                   # distributable plugin package
 │   ├── .claude-plugin/plugin.json
 │   └── skills/android-emulator-skill/
-│       ├── SKILL.md                         # entry point / script reference
-│       ├── references/                      # ships: known-gaps.md
+│       ├── SKILL.md                         # entry point: loop, script index, failures (≤ 32 KiB)
+│       ├── references/                      # ships: one file per script, and known-gaps.md
 │       └── scripts/                         # production scripts + common/ utilities
 ├── .github/workflows/                        # lint, test, release, validate-version, pages
 ├── tests/                                    # pytest suite (adb/subprocess mocked)
@@ -156,7 +156,8 @@ dependency is missing protects nothing.
 2. Black (100 cols) + Ruff (strict, 0 errors) — see `pyproject.toml`.
 3. `pytest tests/` green; unit tests mock adb/subprocess (no device needed).
 4. Never `shell=True`; pass explicit `check=` to `subprocess.run`.
-5. `--help` and `--json` on every script; update `SKILL.md` when adding scripts.
+5. `--help` and `--json` on every script; a new script gets an index entry in `SKILL.md`
+   and its own `references/<script>.md` (DEV.md, "Where documentation goes").
 
 ## Commit messages: no trailers
 

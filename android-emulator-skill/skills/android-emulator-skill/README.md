@@ -4,10 +4,12 @@ Build, test, and drive Android apps through `adb`, `uiautomator`, the emulator
 tooling, and the Gradle wrapper — with concise, structured output intended for
 an AI agent rather than a terminal.
 
-**`SKILL.md` is the reference.** It lists every script, its flags, and the
-environment variables. This file exists only to orient a human browsing the
-package; it deliberately does not duplicate the script table, because the
-duplicate is what went stale last time.
+**`SKILL.md` is what an agent loads.** It holds the loop an agent follows, an
+index of every script with its flags, and the failure contract, in 32 KiB or
+less. Each script's detail — its modes, what it prints, how it fails — is in
+`references/`, one file per script, opened when needed. This file exists only
+to orient a human browsing the package; it deliberately does not duplicate
+the script index, because the duplicate is what went stale last time.
 
 ## Running a script
 
@@ -44,15 +46,14 @@ sends you looking in the wrong place.
 `scripts/android_health_check.sh` verifies the environment and lists what it
 finds.
 
-## Status
+## What it does not do
 
-Under active repair. The upstream repository tracks known defects and the work
-in progress; several scripts were built against assumed tool output and are
-being corrected against recorded output from real devices.
+[references/known-gaps.md](references/known-gaps.md) lists what the skill does
+not do yet, and the limits it states rather than closes.
 
-Treat `SKILL.md`'s script list as the accurate inventory. If a flag documented
-there does not behave as described, that is a bug worth reporting rather than a
-usage error.
+Treat `SKILL.md`'s script index as the accurate inventory: tests hold every
+flag it names to what the script accepts. If a flag documented there does not
+behave as described, that is a bug worth reporting rather than a usage error.
 
 ## Links
 

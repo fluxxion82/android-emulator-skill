@@ -1,13 +1,20 @@
 # Known gaps
 
 What the skill does not do yet, or does with a limit that is stated rather
-than closed. The script reference is [SKILL.md](../SKILL.md); what a failure
-looks like is its **Failures** section.
+than closed. The script index is [SKILL.md](../SKILL.md), each script's detail is
+the file beside this one named after it, and what a failure looks like is
+SKILL.md's **Failures** section.
 
-- Windows is untested. No CI job runs there; `build_and_test.py` never
-  selects `gradlew.bat`, `android_health_check.sh` needs Bash and
-  `anr_watcher.py` refuses. Whether the remaining scripts work there has not
-  been observed.
+- Windows is untested. No CI job runs there; `build_and_test.py` always runs
+  the Unix `gradlew` wrapper (never `gradlew.bat`), `android_health_check.sh`
+  needs Bash, and `anr_watcher.py` is Unix-only (macOS, Linux) as a whole: its
+  session storage locks with `fcntl.flock`, and on a host whose Python has no
+  `fcntl` (Windows) every mode, `--since` included, refuses at once (exit 1,
+  the one refusal object under `--json`). Its live readers differ by level: on
+  API 33 they read by dumps through temporary files, with no `select()`; on
+  every other level they stream, waiting on adb's pipe with `select()`, which
+  on Windows takes only sockets. Whether the remaining scripts work there has
+  not been observed.
 - `accessibility_audit` has no contrast check. Contrast needs pixel sampling
   from a screenshot, which is not implemented.
 - `anr_watcher --package` cannot attribute jank or StrictMode written by an
@@ -32,8 +39,8 @@ looks like is its **Failures** section.
   behind -- Android 13's buffer prunes while it flushes to a slow reader
   and does not disconnect it -- on every level and for every reader, stream
   or dump; nothing on our side can tell a pruned record from one never
-  logged. On API 33 the dump-made read (described under `log_monitor` in
-  SKILL.md) adds its own limits: the
+  logged. On API 33 the dump-made read (described in
+  [log_monitor.md](log_monitor.md)) adds its own limits: the
   records it continues from show only that logd still held them when the
   next dump began, and only in their own buffers (main, system, crash and
   kernel each turn over on their own, so another one turning over within a
@@ -43,7 +50,7 @@ looks like is its **Failures** section.
   may be lost; without a new system record, the remembered suffix and the
   required dump grow until turnover or the byte cap refuses continuation;
   and a buffer with no system record at the open gets a marker line written
-  into it (see `log_monitor` in SKILL.md), so `--clear` on API 33 leaves one
+  into it (see [log_monitor.md](log_monitor.md)), so `--clear` on API 33 leaves one
   `aes-log-monitor` line
   in the device's log. Android 13's `SerializedLogBuffer::Log` numbers a
   record before it takes `logd_lock`, so a record from logd's own kernel

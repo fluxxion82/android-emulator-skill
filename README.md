@@ -106,10 +106,38 @@ ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulato
 Use `cp -R` in place of `ln -s` if you would rather not have a symlink; a
 `git pull` then needs the copy repeating.
 
+## Coming from ios-simulator-skill
+
+| iOS Tool | Android Equivalent | Status |
+|----------|-------------------|--------|
+| xcrun simctl | adb / avdmanager / emulator | ✓ Complete |
+| IDB | adb shell uiautomator / input | ✓ Complete |
+| iOS Simulator | Android Emulator | ✓ Complete |
+| xcodebuild | Gradle wrapper | ✓ Complete |
+| Accessibility tree | UI hierarchy dump | ✓ Complete |
+| simctl privacy | pm grant/revoke | ✓ Complete |
+| xcresult | Gradle test reports / JUnit XML | ✓ Unit (`--test`) and instrumented (`--instrumented`, one device) verdicts from JUnit XML; no attachments, screenshots or coverage |
+
+**Architecture**
+- **iOS**: Uses IDB for UI interaction, xcrun simctl for device management
+- **Android**: Uses adb for everything, uiautomator for UI interaction
+
+**Element Types**
+- **iOS**: Button, TextField, SecureTextField, StaticText, etc.
+- **Android**: Button, EditText, TextView, ImageView, etc.
+
+**Device Management**
+- **iOS**: Simulators only (macOS required)
+- **Android**: Emulators + real devices (cross-platform)
+
+**Build System**
+- **iOS**: Xcode project files (.xcodeproj)
+- **Android**: Gradle build files (build.gradle)
+
 ## Documentation
 
-- `android-emulator-skill/skills/android-emulator-skill/SKILL.md` — script reference and the failure contract.
-- `android-emulator-skill/skills/android-emulator-skill/references/known-gaps.md` — what the skill does not do yet.
+- `android-emulator-skill/skills/android-emulator-skill/SKILL.md` — what an agent loads: the loop, the script index with every flag, and the failure contract.
+- `android-emulator-skill/skills/android-emulator-skill/references/` — one file per script (modes, output, failures), and `known-gaps.md`, what the skill does not do yet.
 - [`CHANGELOG.md`](CHANGELOG.md) — release history.
 - [`docs/`](docs/) — topic notes on adb, test patterns, accessibility and troubleshooting.
 - [`DEV.md`](DEV.md) — development environment, linting, tests, CI, release process.

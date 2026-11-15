@@ -1708,13 +1708,15 @@ def test_package_contains_what_the_docs_promise():
     assert REFERENCES.is_dir(), "references/ is documented but missing"
 
 
-def test_references_holds_the_known_gaps_file_and_nothing_else():
-    """One file until the per-script references arrive (v0.10.0, PR 4).
+def test_references_holds_one_file_per_script_and_the_known_gaps_file():
+    """What `references/` holds, exactly: nothing else is put there unnoticed.
 
-    Stated exactly so that PR 4 has to change this test to add a file, and say
-    then what the rule becomes: one file per index entry, plus this one.
+    One Markdown file per runnable script, named after it, and `known-gaps.md`.
+    Which index entry links which file, and what each file's title says, is
+    `test_skill_index`'s to check; this is the directory's inventory.
     """
-    assert sorted(path.name for path in REFERENCES.iterdir()) == ["known-gaps.md"]
+    expected = sorted([*(Path(name).stem + ".md" for name in _scripts_on_disk()), "known-gaps.md"])
+    assert sorted(path.name for path in REFERENCES.iterdir()) == expected
 
 
 def test_skill_md_links_the_known_gaps_file():
@@ -1749,7 +1751,9 @@ def test_the_link_guard_reads_every_markdown_file_the_package_holds():
     packaged = _packaged_markdown()
     assert set(_shipped_docs()) < set(packaged)
     assert PACKAGED_README in packaged
-    assert [doc.name for doc in packaged if doc.parent == REFERENCES] == ["known-gaps.md"]
+    references = [doc.name for doc in packaged if doc.parent == REFERENCES]
+    assert "known-gaps.md" in references
+    assert len(references) == len(_scripts_on_disk()) + 1
 
 
 @pytest.mark.parametrize("doc", _packaged_markdown(), ids=_doc_id)
@@ -2755,7 +2759,10 @@ def _help_text(script: str) -> str:
     return helped.stdout
 
 
-_SCRIPT_ENTRY = re.compile(r"^\d+\.\s+\*\*([A-Za-z_]\w*\.py)\*\*")
+# Any script's entry, the shell health check's too: with `.py` alone its Options
+# bullet was read as one more bullet of the Python entry above it, and that
+# script was credited with documenting the health check's flags.
+_SCRIPT_ENTRY = re.compile(r"^\d+\.\s+\*\*([A-Za-z_]\w*\.(?:py|sh))\*\*")
 _BACKTICKED = re.compile(r"`([^`]*)`")
 _FLAG = re.compile(r"--?[A-Za-z][\w-]*")
 _OPTIONS_BULLET = "- Options:"
@@ -2884,7 +2891,7 @@ def test_every_flag_documented_in_skill_md_exists():
         f"SKILL.md, so nothing checks their documented interface: {undocumented}"
     )
 
-    stray = sorted(set(documented) - {s.name for s in scripts})
+    stray = sorted(set(documented) - set(_scripts_on_disk()))
     assert not stray, f"SKILL.md documents options for scripts that do not exist: {stray}"
 
     wrong: dict[str, list[str]] = {}
@@ -2946,34 +2953,38 @@ NEVER_UNDOCUMENTED: frozenset[str] = frozenset(
 )
 
 
-def _global_flags() -> frozenset[str]:
+def _global_flags(skill_md: str | None = None) -> frozenset[str]:
     """Flags documented once for every script rather than per entry.
 
     Two sources, both read rather than typed: what ``common.cli.parser``
     registers by itself (its own ``--help``), and the backticked flags of
     SKILL.md's "All scripts support ..." sentence, the one place the doc
-    promises a flag to every script.
+    promises a flag to every script. ``skill_md`` is the file's text when a
+    caller holds a copy of it; the file on disk otherwise.
     """
     from common import cli
 
+    if skill_md is None:
+        skill_md = SKILL_MD.read_text(encoding="utf-8")
     flags = set(_option_tokens(cli.parser(prog="any").format_help()))
-    promise = [
-        line
-        for line in SKILL_MD.read_text(encoding="utf-8").splitlines()
-        if line.startswith("All scripts support")
-    ]
+    promise = [line for line in skill_md.splitlines() if line.startswith("All scripts support")]
     assert len(promise) == 1, f"SKILL.md's 'All scripts support' sentence: {promise}"
     flags |= {flag for chunk in _BACKTICKED.findall(promise[0]) for flag in _FLAG.findall(chunk)}
     return frozenset(flags)
 
 
-def _accepted_but_undocumented() -> dict[str, list[str]]:
+def _accepted_but_undocumented(skill_md: str | None = None) -> dict[str, list[str]]:
     """{script: options} argparse accepts that neither SKILL.md nor the globals name.
 
     One spelling per option (the longest), so `-s/--serial` is one finding.
+    Only SKILL.md is read, by design: an agent picks its flag from the file it
+    has loaded, so a flag a reference file documents is, here, undocumented
+    (`test_skill_index.test_a_flag_documented_only_in_a_reference_is_undocumented`).
     """
-    documented = _documented_options(SKILL_MD.read_text(encoding="utf-8"))
-    global_flags = _global_flags()
+    if skill_md is None:
+        skill_md = SKILL_MD.read_text(encoding="utf-8")
+    documented = _documented_options(skill_md)
+    global_flags = _global_flags(skill_md)
     missing: dict[str, list[str]] = {}
     for script in sorted((SKILL_ROOT / "scripts").glob("*.py")):
         named = documented.get(script.name, set()) | global_flags
