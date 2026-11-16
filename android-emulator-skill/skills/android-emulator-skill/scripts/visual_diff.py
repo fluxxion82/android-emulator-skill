@@ -25,11 +25,12 @@ the inputs too, in ``--json``'s ``summary`` and in ``diff-report.json`` --
 artifact paths name files that were written, and ``Artifacts saved to:``
 names their directory.
 
-Usage: python scripts/visual_diff.py baseline.png current.png [options]
+Usage: python3 "$SKILL_DIR/scripts/visual_diff.py" baseline.png current.png [options]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from datetime import datetime
@@ -217,6 +218,12 @@ def main(argv: list[str] | None = None):
             "difference exceeds 30 painted red."
         ),
         json_flags=("--json", "--details"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 "$SKILL_DIR/scripts/visual_diff.py" baseline.png current.png
+  python3 "$SKILL_DIR/scripts/visual_diff.py" baseline.png current.png --threshold 0.02 --json
+""",
     )
     parser.add_argument("baseline", help="Path to baseline screenshot")
     parser.add_argument("current", help="Path to current screenshot")

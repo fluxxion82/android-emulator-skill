@@ -14,17 +14,17 @@ Key features:
 
 Usage Examples:
     # Create Pixel 7 with Android 34
-    python scripts/emulator_create.py --device "Pixel 7" --api 34 --name MyTestDevice
+    python3 "$SKILL_DIR/scripts/emulator_create.py" --device "Pixel 7" --api 34 --name MyTestDevice
 
     # Create with everything inferred: latest installed API + auto name,
     # and fuzzy device matching ("pixel7" -> pixel_7).
-    python scripts/emulator_create.py --device pixel7
+    python3 "$SKILL_DIR/scripts/emulator_create.py" --device pixel7
 
     # List available devices
-    python scripts/emulator_create.py --list-devices
+    python3 "$SKILL_DIR/scripts/emulator_create.py" --list-devices
 
     # List available system images
-    python scripts/emulator_create.py --list-images
+    python3 "$SKILL_DIR/scripts/emulator_create.py" --list-images
 
 Tunables (env, ANDROID_EMU_ prefix):
     ANDROID_EMU_DEVICE_MATCH_CUTOFF   Fuzzy --device match cutoff 0-100 (default: 60)
@@ -699,19 +699,19 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Create Pixel 7 with Android 34
-  python scripts/emulator_create.py --device pixel_7 --api 34 --name MyTestDevice
+  python3 "$SKILL_DIR/scripts/emulator_create.py" --device pixel_7 --api 34 --name MyTestDevice
 
   # Infer everything: fuzzy device, latest installed API, auto-generated name
-  python scripts/emulator_create.py --device pixel7
+  python3 "$SKILL_DIR/scripts/emulator_create.py" --device pixel7
 
   # Create with specific ABI
-  python scripts/emulator_create.py --device pixel_7 --api 33 --abi x86_64 --name Test
+  python3 "$SKILL_DIR/scripts/emulator_create.py" --device pixel_7 --api 33 --abi x86_64 --name Test
 
   # List available devices
-  python scripts/emulator_create.py --list-devices
+  python3 "$SKILL_DIR/scripts/emulator_create.py" --list-devices
 
   # List available system images
-  python scripts/emulator_create.py --list-images
+  python3 "$SKILL_DIR/scripts/emulator_create.py" --list-images
         """,
     )
 

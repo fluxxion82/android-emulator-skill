@@ -10,13 +10,13 @@ instructions. Nothing was ever recorded.
 The rebuild moves the recording state onto disk, so the unit of work is a
 command rather than a method call:
 
-    SID=$(python test_recorder.py --start "Login flow" --app-name MyApp)
+    SID=$(python3 "$SKILL_DIR/scripts/test_recorder.py" --start "Login flow" --app-name MyApp)
     # ... drive the app with navigator.py / gesture.py ...
-    python test_recorder.py --step "Open the app"
-    python test_recorder.py --step "Tap sign in" --assert "Login form shown"
-    python test_recorder.py --stop
-    python test_recorder.py --list
-    python test_recorder.py --get-details "$SID"
+    python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Open the app"
+    python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Tap sign in" --assert "Login form shown"
+    python3 "$SKILL_DIR/scripts/test_recorder.py" --stop
+    python3 "$SKILL_DIR/scripts/test_recorder.py" --list
+    python3 "$SKILL_DIR/scripts/test_recorder.py" --get-details "$SID"
 
 Session storage follows ``common/anr_sessions.py``: a directory per session
 under ``~/.android-emulator-skill/test-sessions/<id>/`` holding ``meta.json``
@@ -607,8 +607,8 @@ class RecorderSessionStore:
         active = self.active_session_id()
         if not active:
             raise RecorderError(
-                "No recording session. Start one first:\n"
-                '  python test_recorder.py --start "My test"'
+                "No recording session. Start one first:\n  "
+                + cli.invocation("test_recorder.py", "--start", "My test")
             )
         return active
 
@@ -1156,17 +1156,19 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # One session, one process per step (how an agent drives it):
-  SID=$(python test_recorder.py --start "Login flow" --app-name MyApp)
-  python test_recorder.py --step "Open the app"
-  python test_recorder.py --step "Tap sign in" --assert "Login form shown"
-  python test_recorder.py --step "Bad password" --assert "Error shown" --assert-failed
-  python test_recorder.py --stop            # or --stop --failed
+  # One session, one process per step (how an agent drives it).
+  # --start prints the session id:
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --start "Login flow" --app-name MyApp
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Open the app"
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Tap sign in" --assert "Login form shown"
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --step "Bad password" --assert "Error shown" --assert-failed
+  # Finish (add --failed to mark the run failed):
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --stop
 
-  # Retrieval:
-  python test_recorder.py --list
-  python test_recorder.py --get-details "$SID" --json
-  python test_recorder.py --clear --older-than 24h
+  # Retrieval (SESSION_ID is the id --start printed):
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --list
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --get-details SESSION_ID --json
+  python3 "$SKILL_DIR/scripts/test_recorder.py" --clear --older-than 24h
 
 --step and --stop default to the newest recording session; pass --session ID to
 target a specific one. Sessions live under ~/.android-emulator-skill/.

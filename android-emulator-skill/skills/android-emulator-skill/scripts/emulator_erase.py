@@ -13,16 +13,16 @@ removes one).
 
 Usage Examples:
     # Erase single AVD (must be shutdown first)
-    python scripts/emulator_erase.py --name MyTestDevice
+    python3 "$SKILL_DIR/scripts/emulator_erase.py" --name MyTestDevice
 
     # Erase and verify the wipe landed on disk
-    python scripts/emulator_erase.py --name MyTestDevice --verify
+    python3 "$SKILL_DIR/scripts/emulator_erase.py" --name MyTestDevice --verify
 
     # Erase every AVD on this host
-    python scripts/emulator_erase.py --all
+    python3 "$SKILL_DIR/scripts/emulator_erase.py" --all
 
     # List AVDs
-    python scripts/emulator_erase.py --list
+    python3 "$SKILL_DIR/scripts/emulator_erase.py" --list
 """
 
 import argparse
@@ -358,19 +358,19 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # Erase AVD (must be shutdown first)
-  python scripts/emulator_erase.py --name MyTestDevice
+  python3 "$SKILL_DIR/scripts/emulator_erase.py" --name MyTestDevice
 
   # Erase and verify the wipe landed on disk
-  python scripts/emulator_erase.py --name MyTestDevice --verify
+  python3 "$SKILL_DIR/scripts/emulator_erase.py" --name MyTestDevice --verify
 
   # Force erase (even if running - may cause issues)
-  python scripts/emulator_erase.py --name MyTestDevice --force
+  python3 "$SKILL_DIR/scripts/emulator_erase.py" --name MyTestDevice --force
 
   # Erase every AVD on this host
-  python scripts/emulator_erase.py --all
+  python3 "$SKILL_DIR/scripts/emulator_erase.py" --all
 
   # List all AVDs
-  python scripts/emulator_erase.py --list
+  python3 "$SKILL_DIR/scripts/emulator_erase.py" --list
         """,
     )
 

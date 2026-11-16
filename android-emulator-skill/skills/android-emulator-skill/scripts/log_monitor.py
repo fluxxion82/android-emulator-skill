@@ -15,22 +15,22 @@ Features:
 
 Usage Examples:
     # Monitor app logs in real-time (follow mode)
-    python scripts/log_monitor.py --app com.myapp --follow
+    python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --follow
 
     # Capture logs for specific duration
-    python scripts/log_monitor.py --app com.myapp --duration 30s
+    python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --duration 30s
 
     # Extract errors and warnings only
-    python scripts/log_monitor.py --severity error,warning --duration 1m
+    python3 "$SKILL_DIR/scripts/log_monitor.py" --severity error,warning --duration 1m
 
     # Inspect the last 5 minutes of history (dump-and-exit, no live follow)
-    python scripts/log_monitor.py --app com.myapp --last 5m
+    python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --last 5m
 
     # Save logs to file
-    python scripts/log_monitor.py --app com.myapp --duration 1m --output logs/
+    python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --duration 1m --output logs/
 
     # Verbose output with full log lines
-    python scripts/log_monitor.py --app com.myapp --verbose
+    python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --verbose
 """
 
 import argparse
@@ -1372,27 +1372,27 @@ def main(argv: list[str] | None = None):
         description="Monitor and analyze Android device/emulator logs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Also reachable as `python scripts/logs.py tail ...` — the unified log entry
-point, which routes here unchanged. Both invocations are supported.
+Also reachable as the `tail` verb of logs.py, the unified log entry point,
+which routes here unchanged. Both invocations are supported.
 
 Examples:
   # Monitor app in real-time
-  python scripts/log_monitor.py --app com.myapp --follow
+  python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --follow
 
   # Capture logs for 30 seconds
-  python scripts/log_monitor.py --app com.myapp --duration 30s
+  python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --duration 30s
 
   # Show errors/warnings only
-  python scripts/log_monitor.py --severity error,warning --duration 1m
+  python3 "$SKILL_DIR/scripts/log_monitor.py" --severity error,warning --duration 1m
 
   # Inspect the last 5 minutes of history (logcat -d -t)
-  python scripts/log_monitor.py --app com.myapp --last 5m
+  python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --last 5m
 
   # Save logs to file
-  python scripts/log_monitor.py --app com.myapp --duration 1m --output logs/
+  python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --duration 1m --output logs/
 
   # Clear logs first, then monitor
-  python scripts/log_monitor.py --app com.myapp --clear --follow
+  python3 "$SKILL_DIR/scripts/log_monitor.py" --app com.myapp --clear --follow
         """,
     )
 

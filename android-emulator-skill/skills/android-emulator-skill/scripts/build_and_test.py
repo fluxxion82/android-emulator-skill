@@ -11,29 +11,29 @@ mechanics (gradlew tasks, JUnit XML, console parsing). See ``scripts/gradle/``.
 
 Usage Examples:
     # Build (minimal output)
-    python scripts/build_and_test.py --project /path/to/project
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --project /path/to/project
     # Output: Build: SUCCESS (0 errors, 3 warnings) [1:32] [build-20251028-143052-1a2b3c4d]
 
     # Build a specific module + variant, clean first
-    python scripts/build_and_test.py --project . --module :app --variant release --clean
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --module :app --variant release --clean
 
     # Run unit tests (parses JUnit XML for pass/fail + failed names)
-    python scripts/build_and_test.py --project . --test
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --test
 
     # Filter tests
-    python scripts/build_and_test.py --project . --test --suite "com.example.MyTest"
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --test --suite "com.example.MyTest"
 
     # Run instrumented tests (connectedDebugAndroidTest) on one device
-    python scripts/build_and_test.py --project . --instrumented --serial emulator-5554 \
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --instrumented --serial emulator-5554 \
         --suite com.example.MyInstrumentedTest
 
     # Drill into a previous build's details
-    python scripts/build_and_test.py --get-errors build-20251028-143052-1a2b3c4d
-    python scripts/build_and_test.py --get-warnings build-20251028-143052-1a2b3c4d
-    python scripts/build_and_test.py --get-log build-20251028-143052-1a2b3c4d
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --get-errors build-20251028-143052-1a2b3c4d
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --get-warnings build-20251028-143052-1a2b3c4d
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --get-log build-20251028-143052-1a2b3c4d
 
     # List recent builds
-    python scripts/build_and_test.py --list-builds
+    python3 "$SKILL_DIR/scripts/build_and_test.py" --list-builds
 """
 
 import argparse
@@ -251,23 +251,23 @@ def main(argv: list[str] | None = None) -> int:
         epilog="""
 Examples:
   # Build (minimal output)
-  python scripts/build_and_test.py --project /path/to/project
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --project /path/to/project
 
   # Build a module + variant, clean first
-  python scripts/build_and_test.py --project . --module :app --variant release --clean
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --module :app --variant release --clean
 
   # Run tests (parses JUnit XML)
-  python scripts/build_and_test.py --project . --test --suite com.example.MyTest
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --test --suite com.example.MyTest
 
   # Run instrumented tests on one device (connected<Variant>AndroidTest)
-  python scripts/build_and_test.py --project . --instrumented --serial emulator-5554
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --project . --instrumented --serial emulator-5554
 
   # Drill into a previous build
-  python scripts/build_and_test.py --get-errors build-20251028-143052-1a2b3c4d
-  python scripts/build_and_test.py --get-log build-20251028-143052-1a2b3c4d
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --get-errors build-20251028-143052-1a2b3c4d
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --get-log build-20251028-143052-1a2b3c4d
 
   # List recent builds
-  python scripts/build_and_test.py --list-builds
+  python3 "$SKILL_DIR/scripts/build_and_test.py" --list-builds
         """,
     )
 

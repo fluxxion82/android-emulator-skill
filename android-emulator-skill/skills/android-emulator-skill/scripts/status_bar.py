@@ -13,22 +13,22 @@ connection for whatever runs next.
 
 Usage Examples:
     # Set battery to 50%
-    python scripts/status_bar.py --battery 50
+    python3 "$SKILL_DIR/scripts/status_bar.py" --battery 50
 
     # Set full signal
-    python scripts/status_bar.py --signal full
+    python3 "$SKILL_DIR/scripts/status_bar.py" --signal full
 
     # Set time to 9:41 (H:MM or HH:MM; sent to SystemUI as 0941)
-    python scripts/status_bar.py --time "9:41"
+    python3 "$SKILL_DIR/scripts/status_bar.py" --time "9:41"
 
     # Hide the WiFi icon (bare --wifi shows it)
-    python scripts/status_bar.py --wifi hide
+    python3 "$SKILL_DIR/scripts/status_bar.py" --wifi hide
 
     # Apply a coherent demo-mode preset (clean status bar for screenshots)
-    python scripts/status_bar.py --preset clean
+    python3 "$SKILL_DIR/scripts/status_bar.py" --preset clean
 
     # Reset to actual status
-    python scripts/status_bar.py --reset
+    python3 "$SKILL_DIR/scripts/status_bar.py" --reset
 """
 
 import argparse
@@ -553,26 +553,26 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Set battery to 50%
-  python scripts/status_bar.py --battery 50
+  python3 "$SKILL_DIR/scripts/status_bar.py" --battery 50
 
   # Set battery charging
-  python scripts/status_bar.py --battery 75 --charging
+  python3 "$SKILL_DIR/scripts/status_bar.py" --battery 75 --charging
 
   # Set full WiFi signal
-  python scripts/status_bar.py --wifi --wifi-level 4
+  python3 "$SKILL_DIR/scripts/status_bar.py" --wifi --wifi-level 4
 
   # Hide the WiFi and mobile icons
-  python scripts/status_bar.py --wifi hide --mobile hide
+  python3 "$SKILL_DIR/scripts/status_bar.py" --wifi hide --mobile hide
 
   # Set time for screenshots (H:MM or HH:MM; 9:41 is sent as 0941)
-  python scripts/status_bar.py --time "9:41"
+  python3 "$SKILL_DIR/scripts/status_bar.py" --time "9:41"
 
   # Apply a coherent demo-mode preset
-  python scripts/status_bar.py --preset clean
-  python scripts/status_bar.py --preset low-battery
+  python3 "$SKILL_DIR/scripts/status_bar.py" --preset clean
+  python3 "$SKILL_DIR/scripts/status_bar.py" --preset low-battery
 
   # Reset to actual status
-  python scripts/status_bar.py --reset
+  python3 "$SKILL_DIR/scripts/status_bar.py" --reset
         """,
     )
 

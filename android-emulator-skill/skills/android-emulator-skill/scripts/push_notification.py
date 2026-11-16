@@ -54,13 +54,13 @@ exit status and, for ``--post``, from the notification actually appearing in
 
 Usage Examples:
     # Post into the shade (as com.android.shell) and verify it landed
-    python push_notification.py --post --tag order-42 --text "Your order shipped"
+    python3 "$SKILL_DIR/scripts/push_notification.py" --post --tag order-42 --text "Your order shipped"
 
     # Did the app under test post anything? Exit code answers it
-    python push_notification.py --list --expect-package com.example.app
+    python3 "$SKILL_DIR/scripts/push_notification.py" --list --expect-package com.example.app
 
     # Exercise the notifications-blocked path
-    python push_notification.py --revoke-permission --package com.example.app
+    python3 "$SKILL_DIR/scripts/push_notification.py" --revoke-permission --package com.example.app
 """
 
 import argparse
@@ -576,12 +576,12 @@ What --post really does:
   by Google Play services, not by the shell user. Send through FCM instead.
 
 Examples:
-  python push_notification.py --post --tag order-42 --text "Your order shipped"
-  python push_notification.py --post --tag t1 --text hi --no-verify --json
-  python push_notification.py --list --verbose
-  python push_notification.py --list --expect-package com.example.app
-  python push_notification.py --grant-permission --package com.example.app
-  python push_notification.py --revoke-permission --package com.example.app --json
+  python3 "$SKILL_DIR/scripts/push_notification.py" --post --tag order-42 --text "Your order shipped"
+  python3 "$SKILL_DIR/scripts/push_notification.py" --post --tag t1 --text hi --no-verify --json
+  python3 "$SKILL_DIR/scripts/push_notification.py" --list --verbose
+  python3 "$SKILL_DIR/scripts/push_notification.py" --list --expect-package com.example.app
+  python3 "$SKILL_DIR/scripts/push_notification.py" --grant-permission --package com.example.app
+  python3 "$SKILL_DIR/scripts/push_notification.py" --revoke-permission --package com.example.app --json
 
 Exit status:
   0  the action succeeded (for --post: the notification was found in

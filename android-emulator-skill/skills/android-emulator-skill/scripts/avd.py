@@ -95,14 +95,14 @@ the flags they always had -- this script *calls* them. An existing
 identical ``avd.py start --avd Pixel_9 --wait-ready``.
 
 Usage:
-    python3 scripts/avd.py list --json
-    python3 scripts/avd.py pick --suggest
-    python3 scripts/avd.py create --device pixel_7 --api 34 --name test-device
-    python3 scripts/avd.py start --avd test-device --wait-ready
-    python3 scripts/avd.py stop --serial emulator-5554
-    python3 scripts/avd.py reset --name test-device --verify
-    python3 scripts/avd.py delete --name test-device --yes
-    python3 scripts/avd.py <verb> --help      # the verb's full flag set
+    python3 "$SKILL_DIR/scripts/avd.py" list --json
+    python3 "$SKILL_DIR/scripts/avd.py" pick --suggest
+    python3 "$SKILL_DIR/scripts/avd.py" create --device pixel_7 --api 34 --name test-device
+    python3 "$SKILL_DIR/scripts/avd.py" start --avd test-device --wait-ready
+    python3 "$SKILL_DIR/scripts/avd.py" stop --serial emulator-5554
+    python3 "$SKILL_DIR/scripts/avd.py" reset --name test-device --verify
+    python3 "$SKILL_DIR/scripts/avd.py" delete --name test-device --yes
+    python3 "$SKILL_DIR/scripts/avd.py" <verb> --help      # the verb's full flag set
 """
 
 from __future__ import annotations
@@ -159,7 +159,7 @@ ROUTES: tuple[Route, ...] = (
         script="device_list.py",
         effect="reads adb devices -l and the AVD listing; changes nothing",
         destructive=False,
-        example="avd.py list --get-details",
+        example=cli.invocation("avd.py", "list", "--get-details"),
     ),
     Route(
         name="pick",
@@ -168,7 +168,7 @@ ROUTES: tuple[Route, ...] = (
         script="emulator_selector.py",
         effect="ranks AVDs (running > recent > latest API > common model)",
         destructive=False,
-        example="avd.py pick --suggest --json",
+        example=cli.invocation("avd.py", "pick", "--suggest", "--json"),
     ),
     Route(
         name="create",
@@ -177,7 +177,9 @@ ROUTES: tuple[Route, ...] = (
         script="emulator_create.py",
         effect="adds an AVD via avdmanager; touches nothing that exists",
         destructive=False,
-        example="avd.py create --device pixel_7 --api 34 --name test-device",
+        example=cli.invocation(
+            "avd.py", "create", "--device", "pixel_7", "--api", "34", "--name", "test-device"
+        ),
     ),
     Route(
         name="start",
@@ -186,7 +188,7 @@ ROUTES: tuple[Route, ...] = (
         script="emulator_boot.py",
         effect="boots an AVD, optionally waiting for readiness",
         destructive=False,
-        example="avd.py start --avd Pixel_9 --wait-ready",
+        example=cli.invocation("avd.py", "start", "--avd", "Pixel_9", "--wait-ready"),
     ),
     Route(
         name="stop",
@@ -195,7 +197,7 @@ ROUTES: tuple[Route, ...] = (
         script="emulator_shutdown.py",
         effect="shuts a running emulator down; the AVD and its data survive",
         destructive=False,
-        example="avd.py stop --serial emulator-5554",
+        example=cli.invocation("avd.py", "stop", "--serial", "emulator-5554"),
     ),
     Route(
         name="reset",
@@ -204,7 +206,7 @@ ROUTES: tuple[Route, ...] = (
         script="emulator_erase.py",
         effect="DESTRUCTIVE: wipes userdata/cache/sdcard; the AVD remains",
         destructive=True,
-        example="avd.py reset --name test-device --verify",
+        example=cli.invocation("avd.py", "reset", "--name", "test-device", "--verify"),
     ),
     Route(
         name="delete",
@@ -213,7 +215,7 @@ ROUTES: tuple[Route, ...] = (
         script="emulator_delete.py",
         effect="DESTRUCTIVE: removes the AVD itself (prompts unless --yes)",
         destructive=True,
-        example="avd.py delete --name test-device --yes",
+        example=cli.invocation("avd.py", "delete", "--name", "test-device", "--yes"),
     ),
 )
 
@@ -261,8 +263,8 @@ SYNONYMS: dict[str, str] = {
 AMBIGUOUS_DESTRUCTIVE = frozenset({"erase", "wipe", "clean", "clear"})
 
 _DISAMBIGUATION = (
-    "\nDid you mean: avd.py reset (keep the AVD, throw away its data) "
-    "or avd.py delete (throw away the AVD)?"
+    "\nDid you mean the verb `reset` (keep the AVD, throw away its data) "
+    "or `delete` (throw away the AVD)?"
 )
 
 
@@ -282,14 +284,14 @@ def suggest_verb(typed: str) -> str:
     if typed in AMBIGUOUS_DESTRUCTIVE:
         return _DISAMBIGUATION
     if typed in SYNONYMS:
-        return f"\nDid you mean: avd.py {SYNONYMS[typed]}"
+        return f"\nDid you mean the verb `{SYNONYMS[typed]}`?"
 
     match = difflib.get_close_matches(typed, ROUTES_BY_NAME, n=1, cutoff=0.4)
     if not match:
         return ""
     if ROUTES_BY_NAME[match[0]].destructive:
         return _DISAMBIGUATION
-    return f"\nDid you mean: avd.py {match[0]}"
+    return f"\nDid you mean the verb `{match[0]}`?"
 
 
 def _normalise_exit(code: object) -> int:
@@ -402,13 +404,14 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=f"""{_guide()}
 
 Examples:
-  python3 scripts/avd.py list --json
-  python3 scripts/avd.py pick --suggest
-  python3 scripts/avd.py create --device pixel_7 --api 34 --name test-device
-  python3 scripts/avd.py start --avd test-device --wait-ready
-  python3 scripts/avd.py stop --serial emulator-5554
-  python3 scripts/avd.py reset --name test-device --verify   # keeps the AVD
-  python3 scripts/avd.py delete --name test-device --yes     # removes the AVD
+  python3 "$SKILL_DIR/scripts/avd.py" list --json
+  python3 "$SKILL_DIR/scripts/avd.py" pick --suggest
+  python3 "$SKILL_DIR/scripts/avd.py" create --device pixel_7 --api 34 --name test-device
+  python3 "$SKILL_DIR/scripts/avd.py" start --avd test-device --wait-ready
+  python3 "$SKILL_DIR/scripts/avd.py" stop --serial emulator-5554
+  # reset keeps the AVD; delete removes it:
+  python3 "$SKILL_DIR/scripts/avd.py" reset --name test-device --verify
+  python3 "$SKILL_DIR/scripts/avd.py" delete --name test-device --yes
 
 Nothing is replaced: the delegated scripts remain callable with the same flags.
 `--serial`, `--name`, `--json` and `--verbose` belong to the verbs, which accept

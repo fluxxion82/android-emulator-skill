@@ -43,9 +43,9 @@ may is UNVERIFIED, and unverified capabilities are not shipped); and ``--otp``
 is a **heuristic, not a parser** (see :func:`extract_otp`).
 
 Usage Examples:
-    python sms.py --send --to +15551234567 --body "Your code is 428193"
-    python sms.py --list --limit 5
-    python sms.py --otp --json
+    python3 "$SKILL_DIR/scripts/sms.py" --send --to +15551234567 --body "Your code is 428193"
+    python3 "$SKILL_DIR/scripts/sms.py" --list --limit 5
+    python3 "$SKILL_DIR/scripts/sms.py" --otp --json
 """
 
 import argparse
@@ -596,12 +596,12 @@ Why --send reads the inbox back:
   cannot work against one. --list and --otp are plain content queries.
 
 Examples:
-  python sms.py --send --to +15551234567 --body "Your code is 428193"
-  python sms.py --send --to +15551234567 --body hi --no-verify --json
-  python sms.py --list --limit 5
-  python sms.py --list --json
-  python sms.py --otp
-  python sms.py --otp --json
+  python3 "$SKILL_DIR/scripts/sms.py" --send --to +15551234567 --body "Your code is 428193"
+  python3 "$SKILL_DIR/scripts/sms.py" --send --to +15551234567 --body hi --no-verify --json
+  python3 "$SKILL_DIR/scripts/sms.py" --list --limit 5
+  python3 "$SKILL_DIR/scripts/sms.py" --list --json
+  python3 "$SKILL_DIR/scripts/sms.py" --otp
+  python3 "$SKILL_DIR/scripts/sms.py" --otp --json
 
 Exit status:
   0  the action succeeded (for --send: the message was found in the inbox;

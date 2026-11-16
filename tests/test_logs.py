@@ -186,7 +186,7 @@ def test_bare_invocation_is_a_usage_error_that_still_explains_the_verbs(capsys):
 
 def test_unknown_verb_suggests_the_nearest_one(capsys):
     assert logs.main(["crash"]) == 2
-    assert "logs.py crashes" in capsys.readouterr().err
+    assert "Did you mean the verb `crashes`?" in capsys.readouterr().err
 
 
 def test_verb_help_reaches_the_delegate_not_the_router():

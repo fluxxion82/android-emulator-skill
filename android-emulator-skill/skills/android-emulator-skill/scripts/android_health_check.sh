@@ -10,7 +10,7 @@
 # Android mechanics — ANDROID_HOME/ANDROID_SDK_ROOT, adb, emulator, avdmanager,
 # sdkmanager, and java rather than Xcode/simctl/idb.
 #
-# Usage: bash scripts/android_health_check.sh [--help] [--json]
+# Usage: bash "$SKILL_DIR/scripts/android_health_check.sh" [--help] [--json]
 #
 # Exit codes:
 #   0 - All hard requirements satisfied (warnings allowed)
@@ -77,11 +77,14 @@ Android Emulator Testing - Environment Health Check
 Verifies that your environment is properly configured for Android emulator and
 device testing with this skill.
 
-Usage: bash scripts/android_health_check.sh [options]
+Usage: android_health_check.sh [--json] [--help]
 
 Options:
   --help, -h    Show this help message
   --json        Emit one JSON object on stdout (progress goes to stderr)
+
+Example (SKILL_DIR is the skill's directory, the one holding SKILL.md):
+  bash "\$SKILL_DIR/scripts/android_health_check.sh" --json
 
 This script checks for:
   - ANDROID_HOME / ANDROID_SDK_ROOT environment variable

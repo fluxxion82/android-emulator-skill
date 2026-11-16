@@ -59,12 +59,12 @@ the flags they always had -- this script *calls* them. An existing
 ``logs.py tail --duration 3s --json``.
 
 Usage:
-    python3 scripts/logs.py tail --app com.myapp --duration 30s
-    python3 scripts/logs.py tail --serial emulator-5554 --severity error --last 5m
-    python3 scripts/logs.py crashes --package com.myapp --json
-    python3 scripts/logs.py anr --since 5m
-    python3 scripts/logs.py anr --start --package com.myapp
-    python3 scripts/logs.py <verb> --help      # the verb's full flag set
+    python3 "$SKILL_DIR/scripts/logs.py" tail --app com.myapp --duration 30s
+    python3 "$SKILL_DIR/scripts/logs.py" tail --serial emulator-5554 --severity error --last 5m
+    python3 "$SKILL_DIR/scripts/logs.py" crashes --package com.myapp --json
+    python3 "$SKILL_DIR/scripts/logs.py" anr --since 5m
+    python3 "$SKILL_DIR/scripts/logs.py" anr --start --package com.myapp
+    python3 "$SKILL_DIR/scripts/logs.py" <verb> --help      # the verb's full flag set
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ ROUTES: tuple[Route, ...] = (
         module="log_monitor",
         script="log_monitor.py",
         source="main logcat buffers (-v threadtime), live or a historical window",
-        example="logs.py tail --app com.myapp --duration 30s",
+        example=cli.invocation("logs.py", "tail", "--app", "com.myapp", "--duration", "30s"),
     ),
     Route(
         name="crashes",
@@ -124,7 +124,7 @@ ROUTES: tuple[Route, ...] = (
         module="crash_triage",
         script="crash_triage.py",
         source="the dedicated crash buffer (logcat -b crash -d)",
-        example="logs.py crashes --package com.myapp --verbose",
+        example=cli.invocation("logs.py", "crashes", "--package", "com.myapp", "--verbose"),
     ),
     Route(
         name="anr",
@@ -132,7 +132,7 @@ ROUTES: tuple[Route, ...] = (
         module="anr_watcher",
         script="anr_watcher.py",
         source="ActivityManager ANRs + Choreographer jank, one-shot or as a session",
-        example="logs.py anr --start --package com.myapp",
+        example=cli.invocation("logs.py", "anr", "--start", "--package", "com.myapp"),
     ),
 )
 
@@ -240,11 +240,12 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=f"""{_guide()}
 
 Examples:
-  python3 scripts/logs.py tail --app com.myapp --duration 30s
-  python3 scripts/logs.py tail --serial emulator-5554 --severity error --last 5m
-  python3 scripts/logs.py crashes --package com.myapp --json
-  python3 scripts/logs.py anr --since 5m --json
-  python3 scripts/logs.py anr --start --package com.myapp   # record a session
+  python3 "$SKILL_DIR/scripts/logs.py" tail --app com.myapp --duration 30s
+  python3 "$SKILL_DIR/scripts/logs.py" tail --serial emulator-5554 --severity error --last 5m
+  python3 "$SKILL_DIR/scripts/logs.py" crashes --package com.myapp --json
+  python3 "$SKILL_DIR/scripts/logs.py" anr --since 5m --json
+  # Record an ANR session:
+  python3 "$SKILL_DIR/scripts/logs.py" anr --start --package com.myapp
 
 Nothing is replaced: the delegated scripts remain callable with the same flags.
 `--serial`, `--json` and `--verbose` belong to the verbs, which accept them
@@ -286,13 +287,13 @@ def main(argv: list[str] | None = None) -> int:
     # an agent that guessed a synonym. Name the nearest verb instead.
     if args and not args[0].startswith("-"):
         suggestion = difflib.get_close_matches(args[0], ROUTES_BY_NAME, n=1, cutoff=0.4)
-        hint = f"\nDid you mean: logs.py {suggestion[0]}" if suggestion else ""
+        hint = f"\nDid you mean the verb `{suggestion[0]}`?" if suggestion else ""
         if cli.wants_json(args):
             # A usage error under --json is the refusal object, like every
             # parser's (cli.parser); the hint rides in the remedy.
             cli.report(
                 f"Unknown verb {args[0]!r}.",
-                f"{hint.strip() + '. ' if hint else ''}The verbs are "
+                f"{hint.strip() + ' ' if hint else ''}The verbs are "
                 f"{', '.join(ROUTES_BY_NAME)}; run logs.py --help for what each one does.",
                 json_mode=True,
             )

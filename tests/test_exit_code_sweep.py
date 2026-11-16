@@ -678,9 +678,11 @@ def _the_count_sentence(skill_md: str) -> str:
 
 def _count_moved_to_another_section(skill_md: str) -> str:
     sentence = _the_count_sentence(skill_md)
-    return skill_md.replace(sentence, "").replace(
-        "## Contributing\n", f"## Contributing\n\n{sentence}\n"
-    )
+    heading = "## Requirements\n"
+    assert skill_md.count(heading) == 1, "the section this mutation moves the sentence to is gone"
+    moved = skill_md.replace(sentence, "").replace(heading, f"{heading}\n{sentence}\n")
+    assert sentence in moved, "the sentence was deleted, not moved"
+    return moved
 
 
 def _count_off_by_one(skill_md: str) -> str:

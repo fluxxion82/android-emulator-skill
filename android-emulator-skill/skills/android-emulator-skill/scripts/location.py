@@ -31,11 +31,11 @@ Key features:
 - Standard --serial, --json, and --verbose flags
 
 Usage examples:
-    python scripts/location.py --lat 51.5074 --lng -0.1278
-    python scripts/location.py --city london
-    python scripts/location.py --gpx route.gpx --interval 0.5
-    python scripts/location.py --list-cities
-    python scripts/location.py --clear
+    python3 "$SKILL_DIR/scripts/location.py" --lat 51.5074 --lng -0.1278
+    python3 "$SKILL_DIR/scripts/location.py" --city london
+    python3 "$SKILL_DIR/scripts/location.py" --gpx route.gpx --interval 0.5
+    python3 "$SKILL_DIR/scripts/location.py" --list-cities
+    python3 "$SKILL_DIR/scripts/location.py" --clear
 """
 
 import argparse
@@ -442,11 +442,11 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python scripts/location.py --lat 51.5074 --lng -0.1278
-  python scripts/location.py --city london
-  python scripts/location.py --gpx route.gpx --interval 0.5
-  python scripts/location.py --list-cities
-  python scripts/location.py --clear
+  python3 "$SKILL_DIR/scripts/location.py" --lat 51.5074 --lng -0.1278
+  python3 "$SKILL_DIR/scripts/location.py" --city london
+  python3 "$SKILL_DIR/scripts/location.py" --gpx route.gpx --interval 0.5
+  python3 "$SKILL_DIR/scripts/location.py" --list-cities
+  python3 "$SKILL_DIR/scripts/location.py" --clear
 
 Notes:
   EMULATOR-ONLY. 'emu geo fix' drives the emulator console and does not work on

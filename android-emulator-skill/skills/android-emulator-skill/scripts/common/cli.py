@@ -103,6 +103,7 @@ import contextlib
 import functools
 import json
 import os
+import shlex
 import subprocess
 import sys
 import traceback
@@ -161,6 +162,23 @@ class BatchFailure(Failure):
     ):
         super().__init__(error, remedy, details)
         self.exit_status = exit_status
+
+
+def invocation(script: str, *arguments: str) -> str:
+    """One of this skill's scripts as a command line, written the way SKILL.md writes one.
+
+    ``python3 "$SKILL_DIR/scripts/<script>" <arguments>`` (``bash`` for a shell
+    script), each argument quoted for the shell. For a command a script
+    PRINTS for the agent to run next -- a hint, a drill line, a routing
+    table's example: a bare ``navigator.py --find-text ...`` is a
+    file-not-found from a project directory, which is where an installed
+    skill is used. A script's name inside a sentence of a remedy
+    ("`keyboard.py --button back`") is a pointer, not a line to run, and is
+    left as it is.
+    """
+    interpreter = "bash" if script.endswith(".sh") else "python3"
+    words = "".join(f" {shlex.quote(argument)}" for argument in arguments)
+    return f'{interpreter} "$SKILL_DIR/scripts/{script}"{words}'
 
 
 def fail(error: str, remedy: str, *, details: Mapping[str, object] | None = None) -> NoReturn:

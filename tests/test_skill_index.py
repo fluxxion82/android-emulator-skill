@@ -24,8 +24,10 @@ not recognise it. What that leaves unchecked is stated where it applies.
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -396,16 +398,27 @@ def prose_only(markdown: str) -> list[str]:
     return [line for line, kind in markdown_lines(markdown) if kind == PROSE]
 
 
-def _accepted(script: str, entries: dict[str, Entry]) -> set[str]:
-    """Every flag a script takes.
-
-    A Python script's are argparse's own, from its ``--help``. The shell health
-    check has no argparse to ask, so its index entry is its interface: what the
-    Options bullet names is what it takes.
-    """
+@functools.cache
+def _help_of(script: str) -> str:
+    """A script's own `--help`: argparse's for a Python script, the shell script's for it."""
+    path = SKILL_ROOT / "scripts" / script
     if script.endswith(".py"):
-        return _option_tokens(_help_text(str(SKILL_ROOT / "scripts" / script)))
-    return set(entries[script].options) if script in entries else set()
+        return _help_text(str(path))
+    helped = subprocess.run(
+        ["bash", str(path), "--help"], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert helped.returncode == 0, f"{script} --help failed: {helped.stderr[:200]}"
+    return helped.stdout
+
+
+def _accepted(script: str) -> set[str]:
+    """Every flag a script takes, read from its own `--help`.
+
+    The shell health check's too: its help lists its options in the column
+    argparse uses, so one reader serves both. It was read from its SKILL.md
+    entry at first, which made the entry the proof of itself.
+    """
+    return {flag for flag in _option_tokens(_help_of(script)) if _SPELLING.fullmatch(flag)}
 
 
 def index_problems(skill_md: str, references: dict[str, str], scripts: list[str]) -> list[str]:
@@ -418,7 +431,6 @@ def index_problems(skill_md: str, references: dict[str, str], scripts: list[str]
     for name in sorted(set(names) - set(scripts)):
         problems.append(f"the index has an entry for {name}, which is not a script on disk")
 
-    by_name = {entry.name: entry for entry in entries}
     global_flags = _global_flags(skill_md)
     for entry in entries:
         where = f"entry {entry.number} ({entry.name})"
@@ -437,9 +449,14 @@ def index_problems(skill_md: str, references: dict[str, str], scripts: list[str]
                 "bullet does not name"
             )
         if entry.name in scripts:
-            unaccepted = _flags_in(entry.run) - _accepted(entry.name, by_name)
+            unaccepted = _flags_in(entry.run) - _accepted(entry.name)
             if unaccepted:
                 problems.append(f"{where}: its Run line uses {sorted(unaccepted)}, not accepted")
+            if untaken := sorted(entry.options - _accepted(entry.name)):
+                problems.append(
+                    f"{where}: its Options bullet names {untaken}, which the script "
+                    "does not accept"
+                )
     return problems
 
 
@@ -525,8 +542,7 @@ def _undocumented_flags(
 
     A flag is documented for a script when that script's Options bullet names
     it, or when the "All scripts support" sentence does and the script accepts
-    it. The options mapping the flag guards use reads Python entries only;
-    this one reads every entry, so the shell health check's counts.
+    it -- the shell health check's entry and flags like any other script's.
     """
     entries = {entry.name: entry for entry in read_index(skill_md)[0]}
     everywhere = _global_flags(skill_md)
@@ -535,7 +551,7 @@ def _undocumented_flags(
         if script not in entries:
             problems.append(f"{what} runs {script}, which has no index entry")
             continue
-        documented = set(entries[script].options) | (everywhere & _accepted(script, entries))
+        documented = set(entries[script].options) | (everywhere & _accepted(script))
         if missing := sorted(flags - documented):
             problems.append(
                 f"{what} runs {script} with {missing}, which its index entry does not document"
@@ -647,9 +663,12 @@ LOOP_TEST_BASELINE = (
     ("build_and_test.py", ("--get-errors",)),
     ("build_and_test.py", ("--project",)),
     ("navigator.py", ()),
+    ("navigator.py", ()),
+    ("navigator.py", ()),
     ("navigator.py", ("--find-text", "--tap")),
     ("screen_mapper.py", ()),
     ("screen_mapper.py", ()),
+    ("screen_mapper.py", ("--hints",)),
     ("screen_mapper.py", ("--json",)),
 )
 
@@ -836,30 +855,36 @@ def _logical_lines(lines: list[str]) -> list[str]:
     return joined
 
 
-def example_problems(name: str, markdown: str, skill_md: str) -> list[str]:
-    """Every fenced line that runs a script runs it one way, with flags it accepts.
+def command_line_problems(
+    name: str, lines: list[str], skill_md: str, *, names_a_command=None, comments_are_read=False
+) -> list[str]:
+    """Every line that runs a script runs it one way, with flags it accepts.
 
-    A fenced line that mentions ``scripts/`` or any script's file name must be,
-    whole, ``python3 "$SKILL_DIR/scripts/<file>" <arguments>`` (``bash`` for a
-    shell script),
+    A line that names a command (by default: one that mentions ``scripts/`` or
+    any script's file name) must be, whole, ``python3
+    "$SKILL_DIR/scripts/<file>" <arguments>`` (``bash`` for a shell script),
     its arguments plain words; a line ending in a backslash continues on the
     next. Each flag is checked against the script the LINE names -- an example
     in one script's file may show another -- and, after a router's verb
     (``avd.py start --avd ...``), against the script that verb hands it to.
 
-    Limits, stated: only fenced lines are read. Prose names flags that do not
-    exist on purpose ("there is no ``--list``"), so a flag in a sentence or in
-    inline code is not a claim this guard can hold anyone to; a line that
-    captures or pipes a script's output is refused, not interpreted; and a
-    line that runs a script without naming its file (through a variable that
-    holds the whole path) is not seen at all.
+    A line that starts with `#` is a shell comment and is passed over, unless
+    ``comments_are_read``: help text is not shell, and there a `#` line is
+    read like any other.
+
+    Limits, stated: a line that captures or pipes a script's output is
+    refused, not interpreted; and a line that runs a script without naming
+    its file (through a variable that holds the whole path) is not seen at all.
     """
-    entries = {entry.name: entry for entry in read_index(skill_md)[0]}
     scripts = set(_scripts_on_disk())
+    if names_a_command is None:
+        names_a_command = _names_a_script
     routes = _routes()
     problems = []
-    for line in _logical_lines(code_lines(markdown)):
-        if line.startswith("#") or not _names_a_script(line, scripts):
+    for line in _logical_lines(lines):
+        if line.startswith("#") and not comments_are_read:
+            continue
+        if not names_a_command(line, scripts):
             continue
         where = f"{name}: `{line}`"
         example = _EXAMPLE.fullmatch(line)
@@ -880,9 +905,68 @@ def example_problems(name: str, markdown: str, skill_md: str) -> list[str]:
         target = script
         if script in routes and words and words[0] in routes[script]:
             target, words = routes[script][words[0]], words[1:]
-        if unaccepted := sorted(_flags_in(words) - _accepted(target, entries)):
+        if unaccepted := sorted(_flags_in(words) - _accepted(target)):
             problems.append(f"{where} passes {unaccepted}, which {target} does not accept")
     return problems
+
+
+def example_problems(name: str, markdown: str, skill_md: str) -> list[str]:
+    """`command_line_problems` over a document's fenced lines.
+
+    Only fenced lines are read. Prose names flags that do not exist on purpose
+    ("there is no ``--list``"), so a flag in a sentence or in inline code is
+    not a claim this guard can hold anyone to.
+    """
+    return command_line_problems(name, code_lines(markdown), skill_md)
+
+
+def sentence_problems(skill_md: str, scripts: list[str]) -> list[str]:
+    """The "All scripts support ..." sentence promises only flags every script takes.
+
+    The flag guards count a flag in that sentence as documented for every
+    script, so the sentence is itself a claim, and was the one nothing
+    checked: `--verbose` added to it was accepted while eleven scripts do
+    not take it. Each flag it names, in backticks, must be in every script's
+    own `--help`, the shell health check's included.
+    """
+    sentences = [line for line in skill_md.split("\n") if line.startswith("All scripts support")]
+    if len(sentences) != 1:
+        return [f"expected one 'All scripts support' sentence, found {len(sentences)}"]
+    flags, problems = _declared_options(sentences[0], "the 'All scripts support' sentence")
+    if not flags:
+        problems.append("the 'All scripts support' sentence names no flag in backticks")
+    for flag in sorted(flags):
+        if lacking := [script for script in scripts if flag not in _accepted(script)]:
+            problems.append(
+                f"the 'All scripts support' sentence promises {flag}, which "
+                f"{len(lacking)} script(s) do not take: {lacking[:5]}"
+            )
+    return problems
+
+
+def test_the_all_scripts_sentence_promises_only_what_every_script_takes():
+    skill_md, _ = _documents()
+    assert not sentence_problems(skill_md, _scripts_on_disk())
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("`--json` for machine-readable output.", "`--json` for output, and `--verbose`."),
+        ("`--json` for machine-readable output.", "`--json` and `--teleport`."),
+        ("All scripts support `--help`", "Every script supports `--help`"),
+        ("`--help` for detailed options", "`--help.` for detailed options"),
+    ],
+    ids=[
+        "a flag eleven scripts lack",
+        "a flag no script has",
+        "the sentence reworded away",
+        "a misspelt flag",
+    ],
+)
+def test_the_sentence_guard_refuses_a_promise_not_every_script_keeps(old, new):
+    skill_md, _ = _documents()
+    assert sentence_problems(_once(skill_md, old, new), _scripts_on_disk())
 
 
 def reference_options_problems(name: str, markdown: str) -> list[str]:
@@ -1105,15 +1189,24 @@ def _remove_a_quick_start_flag_from_its_options_bullet(skill_md, references):
     )
 
 
-def _remove_the_health_checks_flag_from_its_options_bullet(skill_md, references):
+def _the_health_checks_entry_declares_a_flag_it_does_not_take(skill_md, references):
     return (
         _once(
             skill_md,
             "    - Options: `--json`, `--help`\n    - Detail: [references/android_health_check.md]",
-            "    - Options: `--help`\n    - Detail: [references/android_health_check.md]",
+            "    - Options: `--json`, `--help`, `--verbose`\n"
+            "    - Detail: [references/android_health_check.md]",
         ),
         references,
     )
+
+
+def test_an_entry_declaring_a_flag_its_script_does_not_take_is_refused():
+    """The shell health check's entry is held to its own `--help`, like a Python script's."""
+    skill_md, references = _mutated(_the_health_checks_entry_declares_a_flag_it_does_not_take)
+    problems = index_problems(skill_md, references, _scripts_on_disk())
+    assert any("android_health_check.sh" in p and "--verbose" in p for p in problems), problems
+    assert _accepted("android_health_check.sh") == {"--help", "-h", "--json"}
 
 
 def _move_the_quick_start_block_into_a_reference_file(skill_md, references):
@@ -1168,7 +1261,6 @@ def _a_quick_start_heading_of_another_level_in_a_reference(skill_md, references)
         _a_second_quick_start_heading_in_a_blockquote,
         _a_quick_start_heading_of_another_level_in_a_reference,
         _remove_a_quick_start_flag_from_its_options_bullet,
-        _remove_the_health_checks_flag_from_its_options_bullet,
         _move_the_quick_start_block_into_a_reference_file,
         _copy_the_quick_start_block_into_a_reference_file,
         _quick_start_twice_in_the_main_file,

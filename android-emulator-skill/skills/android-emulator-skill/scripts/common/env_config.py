@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Env-var overrides for tunable defaults.
 
-All overrides use the ``ANDROID_EMU_`` prefix. See SKILL.md → Configuration
-for the canonical list of supported variables.
+All overrides use the ``ANDROID_EMU_`` prefix. There is no one list of them:
+the place that reads a variable defines it, and a script's module docstring,
+its ``--help`` and its file under ``references/`` describe the ones a user is
+likely to set, not all of them.
 """
 
 import os

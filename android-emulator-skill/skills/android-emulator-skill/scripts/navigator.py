@@ -21,22 +21,22 @@ Key Features:
 
 Usage Examples:
     # Find and tap a button by text
-    python scripts/navigator.py --find-text "Login" --tap
+    python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Login" --tap
 
     # Find something below the fold, scrolling until it appears
-    python scripts/navigator.py --find-text "About phone" --scroll-to-find --tap
+    python3 "$SKILL_DIR/scripts/navigator.py" --find-text "About phone" --scroll-to-find --tap
 
     # Enter text into first EditText
-    python scripts/navigator.py --find-type EditText --index 0 --enter-text "username"
+    python3 "$SKILL_DIR/scripts/navigator.py" --find-type EditText --index 0 --enter-text "username"
 
     # Tap element by resource ID
-    python scripts/navigator.py --find-id "submitButton" --tap
+    python3 "$SKILL_DIR/scripts/navigator.py" --find-id "submitButton" --tap
 
     # List all interactive elements
-    python scripts/navigator.py --list
+    python3 "$SKILL_DIR/scripts/navigator.py" --list
 
     # Tap at specific coordinates (fallback)
-    python scripts/navigator.py --tap-at 200,400
+    python3 "$SKILL_DIR/scripts/navigator.py" --tap-at 200,400
 
 Output Format:
     Tapped: Button "Login" at (320, 450)
@@ -1067,32 +1067,32 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Find and tap button by text (fuzzy)
-  python navigator.py --find-text "Login" --tap
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Login" --tap
 
   # Find by exact text (non-fuzzy) and tap
-  python navigator.py --find-exact "Sign In" --tap
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-exact "Sign In" --tap
 
   # Reach an item below the fold (scrolls; off by default because it moves
   # the app's scroll position, which a plain lookup must not do)
-  python navigator.py --find-text "About phone" --scroll-to-find --tap
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-text "About phone" --scroll-to-find --tap
 
   # Scroll back up to find something above the current position
-  python navigator.py --find-id "header" --scroll-to-find --scroll-direction up
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-id "header" --scroll-to-find --scroll-direction up
 
   # Find EditText and enter text
-  python navigator.py --find-type EditText --enter-text "user@example.com"
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-type EditText --enter-text "user@example.com"
 
   # Find by resource ID and tap
-  python navigator.py --find-id "submitButton" --tap
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-id "submitButton" --tap
 
   # Find second button (0-indexed)
-  python navigator.py --find-type Button --index 1 --tap
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-type Button --index 1 --tap
 
   # List all interactive elements
-  python navigator.py --list
+  python3 "$SKILL_DIR/scripts/navigator.py" --list
 
   # Tap at coordinates (fallback)
-  python navigator.py --tap-at 200,400
+  python3 "$SKILL_DIR/scripts/navigator.py" --tap-at 200,400
 
 Environment overrides:
   ANDROID_EMU_TAP_SETTLE_MS     Settle delay after each tap, ms (default: 500)

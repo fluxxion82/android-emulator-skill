@@ -54,6 +54,7 @@ import contextlib
 import io
 import json
 import re
+import shlex
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -65,7 +66,7 @@ import pytest
 import screen_mapper
 from fake_toolchain import FakeToolchain, Rule
 
-from common import adb_exec
+from common import adb_exec, cli
 
 COMPOSE = "uiautomator_compose_default.xml"
 SETTINGS = "uiautomator_settings_top.xml"
@@ -559,6 +560,99 @@ def test_an_action_with_no_criterion_is_refused(recorded, monkeypatch, screen_na
         f"(exit {run.status}) and said: {run.stdout.strip()!r}"
     )
     assert not issued, f"an action with no criterion still drove the screen: {issued}"
+
+
+# ---------------------------------------------------------------------------
+# The same loop through `--hints`: the report prints the command itself.
+# ---------------------------------------------------------------------------
+
+_HINTS_HEADER = "--- Navigation Hints ---"
+_HINT_COMMAND = 'python3 "$SKILL_DIR/scripts/navigator.py" '
+
+
+def _hint_lines(report: str) -> list[str]:
+    """The lines `screen_mapper --hints` prints under its hints header."""
+    _, found, hints = report.partition(_HINTS_HEADER)
+    assert found, f"the report has no hints section:\n{report}"
+    return [line.strip() for line in hints.splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize("screen_name", SCREENS, ids=_SCREEN_IDS)
+def test_a_printed_hint_is_a_command_that_acts_on_the_control_it_names(
+    recorded, monkeypatch, screen_name
+):
+    """`--hints` says it prints the next command to run; so run it, as printed.
+
+    It printed `navigator.py --find-text "..." --tap`: no interpreter and no
+    path, a file-not-found from any project directory, with the label pasted
+    between double quotes whatever it held. Each hint line is now split as a
+    shell would split it, must start with the rooted invocation SKILL.md
+    writes, and its arguments -- nothing else -- are handed to navigator. The
+    tap has to land in the control the label names, by the inventory's
+    rectangle, so a label the quoting mangled fails here.
+    """
+    screen = ET.fromstring(recorded.text(screen_name))
+    rectangles = dict(SCREEN_CONTROLS[screen_name])
+
+    report = _run_cli(screen_mapper, ["screen_mapper.py", "--hints"], screen, monkeypatch)
+    hints = _hint_lines(report.stdout)
+    assert hints, report.stdout
+
+    for hint in hints:
+        assert hint.startswith(_HINT_COMMAND), f"not a rooted navigator command: {hint!r}"
+        words = shlex.split(hint)
+        assert words[:2] == ["python3", "$SKILL_DIR/scripts/navigator.py"], words
+        label = words[words.index("--find-text") + 1]
+
+        run = _run_cli(navigator, ["navigator.py", *words[2:]], screen, monkeypatch)
+        taps = run.adb.shell_inputs("tap")
+
+        assert run.status == 0, f"{hint!r} failed: {run.stdout.strip()} {run.stderr.strip()}"
+        assert len(taps) == 1, f"{hint!r} produced {len(taps)} taps"
+        assert _inside(rectangles[label], int(taps[0][2]), int(taps[0][3])), (hint, taps[0])
+
+
+@pytest.mark.parametrize(
+    "label",
+    ['Say "hi"', "Bob's $HOME & co", "search_action_bar", "a `b` c", "-5 °C", "--tap", "#1", "~"],
+)
+def test_a_hint_carries_its_label_to_navigator_whatever_the_label_holds(
+    recorded, monkeypatch, label
+):
+    """The printed line, split as a shell splits it, is parsed by navigator as that label.
+
+    A quote, a `$` or an `&` must not split or expand it, and a label that
+    starts with a dash must not be read as an option. Checked on navigator's
+    own parser: the lookup refuses (nothing on the Compose screen has these
+    names) and its refusal names the text it searched for. `main()` is called
+    without the boundary `cli.run` puts around it, so the refusal arrives as
+    the exception it is raised as.
+    """
+    command = screen_mapper._navigator_command(label, "--tap")
+    assert command is not None and "\n" not in command
+    words = shlex.split(command)
+    assert words[:2] == ["python3", "$SKILL_DIR/scripts/navigator.py"]
+
+    screen = ET.fromstring(recorded.text(COMPOSE))
+    adb = _AdbRecorder()
+    monkeypatch.setattr(adb_exec, "run_adb", adb)
+    monkeypatch.setattr(adb_exec, "subprocess", _NO_SUBPROCESS)
+    monkeypatch.setattr(navigator, "capture_hierarchy", lambda serial=None, **kwargs: screen)
+    monkeypatch.setattr(sys, "argv", ["navigator.py", *words[2:]])
+
+    with pytest.raises(cli.Failure) as refusal:
+        navigator.main()
+
+    assert f"text='{label}'" in str(refusal.value), str(refusal.value)
+    assert not adb.shell_inputs("tap")
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["", "two\nlines", "a\rb", "bell\x07", "tab\there", "nel\x85x", "sep\u2028x", "par\u2029x"],
+)
+def test_no_hint_is_printed_for_a_label_one_line_cannot_carry(label):
+    assert screen_mapper._navigator_command(label, "--tap") is None
 
 
 # ---------------------------------------------------------------------------

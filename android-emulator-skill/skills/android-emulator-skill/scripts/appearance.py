@@ -14,19 +14,19 @@ text size via the ``font_scale`` system setting, and locale via the
 
 Usage examples:
     # Switch to dark mode
-    python scripts/appearance.py --theme dark
+    python3 "$SKILL_DIR/scripts/appearance.py" --theme dark
 
     # Larger text (Dynamic Type analog) via friendly alias
-    python scripts/appearance.py --text-size large
+    python3 "$SKILL_DIR/scripts/appearance.py" --text-size large
 
     # Exact font scale
-    python scripts/appearance.py --font-scale 1.3
+    python3 "$SKILL_DIR/scripts/appearance.py" --font-scale 1.3
 
     # Best-effort locale change (see caveat below)
-    python scripts/appearance.py --locale fr-FR
+    python3 "$SKILL_DIR/scripts/appearance.py" --locale fr-FR
 
     # Restore defaults (light theme + font_scale 1.0)
-    python scripts/appearance.py --reset
+    python3 "$SKILL_DIR/scripts/appearance.py" --reset
 
 Locale caveat:
     Reliably changing the *global* system locale on Android requires privileged
@@ -306,20 +306,20 @@ def main(argv: list[str] | None = None):
         epilog="""
 Examples:
   # Dark / light theme (UI night mode)
-  python scripts/appearance.py --theme dark
-  python scripts/appearance.py --theme light
+  python3 "$SKILL_DIR/scripts/appearance.py" --theme dark
+  python3 "$SKILL_DIR/scripts/appearance.py" --theme light
 
   # Text size via friendly alias (Dynamic Type analog)
-  python scripts/appearance.py --text-size large
+  python3 "$SKILL_DIR/scripts/appearance.py" --text-size large
 
   # Exact font scale
-  python scripts/appearance.py --font-scale 1.3
+  python3 "$SKILL_DIR/scripts/appearance.py" --font-scale 1.3
 
   # Best-effort locale change (see note below)
-  python scripts/appearance.py --locale fr-FR
+  python3 "$SKILL_DIR/scripts/appearance.py" --locale fr-FR
 
   # Restore defaults (light theme, font_scale 1.0)
-  python scripts/appearance.py --reset
+  python3 "$SKILL_DIR/scripts/appearance.py" --reset
 
 Text sizes: small (0.85) default (1.0) large (1.15) xl (1.3)
 

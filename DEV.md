@@ -55,6 +55,12 @@ link is `[text](relative/path)` or an http(s) URL and nothing else, `]:` appears
 sits on a list marker's line or in a blockquote, and an example names its script as
 `"$SKILL_DIR/scripts/navigator.py"`. The messages say which rule a line broke.
 
+**What a script prints is held to the same form.** An example in a script's `--help`, and any
+command a script prints for the agent to run next (`screen_mapper --hints`), is written
+`python3 "$SKILL_DIR/scripts/<name>" <arguments>` with flags that script accepts, and every
+script's help shows at least one for itself (`tests/test_printed_commands.py`). No trailing
+`# comment` on such a line, no `$VAR`, no `SID=$(...)`: put the comment on the line above.
+
 ## Shared modules (`scripts/common/`)
 
 `device_utils.py` (adb command building and device detection), `screenshot_utils.py` (capture and

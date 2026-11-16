@@ -9,7 +9,8 @@ detail: what each mode does, what it prints, and how it fails.
   `--output` or `--inline`. `--start NAME` opens a session and prints its
   id; each later `--step "description"` captures the current screen into
   it; `--stop` writes `report.md` + `manifest.json`. `--step` and `--stop`
-  default to the newest session, or target one with `--session ID`.
+  default to the newest session still recording (a stopped one is never the
+  default), or target one with `--session ID`.
 - Run its commands on one session one at a time: overlapping ones are
   unsupported — `--step` reads the session's meta and writes it back
   after its capture, so a `--stop` landing in between can be lost.

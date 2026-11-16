@@ -1265,15 +1265,15 @@ Mechanism:
   packages are reported as 'run-as denied' rather than failing cryptically.
 
 Examples:
-  python container.py --package com.example.app --ls
-  python container.py --package com.example.app --ls files
-  python container.py --package com.example.app --cat shared_prefs/settings.xml
-  python container.py --package com.example.app --shared-prefs
-  python container.py --package com.example.app --shared-prefs settings --json
-  python container.py --package com.example.app --databases
-  python container.py --package com.example.app --databases app.db --verbose
-  python container.py --package com.example.app --export ./snapshot/
-  python container.py --get-cached container-20251028-143052-1a2b3c4d
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --ls
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --ls files
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --cat shared_prefs/settings.xml
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --shared-prefs
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --shared-prefs settings --json
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --databases
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --databases app.db --verbose
+  python3 "$SKILL_DIR/scripts/container.py" --package com.example.app --export ./snapshot/
+  python3 "$SKILL_DIR/scripts/container.py" --get-cached container-20251028-143052-1a2b3c4d
         """,
     )
 

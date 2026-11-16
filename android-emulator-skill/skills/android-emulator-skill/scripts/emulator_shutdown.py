@@ -296,16 +296,16 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # Shutdown specific emulator (verifies by default)
-  python emulator_shutdown.py --serial emulator-5554
+  python3 "$SKILL_DIR/scripts/emulator_shutdown.py" --serial emulator-5554
 
   # Shutdown by AVD name
-  python emulator_shutdown.py --name Pixel_5_API_33
+  python3 "$SKILL_DIR/scripts/emulator_shutdown.py" --name Pixel_5_API_33
 
   # Shutdown without waiting for confirmation
-  python emulator_shutdown.py --serial emulator-5554 --no-verify
+  python3 "$SKILL_DIR/scripts/emulator_shutdown.py" --serial emulator-5554 --no-verify
 
   # Shutdown all emulators
-  python emulator_shutdown.py --all
+  python3 "$SKILL_DIR/scripts/emulator_shutdown.py" --all
         """,
     )
 
