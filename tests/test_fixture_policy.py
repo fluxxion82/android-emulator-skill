@@ -1,6 +1,6 @@
 """The fixture rule, enforced instead of merely written down.
 
-CLAUDE.md says: *parser tests read `tests/fixtures/recorded/`; they never inline
+AGENTS.md says: *parser tests read `tests/fixtures/recorded/`; they never inline
 tool output as a string literal.* That rule exists because this repo's defining
 bug class is code and tests both written against imagined `adb` output -- when
 the imagination is wrong they are wrong in the same direction, so the suite
@@ -90,7 +90,7 @@ OUTPUT_KEYWORDS = ("stdout", "stderr", "output", "writes", "buffered")
 SCANNED_HELPERS = ("fake_toolchain.py",)
 
 # Fixtures that hand back verbatim recorded output. An expression reaching one
-# of these is ground truth however much it is then reshaped -- CLAUDE.md's
+# of these is ground truth however much it is then reshaped -- this module's
 # documented exception for "text built by transforming recorded lines", which
 # several tests do deliberately (substituting a frame count into a real
 # Choreographer line, renaming a stack frame in a real crash).
@@ -197,7 +197,7 @@ NOT_A_TOOL_PARSER = {"_build_parser"}
 HIERARCHY_ANNOTATIONS = frozenset({"Element", "ElementTree"})
 XML_ETREE_MODULES = frozenset({"xml.etree.ElementTree", "xml.etree"})
 
-# The dict shape `get_ui_hierarchy()` returns (CLAUDE.md's hierarchy contract):
+# The dict shape `get_ui_hierarchy()` returns (AGENTS.md's hierarchy contract):
 # {"tag": str, "attributes": {...}, "children": [...]}. A function reading or
 # building it consumes a dumped screen, whatever it is called. "tag" alone is
 # too generic to key on; the other two are not.
@@ -905,7 +905,7 @@ def test_a_recorded_fixture_is_not_flagged():
 
 
 def test_a_recorded_line_reshaped_in_the_test_is_not_flagged():
-    """CLAUDE.md's documented exception, exercised rather than trusted.
+    """This module's documented exception, exercised rather than trusted.
 
     Substituting a frame count into a real Choreographer line keeps the line
     itself ground truth; the substitution pattern is a literal, and flagging on

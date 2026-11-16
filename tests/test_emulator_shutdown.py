@@ -41,7 +41,7 @@ def _devices_listing_a_phone(recorded) -> str:
     """Real ``adb devices -l`` output with one row retargeted to a handset.
 
     No profile has recorded ``adb devices -l`` with a physical device attached,
-    and recording one would publish a developer's phone serial (CLAUDE.md
+    and recording one would publish a developer's phone serial (AGENTS.md
     forbids committing personal data from the recorder). So the *shape* is
     ground truth -- header, state column and trailing ``product:``/``model:``/
     ``transport_id:`` fields come from ``adb_devices_multiple`` verbatim -- and
@@ -234,8 +234,9 @@ def _framed_reply(recorded, avd_name: str) -> str:
     The framing is the part that matters and the part nobody would write by
     hand: the console terminates every reply with its own `OK` line, which is
     what defeated the already-booted check for a whole release (S5). So the
-    recording supplies it and only the name is swapped -- CLAUDE.md's
-    "text built by transforming recorded lines" (F4).
+    recording supplies it and only the name is swapped -- the fixture
+    policy's "text built by transforming recorded lines"
+    (`tests/test_fixture_policy.py`).
     """
     return recorded.text("emu_avd_name").replace("Pixel_9", avd_name)
 

@@ -141,7 +141,7 @@ Use `cp -R` in place of `ln -s` if you would rather not have a symlink; a
 - [`CHANGELOG.md`](CHANGELOG.md) — release history.
 - [`docs/`](docs/) — topic notes on adb, test patterns, accessibility and troubleshooting.
 - [`DEV.md`](DEV.md) — development environment, linting, tests, CI, release process.
-- [`CLAUDE.md`](CLAUDE.md) — architecture and conventions for contributors and Claude Code.
+- [`AGENTS.md`](AGENTS.md) — architecture and conventions for contributors and coding agents (`CLAUDE.md` imports it).
 
 ## License
 

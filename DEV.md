@@ -9,13 +9,20 @@ upstream `ios-simulator-skill` (see [README.md](README.md) for attribution).
 ```
 android-emulator-skill/                      # repo root
 ├── .claude-plugin/
-│   └── marketplace.json                     # marketplace manifest (owner: fluxxion82)
+│   └── marketplace.json                     # Claude Code marketplace manifest (owner: fluxxion82)
+├── .agents/plugins/
+│   └── marketplace.json                     # Codex marketplace manifest (same plugin, no version)
 ├── android-emulator-skill/                  # distributable plugin package
 │   ├── .claude-plugin/
-│   │   └── plugin.json                      # plugin manifest
+│   │   └── plugin.json                      # Claude Code plugin manifest
+│   ├── .codex-plugin/
+│   │   └── plugin.json                      # Codex plugin manifest
+│   ├── assets/
+│   │   └── icon.svg                         # the one asset a manifest names
 │   └── skills/
 │       └── android-emulator-skill/
 │           ├── SKILL.md                     # what an agent loads: loop, script index, failures
+│           ├── agents/openai.yaml           # how Codex lists the skill
 │           ├── references/                  # one file per script, and known-gaps.md (ships)
 │           └── scripts/                     # production scripts + common/ utilities
 ├── .github/workflows/                       # lint, test, emulator, release, validate-version, pages
@@ -34,7 +41,7 @@ Three surfaces, and what each one holds:
 |---|---|---|
 | `SKILL.md` | Rooted invocation and device selection, Quick Start, the loop, the script index, Failures, platform limitations, requirements and install | yes |
 | `references/<name>.md`, one per script, and `references/known-gaps.md` | What each mode does, what it prints, how it fails, examples | yes |
-| `CHANGELOG.md`, `docs/`, this file, `CLAUDE.md` | Release history, topic notes, how to work on the repository | no |
+| `CHANGELOG.md`, `docs/`, this file, `AGENTS.md` (`CLAUDE.md` imports it) | Release history, topic notes, how to work on the repository | no |
 
 A new script gets both of these in the same change:
 
@@ -144,16 +151,18 @@ pytest tests/
 | `lint.yml` | PR / push to `main` | Black + Ruff over `scripts/` and `tests/` |
 | `test.yml` | PR / push to `main` | `pytest tests/` |
 | `emulator.yml` | PR, nightly, manual, called by `release.yml` | `pytest -m emulator` against a booted emulator |
-| `release.yml` | release published | Lint + unit tests, the emulator lane, and the four manifests == tag; only then zip the `android-emulator-skill/` package and attach it |
-| `validate-version.yml` | release published, manual | `pyproject.toml`, SKILL.md frontmatter, `plugin.json` and `marketplace.json` versions == tag |
+| `release.yml` | release published | Lint + unit tests, the emulator lane, and the five versioned files == tag; only then zip the `android-emulator-skill/` package and attach it |
+| `validate-version.yml` | release published, manual | `pyproject.toml`, SKILL.md frontmatter, both plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`) and `.claude-plugin/marketplace.json` versions == tag |
 | `pages.yml` | push to `main` touching `site/**` or the workflow itself, manual | Deploy the docs site to GitHub Pages |
 
 ## Release process
 
 ```bash
 # 1. Bump the version in pyproject.toml, SKILL.md (frontmatter and `## Scripts (vX.Y.Z)`),
-#    android-emulator-skill/.claude-plugin/plugin.json, .claude-plugin/marketplace.json
+#    android-emulator-skill/.claude-plugin/plugin.json,
+#    android-emulator-skill/.codex-plugin/plugin.json, .claude-plugin/marketplace.json
 #    and the hero tag in site/index.html; tests/test_packaging_contract.py fails until all agree
+#    (.agents/plugins/marketplace.json carries no version)
 # 2. Commit, tag, push
 git commit -am "chore: bump version to X.Y.Z"
 git tag vX.Y.Z && git push origin main --tags
@@ -176,7 +185,7 @@ git tag vX.Y.Z && git push origin main --tags
 
 - **Unit tests** mock `adb`/`subprocess` so they run in CI without a device. Parsers read output
   recorded from real devices in `tests/fixtures/recorded/<profile>/` (`tests/record_fixtures.py`
-  records it), never inline tool output; CLAUDE.md states the rule and `tests/test_fixture_policy.py`
+  records it), never inline tool output; AGENTS.md states the rule and `tests/test_fixture_policy.py`
   enforces it.
 - **Emulator tests** (`@pytest.mark.emulator`, deselected by default) run with `pytest -m emulator`.
 - **Measured costs.** `python tests/measure_costs.py` prints what one screen costs to read as a raw

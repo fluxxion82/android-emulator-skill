@@ -94,7 +94,7 @@ def test_timeout_raises_a_typed_error_naming_the_command(fake_run):
 
 
 def test_never_uses_a_shell(fake_run):
-    """CLAUDE.md rule 4, enforced at the one place every call now goes."""
+    """AGENTS.md rule 4, enforced at the one place every call now goes."""
     fake_run()
     adb_exec.run_adb("shell", None, "echo", "hi")
     assert fake_run.captured["kwargs"].get("shell") is not True

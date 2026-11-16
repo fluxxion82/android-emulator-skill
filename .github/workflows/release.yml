@@ -52,7 +52,7 @@ jobs:
     name: Emulator lane
     uses: ./.github/workflows/emulator.yml
 
-  # The four manifests must agree with the tag. This ran as a SEPARATE
+  # The five versioned files must agree with the tag. This ran as a SEPARATE
   # workflow on the same trigger, so a mismatched version produced a red
   # check *beside* a successfully uploaded zip -- the check reported the
   # problem after the artifact had already shipped.
@@ -81,6 +81,7 @@ jobs:
           }
           check android-emulator-skill/skills/android-emulator-skill/SKILL.md '^version: *[0-9.]+'
           check android-emulator-skill/.claude-plugin/plugin.json '"version" *: *"[0-9.]+"'
+          check android-emulator-skill/.codex-plugin/plugin.json '"version" *: *"[0-9.]+"'
           check .claude-plugin/marketplace.json '"version" *: *"[0-9.]+"'
           check pyproject.toml '^version *= *"[0-9.]+"'
           exit $fail
@@ -97,7 +98,8 @@ jobs:
       - name: Validate skill structure
         run: |
           echo "Validating android-emulator-skill/ package structure..."
-          test -f android-emulator-skill/.claude-plugin/plugin.json || { echo "ERROR: plugin.json not found"; exit 1; }
+          test -f android-emulator-skill/.claude-plugin/plugin.json || { echo "ERROR: .claude-plugin/plugin.json not found"; exit 1; }
+          test -f android-emulator-skill/.codex-plugin/plugin.json || { echo "ERROR: .codex-plugin/plugin.json not found"; exit 1; }
           test -f android-emulator-skill/skills/android-emulator-skill/SKILL.md || { echo "ERROR: SKILL.md not found"; exit 1; }
           test -d android-emulator-skill/skills/android-emulator-skill/scripts || { echo "ERROR: scripts directory not found"; exit 1; }
           echo "✅ Skill structure validated successfully"

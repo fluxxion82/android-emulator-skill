@@ -102,7 +102,7 @@ def test_attr_bool():
 
 
 # ---------------------------------------------------------------------------
-# The nested-attributes contract (CLAUDE.md): every UI field lives under
+# The nested-attributes contract (AGENTS.md): every UI field lives under
 # node["attributes"] as a string. Reading them off the node returns nothing,
 # which is how the audit once found zero issues on every screen.
 # ---------------------------------------------------------------------------

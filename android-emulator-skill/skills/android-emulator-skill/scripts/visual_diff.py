@@ -245,7 +245,7 @@ Examples:
             "its difference exceeds 10"
         ),
     )
-    # `--json` is the repo-wide contract for machine-readable output (CLAUDE.md:
+    # `--json` is the repo-wide contract for machine-readable output (AGENTS.md:
     # "--help and --json on every script"), and this was the one script without
     # it: the same output was reachable only as `--details`, whose help text
     # reads like a --verbose. An agent following SKILL.md would pass --json here

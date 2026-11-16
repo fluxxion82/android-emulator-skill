@@ -495,7 +495,7 @@ def test_the_serial_is_passed_through_to_adb(fake_adb, monkeypatch):
 
 
 def test_the_serial_is_resolved_through_the_shared_helper(fake_adb, monkeypatch):
-    """CLAUDE.md: resolution goes through resolve_device_identifier."""
+    """AGENTS.md: resolution goes through resolve_device_identifier."""
     seen: list[str | None] = []
 
     def _resolve(identifier):

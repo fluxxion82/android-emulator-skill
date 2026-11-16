@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Android Emulator Skill">
+  <rect width="64" height="64" rx="14" fill="#0d1117"/>
+  <g fill="#3ddc84">
+    <rect x="16" y="24" width="32" height="22" rx="5"/>
+    <rect x="9" y="28" width="5" height="14" rx="2.5"/>
+    <rect x="50" y="28" width="5" height="14" rx="2.5"/>
+    <rect x="22" y="46" width="5" height="10" rx="2.5"/>
+    <rect x="37" y="46" width="5" height="10" rx="2.5"/>
+  </g>
+  <g fill="#0d1117">
+    <circle cx="26" cy="33" r="2.4"/>
+    <circle cx="38" cy="33" r="2.4"/>
+  </g>
+  <g stroke="#3ddc84" stroke-width="3" stroke-linecap="round">
+    <line x1="22" y1="13" x2="27" y2="20"/>
+    <line x1="42" y1="13" x2="37" y2="20"/>
+  </g>
+</svg>

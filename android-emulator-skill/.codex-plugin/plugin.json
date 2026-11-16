@@ -1,0 +1,45 @@
+{
+  "name": "android-emulator-skill",
+  "version": "0.9.0",
+  "description": "Scripts for building, testing and driving Android apps on an emulator or device: semantic UI navigation from the accessibility hierarchy, Gradle builds and tests with errors on demand, log, crash and ANR triage, accessibility audits, and emulator lifecycle management.",
+  "author": {
+    "name": "fluxxion82",
+    "url": "https://github.com/fluxxion82"
+  },
+  "homepage": "https://github.com/fluxxion82/android-emulator-skill",
+  "repository": "https://github.com/fluxxion82/android-emulator-skill",
+  "license": "MIT",
+  "keywords": [
+    "android",
+    "emulator",
+    "adb",
+    "gradle",
+    "testing",
+    "accessibility",
+    "automation"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Android Emulator",
+    "shortDescription": "Build and drive Android apps",
+    "longDescription": "Build Gradle projects and read the errors back on demand, then drive an Android emulator or device by meaning: find and tap controls by their text, type or resource id, enter text, swipe, and launch apps. Includes accessibility audits, visual diffs, log, crash and ANR monitoring, runtime permissions, location, posting a notification from the shell and reading back what is posted, and emulator lifecycle management. Requires macOS or Linux, the Android SDK platform-tools and emulator, and Python 3.12+. Gradle builds need a JDK, managing AVDs needs the SDK command-line tools, and screenshot resizing and image diffs need Pillow.",
+    "developerName": "fluxxion82",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Build and test Gradle projects",
+      "Navigate app UI by text, type or resource id",
+      "Audit accessibility",
+      "Manage emulators"
+    ],
+    "websiteURL": "https://github.com/fluxxion82/android-emulator-skill",
+    "supportURL": "https://github.com/fluxxion82/android-emulator-skill/issues",
+    "defaultPrompt": [
+      "Build my app, install it on the emulator and launch it.",
+      "Log in to my app on the emulator and check the next screen.",
+      "Run an accessibility audit on the current emulator screen."
+    ],
+    "brandColor": "#0D1117",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg"
+  }
+}

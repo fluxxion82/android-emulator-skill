@@ -354,7 +354,7 @@ ln -s ~/src/android-emulator-skill/android-emulator-skill/skills/android-emulato
 
 In the source repository only (not included in the released package):
 
-- **CLAUDE.md** - architecture, conventions, and the recorded-fixture policy
+- **AGENTS.md** - architecture, conventions, and the recorded-fixture policy
 - **CHANGELOG.md** - release history
 - **docs/** - deep dives on adb, test patterns, accessibility
 

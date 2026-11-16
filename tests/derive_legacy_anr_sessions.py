@@ -7,7 +7,7 @@ The ANR session store is the skill's own on-disk format, and sessions outlive
 the code that wrote them: ``--get-details``, ``--diff`` and ``--stop`` are
 asked about a session recorded before an upgrade. A compatibility test needs
 what that earlier code actually wrote -- not a meta.json written from memory
-of its fields, which is the imagined-output bug class CLAUDE.md is about. So
+of its fields, which is the imagined-output bug class AGENTS.md is about. So
 this script runs an earlier version's ``anr_watcher.py`` (its scripts
 directory, extracted from git) end to end and keeps the session directories
 it leaves behind.
