@@ -4,7 +4,7 @@ S1  `get_current_activity()` always returned None. It built an argv list
     containing a literal "|" and "grep", then ran it with shell=True -- which
     on POSIX executes only argv[0] (bare `adb`), discarding the rest. So
     `app_launcher --state` always reported "Foreground: No". It was also the
-    only shell=True in the repo, against CLAUDE.md rule 4.
+    only shell=True in the repo, against AGENTS.md rule 4.
 
 S3  The captured screenshot was dropped from the snapshot manifest.
     `capture_screenshot()` returns {"mode", "file_path", ...} and raises on
@@ -35,7 +35,7 @@ import pytest
 
 
 def test_no_shell_true_anywhere_in_the_skill(scripts_dir):
-    """CLAUDE.md rule 4. This was the only violation; keep it that way.
+    """AGENTS.md rule 4. This was the only violation; keep it that way.
 
     Parsed rather than grepped: several files legitimately mention shell=True in
     a comment explaining why they avoid it, and a substring search cannot tell

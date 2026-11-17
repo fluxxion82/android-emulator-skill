@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Emulator"
+  short_description: "Build and drive Android apps"
+  default_prompt: "Use the Android emulator skill to build, launch, and navigate my app."

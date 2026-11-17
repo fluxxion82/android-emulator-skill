@@ -60,7 +60,7 @@ jobs:
           fi
           echo "SKILL.md version matches"
 
-      - name: Check plugin.json version
+      - name: Check .claude-plugin/plugin.json version
         run: |
           PLUGIN_JSON=android-emulator-skill/.claude-plugin/plugin.json
           PLUGIN_VERSION=$(python3 -c "import json;print(json.load(open('$PLUGIN_JSON')).get('version',''))")
@@ -70,6 +70,17 @@ jobs:
             exit 1
           fi
           echo "plugin.json version matches"
+
+      - name: Check .codex-plugin/plugin.json version
+        run: |
+          PLUGIN_JSON=android-emulator-skill/.codex-plugin/plugin.json
+          PLUGIN_VERSION=$(python3 -c "import json;print(json.load(open('$PLUGIN_JSON')).get('version',''))")
+          echo ".codex-plugin/plugin.json version: $PLUGIN_VERSION"
+          if [ "$PLUGIN_VERSION" != "${{ steps.version.outputs.number }}" ]; then
+            echo "::error::.codex-plugin/plugin.json says '$PLUGIN_VERSION', release is ${{ steps.version.outputs.number }}"
+            exit 1
+          fi
+          echo ".codex-plugin/plugin.json version matches"
 
       - name: Check marketplace.json version
         run: |
@@ -92,6 +103,7 @@ jobs:
           echo "All version references are consistent:" >> $GITHUB_STEP_SUMMARY
           echo "- pyproject.toml: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
           echo "- SKILL.md: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- plugin.json: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- .claude-plugin/plugin.json: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- .codex-plugin/plugin.json: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
           echo "- marketplace.json: ${{ steps.version.outputs.number }}" >> $GITHUB_STEP_SUMMARY
           echo "- Git tag: ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY

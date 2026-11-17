@@ -72,3 +72,11 @@ android-emulator-skill/skills/android-emulator-skill/scripts/config.json
 
 # Other
 .claude
+
+# The Codex marketplace manifest is tracked; a global ignore of .agents/ must not hide
+# it. That one file, at the root, and nothing else under the directory.
+!/.agents/
+/.agents/*
+!/.agents/plugins/
+/.agents/plugins/*
+!/.agents/plugins/marketplace.json

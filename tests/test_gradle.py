@@ -120,7 +120,7 @@ def test_parse_junit_xml_testsuites_root(recorded_gradle):
 
     So the two suite elements are real, lifted verbatim out of the recordings;
     only the wrapper tag is added, and its spelling comes from the JUnit schema
-    rather than from a guess about what some tool prints. This is CLAUDE.md's
+    rather than from a guess about what some tool prints. This is the fixture policy's
     documented "text built by transforming recorded lines", not a transcript
     somebody typed.
     """

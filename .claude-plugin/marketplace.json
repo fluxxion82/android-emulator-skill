@@ -3,12 +3,12 @@
   "owner": {
     "name": "fluxxion82"
   },
-  "description": "Android emulator automation skills for Claude Code",
+  "description": "Android emulator and device automation for coding agents",
   "plugins": [
     {
       "name": "android-emulator-skill",
       "source": "./android-emulator-skill",
-      "description": "Production-ready scripts for Android app testing, building, and automation",
+      "description": "Scripts for building, testing and driving Android apps on an emulator or device: semantic UI navigation from the accessibility hierarchy, Gradle builds and tests with errors on demand, log, crash and ANR triage, accessibility audits, and emulator lifecycle management.",
       "version": "0.9.0"
     }
   ]

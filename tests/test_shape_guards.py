@@ -538,7 +538,7 @@ QUOTED = "quoted"
 # Sites where a non-literal reaches the device shell unquoted and that is not a
 # defect, keyed by file::function so a moved line does not silently re-open one.
 # Every entry names the reason the value cannot carry a shell metacharacter.
-# CLAUDE.md's standing rule applies: this is debt-with-a-reason, not permission.
+# The fixture policy's standing rule applies: this is debt-with-a-reason, not permission.
 QUOTING_EXEMPT: dict[str, str] = {
     "gesture.py::swipe_path": "str() of coordinates argparse already parsed as int",
     "gesture.py::long_press": "str() of coordinates argparse already parsed as int",

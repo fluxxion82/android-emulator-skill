@@ -16,7 +16,7 @@ with two differences that the specs need:
 * **What a stub prints is handed to it by the test, from the recorded corpus.**
   Nothing in this file is tool output. A rule's ``stdout`` is whatever the test
   read through the ``recorded`` / ``recorded_gradle`` fixtures (or derived from
-  them, the way CLAUDE.md permits), written to a file beside the stub and
+  them, the way the fixture policy permits), written to a file beside the stub and
   replayed verbatim. A stub with no rule for a question answers with silence,
   never with a plausible sentence.
 
@@ -592,7 +592,7 @@ class FakeToolchain:
 # says "pidof <package> -> P" must also say "P's uid is the package's", or the
 # fake contradicts itself. Both answers are the RECORDED ones (package_list_uid,
 # ps_pid_uid), with only the package name or the pid substituted -- derivation
-# by substitution, as CLAUDE.md allows.
+# by substitution, as the fixture policy allows.
 
 
 def recorded_package_listing(recorded, package: str) -> str:

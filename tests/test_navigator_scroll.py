@@ -11,7 +11,7 @@ those two answers distinguishable.
 
 Every screen served here is a recorded dump under
 ``tests/fixtures/recorded/emulator-api35/`` -- never an inline literal, per the
-rule in CLAUDE.md. Four of them are successive states of ONE real Settings
+rule in AGENTS.md. Four of them are successive states of ONE real Settings
 list, and the traversal was checked on the device:
 
 ===========================  =============================================

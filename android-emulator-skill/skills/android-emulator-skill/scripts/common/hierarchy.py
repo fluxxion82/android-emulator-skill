@@ -360,7 +360,7 @@ def capture_hierarchy(
 def element_to_dict(element: ET.Element) -> dict:
     """Convert a hierarchy element to the documented dict shape.
 
-    The contract, per CLAUDE.md: ``{"tag": str, "attributes": {...}, "children":
+    The contract, per AGENTS.md: ``{"tag": str, "attributes": {...}, "children":
     [...]}``, with every attribute value left as the string uiautomator emitted.
     Consumers parse their own types -- ``bounds`` is ``"[l,t][r,b]"``, booleans
     are ``"true"``/``"false"``.

@@ -28,7 +28,7 @@ priority filters, so only the command can show a device dropping warnings.
 **Every byte a fake tool prints is recorded.** The toolchain comes from
 ``tests/fake_toolchain.py``; each rule is handed text read through the
 ``recorded`` / ``recorded_gradle`` fixtures, or derived from it by substitution
-the way CLAUDE.md allows (a frame count, a duration). Nothing here is a
+the way the fixture policy allows (a frame count, a duration). Nothing here is a
 transcript somebody typed.
 """
 

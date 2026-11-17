@@ -1,7 +1,7 @@
 """What the released package actually contains, and what the docs claim.
 
 `release.yml` zips only `android-emulator-skill/`, so anything outside that
-directory — the repo README, CLAUDE.md, CHANGELOG.md, `docs/` — does not reach a
+directory — the repo README, AGENTS.md, CHANGELOG.md, `docs/` — does not reach a
 consumer. Docs that point at those from inside the package are broken links for
 everyone who installs it.
 
@@ -15,6 +15,7 @@ separate directory.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import functools
 import hashlib
 import json
@@ -411,10 +412,341 @@ def test_a_mismatched_version_cannot_ship_an_artifact():
         "with the manifests can still upload a release asset"
     )
 
-    steps = release["jobs"]["version"]["steps"]
-    commands = " ".join(step.get("run", "") for step in steps)
-    for manifest in ("SKILL.md", "plugin.json", "marketplace.json", "pyproject.toml"):
-        assert manifest in commands, f"the version gate does not check {manifest}"
+
+# The five files that state the release's version, by full path. Two of them
+# are named `plugin.json`, and the guards that stood here asked the workflows
+# for that basename -- and for the words `exit 1` -- so they could not have
+# told a gate that compares both manifests from one that names either.
+VERSIONED_FILES = (
+    "pyproject.toml",
+    "android-emulator-skill/skills/android-emulator-skill/SKILL.md",
+    "android-emulator-skill/.claude-plugin/plugin.json",
+    "android-emulator-skill/.codex-plugin/plugin.json",
+    ".claude-plugin/marketplace.json",
+)
+# The two gates: the job of each workflow that compares those files with the tag.
+VERSION_GATES = {"release.yml": "version", "validate-version.yml": "validate"}
+ANOTHER_VERSION = "99.98.97"
+CODEX_MANIFEST_PATH = "android-emulator-skill/.codex-plugin/plugin.json"
+CLAUDE_MANIFEST_PATH = "android-emulator-skill/.claude-plugin/plugin.json"
+_EXPRESSION = re.compile(r"\$\{\{\s*([\w.]+)\s*\}\}")
+# All the harness below runs of a workflow, a job and a step. A key outside
+# these is one it would have to interpret (`continue-on-error`, `shell`,
+# `defaults`, an `env` above the step, a condition), and a gate that GitHub
+# lets pass while this harness calls it failed is the defect the harness is
+# for; so such a key is refused, by name, and not read past. `True` is how
+# YAML 1.1 reads the key `on`.
+GATE_WORKFLOW_KEYS = frozenset({"name", "on", True, "permissions", "jobs"})
+GATE_JOB_KEYS = frozenset({"name", "runs-on", "steps"})
+GATE_STEP_KEYS = frozenset({"name", "id", "uses", "run", "env", "if"})
+
+
+def _versioned_tree(tmp_path: Path, wrong: str | None = None) -> Path:
+    """The checkout's files as a gate finds them; `wrong`, when named, states another version.
+
+    A gate runs after checkout, among all the repository's files, and a tree
+    of five would answer `[ -f README.md ]` differently than the runner does.
+    So everything is here: the directories on the way to a versioned file are
+    real, each other entry in them is a link to this checkout's, and the five
+    versioned files are copies. `.git` is left out, so that a script cannot
+    reach this checkout's history through the tree.
+    """
+    tree = tmp_path / "tree"
+    on_the_way = {Path(relative).parent for relative in VERSIONED_FILES}
+    on_the_way |= {parent for directory in on_the_way for parent in directory.parents}
+    for directory in sorted(on_the_way, key=lambda path: len(path.parts)):
+        (tree / directory).mkdir(exist_ok=True)
+        for entry in (REPO_ROOT / directory).iterdir():
+            relative = entry.relative_to(REPO_ROOT)
+            copied = relative in on_the_way or relative.as_posix() in VERSIONED_FILES
+            if not copied and relative != Path(".git"):
+                (tree / relative).symlink_to(entry)
+    for relative in VERSIONED_FILES:
+        stated = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        if relative == wrong:
+            assert _pyproject_version() in stated, f"{relative} does not state the version"
+            stated = stated.replace(_pyproject_version(), ANOTHER_VERSION)
+        (tree / relative).write_text(stated, encoding="utf-8")
+    return tree
+
+
+@dataclasses.dataclass(frozen=True)
+class GateRun:
+    """What a gate did: 0 or its first failing step's status, and what the steps printed."""
+
+    status: int
+    transcript: str
+
+
+def _unmodelled(workflow: dict, job_name: str) -> list[str]:
+    """What a gate's workflow says that the harness does not run as GitHub would."""
+    found = [f"workflow key `{key}`" for key in workflow if key not in GATE_WORKFLOW_KEYS]
+    job = workflow["jobs"][job_name]
+    found += [f"job key `{key}`" for key in job if key not in GATE_JOB_KEYS]
+    if not str(job.get("runs-on", "")).startswith("ubuntu-"):
+        found.append(f"`runs-on: {job.get('runs-on')}`, where a step's shell is not bash")
+    for step in job["steps"]:
+        named = step.get("name", "a step with no name")
+        found += [f"`{key}` on step {named!r}" for key in step if key not in GATE_STEP_KEYS]
+        if step.get("if") not in (None, "success()"):
+            found.append(f"the condition `{step['if']}` on step {named!r}")
+        if ("run" in step) == ("uses" in step):
+            found.append(f"step {named!r}, which is not one `run` or one `uses`")
+        if "uses" in step and not step["uses"].startswith("actions/checkout@"):
+            found.append(f"`uses: {step['uses']}` on step {named!r}")
+    return found
+
+
+def _filled(text: str, known: dict[str, str], where: str) -> str:
+    """A step's text as GitHub hands it to the shell: each `${{ name }}` replaced by its value."""
+
+    def value(match: re.Match[str]) -> str:
+        assert match.group(1) in known, f"{where}: the harness has no value for {match.group(0)}"
+        return known[match.group(1)]
+
+    filled = _EXPRESSION.sub(value, text)
+    assert "${{" not in filled, f"{where}: holds an expression the harness cannot fill: {text!r}"
+    return filled
+
+
+def _run_version_gate(text: str, name: str, tree: Path, tag: str, tmp_path: Path) -> GateRun:
+    """Run the gate of workflow `name` in `tree` as a release on `tag` runs it.
+
+    The steps' own scripts, run in order by `bash -e` (GitHub's shell for a
+    `run` step on Linux that names none), so what is tested is what the gate
+    does and not how it is spelled. `${{ ... }}` is filled in from the
+    release event and from what an earlier step wrote to `$GITHUB_OUTPUT`.
+
+    The limit, stated: this models a job made of checkout and plain `run`
+    steps and nothing else. Anything outside `GATE_*_KEYS` fails here with
+    the key's name -- edit the allowlist together with the harness, or keep
+    the gate plain. And the tree is the repository's files, not a runner: a
+    script that decides by anything else (git history, the network, what is
+    installed on the machine) can differ there, and no test here would know.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(text)
+    job_name = VERSION_GATES[name]
+    unmodelled = _unmodelled(workflow, job_name)
+    assert not unmodelled, (
+        f"{name}: the tests cannot say what its `{job_name}` job does, because of "
+        f"{'; '.join(unmodelled)}. The harness runs checkout and plain `run` steps only."
+    )
+    known = {"github.ref_name": tag, "github.event_name": "release", "inputs.version": ""}
+    outputs = tmp_path / "github-output"
+    transcript = []
+    for step in workflow["jobs"][job_name]["steps"]:
+        if "run" not in step:
+            continue
+        where = f"{name}, step {step.get('name')!r}"
+        outputs.write_text("", encoding="utf-8")
+        environment = {
+            **os.environ,
+            "GITHUB_OUTPUT": str(outputs),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "github-summary"),
+            **{
+                variable: _filled(str(value), known, where)
+                for variable, value in (step.get("env") or {}).items()
+            },
+        }
+        ran = subprocess.run(
+            ["bash", "-e", "-c", _filled(step["run"], known, where)],
+            cwd=tree,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        transcript.append(f"## {where}: exit {ran.returncode}\n{ran.stdout}{ran.stderr}")
+        if ran.returncode:
+            return GateRun(ran.returncode, "\n".join(transcript))
+        for line in outputs.read_text(encoding="utf-8").splitlines():
+            output, _, value = line.partition("=")
+            known[f"steps.{step.get('id')}.outputs.{output}"] = value
+    return GateRun(0, "\n".join(transcript))
+
+
+def _gate(name: str) -> str:
+    return (WORKFLOWS / name).read_text(encoding="utf-8")
+
+
+def test_the_tree_a_gate_runs_in_holds_the_repositorys_files(tmp_path):
+    """Anti-vacuity for the tree: the checkout's files without `.git`, and five real files."""
+    tree = _versioned_tree(tmp_path, CODEX_MANIFEST_PATH)
+
+    at_the_root = {entry.name for entry in tree.iterdir()}
+    assert {"README.md", "DEV.md", ".github", "tests", "site", "docs"} <= at_the_root
+    assert ".git" not in at_the_root
+    assert (tree / "README.md").read_text(encoding="utf-8") == README.read_text(encoding="utf-8")
+    assert (tree / "android-emulator-skill" / "assets" / "icon.svg").is_file()
+    assert (tree / SKILL_MD.relative_to(REPO_ROOT).parent / "scripts" / "navigator.py").is_file()
+    for relative in VERSIONED_FILES:
+        assert not (tree / relative).is_symlink(), relative
+        same = (tree / relative).read_bytes() == (REPO_ROOT / relative).read_bytes()
+        assert same == (relative != CODEX_MANIFEST_PATH), relative
+
+
+@pytest.mark.parametrize("workflow", VERSION_GATES)
+def test_a_release_whose_files_all_state_the_tags_version_passes_the_gate(workflow, tmp_path):
+    """The control for the refusals below: nothing wrong, nothing refused."""
+    tree = _versioned_tree(tmp_path)
+    ran = _run_version_gate(_gate(workflow), workflow, tree, f"v{_pyproject_version()}", tmp_path)
+    assert ran.status == 0, ran.transcript
+
+
+@pytest.mark.parametrize("workflow", VERSION_GATES)
+@pytest.mark.parametrize("wrong", VERSIONED_FILES)
+def test_one_file_stating_another_version_fails_the_gate(workflow, wrong, tmp_path):
+    """Each of the five, alone, in each workflow: the gate is run and exits non-zero."""
+    tree = _versioned_tree(tmp_path, wrong)
+    ran = _run_version_gate(_gate(workflow), workflow, tree, f"v{_pyproject_version()}", tmp_path)
+    assert ran.status != 0, ran.transcript
+    assert ANOTHER_VERSION in ran.transcript, ran.transcript
+
+
+@pytest.mark.parametrize("workflow", VERSION_GATES)
+def test_a_tag_the_files_do_not_state_fails_the_gate(workflow, tmp_path):
+    tree = _versioned_tree(tmp_path)
+    ran = _run_version_gate(_gate(workflow), workflow, tree, f"v{ANOTHER_VERSION}", tmp_path)
+    assert ran.status != 0, ran.transcript
+
+
+# A gate changed so that it no longer catches the Codex manifest, each in a way
+# the guards that read the workflow's text accepted: (workflow, old, new).
+BLINDED_GATES = {
+    "release.yml checks the Claude manifest twice": (
+        "release.yml",
+        f"check {CODEX_MANIFEST_PATH} ",
+        f"check {CLAUDE_MANIFEST_PATH} ",
+    ),
+    "release.yml passes whenever the repository has a README": (
+        "release.yml",
+        "          set -euo pipefail\n",
+        "          set -euo pipefail\n          if [ -f README.md ]; then exit 0; fi\n",
+    ),
+    "release.yml records no failure": (
+        "release.yml",
+        "              fail=1\n",
+        "              :\n",
+    ),
+    "validate-version.yml reads the Claude manifest twice": (
+        "validate-version.yml",
+        f"PLUGIN_JSON={CODEX_MANIFEST_PATH}",
+        f"PLUGIN_JSON={CLAUDE_MANIFEST_PATH}",
+    ),
+    "validate-version.yml compares the Codex manifest with itself": (
+        "validate-version.yml",
+        'echo ".codex-plugin/plugin.json version: $PLUGIN_VERSION"\n',
+        "PLUGIN_VERSION=${{ steps.version.outputs.number }}\n",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", BLINDED_GATES)
+def test_a_gate_that_cannot_see_the_codex_manifest_is_one_the_run_tells_apart(name, tmp_path):
+    """Mutation: the blinded gate passes a release whose Codex manifest is wrong; the real one fails it."""
+    workflow, old, new = BLINDED_GATES[name]
+    text = _gate(workflow)
+    assert text.count(old) == 1, f"the mutation's anchor is gone from {workflow}: {old!r}"
+    tree = _versioned_tree(tmp_path, CODEX_MANIFEST_PATH)
+    tag = f"v{_pyproject_version()}"
+
+    assert _run_version_gate(text, workflow, tree, tag, tmp_path).status != 0
+    blinded = _run_version_gate(text.replace(old, new), workflow, tree, tag, tmp_path)
+    assert blinded.status == 0, blinded.transcript
+
+
+# A gate GitHub would let pass, or run another way, although its script fails
+# a mismatch: (workflow, old, new, what the harness names when it refuses).
+UNMODELLED_GATES = {
+    "the comparing step may fail": (
+        "release.yml",
+        "      - name: Manifests must agree with the tag\n",
+        "      - name: Manifests must agree with the tag\n        continue-on-error: true\n",
+        "`continue-on-error` on step 'Manifests must agree with the tag'",
+    ),
+    "the comparing step names another shell": (
+        "release.yml",
+        "      - name: Manifests must agree with the tag\n",
+        "      - name: Manifests must agree with the tag\n        shell: sh\n",
+        "`shell` on step",
+    ),
+    "the comparing step runs somewhere else": (
+        "validate-version.yml",
+        "      - name: Check pyproject.toml version\n",
+        "      - name: Check pyproject.toml version\n        working-directory: docs\n",
+        "`working-directory` on step 'Check pyproject.toml version'",
+    ),
+    "a comparing step is conditional": (
+        "validate-version.yml",
+        "      - name: Check pyproject.toml version\n",
+        "      - name: Check pyproject.toml version\n        if: github.event_name == 'push'\n",
+        "the condition `github.event_name == 'push'`",
+    ),
+    "the job may fail": (
+        "release.yml",
+        "    name: Version consistency\n",
+        "    name: Version consistency\n    continue-on-error: true\n",
+        "job key `continue-on-error`",
+    ),
+    "the job is conditional": (
+        "validate-version.yml",
+        "    name: Validate version consistency\n",
+        "    name: Validate version consistency\n    if: false\n",
+        "job key `if`",
+    ),
+    "the job sets the tag for its steps": (
+        "release.yml",
+        "    name: Version consistency\n",
+        "    name: Version consistency\n    env:\n      TAG: v0.0.0\n",
+        "job key `env`",
+    ),
+    "the job runs on Windows": (
+        "validate-version.yml",
+        "    name: Validate version consistency\n    runs-on: ubuntu-latest\n",
+        "    name: Validate version consistency\n    runs-on: windows-latest\n",
+        "`runs-on: windows-latest`",
+    ),
+    "the workflow sets a default shell": (
+        "validate-version.yml",
+        "\njobs:\n",
+        "\ndefaults:\n  run:\n    shell: sh\n\njobs:\n",
+        "workflow key `defaults`",
+    ),
+    "the workflow sets the environment": (
+        "release.yml",
+        "\njobs:\n",
+        "\nenv:\n  TAG: v0.0.0\n\njobs:\n",
+        "workflow key `env`",
+    ),
+    "a step uses an expression the harness has no value for": (
+        "release.yml",
+        "          TAG: ${{ github.ref_name }}\n",
+        "          TAG: ${{ github.event.release.tag_name }}\n",
+        "the harness has no value for ${{ github.event.release.tag_name }}",
+    ),
+    "a step computes with an expression": (
+        "release.yml",
+        "          TAG: ${{ github.ref_name }}\n",
+        "          TAG: ${{ format('v{0}', github.ref_name) }}\n",
+        "holds an expression the harness cannot fill",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", UNMODELLED_GATES)
+def test_a_gate_the_harness_does_not_model_is_refused_by_name(name, tmp_path):
+    """The harness's limit, held: what it would have to interpret, it refuses and says why."""
+    workflow, old, new, named = UNMODELLED_GATES[name]
+    text = _gate(workflow)
+    assert text.count(old) == 1, f"the mutation's anchor is gone from {workflow}: {old!r}"
+    tree = _versioned_tree(tmp_path)
+
+    with pytest.raises(AssertionError) as refusal:
+        _run_version_gate(text.replace(old, new), workflow, tree, "v0.0.0", tmp_path)
+    assert named in str(refusal.value), str(refusal.value)
 
 
 def test_the_release_zip_excludes_bytecode_directories():
@@ -2086,7 +2418,7 @@ def test_the_documentation_section_says_where_each_document_is():
     shipped, repository = _documentation_names(SKILL_MD.read_text(encoding="utf-8"))
 
     assert shipped == ["SKILL.md", "README.md", "examples/", "references/"]
-    assert repository == ["CLAUDE.md", "CHANGELOG.md", "docs/"]
+    assert repository == ["AGENTS.md", "CHANGELOG.md", "docs/"]
     for name in shipped:
         assert (SKILL_ROOT / name).exists(), f"{name} is listed as shipped and is not there"
     for name in repository:
@@ -2488,13 +2820,19 @@ def _site_version() -> str:
     ("label", "getter"),
     [
         (
-            "plugin.json",
+            ".claude-plugin/plugin.json",
             lambda: json.loads(
                 (PACKAGE_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
             ).get("version"),
         ),
         (
-            "marketplace.json",
+            ".codex-plugin/plugin.json",
+            lambda: json.loads(
+                (PACKAGE_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+            ).get("version"),
+        ),
+        (
+            ".claude-plugin/marketplace.json",
             lambda: json.loads(
                 (REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
             )["plugins"][0].get("version"),
@@ -2519,22 +2857,12 @@ def test_every_manifest_declares_the_same_version_as_pyproject(label, getter):
     ), f"{label} says {declared}, pyproject.toml says {_pyproject_version()}"
 
 
-def test_release_validation_fails_rather_than_warns():
-    """A check that only warns cannot keep versions in step."""
-    workflow = (REPO_ROOT / ".github" / "workflows" / "validate-version.yml").read_text(
-        encoding="utf-8"
-    )
-    for manifest in ("plugin.json", "marketplace.json", "SKILL.md"):
-        assert manifest in workflow, f"release validation does not check {manifest}"
-    assert workflow.count("exit 1") >= 4, "version drift should fail the release, not warn"
-
-
 def test_commit_trailers_are_rejected_by_a_hook_not_just_a_style_note():
     """The no-trailers rule must stay enforced, not merely documented.
 
     Adding `Co-Authored-By` is a default in several tools, so the rule gets
     re-broken by things that are not paying attention -- it has already come
-    back once mid-session after being agreed. A note in CLAUDE.md cannot stop
+    back once mid-session after being agreed. A note in AGENTS.md cannot stop
     that; a commit-msg hook can. Guarded here because the hook is a few lines
     of YAML away from being deleted.
     """
@@ -2825,7 +3153,7 @@ def _documented_options(markdown: str) -> dict[str, set[str]]:
 
 
 def test_every_script_offers_the_documented_json_contract():
-    """CLAUDE.md: "`--help` and `--json` on every script".
+    """AGENTS.md: "`--help` and `--json` on every script".
 
     That is the machine-readable contract an agent depends on, and it was true
     of every script but one: `visual_diff.py` reached the same output only as
@@ -2846,7 +3174,7 @@ def test_every_script_offers_the_documented_json_contract():
     missing = [s.name for s in scripts if "--json" not in _option_tokens(_help_text(str(s)))]
 
     assert not missing, (
-        f"these scripts do not offer --json, which CLAUDE.md states every script has: " f"{missing}"
+        f"these scripts do not offer --json, which AGENTS.md states every script has: " f"{missing}"
     )
 
 
@@ -3214,7 +3542,7 @@ SETUP_PYTHON_INPUTS = frozenset(
     {(("with", "cache"), "pip"), (("with", "cache-dependency-path"), "dev-constraints.txt")}
 )
 
-# What a code block of CLAUDE.md or DEV.md may show that names an installer.
+# What a code block of AGENTS.md or DEV.md may show that names an installer.
 # Whole lines again; the words after `uvx`'s tool are the tool's own, so the
 # tool is not an installer (`uvx -c dev-constraints.txt pip install requests`
 # pins pip and nothing pip installs): `tool` names none.
@@ -3228,7 +3556,7 @@ DOCUMENTED_FORMS = (
     ),
 )
 
-# A line of CLAUDE.md or DEV.md that fences a block: three backticks, and a
+# A line of AGENTS.md or DEV.md that fences a block: three backticks, and a
 # language to open one. Spaces before it are a list's indentation.
 DOCUMENT_FENCE = "`" * 3
 DOCUMENT_FENCE_LINE = re.compile(rf"(?P<indent> *){DOCUMENT_FENCE}(?P<language>[a-z]*)")
@@ -4097,7 +4425,27 @@ def _documented_installs(markdown: str) -> list[tuple[str, list[str]]]:
     return found
 
 
-@pytest.mark.parametrize("doc", ["CLAUDE.md", "DEV.md"])
+def test_claude_md_is_one_line_that_imports_agents_md():
+    """AGENTS.md is the one copy of the repository's rules; CLAUDE.md imports it.
+
+    Two agents read two file names. A second copy of the rules would be the
+    one that goes stale, so CLAUDE.md is held to the import and nothing else,
+    and the guards that read the rules (the install commands, below) read
+    AGENTS.md.
+    """
+    lines = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+    assert [line for line in lines if line.strip()] == ["@AGENTS.md"]
+    rules = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    for heading in (
+        "## Testing: recorded fixtures are mandatory",
+        "## Quality standards",
+        "## Commit messages: no trailers",
+    ):
+        assert f"\n{heading}\n" in rules, f"AGENTS.md has lost its section {heading!r}"
+    assert "**A live test must never drive someone's phone.**" in rules
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "DEV.md"])
 def test_the_documented_install_commands_use_the_shared_pins(doc):
     """The command a contributor copies must take the versions CI tests with."""
     found = _documented_installs((REPO_ROOT / doc).read_text(encoding="utf-8"))

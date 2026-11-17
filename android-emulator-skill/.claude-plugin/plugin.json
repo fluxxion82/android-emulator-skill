@@ -1,7 +1,7 @@
 {
   "name": "android-emulator-skill",
   "version": "0.9.0",
-  "description": "Production-ready scripts for Android app testing, building, and automation. Provides semantic UI navigation, build automation, accessibility testing, and emulator lifecycle management. Optimized for AI agents with minimal token output.",
+  "description": "Scripts for building, testing and driving Android apps on an emulator or device: semantic UI navigation from the accessibility hierarchy, Gradle builds and tests with errors on demand, log, crash and ANR triage, accessibility audits, and emulator lifecycle management.",
   "author": {
     "name": "fluxxion82"
   },

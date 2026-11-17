@@ -216,7 +216,7 @@ def test_capture_gives_up_with_an_actionable_error(fake_dump):
 
 
 def test_element_to_dict_matches_the_documented_contract(recorded):
-    """CLAUDE.md: {"tag", "attributes": {...}, "children": [...]}, all strings.
+    """AGENTS.md: {"tag", "attributes": {...}, "children": [...]}, all strings.
 
     Read off a recorded dump rather than a two-node sample: the contract is
     about what a real screen converts to, and the recorded EditText carries its

@@ -19,8 +19,8 @@ system_server's to any text parser (recorded: logcat_tag_injection). The
 readers take logd's records (``logcat -B``), whose pid and uid logd took
 from the writing socket's credentials; the tests below read them too.
 
-The spoofed records are DERIVED from the recording (CLAUDE.md allows
-derivation by substitution): a recorded record with its writer's pid, and
+The spoofed records are DERIVED from the recording (the fixture policy
+allows derivation by substitution): a recorded record with its writer's pid, and
 where stated its message, replaced (``fake_toolchain.Frame``).
 system_server's pid is the one ``pidof system_server`` answered in the run
 that recorded logcat_app_restart_records (its MANIFEST entry).
