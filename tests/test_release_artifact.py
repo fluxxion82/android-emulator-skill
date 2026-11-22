@@ -36,8 +36,22 @@ script can ask where it is running. Each step is started as a runner starts
 it (`bash -e` on a file, in the checkout, with an empty summary file), but
 the variables a runner sets, the tools it has installed and the user it runs
 as are this machine's. This harness is for a zip step that packs the wrong
-files. It is not a defence against a step written to tell the two apart;
-that needs the check to run on the runner, on the file about to be uploaded.
+files. It is not a defence against a step written to tell the two apart.
+
+That defence is the job's own last step before the upload, `CHECK`: on the runner,
+`tests/check_release_zip.py` extracts the file about to be uploaded, compares
+it with the plugin directory less the same junk, and starts every Python
+script from the extracted copy. The comparison is that module's, and this
+one uses it too. The step is held where it is by a guard below, and it is
+run here like any other `run` step, from a checkout that holds the two files
+it needs; here it is started by whichever `python3` is first on PATH.
+
+What is on the runner and what is only here, then. On the runner: the files
+of the real zip against the directory, no junk entry, `--help` from every
+Python script. Only here: the directory as it was before the first step (the
+step reads it after, so a file rewritten and then packed agrees with its
+zip; `STEP_CANNOT_SEE` names the case), the shell scripts, the relative
+links, the two manifests, and every refusal of a job in another shape.
 """
 
 from __future__ import annotations
@@ -52,6 +66,7 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
+import check_release_zip
 import pytest
 import verify_install
 from test_distribution_manifests import CLAUDE, CODEX, SHIPPED, SKILL, _path_problems
@@ -86,6 +101,14 @@ UPLOAD = {
         "fail_on_unmatched_files": True,
     },
 }
+# The step before the upload, whole, its name included: the job's own check of
+# the file the upload names, against the directory it was zipped from.
+CHECK = {
+    "name": "Check the zip against the plugin directory",
+    "run": f"python3 tests/check_release_zip.py {UPLOAD['with']['files']} {PACKAGE_ROOT.name}",
+}
+# What that step runs, where a checkout of the repository has it.
+CHECKER_FILES = ("tests/check_release_zip.py", "tests/verify_install.py")
 # The one runner file a step may name: what is written to it is shown, not run.
 RUNNER_FILE = re.compile(r"GITHUB_[A-Z_]+")
 RUNNER_FILES_ALLOWED = frozenset({"GITHUB_STEP_SUMMARY"})
@@ -104,9 +127,7 @@ JUNK_FILES = (
 JUNK_DIRECTORIES = (f"skills/{SKILL}/examples/__pycache__",)
 
 
-def _is_junk(relative: str) -> bool:
-    parts = relative.split("/")
-    return "__pycache__" in parts or relative.endswith(".pyc") or parts[-1] == ".DS_Store"
+_is_junk = check_release_zip.is_junk
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,6 +140,8 @@ class Built:
     # ``{relative path: sha256}`` of the plugin directory less its junk, taken
     # before any step of the job ran.
     wanted: dict[str, str]
+    # The step that exited non-zero, where a job stops. None: every step ran.
+    stopped_at: str | None = None
 
     @property
     def source(self) -> Path:
@@ -140,6 +163,9 @@ def _checkout(root: Path) -> tuple[Path, dict[str, str]]:
         path.write_bytes(b"\x00junk")
     for relative in JUNK_DIRECTORIES:
         (source / relative).mkdir(parents=True, exist_ok=True)
+    for relative in CHECKER_FILES:
+        (checkout / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PACKAGE_ROOT.parent / relative, checkout / relative)
     held = verify_install.files_under(source)
     assert set(JUNK_FILES) <= set(held), "the junk this harness plants is not in the directory"
     return checkout, {name: digest for name, digest in held.items() if not _is_junk(name)}
@@ -193,11 +219,17 @@ def _modelled(text: str) -> tuple[list[tuple[str, str]], str]:
     return scripts, _filled(UPLOAD["with"]["files"], known, "release.yml, the upload")
 
 
-def _package(text: str, root: Path) -> Built:
-    """Run the package job of a release workflow on tag `TAG`, up to its upload step."""
+def _package(text: str, root: Path, *, may_stop: bool = False) -> Built:
+    """Run the package job of a release workflow on tag `TAG`, up to its upload step.
+
+    A step that exits non-zero stops the job, as on a runner. That fails the
+    caller unless it said the job may stop; then the step is named in
+    `stopped_at` and no later step is run.
+    """
     scripts, uploaded = _modelled(text)
     checkout, wanted = _checkout(root)
     transcript: list[str] = []
+    stopped_at = None
     for index, (name, script) in enumerate(scripts):
         # A summary file of its own, there and empty when the step starts, as
         # each step has on a runner. One file for the job, or none until a
@@ -218,32 +250,25 @@ def _package(text: str, root: Path) -> Built:
             check=False,
         )
         transcript.append(f"## step {name!r}: exit {ran.returncode}\n{ran.stdout}{ran.stderr}")
-        assert ran.returncode == 0, "\n".join(transcript)
-    return Built(checkout, checkout / uploaded, "\n".join(transcript), wanted)
+        if ran.returncode != 0:
+            assert may_stop, "\n".join(transcript)
+            stopped_at = name
+            break
+    return Built(checkout, checkout / uploaded, "\n".join(transcript), wanted, stopped_at)
 
 
 def _extract(built: Built, destination: Path) -> Path:
     """Unpack the zip elsewhere, with the tool a person would use."""
-    destination.mkdir(parents=True)
-    subprocess.run(["unzip", "-q", str(built.archive), "-d", str(destination)], check=True)
-    return destination
+    return check_release_zip.extract(built.archive, destination)
 
 
 def _differences(built: Built, extracted: Path) -> list[str]:
-    """How the extracted zip differs from the plugin directory less its junk. Empty: it does not."""
-    wanted, have = built.wanted, verify_install.files_under(extracted)
-    found = [f"missing: {name}" for name in sorted(wanted.keys() - have.keys())]
-    found += [f"not the plugin's: {name}" for name in sorted(have.keys() - wanted.keys())]
-    found += [
-        f"other bytes: {name}"
-        for name in sorted(wanted.keys() & have.keys())
-        if wanted[name] != have[name]
-    ]
-    with zipfile.ZipFile(built.archive) as archive:
-        found += [
-            f"junk entry: {name}" for name in archive.namelist() if _is_junk(name.rstrip("/"))
-        ]
-    return found
+    """How the extracted zip differs from the plugin directory less its junk. Empty: it does not.
+
+    The comparison the job's own step makes, against the directory as it was
+    before the first step ran, where the step has it as the steps left it.
+    """
+    return check_release_zip.differences(built.wanted, extracted, built.archive)
 
 
 @pytest.fixture(scope="module")
@@ -352,15 +377,104 @@ WRONG_PACKAGES = {
 }
 
 
+# The wrong packages the job's own step passes, because it reads the plugin
+# directory after the steps before it: here the directory and the zip agree.
+# Pinned, so that the limit is this set and no larger.
+STEP_CANNOT_SEE = frozenset({"a file is rewritten before it is packed"})
+
+
 @pytest.mark.parametrize("name", WRONG_PACKAGES)
-def test_a_zip_step_that_packs_the_wrong_thing_is_told_apart(name, tmp_path):
-    built = _package(WRONG_PACKAGES[name](RELEASE.read_text(encoding="utf-8")), tmp_path)
+def test_a_zip_step_that_packs_the_wrong_thing_is_told_apart(name, tmp_path, capsys):
+    """By this harness, by the script given the plugin as committed, and by the job's own step."""
+    text = WRONG_PACKAGES[name](RELEASE.read_text(encoding="utf-8"))
+    built = _package(text, tmp_path, may_stop=True)
     assert _differences(built, _extract(built, tmp_path / "elsewhere" / "plugin")), name
+
+    assert check_release_zip.main([str(built.archive), str(PACKAGE_ROOT)]) == 1
+    assert f"FAILED: {built.archive.name}" in capsys.readouterr().out
+
+    stopped_at = None if name in STEP_CANNOT_SEE else CHECK["name"]
+    assert built.stopped_at == stopped_at, built.transcript
+
+
+def test_the_jobs_own_check_passed_on_the_zip_and_says_what_it_compared(release):
+    """The counts are the plugin's: a check that compared nothing would pass as well."""
+    built, _ = release
+    scripts = len([name for name in _scripts_on_disk() if name.endswith(".py")])
+    assert built.stopped_at is None
+    assert (
+        f"ok: {built.archive.name} holds the {len(built.wanted)} files of {PACKAGE_ROOT.name} "
+        f"and nothing else; {scripts} scripts answer --help from the extracted copy."
+    ) in built.transcript
+
+
+def _check_step_problems(text: str) -> list[str]:
+    """Why a package job does not check its zip as its last act before uploading it. Empty: it does.
+
+    The two last steps are compared whole with what is written out above, so
+    nothing runs between the check and the upload, and nothing after.
+    """
+    steps = _yaml_with_the_keys_github_reads(text)["jobs"][PACKAGE_JOB]["steps"]
+    found = []
+    if len(steps) < 2 or not _written_alike(steps[-2], CHECK):
+        found.append("the step before the last is not the check written out in `CHECK`")
+    last = {key: value for key, value in steps[-1].items() if key != "name"}
+    if not _written_alike(last, UPLOAD):
+        found.append("the last step is not the upload written out in `UPLOAD`")
+    return found
+
+
+def test_the_package_job_checks_the_zip_as_its_last_step_before_the_upload():
+    assert _check_step_problems(RELEASE.read_text(encoding="utf-8")) == []
+    name, script = _modelled(RELEASE.read_text(encoding="utf-8"))[0][-1]
+    assert name == CHECK["name"]
+    assert script.split() == [
+        "python3",
+        CHECKER_FILES[0],
+        f"android-emulator-skill-{TAG}.zip",
+        PACKAGE_ROOT.name,
+    ]
+
+
+_CHECK_STEP = f"      - name: {CHECK['name']}\n"
+_CHECK_RUN = f"        run: {CHECK['run']}\n"
+_ZIP_STEP = "      - name: Create skill package\n"
+# Each is a job that uploads a zip its own check did not pass, or did not see.
+UNCHECKED_UPLOADS = {
+    "the check is deleted": _edit_release(f"{_CHECK_STEP}{_CHECK_RUN}", ""),
+    "the check runs before the zip is made": _edit_release(
+        f"{_CHECK_STEP}{_CHECK_RUN}", "", _ZIP_STEP, f"{_CHECK_STEP}{_CHECK_RUN}\n{_ZIP_STEP}"
+    ),
+    "a step runs between the check and the upload": _edit_release(
+        f"{_CHECK_STEP}{_CHECK_RUN}",
+        f"{_CHECK_STEP}{_CHECK_RUN}\n"
+        "      - name: Pack again\n        run: zip -r again.zip android-emulator-skill\n",
+    ),
+    "the check reads another file": _edit_release(
+        _CHECK_RUN, _CHECK_RUN.replace("android-emulator-skill-${{", "other-${{")
+    ),
+    "the check reads another directory": _edit_release(
+        _CHECK_RUN, _CHECK_RUN.replace(".zip android-emulator-skill\n", ".zip tests\n")
+    ),
+    "the check's exit status is thrown away": _edit_release(
+        _CHECK_RUN, _CHECK_RUN.replace("\n", " || true\n")
+    ),
+    "the job goes on when the check fails": _edit_release(
+        _CHECK_STEP, f"{_CHECK_STEP}        continue-on-error: true\n"
+    ),
+    "the check is conditional": _edit_release(_CHECK_STEP, f"{_CHECK_STEP}        if: false\n"),
+    "the check is given another name": _edit_release(_CHECK_STEP, "      - name: Check\n"),
+}
+
+
+@pytest.mark.parametrize("name", UNCHECKED_UPLOADS)
+def test_a_job_that_uploads_a_zip_its_check_did_not_pass_is_told_apart(name):
+    text = UNCHECKED_UPLOADS[name](RELEASE.read_text(encoding="utf-8"))
+    assert _check_step_problems(text), name
 
 
 _UPLOAD_STEP = "      - name: Upload package to release\n"
 _LAST_UPLOAD_INPUT = "          fail_on_unmatched_files: true\n"
-_ZIP_STEP = "      - name: Create skill package\n"
 _UPLOAD_USES = f"        uses: {UPLOAD['uses']}"
 _UPLOAD_FILES = "          files: android-emulator-skill-${{ github.ref_name }}.zip\n"
 _PACKAGE_CHECKOUT = (
@@ -615,3 +729,58 @@ def test_the_extracted_zip_is_a_plugin_the_agent_can_read(release, surface):
     assert _path_problems(manifest, extracted) == []
     missing = [name for name, kind in SHIPPED if not kind(_skill(extracted) / name)]
     assert not missing, missing
+
+
+def _zipped(root: Path, files: dict[str, str]) -> tuple[Path, Path]:
+    """``(a zip, the directory it was made from)`` for a plugin of a few files."""
+    plugin = root / "plugin"
+    plugin.mkdir(parents=True)
+    archive = root / "plugin.zip"
+    with zipfile.ZipFile(archive, "w") as held:
+        for relative, text in files.items():
+            (plugin / relative).parent.mkdir(parents=True, exist_ok=True)
+            (plugin / relative).write_text(text, encoding="utf-8")
+            held.write(plugin / relative, relative)
+    return archive, plugin
+
+
+_SCRIPT = f"skills/{SKILL}/scripts/answers.py"
+_ANSWERS = "import argparse\n\nargparse.ArgumentParser().parse_args()\n"
+
+
+def test_the_check_starts_the_scripts_of_the_extracted_copy(tmp_path, capsys):
+    """The third of its checks, where the files agree: on a script that starts, and one that cannot."""
+    archive, plugin = _zipped(tmp_path / "starts", {_SCRIPT: _ANSWERS, "README.md": "text\n"})
+    assert check_release_zip.main([str(archive), str(plugin)]) == 0
+    assert "holds the 2 files" in capsys.readouterr().out
+
+    archive, plugin = _zipped(tmp_path / "raises", {_SCRIPT: "raise SystemExit(3)\n"})
+    assert check_release_zip.main([str(archive), str(plugin)]) == 1
+    assert "answers.py --help exited 3" in capsys.readouterr().out
+
+    archive, plugin = _zipped(tmp_path / "none", {"README.md": "text\n"})
+    assert check_release_zip.main([str(archive), str(plugin)]) == 1
+    assert "holds no Python script" in capsys.readouterr().out
+
+
+def test_the_check_fails_where_it_could_not_look(release, tmp_path, monkeypatch, capsys):
+    """A zip or a directory it cannot read is a failure, and so is a Python the scripts refuse."""
+    built, extracted = release
+    not_a_zip = tmp_path / "not-a.zip"
+    not_a_zip.write_text("text", encoding="utf-8")
+    (tmp_path / "empty").mkdir()
+    for archive, plugin, said in (
+        (tmp_path / "no-such.zip", extracted, "`unzip` exited"),
+        (not_a_zip, extracted, "`unzip` exited"),
+        (built.archive, tmp_path / "no-such-directory", "could not all be read"),
+        (built.archive, tmp_path / "empty", "holds no file"),
+    ):
+        assert check_release_zip.main([str(archive), str(plugin)]) == 1
+        assert said in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as stopped:
+        check_release_zip.main([str(built.archive)])
+    assert stopped.value.code == 2
+    monkeypatch.setattr(check_release_zip.sys, "version_info", (3, 11, 9))
+    assert check_release_zip.main([str(built.archive), str(extracted)]) == 2
+    assert "need Python 3.12+" in capsys.readouterr().out

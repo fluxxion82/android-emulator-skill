@@ -138,6 +138,14 @@ jobs:
           echo "claude plugin install android-emulator-skill@fluxxion82" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+      # On the runner, on the file the next step uploads. The suite builds a zip
+      # from these steps on the test machine, and a zip step that behaves
+      # differently here is one only this sees. tests/test_release_artifact.py
+      # holds it here, the last step before the upload: a step between the two
+      # could replace the zip with one nothing examined.
+      - name: Check the zip against the plugin directory
+        run: python3 tests/check_release_zip.py android-emulator-skill-${{ github.ref_name }}.zip android-emulator-skill
+
       # Last, and tests/test_release_artifact.py holds it there: a step after the
       # upload could replace the asset with a zip no test examined.
       - name: Upload package to release
