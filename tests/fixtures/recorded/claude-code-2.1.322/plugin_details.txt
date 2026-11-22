@@ -1,0 +1,20 @@
+android-emulator-skill 0.9.0
+  Description: Scripts for building, testing and driving Android apps on an emulator or device: semantic UI navigation from the accessibility hierarchy, Gradle builds and tests with errors on demand, log, crash and ANR triage, accessibility audits, and emulator lifecycle management.
+  Source: android-emulator-skill@fluxxion82
+
+Component inventory
+  Skills (1)  android-emulator-skill
+  Agents (0)
+  Hooks (0)
+  MCP servers (0)
+  LSP servers (0)
+
+Projected token cost
+  Always-on:   ~116 tok   added to every session
+
+Per-component (rounded)
+  component               always-on  on-invoke
+  android-emulator-skill       ~120        ~8k
+
+  On-invoke cost is paid each time a skill or agent fires.
+  Token counts are estimates and may differ from actual usage.

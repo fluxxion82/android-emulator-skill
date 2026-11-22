@@ -12,7 +12,7 @@ jobs:
   # zipped, and uploaded. The checks that decide whether this skill works were
   # not on the path that ships -- which is the same process shape that once let
   # three advertised capabilities ship completely inert behind 470 passing
-  # tests. Both jobs below are required before anything is packaged.
+  # tests. Every job below is required before anything is packaged.
   verify:
     name: Lint and unit tests
     runs-on: ubuntu-latest
@@ -52,6 +52,12 @@ jobs:
     name: Emulator lane
     uses: ./.github/workflows/emulator.yml
 
+  # Each agent's own CLI installs the plugin from this commit. A manifest that
+  # parses is not a plugin that installs, and the suite has no agent CLI.
+  install:
+    name: Plugin install check
+    uses: ./.github/workflows/install-check.yml
+
   # The five versioned files must agree with the tag. This ran as a SEPARATE
   # workflow on the same trigger, so a mismatched version produced a red
   # check *beside* a successfully uploaded zip -- the check reported the
@@ -89,7 +95,7 @@ jobs:
   package:
     name: Package skill and upload to release
     runs-on: ubuntu-latest
-    needs: [verify, emulator, version]
+    needs: [verify, emulator, version, install]
 
     steps:
       - name: Checkout repository
@@ -118,16 +124,9 @@ jobs:
           echo "📦 Created package: android-emulator-skill-${{ github.ref_name }}.zip"
           ls -lh android-emulator-skill-${{ github.ref_name }}.zip
 
-      - name: Upload package to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: android-emulator-skill-${{ github.ref_name }}.zip
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-
-      - name: Release summary
+      - name: Package summary
         run: |
-          echo "## 🎉 Release Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Release Package" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Package:** android-emulator-skill-${{ github.ref_name }}.zip" >> $GITHUB_STEP_SUMMARY
@@ -138,3 +137,12 @@ jobs:
           echo "claude plugin marketplace add ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "claude plugin install android-emulator-skill@fluxxion82" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # Last, and tests/test_release_artifact.py holds it there: a step after the
+      # upload could replace the asset with a zip no test examined.
+      - name: Upload package to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: android-emulator-skill-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

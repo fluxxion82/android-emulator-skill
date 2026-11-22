@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 import test_instrumented_live
+import verify_install
 from fake_toolchain import FakeToolchain, Rule
 from test_quick_start_contract import (
     code_lines,
@@ -349,13 +350,23 @@ def _yaml(name: str):
     A mapping with two keys the loader reads as one is refused. PyYAML keeps
     the last and drops the other without a word, and it reads YAML 1.1, where
     `yes`, `on` and `true` are one key; GitHub reads 1.2, where they are
-    three. What it dropped would be a string no guard here ever saw. (A merge
-    key that an own key overrides is refused the same way; no workflow has
-    one.)
+    three. What it dropped would be a string no guard here ever saw.
+
+    A merge key (`<<`) is refused outright, whatever it merges: PyYAML
+    expands it and GitHub does not read it. No workflow has one.
     """
     import yaml
 
     class RefusingEqualKeys(yaml.SafeLoader):
+        def flatten_mapping(self, node):
+            for key, _ in node.value:
+                assert key.tag != "tag:yaml.org,2002:merge", (
+                    f"{name}:{key.start_mark.line + 1}: a merge key (`<<`). PyYAML expands "
+                    "it into the mapping and GitHub does not read it, so what a guard "
+                    "compared would not be what runs"
+                )
+            super().flatten_mapping(node)
+
         def construct_mapping(self, node, deep=False):
             mapping = super().construct_mapping(node, deep=deep)
             assert len(mapping) == len(node.value), (
@@ -389,6 +400,7 @@ def test_a_release_cannot_be_cut_without_running_the_tests():
 
     assert "verify" in needs, "packaging no longer requires lint and unit tests"
     assert "emulator" in needs, "packaging no longer requires the device-backed lane"
+    assert "install" in needs, "packaging no longer requires the plugin to install"
 
 
 def test_a_mismatched_version_cannot_ship_an_artifact():
@@ -749,17 +761,6 @@ def test_a_gate_the_harness_does_not_model_is_refused_by_name(name, tmp_path):
     assert named in str(refusal.value), str(refusal.value)
 
 
-def test_the_release_zip_excludes_bytecode_directories():
-    """`-x "__pycache__/*"` misses nested and empty __pycache__ entries.
-
-    Not a CI blocker -- a fresh checkout has none -- but the exclusion did not
-    do what it said, and a zip built on a developer machine carried empty
-    `scripts/__pycache__/` entries.
-    """
-    release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
-    assert '-x "*/__pycache__/*"' in release, "nested __pycache__ is not excluded"
-
-
 def test_the_release_gate_actually_runs_the_suites_it_claims_to():
     """`needs:` on a job that tests nothing would satisfy the test above."""
     release = _yaml("release.yml")
@@ -772,6 +773,13 @@ def test_the_release_gate_actually_runs_the_suites_it_claims_to():
     assert release["jobs"]["emulator"]["uses"].endswith(
         "emulator.yml"
     ), "the emulator gate no longer calls the emulator workflow"
+    caller = release["jobs"]["install"]
+    install = {key: value for key, value in caller.items() if key != "name"}
+    assert _written_alike(install, {"uses": f"./.github/workflows/{INSTALL_CHECK}"}), (
+        "the install gate is no longer a call of the install check and nothing else: a path "
+        "that only ends like it, an `if:` or a `with:` is another job"
+    )
+    assert _literal_label(caller.get("name")), "the install gate's `name` is not plain text"
 
 
 def test_the_emulator_workflow_is_callable_as_a_gate():
@@ -782,6 +790,305 @@ def test_the_emulator_workflow_is_callable_as_a_gate():
     triggers = emulator.get("on", emulator.get(True))
     assert triggers is not None, "emulator.yml has no triggers"
     assert "workflow_call" in triggers, "emulator.yml cannot be required by release.yml"
+
+
+INSTALL_CHECK = "install-check.yml"
+
+
+def _install_check_job() -> dict:
+    """install-check.yml as it has to be, less its labels: written out here, compared whole.
+
+    A mirror by hand, like `WORKFLOW_INSTALLS`: the release waits for this job,
+    and a guard that named the edits it refuses (`--agent`, `if:`,
+    `continue-on-error:`) was shown one it had not named, a checkout of
+    another ref. So nothing is named. The workflow is this and no more; an
+    edit to either is an edit to both.
+
+    `python tests/verify_install.py` with no argument is every agent, from a
+    clean export of the commit the first step checked out.
+    """
+    return {
+        "on": {
+            "pull_request": {"branches": ["main"]},
+            "push": {"branches": ["main"]},
+            "workflow_call": None,
+        },
+        "permissions": {"contents": "read"},
+        "jobs": {
+            "install": {
+                "runs-on": "ubuntu-latest",
+                "steps": [
+                    {"uses": "actions/checkout@v4"},
+                    {
+                        "uses": "actions/setup-python@v5",
+                        "with": {
+                            "python-version": "3.12",
+                            "cache": "pip",
+                            "cache-dependency-path": "dev-constraints.txt",
+                        },
+                    },
+                    {"uses": "actions/setup-node@v4", "with": {"node-version": "24"}},
+                    {"run": f"python -m {CONSTRAINED} pip\n{CONSTRAINED} pyyaml\n"},
+                    {"run": _npm_step()},
+                    {"run": "python tests/verify_install.py"},
+                ],
+            }
+        },
+    }
+
+
+def _written_alike(found: object, written: object) -> bool:
+    """Whether parsed YAML is what a mirror writes out, values and their types both.
+
+    `==` will not do: to Python `1 == True`, and an action that reads its
+    input as text takes `true` for a flag and `1` for nothing. Compared as
+    JSON, where the two are written differently.
+
+    Only what a mirror can write is compared at all: mappings keyed by text,
+    lists, text, numbers, true, false and nothing. Anything else YAML can
+    make is not alike, whatever JSON would write for it: a key that is not
+    text (`true:`, `null:`) would be written as the text it resembles, a
+    `!!pairs` tuple as a list, and a date not at all.
+    """
+
+    def writable(node: object) -> bool:
+        if type(node) is dict:
+            return all(type(key) is str and writable(value) for key, value in node.items())
+        if type(node) is list:
+            return all(writable(item) for item in node)
+        return type(node) in (str, int, float, bool, type(None))
+
+    return writable(found) and (
+        json.dumps(found, sort_keys=True) == json.dumps(written, sort_keys=True)
+    )
+
+
+def _literal_label(name: object) -> bool:
+    """Whether a `name:` is text GitHub shows as it stands: not empty, and holding no expression.
+
+    A label is left out of a comparison with a mirror, and only this makes
+    that safe: a list there, or an expression GitHub cannot fill, is a
+    workflow GitHub refuses to run at all.
+    """
+    return isinstance(name, str) and bool(name.strip()) and "${{" not in name
+
+
+def _yaml_with_the_keys_github_reads(text: str) -> object:
+    """Parse YAML with `true` and `false` as its only booleans, as GitHub does.
+
+    PyYAML reads YAML 1.1, where `on` is a boolean: the key `on:` arrives as
+    True, and so does a key written `true:`, which GitHub does not take for
+    its triggers. A mirror compared after that reading could not tell them
+    apart. Here `on` stays the string it is, and so do `yes` and `no`, which
+    an action reading its inputs as text does not take for `true` and `false`.
+
+    Like `_yaml`, it refuses a merge key and a mapping with two keys the
+    loader reads as one. This is the reader for a workflow compared whole
+    with something written out by hand.
+    """
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        yaml_implicit_resolvers = {
+            first: [(tag, pattern) for tag, pattern in resolvers if not tag.endswith(":bool")]
+            for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+        }
+
+        def flatten_mapping(self, node):
+            for key, _ in node.value:
+                assert key.tag != "tag:yaml.org,2002:merge", (
+                    f"line {key.start_mark.line + 1}: a merge key (`<<`). PyYAML expands "
+                    "it into the mapping and GitHub does not read it, so what a guard "
+                    "compared would not be what runs"
+                )
+            super().flatten_mapping(node)
+
+        def construct_mapping(self, node, deep=False):
+            mapping = super().construct_mapping(node, deep=deep)
+            assert len(mapping) == len(node.value), (
+                f"line {node.start_mark.line + 1}: this mapping has {len(node.value)} keys and "
+                f"the loader reads as one key what the file writes as several"
+            )
+            return mapping
+
+    Loader.add_implicit_resolver(
+        "tag:yaml.org,2002:bool",
+        re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+        list("tTfF"),
+    )
+    loader = Loader(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
+
+
+def _install_check_problems(text: str) -> list[str]:
+    """How a text of install-check.yml differs from the mirror. Empty: it is the mirror.
+
+    The `name` of the workflow, of each job and of each step is a label and
+    is left out of the comparison, at those three levels only (a `name`
+    anywhere else is an input to something), and only once it is seen to be
+    text: a label that is a list or a mapping is not one GitHub accepts.
+    """
+    try:
+        workflow = _yaml_with_the_keys_github_reads(text)
+    except AssertionError as refused:
+        return [str(refused)]
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
+        return ["it is not a workflow with jobs"]
+    problems = []
+    jobs = {}
+    labelled = [("the workflow", workflow)]
+    for job_name, job in workflow["jobs"].items():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        if not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps):
+            return [f"job {job_name} is not a job with steps"]
+        labelled.append((f"job {job_name}", job))
+        labelled += [(f"step {index} of job {job_name}", step) for index, step in enumerate(steps)]
+        jobs[job_name] = {
+            **{key: value for key, value in job.items() if key not in ("name", "steps")},
+            "steps": [
+                {key: value for key, value in step.items() if key != "name"} for step in steps
+            ],
+        }
+    for where, owner in labelled:
+        name = owner.get("name")
+        if not _literal_label(name):
+            problems.append(f"{where} has no name that is plain text: {name!r}")
+    written = {
+        **{key: value for key, value in workflow.items() if key not in ("name", "jobs")},
+        "jobs": jobs,
+    }
+    if not _written_alike(written, _install_check_job()):
+        problems.append("it is not the job `_install_check_job` writes out")
+    return problems
+
+
+def test_the_install_check_is_the_job_written_here_and_nothing_else():
+    text = (WORKFLOWS / INSTALL_CHECK).read_text(encoding="utf-8")
+    assert _install_check_problems(text) == []
+    assert _yaml(INSTALL_CHECK)[True] == _install_check_job()["on"], "PyYAML's own reading of `on`"
+
+
+def _edit_install_check(old: str, new: str):
+    def change(text: str) -> str:
+        assert text.count(old) == 1, f"install-check.yml no longer holds {old!r} exactly once"
+        return text.replace(old, new)
+
+    return change
+
+
+_INSTALL_CHECK_RUN = "        run: python tests/verify_install.py\n"
+INSTALL_CHECK_EDITS = {
+    "another ref is checked out": _edit_install_check(
+        "        uses: actions/checkout@v4\n",
+        "        uses: actions/checkout@v4\n        with:\n          ref: main\n",
+    ),
+    "one agent only": _edit_install_check(
+        _INSTALL_CHECK_RUN, "        run: python tests/verify_install.py --agent codex\n"
+    ),
+    "the runner's directory is installed": _edit_install_check(
+        _INSTALL_CHECK_RUN, "        run: python tests/verify_install.py --working-tree\n"
+    ),
+    "the check may fail quietly": _edit_install_check(
+        _INSTALL_CHECK_RUN, f"        continue-on-error: true\n{_INSTALL_CHECK_RUN}"
+    ),
+    "the check is skipped": _edit_install_check(
+        _INSTALL_CHECK_RUN, f"        if: false\n{_INSTALL_CHECK_RUN}"
+    ),
+    "the check's answer is discarded": _edit_install_check(
+        _INSTALL_CHECK_RUN, "        run: python tests/verify_install.py || true\n"
+    ),
+    "a step follows the check": _edit_install_check(
+        _INSTALL_CHECK_RUN, f"{_INSTALL_CHECK_RUN}\n      - name: After\n        run: exit 0\n"
+    ),
+    "the job may fail quietly": _edit_install_check(
+        "    runs-on: ubuntu-latest\n", "    runs-on: ubuntu-latest\n    continue-on-error: true\n"
+    ),
+    "the release cannot call it": _edit_install_check("  workflow_call:\n", ""),
+    "it no longer runs on a pull request": _edit_install_check(
+        "  pull_request:\n    branches: [main]\n", ""
+    ),
+    "it may write to the repository": _edit_install_check(
+        "  contents: read\n", "  contents: write\n"
+    ),
+    "a variable stands over every step": _edit_install_check(
+        "\njobs:\n", "\nenv:\n  PATH: /somewhere/else\n\njobs:\n"
+    ),
+    # PyYAML reads both keys as True; GitHub reads the second as no triggers at all.
+    "the triggers are under a key GitHub does not read": _edit_install_check(
+        "\non:\n", "\ntrue:\n"
+    ),
+    "a step's label is not text": _edit_install_check(
+        "      - name: Checkout repository\n", "      - name: [Checkout repository]\n"
+    ),
+    "a step is written as a merge": _edit_install_check(
+        "      - name: Checkout repository\n        uses: actions/checkout@v4\n",
+        "      - <<: {name: Checkout repository, uses: actions/checkout@v4}\n",
+    ),
+    "a step's label is an expression nobody can fill": _edit_install_check(
+        "      - name: Checkout repository\n", "      - name: ${{ missing.value }}\n"
+    ),
+    # Equal to Python, and not the same thing written.
+    "a version is written as a number": _edit_install_check(
+        "          node-version: '24'\n", "          node-version: 24\n"
+    ),
+    "a step has no label": _edit_install_check(
+        "      - name: Set up Node\n        uses:", "      - uses:"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", INSTALL_CHECK_EDITS)
+def test_an_edit_to_the_install_check_is_an_edit_to_its_mirror(name):
+    text = (WORKFLOWS / INSTALL_CHECK).read_text(encoding="utf-8")
+    assert _install_check_problems(INSTALL_CHECK_EDITS[name](text)), name
+
+
+def test_both_workflow_readers_refuse_what_github_would_read_another_way(monkeypatch, tmp_path):
+    """A merge key, and two keys that are one to the loader: neither reaches a comparison."""
+    merged = "on: push\njobs:\n  a:\n    steps:\n      - <<: {name: Checkout, uses: x/y@v1}\n"
+    (tmp_path / "merged.yml").write_text(merged, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOWS", tmp_path)
+    with pytest.raises(AssertionError, match=re.escape("merged.yml:5: a merge key")):
+        _yaml("merged.yml")
+    # A merged key the mapping writes again was once the only merge refused.
+    (tmp_path / "again.yml").write_text("env: {<<: {X: pip, Y: ok}, X: ok}\njobs: {}\n")
+    with pytest.raises(AssertionError, match=re.escape("again.yml:1: a merge key")):
+        _yaml("again.yml")
+    with pytest.raises(AssertionError, match="line 5: a merge key"):
+        _yaml_with_the_keys_github_reads(merged)
+    with pytest.raises(AssertionError, match="reads as one key"):
+        _yaml_with_the_keys_github_reads("jobs:\n  a: 1\n  a: 2\n")
+
+    read = _yaml_with_the_keys_github_reads("on: yes\noff: No\nt: true\nf: False\nn: 24\n")
+    assert read == {"on": "yes", "off": "No", "t": True, "f": False, "n": 24}
+
+
+def test_a_mirror_is_compared_by_what_is_written_and_a_label_is_plain_text():
+    assert {"flag": 1} == {"flag": True}, "to Python these are equal, which is the trouble"
+    assert not _written_alike({"flag": 1}, {"flag": True})
+    assert not _written_alike({"flag": "true"}, {"flag": True})
+    assert not _written_alike({"version": 24}, {"version": "24"})
+    assert _written_alike({"b": [True, None], "a": "x"}, {"a": "x", "b": [True, None]})
+    assert not _written_alike({True: "x", "a": "y"}, {"on": "x", "a": "y"})
+    # One key each, so nothing is put in order: JSON alone writes both keys as "true".
+    assert not _written_alike({True: "x"}, {"true": "x"})
+    assert not _written_alike({"outer": [{None: "x"}]}, {"outer": [{"null": "x"}]})
+    assert not _written_alike({"a": {1: "x"}}, {"a": {"1": "x"}})
+    # What YAML can make and a mirror cannot write: a `!!pairs` tuple, a date, a set.
+    pairs = _yaml_with_the_keys_github_reads("root: !!pairs [{x: {true: value}}]\n")
+    assert pairs == {"root": [("x", {True: "value"})]}
+    assert not _written_alike(pairs, {"root": [["x", {"true": "value"}]]})
+    assert not _written_alike({"root": [("x", "y")]}, {"root": [["x", "y"]]})
+    dated = _yaml_with_the_keys_github_reads("version: 2026-01-01\n")
+    assert not _written_alike(dated, {"version": "2026-01-01"})
+    assert not _written_alike({"a": {"x"}}, {"a": ["x"]})
+
+    assert _literal_label("Checkout repository")
+    for label in (None, "", "  ", ["Checkout"], {"a": 1}, 7, "${{ missing.value }}", "v${{ x }}"):
+        assert not _literal_label(label), label
 
 
 LANE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "run-emulator-lane.sh"
@@ -2003,8 +2310,11 @@ def _installed_root(doc: Path) -> Path:
     return SKILL_ROOT if SKILL_ROOT in doc.parents else PACKAGE_ROOT
 
 
-def _links_that_do_not_ship(doc: Path, markdown: str) -> list[str]:
+def _links_that_do_not_ship(doc: Path, markdown: str, root: Path | None = None) -> list[str]:
     """Relative links in ``doc`` that an installed copy could not follow.
+
+    ``root`` is the installed root when ``doc`` is not this checkout's copy:
+    a document of the extracted release zip, say.
 
     Followed one step at a time from the document's own directory, as an
     installed copy on any filesystem would have to: `..` may not climb above
@@ -2016,7 +2326,7 @@ def _links_that_do_not_ship(doc: Path, markdown: str) -> list[str]:
     symlinks (`test_the_package_holds_no_symlinks`), so following the text of a
     path is following the path.
     """
-    root = _installed_root(doc)
+    root = _installed_root(doc) if root is None else root
     broken = []
     for target in _relative_links(markdown):
         at = doc.parent
@@ -3510,16 +3820,23 @@ def test_the_path_filter_detector_actually_detects():
 # ---------------------------------------------------------------------------
 
 CONSTRAINTS = REPO_ROOT / "dev-constraints.txt"
+# The agent CLIs' pins: npm's packages, in npm's spelling, one to a line. Named
+# for what it pins and not for npm: a line of a document's tree that holds an
+# installer's letters is refused, and this file is listed in two such trees.
+NPM_CONSTRAINTS = REPO_ROOT / "agent-cli-pins.txt"
 
-# What each workflow installs with pip, by hand: the mirror that keeps the scan
-# below from passing over nothing, and from passing a test workflow that quietly
-# stopped installing Pillow (the image tests would skip, not fail). A workflow
-# not named here installs nothing.
+# What each workflow installs, by hand and by workflow file: the mirror that
+# keeps the scan below from passing over nothing, and from passing a test
+# workflow that quietly stopped installing Pillow (the image tests would skip,
+# not fail). A workflow not named here installs nothing. A package npm installs
+# is written `npm:<name>`, so the two ecosystems' names cannot be taken for one
+# another, and each is looked up in its own file of pins.
 WORKFLOW_INSTALLS = {
     "test.yml": {"pip", "pytest", "pillow", "pyyaml"},
     "emulator.yml": {"pip", "pytest", "pillow", "pyyaml"},
     "lint.yml": {"pip", "black", "ruff"},
     "release.yml": {"pip", "pytest", "pillow", "pyyaml", "black", "ruff"},
+    "install-check.yml": {"pip", "pyyaml", "npm:@openai/codex", "npm:@anthropic-ai/claude-code"},
 }
 
 # The one way a workflow installs: a line that is this text and nothing else,
@@ -3532,6 +3849,12 @@ INSTALL_LINE = re.compile(
     rf"(?:python -m )?pip install -c dev-constraints\.txt(?P<names>(?: {PINNED_NAME})+)"
 )
 INSTALL_FORM = "pip install -c dev-constraints.txt <names pinned there>"
+# The one way a workflow installs with npm, which has no constraints file to be
+# handed: this text followed by one line of agent-cli-pins.txt, compared
+# as a string. There is no pattern for a name or a version to slip through; a
+# version the file does not state is simply not one of its lines.
+NPM_INSTALL = "npm install -g"
+NPM_INSTALL_FORM = f"{NPM_INSTALL} <a line of {NPM_CONSTRAINTS.name}>"
 # A step that installs has these keys and no others: `shell:`,
 # `working-directory:` and `env:` each change what the same line does.
 INSTALL_STEP_KEYS = frozenset({"name", "run"})
@@ -3563,7 +3886,22 @@ DOCUMENT_FENCE_LINE = re.compile(rf"(?P<indent> *){DOCUMENT_FENCE}(?P<language>[
 
 # The letters of a tool that installs packages. `pipx` and `uvx` stand before
 # `pip` and `uv` only so that a message names the longer one.
-INSTALLER_NAMES = ("pipx", "pip", "uvx", "uv", "poetry", "pdm", "conda", "easy_install")
+INSTALLER_NAMES = (
+    "pipx",
+    "pip",
+    "uvx",
+    "uv",
+    "poetry",
+    "pdm",
+    "conda",
+    "easy_install",
+    # npm's. Until the install check, no reader here knew these letters, and a
+    # workflow could have run `npx <anything>` unread. `pnpm` holds `npm`.
+    "npx",
+    "pnpm",
+    "npm",
+    "yarn",
+)
 # The one word CI spells with those letters that is not an installer.
 NOT_AN_INSTALLER = "pipefail"
 
@@ -3610,6 +3948,21 @@ def _shared_pins(text: str | None = None) -> dict[str, str]:
     return pins
 
 
+def _npm_pins() -> dict[str, str]:
+    """``{npm name: version}`` from agent-cli-pins.txt.
+
+    Read by the install check's own reader, so the guard on how a workflow is
+    written and the check's refusal of another version go by one reading of
+    one file.
+    """
+    return verify_install.read_pins(NPM_CONSTRAINTS.read_text(encoding="utf-8"))
+
+
+def _npm_install_lines() -> dict[str, str]:
+    """``{the line that installs it: npm name}``, one for each pin and no other line."""
+    return {f"{NPM_INSTALL} {name}@{version}": name for name, version in _npm_pins().items()}
+
+
 def _installer_named(text: str) -> str | None:
     """The installer whose letters stand anywhere in a string, whatever the case.
 
@@ -3624,13 +3977,14 @@ def _installer_named(text: str) -> str | None:
 
 
 def _named(text: str) -> str | None:
-    """What a string names that only an install may: an installer, or the constraints file.
+    """What a string names that only an install may: an installer, or a file of pins.
 
-    The file by its letters too, so that a step writing to it
+    Either file by its letters too, so that a step writing to one
     (`printf ... > dev-constraints.txt`) is read as an install step and refused.
     """
-    return _installer_named(text) or (
-        CONSTRAINTS.stem if CONSTRAINTS.stem in text.casefold() else None
+    folded = text.casefold()
+    return _installer_named(text) or next(
+        (pins.stem for pins in (CONSTRAINTS, NPM_CONSTRAINTS) if pins.stem in folded), None
     )
 
 
@@ -3646,11 +4000,16 @@ def _install_lines(script: str, pins: dict[str, str]) -> tuple[set[str], list[st
         lines.pop()
     names: set[str] = set()
     offenders: list[str] = []
+    npm_lines = _npm_install_lines()
     for line in lines:
+        if line in npm_lines:
+            names.add(f"npm:{npm_lines[line]}")
+            continue
         match = INSTALL_LINE.fullmatch(line)
         if match is None:
             offenders.append(
-                f"{line!r} is not `{INSTALL_FORM}` (or `python -m pip ...`). A step that names "
+                f"{line!r} is not `{INSTALL_FORM}` (or `python -m pip ...`), nor "
+                f"`{NPM_INSTALL_FORM}`. A step that names "
                 "an installer or the constraints file holds such lines and nothing else: no "
                 "comment, quote, option or other command. Put those in a step of their own."
             )
@@ -3829,9 +4188,12 @@ def test_the_shared_pins_are_exact_and_cover_the_toolchain():
     removes `Image.getdata`, which has already forced one rework here, so an
     unpinned install is a red main on a date nobody chose.
     """
-    pins = _shared_pins()
+    pins, npm_pins = _shared_pins(), _npm_pins()
     for name in sorted(set().union(*WORKFLOW_INSTALLS.values())):
-        assert name in pins, f"dev-constraints.txt has no pin for {name}"
+        if name.startswith("npm:"):
+            assert name[4:] in npm_pins, f"{NPM_CONSTRAINTS.name} has no pin for {name[4:]}"
+        else:
+            assert name in pins, f"dev-constraints.txt has no pin for {name}"
 
 
 @pytest.mark.parametrize(
@@ -3845,6 +4207,10 @@ def test_the_shared_pins_refuse_anything_but_an_exact_version(line):
 
 def test_every_workflow_install_takes_its_version_from_the_shared_pins():
     """Every install a workflow writes is `pip install -c dev-constraints.txt <pinned names>`.
+
+    Or, for the agent CLIs npm installs, `npm install -g <a line of
+    agent-cli-pins.txt>`: npm takes no constraints file, so the line
+    states the version and is held to the file by being compared with it.
 
     What is read: every string in `.github/workflows/` (parsed with pyyaml),
     and every line of every file under `.github/scripts/` and
@@ -3867,7 +4233,7 @@ def test_every_workflow_install_takes_its_version_from_the_shared_pins():
         offenders += [f"{path.name}: {reason}" for reason in wrong]
         expected = WORKFLOW_INSTALLS.get(path.name, set())
         assert names == expected, (
-            f"{path.name} installs {sorted(names)} with pip; WORKFLOW_INSTALLS says "
+            f"{path.name} installs {sorted(names)}; WORKFLOW_INSTALLS says "
             f"{sorted(expected)}. Change the mirror only with the workflow."
         )
     offenders += _unparsed_ci_file_offenders()
@@ -4058,6 +4424,114 @@ def test_the_install_line_has_one_spelling(script):
     assert any("Put those in a step of their own" in offender for offender in offenders)
 
 
+def _npm_step() -> str:
+    """The step install-check.yml writes: one line for each pin, in the file's order."""
+    return "".join(f"{line}\n" for line in _npm_install_lines())
+
+
+def test_the_pin_guard_passes_a_line_of_the_npm_pins_and_names_what_it_installs():
+    names = {f"npm:{name}" for name in _npm_pins()}
+    assert names == {"npm:@openai/codex", "npm:@anthropic-ai/claude-code"}
+    assert _workflow_installs(_one_step(_npm_step()), _shared_pins()) == (names, [])
+    # Beside the pip line, in one step: each line is a form and there is nothing else.
+    mixed = f"{CONSTRAINED} pyyaml\n{_npm_step()}"
+    assert _workflow_installs(_one_step(mixed), _shared_pins()) == ({"pyyaml", *names}, [])
+
+
+def _npm_spellings() -> list[str]:
+    """Ways to install an agent CLI that are not a line of the pins, built from the first pin."""
+    name, version = next(iter(_npm_pins().items()))
+    pinned = f"{name}@{version}"
+    major, minor, patch = version.split(".")
+    other = f"{name}@{major}.{minor}.{int(patch) + 1}"
+    return [
+        # No version, a moving one, a range, or one the file does not state.
+        f"npm install -g {name}",
+        f"npm install -g {name}@latest",
+        f"npm install -g {name}@^{version}",
+        f"npm install -g {name}@{major}",
+        f"npm install -g {other}",
+        f"npm install -g {pinned}-alpha.1",
+        # A package the file does not pin at all.
+        "npm install -g skills@1.2.3",
+        # The same install, spelled another way: one spelling is read.
+        f"npm i -g {pinned}",
+        f"npm install --global {pinned}",
+        f"npm install -g  {pinned}",
+        f"npm install -g {pinned} ",
+        f" npm install -g {pinned}",
+        f"NPM install -g {pinned}",
+        f"sudo npm install -g {pinned}",
+        f"npm install {pinned}",
+        f"npm install -g --registry https://example.invalid {pinned}",
+        f"npm install -g {pinned} --ignore-scripts",
+        f"npm install -g {pinned}  # the CLI",
+        # Two packages on a line, two commands, a continuation.
+        f"npm install -g {pinned} skills@1.2.3",
+        f"npm install -g {pinned} && npm install -g skills",
+        f"npm install -g {pinned}; npx skills add x",
+        f"npm install -g \\\n  {pinned}",
+        f"cd tests\nnpm install -g {pinned}",
+        # The file handed to the shell, or written to.
+        "npm install -g $(grep -v '^#' agent-cli-pins.txt)",
+        "xargs npm install -g < agent-cli-pins.txt",
+        f"echo {other} >> agent-cli-pins.txt",
+        # npm's other installers, and the tools beside it.
+        "npm ci",
+        f"npx {pinned} --version",
+        f"npx --yes {pinned}",
+        "npx skills add fluxxion82/android-emulator-skill",
+        f"pnpm add -g {pinned}",
+        f"yarn global add {pinned}",
+        f"corepack npm install -g {pinned}",
+    ]
+
+
+@pytest.mark.parametrize("index", range(33))
+def test_the_pin_guard_refuses_every_npm_line_that_is_not_a_line_of_the_pins(index):
+    """Until this guard knew npm's letters, each of these was a step it did not read at all."""
+    spellings = _npm_spellings()
+    assert len(spellings) == 33, "the range above no longer covers the list"
+    offenders = _offenders(_one_step(spellings[index]))
+    assert any(NOT_THE_LINE in offender for offender in offenders), (spellings[index], offenders)
+    assert any(NPM_INSTALL_FORM in offender for offender in offenders)
+
+
+def test_an_npm_install_is_held_to_an_install_step_like_any_other():
+    line = next(iter(_npm_install_lines()))
+    assert _offenders(_one_step(line, env={"NPM_CONFIG_REGISTRY": "https://example.invalid"}))
+    assert _offenders(_one_step(line, shell="bash"))
+    assert _offenders(_one_step(line, **{"working-directory": "tests"}))
+    named = {"jobs": {"test": {"steps": [{"name": "Use npx", "run": "true"}]}}}
+    assert _offenders(named) == ["jobs.test.steps.0.name: names `npx` outside an install step"]
+    cached = {"uses": "actions/setup-node@v4", "with": {"node-version": "24", "cache": "npm"}}
+    assert _offenders({"jobs": {"test": {"steps": [cached]}}}) == [
+        "jobs.test.steps.0.with.cache: names `npm` outside an install step"
+    ]
+
+
+def test_the_install_check_installs_each_pinned_cli_and_runs_them_after():
+    """What the mirror cannot say: the CLIs are installed before the step that needs them."""
+    (job,) = _yaml("install-check.yml")["jobs"].values()
+    scripts = [str(step.get("run", "")) for step in job["steps"]]
+    installs = next(index for index, script in enumerate(scripts) if script == _npm_step())
+    assert installs < len(scripts) - 1
+    setup = [str(step.get("uses", "")) for step in job["steps"][:installs]]
+    assert any(uses.startswith("actions/setup-node@") for uses in setup), setup
+
+
+@pytest.mark.parametrize("line", ["npm install -g x@1.2.3", "npx skills add x", "npm ci"])
+def test_a_documented_npm_command_is_a_line_of_the_pins_or_is_refused(line):
+    ((found, offenders),) = _documented(line)
+    assert found == line
+    assert len(offenders) == 1 and NPM_INSTALL_FORM in offenders[0], offenders
+
+
+def test_the_documented_reader_passes_a_line_of_the_npm_pins():
+    for line in _npm_install_lines():
+        assert _documented(line) == [(line, [])]
+
+
 def test_the_pin_guard_refuses_a_package_the_shared_pins_do_not_name():
     assert _workflow_installs(_one_step(f"{CONSTRAINED} pytest requests"), _shared_pins()) == (
         {"pytest"},
@@ -4242,6 +4716,11 @@ def test_the_cache_inputs_are_let_through_for_setup_python_and_no_other_action(
         # holds the letters is refused, and the message says which letters.
         ("pipeline", "pip"),
         ("maneuver", "uv"),
+        # npm's, and the file that pins what npm installs.
+        ("npm install -g x", "npm"),
+        ("NPX skills add", "npx"),
+        ("corepack pnpm add -g x", "pnpm"),
+        ("yarn global add x", "yarn"),
     ],
 )
 def test_an_installer_is_named_by_its_letters_wherever_they_stand(text, name):
@@ -4380,7 +4859,8 @@ def _documented_installs(markdown: str) -> list[tuple[str, list[str]]]:
     """``(line, offenders)`` for each line of a document's code blocks that names an installer.
 
     Such a line is one of `DOCUMENTED_FORMS`, whole, and every package it
-    names has a pin. Named by its letters, as in a workflow: a line of a tree
+    names has a pin; or it is `NPM_INSTALL_FORM`, which states its pin.
+    Named by its letters, as in a workflow: a line of a tree
     or of sample output that has them is refused too, and is reworded.
     Indentation is the document's (a block inside a list), so spaces at
     either end are not the command's.
@@ -4390,14 +4870,20 @@ def _documented_installs(markdown: str) -> list[tuple[str, list[str]]]:
     in a block made by indentation alone is not read.
     """
     pins = _shared_pins()
+    npm_lines = _npm_install_lines()
     fenced, found = _fenced_lines(markdown)
     for raw in fenced:
         line = raw.strip(" ")
         if _installer_named(line) is None:
             continue
+        if line in npm_lines:
+            found.append((line, []))
+            continue
         match = next((match for form in DOCUMENTED_FORMS if (match := form.fullmatch(line))), None)
         if match is None:
-            shown = "; ".join(f"`{form.pattern}`" for form in DOCUMENTED_FORMS)
+            shown = "; ".join(
+                [*(f"`{form.pattern}`" for form in DOCUMENTED_FORMS), f"`{NPM_INSTALL_FORM}`"]
+            )
             found.append(
                 (
                     line,
@@ -4594,8 +5080,6 @@ def test_a_workflow_holding_what_the_guard_does_not_walk_is_refused(document):
         "env:\n  true: pip\n  on: ok\njobs: {}\n",
         "env: {X: pip, X: ok}\njobs: {}\n",
         "jobs: {a: {steps: [{run: pip install requests, run: echo ok}]}}\n",
-        # A merged key the mapping writes again: counted after the merge is laid out.
-        "env: {<<: {X: pip, Y: ok}, X: ok}\njobs: {}\n",
     ],
 )
 def test_a_workflow_with_two_keys_the_loader_reads_as_one_is_refused(
