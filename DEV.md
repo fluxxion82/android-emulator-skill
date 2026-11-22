@@ -25,10 +25,11 @@ android-emulator-skill/                      # repo root
 │           ├── agents/openai.yaml           # how Codex lists the skill
 │           ├── references/                  # one file per script, and known-gaps.md (ships)
 │           └── scripts/                     # production scripts + common/ utilities
-├── .github/workflows/                       # lint, test, emulator, release, validate-version, pages
+├── .github/workflows/                       # lint, test, emulator, install-check, release, validate-version, pages
 ├── tests/                                   # pytest suite (adb/subprocess mocked, no device)
 ├── pyproject.toml                           # Black / Ruff / pytest config (Python 3.12+)
 ├── dev-constraints.txt                      # exact pins for the dev toolchain; CI and local read it
+├── agent-cli-pins.txt                       # exact pins for the agent CLIs the install check runs
 └── .pre-commit-config.yaml
 ```
 
@@ -125,7 +126,14 @@ same versions of those packages (a dependency the file does not name still float
 `tests/test_packaging_contract.py` fails a workflow that names an installer any other way (it
 checks how the workflows are written, not what a job does at run time). To move a
 version, change it there (and the matching `rev:` in `.pre-commit-config.yaml` for Black or Ruff),
-run the suite, and commit both. Without a venv:
+run the suite, and commit both.
+
+The agent CLIs come from npm, which takes no constraints file, so they have a file of their own:
+[agent-cli-pins.txt](agent-cli-pins.txt), one `name@version` to a line. The one step
+that installs them writes `npm install -g` followed by a line of that file, the same test fails
+any other spelling, and the install check refuses a CLI whose `--version` is not the pin.
+
+Without a venv:
 
 ```bash
 uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest tests/
@@ -151,7 +159,8 @@ pytest tests/
 | `lint.yml` | PR / push to `main` | Black + Ruff over `scripts/` and `tests/` |
 | `test.yml` | PR / push to `main` | `pytest tests/` |
 | `emulator.yml` | PR, nightly, manual, called by `release.yml` | `pytest -m emulator` against a booted emulator |
-| `release.yml` | release published | Lint + unit tests, the emulator lane, and the five versioned files == tag; only then zip the `android-emulator-skill/` package and attach it |
+| `install-check.yml` | PR / push to `main`, called by `release.yml` | `python tests/verify_install.py`: Codex and Claude Code, at their pinned versions, each install the plugin into an empty home |
+| `release.yml` | release published | Lint + unit tests, the emulator lane, the install check, and the five versioned files == tag; only then zip the `android-emulator-skill/` package and attach it |
 | `validate-version.yml` | release published, manual | `pyproject.toml`, SKILL.md frontmatter, both plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`) and `.claude-plugin/marketplace.json` versions == tag |
 | `pages.yml` | push to `main` touching `site/**` or the workflow itself, manual | Deploy the docs site to GitHub Pages |
 
@@ -188,6 +197,17 @@ git tag vX.Y.Z && git push origin main --tags
   records it), never inline tool output; AGENTS.md states the rule and `tests/test_fixture_policy.py`
   enforces it.
 - **Emulator tests** (`@pytest.mark.emulator`, deselected by default) run with `pytest -m emulator`.
+- **The release zip.** `tests/test_release_artifact.py` runs the `package` job's own steps, extracts
+  the zip elsewhere and uses it: the files, a `--help` from every script, the file each relative
+  link names, both manifests.
+- **The install check.** `python tests/verify_install.py` (Python 3.12+ with PyYAML, as in the venv
+  above) installs the plugin with `codex` and `claude` into empty homes, from a clean export of
+  HEAD, and compares what arrived with the plugin directory. It needs both CLIs on PATH at the
+  versions `agent-cli-pins.txt` pins and refuses any other; each CLI is handed a home under a
+  temporary directory, not your `~/.codex` or `~/.claude`. To move a pin: install the new version, change the line in the
+  file and in `install-check.yml`, and run it with `--record`, which rewrites
+  `tests/fixtures/recorded/<cli>-<version>/`. The unit tests in `tests/test_verify_install.py` read
+  those recordings, so a pin nobody ran fails the suite.
 - **Measured costs.** `python tests/measure_costs.py` prints what one screen costs to read as a raw
   dump and through `screen_mapper` / `navigator`, from the recordings; nothing in it is typed. The
   screen rows are committed as `tests/fixtures/measurements/expected.json` and compared by

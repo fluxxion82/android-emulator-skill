@@ -1,0 +1,23 @@
+# The agent CLIs this plugin is installed with by tests/verify_install.py, and
+# the one version of each that check will run against. They are npm's packages
+# and npm takes no constraints file, so they are pinned here and not in
+# dev-constraints.txt.
+#
+# One `name@version` to a line, in npm's own spelling, exact versions only. A
+# line that is not a pin starts with `#` or is empty; nothing else is read.
+#
+# Three readers, one number:
+#   - tests/verify_install.py refuses to run a CLI whose `--version` is not the
+#     version stated here;
+#   - .github/workflows/install-check.yml installs with
+#     `npm install -g <a line of this file>`, and
+#     tests/test_packaging_contract.py fails a workflow whose line is not one;
+#   - tests/fixtures/recorded/<cli>-<version>/ holds what that version printed,
+#     and tests/test_verify_install.py fails a pin that has no recording.
+#
+# To move a pin: install the new version, change the line here and in the
+# workflow, and run `python tests/verify_install.py --record`. The check passing
+# against the new version is what the new pin claims.
+
+@openai/codex@0.170.0
+@anthropic-ai/claude-code@2.1.322

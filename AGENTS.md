@@ -24,11 +24,12 @@ android-emulator-skill/                      # repo root
 │       ├── agents/openai.yaml               # how Codex lists the skill
 │       ├── references/                      # ships: one file per script, and known-gaps.md
 │       └── scripts/                         # production scripts + common/ utilities
-├── .github/workflows/                        # lint, test, release, validate-version, pages
+├── .github/workflows/                        # lint, test, emulator, install-check, release, validate-version, pages
 ├── tests/                                    # pytest suite (adb/subprocess mocked)
 ├── docs/                                     # repo-only topic docs (adb, test patterns, a11y)
 ├── CHANGELOG.md                              # release history (repo-only; not in the package)
 ├── dev-constraints.txt                       # exact pins for the dev toolchain; CI and local read it
+├── agent-cli-pins.txt                        # exact pins for the agent CLIs the install check runs
 └── pyproject.toml / .pre-commit-config.yaml
 ```
 
@@ -149,6 +150,14 @@ else in the step; a guard in `tests/test_packaging_contract.py` fails a workflow
 that names an installer any other way. It checks how the workflows are written,
 not what a job does at run time. Third-party actions are pinned to commits by the
 same module.
+
+The agent CLIs (`codex`, `claude`) are npm's, and npm takes no constraints file:
+`agent-cli-pins.txt` pins them, one `name@version` to a line, and the same
+guard lets a workflow write `npm install -g <a line of that file>` and nothing
+else that names npm or npx. `python tests/verify_install.py` installs the plugin
+with each CLI into an empty home and refuses a CLI at any other version; its
+unit tests read `tests/fixtures/recorded/<cli>-<version>/`, which
+`python tests/verify_install.py --record` writes.
 
 `pyyaml` is required, not optional: the guards in `tests/test_packaging_contract.py`
 parse `.github/workflows/` to assert a release cannot be cut without running the

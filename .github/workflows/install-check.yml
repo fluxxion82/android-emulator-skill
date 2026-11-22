@@ -1,0 +1,61 @@
+name: Plugin Install Check
+
+# Each agent's own CLI installs this plugin into an empty home, from the commit
+# under test, and tests/verify_install.py looks at what arrived. The suite
+# cannot do this: it has no agent CLI, and a manifest that parses is not a
+# plugin that installs.
+#
+# release.yml calls this workflow, so a plugin that does not install is not
+# packaged. tests/test_packaging_contract.py holds the last step to the whole
+# check (every agent, a clean export) with nothing to soften its answer.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_call:
+
+# The job runs two CLIs from npm. It reads the repository and needs nothing more.
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install the plugin with each agent's CLI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: dev-constraints.txt
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install what the check imports
+        # Versions come from dev-constraints.txt and nowhere else: packages are
+        # named bare here. Guarded by tests/test_packaging_contract.py::
+        # test_every_workflow_install_takes_its_version_from_the_shared_pins.
+        run: |
+          python -m pip install -c dev-constraints.txt pip
+          pip install -c dev-constraints.txt pyyaml
+
+      - name: Install the agent CLIs
+        # Each line ends in one line of agent-cli-pins.txt, and the same
+        # guard fails a line that does not. The check below then refuses a CLI
+        # whose own `--version` is not that version, whatever was installed.
+        run: |
+          npm install -g @openai/codex@0.170.0
+          npm install -g @anthropic-ai/claude-code@2.1.322
+
+      - name: Install the plugin with each CLI and check what arrived
+        run: python tests/verify_install.py

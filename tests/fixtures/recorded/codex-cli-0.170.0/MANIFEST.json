@@ -1,0 +1,19 @@
+{
+  "profile": "codex-cli-0.170.0",
+  "recorded_at": "2026-11-22T06:41:26Z",
+  "package": "@openai/codex",
+  "cli_version": "0.170.0",
+  "platform": "darwin",
+  "command": "python tests/verify_install.py --record",
+  "source_commit": "a4a6ed025a2bee6c8a37a777d71707d63dd75f80",
+  "note": "Standard output of the agent's own CLI, verbatim, from a passing run of tests/verify_install.py: an empty home, this plugin installed from a clean export of source_commit. A tool corpus, not a device profile.",
+  "fixtures": [
+    {
+      "name": "version",
+      "file": "version.txt",
+      "command": "codex --version",
+      "sha256": "49bcf97ef847bee772d62cb10e2f37b103a8e532171c7d12b9015f8dc0392df9",
+      "bytes": 18
+    }
+  ]
+}

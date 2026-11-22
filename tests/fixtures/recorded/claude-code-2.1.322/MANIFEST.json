@@ -1,0 +1,26 @@
+{
+  "profile": "claude-code-2.1.322",
+  "recorded_at": "2026-11-22T06:41:30Z",
+  "package": "@anthropic-ai/claude-code",
+  "cli_version": "2.1.322",
+  "platform": "darwin",
+  "command": "python tests/verify_install.py --record",
+  "source_commit": "a4a6ed025a2bee6c8a37a777d71707d63dd75f80",
+  "note": "Standard output of the agent's own CLI, verbatim, from a passing run of tests/verify_install.py: an empty home, this plugin installed from a clean export of source_commit. A tool corpus, not a device profile.",
+  "fixtures": [
+    {
+      "name": "plugin_details",
+      "file": "plugin_details.txt",
+      "command": "claude plugin details android-emulator-skill@fluxxion82",
+      "sha256": "c544055f2a924e1d92afa3865e019865aada256b6fec25df6253843a6d9f8e55",
+      "bytes": 789
+    },
+    {
+      "name": "version",
+      "file": "version.txt",
+      "command": "claude --version",
+      "sha256": "b445bd47f91a2d4534915f9e4055f4e7f87e538026847ae530108d7b9c01c07c",
+      "bytes": 22
+    }
+  ]
+}

@@ -6,7 +6,8 @@
 # `pip install -c dev-constraints.txt <names pinned here>`, and
 # tests/test_packaging_contract.py::test_every_workflow_install_takes_its_version_from_the_shared_pins
 # fails a workflow that names an installer any other way. It checks how the
-# workflows are written, not what a job does when it runs. Locally:
+# workflows are written, not what a job does when it runs. (The agent CLIs are
+# npm's and are pinned beside this file, in agent-cli-pins.txt.) Locally:
 #
 #   uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest tests/
 #
