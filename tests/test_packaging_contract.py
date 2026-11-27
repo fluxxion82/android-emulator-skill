@@ -28,6 +28,7 @@ import tomllib
 from html.parser import HTMLParser
 from pathlib import Path
 
+import check_versions
 import pytest
 import test_instrumented_live
 import verify_install
@@ -510,19 +511,48 @@ def _unmodelled(workflow: dict, job_name: str) -> list[str]:
 
 
 def _filled(text: str, known: dict[str, str], where: str) -> str:
-    """A step's text as GitHub hands it to the shell: each `${{ name }}` replaced by its value."""
+    """A step's text as GitHub hands it to the shell: each `${{ name }}` replaced by its value.
+
+    What is checked is the text as the workflow writes it. A value put in is
+    data from then on: one that itself reads `${{ ... }}` (typed into a manual
+    run, say) is left as it is, as GitHub leaves it.
+    """
 
     def value(match: re.Match[str]) -> str:
         assert match.group(1) in known, f"{where}: the harness has no value for {match.group(0)}"
         return known[match.group(1)]
 
-    filled = _EXPRESSION.sub(value, text)
-    assert "${{" not in filled, f"{where}: holds an expression the harness cannot fill: {text!r}"
-    return filled
+    # Each expression read is stood in for by one character that is neither
+    # `$` nor `{`: taken out altogether, what stood either side of it would
+    # meet, and `$${{ x }}{{` would seem to open an expression it does not.
+    assert "${{" not in _EXPRESSION.sub(
+        "\x00", text
+    ), f"{where}: holds an expression the harness cannot fill: {text!r}"
+    return _EXPRESSION.sub(value, text)
 
 
-def _run_version_gate(text: str, name: str, tree: Path, tag: str, tmp_path: Path) -> GateRun:
+def test_a_template_is_checked_as_written_and_filled_once():
+    known = {"github.ref_name": "v1.2.3"}
+    assert _filled("tag ${{ github.ref_name }}.", known, "here") == "tag v1.2.3."
+    # What stands either side of an expression does not become one when it is filled.
+    assert _filled("echo '$${{ github.ref_name }}{{'", known, "here") == "echo '$v1.2.3{{'"
+    # A value is data: one that reads like an expression is not filled again.
+    assert _filled("${{ a }}", {"a": "${{ b }}"}, "here") == "${{ b }}"
+    with pytest.raises(AssertionError, match="cannot fill"):
+        _filled("${{ format('v{0}', github.ref_name) }}", known, "here")
+    with pytest.raises(AssertionError, match="cannot fill"):
+        _filled("${{ github.ref_name }} and ${{ unclosed", known, "here")
+    with pytest.raises(AssertionError, match="no value for"):
+        _filled("${{ github.sha }}", known, "here")
+
+
+def _run_version_gate(
+    text: str, name: str, tree: Path, tag: str, tmp_path: Path, *, typed: str | None = None
+) -> GateRun:
     """Run the gate of workflow `name` in `tree` as a release on `tag` runs it.
+
+    Or, with `typed`, as a run started by hand on `main` with that typed into
+    its `version` input: the tag is then not looked at.
 
     The steps' own scripts, run in order by `bash -e` (GitHub's shell for a
     `run` step on Linux that names none), so what is tested is what the gate
@@ -546,6 +576,12 @@ def _run_version_gate(text: str, name: str, tree: Path, tag: str, tmp_path: Path
         f"{'; '.join(unmodelled)}. The harness runs checkout and plain `run` steps only."
     )
     known = {"github.ref_name": tag, "github.event_name": "release", "inputs.version": ""}
+    if typed is not None:
+        known = {
+            "github.ref_name": "main",
+            "github.event_name": "workflow_dispatch",
+            "inputs.version": typed,
+        }
     outputs = tmp_path / "github-output"
     transcript = []
     for step in workflow["jobs"][job_name]["steps"]:
@@ -627,33 +663,436 @@ def test_a_tag_the_files_do_not_state_fails_the_gate(workflow, tmp_path):
 
 # A gate changed so that it no longer catches the Codex manifest, each in a way
 # the guards that read the workflow's text accepted: (workflow, old, new).
+def test_the_gates_reader_and_this_modules_agree_on_what_the_five_files_state():
+    """One list of files, and two readings of each that must come to the same version.
+
+    The gates' reader has no YAML parser and holds SKILL.md's frontmatter to
+    one spelling; this module parses it. If the file were written another way
+    YAML allows, the two would part here, in a pull request, and not at the
+    gate on the day of a release.
+    """
+    assert tuple(check_versions.READERS) == VERSIONED_FILES
+    stated = _pyproject_version()
+    assert check_versions.read(REPO_ROOT) == dict.fromkeys(VERSIONED_FILES, stated)
+    assert _skill_md_version() == stated
+
+
+def _json_edit(change) -> object:
+    def edited(text: str, _stated: str) -> str:
+        document = json.loads(text)
+        return json.dumps(change(document), indent=2) + "\n"
+
+    return edited
+
+
+def _reflowed(old: str, new: str) -> object:
+    """An edit to a JSON file's text, made on the text `json.dumps` writes for it.
+
+    So the edit finds its anchor however this checkout's file is laid out.
+    """
+
+    def edited(text: str, stated: str) -> str:
+        dumped = json.dumps(json.loads(text), indent=2) + "\n"
+        before = old.format(stated=stated)
+        assert dumped.count(before) == 1, f"the file does not hold {before!r} exactly once"
+        return dumped.replace(before, new.format(stated=stated))
+
+    return edited
+
+
+def _replace_once(old: str, new: str, append: str = "") -> object:
+    def edited(text: str, stated: str) -> str:
+        before = old.format(stated=stated)
+        assert text.count(before) == 1, f"the file does not hold {before!r} exactly once"
+        return text.replace(before, new.format(stated=stated, other=ANOTHER_VERSION)) + (
+            append.format(stated=stated)
+        )
+
+    return edited
+
+
+def _two_tables(project: str, elsewhere: str) -> object:
+    """A pyproject.toml of its own: `[project]` states one version, a tool table another.
+
+    Written here whole, so it does not depend on how this repository's file
+    spells its version. The project's is `version='...'`, which a pattern for
+    `version = "..."` does not see; the tool table's is the line it finds.
+    """
+
+    def edited(_text: str, stated: str) -> str:
+        versions = {"stated": stated, "other": ANOTHER_VERSION}
+        return (
+            f"[project]\nname = \"probe\"\nversion='{versions[project]}'\n\n"
+            f'[tool.release_probe]\nversion = "{versions[elsewhere]}"\n'
+        )
+
+    return edited
+
+
+SKILL_MD_PATH = VERSIONED_FILES[1]
+MARKETPLACE_PATH = VERSIONED_FILES[4]
+_OTHER_PLUGIN = {"name": "another-plugin", "source": "./elsewhere"}
+
+# name: (the file, how its text is rewritten, whether a release on the stated tag passes).
+# Each is one file written another way. A gate that fails one marked True
+# rejects a release whose files agree; one that passes one marked False ships
+# a version no file states where its format puts it.
+VERSION_DOCUMENTS = {
+    "pyproject: the project states another version, a tool table the tag's": (
+        "pyproject.toml",
+        _two_tables("other", "stated"),
+        False,
+    ),
+    "pyproject: the project states the tag's version, a tool table another": (
+        "pyproject.toml",
+        _two_tables("stated", "other"),
+        True,
+    ),
+    "SKILL.md: the version and a word after it": (
+        SKILL_MD_PATH,
+        _replace_once("\nversion: {stated}\n", "\nversion: {stated} extra\n"),
+        False,
+    ),
+    "SKILL.md: the frontmatter states another version, a line of the body the tag's": (
+        SKILL_MD_PATH,
+        _replace_once("\nversion: {stated}\n", "\nversion: {other}\n", "\nversion: {stated}\n"),
+        False,
+    ),
+    "SKILL.md: no version in the frontmatter, one in the body": (
+        SKILL_MD_PATH,
+        _replace_once("\nversion: {stated}\n", "\n", "\nversion: {stated}\n"),
+        False,
+    ),
+    **{
+        f"{relative}: the value on the line after its key": (
+            relative,
+            _reflowed('"version": "{stated}"', '"version":\n    "{stated}"'),
+            True,
+        )
+        for relative in VERSIONED_FILES[2:]
+    },
+    **{
+        f"{Path(relative).parent.name}: a nested version states the tag's, its own another": (
+            relative,
+            _json_edit(
+                lambda document: {
+                    "note": {"version": document["version"]},
+                    **document,
+                    "version": ANOTHER_VERSION,
+                }
+            ),
+            False,
+        )
+        for relative in VERSIONED_FILES[2:4]
+    },
+    "marketplace: another plugin is listed first, this one states the tag's": (
+        MARKETPLACE_PATH,
+        _json_edit(
+            lambda document: {
+                **document,
+                "plugins": [{**_OTHER_PLUGIN, "version": ANOTHER_VERSION}, *document["plugins"]],
+            }
+        ),
+        True,
+    ),
+    "marketplace: another plugin states the tag's, this one another": (
+        MARKETPLACE_PATH,
+        _json_edit(
+            lambda document: {
+                **document,
+                "plugins": [
+                    {**_OTHER_PLUGIN, "version": document["plugins"][0]["version"]},
+                    *({**entry, "version": ANOTHER_VERSION} for entry in document["plugins"]),
+                ],
+            }
+        ),
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("workflow", VERSION_GATES)
+@pytest.mark.parametrize("name", VERSION_DOCUMENTS)
+def test_a_gate_reads_each_file_the_way_its_format_says(name, workflow, tmp_path):
+    """Both gates, run on a tree with one file rewritten: see `VERSION_DOCUMENTS`."""
+    relative, rewrite, passes = VERSION_DOCUMENTS[name]
+    stated = _pyproject_version()
+    tree = _versioned_tree(tmp_path)
+    original = (tree / relative).read_text(encoding="utf-8")
+    (tree / relative).write_text(rewrite(original, stated), encoding="utf-8")
+
+    ran = _run_version_gate(_gate(workflow), workflow, tree, f"v{stated}", tmp_path)
+    assert (ran.status == 0) is passes, ran.transcript
+    if not passes:
+        assert f"file={relative}::" in ran.transcript, ran.transcript
+
+
+def test_the_version_read_for_the_project_is_the_projects_and_no_other_tables():
+    stated = _pyproject_version()
+    text = _two_tables("other", "stated")("", stated)
+    assert tomllib.loads(text)["tool"]["release_probe"]["version"] == stated
+    assert _pyproject_version(text) == ANOTHER_VERSION
+    with pytest.raises(AssertionError, match="has no version"):
+        _pyproject_version(f'[tool.release_probe]\nversion = "{stated}"\n')
+
+
+def _skill_md_with(line: str) -> str:
+    text = SKILL_MD.read_text(encoding="utf-8")
+    stated = f"\nversion: {_pyproject_version()}\n"
+    assert text.count(stated) == 1
+    return text.replace(stated, f"\n{line}\n" if line else "\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "version: {v} extra",
+        'version: "{v}"',
+        "version: '{v}'",
+        "version: {v} # the release",
+        "version:  {v}",
+        "version:{v}",
+        "version: {v}\nversion: {v}",
+        "",
+        "metadata:\n  version: {v}",
+        "version: {v}\r",
+        "version: {v}\n# a comment",
+        "version: {v}\n",
+        "Version: {v}",
+        # A key YAML refuses for its length, a key written twice, a key that
+        # is none of the three, and a version YAML reads as something else.
+        "version: {v}\n" + "a" * 1025 + ": b",
+        "version: {v}\ndescription: Different text",
+        "version: {v}\nname: another-name",
+        "version: {v}\nlicense: MIT",
+        "version: true",
+        "version: 1.0",
+        "version: {v}-rc1",
+    ],
+)
+def test_a_frontmatter_version_written_any_other_way_is_unreadable_not_guessed(line):
+    """One spelling is read. The rest is refused here, and never read as part of a version."""
+    text = _skill_md_with(line.format(v=_pyproject_version()))
+    with pytest.raises(check_versions.UnreadableError):
+        check_versions.skill_md(text)
+
+
+def _skill_md_described(description: str) -> str:
+    """SKILL.md with the value of its frontmatter `description` replaced, and nothing else."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    closing = text.index("\n---\n", 4)
+    lines = text[4:closing].split("\n")
+    (index,) = [index for index, line in enumerate(lines) if line.startswith("description: ")]
+    lines[index] = f"description: {description}"
+    return "---\n" + "\n".join(lines) + text[closing:]
+
+
+# A description that is not plain text to YAML, and the one rule here that
+# refuses it. The key is one of the three, so nothing else stands in the way.
+DESCRIPTIONS_YAML_READS_ANOTHER_WAY = {
+    "a second mapping": ("Mode: build", "structure"),
+    "a mapping with no value": ("Mode:", "structure"),
+    "a comment": ("Build apps # editorial", "structure"),
+    "an accented first letter": ("\u00c9mulateur", "the pattern"),
+    "an accented letter further on": ("Emulateur \u00e9", "the pattern"),
+    "a tab": ("a\tb", "the pattern"),
+    # U+0085 and U+2028 end a line to YAML and are characters to `split`.
+    "a line break of another script": ("Intro\u0085more", "the pattern"),
+    "a line separator": ("Line\u2028separated", "the pattern"),
+    # YAML reads a date, and refuses this one: there is no 30th of February.
+    "a date": ("2026-02-30", "the pattern"),
+    "a number": ("12", "the pattern"),
+    "a quoted value over several lines": ('"line one\nversion: 0.0.0\nline three"', "the pattern"),
+    "a folded value": (">\n  folded", "the pattern"),
+    "nothing": ("", "the pattern"),
+}
+
+
+@pytest.mark.parametrize("name", DESCRIPTIONS_YAML_READS_ANOTHER_WAY)
+def test_a_description_yaml_would_read_as_more_than_text_is_refused_by_one_rule(name, monkeypatch):
+    """Refused; and with the one rule that refuses it taken away, read.
+
+    The second half is what makes the first a test of that rule. An earlier
+    version of these cases wrote them under a fourth key, which was refused
+    for being a fourth key whatever its value held.
+    """
+    description, rule = DESCRIPTIONS_YAML_READS_ANOTHER_WAY[name]
+    text = _skill_md_described(description)
+    with pytest.raises(check_versions.UnreadableError):
+        check_versions.skill_md(text)
+
+    if rule == "structure":
+        monkeypatch.setattr(check_versions, "FRONTMATTER_STRUCTURE", ())
+    else:
+        anything = (
+            r"(?P<key>description|name): (?P<value>.*)|(?P<version_key>version): (?P<version>.*)"
+        )
+        monkeypatch.setattr(check_versions, "FRONTMATTER_FIELD", re.compile(anything, re.DOTALL))
+    if "\n" not in description:
+        assert check_versions.skill_md(text) == _pyproject_version()
+
+
+def test_the_frontmatter_is_its_three_fields_in_any_order_and_no_others():
+    stated = _pyproject_version()
+    text = SKILL_MD.read_text(encoding="utf-8")
+    block = text[4 : text.index("\n---\n", 4)].split("\n")
+    assert sorted(line.split(":", 1)[0] for line in block) == list(check_versions.FRONTMATTER_KEYS)
+    rest = text[text.index("\n---\n", 4) :]
+    for order in (block, block[::-1], [block[1], block[0], block[2]]):
+        assert check_versions.skill_md("---\n" + "\n".join(order) + rest) == stated
+    for dropped in range(3):
+        kept = [line for index, line in enumerate(block) if index != dropped]
+        with pytest.raises(check_versions.UnreadableError):
+            check_versions.skill_md("---\n" + "\n".join(kept) + rest)
+
+
+def test_a_manifest_states_its_version_once_as_text_at_the_top():
+    stated = _pyproject_version()
+    text = (REPO_ROOT / VERSIONED_FILES[2]).read_text(encoding="utf-8")
+    assert check_versions.manifest(text) == stated
+    document = json.loads(text)
+    for wrong in (
+        json.dumps({**document, "version": 9}),
+        json.dumps({**document, "version": None}),
+        json.dumps({key: value for key, value in document.items() if key != "version"}),
+        json.dumps([document]),
+        _reflowed('"version": "{stated}"', '"version": "{stated}", "version": "{stated}"')(
+            text, stated
+        ),
+        _reflowed('"version": "{stated}"', '"probe": NaN, "version": "{stated}"')(text, stated),
+        _reflowed('"version": "{stated}"', '"probe": -Infinity, "version": "{stated}"')(
+            text, stated
+        ),
+        text.rstrip()[:-1],
+    ):
+        with pytest.raises(check_versions.UnreadableError):
+            check_versions.manifest(wrong)
+
+
+def test_the_marketplace_entry_is_found_by_the_plugins_name_and_must_be_the_only_one():
+    text = (REPO_ROOT / MARKETPLACE_PATH).read_text(encoding="utf-8")
+    document = json.loads(text)
+    (entry,) = document["plugins"]
+    assert entry["name"] == check_versions.PLUGIN
+    for plugins in ([], [_OTHER_PLUGIN], [entry, entry], "none"):
+        with pytest.raises(check_versions.UnreadableError):
+            check_versions.marketplace(json.dumps({**document, "plugins": plugins}))
+
+
+@pytest.mark.parametrize("arguments", [[], ["v0.9.0"], ["0.9"], ["0.9.0", "0.9.0"], ["latest"]])
+def test_the_checker_is_given_one_version_and_refuses_anything_else(arguments, capsys):
+    assert check_versions.main(arguments) == 2
+    assert "usage:" in capsys.readouterr().out
+
+
+def test_the_checker_reads_the_directory_it_is_run_in(tmp_path, monkeypatch, capsys):
+    """Not the checkout this file sits in: a gate runs it in its own checkout, by its path."""
+    stated = _pyproject_version()
+    monkeypatch.chdir(_versioned_tree(tmp_path, CODEX_MANIFEST_PATH))
+    assert check_versions.main([stated]) == 1
+    assert capsys.readouterr().out.strip() == (
+        f"::error file={CODEX_MANIFEST_PATH}::expected {stated}, found '{ANOTHER_VERSION}'"
+    )
+    monkeypatch.chdir(tmp_path)
+    assert check_versions.main([stated]) == 1
+    assert capsys.readouterr().out.count("it could not be read") == len(VERSIONED_FILES)
+
+
+_RELEASE_CHECK = '          python3 tests/check_versions.py "${TAG#v}"\n'
+_VALIDATE_CHECK = (
+    '          python3 tests/check_versions.py "${version#v}" | tee -a "$GITHUB_STEP_SUMMARY"\n'
+)
 BLINDED_GATES = {
-    "release.yml checks the Claude manifest twice": (
+    "release.yml lets the check fail": (
         "release.yml",
-        f"check {CODEX_MANIFEST_PATH} ",
-        f"check {CLAUDE_MANIFEST_PATH} ",
+        _RELEASE_CHECK,
+        _RELEASE_CHECK.replace("\n", " || true\n"),
+    ),
+    "release.yml only prints the command": (
+        "release.yml",
+        _RELEASE_CHECK,
+        _RELEASE_CHECK.replace("python3", "echo python3"),
     ),
     "release.yml passes whenever the repository has a README": (
         "release.yml",
-        "          set -euo pipefail\n",
-        "          set -euo pipefail\n          if [ -f README.md ]; then exit 0; fi\n",
+        "          set -euo pipefail\n          python3 tests/check_versions.py",
+        "          set -euo pipefail\n          if [ -f README.md ]; then exit 0; fi\n"
+        "          python3 tests/check_versions.py",
     ),
-    "release.yml records no failure": (
-        "release.yml",
-        "              fail=1\n",
-        "              :\n",
-    ),
-    "validate-version.yml reads the Claude manifest twice": (
+    "validate-version.yml lets the check fail": (
         "validate-version.yml",
-        f"PLUGIN_JSON={CODEX_MANIFEST_PATH}",
-        f"PLUGIN_JSON={CLAUDE_MANIFEST_PATH}",
+        _VALIDATE_CHECK,
+        _VALIDATE_CHECK.replace(" | tee", " || true | tee"),
     ),
-    "validate-version.yml compares the Codex manifest with itself": (
+    "validate-version.yml only prints the command": (
         "validate-version.yml",
-        'echo ".codex-plugin/plugin.json version: $PLUGIN_VERSION"\n',
-        "PLUGIN_VERSION=${{ steps.version.outputs.number }}\n",
+        _VALIDATE_CHECK,
+        _VALIDATE_CHECK.replace("python3", "echo python3"),
+    ),
+    # The check's answer goes through a pipe to the summary: without
+    # `pipefail` the step's status is `tee`'s.
+    "validate-version.yml takes the status of the summary, not of the check": (
+        "validate-version.yml",
+        "          set -euo pipefail\n          if [",
+        "          set -eu\n          if [",
     ),
 }
+
+
+def _typed(spelling: str) -> str:
+    return spelling.format(v=_pyproject_version())
+
+
+@pytest.mark.parametrize(
+    ("spelling", "passes"),
+    [
+        ("{v}", True),
+        ("v{v}", True),
+        (ANOTHER_VERSION, False),
+        ("", False),
+        ("latest", False),
+        # Each is shell, if it is ever written into the script and not handed
+        # to it. The first is a quoted digit, which the shell reads as the digit.
+        ('0.9."0"', False),
+        ("{v}; exit 0", False),
+        ('{v}" || true #', False),
+        ("$(echo {v})", False),
+        ("`echo {v}`", False),
+        ("{v}\nexit 0", False),
+        # An expression, typed: GitHub does not fill what a value holds.
+        ("${{{{ github.ref_name }}}}", False),
+    ],
+)
+def test_a_version_typed_into_the_manual_validator_is_data_and_never_script(
+    spelling, passes, tmp_path
+):
+    """validate-version.yml, started by hand: what is typed is compared, whatever it holds.
+
+    The workflow once wrote the typed version into its script as text, where
+    `0.9."0"` is `0.9.0` to the shell and anything after a `;` is a command.
+    """
+    if spelling == '0.9."0"':
+        number = _pyproject_version()
+        spelling = f'{number[:-1]}"{number[-1]}"'
+    workflow = "validate-version.yml"
+    ran = _run_version_gate(
+        _gate(workflow),
+        workflow,
+        _versioned_tree(tmp_path),
+        "v0.0.0",
+        tmp_path,
+        typed=_typed(spelling),
+    )
+    assert (ran.status == 0) is passes, ran.transcript
+
+
+def test_no_step_of_a_version_gate_writes_an_expression_into_its_script():
+    """An expression in `run:` becomes part of the script; one in `env:` is a value."""
+    import yaml
+
+    for name, job in VERSION_GATES.items():
+        for step in yaml.safe_load(_gate(name))["jobs"][job]["steps"]:
+            assert "${{" not in str(step.get("run", "")), f"{name}, step {step.get('name')!r}"
 
 
 @pytest.mark.parametrize("name", BLINDED_GATES)
@@ -687,14 +1126,14 @@ UNMODELLED_GATES = {
     ),
     "the comparing step runs somewhere else": (
         "validate-version.yml",
-        "      - name: Check pyproject.toml version\n",
-        "      - name: Check pyproject.toml version\n        working-directory: docs\n",
-        "`working-directory` on step 'Check pyproject.toml version'",
+        "      - name: Check the five versioned files\n",
+        "      - name: Check the five versioned files\n        working-directory: docs\n",
+        "`working-directory` on step 'Check the five versioned files'",
     ),
     "a comparing step is conditional": (
         "validate-version.yml",
-        "      - name: Check pyproject.toml version\n",
-        "      - name: Check pyproject.toml version\n        if: github.event_name == 'push'\n",
+        "      - name: Check the five versioned files\n",
+        "      - name: Check the five versioned files\n        if: github.event_name == 'push'\n",
         "the condition `github.event_name == 'push'`",
     ),
     "the job may fail": (
@@ -3082,9 +3521,19 @@ def test_the_readme_names_the_emulator_path_trap():
 
 
 def _skill_md_version() -> str:
-    match = re.search(r"^version:\s*(\S+)", SKILL_MD.read_text(encoding="utf-8"), re.MULTILINE)
-    assert match, "SKILL.md frontmatter has no version"
-    return match.group(1)
+    """The `version` of SKILL.md's frontmatter, with the frontmatter parsed as the YAML it is.
+
+    The whole value: a pattern for the first `version:` line read `0.9.0` out
+    of `version: 0.9.0 extra`, and a line of the body when the frontmatter
+    had none.
+    """
+    import yaml
+
+    text = SKILL_MD.read_text(encoding="utf-8")
+    assert text.startswith("---\n") and "\n---\n" in text[4:], "SKILL.md has no frontmatter"
+    version = yaml.safe_load(text[4 : text.index("\n---\n", 4)]).get("version")
+    assert isinstance(version, str) and version, f"SKILL.md's frontmatter version is {version!r}"
+    return version
 
 
 def _skill_md_scripts_heading_version() -> str:
@@ -3105,14 +3554,19 @@ def _skill_md_scripts_heading_version() -> str:
     return match.group(1)
 
 
-def _pyproject_version() -> str:
-    match = re.search(
-        r'^version\s*=\s*"([^"]+)"',
-        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
-    assert match, "pyproject.toml has no version"
-    return match.group(1)
+def _pyproject_version(text: str | None = None) -> str:
+    """`[project].version`, read as TOML.
+
+    A pattern for a line that looks like a version took the first such line
+    in the file, whichever table it stood in, and no line at all when the
+    project's was written `version='...'`. Every other reader here is compared
+    with this one, so what it read was what "the version" meant.
+    """
+    if text is None:
+        text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    version = tomllib.loads(text).get("project", {}).get("version")
+    assert isinstance(version, str) and version, "pyproject.toml's [project] has no version"
+    return version
 
 
 def _site_version() -> str:
@@ -3816,7 +4270,8 @@ def test_the_path_filter_detector_actually_detects():
 
 
 # ---------------------------------------------------------------------------
-# Toolchain pins (S5): one file states the versions, every install reads it.
+# Toolchain pins (S5): one file for each ecosystem states the versions, and every
+# install is written to take its version from that file.
 # ---------------------------------------------------------------------------
 
 CONSTRAINTS = REPO_ROOT / "dev-constraints.txt"
@@ -3839,7 +4294,7 @@ WORKFLOW_INSTALLS = {
     "install-check.yml": {"pip", "pyyaml", "npm:@openai/codex", "npm:@anthropic-ai/claude-code"},
 }
 
-# The one way a workflow installs: a line that is this text and nothing else,
+# The one way a workflow installs a Python package: a line that is this text and nothing else,
 # matched whole. An earlier reader understood shell (words, quotes, `;`,
 # comments, continuations, `$(...)`), and four reviews each found a spelling it
 # read one way and bash another. A line with nothing in it to interpret has no
@@ -4010,8 +4465,11 @@ def _install_lines(script: str, pins: dict[str, str]) -> tuple[set[str], list[st
             offenders.append(
                 f"{line!r} is not `{INSTALL_FORM}` (or `python -m pip ...`), nor "
                 f"`{NPM_INSTALL_FORM}`. A step that names "
-                "an installer or the constraints file holds such lines and nothing else: no "
-                "comment, quote, option or other command. Put those in a step of their own."
+                "an installer or a file of pins holds such lines and nothing else: no "
+                "comment, quote, option or other command. A command that names neither goes "
+                "in a step of its own. A comment goes above the step, as a YAML comment: one "
+                "that names an installer is refused in any `run:`. An option or another "
+                "spelling has no place; the line is written the one way."
             )
             continue
         for name in match["names"].split():
@@ -4120,8 +4578,9 @@ def _workflow_installs(workflow: dict, pins: dict[str, str]) -> tuple[set[str], 
     the third:
 
     - the `run:` of an install step: a step with `name` and `run` only, in a
-      job and a workflow that set no `defaults`, whose every line is
-      `INSTALL_LINE` naming pinned packages;
+      job and a workflow that set no `defaults`, whose every line is either
+      `INSTALL_LINE` naming pinned packages or `NPM_INSTALL` followed by a
+      line of the npm pins;
     - `cache: pip` or `cache-dependency-path: dev-constraints.txt` handed to
       `actions/setup-python`, and to that action only;
     - an offender.
@@ -4206,9 +4665,11 @@ def test_the_shared_pins_refuse_anything_but_an_exact_version(line):
 
 
 def test_every_workflow_install_takes_its_version_from_the_shared_pins():
-    """Every install a workflow writes is `pip install -c dev-constraints.txt <pinned names>`.
+    """Every install a workflow writes is one of two lines.
 
-    Or, for the agent CLIs npm installs, `npm install -g <a line of
+    For a Python package, `pip install -c dev-constraints.txt <pinned names>`,
+    with or without `python -m` before it (`INSTALL_LINE`).
+    For the agent CLIs npm installs, `npm install -g <a line of
     agent-cli-pins.txt>`: npm takes no constraints file, so the line
     states the version and is held to the file by being compared with it.
 
@@ -4421,7 +4882,7 @@ def test_the_install_line_has_one_spelling(script):
     """The price of reading no shell, paid on purpose: a harmless variant is refused too."""
     offenders = _offenders(_one_step(script))
     assert any(NOT_THE_LINE in offender for offender in offenders), offenders
-    assert any("Put those in a step of their own" in offender for offender in offenders)
+    assert any("goes above the step, as a YAML comment" in offender for offender in offenders)
 
 
 def _npm_step() -> str:
@@ -4532,6 +4993,24 @@ def test_the_documented_reader_passes_a_line_of_the_npm_pins():
         assert _documented(line) == [(line, [])]
 
 
+def test_the_remedy_the_pin_guard_gives_for_a_comment_is_one_that_works():
+    """The message once said to put a comment in a step of its own, where it is refused again."""
+    import yaml
+
+    in_the_step = _one_step(f"{CONSTRAINED} pytest\n# pip bootstrap\n", name="Install")
+    (refused,) = _offenders(in_the_step)
+    assert "goes above the step, as a YAML comment" in refused
+
+    own_step = {"jobs": {"test": {"steps": [{"name": "Why", "run": "# pip bootstrap\n"}]}}}
+    assert any(NOT_THE_LINE in offender for offender in _offenders(own_step))
+
+    above = yaml.safe_load(
+        "jobs:\n  test:\n    steps:\n      # pip bootstrap\n"
+        f"      - name: Install\n        run: {CONSTRAINED} pytest\n"
+    )
+    assert _workflow_installs(above, _shared_pins()) == ({"pytest"}, [])
+
+
 def test_the_pin_guard_refuses_a_package_the_shared_pins_do_not_name():
     assert _workflow_installs(_one_step(f"{CONSTRAINED} pytest requests"), _shared_pins()) == (
         {"pytest"},
@@ -4639,7 +5118,7 @@ def test_an_installer_named_outside_an_install_step_is_refused():
 
 
 def test_setup_python_is_handed_the_pip_cache_and_the_file_it_is_keyed_on():
-    """The two mentions that install nothing, as the four workflows make them."""
+    """The two mentions that install nothing, as the workflows make them."""
     setup = {
         "uses": "actions/setup-python@v5",
         "with": {

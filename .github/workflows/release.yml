@@ -58,7 +58,8 @@ jobs:
     name: Plugin install check
     uses: ./.github/workflows/install-check.yml
 
-  # The five versioned files must agree with the tag. This ran as a SEPARATE
+  # The five versioned files must agree with the tag, each read the way its
+  # format says (tests/check_versions.py; nothing is installed for it). This ran as a SEPARATE
   # workflow on the same trigger, so a mismatched version produced a red
   # check *beside* a successfully uploaded zip -- the check reported the
   # problem after the artifact had already shipped.
@@ -74,23 +75,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          expected="${TAG#v}"
-          fail=0
-          check() {
-            found=$(grep -oE "$2" "$1" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-            if [ "$found" != "$expected" ]; then
-              echo "::error file=$1::expected $expected, found '${found:-none}'"
-              fail=1
-            else
-              echo "ok  $1 -> $found"
-            fi
-          }
-          check android-emulator-skill/skills/android-emulator-skill/SKILL.md '^version: *[0-9.]+'
-          check android-emulator-skill/.claude-plugin/plugin.json '"version" *: *"[0-9.]+"'
-          check android-emulator-skill/.codex-plugin/plugin.json '"version" *: *"[0-9.]+"'
-          check .claude-plugin/marketplace.json '"version" *: *"[0-9.]+"'
-          check pyproject.toml '^version *= *"[0-9.]+"'
-          exit $fail
+          python3 tests/check_versions.py "${TAG#v}"
 
   package:
     name: Package skill and upload to release

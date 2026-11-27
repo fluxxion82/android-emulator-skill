@@ -112,8 +112,8 @@ DESCRIPTION_LIMIT = 1024
 def frontmatter_problems(skill_md: str) -> list[str]:
     """SKILL.md opens with YAML a YAML parser reads: three strings, one line each.
 
-    Parsed, not matched. The version guards read `version:` with a pattern and
-    were satisfied by a block whose `description` held `shell: build`, which
+    Parsed, not matched. The version guards of the time read `version:` with a
+    pattern and were satisfied by a block whose `description` held `shell: build`, which
     is a second mapping inside a plain scalar: no parser accepts the block,
     so a host would have had no name or description to load the skill by.
 
