@@ -144,12 +144,13 @@ uvx --python 3.12 -c dev-constraints.txt --with pillow --with pyyaml pytest test
 ```
 
 `dev-constraints.txt` is the one place the toolchain's versions are stated (exact
-pins: pip, pytest, Pillow, PyYAML, Black, Ruff). Every install step in a workflow
-is written one way, `pip install -c dev-constraints.txt <pinned names>` and nothing
-else in the step; a guard in `tests/test_packaging_contract.py` fails a workflow
-that names an installer any other way. It checks how the workflows are written,
-not what a job does at run time. Third-party actions are pinned to commits by the
-same module.
+pins: pip, pytest, Pillow, PyYAML, Black, Ruff). Every workflow step that installs
+a Python package is written one way, `pip install -c dev-constraints.txt <pinned names>`
+(with or without `python -m` before it) and nothing else in the step; a guard in
+`tests/test_packaging_contract.py` fails a
+workflow that names a Python installer any other way. It checks how the workflows
+are written, not what a job does at run time. Third-party actions are pinned to
+commits by the same module.
 
 The agent CLIs (`codex`, `claude`) are npm's, and npm takes no constraints file:
 `agent-cli-pins.txt` pins them, one `name@version` to a line, and the same

@@ -120,11 +120,12 @@ pre-commit install && pre-commit install --hook-type commit-msg
 ```
 
 Versions are stated once, in [dev-constraints.txt](dev-constraints.txt) (exact pins: pip, pytest,
-Pillow, PyYAML, Black, Ruff, pre-commit). Every install step in `.github/workflows/` is written
-one way, `pip install -c dev-constraints.txt <pinned names>`, so CI and the commands here get the
-same versions of those packages (a dependency the file does not name still floats);
-`tests/test_packaging_contract.py` fails a workflow that names an installer any other way (it
-checks how the workflows are written, not what a job does at run time). To move a
+Pillow, PyYAML, Black, Ruff, pre-commit). Every step in `.github/workflows/` that installs a
+Python package is written one way, `pip install -c dev-constraints.txt <pinned names>` (with or
+without `python -m` before it), so CI and
+the commands here get the same versions of those packages (a dependency the file does not name
+still floats); `tests/test_packaging_contract.py` fails a workflow that names a Python installer
+any other way (it checks how the workflows are written, not what a job does at run time). To move a
 version, change it there (and the matching `rev:` in `.pre-commit-config.yaml` for Black or Ruff),
 run the suite, and commit both.
 
@@ -161,7 +162,7 @@ pytest tests/
 | `emulator.yml` | PR, nightly, manual, called by `release.yml` | `pytest -m emulator` against a booted emulator |
 | `install-check.yml` | PR / push to `main`, called by `release.yml` | `python tests/verify_install.py`: Codex and Claude Code, at their pinned versions, each install the plugin into an empty home |
 | `release.yml` | release published | Lint + unit tests, the emulator lane, the install check, and the five versioned files == tag; only then zip the `android-emulator-skill/` package, check the zip on the runner (`tests/check_release_zip.py`) and attach it |
-| `validate-version.yml` | release published, manual | `pyproject.toml`, SKILL.md frontmatter, both plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`) and `.claude-plugin/marketplace.json` versions == tag |
+| `validate-version.yml` | release published, manual | `python3 tests/check_versions.py`: `pyproject.toml`, SKILL.md frontmatter, both plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`) and `.claude-plugin/marketplace.json` versions == tag, each read at the place its format gives it (SKILL.md's frontmatter is held to one plain ASCII field to a line, as a runner has no YAML reader) |
 | `pages.yml` | push to `main` touching `site/**` or the workflow itself, manual | Deploy the docs site to GitHub Pages |
 
 ## Release process

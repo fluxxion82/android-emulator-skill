@@ -2,10 +2,11 @@
 #
 # A pip constraints file: it installs nothing by itself, it fixes the version of
 # each package named below whenever an install brings that package in. Every
-# install step in .github/workflows/ is written one way,
-# `pip install -c dev-constraints.txt <names pinned here>`, and
+# step in .github/workflows/ that installs a Python package is written one way,
+# `pip install -c dev-constraints.txt <names pinned here>` (with or without
+# `python -m` before it), and
 # tests/test_packaging_contract.py::test_every_workflow_install_takes_its_version_from_the_shared_pins
-# fails a workflow that names an installer any other way. It checks how the
+# fails a workflow that names a Python installer any other way. It checks how the
 # workflows are written, not what a job does when it runs. (The agent CLIs are
 # npm's and are pinned beside this file, in agent-cli-pins.txt.) Locally:
 #
