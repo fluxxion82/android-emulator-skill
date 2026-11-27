@@ -202,13 +202,17 @@ git tag vX.Y.Z && git push origin main --tags
   the upload runs `python3 tests/check_release_zip.py <zip> android-emulator-skill` (standard library
   only, nothing installed) on the file about to be uploaded: extracted, its files are the plugin
   directory's byte for byte less bytecode and `.DS_Store`, the zip holds no such entry, and every
-  Python script answers `--help` from the extracted copy. That step runs on a release and at no
-  other time. In the suite, `tests/test_release_artifact.py` runs the `package` job's own steps, the
+  Python script answers `--help` from the extracted copy. A runner runs that step when a release
+  is published and at no other time. In the suite, `tests/test_release_artifact.py` runs the
+  `package` job's own steps, the
   check among them, on the test machine, extracts the zip elsewhere and uses it: the same
   comparison, against the directory as it was before the first step, then the shell scripts, the
   file each relative link names and both manifests. Only the suite sees a file rewritten before it
   is packed (the step reads the directory afterwards); only the step sees a zip that comes out
   differently on the runner. A guard in the same module keeps the step the last before the upload.
+  Another holds who may write the asset: `release.yml` has the five jobs written out there, and
+  the token of every job in every workflow reads at most, the `package` job's `contents: write`
+  apart. A workflow must list its `permissions`; one that lists none is refused.
 - **The install check.** `python tests/verify_install.py` (Python 3.12+ with PyYAML, as in the venv
   above) installs the plugin with `codex` and `claude` into empty homes, from a clean export of
   HEAD, and compares what arrived with the plugin directory. It needs both CLIs on PATH at the

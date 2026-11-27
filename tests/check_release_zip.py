@@ -15,7 +15,8 @@ first that fails:
    directory included.
 3. Every Python script under `skills/android-emulator-skill/scripts/` of the
    extracted copy answers `--help`, started by its absolute path from another
-   directory with an environment that is PATH alone.
+   directory. Of this environment it is given PATH and nothing else;
+   `verify_install.script_problems` adds `PYTHONDONTWRITEBYTECODE=1`.
 
 Exit status: 0 when all three hold, 1 when one does not, 2 for bad arguments
 or a Python older than the scripts need.
@@ -24,6 +25,9 @@ Limits. The plugin directory is read when this runs, after the steps before
 it: a step that rewrote a file and then packed it leaves a directory and a
 zip that agree, and this passes. tests/test_release_artifact.py records the
 directory before the first step and tells that apart, on the test machine.
+Files are compared, by name and by bytes. A directory with nothing in it
+that the zip holds and the plugin does not is not seen, and neither is a
+file whose mode changed, a lost executable bit included.
 The scripts are started by the Python running this, which on the runner is
 the image's `python3` with whatever packages the image has. And the zip is
 the one that exists when this runs: the job keeps this the last step before
@@ -120,7 +124,10 @@ def check(archive: Path, plugin: Path, scratch: Path) -> tuple[int, int, list[st
     cwd = scratch / "cwd"
     cwd.mkdir()
     scripts, problems = verify_install.script_problems(
-        extracted / "skills" / verify_install.SKILL, cwd, {"PATH": os.environ.get("PATH", "")}
+        extracted / "skills" / verify_install.SKILL,
+        cwd,
+        {"PATH": os.environ.get("PATH", "")},
+        "extracted",
     )
     return len(wanted), scripts, problems
 
@@ -150,8 +157,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {problem}")
         return 1
     print(
-        f"ok: {arguments.zip.name} holds the {files} files of {arguments.plugin_dir} and nothing "
-        f"else; {scripts} scripts answer --help from the extracted copy."
+        f"ok: {arguments.zip.name} holds the {files} files of {arguments.plugin_dir} and no other "
+        f"file; {scripts} scripts answer --help from the extracted copy."
     )
     return 0
 

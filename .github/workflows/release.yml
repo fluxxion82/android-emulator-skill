@@ -4,8 +4,12 @@ on:
   release:
     types: [published]
 
+# Read, for every job but the one that uploads: a job that could write the
+# repository's contents could replace the asset `package` checked. The jobs
+# of this workflow and what each token may do are written out in
+# tests/test_release_artifact.py and compared whole.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # A release used to run ZERO tests: it checked that three files existed,
@@ -81,6 +85,10 @@ jobs:
     name: Package skill and upload to release
     runs-on: ubuntu-latest
     needs: [verify, emulator, version, install]
+    # The upload writes the release's asset, and nothing else in any workflow
+    # here may.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository

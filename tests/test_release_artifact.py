@@ -36,9 +36,13 @@ script can ask where it is running. Each step is started as a runner starts
 it (`bash -e` on a file, in the checkout, with an empty summary file), but
 the variables a runner sets, the tools it has installed and the user it runs
 as are this machine's. This harness is for a zip step that packs the wrong
-files. It is not a defence against a step written to tell the two apart.
+files. It is not a defence against a step written to tell the two apart, and
+nothing in the job is: a step that knows a runner when it sees one can
+rewrite `tests/check_release_zip.py` there as easily as the zip.
 
-That defence is the job's own last step before the upload, `CHECK`: on the runner,
+What the job's own last step before the upload, `CHECK`, sees is a runner
+that differs from this machine by accident: another `zip`, another `unzip`,
+a checkout with other files in it. On the runner,
 `tests/check_release_zip.py` extracts the file about to be uploaded, compares
 it with the plugin directory less the same junk, and starts every Python
 script from the extracted copy. The comparison is that module's, and this
@@ -52,6 +56,12 @@ Python script. Only here: the directory as it was before the first step (the
 step reads it after, so a file rewritten and then packed agrees with its
 zip; `STEP_CANNOT_SEE` names the case), the shell scripts, the relative
 links, the two manifests, and every refusal of a job in another shape.
+
+And who may write the asset at all. The check is of the file the `package`
+job uploads; a job after it, or another workflow on the same trigger, could
+put another file of that name in its place. `_asset_writer_problems` holds
+the jobs of release.yml to the ones written out here, and the token of
+every job of every workflow to reading, the `package` job's apart.
 """
 
 from __future__ import annotations
@@ -88,8 +98,12 @@ PACKAGE_JOB = "package"
 TAG = "v99.98.97"
 REPOSITORY = "owner/repository"
 WORKFLOW_KEYS = frozenset({"name", "on", "permissions", "jobs"})
-JOB_KEYS = frozenset({"name", "runs-on", "needs", "steps"})
+JOB_KEYS = frozenset({"name", "runs-on", "needs", "permissions", "steps"})
 RUNNER = "ubuntu-latest"
+# Every job of release.yml. A job beside these is one nothing here examined.
+RELEASE_JOBS = ("verify", "emulator", "install", "version", "package")
+# What the token of the package job may do, whole. Every other job's reads at most.
+PACKAGE_PERMISSIONS = {"contents": "write"}
 # The job's first and last steps, less their `name`, exactly. The upload's
 # `files` is one path as the action reads it: no comma, newline or pattern.
 CHECKOUT = {"uses": "actions/checkout@v4"}
@@ -404,8 +418,23 @@ def test_the_jobs_own_check_passed_on_the_zip_and_says_what_it_compared(release)
     assert built.stopped_at is None
     assert (
         f"ok: {built.archive.name} holds the {len(built.wanted)} files of {PACKAGE_ROOT.name} "
-        f"and nothing else; {scripts} scripts answer --help from the extracted copy."
+        f"and no other file; {scripts} scripts answer --help from the extracted copy."
     ) in built.transcript
+
+
+def test_a_job_stops_at_the_step_that_fails_and_runs_none_after_it(tmp_path):
+    """As on a runner. The step that fails here is before the zip step, which would leave a zip."""
+    text = _edit_release(
+        '          echo "Validating android-emulator-skill/ package structure..."\n',
+        "          exit 3\n",
+    )(RELEASE.read_text(encoding="utf-8"))
+    built = _package(text, tmp_path / "may", may_stop=True)
+    assert built.stopped_at == "Validate skill structure"
+    assert built.transcript.count("## step ") == 1 and ": exit 3\n" in built.transcript
+    assert not built.archive.exists(), "a step after the one that failed was run"
+
+    with pytest.raises(AssertionError, match="Validate skill structure"):
+        _package(text, tmp_path / "may-not")
 
 
 def _check_step_problems(text: str) -> list[str]:
@@ -439,7 +468,10 @@ def test_the_package_job_checks_the_zip_as_its_last_step_before_the_upload():
 _CHECK_STEP = f"      - name: {CHECK['name']}\n"
 _CHECK_RUN = f"        run: {CHECK['run']}\n"
 _ZIP_STEP = "      - name: Create skill package\n"
-# Each is a job that uploads a zip its own check did not pass, or did not see.
+# Each is a job whose last two steps are not the check and the upload as they
+# are written out. All but the last would upload a zip the check did not pass,
+# or did not see. The last changes nothing that runs: the step is compared
+# whole, and its name is how a transcript and `stopped_at` say which step it was.
 UNCHECKED_UPLOADS = {
     "the check is deleted": _edit_release(f"{_CHECK_STEP}{_CHECK_RUN}", ""),
     "the check runs before the zip is made": _edit_release(
@@ -468,9 +500,162 @@ UNCHECKED_UPLOADS = {
 
 
 @pytest.mark.parametrize("name", UNCHECKED_UPLOADS)
-def test_a_job_that_uploads_a_zip_its_check_did_not_pass_is_told_apart(name):
+def test_a_job_whose_last_steps_are_not_the_check_and_the_upload_is_told_apart(name):
     text = UNCHECKED_UPLOADS[name](RELEASE.read_text(encoding="utf-8"))
     assert _check_step_problems(text), name
+
+
+def _workflow_texts() -> dict[str, str]:
+    """``{file name: text}`` of every workflow GitHub reads from this checkout."""
+    return {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(WORKFLOWS.iterdir())
+        if path.suffix in (".yml", ".yaml")
+    }
+
+
+def _asset_writer_problems(workflows: dict[str, str]) -> list[str]:
+    """Why something besides the package job could write a release's asset. Empty: nothing could.
+
+    Two rules, each compared whole. The jobs of release.yml are the ones
+    written out in `RELEASE_JOBS`. And the token GitHub makes for a job reads
+    at most, in every workflow: the workflow lists its permissions, `contents`
+    among them is not `write`, and no job sets permissions of its own but the
+    package job, whose are `PACKAGE_PERMISSIONS`. A workflow that lists none
+    gets the repository's default, which is a setting and in no file, so it
+    is refused.
+
+    The limit: that token is all this reads. A step handed another one, as a
+    secret, writes whatever that one may, and a person who may write the
+    repository needs no workflow.
+    """
+    found = []
+    for name, text in sorted(workflows.items()):
+        workflow = _yaml_with_the_keys_github_reads(text)
+        granted = workflow.get("permissions")
+        if type(granted) is not dict:
+            found.append(
+                f"{name} does not list what its token may do: `permissions` is {granted!r}"
+            )
+        elif granted.get("contents", "none") not in ("read", "none"):
+            found.append(f"{name} lets the token of every job write the repository's contents")
+        for job, body in workflow["jobs"].items():
+            own = body.get("permissions")
+            if (name, job) == (RELEASE.name, PACKAGE_JOB):
+                if not _written_alike(own, PACKAGE_PERMISSIONS):
+                    found.append(
+                        f"{name}, job `{job}`: `permissions` is {own!r}, not {PACKAGE_PERMISSIONS}"
+                    )
+            elif "permissions" in body:
+                found.append(f"{name}, job `{job}`, sets permissions of its own: {own!r}")
+        if name == RELEASE.name and sorted(workflow["jobs"]) != sorted(RELEASE_JOBS):
+            found.append(
+                f"the jobs of {name} are {sorted(workflow['jobs'])}, not {sorted(RELEASE_JOBS)}"
+            )
+    return found
+
+
+def test_nothing_but_the_package_job_may_write_a_releases_asset():
+    workflows = _workflow_texts()
+    assert sorted(workflows) == sorted(
+        path.name for path in WORKFLOWS.iterdir()
+    ), "a file in the workflows directory that this guard did not read"
+    assert RELEASE.name in workflows
+    assert _asset_writer_problems(workflows) == []
+
+
+def _in(name: str, change: Callable[[str], str]) -> Callable[[dict[str, str]], dict[str, str]]:
+    """An edit to one workflow among them all."""
+    return lambda workflows: {**workflows, name: change(workflows[name])}
+
+
+_TOKEN = "\npermissions:\n  contents: read\n"
+_PACKAGE_TOKEN = "    permissions:\n      contents: write\n"
+# What the review of this module appended to release.yml, with every guard
+# then green: the upload action puts a file over an asset of the same name.
+_REPLACING_JOB = (
+    "\n  replace_asset:\n"
+    "    name: Replace the asset\n"
+    "    needs: package\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    "      - name: Fetch\n"
+    "        uses: actions/checkout@v4\n"
+    "      - name: Pack an incomplete replacement\n"
+    "        run: zip android-emulator-skill-${{ github.ref_name }}.zip README.md\n"
+    "      - name: Replace\n"
+    f"        uses: {UPLOAD['uses']}\n"
+    "        with:\n"
+    "          files: android-emulator-skill-${{ github.ref_name }}.zip\n"
+)
+_ANOTHER_WORKFLOW = (
+    "name: After the release\n\non:\n  release:\n    types: [published]\n\n"
+    "permissions:\n  contents: write\n\n"
+    "jobs:\n  replace:\n    runs-on: ubuntu-latest\n    steps:\n"
+    '      - run: gh release upload "$GITHUB_REF_NAME" other.zip --clobber\n'
+)
+# Each with the words of the one rule that refuses it, and it is the only
+# thing found: a control refused for something else holds nothing.
+OTHER_WRITERS = {
+    "a job after the package job uploads a file of the same name": (
+        _in(RELEASE.name, lambda text: text + _REPLACING_JOB),
+        f"the jobs of {RELEASE.name} are ",
+    ),
+    "the token of every job of the release may write, as it once could": (
+        _in(RELEASE.name, _edit_release(_TOKEN, "\npermissions:\n  contents: write\n")),
+        f"{RELEASE.name} lets the token of every job write",
+    ),
+    "the release grants every permission in one word": (
+        _in(RELEASE.name, _edit_release(_TOKEN, "\npermissions: write-all\n")),
+        f"{RELEASE.name} does not list what its token may do: `permissions` is 'write-all'",
+    ),
+    "a workflow says nothing of its token": (
+        _in("test.yml", _edit_release(_TOKEN, "\n")),
+        "test.yml does not list what its token may do: `permissions` is None",
+    ),
+    "a gate of the release is given the write": (
+        _in(
+            RELEASE.name,
+            _edit_release(
+                "    name: Version consistency\n",
+                f"    name: Version consistency\n{_PACKAGE_TOKEN}",
+            ),
+        ),
+        f"{RELEASE.name}, job `version`, sets permissions of its own",
+    ),
+    "the package job may write more than the repository's contents": (
+        _in(
+            RELEASE.name,
+            _edit_release(_PACKAGE_TOKEN, f"{_PACKAGE_TOKEN}      actions: write\n"),
+        ),
+        f"{RELEASE.name}, job `package`: `permissions` is {{'contents': 'write', 'actions'",
+    ),
+    "the package job cannot upload": (
+        _in(RELEASE.name, _edit_release(_PACKAGE_TOKEN, "")),
+        f"{RELEASE.name}, job `package`: `permissions` is None",
+    ),
+    "a second workflow on the same trigger may write": (
+        lambda workflows: {**workflows, "after-release.yml": _ANOTHER_WORKFLOW},
+        "after-release.yml lets the token of every job write",
+    ),
+    "a job of another workflow is given the write": (
+        _in(
+            "validate-version.yml",
+            _edit_release(
+                "    name: Validate version consistency\n",
+                f"    name: Validate version consistency\n{_PACKAGE_TOKEN}",
+            ),
+        ),
+        "validate-version.yml, job `validate`, sets permissions of its own",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", OTHER_WRITERS)
+def test_another_writer_of_the_asset_is_refused_by_the_rule_it_breaks(name):
+    change, said = OTHER_WRITERS[name]
+    found = _asset_writer_problems(change(_workflow_texts()))
+    assert len(found) == 1 and said in found[0], found
 
 
 _UPLOAD_STEP = "      - name: Upload package to release\n"
@@ -652,12 +837,13 @@ def test_every_packaged_script_starts_by_its_absolute_path_from_another_director
     """The invocation SKILL.md documents, against the files the zip holds.
 
     Each Python script is asked for `--help` by absolute path, with a working
-    directory that is not the skill's and an environment that is PATH alone,
-    so the modules it imports are the ones extracted beside it.
+    directory that is not the skill's. Of this environment it is given PATH and
+    nothing else (`script_problems` adds `PYTHONDONTWRITEBYTECODE=1`), so the
+    modules it imports are the ones extracted beside it.
     """
     _, extracted = release
     env = {"PATH": os.environ["PATH"]}
-    ran, problems = verify_install.script_problems(_skill(extracted), tmp_path, env)
+    ran, problems = verify_install.script_problems(_skill(extracted), tmp_path, env, "extracted")
     assert problems == []
     assert ran == len([name for name in _scripts_on_disk() if name.endswith(".py")])
 
@@ -731,8 +917,11 @@ def test_the_extracted_zip_is_a_plugin_the_agent_can_read(release, surface):
     assert not missing, missing
 
 
-def _zipped(root: Path, files: dict[str, str]) -> tuple[Path, Path]:
-    """``(a zip, the directory it was made from)`` for a plugin of a few files."""
+def _zipped(root: Path, files: dict[str, str], beside: tuple[str, ...] = ()) -> tuple[Path, Path]:
+    """``(a zip, the directory it was made from)`` for a plugin of a few files.
+
+    `beside` names files the directory has and the zip has not.
+    """
     plugin = root / "plugin"
     plugin.mkdir(parents=True)
     archive = root / "plugin.zip"
@@ -741,22 +930,37 @@ def _zipped(root: Path, files: dict[str, str]) -> tuple[Path, Path]:
             (plugin / relative).parent.mkdir(parents=True, exist_ok=True)
             (plugin / relative).write_text(text, encoding="utf-8")
             held.write(plugin / relative, relative)
+    for relative in beside:
+        (plugin / relative).parent.mkdir(parents=True, exist_ok=True)
+        (plugin / relative).write_bytes(b"\x00junk")
     return archive, plugin
 
 
 _SCRIPT = f"skills/{SKILL}/scripts/answers.py"
-_ANSWERS = "import argparse\n\nargparse.ArgumentParser().parse_args()\n"
+_FINDERS = f"skills/{SKILL}/scripts/.DS_Store"
+# Answers `--help` unless Finder's file is beside it. A plugin directory can
+# have that file and its zip cannot, so the script tells the two copies apart.
+_ANSWERS = (
+    "import argparse\nimport sys\nfrom pathlib import Path\n\n"
+    "if (Path(__file__).parent / '.DS_Store').exists():\n    sys.exit(7)\n"
+    "argparse.ArgumentParser().parse_args()\n"
+)
 
 
 def test_the_check_starts_the_scripts_of_the_extracted_copy(tmp_path, capsys):
-    """The third of its checks, where the files agree: on a script that starts, and one that cannot."""
-    archive, plugin = _zipped(tmp_path / "starts", {_SCRIPT: _ANSWERS, "README.md": "text\n"})
+    """Not the directory's, where the one script exits 7 and the files of the two agree."""
+    files = {_SCRIPT: _ANSWERS, "README.md": "text\n"}
+    archive, plugin = _zipped(tmp_path / "starts", files, beside=(_FINDERS,))
+    _, in_the_directory = verify_install.script_problems(
+        plugin / "skills" / SKILL, tmp_path, {"PATH": os.environ["PATH"]}
+    )
+    assert len(in_the_directory) == 1 and "--help exited 7" in in_the_directory[0]
     assert check_release_zip.main([str(archive), str(plugin)]) == 0
     assert "holds the 2 files" in capsys.readouterr().out
 
     archive, plugin = _zipped(tmp_path / "raises", {_SCRIPT: "raise SystemExit(3)\n"})
     assert check_release_zip.main([str(archive), str(plugin)]) == 1
-    assert "answers.py --help exited 3" in capsys.readouterr().out
+    assert "answers.py --help exited 3 from the extracted copy" in capsys.readouterr().out
 
     archive, plugin = _zipped(tmp_path / "none", {"README.md": "text\n"})
     assert check_release_zip.main([str(archive), str(plugin)]) == 1

@@ -12,6 +12,12 @@ on:
   push:
     branches: [main]
 
+# The token GitHub hands each job may read the repository and no more.
+# tests/test_release_artifact.py holds that for every workflow here: a release
+# asset is written with `contents: write`, and one job of release.yml has it.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Run Black and Ruff
