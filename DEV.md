@@ -161,7 +161,7 @@ pytest tests/
 | `test.yml` | PR / push to `main` | `pytest tests/` |
 | `emulator.yml` | PR, nightly, manual, called by `release.yml` | `pytest -m emulator` against a booted emulator |
 | `install-check.yml` | PR / push to `main`, called by `release.yml` | `python tests/verify_install.py`: Codex and Claude Code, at their pinned versions, each install the plugin into an empty home |
-| `release.yml` | release published | Lint + unit tests, the emulator lane, the install check, and the five versioned files == tag; only then zip the `android-emulator-skill/` package and attach it |
+| `release.yml` | release published | Lint + unit tests, the emulator lane, the install check, and the five versioned files == tag; only then zip the `android-emulator-skill/` package, check the zip on the runner (`tests/check_release_zip.py`) and attach it |
 | `validate-version.yml` | release published, manual | `python3 tests/check_versions.py`: `pyproject.toml`, SKILL.md frontmatter, both plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`) and `.claude-plugin/marketplace.json` versions == tag, each read at the place its format gives it (SKILL.md's frontmatter is held to one plain ASCII field to a line, as a runner has no YAML reader) |
 | `pages.yml` | push to `main` touching `site/**` or the workflow itself, manual | Deploy the docs site to GitHub Pages |
 
@@ -198,9 +198,21 @@ git tag vX.Y.Z && git push origin main --tags
   records it), never inline tool output; AGENTS.md states the rule and `tests/test_fixture_policy.py`
   enforces it.
 - **Emulator tests** (`@pytest.mark.emulator`, deselected by default) run with `pytest -m emulator`.
-- **The release zip.** `tests/test_release_artifact.py` runs the `package` job's own steps, extracts
-  the zip elsewhere and uses it: the files, a `--help` from every script, the file each relative
-  link names, both manifests.
+- **The release zip.** Checked in two places. On the runner, the `package` job's last step before
+  the upload runs `python3 tests/check_release_zip.py <zip> android-emulator-skill` (standard
+  library only, nothing installed) on the file about to be uploaded: extracted, its files are the
+  plugin directory's byte for byte less bytecode and `.DS_Store`, the zip holds no such entry, and
+  every Python script answers `--help` from the extracted copy. The `package` job itself runs only
+  when a release is published. In the suite, `tests/test_release_artifact.py` runs the `package`
+  job's own steps, the check among them, on the test machine, extracts the zip elsewhere and uses
+  it: the same comparison, against the directory as it was before the first step, then the shell
+  scripts, the file each relative link names and both manifests. Only the suite sees a file
+  rewritten before it is packed (the step reads the directory afterwards); only the step sees a zip
+  that comes out differently on the runner. A guard in the same module keeps the step the last
+  before the upload. Another holds who may write the asset: `release.yml` has the five jobs written
+  out there, and no job's token in any workflow may write the repository's contents, the `package`
+  job's apart. Other scopes are not held. A workflow must list its `permissions`; one that lists
+  none is refused.
 - **The install check.** `python tests/verify_install.py` (Python 3.12+ with PyYAML, as in the venv
   above) installs the plugin with `codex` and `claude` into empty homes, from a clean export of
   HEAD, and compares what arrived with the plugin directory. It needs both CLIs on PATH at the

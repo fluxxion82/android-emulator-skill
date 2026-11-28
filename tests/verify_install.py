@@ -322,8 +322,15 @@ def skill_description(skill: Path) -> str | None:
     return description if isinstance(description, str) and description.strip() else None
 
 
-def script_problems(skill: Path, cwd: Path, env: dict[str, str]) -> tuple[int, list[str]]:
-    """``(scripts run, the ones that did not answer --help)``, each by its absolute path."""
+def script_problems(
+    skill: Path, cwd: Path, env: dict[str, str], copy: str = "installed"
+) -> tuple[int, list[str]]:
+    """``(scripts run, the ones that did not answer --help)``, each by its absolute path.
+
+    Each is given `env` and `PYTHONDONTWRITEBYTECODE=1`. `copy` is the word a
+    problem has for the copy the scripts are in: the release's check starts
+    an extracted one.
+    """
     scripts = sorted((skill / "scripts").glob("*.py"))
     problems = []
     for script in scripts:
@@ -332,7 +339,7 @@ def script_problems(skill: Path, cwd: Path, env: dict[str, str]) -> tuple[int, l
         )
         if status != 0 or not stdout.strip():
             problems.append(
-                f"{script.name} --help exited {status} from the installed copy:\n{_tail(stderr)}"
+                f"{script.name} --help exited {status} from the {copy} copy:\n{_tail(stderr)}"
             )
     if not scripts:
         problems.append(f"{skill / 'scripts'} holds no Python script")

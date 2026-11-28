@@ -37,6 +37,13 @@ on:
     # `.github/scripts/run-emulator-lane.sh`, so editing the lane script did
     # not re-run the lane.
 
+# The token GitHub hands each job here may read the repository's contents and
+# not write them. tests/test_release_artifact.py holds that much of every
+# workflow: a release asset is written with `contents: write`, and one job of
+# release.yml has it.
+permissions:
+  contents: read
+
 jobs:
   emulator:
     name: pytest -m emulator (real AVD)

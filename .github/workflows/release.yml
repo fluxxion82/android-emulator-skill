@@ -4,8 +4,13 @@ on:
   release:
     types: [published]
 
+# Read, for every job but the one that uploads: a job that could write the
+# repository's contents could replace the asset `package` checked.
+# tests/test_release_artifact.py compares the names of this workflow's jobs
+# with the ones written out there, and lets no job's token but the package
+# job's write contents, in this workflow or another.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # A release used to run ZERO tests: it checked that three files existed,
@@ -81,6 +86,10 @@ jobs:
     name: Package skill and upload to release
     runs-on: ubuntu-latest
     needs: [verify, emulator, version, install]
+    # The upload writes the release's asset, and nothing else in any workflow
+    # here may.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -122,6 +131,14 @@ jobs:
           echo "claude plugin marketplace add ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "claude plugin install android-emulator-skill@fluxxion82" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # On the runner, on the file the next step uploads. The suite builds a zip
+      # from these steps on the test machine, and a zip step that behaves
+      # differently here is one only this sees. tests/test_release_artifact.py
+      # holds it here, the last step before the upload: a step between the two
+      # could replace the zip with one nothing examined.
+      - name: Check the zip against the plugin directory
+        run: python3 tests/check_release_zip.py android-emulator-skill-${{ github.ref_name }}.zip android-emulator-skill
 
       # Last, and tests/test_release_artifact.py holds it there: a step after the
       # upload could replace the asset with a zip no test examined.
