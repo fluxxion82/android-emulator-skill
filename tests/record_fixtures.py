@@ -97,6 +97,7 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -3641,6 +3642,236 @@ def _delayed_window(_scratch: Path, serial: str, extra: dict) -> Capture:
     return before
 
 
+# --- a dump that is stopped before it answers -------------------------------
+#
+# A reader with a time limit has to end a dump that is still running. Where it
+# is ended decides what the device is like afterwards, and these record both.
+
+# Device-side limits, in seconds, for toybox `timeout`. The first is one the
+# View ticker's dump cannot meet (it answers after about eleven); the second
+# is one no dump can, because uiautomator waits for a full second without an
+# accessibility event before it reads anything.
+_STOP_NEVER_IDLE_S = "4"
+_STOP_MID_READ_S = "0.5"
+# How far into a dump the host's adb client is killed, and how far into one
+# dump the second is started.
+_HOST_KILL_AFTER_S = 0.5
+# The dump that shows the state has passed is asked for three seconds after the
+# kill, and refused if it was asked later than this.
+_RECOVERED_WITHIN_S = 4
+_OVERLAP_AFTER_S = 3
+
+
+def _dump_within(limit: str) -> list[str]:
+    """The dump, under the device's own ``timeout``: it is stopped THERE when time is up."""
+    return ["exec-out", "timeout", limit, "uiautomator", "dump", "/dev/tty"]
+
+
+_OPEN_VIEW_TICKER = [
+    ["shell", "am", "force-stop", COMPOSE_PACKAGE],
+    [
+        "shell",
+        "am",
+        "start",
+        "-W",
+        "-n",
+        f"{COMPOSE_PACKAGE}/.NeverIdleActivity",
+        "--es",
+        "mode",
+        "view_ticker",
+    ],
+    ["shell", "sleep", "1"],
+]
+
+
+def _stopped_on_device(limit: str, twin: str | None = None) -> Callable[[Path, str, dict], Capture]:
+    """A ``capture_with``: one dump under ``timeout <limit>``, timed.
+
+    With ``twin``, a plain dump is asked for as soon as that one returns and
+    handed to the fixture of that name: what the device answers right after a
+    dump was stopped on it.
+    """
+
+    def capture(_scratch: Path, serial: str, extra: dict) -> Capture:
+        began = time.monotonic()
+        stopped = _run(_dump_within(limit), serial, timeout=60)
+        returned = time.monotonic()
+        took = returned - began
+        provenance = {
+            "device_side_limit_s": float(limit),
+            "answered_after_s": round(took, 1),
+        }
+        # Each fact the fixture states, checked here: stopped AT the limit (not
+        # before it, and not a second after), no byte on either stream, exit 0.
+        if not float(limit) <= took <= float(limit) + 1:
+            raise CaptureError(
+                f"the dump answered after {took:.1f}s, not at its {limit}s limit: "
+                f"it was not that limit that ended it"
+            )
+        if stopped.stdout or stopped.stderr or stopped.returncode != 0:
+            raise CaptureError(
+                f"a stopped dump is recorded as no output at exit 0; this one exited "
+                f"{stopped.returncode} with {stopped.stdout[:80]!r} / {stopped.stderr[:80]!r}"
+            )
+        if twin is not None:
+            next_began = time.monotonic()
+            after = _run(_DUMP, serial, timeout=60)
+            _TEXT_TWINS[twin] = (
+                after,
+                {
+                    "asked_s_after_the_stopped_dump_returned": round(next_began - returned, 2),
+                    "the_stopped_dump": "uiautomator_dump_stopped_mid_read",
+                },
+            )
+        extra.update(provenance)
+        return stopped
+
+    return capture
+
+
+def _within_limit_same_as_plain(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """A dump under a limit it meets, refused unless a plain dump taken next is the same."""
+    limited = _run(_dump_within("30"), serial, timeout=60)
+    plain = _run(_DUMP, serial, timeout=60)
+    if _trim_hierarchy(limited.text) != _trim_hierarchy(plain.text):
+        raise CaptureError(
+            "the dump under `timeout` is not the document a plain dump of the same screen "
+            "gave next: the wrapper changed something, or the screen did"
+        )
+    extra["same_document_as_a_plain_dump_taken_next"] = True
+    return limited
+
+
+def _dump_started(serial: str) -> subprocess.Popen:
+    """A dump left running, for a capture that needs a second one beside it."""
+    return subprocess.Popen(
+        _adb_argv(serial, _DUMP), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+
+def _killed_alone(capture: Capture, took: float) -> None:
+    """Refuse an answer that is not the one word, on stdout, at exit 0, within a second."""
+    if capture.stdout.strip() != "Killed" or capture.stderr or capture.returncode != 0:
+        raise CaptureError(
+            f"expected the one word 'Killed' on stdout at exit 0; got exit "
+            f"{capture.returncode}, {capture.stdout[:80]!r} / {capture.stderr[:80]!r}"
+        )
+    if took >= 1:
+        raise CaptureError(f"'Killed' took {took:.1f}s to arrive; it is recorded as immediate")
+
+
+def _already_registered_line(serial: str) -> str:
+    """What AndroidRuntime logged about the refused dump; refused when it logged nothing."""
+    log = _run(["logcat", "-d", "-v", "brief", "AndroidRuntime:E", "*:S"], serial, timeout=30)
+    for line in log.text.splitlines():
+        if "IllegalStateException: UiAutomationService" in line and "already registered" in line:
+            # The proxy's identity hash differs every run; the rest is the message.
+            # Android prints no space after the hash: "...$Stub$Proxy@2938e26already registered!"
+            message = line.split("): ", 1)[-1].strip()
+            return re.sub(r"@[0-9a-f]+?(?=already registered)", "@<hash>", message)
+    raise CaptureError(
+        "logcat AndroidRuntime:E has no 'IllegalStateException: UiAutomationService ... "
+        "already registered' line: the reason this fixture gives for the answer was not "
+        "observed"
+    )
+
+
+def _dump_while_another_runs(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """The second of two dumps running at once; the first runs to its own answer.
+
+    On the View ticker the first takes about eleven seconds, so a second one
+    started :data:`_OVERLAP_AFTER_S` in overlaps it without any race.
+    """
+    _run(["logcat", "-c"], serial, timeout=30)
+    first = _dump_started(serial)
+    try:
+        time.sleep(_OVERLAP_AFTER_S)
+        asked = time.monotonic()
+        second = _run(_DUMP, serial, timeout=60)
+        took = time.monotonic() - asked
+        try:
+            first_answer, _ = first.communicate(timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            raise CaptureError("the first dump did not answer within 60s") from exc
+    finally:
+        # Whatever happened above, the first dump is not left running.
+        first.kill()
+        first.wait()
+    if "could not get idle state" not in first_answer:
+        raise CaptureError(
+            f"the first dump answered {first_answer.strip()[:120]!r}, not its own idle "
+            f"failure: the two did not overlap as this fixture says"
+        )
+    _killed_alone(second, took)
+    extra.update(
+        {
+            "started_s_after_the_first_dump": _OVERLAP_AFTER_S,
+            "answered_in_s": round(took, 2),
+            "the_first_dump_answered": first_answer.strip(),
+            "android_runtime_logged": _already_registered_line(serial),
+        }
+    )
+    return second
+
+
+def _dump_after_host_kill(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """The dump asked for at once after the host killed another dump's adb client.
+
+    A third dump, three seconds on, must be a hierarchy: the state passes, and
+    the fixture says so only because it was read back.
+
+    The kill has to land while the first dump is registered and still waiting
+    for idle. Measured on API 33 and 35, on this settled screen: killed up to
+    0.8s in, the next dump answers 'Killed'; killed 1.2s in or later, the first
+    dump is as good as done and the next one reads the screen. A dump is asked
+    for and thrown away first, because on a just-booted emulator the first
+    start of uiautomator alone took longer than the half second.
+    """
+    warm = _run(_DUMP, serial, timeout=60)
+    if "<hierarchy" not in warm.text:
+        raise CaptureError(f"the screen could not be dumped at all: {warm.text.strip()[:120]!r}")
+    _run(["logcat", "-c"], serial, timeout=30)
+    first = _dump_started(serial)
+    time.sleep(_HOST_KILL_AFTER_S)
+    first.kill()
+    first.wait()
+    killed = time.monotonic()
+    asked = time.monotonic()
+    second = _run(_DUMP, serial, timeout=60)
+    answered = time.monotonic()
+    _killed_alone(second, answered - asked)
+    logged = _already_registered_line(serial)
+    # Three seconds counted from the kill, whatever the two steps above took.
+    time.sleep(max(0.0, killed + 3 - time.monotonic()))
+    later_asked = time.monotonic()
+    later = _run(_DUMP, serial, timeout=60)
+    try:
+        # Parsed, not only found: a document with its ends in place and a broken
+        # tag inside is not a screen anyone read.
+        ET.fromstring(_trim_hierarchy(later.text))
+    except (CaptureError, ET.ParseError) as exc:
+        raise CaptureError(
+            f"{later_asked - killed:.1f}s after the kill a dump was still not a hierarchy "
+            f"that parses ({exc}): {later.text.strip()[:120]!r}"
+        ) from exc
+    if later_asked - killed > _RECOVERED_WITHIN_S:
+        raise CaptureError(
+            f"the later dump was asked {later_asked - killed:.1f}s after the kill, not within "
+            f"{_RECOVERED_WITHIN_S}: this run does not show how soon the state passes"
+        )
+    extra.update(
+        {
+            "host_client_killed_s_into_its_dump": _HOST_KILL_AFTER_S,
+            "asked_s_after_the_kill": round(asked - killed, 2),
+            "answered_in_s": round(answered - asked, 2),
+            "a_later_dump_was": "a hierarchy",
+            "the_later_dump_was_asked_s_after_the_kill": round(later_asked - killed, 1),
+            "android_runtime_logged": logged,
+        }
+    )
+    return second
+
+
 _ANIMATION_SCALES = (
     "window_animation_scale",
     "transition_animation_scale",
@@ -3652,7 +3883,7 @@ def _view_ticker_with_animations_off(_scratch: Path, serial: str) -> None:
     """``prepare``: all three animation scales at 0, read back, then open the View ticker.
 
     "Disable animations" is the standard remedy for a dump that cannot reach
-    idle, and the one the skill's own error message gives. The scales are saved
+    idle, and the one the skill's own error message gave until v0.10.0. The scales are saved
     as they are changed and restored by ``_global_settings_restored``, which the
     recording loop runs whether or not the capture succeeded.
     """
@@ -8011,7 +8242,7 @@ FIXTURES: list[Fixture] = [
             "with all three animation scales set to 0 and read back as 0. The "
             "answer is unchanged: 'ERROR: could not get idle state.' on stdout "
             "at exit 0. Disabling animations is the remedy usually given for "
-            "this error -- it is the one common/hierarchy.py prints -- and it "
+            "this error -- common/hierarchy.py printed it until v0.10.0 -- and it "
             "does nothing here, because nothing is animating: the content is "
             "changing. An agent told to disable animations will do so, retry, "
             "and fail the same way."
@@ -8092,6 +8323,132 @@ FIXTURES: list[Fixture] = [
         teardown_verify=_device_awake,
         record_both_streams=True,
         post=_requires("null root node", absent=("<hierarchy",)),
+    ),
+    # --- a dump stopped before it answers, and what that leaves behind ------
+    Fixture(
+        name="uiautomator_dump_stopped_on_device",
+        emulator_only=True,
+        args=_dump_within(_STOP_NEVER_IDLE_S),
+        description=(
+            "A dump the DEVICE stopped: `timeout 4 uiautomator dump /dev/tty` on "
+            "the View ticker, whose dump takes about eleven seconds. The answer "
+            "is nothing at all -- no bytes on either stream -- at exit status 0, "
+            "when the limit is up. toybox `timeout` says nothing when it stops "
+            "its command (its `-v` flag would, but API 33's toybox has no `-v`), "
+            "and `adb exec-out` does not carry the 124 it exits with. So for a "
+            "reader that set the limit, an empty answer is the stopped one."
+        ),
+        setup=_OPEN_VIEW_TICKER,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_with=_stopped_on_device(_STOP_NEVER_IDLE_S),
+        record_both_streams=True,
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="uiautomator_dump_stopped_mid_read",
+        emulator_only=True,
+        args=_dump_within(_STOP_MID_READ_S),
+        description=(
+            "The same stop on a screen that CAN be read (the walk's confirmation "
+            "screen): `timeout 0.5 uiautomator dump /dev/tty` ends the dump "
+            "while it is still waiting for idle. Empty again. Recorded with "
+            "uiautomator_dump_right_after_a_stop, the plain dump asked for as "
+            "soon as this one returned."
+        ),
+        setup=_open_walk(5),
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_with=_stopped_on_device(
+            _STOP_MID_READ_S, twin="uiautomator_dump_right_after_a_stop"
+        ),
+        record_both_streams=True,
+        post=_requires_empty(),
+    ),
+    Fixture(
+        name="uiautomator_dump_right_after_a_stop",
+        emulator_only=True,
+        ext="xml",
+        args=_DUMP,
+        command=(
+            "adb exec-out uiautomator dump /dev/tty (at once after "
+            "uiautomator_dump_stopped_mid_read returned)"
+        ),
+        description=(
+            "What the device answers right after a dump was stopped ON it: the "
+            "screen, as usual. A dump stopped by the device's `timeout` leaves "
+            "nothing behind for the next one to trip over. Compare "
+            "uiautomator_dump_after_host_kill, where the dump was ended from the "
+            "host instead."
+        ),
+        capture_with=_text_twin(
+            "uiautomator_dump_right_after_a_stop", "uiautomator_dump_stopped_mid_read"
+        ),
+        post=_screen_of(COMPOSE_PACKAGE, require=("Order placed", "Arrives Thursday")),
+    ),
+    Fixture(
+        name="uiautomator_dump_within_device_limit",
+        emulator_only=True,
+        ext="xml",
+        args=_dump_within("30"),
+        description=(
+            "A dump that finishes inside its device-side limit: `timeout 30 "
+            "uiautomator dump /dev/tty` on the walk's confirmation screen. The "
+            "wrapper changes nothing about a dump that answers in time: a "
+            "plain dump is taken next and this is refused unless the two are "
+            "the same document."
+        ),
+        setup=_open_walk(5),
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_with=_within_limit_same_as_plain,
+        post=_screen_of(COMPOSE_PACKAGE, require=("Order placed", "Arrives Thursday")),
+    ),
+    Fixture(
+        name="uiautomator_dump_while_another_runs",
+        emulator_only=True,
+        args=_DUMP,
+        command=(
+            "adb exec-out uiautomator dump /dev/tty, started 3s into another "
+            "adb exec-out uiautomator dump /dev/tty that was still running"
+        ),
+        description=(
+            "A dump asked for while another is still running on the device: the "
+            "one word 'Killed', on stdout at exit status 0, within a second "
+            "(each of those is checked before this is written). The "
+            "first dump is unaffected and runs to its own answer (the manifest "
+            "entry quotes it). Only one UI automation session can be registered "
+            "at a time; the second process dies registering, and what it logged "
+            "is in the entry too. Two agents on one device, or a dump beside an "
+            "instrumented UI test, meet this."
+        ),
+        setup=_OPEN_VIEW_TICKER,
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_with=_dump_while_another_runs,
+        record_both_streams=True,
+        post=_requires("Killed", absent=("<hierarchy",)),
+    ),
+    Fixture(
+        name="uiautomator_dump_after_host_kill",
+        emulator_only=True,
+        args=_DUMP,
+        command=(
+            "adb exec-out uiautomator dump /dev/tty, at once after the adb client "
+            "of another dump was killed on the host 0.5s into it"
+        ),
+        description=(
+            "What ending a dump from the HOST leaves behind. The adb client of a "
+            "running dump is killed (which is what a subprocess timeout does); "
+            "the dump asked for next answers 'Killed', because the first one's "
+            "process is still registered on the device for a moment after its "
+            "client is gone. A dump asked for three to four seconds after the "
+            "kill reads the screen again (the recorder refuses the run "
+            "otherwise). This is why a reader with a "
+            "deadline stops its dump on the device: compare "
+            "uiautomator_dump_right_after_a_stop."
+        ),
+        setup=_open_walk(5),
+        teardown=[["shell", "am", "force-stop", COMPOSE_PACKAGE]],
+        capture_with=_dump_after_host_kill,
+        record_both_streams=True,
+        post=_requires("Killed", absent=("<hierarchy",)),
     ),
     # --- six screens of one flow: a walk that is a walk ---------------------
     *[

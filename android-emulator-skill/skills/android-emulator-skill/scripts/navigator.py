@@ -38,6 +38,12 @@ Usage Examples:
     # Tap at specific coordinates (fallback)
     python3 "$SKILL_DIR/scripts/navigator.py" --tap-at 200,400
 
+    # Wait for text to appear, without touching anything
+    python3 "$SKILL_DIR/scripts/navigator.py" --wait-for "Order confirmed"
+
+    # Tap, wait for what the tap should bring, and get the screen that followed
+    python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Place order" --tap --expect "Order placed"
+
 Output Format:
     Tapped: Button "Login" at (320, 450)
     Entered text in: EditText "Username"
@@ -60,6 +66,40 @@ The default still has to answer the question that made this necessary: when
 nothing matches and the screen *does* have a scrollable container, the failure
 says so and names the flag, so "not found" is never mistaken for "not there".
 
+Waiting
+-------
+``--wait-for TEXT`` reads the screen until TEXT is on it, and ``--tap --expect
+TEXT`` does the same after one tap. One waiter, with one deadline over
+everything it does (``--timeout``, default 30 seconds): reading the screen to
+find the target, the tap, the settle pause, every dump and every pause between
+dumps. It scrolls nothing, taps nothing more and changes no setting.
+
+Each dump is given what is left of the deadline and is stopped ON THE DEVICE
+when that is up (:func:`common.hierarchy.capture_hierarchy_within`), not from
+here: a dump whose adb client is killed can stay registered on the device for
+a moment, and the next dump anyone asks for -- the agent's next command -- is
+then answered ``Killed``. The host's own timeout is set a few seconds past the
+device's and ends a dump only when adb itself has stopped answering.
+
+Three things can run past the deadline, each by a stated amount: the tap
+command is given at least ``TAP_COMMAND_FLOOR_SECONDS``; an adb that does not
+answer is given up on ``HOST_GRACE_SECONDS`` (and a rounding to whole seconds)
+after the dump's limit; and when adb says the device is not there, or that
+there are several, ``adb_exec`` asks adb once what is attached, to word the
+error, with ten seconds of its own.
+
+Once the tap has been sent, a wait that ran out says so, and so does an adb
+failure on a read after it (the device gone, adb not answering) -- because the
+one thing the caller must not do on a bare "adb failed, retry" is tap again.
+An interrupt is not covered: it is ``Interrupted.`` and nothing more.
+
+It has three answers, and the last capture that FINISHED decides between the
+two failures: a screen without the text is "not observed"; anything else, or
+nothing, is "could not read the screen". The second is not a statement about
+the text. A screen that never goes idle cannot be dumped at all, and a wait on
+it ends that way however long it is given. Recorded: a ``TextView`` whose text
+changes every 100 ms is such a screen; Compose texts changing as often are not.
+
 Navigation Priority (best to worst):
     1. Find by text (content-desc or text attribute - most reliable)
     2. Find by element type + index (good for forms)
@@ -77,6 +117,7 @@ Technical Details:
 
 import argparse
 import json as json_lib
+import math
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -102,8 +143,11 @@ from common.device_utils import (
 from common.env_config import env_float, env_int
 from common.hierarchy import (
     CAPTURE_ATTEMPTS,
+    CaptureCutOff,
+    HierarchyError,
     bare_resource_id,
     capture_hierarchy,
+    capture_hierarchy_within,
     is_actionable,
     is_interactive,
     parse_bounds,
@@ -194,6 +238,133 @@ SCROLL_SEARCH_DEADLINE_SECONDS = env_float("ANDROID_EMU_SCROLL_SEARCH_DEADLINE",
 # ("could not get idle state", retried inside capture_hierarchy) or captures a
 # mid-flight screen whose bounds are stale.
 SCROLL_SETTLE_SECONDS = env_float("ANDROID_EMU_SCROLL_SETTLE_MS", 600.0) / 1000.0
+
+
+# Default --timeout for --wait-for and --expect, in seconds. A dump of a settled
+# screen took about two seconds on a warm emulator (up to seventeen on one that
+# had just booted) and one of a screen that never goes idle gives up after about
+# eleven, so this is a dozen reads of the first kind and two full answers of the
+# second -- enough to be told which it is.
+WAIT_TIMEOUT_SECONDS = 30.0
+
+# The range --timeout accepts. The floor is a choice, not a measurement: a dump
+# of a settled screen took about two seconds on a warm emulator, and a timeout
+# of one second started no dump at all (none is started with under
+# MIN_CAPTURE_SECONDS left). The ceiling is the same argument as
+# MAX_SCROLLS_CEILING: past it this is not a longer wait but a hang with a
+# plausible explanation.
+WAIT_TIMEOUT_FLOOR = 3.0
+WAIT_TIMEOUT_CEILING = 600.0
+
+# A dump is not started with less than this left. uiautomator waits for a full
+# second without an accessibility event before it reads anything, so a dump
+# given less cannot answer: it would only be started to be stopped.
+MIN_CAPTURE_SECONDS = 1.0
+
+# Pause between one capture and the next while waiting. Short: the dump's own
+# idle wait already spaces the reads out.
+WAIT_POLL_SECONDS = 0.3
+
+# The least the tap command itself is given under a deadline. `input tap` is
+# never cut shorter than this, because a tap that was killed half way is a tap
+# nobody can say happened; so a stalled adb can overrun the deadline by this
+# much, and says so when it does.
+TAP_COMMAND_FLOOR_SECONDS = 5
+
+# How many of the screen's texts a failed wait quotes.
+SCREEN_TEXTS_SHOWN = 8
+SCREEN_TEXT_WIDTH = 40
+
+
+def _now() -> float:
+    """The waiter's clock. One function so a test can own the time."""
+    return time.monotonic()
+
+
+def _pause(seconds: float) -> None:
+    """The waiter's sleep, for the same reason."""
+    time.sleep(seconds)
+
+
+class Deadline:
+    """One monotonic deadline for a whole wait.
+
+    Everything a wait does is paid for from here -- dumps, the tap, pauses --
+    so the time each step may take is what is left, not a share of the total
+    and not a default of its own. The scroll search's budget divides what
+    remains across the capture layer's retries with a one-second floor, and
+    the capture layer's default is three attempts of sixty seconds; neither is
+    a bound on the whole, and this copies neither.
+    """
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self._started = _now()
+
+    @property
+    def elapsed(self) -> float:
+        """Seconds since the wait began."""
+        return _now() - self._started
+
+    @property
+    def remaining(self) -> float:
+        """Seconds left, never negative."""
+        return max(0.0, self.seconds - self.elapsed)
+
+    def pause(self, seconds: float) -> None:
+        """Sleep for ``seconds`` or for what is left, whichever is shorter."""
+        seconds = min(seconds, self.remaining)
+        if seconds > 0:
+            _pause(seconds)
+
+
+@dataclass
+class Wait:
+    """What a wait did, and how it ended.
+
+    Attributes:
+        text: The text waited for; None when any readable screen would do
+            (reading the screen to find a tap's target).
+        timeout: The whole budget, in seconds.
+        found: The wait ended on a capture that satisfied it.
+        element: The node that carried the text, when there was a text.
+        root: The last capture that was a screen, or None.
+        read_at: Seconds into the wait when that capture arrived.
+        readable: Captures that were a screen.
+        failed: Captures that answered and were not a screen.
+        unfinished: Captures the device stopped at the deadline.
+        last_failure: What the last capture that was not a screen said.
+        last_was_screen: Whether the last capture that FINISHED was a screen.
+            This, not the count, decides between "not observed" and "could not
+            read": a screen read at two seconds says nothing about a screen
+            that has answered `could not get idle state` ever since.
+        elapsed: Seconds the wait took.
+    """
+
+    text: str | None
+    timeout: float
+    found: bool = False
+    element: "Element | None" = None
+    root: ET.Element | None = None
+    read_at: float | None = None
+    readable: int = 0
+    failed: int = 0
+    unfinished: int = 0
+    last_failure: str | None = None
+    last_was_screen: bool = False
+    elapsed: float = 0.0
+
+    @property
+    def outcome(self) -> str:
+        """``found``, ``not_observed`` or ``unreadable``."""
+        if self.found:
+            return "found"
+        return "not_observed" if self.last_was_screen else "unreadable"
+
+    @property
+    def stale(self) -> bool:
+        """Whether the screen in :attr:`root` was followed by a capture that was not one."""
+        return self.root is not None and not self.last_was_screen
 
 
 @dataclass
@@ -610,7 +781,9 @@ class Navigator:
             seen.add(id(resolved.node))
             matches.append(resolved)
 
-        if matches and index < len(matches):
+        # Bounded at both ends: `--index -1` has always meant the last match,
+        # and `--index -99` was an IndexError traceback from five matches.
+        if matches and -len(matches) <= index < len(matches):
             return matches[index]
 
         return None
@@ -912,12 +1085,111 @@ class Navigator:
         note(f"reached the {max_scrolls}-scroll limit with the screen still changing")
         return ScrollSearch(None, screens, scrolls, True, hit_limit=True)
 
-    def tap(self, element: Element) -> tuple:
+    def find_visible(self, root: ET.Element, text: str, fuzzy: bool = True) -> Element | None:
+        """The first node on a captured screen that answers to ``text``, operable or not.
+
+        What a wait matches. The names are the ones :meth:`_matches_text` knows
+        -- a node's text or content description, a control's recovered caption,
+        a resource id given whole -- so any name the screen report prints can
+        be waited for, and so can a line of plain text.
+
+        Deliberately not :meth:`_find_in`: that resolves a caption to the
+        control that owns it and its caller refuses a passive label, because
+        its answer is about to be tapped. A wait observes. "Order confirmed"
+        is a label and nothing else, and it is exactly what is waited for.
+        Disabled nodes are not skipped either: their text is on the screen.
+
+        Args:
+            root: A captured hierarchy root.
+            text: The text to look for.
+            fuzzy: Case-insensitive substring match; False for the whole text.
+
+        Returns:
+            The first match in document order, or None.
+        """
+        for element in self._flatten_tree(root):
+            if self._matches_text(element, text, fuzzy):
+                return element
+        return None
+
+    def watch(
+        self,
+        deadline: Deadline,
+        text: str | None = None,
+        fuzzy: bool = True,
+        progress: Callable[[str], None] | None = None,
+    ) -> Wait:
+        """Read the screen until ``text`` is on it, or the deadline passes.
+
+        With no ``text``, until the screen can be read at all: what a tap's
+        targeting needs, and the retry of a just-launched app's ``null root
+        node`` that the capture layer would otherwise make with a budget of its
+        own.
+
+        Only reads. Each dump is given what the deadline has left and is
+        stopped on the device when that is up; a capture that answers and is
+        not a screen is counted and the next one asked for, because the
+        recorded ways that happens (the screen not idle, no window focused,
+        another session registered) can pass by themselves. When one does not,
+        the deadline ends the asking.
+
+        Args:
+            deadline: The wait's one deadline, already running.
+            text: Text to wait for, or None for any readable screen.
+            fuzzy: Case-insensitive substring match; False for the whole text.
+            progress: Optional callback given one line per capture.
+
+        Returns:
+            A :class:`Wait`. A device that goes away raises instead
+            (:class:`common.adb_exec.DeviceError`), as everywhere else.
+        """
+        wait = Wait(text=text, timeout=deadline.seconds)
+
+        def note(outcome: str) -> None:
+            if progress is not None:
+                number = wait.readable + wait.failed + wait.unfinished
+                progress(f"capture {number} at {deadline.elapsed:.1f}s: {outcome}")
+
+        while deadline.remaining >= MIN_CAPTURE_SECONDS:
+            try:
+                root = capture_hierarchy_within(self.serial, deadline.remaining)
+            except CaptureCutOff:
+                # Nothing was learned about the screen; the capture before
+                # this one, if any, is still the last word on it.
+                wait.unfinished += 1
+                note("did not finish in the time left")
+            except HierarchyError as error:
+                wait.failed += 1
+                wait.last_failure = str(error)
+                wait.last_was_screen = False
+                note(f"not a screen ({str(error).split(':', 1)[0].split('.', 1)[0]})")
+            else:
+                wait.readable += 1
+                wait.root = root
+                wait.read_at = deadline.elapsed
+                wait.last_was_screen = True
+                self._tree_cache = root
+                if text is None:
+                    wait.found = True
+                    note("a screen")
+                else:
+                    wait.element = self.find_visible(root, text, fuzzy)
+                    wait.found = wait.element is not None
+                    note("match" if wait.found else "no match")
+                if wait.found:
+                    break
+            deadline.pause(WAIT_POLL_SECONDS)
+
+        wait.elapsed = deadline.elapsed
+        return wait
+
+    def tap(self, element: Element, deadline: Deadline | None = None) -> tuple:
         """
         Tap on an element.
 
         Args:
             element: Element to tap
+            deadline: A wait this tap is part of; see :meth:`tap_at`.
 
         Returns:
             (success, message) tuple
@@ -926,30 +1198,53 @@ class Navigator:
         if centre is None:
             return False, _NO_BOUNDS_MESSAGE.format(description=element.description)
         x, y = centre
-        success, message = self.tap_at(x, y)
+        success, message = self.tap_at(x, y, deadline)
         if success:
             return True, f"Tapped: {element.description} at ({x}, {y})"
         return False, message
 
-    def tap_at(self, x: int, y: int) -> tuple:
+    def tap_at(self, x: int, y: int, deadline: Deadline | None = None) -> tuple:
         """
         Tap at specific coordinates.
 
         Args:
             x: X coordinate
             y: Y coordinate
+            deadline: A wait this tap is part of. The tap is then not sent at
+                all once the time is up, the command gets what is left, in
+                whole seconds rounded up (never less than
+                ``TAP_COMMAND_FLOOR_SECONDS``), and the settle pause is paid
+                for from the deadline.
 
         Returns:
             (success, message) tuple
         """
+        limits = {}
+        if deadline is not None:
+            if deadline.remaining <= 0:
+                return False, (
+                    f"Ran out of time before the tap ({deadline.seconds:g}s), so nothing "
+                    f"was tapped"
+                )
+            limits["timeout"] = max(math.ceil(deadline.remaining), TAP_COMMAND_FLOOR_SECONDS)
         try:
-            adb_exec.run_adb("shell", self.serial, "input", "tap", str(x), str(y), check=True)
+            adb_exec.run_adb(
+                "shell", self.serial, "input", "tap", str(x), str(y), check=True, **limits
+            )
             # Let the UI settle after the tap (animations, transitions, focus).
-            if TAP_SETTLE_SECONDS > 0:
+            if deadline is not None:
+                deadline.pause(TAP_SETTLE_SECONDS)
+            elif TAP_SETTLE_SECONDS > 0:
                 time.sleep(TAP_SETTLE_SECONDS)
             return True, f"Tapped at ({x}, {y})"
         except adb_exec.AdbCommandError as e:
             return False, f"Tap failed: {e}"
+        except adb_exec.AdbTimeoutError:
+            if deadline is None:
+                raise
+            return False, (
+                f"The tap command did not finish within {limits['timeout']}s; {TAP_UNVOUCHED}"
+            )
 
     def enter_text(self, element: Element, text: str) -> tuple:
         """
@@ -1043,6 +1338,226 @@ ACTION_REMEDY = (
 )
 
 
+# What to do when a wait read the screen and the text was not on it.
+NOT_OBSERVED_REMEDY = (
+    "The screen was read and the text was not on it. Compare the wording with the text "
+    "quoted (without --exact, case is ignored and part of a text is enough; a resource "
+    "id is matched whole, as written), allow longer with --timeout, or run "
+    "screen_mapper.py for the controls."
+)
+
+# What to do when a wait could not say, because the screen would not be read.
+UNREADABLE_REMEDY = (
+    "This is not an answer about the text. If no app is in front or the display is off, "
+    "fix that; if the screen never goes idle (some views that update several times a "
+    "second do this) it cannot be dumped at any timeout, so read it from a screenshot; "
+    "otherwise retry with a longer --timeout."
+)
+
+# How a tap that may or may not have happened ends its message, and what to do then:
+# the usual "fix it and retry" would be a second tap on top of an unknown first.
+TAP_UNVOUCHED = "whether the tap reached the screen is not known"
+TAP_UNVOUCHED_REMEDY = (
+    "Run screen_mapper.py to see whether the tap landed before tapping again; if adb "
+    "keeps stalling, reset it with `adb kill-server && adb start-server`."
+)
+
+
+def _tap_remedy(message: str) -> str:
+    """The remedy for a failed tap: look first when nobody can say it was not sent."""
+    return TAP_UNVOUCHED_REMEDY if message.endswith(TAP_UNVOUCHED) else ACTION_REMEDY
+
+
+# Said first when the wait came after a tap, whichever way it failed.
+TAP_WAS_SENT = "The tap was sent, so do not repeat it before looking at the screen. "
+
+
+def _screen_summary(root: ET.Element) -> dict:
+    """A captured screen as counts and control names, with no call to the device.
+
+    The names are `screen_mapper`'s, from the same function, so one copied
+    from here is one ``--find-text`` accepts.
+    """
+    analysis = Navigator._labeller.analyze_captured(root)
+    return {
+        "total_elements": analysis["total_elements"],
+        "interactive_elements": analysis["interactive_elements"],
+        "controls": dict(ScreenMapper.interactive_names(analysis)),
+        "lines": [
+            f"Screen: {analysis['total_elements']} elements, "
+            f"{analysis['interactive_elements']} interactive",
+            *ScreenMapper.control_lines(analysis),
+        ],
+    }
+
+
+def _screen_texts(root: ET.Element) -> list[str]:
+    """The first few texts on a captured screen, in document order, each once.
+
+    What a failed wait quotes: the control names say what can be done on the
+    screen, and these say what it reads -- which is what the text waited for
+    has to be compared with.
+    """
+    texts: list[str] = []
+    for node in root.iter("node"):
+        text = (node.get("text") or node.get("content-desc") or "").strip()
+        if not text or text in texts:
+            continue
+        if len(text) > SCREEN_TEXT_WIDTH:
+            text = text[: SCREEN_TEXT_WIDTH - 3] + "..."
+        texts.append(text)
+        if len(texts) == SCREEN_TEXTS_SHOWN:
+            break
+    return texts
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+def _screen_sentence(wait: Wait) -> str:
+    """The last readable screen on one line: counts, control names, texts."""
+    summary = _screen_summary(wait.root)
+    parts = [summary["lines"][0].removeprefix("Screen: "), *summary["lines"][1:]]
+    texts = _screen_texts(wait.root)
+    if texts:
+        parts.append('text: "' + '", "'.join(texts) + '"')
+    return "; ".join(parts)
+
+
+def _wait_error(wait: Wait, *, to_find_target: bool = False) -> str:
+    """One line saying how a wait that did not find its text ended."""
+    budget = f"{wait.timeout:g}s"
+    others = []
+    if wait.failed:
+        others.append(f"{_plural(wait.failed, 'capture')} answered without a screen")
+    if wait.unfinished:
+        others.append(f"{_plural(wait.unfinished, 'capture')} did not finish in the time left")
+
+    if wait.outcome == "not_observed":
+        read = f"{_plural(wait.readable, 'screen')} read, the last at {wait.read_at:.1f}s"
+        return (
+            f"Not observed: text='{wait.text}' did not appear within {budget} "
+            f"({'; '.join([read, *others])}). Last screen: {_screen_sentence(wait)}."
+        )
+
+    purpose = " to find the target, so nothing was tapped" if to_find_target else ""
+    if wait.failed:
+        detail = f"{'; '.join(others)}. The last said: {wait.last_failure}"
+    elif wait.unfinished:
+        detail = (
+            f"{'; '.join(others)}, and none answered within {budget}. A dump of a settled "
+            f"screen took about two seconds on a warm emulator and longer on one just "
+            f"booted; one of a screen that never goes idle gives up after about eleven."
+        )
+    else:
+        detail = f"no time was left to read it within {budget}."
+    message = f"Could not read the screen{purpose}: {detail}"
+    if wait.root is not None:
+        message += (
+            f" An earlier capture read it at {wait.read_at:.1f}s; that reading is stale: "
+            f"{_screen_sentence(wait)}."
+        )
+    return message
+
+
+def _wait_json(wait: Wait) -> dict:
+    """Machine-readable form of what a wait did."""
+    summary = _screen_summary(wait.root) if wait.root is not None else None
+    if summary is not None:
+        del summary["lines"]
+    return {
+        "outcome": wait.outcome,
+        "waited_for": wait.text,
+        "elapsed_seconds": round(wait.elapsed, 1),
+        "timeout_seconds": wait.timeout,
+        "captures": {
+            "readable": wait.readable,
+            "failed": wait.failed,
+            "unfinished": wait.unfinished,
+        },
+        "last_read_seconds": None if wait.read_at is None else round(wait.read_at, 1),
+        "screen": summary,
+        "screen_stale": wait.stale,
+        "texts": _screen_texts(wait.root) if wait.root is not None else [],
+        "last_failure": wait.last_failure,
+    }
+
+
+def _element_json(element: Element) -> dict:
+    return {
+        "type": element.type,
+        "label": element.label,
+        "bounds": element.bounds,
+        "center": element.center,
+    }
+
+
+def _report_wait(
+    wait: Wait,
+    args: argparse.Namespace,
+    *,
+    tapped: str | None = None,
+    tapped_at: list[int] | None = None,
+) -> None:
+    """Print a wait's answer and exit 0, or raise its failure.
+
+    Args:
+        wait: The finished wait.
+        args: Parsed arguments (for ``--json``).
+        tapped: The tap's own message, when the wait followed a tap.
+        tapped_at: Where that tap went.
+    """
+    extra = {} if tapped_at is None else {"tapped": tapped, "tapped_at": tapped_at}
+    if not wait.found:
+        error = _wait_error(wait)
+        remedy = NOT_OBSERVED_REMEDY if wait.outcome == "not_observed" else UNREADABLE_REMEDY
+        if tapped is not None:
+            error = f"{tapped}, then: {error}"
+            remedy = TAP_WAS_SENT + remedy
+        cli.fail(error, remedy, details={"wait": _wait_json(wait), **extra})
+
+    summary = _screen_summary(wait.root)
+    found = f"Found: text='{wait.text}' after {wait.elapsed:.1f}s ({wait.element.description})"
+    if args.json:
+        result = {
+            "success": True,
+            "message": found,
+            "waited_for": wait.text,
+            "elapsed_seconds": round(wait.elapsed, 1),
+            "timeout_seconds": wait.timeout,
+            "captures": {
+                "readable": wait.readable,
+                "failed": wait.failed,
+                "unfinished": wait.unfinished,
+            },
+            "element": _element_json(wait.element),
+            "screen": {key: value for key, value in summary.items() if key != "lines"},
+            **extra,
+        }
+        print(json_lib.dumps(result, indent=2))
+    else:
+        if tapped is not None:
+            print(tapped)
+        print(found)
+        print("\n".join(summary["lines"]))
+    sys.exit(0)
+
+
+def _wait_budget(value: str) -> float:
+    """argparse ``type`` for ``--timeout``: seconds, finite, within the range."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number of seconds") from None
+    if not math.isfinite(seconds) or not WAIT_TIMEOUT_FLOOR <= seconds <= WAIT_TIMEOUT_CEILING:
+        raise argparse.ArgumentTypeError(
+            f"must be between {WAIT_TIMEOUT_FLOOR:g} and {WAIT_TIMEOUT_CEILING:g} seconds, "
+            f"got {value!r}"
+        )
+    return seconds
+
+
 def _scroll_budget(value: str) -> int:
     """argparse ``type`` for ``--max-scrolls``: the shared validator, re-worded.
 
@@ -1094,6 +1609,12 @@ Examples:
   # Tap at coordinates (fallback)
   python3 "$SKILL_DIR/scripts/navigator.py" --tap-at 200,400
 
+  # Wait for text to appear; reads the screen and nothing else
+  python3 "$SKILL_DIR/scripts/navigator.py" --wait-for "Order confirmed" --timeout 20
+
+  # Tap, wait for what the tap should bring, and print the screen that followed
+  python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Place order" --tap --expect "Order placed"
+
 Environment overrides:
   ANDROID_EMU_TAP_SETTLE_MS     Settle delay after each tap, ms (default: 500)
   ANDROID_EMU_MAX_ELEMENTS      Max elements shown by --list (default: 25)
@@ -1118,7 +1639,7 @@ Environment overrides:
     parser.add_argument(
         "--exact",
         action="store_true",
-        help="Use exact text matching for --find-text (not fuzzy)",
+        help="Match the whole text, not part of it: --find-text, --wait-for and --expect",
     )
     parser.add_argument(
         "--scroll-to-find",
@@ -1147,6 +1668,32 @@ Environment overrides:
     parser.add_argument("--tap", action="store_true", help="Tap the found element")
     parser.add_argument("--enter-text", help="Enter text into found element")
     parser.add_argument("--tap-at", help="Tap at coordinates (format: x,y)")
+    parser.add_argument(
+        "--wait-for",
+        metavar="TEXT",
+        help=(
+            "Read the screen until TEXT is on it (any text, label or name the screen "
+            "report prints; fuzzy unless --exact). Reads only: no scroll, no tap"
+        ),
+    )
+    parser.add_argument(
+        "--expect",
+        metavar="TEXT",
+        help=(
+            "With --tap or --tap-at: after the tap, wait for TEXT as --wait-for does "
+            "and print the screen that followed"
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=_wait_budget,
+        metavar="S",
+        help=(
+            f"Seconds --wait-for or --expect may take in all, finding the target and "
+            f"the tap included (default: {WAIT_TIMEOUT_SECONDS:g}, "
+            f"{WAIT_TIMEOUT_FLOOR:g} to {WAIT_TIMEOUT_CEILING:g})"
+        ),
+    )
     parser.add_argument("--list", action="store_true", help="List all interactive elements")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     parser.add_argument(
@@ -1157,6 +1704,64 @@ Environment overrides:
     )
 
     args = parser.parse_args(argv)
+
+    # A wait is one thing or the other: watching, or watching after one tap.
+    # Refused here, before anything reaches the device, like the check below.
+    if args.wait_for is not None:
+        others = [
+            flag
+            for flag, given in (
+                # By presence, not truth: `--find-text ""` is still a second mode.
+                ("--find-text", args.find_text is not None),
+                ("--find-exact", args.find_exact is not None),
+                ("--find-type", args.find_type is not None),
+                ("--find-id", args.find_id is not None),
+                ("--tap", args.tap),
+                ("--enter-text", args.enter_text is not None),
+                ("--tap-at", args.tap_at is not None),
+                ("--list", args.list),
+                ("--scroll-to-find", args.scroll_to_find),
+                ("--expect", args.expect is not None),
+            )
+            if given
+        ]
+        if others:
+            parser.error(
+                f"--wait-for only watches the screen and does not go with {', '.join(others)}. "
+                f"To act and then wait, use --tap --expect TEXT."
+            )
+        if not args.wait_for.strip():
+            parser.error("--wait-for needs the text to wait for; it was given none")
+    if args.expect is not None:
+        if args.enter_text is not None or args.list or not (args.tap or args.tap_at):
+            parser.error(
+                "--expect waits for text after one tap: it goes with --tap (and a target) or "
+                "--tap-at x,y, and with nothing else that acts. To wait without acting, use "
+                "--wait-for TEXT."
+            )
+        if args.scroll_to_find:
+            parser.error(
+                "--expect does not go with --scroll-to-find: a scroll search has a budget of "
+                "its own. Run the --scroll-to-find lookup first, then --tap --expect on the "
+                "screen it leaves."
+            )
+        if not args.expect.strip():
+            parser.error("--expect needs the text to wait for; it was given none")
+    # A selector given an empty value is not "no selector": `--find-exact ""`
+    # beside `--find-text "Place order"` took precedence over it and matched
+    # every node, and the tap went to the first of them.
+    for flag, value in (
+        ("--find-text", args.find_text),
+        ("--find-exact", args.find_exact),
+        ("--find-type", args.find_type),
+        ("--find-id", args.find_id),
+    ):
+        if value is not None and not value.strip():
+            parser.error(f"{flag} needs a value that is not blank")
+    if args.timeout is not None and args.wait_for is None and args.expect is None:
+        parser.error("--timeout bounds --wait-for and --expect; there is neither here")
+    if args.timeout is None:
+        args.timeout = WAIT_TIMEOUT_SECONDS
 
     # An action needs a target (C2).
     #
@@ -1184,8 +1789,56 @@ Environment overrides:
     _run_action(Navigator(serial), args)
 
 
+def _watch_after_tap(
+    navigator: Navigator,
+    deadline: Deadline,
+    args: argparse.Namespace,
+    tapped: str,
+    tapped_at: list[int],
+) -> Wait:
+    """The wait that follows a tap; if adb fails under it, the answer still names the tap.
+
+    A wait that runs out is reported by :func:`_report_wait`, which says so.
+    This is for another way it can end: adb failing on a read after the tap
+    -- the device gone, adb not answering. Left to the boundary, that is "the
+    device is not attached; run `adb devices`" or "try `adb kill-server` and
+    retry", with no word of the tap, and retrying the command taps again. The
+    adb error keeps its exit status (3 for a device that is unavailable) and
+    its remedy; the tap is put in front of both.
+    """
+    try:
+        return navigator.watch(
+            deadline, args.expect, fuzzy=not args.exact, progress=_wait_progress(args)
+        )
+    except adb_exec.AdbError as error:
+        what, remedy = cli.describe(error)
+        cli.fail(
+            f"{tapped}, then the screen could not be read: {what}",
+            TAP_WAS_SENT + remedy,
+            details={"tapped": tapped, "tapped_at": tapped_at},
+            exit_status=cli.exit_code_for(error),
+        )
+
+
+def _wait_progress(args: argparse.Namespace) -> Callable[[str], None] | None:
+    """Where a wait's per-capture lines go: stderr under --verbose, nowhere otherwise."""
+    if not args.verbose:
+        return None
+    return lambda line: print(f"  {line}", file=sys.stderr)
+
+
 def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     """Perform the requested action, exiting with its status."""
+    # Wait mode: read until the text is there. Nothing else happens.
+    if args.wait_for is not None:
+        wait = navigator.watch(
+            Deadline(args.timeout),
+            args.wait_for,
+            fuzzy=not args.exact,
+            progress=_wait_progress(args),
+        )
+        _report_wait(wait, args)
+
     # List mode
     if args.list:
         elements = navigator.list_elements()
@@ -1240,9 +1893,15 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
                 "Pass the coordinates as x,y, e.g. --tap-at 200,400.",
             )
 
-        success, message = navigator.tap_at(x, y)
+        # With --expect the clock starts here: the tap and its settle pause
+        # are paid for from the same deadline as the wait that follows.
+        deadline = Deadline(args.timeout) if args.expect is not None else None
+        success, message = navigator.tap_at(x, y, deadline)
         if not success:
-            cli.fail(message, ACTION_REMEDY)
+            cli.fail(message, _tap_remedy(message))
+        if deadline is not None:
+            wait = _watch_after_tap(navigator, deadline, args, message, [x, y])
+            _report_wait(wait, args, tapped=message, tapped_at=[x, y])
         if args.json:
             print(
                 json_lib.dumps({"success": True, "message": message, "tapped_at": [x, y]}, indent=2)
@@ -1260,9 +1919,35 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
         search_text = args.find_text
         fuzzy = not args.exact
 
-    # Find element mode. Both paths produce a ScrollSearch so the reporting
+    # Find element mode. Every path produces a ScrollSearch so the reporting
     # below is identical: the difference is only whether anything moved.
-    if args.scroll_to_find:
+    deadline = None
+    if args.expect is not None:
+        # The clock starts before the screen is read to find the target. That
+        # read goes through the waiter too, so it is bounded by the deadline
+        # and not by the capture layer's own three attempts of sixty seconds.
+        deadline = Deadline(args.timeout)
+        reading = navigator.watch(deadline, progress=_wait_progress(args))
+        if not reading.found:
+            cli.fail(
+                _wait_error(reading, to_find_target=True),
+                UNREADABLE_REMEDY,
+                details={"wait": _wait_json(reading)},
+            )
+        search = ScrollSearch(
+            element=navigator._find_in(
+                reading.root,
+                text=search_text,
+                element_type=args.find_type,
+                resource_id=args.find_id,
+                index=args.index,
+                fuzzy=fuzzy,
+            ),
+            screens_searched=1,
+            scrolls=0,
+            scrollable=navigator.screen_scrolls(),
+        )
+    elif args.scroll_to_find:
         search = navigator.find_element_scrolling(
             text=search_text,
             element_type=args.find_type,
@@ -1334,7 +2019,7 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     # is now -- after any scrolling -- so a tap lands where the element ended
     # up rather than where it started.
     if args.tap:
-        success, message = navigator.tap(element)
+        success, message = navigator.tap(element, deadline)
     elif args.enter_text:
         success, message = navigator.enter_text(element, args.enter_text)
     elif element.center is None:
@@ -1351,7 +2036,12 @@ def _run_action(navigator: Navigator, args: argparse.Namespace) -> None:
     if search.scrolls:
         message = f"{message} ({search.detail})"
     if not success:
-        cli.fail(message, ACTION_REMEDY, details={"search": _search_json(search)})
+        cli.fail(message, _tap_remedy(message), details={"search": _search_json(search)})
+    if deadline is not None:
+        # One tap was sent. What is left of the deadline is the wait's.
+        tapped_at = list(element.center)
+        wait = _watch_after_tap(navigator, deadline, args, message, tapped_at)
+        _report_wait(wait, args, tapped=message, tapped_at=tapped_at)
     if args.verbose:
         print(
             f"  bounds={element.bounds} clickable={element.clickable} "

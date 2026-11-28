@@ -22,6 +22,14 @@ The dump also fails transiently while the screen is animating, with
 ``ERROR: could not get idle state``. Every script that reads the screen was
 flaky because of it, so a bounded retry lives here instead of in each caller.
 
+``navigator``'s waiter, which has a deadline of its own, uses
+:func:`capture_hierarchy_within` instead: one dump, stopped ON THE DEVICE when
+its time is up. Stopping it from the host -- which is what a subprocess timeout
+does -- can leave the dump registered on the device for a moment, and the next
+dump anyone asks for then answers ``Killed`` (recorded:
+``uiautomator_dump_after_host_kill``; it depends on how far into the dump the
+kill lands). The scroll search still bounds its dumps from the host.
+
 Two questions every consumer of a dump asks -- *where is this node* and *can it
 be operated* -- are answered here too, by :func:`parse_bounds` and
 :func:`is_interactive`. They used to be answered three and two times
@@ -33,6 +41,7 @@ coordinate a partially off-screen view reports and silently returned
 
 from __future__ import annotations
 
+import math
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -63,6 +72,20 @@ _NO_ROOT_ERROR = "null root node"
 
 _TRANSIENT_ERRORS = (_IDLE_ERROR, _NO_ROOT_ERROR)
 
+# The whole of what a dump prints when another UI automation session is already
+# registered on the device: the process dies registering, and the shell reports
+# that (recorded with a trailing space, at exit 0; logcat has "UiAutomationService
+# ... already registered!"). Another dump still running does it, and so does one
+# whose adb client was killed a moment ago, which is the case a retry fixes.
+# Compared whole, not searched for: the word could appear in anything.
+_BUSY_ANSWER = "Killed"
+
+# How much longer than the device's own limit the host waits for the answer of
+# a bounded dump. The device is meant to end it; the host's timeout is only for
+# an adb that has stopped answering, and firing first would be the host kill
+# this exists to avoid.
+HOST_GRACE_SECONDS = 5
+
 # `bounds="[left,top][right,bottom]"`, with SIGNED coordinates.
 #
 # Not because a negative bound was observed: on API 35 uiautomator clips every
@@ -91,10 +114,15 @@ INTERACTIVE_ATTRIBUTES = ("clickable", "long-clickable", "checkable", "scrollabl
 ACTION_ATTRIBUTES = ("clickable", "long-clickable", "checkable")
 
 
+def _is_busy(payload: str) -> bool:
+    """Whether the dump died because another UI automation session is registered."""
+    return payload.strip() == _BUSY_ANSWER
+
+
 def _is_transient(payload: str) -> bool:
     """Whether a failed dump is worth retrying."""
     lowered = payload.lower()
-    return any(marker in lowered for marker in _TRANSIENT_ERRORS)
+    return _is_busy(payload) or any(marker in lowered for marker in _TRANSIENT_ERRORS)
 
 
 class HierarchyError(RuntimeError):
@@ -102,6 +130,15 @@ class HierarchyError(RuntimeError):
 
     Subclasses RuntimeError so the CLI boundaries that already catch it keep
     working, as :class:`common.adb_exec.AdbError` does.
+    """
+
+
+class CaptureCutOff(HierarchyError):  # noqa: N818 -- an outcome a caller branches on
+    """A bounded dump was stopped at its limit before it answered.
+
+    Not a statement about the screen: nothing was read, because the time given
+    was not enough. A caller with a deadline tells this apart from a dump that
+    answered and was not a screen.
     """
 
 
@@ -333,28 +370,107 @@ def capture_hierarchy(
                     f"uiautomator returned a document that would not parse: {exc}"
                 ) from exc
 
-        # Only the idle-state failure is worth retrying; anything else will not
-        # fix itself and retrying just delays the error.
+        # Only a failure that can pass by itself is worth retrying; anything
+        # else will not fix itself and retrying just delays the error.
         if not _is_transient(last_payload):
             break
         if attempt < attempts - 1:
             time.sleep(RETRY_DELAY_SECONDS)
 
-    if _NO_ROOT_ERROR in last_payload.lower():
-        raise HierarchyError(
-            f"uiautomator found no focused window after {attempts} attempts "
+    raise _not_a_screen(last_payload, attempts)
+
+
+def _not_a_screen(payload: str, attempts: int) -> HierarchyError:
+    """The error for a dump that answered with something other than a hierarchy.
+
+    Args:
+        payload: What uiautomator printed.
+        attempts: How many dumps were made before giving up.
+    """
+    tried = f"{attempts} attempt" + ("" if attempts == 1 else "s")
+    lowered = payload.lower()
+    if _NO_ROOT_ERROR in lowered:
+        return HierarchyError(
+            f"uiautomator found no focused window after {tried} "
             f'("null root node returned by UiTestAutomationBridge"). Nothing is '
             f"drawn yet, or the display is off: launch the app first, and check "
             f"`adb shell dumpsys window | grep mCurrentFocus`."
         )
-    if _IDLE_ERROR in last_payload.lower():
-        raise HierarchyError(
-            f"uiautomator could not get an idle state after {attempts} attempts. "
-            f"The screen is still animating; wait for it to settle, or disable "
-            f"animations (window_animation_scale / transition_animation_scale / "
-            f"animator_duration_scale set to 0)."
+    if _IDLE_ERROR in lowered:
+        # Not "disable animations": on the recorded screen that fails this way
+        # nothing animates -- a TextView's text changes ten times a second --
+        # and with all three animation scales at 0 it fails the same (V10-A).
+        return HierarchyError(
+            f"uiautomator could not get an idle state after {tried}: the screen never "
+            f"went a second without changing. Either it is still animating, which "
+            f"passes, or its content keeps changing by itself (a timer, a counter, a "
+            f"progress readout), which does not, and setting the animation scales to 0 "
+            f"does not stop that. Wait and retry; a screen that never settles cannot be "
+            f"dumped at all and has to be read from a screenshot."
         )
-    raise HierarchyError(f"No UI hierarchy in uiautomator output: {last_payload.strip()[:200]!r}")
+    if _is_busy(payload):
+        return HierarchyError(
+            f'uiautomator was killed as it started ("Killed") after {tried}: another UI '
+            f"automation session is already registered on the device. A dump that is still "
+            f"running holds it, so does one that was cut off a moment ago, and so does an "
+            f"instrumented UI test; retry when that has finished."
+        )
+    return HierarchyError(f"No UI hierarchy in uiautomator output: {payload.strip()[:200]!r}")
+
+
+def capture_hierarchy_within(serial: str | None, seconds: float) -> ET.Element:
+    """Capture the screen with ONE dump that the device stops after ``seconds``.
+
+    For a caller that has a deadline of its own and makes its own retries. The
+    dump runs under the device's ``timeout`` (toybox; measured on API 33 and
+    35), so when the time is up it is ended there and the next dump finds
+    nothing in its way -- which is not true of a dump whose adb client the host
+    killed (see the module docstring).
+
+    Args:
+        serial: Device serial; the default device is used when None.
+        seconds: How long the dump may take. Given to the device in tenths of
+            a second, rounded DOWN, so it does not run past what was asked --
+            except that the least it is given is a tenth of a second.
+
+    Returns:
+        The parsed ``<hierarchy>`` root element.
+
+    Raises:
+        CaptureCutOff: The device stopped the dump at the limit. It answers
+            with no output at all then, at exit 0.
+        HierarchyError: The dump answered and was not a screen.
+        AdbError: For device-level failures, which carry their own remedy.
+            That includes :class:`common.adb_exec.AdbTimeoutError` when adb
+            itself did not answer ``HOST_GRACE_SECONDS`` after the limit (the
+            limit rounded up to a whole second first, so up to one more).
+    """
+    limit = max(math.floor(seconds * 10) / 10, 0.1)
+    result = run_adb(
+        "exec-out",
+        serial,
+        "timeout",
+        f"{limit:.1f}",
+        "uiautomator",
+        "dump",
+        "/dev/tty",
+        timeout=math.ceil(limit) + HOST_GRACE_SECONDS,
+    )
+    payload = result.output
+
+    document = _extract_xml(payload)
+    if document is not None:
+        try:
+            return ET.fromstring(document)
+        except ET.ParseError as exc:
+            raise HierarchyError(
+                f"uiautomator returned a document that would not parse: {exc}"
+            ) from exc
+    if not payload.strip():
+        raise CaptureCutOff(
+            f"uiautomator had not answered after {limit:.1f}s and was stopped on the device"
+        )
+    raise _not_a_screen(payload, 1)
 
 
 def element_to_dict(element: ET.Element) -> dict:
@@ -395,10 +511,12 @@ __all__ = [
     "ACTION_ATTRIBUTES",
     "INTERACTIVE_ATTRIBUTES",
     "AdbError",
+    "CaptureCutOff",
     "HierarchyError",
     "bare_resource_id",
     "capture_hierarchy",
     "capture_hierarchy_dict",
+    "capture_hierarchy_within",
     "element_to_dict",
     "is_actionable",
     "is_interactive",
