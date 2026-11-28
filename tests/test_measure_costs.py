@@ -427,6 +427,7 @@ def test_json_is_one_object_holding_every_section(tmp_path):
         "estimate",
         "profile",
         "skill",
+        "skill_at_v0_9_0",
         "screens",
         "walk",
         "stream",
@@ -456,6 +457,46 @@ def test_the_printed_table_carries_every_measured_figure(measured):
     for shot in measured["screenshots"]:
         for cell in shot["presets"].values():
             assert f"{cell['width']}x{cell['height']}, {cell['bytes']:,}" in table
+
+
+def test_the_before_row_is_the_frozen_v0_9_0_file(measured):
+    """The size SKILL.md had when it was the only file: read from the frozen entry, not typed."""
+    before = measured["skill_at_v0_9_0"]
+
+    assert before == {
+        "release": "0.9.0",
+        "commit": V0_9_0_COMMIT,
+        "bytes": V0_9_0_BYTES,
+        "tokens_est": mc.estimated_tokens(V0_9_0_BYTES),
+    }
+    assert mc.stable_view(measured)["skill_at_v0_9_0"] == before, "a frozen figure is not committed"
+    row = f"| `SKILL.md` at v0.9.0, with no reference files beside it | {V0_9_0_BYTES:,} | ~"
+    assert row in mc.render(measured)
+
+
+def test_the_readme_block_is_the_printed_tables_less_the_screenshots(measured):
+    """One renderer, two headings levels: the README cannot be given other numbers."""
+    printed = mc.render(measured)
+    block = mc.readme_block(measured)
+
+    screens, screenshots, skill = printed.split("\n\n## ")
+    assert screenshots.startswith("Screenshots")
+    assert block == (screens + "\n\n## " + skill).replace("\n## ", "\n### ").replace(
+        "## What", "### What", 1
+    )
+    assert "Screenshots" not in block and "x2424" not in block
+
+
+def test_readme_mode_prints_the_whole_section_around_that_block(tmp_path, measured):
+    result = _run_harness("--readme", cwd=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == mc.readme_section(measured)
+    head, block, tail = result.stdout.partition(mc.readme_block(measured))
+    assert block, "the section does not hold the block"
+    assert head == mc.README_HEADING + "\n\n" + "\n".join(mc.README_INTRODUCTION) + "\n\n"
+    assert tail.startswith("\nTo reproduce it from a checkout:\n\n```bash\n" + mc.REPRODUCE)
+    assert mc.REPRODUCE in mc.__doc__, "the command it gives is not the one its docstring gives"
 
 
 def test_the_printed_table_says_so_when_no_reference_file_ships(measured):

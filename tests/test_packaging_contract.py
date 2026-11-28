@@ -4292,6 +4292,8 @@ WORKFLOW_INSTALLS = {
     "lint.yml": {"pip", "black", "ruff"},
     "release.yml": {"pip", "pytest", "pillow", "pyyaml", "black", "ruff"},
     "install-check.yml": {"pip", "pyyaml", "npm:@openai/codex", "npm:@anthropic-ai/claude-code"},
+    # The suite runs before the site is published: its `check` job installs what test.yml does.
+    "pages.yml": {"pip", "pytest", "pillow", "pyyaml"},
 }
 
 # The one way a workflow installs a Python package: a line that is this text and nothing else,

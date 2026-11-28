@@ -2276,6 +2276,19 @@
       "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
     },
     {
+      "name": "uiautomator_settings_apps",
+      "file": "uiautomator_settings_apps.xml",
+      "command": "adb shell am start -a android.settings.SETTINGS; adb shell input tap <the centre of 'Apps'>; adb exec-out uiautomator dump /dev/tty",
+      "description": "Settings' Apps screen: what a tap on 'Apps' in uiautomator_settings_top's list opens. 'Default apps' and 'All apps' are on it and 'Network & internet' is not. With uiautomator_settings_top it is a before and an after that a tap separates, on an app every emulator has: what the skill's example script walks, and what its test replays. Stock emulator content only (app counts, the image's own name).",
+      "catches": [],
+      "bytes": 15887,
+      "exit_status": 0,
+      "stream": "stdout",
+      "reached_by": "adb shell input tap 250 1329: the centre of the node whose text is 'Apps' on Settings home, read from a dump taken first",
+      "recorded_at": "2026-11-28T07:21:55Z",
+      "recorded_on": "macOS-27.0.1-arm64-arm-64bit"
+    },
+    {
       "name": "uiautomator_settings_half",
       "file": "uiautomator_settings_half.xml",
       "command": "adb exec-out uiautomator dump /dev/tty",

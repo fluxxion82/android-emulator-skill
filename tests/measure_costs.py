@@ -6,6 +6,7 @@ plugin; Pillow is needed for the screenshot rows):
 
     uvx --python 3.12 -c dev-constraints.txt --with pillow python tests/measure_costs.py
     ... python tests/measure_costs.py --json     # the same numbers, one JSON object
+    ... python tests/measure_costs.py --readme   # README.md's "What it costs", whole
     ... python tests/measure_costs.py --check    # compare with the committed table
     ... python tests/measure_costs.py --write    # rewrite the committed table
 
@@ -13,7 +14,9 @@ Why this exists
 ---------------
 "Token-efficient" was a claim with no number behind it. This prints the numbers
 and nothing in it is typed: every figure is the size of something, computed
-when you run it.
+when you run it -- with one exception, said where it is printed: the size
+SKILL.md had at v0.9.0 is read from a file written afterwards from that
+release's commit, and not regenerated.
 
 What is measured
 ----------------
@@ -73,8 +76,22 @@ RECORDED = REPO / "tests" / "fixtures" / "recorded"
 MEASUREMENTS = REPO / "tests" / "fixtures" / "measurements"
 CASES = MEASUREMENTS / "cases.json"
 EXPECTED = MEASUREMENTS / "expected.json"
+FROZEN_V0_9_0 = MEASUREMENTS / "skill_md_v0.9.0.json"
 
 ESTIMATE = "tokens are bytes / 4, rounded: an estimate, no tokenizer is run"
+
+# README.md's section, as this script prints it (`--readme`): its heading, what
+# stands before the tables, and the command that stands after them.
+README_HEADING = "## What it costs"
+README_INTRODUCTION = (
+    "The numbers below are printed by a script, and a test fails if this file and the script",
+    "disagree. The screen figures are measured from recorded screens: the size of the recorded",
+    "`uiautomator` dump, and the size of what each command prints for that same screen. The",
+    "skill's sizes are those of the files in the checkout; the v0.9.0 one was measured once,",
+    "from that release's commit, and is kept.",
+    "Tokens are bytes divided by four, an estimate; no tokenizer is run.",
+)
+REPRODUCE = "uvx --python 3.12 -c dev-constraints.txt --with pillow python tests/measure_costs.py"
 NOT_PRESENT = "not present"
 
 # The serial the replayed scripts are told they are talking to. Nothing is.
@@ -345,6 +362,18 @@ def measure_skill() -> dict:
     return skill
 
 
+def frozen_skill() -> dict:
+    """SKILL.md as v0.9.0 shipped it, from the file kept of it: the "before".
+
+    Measured once from that release's commit, the day after the release.
+
+    Not measured here and not regenerated: the file says how to check it
+    against the commit, and ``tests/test_measure_costs.py`` pins it twice.
+    """
+    frozen = json.loads(FROZEN_V0_9_0.read_text(encoding="utf-8"))
+    return {key: frozen[key] for key in ("release", "commit", "bytes", "tokens_est")}
+
+
 def measure() -> dict:
     """Everything, as one JSON-serialisable object."""
     cases = load_cases()
@@ -353,6 +382,7 @@ def measure() -> dict:
         "estimate": ESTIMATE,
         "profile": cases["profile"],
         "skill": measure_skill(),
+        "skill_at_v0_9_0": frozen_skill(),
         "screens": screens,
         "walk": measure_walk(screens),
         "stream": measure_stream(cases),
@@ -411,8 +441,8 @@ def _cell(measured: dict) -> str:
     return f"{measured['bytes']:,} (~{measured['tokens_est']:,})"
 
 
-def render(result: dict) -> str:
-    """The measurement as Markdown tables, for a person."""
+def _screens_section(result: dict, heading: str) -> list[str]:
+    """The per-screen table and what it does and does not compare."""
     outputs = list(result["screens"][0]["rows"])
     titles = {
         "raw_dump": "raw dump",
@@ -422,7 +452,7 @@ def render(result: dict) -> str:
         "navigator_find_text": "`navigator --find-text`",
     }
     lines = [
-        "## What one screen costs to read",
+        f"{heading} What one screen costs to read",
         "",
         f"Bytes, with tokens in brackets. {ESTIMATE.capitalize()}.",
         "",
@@ -452,17 +482,26 @@ def render(result: dict) -> str:
         "rows are single recorded screens, replayed. It is the size of one answer per "
         "screen, not the cost of a task: taps, scrolling, retries and second looks are "
         "not counted.",
-        "- The columns do not carry the same information. The raw dump is everything on "
-        "screen. `screen_mapper` and `navigator --list` are summaries that leave things "
+        "- The columns do not carry the same information. The raw dump is the whole "
+        "hierarchy `uiautomator` exposes. `screen_mapper` and `navigator --list` are "
+        "summaries that leave things "
         "out and cut long lists short. `navigator --find-text` answers one question, for "
         "a text the agent already knew to ask for, and found it every time here.",
-        "- The fixture app sets `testTagsAsResourceId`, so its controls are reported by "
-        "short ids. An app that does not is reported by its visible text.",
+        "- The fixture app sets `testTagsAsResourceId`, so its Compose controls are "
+        "reported by short ids. The `compose single screen` row is a screen without it: "
+        "its controls have no id and no text of their own, and are reported by a caption "
+        "recovered from the texts around them.",
         f"- Over `adb exec-out` a dump arrives with {stream['framing_bytes']} bytes of "
         f"status line after the document ({stream['stream_bytes']:,} bytes in all for a "
         f"{stream['document_bytes']:,}-byte document).",
-        "",
-        "## Screenshots",
+    ]
+    return lines
+
+
+def _screenshots_section(result: dict, heading: str) -> list[str]:
+    """Pixel dimensions and PNG bytes per preset."""
+    lines = [
+        f"{heading} Screenshots",
         "",
         "Pixel dimensions and PNG bytes at each `--size` preset. No token figure: what an "
         "image costs a model is not a function of its file size. The recorded screens have "
@@ -477,10 +516,14 @@ def render(result: dict) -> str:
             f"{m['width']}x{m['height']}, {m['bytes']:,}" for m in screenshot["presets"].values()
         ]
         lines.append(f"| {screenshot['id'].replace('_', ' ')} | " + " | ".join(cells) + " |")
+    return lines
+
+
+def _skill_section(result: dict, heading: str) -> list[str]:
+    """What loading the skill costs, beside what it cost at v0.9.0."""
     skill = result["skill"]
-    lines += [
-        "",
-        "## Loading the skill",
+    lines = [
+        f"{heading} Loading the skill",
         "",
         "| What the agent loads | bytes | tokens (estimate) |",
         "|---|---:|---:|",
@@ -494,6 +537,60 @@ def render(result: dict) -> str:
             f"| `SKILL.md` plus its largest reference file | {plus['bytes']:,} | "
             f"~{plus['tokens_est']:,} |"
         )
+    before = result["skill_at_v0_9_0"]
+    lines.append(
+        f"| `SKILL.md` at v{before['release']}, with no reference files beside it | "
+        f"{before['bytes']:,} | ~{before['tokens_est']:,} |"
+    )
+    return lines
+
+
+def render(result: dict) -> str:
+    """The measurement as Markdown tables, for a person."""
+    sections = (
+        _screens_section(result, "##"),
+        _screenshots_section(result, "##"),
+        _skill_section(result, "##"),
+    )
+    return "\n\n".join("\n".join(section) for section in sections) + "\n"
+
+
+def readme_block(result: dict) -> str:
+    """The part README.md carries, word for word: the screen table and the skill's size.
+
+    The screenshot table is left to the full output: the bytes of a resized
+    PNG depend on the zlib the encoder was built with, so a README could not
+    be held to them on every machine. Everything here can be, and
+    ``tests/test_public_face.py`` holds README.md to it.
+    """
+    sections = (_screens_section(result, "###"), _skill_section(result, "###"))
+    return "\n\n".join("\n".join(section) for section in sections) + "\n"
+
+
+def readme_section(result: dict) -> str:
+    """README.md's ``## What it costs``, whole: heading, introduction, tables, how to reproduce.
+
+    Whole, so that the README can be compared with it character for character.
+    A guard that read the README's tables instead was shown, twice, a README
+    that was wrong and that it passed (a heading one level deeper, a table
+    indented into a code block): there is nothing to read when the section is
+    this text or it is not.
+    """
+    lines = [
+        README_HEADING,
+        "",
+        *README_INTRODUCTION,
+        "",
+        readme_block(result).rstrip("\n"),
+        "",
+        "To reproduce it from a checkout:",
+        "",
+        "```bash",
+        REPRODUCE,
+        "```",
+        "",
+        "That prints these tables and one more, of screenshot sizes at each `--size` preset.",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -504,6 +601,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true", help="Print one JSON object")
+    mode.add_argument(
+        "--readme",
+        action="store_true",
+        help="Print README.md's `What it costs` section, whole",
+    )
     mode.add_argument(
         "--check",
         action="store_true",
@@ -520,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps(result, indent=2))
+    elif args.readme:
+        print(readme_section(result), end="")
     elif args.write:
         EXPECTED.write_text(json.dumps(stable_view(result), indent=2) + "\n", encoding="utf-8")
         print(f"Wrote {EXPECTED.relative_to(REPO)}")

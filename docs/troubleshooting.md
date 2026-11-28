@@ -60,31 +60,45 @@ and it resolves it the same way before pinning Gradle to that one device.)
 
 ---
 
-## `uiautomator dump` fails / empty hierarchy
+## `uiautomator dump` does not return a screen
 
-**Problem:** `screen_mapper.py`, `navigator.py`, or `accessibility_audit.py` fail with
-`Failed to get UI hierarchy`, or report zero elements.
+**Problem:** `screen_mapper.py`, `navigator.py`, or `accessibility_audit.py` fail with one of
+three errors from the capture layer, or `navigator.py --wait-for` ends `Could not read the
+screen`.
 
-**Cause:** `get_ui_hierarchy()` runs `adb shell uiautomator dump /sdcard/window_dump.xml`,
-pulls the XML, and parses it. It fails when the screen has no accessible window (lock screen,
-secure/FLAG_SECURE surface, a pure SurfaceView/game, or a transient animation), when the app
-is not in the foreground, or when `/sdcard` is not writable.
+**Cause:** the screen is read with `adb exec-out uiautomator dump /dev/tty` (no file is written
+on the device or the host; a wait runs the same dump under the device's `timeout`).
+uiautomator answers with one line instead of a document, at exit 0, in three recorded cases,
+and each is reported under its own name:
+
+- `could not get an idle state` -- the screen never went a second without an accessibility
+  event. An animation that ends passes by itself. The recorded case that does not pass is an
+  `android.widget.TextView` whose text is set every 100 ms: setting the animation scales to
+  0 does not help it, because nothing is animating. Changing content is not by itself this
+  case: a Compose text updated as often was dumped normally.
+- `found no focused window` -- nothing is drawn yet, or the display is off.
+- `was killed as it started` (`Killed`) -- another UI automation session is registered on the
+  device: a dump still running, one whose adb client was killed a moment ago, or an
+  instrumented UI test.
+
+Not recorded, so not described here: a secure window (`FLAG_SECURE`), and a screen that is
+one opaque surface (a game, a video).
 
 **Fix:**
-- Make sure the target app is foregrounded first:
+- Put the app in front and wait for the screen by its text, not by a pause:
   ```bash
-  python app_launcher.py --launch com.example.app
+  python3 "$SKILL_DIR/scripts/app_launcher.py" --launch com.example.app
+  python3 "$SKILL_DIR/scripts/navigator.py" --wait-for "Login"
   ```
-- Unlock the device and dismiss any system dialog, then re-map:
+  The wait asks again after any of the three for as long as its `--timeout` allows. If it
+  gives up with the screen still unread, it says what the last dump that answered reported,
+  or that none answered in time; if a screen was read after them, it counts them and
+  reports that screen.
+- Unlock the device and dismiss any system dialog, then map again.
+- For a screen that never goes idle, use a screenshot (`app_state_capture.py`).
+- To see the raw answer:
   ```bash
-  python screen_mapper.py
-  ```
-- Wait for animations/splash to settle and retry; `uiautomator` cannot dump mid-transition.
-- Secure windows and DRM/`FLAG_SECURE` screens never expose a hierarchy — this is expected;
-  fall back to a screenshot-based check (e.g. `app_state_capture.py`).
-- Verify the raw dump manually if it keeps failing:
-  ```bash
-  adb shell uiautomator dump /sdcard/window_dump.xml && adb shell cat /sdcard/window_dump.xml | head
+  adb exec-out uiautomator dump /dev/tty | head -c 300
   ```
 
 ---

@@ -1,6 +1,12 @@
 {
   "estimate": "tokens are bytes / 4, rounded: an estimate, no tokenizer is run",
   "profile": "emulator-api35",
+  "skill_at_v0_9_0": {
+    "release": "0.9.0",
+    "commit": "f9ab727",
+    "bytes": 156541,
+    "tokens_est": 39135
+  },
   "screens": [
     {
       "id": "walk_1_catalog",
