@@ -187,6 +187,27 @@ class ScreenMapper:
         Returns:
             Analysis dict with element counts and summaries
         """
+        analysis = self.analyze_captured(root)
+
+        # Try to determine screen name from activity
+        self._detect_screen_name(analysis)
+
+        return analysis
+
+    def analyze_captured(self, root: ET.Element) -> dict:
+        """:meth:`analyze_tree` without the device: the tree alone, no activity lookup.
+
+        For a caller that already holds a capture and must not go back to the
+        device for it -- ``navigator``'s waiter reports the screen it read
+        inside a deadline, and naming the activity is one more adb call.
+        ``screen_name`` is None.
+
+        Args:
+            root: XML root element from uiautomator dump
+
+        Returns:
+            Analysis dict with element counts and summaries
+        """
         analysis = {
             "elements_by_type": defaultdict(list),
             "total_elements": 0,
@@ -203,9 +224,6 @@ class ScreenMapper:
 
         # Post-process for clean output
         analysis["elements_by_type"] = dict(analysis["elements_by_type"])
-
-        # Try to determine screen name from activity
-        self._detect_screen_name(analysis)
 
         return analysis
 
@@ -382,6 +400,28 @@ class ScreenMapper:
             if bucket != "TextView" and labels
         ]
 
+    @classmethod
+    def control_lines(cls, analysis: dict) -> list[str]:
+        """The report's control lines: one per bucket, each control BY NAME.
+
+        One function because two scripts print these lines -- this one's
+        summary, and ``navigator``'s account of the screen a wait ended on --
+        and an agent copies a name from either into ``--find-text``.
+
+        Args:
+            analysis: Analysis dict from :meth:`analyze_tree`.
+
+        Returns:
+            ``Bucket: "name", "name"`` lines, with the total when a bucket was cut.
+        """
+        lines = []
+        for bucket, names in cls.interactive_names(analysis):
+            available = len(analysis["elements_by_type"][bucket])
+            rendered = '", "'.join(names)
+            suffix = f", ... ({available} total)" if available > len(names) else ""
+            lines.append(f'{bucket}: "{rendered}"{suffix}')
+        return lines
+
     def format_summary(self, analysis: dict, verbose: bool = False, hints: bool = False) -> str:
         """
         Format analysis as human-readable summary.
@@ -411,11 +451,7 @@ class ScreenMapper:
         # neither flag and step 3 asks the agent to feed a name from it into
         # `navigator --find-text`, so the documented path handed the agent a
         # count and no names.
-        for bucket, names in self.interactive_names(analysis):
-            available = len(analysis["elements_by_type"][bucket])
-            rendered = '", "'.join(names)
-            suffix = f", ... ({available} total)" if available > len(names) else ""
-            lines.append(f'{bucket}: "{rendered}"{suffix}')
+        lines.extend(self.control_lines(analysis))
 
         # EditTexts: the names are on the bucket line above; this line carries
         # what a name cannot say -- how many are filled, and how many are secure.

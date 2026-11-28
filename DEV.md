@@ -79,7 +79,9 @@ batch that reports per item -- `items`, each with `success` / `error` /
 `remedy` -- and when a device error stops one), **adb_exec.py** (the one bounded
 entry point for every adb call, with typed errors that name a remedy),
 **hierarchy.py** (the one way to capture the UI hierarchy — no temp files,
-so concurrent runs cannot read each other's screen), **emu_console.py** (`adb emu`, which exits 0 even when it
+so concurrent runs cannot read each other's screen; `navigator`'s waiter uses
+`capture_hierarchy_within`, whose dump is stopped on the device, because one ended
+from the host can leave the next dump answering `Killed`), **emu_console.py** (`adb emu`, which exits 0 even when it
 fails), **logcat.py** (the one place that builds an `adb logcat` argv and
 parses a duration, shared by all four log readers), **dump_read.py** (the
 live read made of dumps on API 33, whose logcat holds `-B` records back

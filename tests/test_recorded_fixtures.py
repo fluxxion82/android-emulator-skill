@@ -4,8 +4,8 @@ These are the payoff of ``tests/record_fixtures.py``. Every assertion here runs
 against bytes a real device actually produced, never a hand-written literal.
 
 A known defect is pinned here with ``xfail(strict=True)`` against its defect ID
-until it is fixed; one is pinned today (V10-A, at the end of this file). That
-convention is deliberate and load-bearing:
+until it is fixed; none is pinned today (V10-A, at the end of this file, was the
+last). That convention is deliberate and load-bearing:
 
 - The suite stays honest — a known-broken parser is not reported as passing.
 - ``strict=True`` means the test *fails* if it unexpectedly passes, so whoever
@@ -984,19 +984,13 @@ def test_the_whole_package_table_names_the_fixture_app_and_a_shared_uid(recorded
 
 # ---------------------------------------------------------------------------
 # V10-A: the remedy for a dump that cannot reach idle (v0.10.0 ground truth).
+#
+# Pinned strict-xfail until `navigator --wait-for` needed the answer: the error said
+# "The screen is still animating; wait for it to settle, or disable animations", and
+# uiautomator_never_idle_animations_off is that advice followed, failing identically.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "V10-A: common/hierarchy.py says 'The screen is still animating; wait for it to "
-        "settle, or disable animations'. uiautomator_never_idle_animations_off is that "
-        "advice followed -- all three scales at 0 -- and the dump fails identically, "
-        "because the screen's content is changing, not animating. Fixed with the "
-        "unreadable-screen answer of navigator --wait-for; delete this marker there."
-    ),
-)
 def test_the_idle_failure_remedy_covers_content_that_keeps_changing(recorded, monkeypatch):
     """The error must not send the reader after a fix the recording shows does nothing."""
     import subprocess
@@ -1029,3 +1023,8 @@ def test_the_idle_failure_remedy_covers_content_that_keeps_changing(recorded, mo
         "the remedy names animation only; a screen whose content keeps changing (a timer, a "
         "counter) fails the same way with animations disabled"
     )
+    # And saying it is not enough if the old advice is still given beside it.
+    advice = r"\b(disable|disabling|turn(ing)? off|switch(ing)? off)\b[^.]*\banimation"
+    assert not re.search(
+        advice, message
+    ), "the error still advises disabling animations, which this recording shows does nothing"

@@ -23,6 +23,11 @@ last section of this module): a build id `build_and_test` printed goes back in
 as `--get-errors <id>`. `test_skill_index.py` requires every command that
 section shows to be run from this module.
 
+The waiter closes the same loop in fewer calls, and both of its ends are driven
+from printed output as well: a name the screen report printed goes to
+`navigator --wait-for`, and the screen `navigator --tap --expect` prints after
+its tap names the controls the next `navigator` call taps.
+
 and asserts the tap landed inside the control that name belongs to. The expected
 rectangle is a literal in the inventory below, checked against the recorded
 hierarchy by ``test_the_case_inventory_matches_the_recorded_screen``, and never
@@ -71,6 +76,11 @@ from common import adb_exec, cli
 COMPOSE = "uiautomator_compose_default.xml"
 SETTINGS = "uiautomator_settings_top.xml"
 SCREENS = (COMPOSE, SETTINGS)
+
+# Two screens of one flow, one tap apart: "Place order" on the first opens the
+# second. Recorded by opening each directly, so neither depends on the tap.
+CHECKOUT = "uiautomator_walk_4_checkout.xml"
+CONFIRMATION = "uiautomator_walk_5_confirmation.xml"
 
 # A screen an agent can act on names at least this many of its controls. The
 # plan's floor for C4, applied to both toolkits.
@@ -234,7 +244,13 @@ class _Run:
     adb: _AdbRecorder
 
 
-def _run_cli(module, argv: list[str], screen: ET.Element, monkeypatch) -> _Run:
+def _run_cli(
+    module,
+    argv: list[str],
+    screen: ET.Element,
+    monkeypatch,
+    following: tuple[ET.Element, ...] = (),
+) -> _Run:
     """Run a script's ``main()`` against a recorded screen, recording adb.
 
     The seams are the ones the scripts genuinely use: both read the screen
@@ -242,12 +258,23 @@ def _run_cli(module, argv: list[str], screen: ET.Element, monkeypatch) -> _Run:
     ``common.hierarchy``, and both reach adb through ``adb_exec.run_adb``. No
     ``--serial`` is passed, so ``resolve_device_identifier(None)`` returns None
     without consulting adb at all.
+
+    A wait reads through ``capture_hierarchy_within`` instead, once per look:
+    it is handed ``screen`` and then each of ``following`` in turn, the last
+    one for as long as it keeps asking.
     """
     adb = _AdbRecorder()
     monkeypatch.setattr(adb_exec, "run_adb", adb)
     monkeypatch.setattr(adb_exec, "subprocess", _NO_SUBPROCESS)
     monkeypatch.setattr(navigator, "capture_hierarchy", lambda serial=None, **kwargs: screen)
     monkeypatch.setattr(screen_mapper, "capture_hierarchy", lambda serial=None, **kwargs: screen)
+    looks = [screen, *following]
+    monkeypatch.setattr(
+        navigator,
+        "capture_hierarchy_within",
+        lambda serial, seconds: looks.pop(0) if len(looks) > 1 else looks[0],
+    )
+    monkeypatch.setattr(navigator, "_pause", lambda seconds: None)
     # A real settle delay would add half a second per tap for no signal here.
     monkeypatch.setattr(navigator, "TAP_SETTLE_SECONDS", 0)
     monkeypatch.setattr(sys, "argv", list(argv))
@@ -713,6 +740,80 @@ def test_the_expectation_is_not_read_from_the_tool_under_test(recorded):
     assert _expected_rect(screen, "Remember me") == (33, 754, 159, 880)
     assert _expected_rect(screen, "Dark theme") == (32, 890, 169, 1016)
     assert _expected_rect(screen, "Submit Order") == (32, 217, 375, 343)
+
+
+# ---------------------------------------------------------------------------
+# The waiter: both ends from printed output.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "screen_name", (*SCREENS, CONFIRMATION), ids=[*_SCREEN_IDS, _screen_id(CONFIRMATION)]
+)
+def test_a_reported_name_is_text_the_waiter_finds(recorded, monkeypatch, screen_name):
+    """Every name the screen report prints can be handed to ``--wait-for``, as printed.
+
+    Three kinds of name are among them, and a waiter that matched only a
+    node's own text would find one: a text or content description (Settings'
+    profile picture), a caption recovered for a control with no name of its
+    own (every Compose control on the first screen), and a bare resource id
+    (the tagged buttons of the confirmation screen).
+    """
+    screen = ET.fromstring(recorded.text(screen_name))
+
+    report = _run_cli(screen_mapper, ["screen_mapper.py"], screen, monkeypatch)
+    names = _names_printed(report.stdout)
+    assert names, report.stdout
+
+    for name in names:
+        run = _run_cli(navigator, ["navigator.py", "--wait-for", name], screen, monkeypatch)
+
+        assert run.status == 0, f"{name!r}: {run.stdout.strip()} {run.stderr.strip()}"
+        assert run.stdout.startswith(f"Found: text='{name}' after "), run.stdout
+        assert run.adb.calls == [], f"waiting for {name!r} sent the device {run.adb.calls}"
+
+
+def test_the_screen_a_tap_then_expect_prints_names_what_the_next_call_taps(recorded, monkeypatch):
+    """screen_mapper -> a printed name -> ``--tap --expect`` -> a printed name -> ``--tap``.
+
+    The middle command taps once, waits for a text of the screen the tap
+    opens, and prints that screen. Nothing maps the second screen: its control
+    names are read off what the command printed and each is handed to the
+    next ``navigator`` call, whose tap has to land in the control that name
+    belongs to -- by the rectangle this module derives from the recording.
+    """
+    checkout = ET.fromstring(recorded.text(CHECKOUT))
+    confirmation = ET.fromstring(recorded.text(CONFIRMATION))
+
+    report = _run_cli(screen_mapper, ["screen_mapper.py"], checkout, monkeypatch)
+    assert "place_order_button" in _names_printed(report.stdout), report.stdout
+    button = "place_order_button"
+
+    acted = _run_cli(
+        navigator,
+        ["navigator.py", "--find-text", button, "--tap", "--expect", "Order placed"],
+        checkout,
+        monkeypatch,
+        following=(confirmation,),
+    )
+
+    assert acted.status == 0, f"{acted.stdout.strip()} {acted.stderr.strip()}"
+    (tap,) = acted.adb.shell_inputs("tap")
+    assert _inside(_expected_rect(checkout, button), int(tap[2]), int(tap[3])), tap
+    _before, header, summary = acted.stdout.partition("Screen: ")
+    assert header, f"no screen was printed after the tap:\n{acted.stdout}"
+    names = _names_printed(header + summary)
+    assert set(names) == {"open_settings_button", "back_to_catalog_button"}, acted.stdout
+
+    for name in names:
+        run = _run_cli(
+            navigator, ["navigator.py", "--find-text", name, "--tap"], confirmation, monkeypatch
+        )
+        taps = run.adb.shell_inputs("tap")
+
+        assert run.status == 0, f"{name!r}: {run.stdout.strip()} {run.stderr.strip()}"
+        assert len(taps) == 1, f"{name!r} produced {len(taps)} taps"
+        assert _inside(_expected_rect(confirmation, name), int(taps[0][2]), int(taps[0][3]))
 
 
 # ---------------------------------------------------------------------------

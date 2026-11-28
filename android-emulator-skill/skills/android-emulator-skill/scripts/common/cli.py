@@ -131,12 +131,27 @@ class Failure(Exception):  # noqa: N818 -- reads as `cli.Failure` at the call si
     Attributes:
         remedy: What the caller should do about it.
         details: Extra keys for the ``--json`` object (see :func:`fail`).
+        exit_status: The status this failure was raised with: 1 unless said.
+            A script that has to add to another error's account -- "the tap
+            was sent, and then the device went away" -- raises with that
+            error's status (3) while saying the rest. It is the stored status,
+            not always the one exited with: :func:`exit_code_for` exits 3 for
+            a failure that is itself one of ``DEVICE_UNAVAILABLE``, whatever
+            is stored here.
     """
 
-    def __init__(self, error: str, remedy: str, details: Mapping[str, object] | None = None):
+    def __init__(
+        self,
+        error: str,
+        remedy: str,
+        details: Mapping[str, object] | None = None,
+        *,
+        exit_status: int = EXIT_FAILURE,
+    ):
         super().__init__(error)
         self.remedy = remedy
         self.details = dict(details or {})
+        self.exit_status = exit_status
 
 
 class BatchFailure(Failure):
@@ -160,8 +175,7 @@ class BatchFailure(Failure):
         *,
         exit_status: int = EXIT_FAILURE,
     ):
-        super().__init__(error, remedy, details)
-        self.exit_status = exit_status
+        super().__init__(error, remedy, details, exit_status=exit_status)
 
 
 def invocation(script: str, *arguments: str) -> str:
@@ -181,8 +195,16 @@ def invocation(script: str, *arguments: str) -> str:
     return f'{interpreter} "$SKILL_DIR/scripts/{script}"{words}'
 
 
-def fail(error: str, remedy: str, *, details: Mapping[str, object] | None = None) -> NoReturn:
-    """Raise a failure the script detected itself, for :func:`run` to report (exit 1).
+def fail(
+    error: str,
+    remedy: str,
+    *,
+    details: Mapping[str, object] | None = None,
+    exit_status: int = EXIT_FAILURE,
+) -> NoReturn:
+    """Raise a failure the script detected itself, for :func:`run` to report.
+
+    Exit 1, unless ``exit_status`` says otherwise.
 
     For the shape this skill keeps finding: a script notices the lookup failed,
     prints an empty result, and exits 0. Raise instead, and :func:`run` reports
@@ -196,6 +218,9 @@ def fail(error: str, remedy: str, *, details: Mapping[str, object] | None = None
             caller: added to the refusal object after ``success`` / ``error`` /
             ``remedy``, none of which a detail can replace. Not printed in the
             text form, so nothing an agent needs may live only here.
+        exit_status: The status to exit with, when it is not 1: for a failure
+            that restates a typed error with more to say and must keep that
+            error's status (:func:`exit_code_for` gives it).
 
     Example:
         >>> if not packages and result.returncode != 0:
@@ -204,7 +229,7 @@ def fail(error: str, remedy: str, *, details: Mapping[str, object] | None = None
         ...         "Check the device is booted (`adb shell getprop sys.boot_completed`).",
         ...     )
     """
-    raise Failure(error, remedy, details)
+    raise Failure(error, remedy, details, exit_status=exit_status)
 
 
 # What the skill expects to fail with. Everything raised under RuntimeError
@@ -380,11 +405,26 @@ def _neutralize(stream) -> None:
 def exit_code_for(error: BaseException) -> int:
     """The exit status for a typed failure: 3 when the device is unavailable, else 1.
 
-    A :class:`BatchFailure` carries its own: the stopping device error's, or 1.
+    Asked in this order:
+
+    - a :class:`BatchFailure` exits with its own ``exit_status`` (the stopping
+      device error's, or 1);
+    - anything that is one of ``DEVICE_UNAVAILABLE`` -- not found, offline,
+      unauthorized -- exits 3. That includes a :class:`Failure` that is also
+      one of them, whose stored ``exit_status`` (1) is overridden:
+      ``dump_read`` and ``app_state_capture`` build such refusals so a device
+      lost mid-read is exit 3 and still carries ``details``. A
+      ``MultipleDevicesError`` is a device error and is not among them: 1;
+    - any other :class:`Failure` exits with its own ``exit_status``;
+    - everything else exits 1.
     """
     if isinstance(error, BatchFailure):
         return error.exit_status
-    return EXIT_DEVICE_UNAVAILABLE if isinstance(error, DEVICE_UNAVAILABLE) else EXIT_FAILURE
+    if isinstance(error, DEVICE_UNAVAILABLE):
+        return EXIT_DEVICE_UNAVAILABLE
+    if isinstance(error, Failure):
+        return error.exit_status
+    return EXIT_FAILURE
 
 
 USAGE_HELP_REMEDY = "run with --help"

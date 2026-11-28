@@ -180,6 +180,8 @@ MODES: tuple[Mode, ...] = (
     _adb("screen_mapper.py", ("--json",), "machine-readable screen map"),
     _adb("navigator.py", ("--find-text", "x", "--json"), "lookup"),
     _adb("navigator.py", ("--find-text", "x", "--tap"), "Quick Start step 3"),
+    _adb("navigator.py", ("--wait-for", "x"), "wait for text"),
+    _adb("navigator.py", ("--find-text", "x", "--tap", "--expect", "y"), "tap, then wait"),
     _adb(
         "navigator.py",
         ("--find-type", "EditText", "--enter-text", "x"),

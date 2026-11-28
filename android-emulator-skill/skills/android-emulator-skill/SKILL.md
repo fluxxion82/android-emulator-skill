@@ -153,7 +153,8 @@ Shared by the scripts and not run directly: `adb_exec`, `anr_pipeline`, `anr_ses
 10. **navigator.py** - Find a control by a name `screen_mapper` printed, by type or by id, then tap it or type into it.
     - Run: `python3 "$SKILL_DIR/scripts/navigator.py" --find-text "Login" --tap`
     - Reads the visible screen only; add `--scroll-to-find` to search below the fold.
-    - Options: `--find-text`, `--find-exact`, `--exact`, `--find-type`, `--find-id`, `--index`, `--tap`, `--enter-text`, `--tap-at x,y`, `--list`, `--scroll-to-find`, `--scroll-direction {down,up}`, `--max-scrolls N`, `--serial`, `--json`, `--verbose`
+    - `--wait-for TEXT` waits for text; `--tap --expect TEXT` taps, waits, then prints the screen that followed.
+    - Options: `--find-text`, `--find-exact`, `--exact`, `--find-type`, `--find-id`, `--index`, `--tap`, `--enter-text`, `--tap-at x,y`, `--wait-for TEXT`, `--expect TEXT`, `--timeout S`, `--list`, `--scroll-to-find`, `--scroll-direction {down,up}`, `--max-scrolls N`, `--serial`, `--json`, `--verbose`
     - Detail: [references/navigator.md](references/navigator.md)
 
 11. **gesture.py** - Swipe, scroll, drag, long-press, pull to refresh.
@@ -472,7 +473,7 @@ shape whichever script met it. What is promised, and what is not yet:
   tools present and failing, and with none on PATH at all — and
   asserts the refusal itself (one object, or `Error:` / `Remedy:`; an error
   naming the tool; the exact status), not just a non-zero exit. In all it
-  asserts the payload of 40 documented modes, each of them twice. It runs a
+  asserts the payload of 42 documented modes, each of them twice. It runs a
   usage error through every script in both modes too, and fails if a
   script on disk is missing from that run (`android_health_check.sh`
   included; its object carries `ok` as well, like its other answers).
