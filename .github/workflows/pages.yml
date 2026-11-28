@@ -8,17 +8,54 @@ on:
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
+# The token every job here gets may read the repository and nothing more.
+# Publishing needs more, and the `deploy` job alone is given it: the `check`
+# job installs packages and runs the whole test suite, and has no business
+# holding a token that can write Pages or ask for an identity.
+# tests/test_release_artifact.py holds both halves.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
+  # The site states facts about the package: how many scripts, which flags,
+  # which agents and how to install with each. The tests hold it to them, and
+  # until this job existed a push to site/ was deployed without running one.
+  # The whole suite, not a selection: a selection is a list somebody has to
+  # keep. Guarded by tests/test_public_face.py.
+  check:
+    name: Run pytest before the site is published
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: dev-constraints.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install -c dev-constraints.txt pip
+          pip install -c dev-constraints.txt pytest pillow pyyaml
+
+      - name: Run pytest
+        run: |
+          echo "🧪 Running unit tests (adb/subprocess mocked)..."
+          pytest tests/
+
   deploy:
+    needs: check
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -30,9 +67,11 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:
-          # Enable Pages (source = GitHub Actions) if it isn't already, using the
-          # workflow's `pages: write` token. Without this the step 404s on repos
-          # where Pages has never been turned on in Settings.
+          # Ask the action to enable Pages (source = GitHub Actions) if it isn't
+          # already. Its own documentation says that needs a token other than the
+          # one a workflow is given, so on a repository where Pages has never been
+          # turned on, turn it on in Settings first; this job's token can deploy
+          # to Pages once it is.
           enablement: true
 
       - name: Upload site artifact

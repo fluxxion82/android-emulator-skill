@@ -105,6 +105,19 @@ RUNNER = "ubuntu-latest"
 RELEASE_JOBS = ("verify", "emulator", "install", "version", "package")
 # What the token of the package job may do, whole. No other job's may write contents.
 PACKAGE_PERMISSIONS = {"contents": "write"}
+# The other job with a token of its own: the one that publishes the site. It
+# reads the checkout and writes Pages; pages.yml's other job runs the suite
+# and gets what every job gets.
+PAGES_WORKFLOW = "pages.yml"
+PAGES_DEPLOY_JOB = "deploy"
+PAGES_DEPLOY_PERMISSIONS = {"contents": "read", "pages": "write", "id-token": "write"}
+# What the token of every job is, in every workflow, unless the job is one of the two.
+WORKFLOW_PERMISSIONS = {"contents": "read"}
+# The jobs that set permissions of their own, and exactly which.
+JOB_PERMISSIONS = {
+    (RELEASE.name, PACKAGE_JOB): PACKAGE_PERMISSIONS,
+    (PAGES_WORKFLOW, PAGES_DEPLOY_JOB): PAGES_DEPLOY_PERMISSIONS,
+}
 # The job's first and last steps, less their `name`, exactly. The upload's
 # `files` is one path as the action reads it: no comma, newline or pattern.
 CHECKOUT = {"uses": "actions/checkout@v4"}
@@ -519,16 +532,19 @@ def _asset_writer_problems(workflows: dict[str, str]) -> list[str]:
     """Why something besides the package job could write a release's asset. Empty: nothing could.
 
     Two rules. The names of release.yml's jobs are the ones written out in
-    `RELEASE_JOBS`. And the token GitHub makes for a job may not write the
-    repository's contents, in any workflow, the package job's apart: the
-    workflow lists its permissions, `contents` among them is not `write`,
-    and no job sets permissions of its own but the package job, whose are
-    `PACKAGE_PERMISSIONS` and nothing more. A workflow that lists none gets
-    the repository's default, which is a setting and in no file, so it is
-    refused.
+    `RELEASE_JOBS`. And the token GitHub makes for a job reads the
+    repository's contents and does nothing else, in any workflow, two jobs
+    apart: each workflow lists `WORKFLOW_PERMISSIONS` and nothing more, and
+    no job sets permissions of its own but the package job, whose are
+    `PACKAGE_PERMISSIONS`, and the job that publishes the site, whose are
+    `PAGES_DEPLOY_PERMISSIONS`; each of those whole. A workflow that lists
+    none gets the repository's default, which is a setting and in no file,
+    so it is refused.
 
-    `contents` is the one scope held. Any other that a workflow lists for
-    all its jobs is not read: pages.yml's token may write Pages.
+    The second exception is there for the first's reason turned round. The
+    site's workflow once listed `pages: write` and `id-token: write` for all
+    its jobs, which was one job; when a job that installs packages and runs
+    the test suite was put before it, that job held them too.
 
     The limit: that token is all this reads. A step handed another one, as a
     secret, writes whatever that one may, and a person who may write the
@@ -544,13 +560,16 @@ def _asset_writer_problems(workflows: dict[str, str]) -> list[str]:
             )
         elif granted.get("contents", "none") not in ("read", "none"):
             found.append(f"{name} lets the token of every job write the repository's contents")
+        elif not _written_alike(granted, WORKFLOW_PERMISSIONS):
+            found.append(
+                f"{name} gives the token of every job more than {WORKFLOW_PERMISSIONS}: {granted!r}"
+            )
         for job, body in workflow["jobs"].items():
             own = body.get("permissions")
-            if (name, job) == (RELEASE.name, PACKAGE_JOB):
-                if not _written_alike(own, PACKAGE_PERMISSIONS):
-                    found.append(
-                        f"{name}, job `{job}`: `permissions` is {own!r}, not {PACKAGE_PERMISSIONS}"
-                    )
+            wanted = JOB_PERMISSIONS.get((name, job))
+            if wanted is not None:
+                if not _written_alike(own, wanted):
+                    found.append(f"{name}, job `{job}`: `permissions` is {own!r}, not {wanted}")
             elif "permissions" in body:
                 found.append(f"{name}, job `{job}`, sets permissions of its own: {own!r}")
         if name == RELEASE.name and sorted(workflow["jobs"]) != sorted(RELEASE_JOBS):
@@ -558,6 +577,13 @@ def _asset_writer_problems(workflows: dict[str, str]) -> list[str]:
                 f"the jobs of {name} are {sorted(workflow['jobs'])}, not {sorted(RELEASE_JOBS)}"
             )
     return found
+
+
+def test_the_two_jobs_with_a_token_of_their_own_exist():
+    """An exception for a job that is not there excuses nothing, and says so here."""
+    workflows = _workflow_texts()
+    for name, job in JOB_PERMISSIONS:
+        assert job in _yaml_with_the_keys_github_reads(workflows[name])["jobs"], (name, job)
 
 
 def test_nothing_but_the_package_job_may_write_a_releases_asset():
@@ -576,6 +602,7 @@ def _in(name: str, change: Callable[[str], str]) -> Callable[[dict[str, str]], d
 
 _TOKEN = "\npermissions:\n  contents: read\n"
 _PACKAGE_TOKEN = "    permissions:\n      contents: write\n"
+_PAGES_TOKEN = "    permissions:\n      contents: read\n      pages: write\n      id-token: write\n"
 # What the review of this module appended to release.yml, with every guard
 # then green: the upload action puts a file over an asset of the same name.
 # The workflow's token no longer writes contents, so here this job is the
@@ -644,6 +671,30 @@ OTHER_WRITERS = {
     "a second workflow on the same trigger may write": (
         lambda workflows: {**workflows, "after-release.yml": _ANOTHER_WORKFLOW},
         "after-release.yml lets the token of every job write",
+    ),
+    "every job of the site's workflow may publish, as its one job once could": (
+        _in(
+            PAGES_WORKFLOW,
+            _edit_release(_TOKEN, "\npermissions:\n  contents: read\n  pages: write\n"),
+        ),
+        f"{PAGES_WORKFLOW} gives the token of every job more than ",
+    ),
+    "the job that publishes the site may write the repository too": (
+        _in(
+            PAGES_WORKFLOW,
+            _edit_release(_PAGES_TOKEN, _PAGES_TOKEN.replace("contents: read", "contents: write")),
+        ),
+        f"{PAGES_WORKFLOW}, job `deploy`: `permissions` is {{'contents': 'write'",
+    ),
+    "the job that runs the suite before publishing is given the publisher's token": (
+        _in(
+            PAGES_WORKFLOW,
+            _edit_release(
+                "    name: Run pytest before the site is published\n",
+                f"    name: Run pytest before the site is published\n{_PAGES_TOKEN}",
+            ),
+        ),
+        f"{PAGES_WORKFLOW}, job `check`, sets permissions of its own",
     ),
     "a job of another workflow is given the write": (
         _in(

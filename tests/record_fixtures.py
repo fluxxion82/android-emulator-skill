@@ -3662,6 +3662,30 @@ _RECOVERED_WITHIN_S = 4
 _OVERLAP_AFTER_S = 3
 
 
+def _settings_apps_screen(_scratch: Path, serial: str, extra: dict) -> Capture:
+    """Settings' Apps screen, reached as a person reaches it: a tap on "Apps" in the home list.
+
+    `am start -a android.settings.APPLICATION_SETTINGS` opens the list of all
+    apps, which is another screen. So the home screen is dumped, the "Apps"
+    title's rectangle read from it, and its centre tapped.
+    """
+    home = _run(_DUMP, serial, timeout=60)
+    title = re.search(r'text="Apps"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', home.text)
+    if title is None:
+        raise CaptureError("Settings home has no node whose text is 'Apps' to tap")
+    left, top, right, bottom = (int(number) for number in title.groups())
+    x, y = (left + right) // 2, (top + bottom) // 2
+    tapped = _run(["shell", "input", "tap", str(x), str(y)], serial)
+    if tapped.returncode != 0:
+        raise CaptureError(f"`input tap {x} {y}` exited {tapped.returncode}: {tapped.text!r}")
+    time.sleep(2)
+    extra["reached_by"] = (
+        f"adb shell input tap {x} {y}: the centre of the node whose text is 'Apps' on "
+        f"Settings home, read from a dump taken first"
+    )
+    return _run(_DUMP, serial, timeout=60)
+
+
 def _dump_within(limit: str) -> list[str]:
     """The dump, under the device's own ``timeout``: it is stopped THERE when time is up."""
     return ["exec-out", "timeout", limit, "uiautomator", "dump", "/dev/tty"]
@@ -8323,6 +8347,33 @@ FIXTURES: list[Fixture] = [
         teardown_verify=_device_awake,
         record_both_streams=True,
         post=_requires("null root node", absent=("<hierarchy",)),
+    ),
+    # --- the screen one tap from Settings home ------------------------------
+    Fixture(
+        name="uiautomator_settings_apps",
+        emulator_only=True,
+        ext="xml",
+        args=_DUMP,
+        command=(
+            "adb shell am start -a android.settings.SETTINGS; adb shell input tap "
+            "<the centre of 'Apps'>; adb exec-out uiautomator dump /dev/tty"
+        ),
+        description=(
+            "Settings' Apps screen: what a tap on 'Apps' in uiautomator_settings_top's "
+            "list opens. 'Default apps' and 'All apps' are on it and 'Network & "
+            "internet' is not. With uiautomator_settings_top it is a before and an "
+            "after that a tap separates, on an app every emulator has: what the "
+            "skill's example script walks, and what its test replays. Stock "
+            "emulator content only (app counts, the image's own name)."
+        ),
+        setup=_OPEN_SETTINGS,
+        teardown=[["shell", "am", "force-stop", SETTINGS_PACKAGE]],
+        capture_with=_settings_apps_screen,
+        post=_screen_of(
+            SETTINGS_PACKAGE,
+            require=("Default apps", "All apps"),
+            forbid=("Network &amp; internet",),
+        ),
     ),
     # --- a dump stopped before it answers, and what that leaves behind ------
     Fixture(

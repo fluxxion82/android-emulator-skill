@@ -5,6 +5,13 @@ than closed. The script index is [SKILL.md](../SKILL.md), each script's detail i
 the file beside this one named after it, and what a failure looks like is
 SKILL.md's **Failures** section.
 
+- `navigator.py --wait-for` and `--tap --expect` stop each dump on the device with its
+  own `timeout` command (toybox). It is on the API 33 and API 35 emulators this was
+  measured on; a device without it was not recorded, and a wait there would end
+  `Could not read the screen`. The scroll search (`--scroll-to-find`) still ends a dump
+  that overruns its deadline from the host, and a dump ended that way can leave the next
+  one answering `Killed` (recorded: asked at once after the kill it did; asked three to
+  four seconds later it read the screen); the capture layer retries that.
 - Windows is untested. No CI job runs there; `build_and_test.py` always runs
   the Unix `gradlew` wrapper (never `gradlew.bat`), `android_health_check.sh`
   needs Bash, and `anr_watcher.py` is Unix-only (macOS, Linux) as a whole: its

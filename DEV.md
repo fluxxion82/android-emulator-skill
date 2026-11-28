@@ -175,6 +175,10 @@ pytest tests/
 #    android-emulator-skill/.codex-plugin/plugin.json, .claude-plugin/marketplace.json
 #    and the hero tag in site/index.html; tests/test_packaging_contract.py fails until all agree
 #    (.agents/plugins/marketplace.json carries no version)
+# 1b. SKILL.md's size is in README.md, and the version is in SKILL.md: print README.md's
+#    "What it costs" section again and put it in place of the old one;
+#    tests/test_public_face.py fails until the section is the script's output:
+#    `python tests/measure_costs.py --readme`, run as that section shows
 # 2. Commit, tag, push
 git commit -am "chore: bump version to X.Y.Z"
 git tag vX.Y.Z && git push origin main --tags
@@ -183,6 +187,19 @@ git tag vX.Y.Z && git push origin main --tags
 #    (`cd android-emulator-skill && claude plugin tag`, giving android-emulator-skill--vX.Y.Z)
 #    goes on the same commit, as v0.8.0's did; release.yml packages the plugin zip
 ```
+
+Not gated, so on this list: a demo recording of the skill driving an emulator, made last,
+after the tag, from the released plugin.
+
+The public pages are held to the repository by `tests/test_public_face.py`. It does not
+read them: it builds the text that must be there and compares it whole. README.md's
+"What it costs" is `tests/measure_costs.py --readme` character for character; "Supported
+agents" and the opening of "Install" are built from the agents `tests/verify_install.py`
+installs with and `agent-cli-pins.txt`; the site's install section and its own figures are
+fragments of its source built from the same. `pages.yml` is compared with a copy written out
+in that module, and runs the suite before it deploys. So editing one of those sections means
+editing what builds it. Prose outside them (the README's Status, the site's other cards) is
+not re-read by anything, and what a browser shows of the site's source is not computed.
 
 ## Code style
 
@@ -212,9 +229,10 @@ git tag vX.Y.Z && git push origin main --tags
   rewritten before it is packed (the step reads the directory afterwards); only the step sees a zip
   that comes out differently on the runner. A guard in the same module keeps the step the last
   before the upload. Another holds who may write the asset: `release.yml` has the five jobs written
-  out there, and no job's token in any workflow may write the repository's contents, the `package`
-  job's apart. Other scopes are not held. A workflow must list its `permissions`; one that lists
-  none is refused.
+  out there, and the token of every job in every workflow reads the repository's contents and does
+  nothing else, two jobs apart: the `package` job's may write contents, and the `deploy` job of
+  `pages.yml` may write Pages. Each workflow lists exactly `contents: read`; one that lists
+  nothing, or more, is refused, and so is any other job with permissions of its own.
 - **The install check.** `python tests/verify_install.py` (Python 3.12+ with PyYAML, as in the venv
   above) installs the plugin with `codex` and `claude` into empty homes, from a clean export of
   HEAD, and compares what arrived with the plugin directory. It needs both CLIs on PATH at the
