@@ -10,9 +10,10 @@ on:
         required: true
         type: string
 
-# The token GitHub hands each job may read the repository and no more.
-# tests/test_release_artifact.py holds that for every workflow here: a release
-# asset is written with `contents: write`, and one job of release.yml has it.
+# The token GitHub hands each job here may read the repository's contents and
+# not write them. tests/test_release_artifact.py holds that much of every
+# workflow: a release asset is written with `contents: write`, and one job of
+# release.yml has it.
 permissions:
   contents: read
 

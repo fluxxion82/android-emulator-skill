@@ -5,9 +5,10 @@ on:
     types: [published]
 
 # Read, for every job but the one that uploads: a job that could write the
-# repository's contents could replace the asset `package` checked. The jobs
-# of this workflow and what each token may do are written out in
-# tests/test_release_artifact.py and compared whole.
+# repository's contents could replace the asset `package` checked.
+# tests/test_release_artifact.py compares the names of this workflow's jobs
+# with the ones written out there, and lets no job's token but the package
+# job's write contents, in this workflow or another.
 permissions:
   contents: read
 

@@ -60,8 +60,9 @@ links, the two manifests, and every refusal of a job in another shape.
 And who may write the asset at all. The check is of the file the `package`
 job uploads; a job after it, or another workflow on the same trigger, could
 put another file of that name in its place. `_asset_writer_problems` holds
-the jobs of release.yml to the ones written out here, and the token of
-every job of every workflow to reading, the `package` job's apart.
+the jobs of release.yml to the ones written out here, and lets the token of
+no job of any workflow write the repository's contents, the `package`
+job's apart.
 """
 
 from __future__ import annotations
@@ -102,7 +103,7 @@ JOB_KEYS = frozenset({"name", "runs-on", "needs", "permissions", "steps"})
 RUNNER = "ubuntu-latest"
 # Every job of release.yml. A job beside these is one nothing here examined.
 RELEASE_JOBS = ("verify", "emulator", "install", "version", "package")
-# What the token of the package job may do, whole. Every other job's reads at most.
+# What the token of the package job may do, whole. No other job's may write contents.
 PACKAGE_PERMISSIONS = {"contents": "write"}
 # The job's first and last steps, less their `name`, exactly. The upload's
 # `files` is one path as the action reads it: no comma, newline or pattern.
@@ -517,13 +518,17 @@ def _workflow_texts() -> dict[str, str]:
 def _asset_writer_problems(workflows: dict[str, str]) -> list[str]:
     """Why something besides the package job could write a release's asset. Empty: nothing could.
 
-    Two rules, each compared whole. The jobs of release.yml are the ones
-    written out in `RELEASE_JOBS`. And the token GitHub makes for a job reads
-    at most, in every workflow: the workflow lists its permissions, `contents`
-    among them is not `write`, and no job sets permissions of its own but the
-    package job, whose are `PACKAGE_PERMISSIONS`. A workflow that lists none
-    gets the repository's default, which is a setting and in no file, so it
-    is refused.
+    Two rules. The names of release.yml's jobs are the ones written out in
+    `RELEASE_JOBS`. And the token GitHub makes for a job may not write the
+    repository's contents, in any workflow, the package job's apart: the
+    workflow lists its permissions, `contents` among them is not `write`,
+    and no job sets permissions of its own but the package job, whose are
+    `PACKAGE_PERMISSIONS` and nothing more. A workflow that lists none gets
+    the repository's default, which is a setting and in no file, so it is
+    refused.
+
+    `contents` is the one scope held. Any other that a workflow lists for
+    all its jobs is not read: pages.yml's token may write Pages.
 
     The limit: that token is all this reads. A step handed another one, as a
     secret, writes whatever that one may, and a person who may write the
@@ -573,6 +578,8 @@ _TOKEN = "\npermissions:\n  contents: read\n"
 _PACKAGE_TOKEN = "    permissions:\n      contents: write\n"
 # What the review of this module appended to release.yml, with every guard
 # then green: the upload action puts a file over an asset of the same name.
+# The workflow's token no longer writes contents, so here this job is the
+# control of the job-set rule alone.
 _REPLACING_JOB = (
     "\n  replace_asset:\n"
     "    name: Replace the asset\n"
@@ -597,7 +604,7 @@ _ANOTHER_WORKFLOW = (
 # Each with the words of the one rule that refuses it, and it is the only
 # thing found: a control refused for something else holds nothing.
 OTHER_WRITERS = {
-    "a job after the package job uploads a file of the same name": (
+    "a job is added to the release, after the package job": (
         _in(RELEASE.name, lambda text: text + _REPLACING_JOB),
         f"the jobs of {RELEASE.name} are ",
     ),
